@@ -688,11 +688,18 @@ class InfraBlockedConfig:
     #: and budget-failed checks fall back to ordinary ``failed`` routing
     #: (the pre-#1383 behavior).
     enabled: bool = True
-    #: Structural signal: a FAILURE conclusion whose job ran for at most
-    #: this many seconds with zero non-setup steps executed is classified
-    #: infra_blocked (runner never started the work -- billing/runner
-    #: outage). 0 disables the timing signal; zero-step-alone still
-    #: classifies.
+    #: Reserved timing threshold. Originally a separate "instant-fail"
+    #: signal for jobs whose ``steps`` array the Actions API omitted (a
+    #: FAILURE concluding within this many seconds of starting). The
+    #: round-2 #1383 review found that gating the missing-``steps`` case
+    #: on this threshold was not behavior-preserving vs. the pre-#1383
+    #: ``is_infrastructure_failure`` (which returned True for a missing
+    #: ``steps`` key unconditionally), so the missing/empty/setup-only
+    #: steps case is now classified by ``is_infra_blocked_check``'s
+    #: zero-step signal regardless of this value. The field is kept (and
+    #: still validated) as a reserved knob so a future timing signal for
+    #: a distinct shape can reuse it without a config migration; it
+    #: currently has no behavioral effect.
     instant_fail_seconds: int = 10
     #: Case-insensitive annotation substrings (matched against each
     #: annotation's ``message``) that indicate an infrastructure/billing

@@ -19232,11 +19232,23 @@ class OrchestratorApp:
                 )
             )
             # Issue #1383: reset the cross-pass infra_blocked window when a
-            # pass observes no infra_blocked PRs -- the fleet-wide infra
-            # condition has cleared, so the consecutive-pass counter starts
-            # fresh next time. Queried by this pass's correlation ID (same
-            # pattern as sink_clears above) so the count is exact for this
-            # pass with no allow-list to drift.
+            # pass reviews at least one PR and finds none infra-blocked --
+            # the fleet-wide infra condition has cleared, so the
+            # consecutive-pass counter starts fresh next time. Queried by
+            # this pass's correlation ID (same pattern as sink_clears
+            # above) so the count is exact for this pass with no
+            # allow-list to drift.
+            #
+            # Round-2 #1383 review: the reset must NOT fire merely because
+            # zero ``check_infra_blocked`` events were emitted -- that is
+            # also true when the pass reviewed no PRs at all (empty queue,
+            # ``limit=0`` with no candidates, ...). Resetting on an
+            # idle pass during a live outage silently clears
+            # ``consecutive_passes``/``last_escalation`` and can prevent
+            # the AC3 persistence escalation from ever firing. Gate on
+            # ``reviews`` (PRs actually reviewed this pass) being
+            # non-empty so the reset means "we looked and the coast was
+            # clear", not "we didn't look".
             infra_blocked_this_pass = len(
                 query_events(
                     self.paths.state_file,
@@ -19244,7 +19256,8 @@ class OrchestratorApp:
                     correlation_id=cid,
                 )
             )
-            if infra_blocked_this_pass == 0:
+            reviewed_this_pass = len(result.data.get("reviews", []))
+            if reviewed_this_pass > 0 and infra_blocked_this_pass == 0:
                 repo_key = str(self.repo_root)
                 window = _infra_blocked_window.get(repo_key)
                 if window is not None and window.get("consecutive_passes", 0) > 0:

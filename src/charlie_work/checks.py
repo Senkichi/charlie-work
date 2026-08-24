@@ -416,13 +416,15 @@ def is_infra_blocked_check(
          case-insensitive substring from ``config.annotation_patterns``. A
          billing annotation is authoritative infrastructure evidence even
          when step data is present, so this wins independently.
-      2. Zero non-setup steps: the job has no steps at all, or only setup
-         bootstrap steps -- the runner never started the actual work
-         (billing lapse / runner never picked up the job).
-      3. Instant-fail with no step data: the Actions API did not expose a
-         ``steps`` array (some check-run shapes omit it) but the job
-         concluded FAILURE within ``config.instant_fail_seconds`` of
-         starting -- corroboration strong enough to classify on its own.
+      2. Zero non-setup steps: the job has no ``steps`` key at all, an
+         empty steps list, or only setup bootstrap steps -- the runner
+         never started the actual work (billing lapse / runner never
+         picked up the job). A missing ``steps`` key is treated as zero
+         steps, restoring the pre-#1383 ``is_infrastructure_failure``
+         behavior for the absent-key shape (round-2 #1383 review).
+
+    ``config.instant_fail_seconds`` is a reserved knob with no current
+    behavioral effect (see its config docstring).
 
     Returns ``False`` for any non-FAILURE conclusion (the function is only
     meaningful for checks already known to have failed). Never raises: a
@@ -448,8 +450,20 @@ def is_infra_blocked_check(
             if any(pattern.lower() in message for pattern in patterns if pattern):
                 return True
 
-    # Signal 2: zero non-setup steps (runner never started the work).
+    # Signal 2: zero non-setup steps (runner never started the work). A
+    # missing ``steps`` key is treated as zero steps -- the Actions API
+    # omits the array for some check-run shapes, and the pre-#1383
+    # ``is_infrastructure_failure`` returned True for that case (a FAILURE
+    # job with no step data never started the work). Restoring that
+    # behavior keeps this classifier behavior-preserving for the
+    # absent-key shape that the prior Signal 3 duration gate alone missed
+    # when timestamps were also absent (issue #1383 round-2 review). The
+    # config docstring's "0 disables the timing signal; zero-step-alone
+    # still classifies" contract is honored: a missing/empty steps array
+    # classifies regardless of ``instant_fail_seconds``.
     steps = job.get("steps")
+    if steps is None:
+        return True
     if isinstance(steps, list):
         non_setup = [
             s
@@ -457,12 +471,6 @@ def is_infra_blocked_check(
             if isinstance(s, dict) and str(s.get("name") or "").lower() not in _SETUP_STEP_NAMES
         ]
         if len(steps) == 0 or len(non_setup) == 0:
-            return True
-
-    # Signal 3: instant-fail when the API exposed no steps array at all.
-    if "steps" not in job and config.instant_fail_seconds > 0:
-        duration = _job_duration_seconds(job)
-        if duration is not None and duration <= config.instant_fail_seconds:
             return True
 
     return False

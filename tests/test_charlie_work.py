@@ -16250,18 +16250,20 @@ def test_infra_blocked_multiple_prs_one_pass_no_premature_escalation(
     assert len(escalated_3) == 1
 
 
-def test_infra_blocked_window_resets_when_pass_observes_zero(tmp_path: Path) -> None:
+def test_infra_blocked_window_resets_when_pass_reviews_clear_prs(tmp_path: Path) -> None:
     """Rework finding: the ``_loop_impl`` branch that resets
-    ``_infra_blocked_window`` when a pass observes zero infra_blocked PRs
-    (the fleet-wide infra condition has cleared). A pass that processes no
-    infra-blocked PRs must zero the consecutive-pass counter so the next
-    outage starts fresh, rather than carrying stale persistence forward.
+    ``_infra_blocked_window`` when a pass reviews PRs and finds none
+    infra-blocked (the fleet-wide infra condition has cleared). A pass
+    that reviews at least one clear PR must zero the consecutive-pass
+    counter so the next outage starts fresh, rather than carrying stale
+    persistence forward.
 
-    ``loop(limit=0)`` runs a full pass (intake, dispatch, reviews, the
-    post-pass reset sweep) but processes zero PRs, so no
-    ``check_infra_blocked`` events are emitted for this pass's
-    correlation_id -- exactly the ``infra_blocked_this_pass == 0`` condition
-    that triggers the reset.
+    ``FakeGitHub()`` ships a janitor-green PR 456 with passing required
+    checks, so ``loop(limit=0)`` runs a full pass (intake, dispatch, the
+    review lane, the post-pass reset sweep) that actually reviews PR 456
+    and emits no ``check_infra_blocked`` events for this pass's
+    correlation_id -- exactly the "we looked and the coast was clear"
+    condition that triggers the reset.
     """
     from charlie_work.workflow import _infra_blocked_window
 
@@ -16278,13 +16280,58 @@ def test_infra_blocked_window_resets_when_pass_observes_zero(tmp_path: Path) -> 
         "last_pass_cid": "stale-cid-from-prior-pass",
     }
 
-    app.loop(limit=0)
+    result = app.loop(limit=0)
 
-    # The pass observed zero infra_blocked PRs -> the window was reset.
+    # The pass reviewed PR 456 (green) and found no infra-blocked PRs -> the
+    # window was reset.
+    assert len(result.data["reviews"]) >= 1
     window = _infra_blocked_window[repo_key]
     assert window["consecutive_passes"] == 0
     assert window["last_escalation"] is None
     assert window["last_pass_cid"] is None
+
+
+def test_infra_blocked_window_not_reset_when_pass_reviews_zero_prs(tmp_path: Path) -> None:
+    """Round-2 #1383 regression: a pass that reviews ZERO PRs during a live
+    outage must NOT reset ``_infra_blocked_window``. The prior reset logic
+    conflated "zero ``check_infra_blocked`` events emitted" with "we looked
+    and the coast was clear" -- but a pass that reviews nothing also emits
+    zero such events, so an idle pass during a live outage silently cleared
+    ``consecutive_passes``/``last_escalation`` and could prevent the AC3
+    persistence escalation from ever firing.
+
+    Distinct from ``test_infra_blocked_window_resets_when_pass_reviews_clear_prs``
+    (which reviews a green PR and DOES reset): here the PR/issue queue is
+    empty so the review lane runs over zero PRs.
+    """
+    from charlie_work.workflow import _infra_blocked_window
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Empty queue: no PRs and no issues, so the review lane reviews nothing.
+    fake_gh.prs = []
+    fake_gh.issues = []
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pre-populate the window as if prior passes observed infra-blocked PRs
+    # (a live outage is in progress).
+    repo_key = str(tmp_path)
+    prior_last_esc = datetime.now(UTC)
+    _infra_blocked_window[repo_key] = {
+        "consecutive_passes": 2,
+        "last_escalation": prior_last_esc,
+        "last_pass_cid": "stale-cid-from-prior-pass",
+    }
+
+    result = app.loop(limit=0)
+
+    # The pass reviewed zero PRs -> the window must be preserved, not reset.
+    assert len(result.data["reviews"]) == 0
+    window = _infra_blocked_window[repo_key]
+    assert window["consecutive_passes"] == 2
+    assert window["last_escalation"] == prior_last_esc
+    assert window["last_pass_cid"] == "stale-cid-from-prior-pass"
 
 
 def test_infra_blocked_check_infra_blocked_event_emitted(tmp_path: Path) -> None:
