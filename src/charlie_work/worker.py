@@ -780,6 +780,12 @@ def classify_worker_health(
     # attempts after the suspension message) and kill the worker immediately
     # so the session ends within one supervision pass. Terminal like Signal 2
     # — overrides a fresh probe.
+    #
+    # The match is structurally anchored (``_provider_suspension_in_tail``):
+    # the billing phrase must co-occur on the same log line with an HTTP 402
+    # status or a CLI ``Error:``/``API Error:`` prefix, so a live worker that
+    # merely quotes or reviews the trigger phrase in prose/code is NOT killed
+    # (PR #1426 round-2 review).
     has_provider_suspension = False
     try:
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
@@ -791,10 +797,10 @@ def classify_worker_health(
                     has_terminal_error = True
                     break
         if view.adapter_kind == "api":
-            from .claude_code import _PROVIDER_SUSPENDED_PATTERN
+            from .claude_code import _provider_suspension_in_tail
 
             tail = log_text[-2048:] if len(log_text) > 2048 else log_text
-            if _PROVIDER_SUSPENDED_PATTERN.search(tail):
+            if _provider_suspension_in_tail(tail):
                 has_provider_suspension = True
     except OSError:
         pass

@@ -103,24 +103,32 @@ _PROVIDER_AUTH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Pattern for provider account suspension / insufficient-balance responses
-# (issue #1342). Matched against the log tail of api-kind sessions only — a
-# suspended provider account (e.g. Moonshot "suspended due to insufficient
-# balance, please recharge your account") is a TERMINAL billing failure that
-# will not self-heal in minutes, so it must NOT enter the rate-limit backoff
-# loop. It is classified as ``provider_suspended`` with NO cooldown (terminal),
-# and ``provider_suspended`` sits in
-# ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` so the issue escalates to
-# an operator on the first occurrence instead of burning the redispatch cap.
+# Provider account suspension / insufficient-balance responses (issue #1342).
+# Matched against the log tail of api-kind sessions only — a suspended provider
+# account (e.g. Moonshot "Error: suspended due to insufficient balance, please
+# recharge your account") is a TERMINAL billing failure that will not self-heal
+# in minutes, so it must NOT enter the rate-limit backoff loop. It is classified
+# as ``provider_suspended`` with NO cooldown (terminal), and
+# ``provider_suspended`` sits in ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS``
+# so the issue escalates to an operator on the first occurrence instead of
+# burning the redispatch cap.
 #
-# Matched by response semantics (HTTP status + error code/message the provider
-# documents), not a brittle full-string comparison: the canonical billing-
-# suspension signals across Anthropic-compatible providers are
-# "insufficient balance/funds/credit", "account (is) suspended" (with billing
-# context), and "recharge your account". These are distinct from the
-# provider-auth pattern (401/403/invalid-key — a credential problem) and the
-# quota-exhaustion pattern ("usage limit" — a usage-ceiling problem).
-_PROVIDER_SUSPENDED_PATTERN = re.compile(
+# Structural anchor (PR #1426 round-2 review): the billing phrase alone is NOT
+# enough — it must co-occur on the SAME log line with a structural API-error
+# signal, enforced by ``_provider_suspension_in_tail``. The anchor is either an
+# HTTP 402 (Payment Required) status code (word-boundary, like the 401/403 auth
+# pattern) or a CLI error-rendering line prefix (``Error:`` / ``API Error:``).
+# Without this anchor the phrase regex matches the suspension trigger when it
+# appears only as quoted or reviewed prose — e.g. a worker reviewing this very
+# fix whose log contains the trigger phrase inside a code string or prose
+# sentence — and Signal 2.5 in ``classify_worker_health`` then kills that live
+# worker as DEAD (self-inflicted). The anchor cannot be a bare prose phrase:
+# 402 is a numeric token that does not appear in prose about the suspension, and
+# ``Error:``/``API Error:`` is the CLI's structured error-rendering marker, not a
+# mid-sentence quote. This is distinct from the provider-auth pattern
+# (401/403/invalid-key — a credential problem) and the quota-exhaustion pattern
+# ("usage limit" — a usage-ceiling problem).
+_PROVIDER_SUSPENDED_PHRASE = re.compile(
     r"insufficient\s+(?:balance|funds|credit)"
     r"|account\s+(?:is\s+)?suspended"
     r"|suspended\s+due\s+to\s+(?:insufficient\s+balance|billing|payment|unpaid)"
@@ -128,6 +136,39 @@ _PROVIDER_SUSPENDED_PATTERN = re.compile(
     r"|please\s+recharge",
     re.IGNORECASE,
 )
+# The structural API-error signal that must co-occur on the same log line as a
+# billing phrase (see ``_provider_suspension_in_tail``). The ``Error:`` /
+# ``API Error:`` prefix is anchored to the START of the line (after optional
+# whitespace) because that is the CLI's error-rendering marker — a code string
+# or prose sentence that merely quotes ``Error: suspended ...`` (e.g. a worker
+# catting this PR's own test fixtures) does not start with ``Error:`` and so is
+# not treated as a real API error. HTTP 402 (Payment Required) is matched
+# word-boundary anywhere on the line, mirroring the 401/403 auth pattern.
+_PROVIDER_SUSPENDED_ANCHOR = re.compile(
+    r"^\s*(?:api\s+)?error\s*:|\b402\b",
+    re.IGNORECASE,
+)
+
+
+def _provider_suspension_in_tail(tail: str) -> bool:
+    """Return True if the log tail contains a structurally-anchored provider
+    account-suspension signature (issue #1342).
+
+    The billing phrase (``_PROVIDER_SUSPENDED_PHRASE``) must co-occur on the
+    SAME log line with a structural API-error signal
+    (``_PROVIDER_SUSPENDED_ANCHOR`` — HTTP 402 or a CLI ``Error:``/``API
+    Error:`` prefix). The phrase alone is not enough: a worker that merely
+    quotes or reviews the suspension trigger (e.g. a session reviewing this
+    very fix) would otherwise be misclassified — and, in
+    ``classify_worker_health``'s Signal 2.5, killed as DEAD mid-session.
+    Requiring the anchor on the same line makes the phrase's surrounding
+    prose/code context a non-match.
+    """
+    for line in tail.splitlines():
+        if _PROVIDER_SUSPENDED_PHRASE.search(line) and _PROVIDER_SUSPENDED_ANCHOR.search(line):
+            return True
+    return False
+
 
 # Default cooldown durations when we can't parse a specific reset time
 _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
@@ -597,7 +638,7 @@ def _classify_session_failure(
     # billing failure: it returns ``provider_suspended`` with NO cooldown
     # (the account will not self-heal) and escalates to an operator on the
     # first occurrence via ``DETERMINISTIC_ESCALATION_FAILURE_KINDS``.
-    if adapter_kind == "api" and _PROVIDER_SUSPENDED_PATTERN.search(tail):
+    if adapter_kind == "api" and _provider_suspension_in_tail(tail):
         return "provider_suspended", None
 
     # Provider-auth classification (api only, issue #484). Checked before

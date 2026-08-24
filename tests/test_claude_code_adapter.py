@@ -4187,7 +4187,7 @@ def test_classify_session_failure_provider_suspended_takes_precedence_over_throt
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
         "Error: rate limit exceeded.\n"
-        "suspended due to insufficient balance, please recharge your account.\n",
+        "Error: suspended due to insufficient balance, please recharge your account.\n",
         encoding="utf-8",
     )
 
@@ -4214,3 +4214,62 @@ def test_classify_session_failure_genuine_429_keeps_rate_limited(tmp_path: Path)
 
     assert failure_kind == "rate_limited"
     assert throttled_until is not None
+
+
+def test_classify_session_failure_provider_suspended_quoted_prose_not_matched(
+    tmp_path: Path,
+) -> None:
+    """PR #1426 round-2 review: the suspension phrase appearing only as
+    quoted/reviewed prose (not the session's actual terminal error) must NOT
+    classify as ``provider_suspended``. The structural anchor requires the
+    billing phrase to co-occur on the same log line with an HTTP 402 status or
+    a CLI ``Error:``/``API Error:`` line prefix; prose/code that merely quotes
+    the trigger phrase does not start with ``Error:`` and so is not treated as
+    a real API error. This is the self-inflicted-misclassification guard: a
+    worker reviewing this very fix must not be classified as suspended."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    # The session's actual terminal error is a normal test failure; the
+    # suspension trigger appears only inside a code-string quote and a prose
+    # sentence — neither line starts with ``Error:`` nor carries a 402.
+    log_path.write_text(
+        "Reviewing PR #1426...\n"
+        '    log_path.write_text("Error: suspended due to insufficient '
+        'balance, please recharge your account")\n'
+        "The regex matches `suspended due to insufficient balance` and "
+        "`recharge your account` phrases.\n"
+        "Ran tests.\n"
+        "Error: test failed: assertion error in test_worker.py\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    # Not provider_suspended — the quoted/prose lines have no structural
+    # anchor on the same line, and the real terminal error is a test failure
+    # (no billing phrase on that line either).
+    assert failure_kind is None
+    assert throttled_until is None
+
+
+def test_classify_session_failure_provider_suspended_402_status_anchor(
+    tmp_path: Path,
+) -> None:
+    """PR #1426 round-2 review: an HTTP 402 (Payment Required) status on the
+    same line as a billing phrase is a valid structural anchor — the canonical
+    billing-suspension status code, distinct from any prose phrase."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Working...\n"
+        "Request failed: 402 Payment Required - insufficient balance, please "
+        "recharge your account.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_suspended"
+    assert throttled_until is None

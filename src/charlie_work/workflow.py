@@ -4688,29 +4688,6 @@ def _classify_dead_sessions_and_update_throttle_state(
                     )
                     write_gate.save_state(state)
 
-            # Issue #1342: emit the distinct suspension event for a launch
-            # failure too (e.g. the provider endpoint returned suspension on
-            # the first probe). Same once-per-episode reasoning as the dead-
-            # session branch below — the sidecar is reaped below and the
-            # deterministic-escalation block just after escalates immediately.
-            if w.adapter_kind == "api" and failure_kind == "provider_suspended":
-                with state_lock(state_file):
-                    state = load_state(state_file)
-                    state = write_gate.append_event(
-                        state,
-                        "api_worker_provider_suspended",
-                        {
-                            "issue_number": w.issue_number,
-                            "pid": w.pid,
-                            "process_start_time": w.process_start_time,
-                            "provider": w.provider,
-                            "failure_kind": failure_kind,
-                            "launch_failure": True,
-                        },
-                        level="error",
-                    )
-                    write_gate.save_state(state)
-
             if (
                 failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
                 and w.issue_number not in open_prs_by_issue
