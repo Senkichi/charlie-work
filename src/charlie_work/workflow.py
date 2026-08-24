@@ -5780,6 +5780,32 @@ def _is_rerun_already_running_error(error: str) -> bool:
     return "already running" in error.lower()
 
 
+def _has_other_open_pr(
+    state: dict[str, Any], issue_number: int | None, exclude_pr_number: int | None
+) -> bool:
+    """Return True if any PR for ``issue_number`` is open besides ``exclude_pr_number``.
+
+    Used by ``unescalate`` to decide whether a terminal PR on GitHub is the
+    *only* PR for the issue (issue #1391): when it is, the issue can be
+    dropped to baseline in the same call instead of requiring a second
+    ``unescalate --issue N`` to take the no-live-PR path. "Open" here means
+    the state.json status is not ``merged`` or ``closed`` — the same
+    predicate the PR resolution at the top of ``unescalate`` uses.
+    """
+    if issue_number is None:
+        return False
+    for k, v in state.get("prs", {}).items():
+        if not isinstance(v, dict) or not k.isdigit():
+            continue
+        if v.get("issue_number") != issue_number:
+            continue
+        if exclude_pr_number is not None and int(k) == exclude_pr_number:
+            continue
+        if v.get("status") not in ("merged", "closed"):
+            return True
+    return False
+
+
 class OrchestratorApp:
     def __init__(
         self,
@@ -14084,9 +14110,19 @@ class OrchestratorApp:
                 issue_status_action = "passive"
                 label_edge = "unescalated_pr_open"
             elif live_pr_state in ("MERGED", "CLOSED"):
-                # Terminal PR: leave issue status to finalization/reconcile,
-                # which own the closed-issue bookkeeping.
-                label_edge = None
+                # Terminal PR on GitHub. If the issue is still escalated and
+                # no other open PR references it, drop the issue to baseline
+                # in the same call — reconcile deliberately never rewrites an
+                # open escalated issue's status (D-2), so leaving it would
+                # require a second identical ``unescalate --issue N`` call to
+                # take the no-live-PR path (issue #1391). When another open PR
+                # exists, or the issue is not stuck, leave the issue to
+                # finalization/reconcile as before.
+                if issue_stuck and not _has_other_open_pr(state, issue_number, pr_number):
+                    issue_status_action = "drop"
+                    label_edge = "unescalated_requeued"
+                else:
+                    label_edge = None
             elif issue_stuck:
                 # No live PR at all — back to the never-dispatched baseline
                 # (a status literal no dispatch selector reads would just
