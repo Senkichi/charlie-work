@@ -4111,3 +4111,165 @@ def test_classify_session_failure_provider_auth_word_boundary_still_matches(
             f"real auth tail no longer matched for tail: {tail!r}"
         )
         assert throttled_until is not None
+
+
+def test_classify_session_failure_provider_suspended_insufficient_balance(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342: a provider account-suspension / insufficient-balance response
+    classifies as ``provider_suspended`` (terminal) for api sessions, not as a
+    transient rate-limit."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    # Verbatim Moonshot suspension message observed 2026-08-18 (issue #1342).
+    log_path.write_text(
+        "Working...\n"
+        "Error: suspended due to insufficient balance, please recharge your "
+        "account or check your plan and billing details.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_suspended"
+    # Terminal failure: no cooldown window (it will not self-heal).
+    assert throttled_until is None
+
+
+def test_classify_session_failure_provider_suspended_account_suspended(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342: a generic ``account suspended`` billing message also
+    classifies as ``provider_suspended`` (matched by semantics, not full-string)."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Error: Your account is suspended. Please update your billing details.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_suspended"
+    assert throttled_until is None
+
+
+def test_classify_session_failure_provider_suspended_not_for_claude_code(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342: suspension classification is api-only (mirrors provider_auth)
+    — a claude-code session with the same message is not classified."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Error: suspended due to insufficient balance, please recharge.\n",
+        encoding="utf-8",
+    )
+
+    # Default adapter_kind="claude-code" — suspension patterns are not checked.
+    failure_kind, throttled_until = _classify_session_failure(log_path)
+
+    assert failure_kind is None
+    assert throttled_until is None
+
+
+def test_classify_session_failure_provider_suspended_takes_precedence_over_throttle(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342: a suspension signature must win over a coincidental
+    rate-limit phrase in the same tail, so the session is not retried as a
+    transient throttle."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Error: rate limit exceeded.\n"
+        "Error: suspended due to insufficient balance, please recharge your account.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_suspended"
+    assert throttled_until is None
+
+
+def test_classify_session_failure_genuine_429_keeps_rate_limited(tmp_path: Path) -> None:
+    """Issue #1342 acceptance criterion 4: a genuine transient 429 rate-limit
+    keeps the existing ``rate_limited`` backoff behavior (no suspension match)."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Working...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
+
+
+def test_classify_session_failure_provider_suspended_quoted_prose_not_matched(
+    tmp_path: Path,
+) -> None:
+    """PR #1426 round-2 review: the suspension phrase appearing only as
+    quoted/reviewed prose (not the session's actual terminal error) must NOT
+    classify as ``provider_suspended``. The structural anchor requires the
+    billing phrase to co-occur on the same log line with an HTTP 402 status or
+    a CLI ``Error:``/``API Error:`` line prefix; prose/code that merely quotes
+    the trigger phrase does not start with ``Error:`` and so is not treated as
+    a real API error. This is the self-inflicted-misclassification guard: a
+    worker reviewing this very fix must not be classified as suspended."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    # The session's actual terminal error is a normal test failure; the
+    # suspension trigger appears only inside a code-string quote and a prose
+    # sentence — neither line starts with ``Error:`` nor carries a 402.
+    log_path.write_text(
+        "Reviewing PR #1426...\n"
+        '    log_path.write_text("Error: suspended due to insufficient '
+        'balance, please recharge your account")\n'
+        "The regex matches `suspended due to insufficient balance` and "
+        "`recharge your account` phrases.\n"
+        "Ran tests.\n"
+        "Error: test failed: assertion error in test_worker.py\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    # Not provider_suspended — the quoted/prose lines have no structural
+    # anchor on the same line, and the real terminal error is a test failure
+    # (no billing phrase on that line either).
+    assert failure_kind is None
+    assert throttled_until is None
+
+
+def test_classify_session_failure_provider_suspended_402_status_anchor(
+    tmp_path: Path,
+) -> None:
+    """PR #1426 round-2 review: an HTTP 402 (Payment Required) status on the
+    same line as a billing phrase is a valid structural anchor — the canonical
+    billing-suspension status code, distinct from any prose phrase."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Working...\n"
+        "Request failed: 402 Payment Required - insufficient balance, please "
+        "recharge your account.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_suspended"
+    assert throttled_until is None
