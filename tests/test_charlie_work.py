@@ -23477,6 +23477,101 @@ def test_refresh_pr_decision_cache_skips_pr_not_yet_in_state(tmp_path: Path) -> 
     assert "999" not in state["prs"]
 
 
+def test_loop_pass_refreshes_pr_decision_cache_to_file_value(tmp_path: Path) -> None:
+    """Issue #1386: pin the _refresh_pr_decision_cache CALL SITE in loop()'s
+    per-PR dispatch block.
+
+    The three behavioral tests above cover the method itself (updates a
+    disagreeing tracked PR, no-ops when the cache agrees, skips untracked
+    PRs), but none of them exercise the call site -- deleting the
+    ``self._refresh_pr_decision_cache(...)`` invocation from ``loop()``'s
+    dispatch block would leave the whole suite green. This test closes that
+    gap: it seeds a tracked PR whose state-side decision disagrees with its
+    flat ``review-decision.json`` (the #1340 divergence shape: state lags a
+    concurrent void/record_review), runs one ``loop()`` pass, and asserts
+    ``state["prs"][N]`` was reconciled to the file value.
+
+    The test runs in live (non-dry-run) mode. Dry-run would seem isolating
+    but is not: ``_refresh_pr_decision_cache`` writes through
+    ``self.write_gate.save_state``, which is a no-op under dry-run (the
+    WriteGate's strict "zero writes under dry-run" invariant), so the
+    refresh's disk write is invisible there. In live mode the merge success
+    path (``merge_ready``) DOES write state, but it carries forward the
+    existing decision cache fields via ``**state["prs"].get(...)``
+    (workflow.py merge_success block) -- it does NOT re-derive
+    ``decision``/``reviewed_head_sha``/``decision_path`` from the file. So
+    the final state's cache fields are exactly what the refresh wrote: the
+    file value if the refresh ran, the stale seed value if it did not.
+    Deleting the call site leaves the seeded divergence unreconciled and
+    this test fails.
+    """
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubListingPRs(FakeGitHub):
+        """loop()'s reconcile pass (merge-lane-recovery §6-B) queries
+        gh.run(["pr", "list", ...]); the base fake's generic run() fallback
+        returns [] regardless of self.prs, which misreports PR 456 as
+        missing on GitHub. Reflect self.prs so the reconcile pass sees the
+        same PR the rest of this fake knows about. Same override as
+        test_loop_skips_review_for_approved_unmerged_pr."""
+
+        def run(self, args, *, json_output=False, allow_failure=False):
+            if args[:2] == ["pr", "list"]:
+                return list(self.prs) if json_output else ""
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    fake_gh = FakeGitHubListingPRs()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Seed a tracked PR whose state-side decision DISAGREES with the file
+    # (the #1340 divergence shape: state says "pending" at a stale head while
+    # the file has already been reset to "approved" at the live head).
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {
+        "number": 456,
+        "issue_number": 123,
+        "status": "reviewing",
+        "decision": "pending",
+        "reviewed_head_sha": "stale-sha",
+        "decision_path": "stale-path",
+    }
+    save_state(paths.state_file, state)
+
+    # The flat file is authoritative: it says "approved" at the live head
+    # (sha-abc123, matching FakeGitHub's default PR head). The file's
+    # reviewed_head_sha matches the live head so the already_approved /
+    # head_matches gates fire and merge_ready's merge-success path runs --
+    # which carries forward the existing cache fields rather than
+    # re-deriving them, isolating the refresh as the sole reconciler.
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    decision_path = decision_dir / "review-decision.json"
+    decision_path.write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    result = app.loop(limit=0)
+
+    # The merge must have run (confirms the per-PR dispatch block reached
+    # merge_ready, which is downstream of the refresh call site).
+    assert len(result.data["merges"]) == 1
+    assert result.data["merges"][0]["merged"] is True
+
+    refreshed = load_state(paths.state_file)["prs"]["456"]
+    # The three cache fields must be reconciled to the file value by the
+    # refresh -- merge_ready's carry-forward preserves whatever the refresh
+    # wrote, so these fail if the refresh call site is deleted.
+    assert refreshed["decision"] == "approved"
+    assert refreshed["reviewed_head_sha"] == "sha-abc123"
+    assert refreshed["decision_path"] == str(decision_path)
+    # Non-decision fields survive: issue_number is carried forward by both
+    # the refresh and merge_ready's spread. (status becomes "merged" after
+    # the merge, which is expected and not a cache field.)
+    assert refreshed["issue_number"] == 123
+
+
 def test_merge_ready_reads_escalated_from_persisted_decision(tmp_path: Path) -> None:
     """Issue #407: merge_ready (via _review_decision and merge-train
     eligibility) must see the escalated flag from the persisted decision file.
