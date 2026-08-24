@@ -854,9 +854,13 @@ _RATCHET_BASELINE: dict[str, int] = {
     # candidate-filtering safety net, and stranded .json.tmp cleanup). These
     # are out-of-wave raw sites in unconverted territory, same class as the
     # pre-existing 270 — the ratchet holds at the new count.
-    # Combined baseline after merging #1131 (+2) and #1393 (+11) onto the
-    # pre-existing 270: 283.
-    "workflow.py": 283,
+    # Issue #1314: +2 raw calls for the operator-queue depth gauge
+    # (_maybe_emit_operator_queue_depth: one save_state + one _record_event
+    # -> append_event). Same out-of-wave raw-site class as the pre-existing
+    # 281 — the ratchet holds at the new count.
+    # Combined baseline after merging #1131 (+2), #1393 (+11), and #1314 (+2)
+    # onto the pre-existing 270: 285.
+    "workflow.py": 285,
     # Issue #1423: +2 raw primitives in _reap_idle_foreign_writer (log_event
     # for the foreign_writer_reaped instrumentation event, and kill_orphan_pid
     # for sweeping the reaped writer's orphan processes). This is a standalone

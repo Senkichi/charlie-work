@@ -47,6 +47,17 @@ EXPECTED_OPERATIONAL_KINDS: frozenset[str] = frozenset(
         "dispatch_stale",
         "runner_capacity_starved",
         "draft_pr_ready_held",
+        # Issue #1314 item 3: the operator-queue depth gauge fires every pass
+        # the gauge is due when the queue is chronically deep (depth exceeds
+        # ``operator_queue_depth_threshold``). That is exactly the
+        # high-volume-relative-to-genuinely-rare-warnings shape this bucket
+        # exists for: a fleet with a stuck queue emits this on every pass,
+        # and interleaving it flat with rare warnings would drown them out.
+        # The consumer (``heartbeat_check.py``'s ``check_warning_events``)
+        # already buckets every member of this set into a summarized count,
+        # so adding the kind here IS the consumer wiring the
+        # signal-without-a-consumer rule requires to land in the same PR.
+        "operator_queue_depth",
     }
 )
 
