@@ -70,7 +70,13 @@ def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, 
 
 
 DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"worker_blocked", "worktree_unsafe", "rework_branch_conflict", "cross_repo_hop"}
+    {
+        "worker_blocked",
+        "worktree_unsafe",
+        "rework_branch_conflict",
+        "cross_repo_hop",
+        "provider_suspended",
+    }
 )
 # Deliberately excluded: "worktree_probe_failed" (see worktree.WorktreeProbeFailedError).
 # A failed safety probe (e.g. git status --porcelain hitting an index lock) is
@@ -84,6 +90,15 @@ DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
 # and exits with zero artifacts in the dispatching repo.  Escalate on the
 # first occurrence so a human can file/transfer a mirror into the target
 # repo's tracker, exactly as was done by hand for #709.
+#
+# "provider_suspended" (issue #1342): a provider account suspension /
+# insufficient-balance response (e.g. Moonshot "suspended due to insufficient
+# balance").  The Claude Code CLI retries it as a transient rate-limit, so
+# without this classification the orchestrator burns the full auto-redispatch
+# cap (~35 min, 4 sessions) on a deterministic external billing failure before
+# the operator hears about it.  Escalate on the first occurrence so the
+# operator learns about a billing problem in minutes, and the issue's own
+# dispatch history is not polluted by a provider outage.
 
 # Issue #1393: pre-launch environment blocks — failure kinds that happen
 # BEFORE a worker session PID exists (the worker process never started).

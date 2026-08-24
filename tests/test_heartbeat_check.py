@@ -830,6 +830,218 @@ def test_check_dispatch_coverage_anomaly_possibly_spurious_when_degraded(
 
 
 # ---------------------------------------------------------------------------
+# check_dispatch_coverage drain-at-cap (issue #1424)
+# ---------------------------------------------------------------------------
+
+
+def _write_dispatch_event(
+    state_dir: Path,
+    *,
+    concurrency_governor: dict[str, Any],
+    deferred_by_concurrency_count: int = 0,
+    ts: str | None = None,
+) -> Path:
+    """Seed a ``dispatch`` event row in ``state_dir/events.db``.
+
+    Mirrors the payload shape ``workflow.py``'s dispatch path writes: a
+    top-level ``concurrency_governor`` sub-dict (with ``dispatch_limit``,
+    ``fleet_concurrency_limit`` / ``fleet_live_session_count`` when the fleet
+    governor is enabled) and a sibling ``deferred_by_concurrency_count``.
+    Uses the production ``events`` schema by hand rather than importing
+    ``charlie_work.instrumentation``, matching ``_write_events_db``.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = state_dir / "events.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts              TEXT    NOT NULL,
+                kind            TEXT    NOT NULL,
+                payload         TEXT    NOT NULL,
+                repo            TEXT,
+                correlation_id  TEXT,
+                pr_number       INTEGER,
+                issue_number    INTEGER,
+                level           TEXT DEFAULT 'info'
+            )
+            """
+        )
+        payload = json.dumps(
+            {
+                "concurrency_governor": concurrency_governor,
+                "deferred_by_concurrency_count": deferred_by_concurrency_count,
+            }
+        )
+        conn.execute(
+            "INSERT INTO events (ts, kind, payload, level) VALUES (?, 'dispatch', ?, 'info')",
+            (ts or _iso(1), payload),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def test_check_dispatch_coverage_drain_note_when_fleet_at_cap(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1424: fleet-wide cap saturated -> drain note, not anomaly.
+
+    The repo is at 2/5 in-progress (below its per-repo cap of 5), but the
+    fleet governor shows fleet_live=5/fleet_cap=5 -- the sibling repo holds
+    the other slots. The old per-repo denominator read this as a dispatch
+    failure; the governor-based condition recognises it as designed drain.
+    """
+    repo = _make_repo(hb, tmp_path)
+    repo.config_path.write_text("dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8")
+    issues = [
+        {"number": 1401, "labels": [], "updatedAt": _iso(1)},
+        {"number": 1402, "labels": [], "updatedAt": _iso(1)},
+    ]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    _write_dispatch_event(
+        repo.state_dir,
+        concurrency_governor={
+            "clamped": True,
+            "dispatch_limit": 0,
+            "concurrency_limit": 5,
+            "live_session_count": 2,
+            "available_slots": 3,
+            "fleet_concurrency_limit": 5,
+            "fleet_live_session_count": 5,
+        },
+        deferred_by_concurrency_count=4,
+    )
+    prev = {"dispatchable_issues": [1401, 1402]}
+    new: dict[str, Any] = {}
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report, repo, prev, new, skip_delta=False, blocked_numbers=None, blocked_err=""
+    )
+    assert not report.anomaly
+    line = report.lines[0]
+    assert "draining at cap" in line
+    assert "fleet_live=5/fleet_cap=5" in line
+    assert "dispatchable across 2 consecutive beats" not in line
+
+
+def test_check_dispatch_coverage_anomaly_when_governor_has_free_slots(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1424: governor shows free slots and issues persist -> anomaly.
+
+    The fleet has room (fleet_live=3/fleet_cap=5) and the last dispatch had
+    dispatch_limit=5 with zero deferrals -- there was capacity but the issues
+    were not picked up. This is the #1398 head-of-line case, which is real.
+    """
+    repo = _make_repo(hb, tmp_path)
+    repo.config_path.write_text("dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8")
+    issues = [
+        {"number": 1398, "labels": [], "updatedAt": _iso(1)},
+    ]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    _write_dispatch_event(
+        repo.state_dir,
+        concurrency_governor={
+            "clamped": False,
+            "dispatch_limit": 5,
+            "concurrency_limit": 5,
+            "live_session_count": 2,
+            "available_slots": 3,
+            "fleet_concurrency_limit": 5,
+            "fleet_live_session_count": 3,
+        },
+        deferred_by_concurrency_count=0,
+    )
+    prev = {"dispatchable_issues": [1398]}
+    new: dict[str, Any] = {}
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report, repo, prev, new, skip_delta=False, blocked_numbers=None, blocked_err=""
+    )
+    assert report.anomaly
+    assert "dispatchable across 2 consecutive beats" in report.lines[0]
+    assert "draining at cap" not in report.lines[0]
+
+
+def test_check_dispatch_coverage_drain_note_when_dispatch_limit_at_deferred(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1424: dispatch_limit <= deferred_by_concurrency_count -> drain note.
+
+    The fleet governor is not enabled (no fleet_concurrency_limit in the
+    payload), but the effective dispatch_limit was 1 with 4 deferred issues
+    -- the backlog exceeds the per-pass dispatch rate, so the backlog is
+    draining at the allowed rate.
+    """
+    repo = _make_repo(hb, tmp_path)
+    repo.config_path.write_text("dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8")
+    issues = [
+        {"number": 1401, "labels": [], "updatedAt": _iso(1)},
+        {"number": 1402, "labels": [], "updatedAt": _iso(1)},
+    ]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    _write_dispatch_event(
+        repo.state_dir,
+        concurrency_governor={
+            "clamped": True,
+            "dispatch_limit": 1,
+            "concurrency_limit": 5,
+            "live_session_count": 4,
+            "available_slots": 1,
+        },
+        deferred_by_concurrency_count=4,
+    )
+    prev = {"dispatchable_issues": [1401, 1402]}
+    new: dict[str, Any] = {}
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report, repo, prev, new, skip_delta=False, blocked_numbers=None, blocked_err=""
+    )
+    assert not report.anomaly
+    line = report.lines[0]
+    assert "draining at cap" in line
+    assert "dispatch_limit=1" in line
+    assert "dispatchable across 2 consecutive beats" not in line
+
+
+def test_check_dispatch_coverage_fallback_per_repo_cap_when_no_events_db(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1424: no events.db -> fall back to the per-repo cap check.
+
+    A fresh install with no dispatch events yet cannot provide governor data.
+    The existing per-repo cap drain condition is preserved as a conservative
+    fallback so the check does not regress on repos without instrumentation.
+    """
+    repo = _make_repo(hb, tmp_path)
+    repo.config_path.write_text("dispatch:\n  max_concurrent_sessions: 3\n", encoding="utf-8")
+    # 3 in-progress issues fill the per-repo cap; 2 dispatchable persist.
+    issues = [
+        {"number": 10, "labels": [{"name": "agent:in-progress"}], "updatedAt": _iso(1)},
+        {"number": 11, "labels": [{"name": "agent:in-progress"}], "updatedAt": _iso(1)},
+        {"number": 12, "labels": [{"name": "agent:in-progress"}], "updatedAt": _iso(1)},
+        {"number": 20, "labels": [], "updatedAt": _iso(1)},
+        {"number": 21, "labels": [], "updatedAt": _iso(1)},
+    ]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    # No events.db written -- _last_dispatch_drain_signal returns None.
+    prev = {"dispatchable_issues": [20, 21]}
+    new: dict[str, Any] = {}
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report, repo, prev, new, skip_delta=False, blocked_numbers=None, blocked_err=""
+    )
+    assert not report.anomaly
+    line = report.lines[0]
+    assert "draining at cap" in line
+    assert "in_progress=3/cap=3" in line
+
+
+# ---------------------------------------------------------------------------
 # check_armable_backlog (issue #armable-backlog, added 2026-08-23)
 # ---------------------------------------------------------------------------
 

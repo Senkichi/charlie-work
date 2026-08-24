@@ -2014,3 +2014,13 @@ def test_load_config_infra_blocked_enabled_rejects_non_bool(tmp_path: Path) -> N
     )
     with pytest.raises(ConfigError, match="infra_blocked.enabled.*must be a bool"):
         load_config(config_file)
+
+
+def test_provider_suspended_is_deterministic_escalation_failure_kind() -> None:
+    """Issue #1342: ``provider_suspended`` must sit in
+    DETERMINISTIC_ESCALATION_FAILURE_KINDS so a suspended provider account
+    escalates to an operator on the first occurrence instead of burning the
+    auto-redispatch cap on a deterministic external billing failure."""
+    from charlie_work.config import DETERMINISTIC_ESCALATION_FAILURE_KINDS
+
+    assert "provider_suspended" in DETERMINISTIC_ESCALATION_FAILURE_KINDS

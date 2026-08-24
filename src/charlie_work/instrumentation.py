@@ -149,6 +149,10 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # -----------------------------------------------------------------
         # error-level kinds: conditions that ended a lane or lost work
         # -----------------------------------------------------------------
+        # Issue #1342: a provider account suspension is a terminal billing
+        # failure — the operator must learn about it in minutes, not after the
+        # redispatch cap drains. Error, like the other *_escalated kinds.
+        "api_worker_provider_suspended": "error",
         "cross_family_verdict_abandoned": "error",
         # The head-SHA guard could not adjudicate, so no verdict is recorded on
         # this pass. Since #1081 an unusable report is regenerated (bounded per
