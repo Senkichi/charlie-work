@@ -40,6 +40,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .config import LAUNCHER_OWNED_DIRS
 from .safe_path import contains
 
 # A file extension: 1-10 word characters after a dot.  Bounds the length so
@@ -96,6 +97,16 @@ _DOMAIN_PATH = r"\b(?:[\w-]+\.)+[a-zA-Z]{2,24}/[^\s|`)\]]*"
 #     unknown number.
 _PLACEHOLDER_SEGMENT = re.compile(r"^(?:[A-Za-z]+-N|.*[<>].*)$")
 
+# Glob metacharacters: ``*``, ``?``, ``[``, ``]``. A candidate containing any
+# of these is a glob pattern, not a literal file path — no file literally
+# named ``*.py`` exists, so a glob candidate is always "missing" and would
+# false-positive the gate. The backtick-quoted path regex (``_TICK_PATH``)
+# captures globs because it matches anything inside backticks that contains a
+# separator and ends with an extension; the non-tick regexes exclude ``*``
+# from their character classes, so only backtick-quoted globs reach this
+# filter (issue #1391).
+_GLOB_METACHAR = re.compile(r"[*?\[\]]")
+
 
 @dataclass(frozen=True)
 class CrossRepoGateResult:
@@ -137,6 +148,16 @@ def extract_referenced_paths(issue_body: str) -> list[str]:
     ``pr-N``, ``issue-N``, ``<...>``) are dropped — a template stand-in can
     never name a real file, so a templated documentation path in an issue
     body cannot fire the gate (issue #1343).
+
+    Candidates containing glob metacharacters (``*``, ``?``, ``[``, ``]``)
+    are dropped — a glob pattern is not a literal file path, and no file
+    literally named ``*.py`` exists, so a glob candidate is always "missing"
+    and would false-positive the gate (issue #1391).
+
+    Candidates whose first path segment is a launcher-owned worktree
+    directory (``.devin``, ``.git_worktree_dir``) are dropped — these paths
+    live only inside agent worktrees, not in the repo tree, so they are not
+    evidence of a cross-repo target (issue #1391).
     """
     # Strip URLs before matching so the POSIX absolute-path alternation does
     # not capture the path portion of ``https://example.com/foo.py``.
@@ -156,6 +177,16 @@ def extract_referenced_paths(issue_body: str) -> list[str]:
         # reference, and can never be a genuine cross-repo target.
         if _has_placeholder_segment(raw):
             continue
+        # Drop glob patterns: a candidate containing ``*``, ``?``, ``[``, or
+        # ``]`` is a glob, not a literal path. No file named ``*.py`` exists,
+        # so a glob is always "missing" and would false-positive the gate.
+        if _GLOB_METACHAR.search(raw):
+            continue
+        # Drop launcher-owned worktree paths: paths under ``.devin/`` or
+        # ``.git_worktree_dir/`` live only inside agent worktrees, not in the
+        # repo tree, so they are not evidence of a cross-repo target.
+        if _is_launcher_owned_path(raw):
+            continue
         if raw not in seen:
             seen.add(raw)
             candidates.append(raw)
@@ -172,6 +203,24 @@ def _has_placeholder_segment(candidate: str) -> bool:
     (issue #1343).
     """
     return any(_PLACEHOLDER_SEGMENT.match(seg) for seg in re.split(r"[\\/]+", candidate))
+
+
+def _is_launcher_owned_path(candidate: str) -> bool:
+    """Return ``True`` when ``candidate`` is under a launcher-owned worktree dir.
+
+    Paths under ``.devin/`` or ``.git_worktree_dir/`` live only inside agent
+    worktrees — the shim materializes them on every dispatch — not in the
+    repo tree. A candidate whose first path segment names one of these
+    directories is not evidence of a cross-repo target: it will always be
+    "missing" from the repo and would false-positive the gate (issue #1391).
+
+    The launcher-owned directory set is sourced from
+    :data:`charlie_work.config.LAUNCHER_OWNED_DIRS`, shared with
+    :mod:`charlie_work.worktree`'s dirty check so the two modules share one
+    definition of "launcher-owned, not evidence."
+    """
+    segments = re.split(r"[\\/]+", candidate, maxsplit=1)
+    return bool(segments) and segments[0] in LAUNCHER_OWNED_DIRS
 
 
 def _path_exists_in_repo(path_str: str, repo_root: Path) -> bool:

@@ -27,7 +27,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, runtime_checkable
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
-from .config import OrchestratorConfig, WORKER_OUTCOME_FILENAME, WRITER_MARKER_FILENAME
+from .config import (
+    LAUNCHER_OWNED_DIRS,
+    OrchestratorConfig,
+    WORKER_OUTCOME_FILENAME,
+    WRITER_MARKER_FILENAME,
+)
 from . import git_pull_blockers
 from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
 from .janitor import _calculate_patch_id
@@ -44,6 +49,15 @@ _DEFAULT_TIMEOUT_SECONDS = 60
 # Shorter timeout for network-touching git commands (ls-remote, fetch) so a
 # stalled remote call cannot consume the entire local dispatch budget.
 _REMOTE_TIMEOUT_SECONDS = 20
+
+# PR body scratch files: workers ad-hoc draft PR bodies into root-level .md
+# files with varying naming conventions (``PR_BODY.md``, ``PR_BODY_<issue>.md``,
+# ``.worker-pr-body.md``, ``_pr_body.md``). All are launcher/protocol residue,
+# not worker output (issue #1391). The regex matches any root-level filename
+# in this family so a new ad-hoc variant does not re-trip the unsafe check.
+_LAUNCHER_OWNED_PR_BODY_RE = re.compile(
+    r"^(?:PR_BODY.*|\.worker-pr-body|_pr_body)\.md$", re.IGNORECASE
+)
 
 
 def _run_remote_captured(command: list[str], cwd: Path) -> RunResult:
@@ -1412,6 +1426,40 @@ def _parse_status_v2_paths(stdout: str) -> list[str]:
     return paths
 
 
+def _launcher_owned_matcher() -> Callable[[str], bool]:
+    """Build a predicate matching worktree-relative paths owned by the
+    worker launch shim (not worker output).
+
+    The shim materializes ``.devin/`` (the Devin CLI config directory) and
+    ``.git_worktree_dir/`` into each worktree on every dispatch; workers
+    also ad-hoc draft PR bodies into root-level ``.md`` scratch files.
+    None of this is worker product — it is launcher/protocol residue that
+    the shim re-materializes on the next dispatch — so it is excluded from
+    the dirty check alongside declared scaffolding (issue #1391).
+
+    Semantically distinct from :func:`_declared_scaffolding_matcher`:
+    declared scaffolding is what the *orchestrator* itself writes
+    (``injected_paths`` + ``materialize_dirs``); launcher-owned paths are
+    what the *shim* writes. Both are "not worker product", but they have
+    different sources and different re-materialization guarantees, so they
+    are kept as separate predicates.
+    """
+    excluded_dirs = [PurePosixPath(d) for d in LAUNCHER_OWNED_DIRS]
+
+    def _is_launcher_owned(raw_path: str) -> bool:
+        path = PurePosixPath(str(raw_path).replace("\\", "/"))
+        # Directory match: path is at or under a launcher-owned directory.
+        if any(path == d or d in path.parents for d in excluded_dirs):
+            return True
+        # PR body scratch file match: root-level file (no path separator)
+        # whose name matches the PR body family pattern.
+        if len(path.parts) == 1 and _LAUNCHER_OWNED_PR_BODY_RE.match(path.name):
+            return True
+        return False
+
+    return _is_launcher_owned
+
+
 def _declared_scaffolding_matcher(
     injected_paths: tuple[str, ...] = (),
     materialize_dirs: tuple[str, ...] = (),
@@ -1660,8 +1708,9 @@ def _worker_authored_dirty(
         )
 
     is_declared = _declared_scaffolding_matcher(injected_paths, materialize_dirs)
+    is_launcher_owned = _launcher_owned_matcher()
     for raw_path in _parse_status_v2_paths(status_result.stdout):
-        if is_declared(raw_path):
+        if is_declared(raw_path) or is_launcher_owned(raw_path):
             continue
         return True
     return False
@@ -1692,7 +1741,17 @@ def _capture_worktree_work_to_rescue_ref(
     # Build exclusion pathspecs. ``.venv`` is always excluded: it is either a
     # junction into the shared virtualenv (following it would add every other
     # worktree's venv contents) or a local venv that is not worker content.
+    # Launcher-owned directories (``.devin``, ``.git_worktree_dir``) are also
+    # excluded: they are shim residue, not worker output, and including them
+    # in the rescue tree pollutes the salvage commit (issue #1391).
     exclusions: list[str] = [":(exclude).venv"]
+    for d in LAUNCHER_OWNED_DIRS:
+        exclusions.append(f":(exclude){d}")
+    # PR body scratch files are root-level glob patterns; exclude them with
+    # pathspec globs so they do not pollute the rescue tree either.
+    exclusions.append(":(exclude)PR_BODY*.md")
+    exclusions.append(":(exclude).worker-pr-body.md")
+    exclusions.append(":(exclude)_pr_body.md")
     for p in (*injected_paths, *materialize_dirs):
         normalized = str(p).replace("\\", "/").strip("/")
         if normalized:
@@ -1927,7 +1986,11 @@ def _worktree_refuse_to_reset_reason(
             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )
         if not merge_base_result.ok:
-            return "worktree has local commits not on remote branch"
+            return (
+                f"worktree has local commits not on remote branch "
+                f"(refs/heads/{branch} @ {local_sha[:12]}); push to a "
+                f"salvage ref with: git push origin {local_sha}:refs/heads/salvage/{branch}"
+            )
         merge_base = merge_base_result.stdout.strip()
         rev_list_result = run_captured(
             ["git", "rev-list", "--count", f"{merge_base}..{local_sha}"],
@@ -1939,7 +2002,12 @@ def _worktree_refuse_to_reset_reason(
             and rev_list_result.stdout.strip().isdigit()
             and int(rev_list_result.stdout.strip()) > 0
         ):
-            return f"worktree has {rev_list_result.stdout.strip()} local commit(s) not on remote branch"
+            count = rev_list_result.stdout.strip()
+            return (
+                f"worktree has {count} local commit(s) not on remote branch "
+                f"(refs/heads/{branch} @ {local_sha[:12]}); push to a "
+                f"salvage ref with: git push origin {local_sha}:refs/heads/salvage/{branch}"
+            )
         return None
 
     # Remote branch exists. If local tip matches the remote tip, there are no
@@ -1958,7 +2026,12 @@ def _worktree_refuse_to_reset_reason(
     if ancestor_result.ok:
         return None
 
-    return "worktree has local commits not on remote branch"
+    return (
+        f"worktree has local commits not on remote branch "
+        f"(refs/heads/{branch} @ {local_sha[:12]} diverged from origin/{branch} "
+        f"@ {remote_sha[:12]}); push to a salvage ref with: "
+        f"git push origin {local_sha}:refs/heads/salvage/{branch}"
+    )
 
 
 def _worktree_dirty_reason(
