@@ -2576,6 +2576,15 @@ def is_infrastructure_failure(job: dict[str, Any], annotations: list[dict[str, A
     This is used to reclassify FAILURE-state checks as infra_failed instead of
     code failures, preventing rework worker dispatch against untested code.
 
+    Issue #1383: the detection logic now lives in
+    :func:`charlie_work.checks.is_infra_blocked_check`, which is config-driven
+    (annotation patterns and the instant-fail threshold live in
+    :class:`InfraBlockedConfig`, not hardcoded here). This function remains as
+    a thin backward-compatible wrapper that delegates to the canonical
+    classifier with a default config, so existing callers and tests keep
+    working unchanged. New call sites should call
+    ``is_infra_blocked_check`` directly with the active config.
+
     Args:
         job: A single job object with steps[] from the GitHub Actions API
         annotations: A flat list of annotation objects from the check-runs API
@@ -2583,51 +2592,10 @@ def is_infrastructure_failure(job: dict[str, Any], annotations: list[dict[str, A
     Returns:
         True if any infrastructure failure signal is detected, False otherwise.
     """
-    conclusion = str(job.get("conclusion") or "").upper()
-    if conclusion != "FAILURE":
-        # Only check jobs that actually failed
-        return False
+    from .checks import is_infra_blocked_check
+    from .config import InfraBlockedConfig
 
-    steps = job.get("steps", [])
-    if not isinstance(steps, list):
-        steps = []
-
-    # Signal 1: zero-step job (never started)
-    # Primary signal: job with no steps at all (runner never started)
-    if len(steps) == 0:
-        return True
-
-    # Fallback: filter out setup steps to detect jobs that completed
-    # without running any actual test/work steps
-    non_setup_steps = [
-        s
-        for s in steps
-        if isinstance(s, dict)
-        and str(s.get("name") or "").lower()
-        not in {
-            "set up job",
-            "checkout",
-            "initialize",
-            "complete job",
-        }
-    ]
-
-    if len(non_setup_steps) == 0:
-        # Job completed with zero non-setup steps - infrastructure failure
-        return True
-
-    # Signal 2: check for "was not started" annotations
-    # Billing lapse annotation: "The job was not started because recent account payments have failed or your spending limit needs to be increased."
-    if not isinstance(annotations, list):
-        annotations = []
-
-    for annotation in annotations:
-        if isinstance(annotation, dict):
-            message = str(annotation.get("message") or "").lower()
-            if "was not started" in message:
-                return True
-
-    return False
+    return is_infra_blocked_check(job, annotations, InfraBlockedConfig())
 
 
 def parse_blockers(text: str) -> list[int]:

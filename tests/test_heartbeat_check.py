@@ -2618,6 +2618,147 @@ def test_report_warn_does_not_set_anomaly(hb: ModuleType) -> None:
 
 
 # ---------------------------------------------------------------------------
+# check_infra_blocked_events (issue #1383, AC4)
+#
+# Mirrors the check_error_events / check_warning_events coverage above: a
+# missing or unreadable events.db is an anomaly (this check cannot vouch for
+# a repo it cannot read), and the ok/warn/anom branching follows the
+# production precedence -- an ``infra_blocked_escalated`` row newer than
+# baseline is an anomaly; otherwise a ``check_infra_blocked`` row newer than
+# baseline is a warning; otherwise OK.
+# ---------------------------------------------------------------------------
+
+
+def test_check_infra_blocked_events_anomaly_when_db_missing(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """A missing events.db is an anomaly, matching
+    `test_check_error_events_anomaly_when_db_missing`: this check's entire
+    job is "did any infra-blocked escalation fire," and a registered repo
+    with no events.db is a repo this check cannot vouch for."""
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert report.anomaly
+    assert "no events.db" in report.lines[-1]
+
+
+def test_check_infra_blocked_events_anomaly_when_table_missing(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = repo.state_dir / "events.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE unrelated (id INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert report.anomaly
+    assert "no events table" in report.lines[-1]
+
+
+def test_check_infra_blocked_events_anomaly_when_db_unreadable(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    (repo.state_dir / "events.db").write_bytes(b"not a sqlite database at all")
+
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert report.anomaly
+
+
+def test_check_infra_blocked_events_ok_when_no_relevant_events(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """An events.db with only unrelated kinds (no check_infra_blocked, no
+    infra_blocked_escalated) yields OK with the row-count facts."""
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(
+        repo.state_dir,
+        [(_iso(1), "dispatch_started", "info"), (_iso(1), "self_deploy_alarm", "error")],
+    )
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert "blocked_rows=0" in report.lines[-1]
+    assert "escalated_rows=0" in report.lines[-1]
+    assert report.lines[-1].startswith("OK ")
+
+
+def test_check_infra_blocked_events_warn_when_blocked_since_baseline(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """A ``check_infra_blocked`` row newer than baseline (with no
+    ``infra_blocked_escalated``) surfaces as a WARN without setting
+    ``anomaly`` -- the infra condition is being held, not yet escalated."""
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(repo.state_dir, [(_iso(1), "check_infra_blocked", "warning")])
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert "check_infra_blocked since last beat" in report.lines[-1]
+    assert report.lines[-1].startswith("WARN ")
+
+
+def test_check_infra_blocked_events_anom_when_escalated_since_baseline(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """An ``infra_blocked_escalated`` row newer than baseline is an ANOMALY
+    -- the persistence threshold was reached and an operator-facing
+    escalation fired. Precedence over the warn branch: even when
+    ``check_infra_blocked`` rows are also present, the escalation is the
+    finding that surfaces."""
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(
+        repo.state_dir,
+        [
+            (_iso(1), "check_infra_blocked", "warning"),
+            (_iso(1), "infra_blocked_escalated", "error"),
+        ],
+    )
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert report.anomaly, report.lines
+    assert "infra_blocked_escalated since last beat" in report.lines[-1]
+    assert report.lines[-1].startswith("ANOMALY ")
+
+
+def test_check_infra_blocked_events_excludes_old_rows(hb: ModuleType, tmp_path: Path) -> None:
+    """Rows older than baseline are excluded from the new-since-last-beat
+    counts, matching the check_error_events/check_warning_events
+    old-row-exclusion convention."""
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(
+        repo.state_dir,
+        [
+            (_iso(60), "check_infra_blocked", "warning"),
+            (_iso(60), "infra_blocked_escalated", "error"),
+        ],
+    )
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=5)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert "blocked_rows=1" in report.lines[-1]
+    assert "escalated_rows=1" in report.lines[-1]
+    assert report.lines[-1].startswith("OK ")
+
+
+# ---------------------------------------------------------------------------
 # check_stale_open_issue_mentions (issue #902)
 #
 # Real captured payload text, not paraphrased: PR #824's body starts with

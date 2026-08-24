@@ -33,6 +33,7 @@ from .claude_code import (
 )
 from .checks import (
     CheckSummary,
+    is_infra_blocked_check,
     summarize_checks,
 )
 from .citation_check import (
@@ -82,7 +83,6 @@ from .github import (
     defang_closing_keywords,
     detect_prose_only_dependencies,
     get_github_issue_dependencies,
-    is_infrastructure_failure,
     issue_numbers_mentioned_by_pr,
     label_names,
     linked_issue_number,
@@ -204,7 +204,13 @@ from .state import (
     utc_now,
     without_review_dispatch_claim,
 )
-from .instrumentation import correlation_context, log_event, query_events, record_loop_pass
+from .instrumentation import (
+    correlation_context,
+    current_correlation_id,
+    log_event,
+    query_events,
+    record_loop_pass,
+)
 from .preflight import (
     PreflightPaths,
     emit_preflight_refusal,
@@ -1972,6 +1978,21 @@ def summarize_loop_errors(
 # Centralized so the sink census and the sweep cannot drift apart on what
 # "in the sink" means. Issue #1083.
 _SINK_STATUSES: frozenset[str] = frozenset({"escalated", "blocked"})
+
+# Issue #1383: cross-pass infra_blocked escalation tracking. The
+# OrchestratorApp instance is rebuilt per repo per pass (fleet_loop), so
+# instance-level state cannot track "persistence across N passes." This
+# module-level dict, keyed by repo_root string, survives across passes
+# within the same supervisor process -- exactly the scope AC3 needs:
+# "one operator escalation per window, not one per PR per pass." Each
+# entry records the consecutive-pass count of infra_blocked observations,
+# the datetime of the last ``infra_blocked_escalated`` emission (or None
+# if none has been emitted yet), and the correlation_id of the pass that
+# last incremented the counter (so multiple infra-blocked PRs encountered
+# within the same ``review()`` pass increment the counter at most once).
+# Reset to zero/None/None when a pass observes no infra_blocked PRs (the
+# infra condition cleared).
+_infra_blocked_window: dict[str, dict[str, Any]] = {}
 
 
 def sink_census(state: dict[str, Any]) -> set[int]:
@@ -5815,6 +5836,7 @@ def _is_pending_only(summary: CheckSummary) -> bool:
         and not summary.failed
         and not summary.missing
         and not summary.infra_failed
+        and not summary.infra_blocked
         and not summary.unavailable
     )
 
@@ -5841,6 +5863,8 @@ def _format_merge_attempt_alarm_message(
         buckets.append(f"failed: {', '.join(summary.failed)}")
     if summary.infra_failed:
         buckets.append(f"infra_failed: {', '.join(summary.infra_failed)}")
+    if summary.infra_blocked:
+        buckets.append(f"infra_blocked: {', '.join(summary.infra_blocked)}")
     if summary.unavailable:
         # gh reported no parseable check list at all (see summarize_checks'
         # `checks is None` branch) — distinct from "all required checks
@@ -8902,6 +8926,56 @@ class OrchestratorApp:
             data,
         )
 
+    def _enrich_checks_infra_blocked(
+        self, checks: list[dict[str, Any]] | None, required: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        """Reclassify FAILURE required checks as ``INFRA_BLOCKED`` at the
+        check-ingestion data boundary (issue #1383).
+
+        Single point of enforcement for the infra_blocked classification: a
+        required check whose FAILED job shows structural evidence of a
+        non-started job (zero non-setup steps / instant-fail) or a
+        config-listed billing annotation is rewritten to the
+        ``INFRA_BLOCKED`` marker state before ``summarize_checks`` (and
+        therefore the janitor gate / rework-routing decision) ever sees it.
+        ``summarize_checks`` then routes it to ``CheckSummary.infra_blocked``
+        rather than ``failed``, so it never enters the "required checks
+        failed -> dispatch rework" path and never burns a rework attempt.
+
+        Kept as an OrchestratorApp method (not a pure function in
+        ``checks.py``) because the structural + annotation signals require
+        two ``gh`` API calls per FAILURE check (``actions_job`` /
+        ``check_run_annotations``) -- I/O that the pure
+        ``summarize_checks``/``is_infra_blocked_check`` layer must not
+        perform. Both API methods return safe empty values (``None`` / ``[]``)
+        on any GitHub failure and never raise, so an unenrichable check
+        degrades to ordinary ``failed`` routing rather than crashing
+        ingestion -- mirroring the existing ``merge_ready`` enrichment this
+        replaces.
+
+        Called before the janitor gate in ``review()`` (the rework-routing
+        path) and in ``merge_ready()`` (the merge-execution path) so both
+        paths classify budget-failed checks identically.
+        """
+        if not checks or not required:
+            return list(checks or [])
+        cfg = self.config.auto_merge.infra_blocked
+        if not cfg.enabled:
+            return list(checks)
+        required_set = set(required)
+        enriched: list[dict[str, Any]] = []
+        for check in checks:
+            name = str(check.get("name") or "")
+            if name in required_set and str(check.get("state") or "").upper() == "FAILURE":
+                check_run_id = check.get("databaseId")
+                if isinstance(check_run_id, int):
+                    job = self.gh.actions_job(check_run_id)
+                    annotations = self.gh.check_run_annotations(check_run_id)
+                    if job is not None and is_infra_blocked_check(job, annotations, cfg):
+                        check = {**check, "state": "INFRA_BLOCKED"}
+            enriched.append(check)
+        return enriched
+
     @_guard_state_lock
     def review(
         self,
@@ -9197,6 +9271,19 @@ class OrchestratorApp:
 
         issue = self.gh.issue_view(issue_number) if issue_number is not None else {}
         checks = self.gh.pr_checks(pr_number)
+        # Issue #1383: reclassify fleet-wide infra failures (Actions budget /
+        # runner outage) as INFRA_BLOCKED at the data boundary, BEFORE the
+        # janitor gate / rework-routing decision. A budget-failed check has a
+        # FAILURE conclusion (not CANCELLED/INFRA_FAILURE), so without this
+        # enrichment it lands in summary.failed and is routed to rework --
+        # burning no-op rework caps on a healthy PR. Enriching here is the
+        # single point of enforcement; the janitor and merge_ready both see
+        # the reclassified checks.
+        checks_unavailable = checks is None
+        if not checks_unavailable:
+            checks = self._enrich_checks_infra_blocked(
+                checks, self.config.auto_merge.required_checks
+            )
 
         # Load PR state for no-op rework detection (only if PR has verdict history)
         pr_state = None
@@ -9693,6 +9780,89 @@ class OrchestratorApp:
                         "issue": issue_number,
                         "infra_escalated": True,
                         "label_error": label_error,
+                    },
+                )
+
+            # Issue #1383: infra_blocked required checks (fleet-wide Actions
+            # budget/runner outage) are held without dispatching rework and
+            # without burning rework/no-op attempt counters. The PR is not
+            # transitioned to review_started (there is nothing for the worker
+            # to fix), no request_changes verdict is recorded, and the
+            # check-failure rework route below is skipped entirely. A distinct
+            # ``check_infra_blocked`` warning event is emitted per affected PR
+            # so the heartbeat consumer (AC4) and the cross-pass escalation
+            # tracker can see it. The operator-facing
+            # ``infra_blocked_escalated`` error event is emitted at most once
+            # per ``escalation_window_minutes`` window across ALL affected PRs
+            # (AC3), not once per PR per pass -- tracked in the module-level
+            # ``_infra_blocked_window`` dict because the app instance is
+            # rebuilt per pass.
+            if verdict.is_infra_blocked_block:
+                log_event(
+                    self.paths.state_file,
+                    "check_infra_blocked",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "checks": list(verdict.infra_blocked_checks),
+                    },
+                    repo=self.repo_root.name,
+                    level="warning",
+                )
+                # Cross-pass persistence tracking + windowed escalation.
+                cfg = self.config.auto_merge.infra_blocked
+                repo_key = str(self.repo_root)
+                window = _infra_blocked_window.setdefault(
+                    repo_key,
+                    {
+                        "consecutive_passes": 0,
+                        "last_escalation": None,
+                        "last_pass_cid": None,
+                    },
+                )
+                # Issue #1383: increment at most once per loop pass (per
+                # correlation_id), not once per infra-blocked PR encountered
+                # within review(). Without this gate, N concurrent
+                # infra-blocked PRs in one pass would reach
+                # persistence_passes=N in a single pass and fire
+                # ``infra_blocked_escalated`` immediately, contradicting AC3
+                # ("persistence across N passes, not per PR per pass"). The
+                # same correlation_id-dedup pattern is used by the
+                # reset-on-clear logic in ``_loop_impl``. When no correlation
+                # context is active (direct ``review()`` calls outside
+                # ``loop()``, e.g. in tests), ``cid`` is None and each call
+                # increments -- matching the pre-fix direct-call behavior.
+                cid = current_correlation_id()
+                if cid is None or window.get("last_pass_cid") != cid:
+                    window["consecutive_passes"] = window.get("consecutive_passes", 0) + 1
+                    window["last_pass_cid"] = cid
+                last_esc = window.get("last_escalation")
+                now_dt = datetime.now(UTC)
+                should_escalate = window["consecutive_passes"] >= cfg.persistence_passes
+                if should_escalate and (
+                    last_esc is None
+                    or (now_dt - last_esc).total_seconds() >= cfg.escalation_window_minutes * 60
+                ):
+                    log_event(
+                        self.paths.state_file,
+                        "infra_blocked_escalated",
+                        {
+                            "consecutive_passes": window["consecutive_passes"],
+                            "persistence_passes": cfg.persistence_passes,
+                            "window_minutes": cfg.escalation_window_minutes,
+                        },
+                        repo=self.repo_root.name,
+                        level="error",
+                    )
+                    window["last_escalation"] = now_dt
+                return CommandResult(
+                    False,
+                    f"PR #{pr_number} infra-blocked (billing/runner outage): "
+                    + ", ".join(verdict.infra_blocked_checks),
+                    {
+                        "infra_blocked": True,
+                        "checks": list(verdict.infra_blocked_checks),
+                        "checks_unavailable": False,
                     },
                 )
 
@@ -15347,24 +15517,28 @@ class OrchestratorApp:
             summary = summarize_checks(None, self.config.auto_merge.required_checks)
             enriched_checks: list[dict[str, Any]] = []
         else:
-            # Enrich check data with infrastructure failure detection for FAILED checks
-            # This implements detection signals 1 (zero-step jobs) and 2 (billing annotations)
-            # from issue #210, keeping summarize_checks pure by enriching at the data boundary
-            enriched_checks = []
-            for check in checks:
-                state = str(check.get("state") or "").upper()
-                if state == "FAILURE":
-                    # Check if this failure is due to infrastructure issues
-                    check_run_id = check.get("databaseId")
-                    if check_run_id and isinstance(check_run_id, int):
-                        # The databaseId from gh pr checks IS the GitHub Actions job id
-                        job = self.gh.actions_job(check_run_id)
-                        annotations = self.gh.check_run_annotations(check_run_id)
-                        if job and is_infrastructure_failure(job, annotations):
-                            # Reclassify as infrastructure failure by setting state to a marker
-                            # that summarize_checks will route to infra_failed
-                            check = {**check, "state": "INFRA_FAILURE"}
-                enriched_checks.append(check)
+            # Issue #1383: use the shared data-boundary enrichment so the
+            # merge path classifies infra_blocked checks identically to the
+            # review path. The old inline enrichment reclassified a FAILURE
+            # check with an infra signature to ``INFRA_FAILURE`` (routing it
+            # to ``CheckSummary.infra_failed``); the shared helper rewrites
+            # the same population to ``INFRA_BLOCKED`` instead, so those
+            # checks now land in ``CheckSummary.infra_blocked`` rather than
+            # ``infra_failed``. Both buckets block merge (``CheckSummary.ready``
+            # is False for either), so the merge gate is unchanged -- only the
+            # bucket/failure-message differs. ``infra_failed`` is NOT emptied
+            # for its original population: ``_enrich_checks_infra_blocked``
+            # only touches ``FAILURE``-conclusion checks, so genuine
+            # ``CANCELLED``/``INFRA_FAILURE``/``TIMED_OUT`` checks still route
+            # to ``infra_failed`` exactly as before (the #841 auto-rerun path
+            # in ``review()`` is fed by ``run_janitor``, which sees raw checks
+            # -- it never enriched FAILURE to INFRA_FAILURE pre-#1383, so the
+            # #1383 change reroutes zero-step FAILURE from
+            # ``is_check_failure_block`` (rework) to ``is_infra_blocked_block``
+            # (hold), not from ``is_infra_failure_block``).
+            enriched_checks = self._enrich_checks_infra_blocked(
+                checks, self.config.auto_merge.required_checks
+            )
             summary = summarize_checks(enriched_checks, self.config.auto_merge.required_checks)
         # Run containment check for worker edits leaked into operator checkout
         diff = self.gh.pr_diff(pr_number)
@@ -16237,19 +16411,11 @@ class OrchestratorApp:
             summary = summarize_checks(None, self.config.auto_merge.required_checks)
             enriched_checks: list[dict[str, Any]] = []
         else:
-            # Enrich check data with infrastructure failure detection — same
-            # read-only logic as the real path (issue #210).
-            enriched_checks = []
-            for check in checks:
-                check_state = str(check.get("state") or "").upper()
-                if check_state == "FAILURE":
-                    check_run_id = check.get("databaseId")
-                    if check_run_id and isinstance(check_run_id, int):
-                        job = self.gh.actions_job(check_run_id)
-                        annotations = self.gh.check_run_annotations(check_run_id)
-                        if job and is_infrastructure_failure(job, annotations):
-                            check = {**check, "state": "INFRA_FAILURE"}
-                enriched_checks.append(check)
+            # Issue #1383: shared data-boundary enrichment, same as the real
+            # merge_ready path -- see _enrich_checks_infra_blocked.
+            enriched_checks = self._enrich_checks_infra_blocked(
+                checks, self.config.auto_merge.required_checks
+            )
             summary = summarize_checks(enriched_checks, self.config.auto_merge.required_checks)
 
         diff = self.gh.pr_diff(pr_number)
@@ -19510,6 +19676,41 @@ class OrchestratorApp:
                     correlation_id=cid,
                 )
             )
+            # Issue #1383: reset the cross-pass infra_blocked window when a
+            # pass reviews at least one PR and finds none infra-blocked --
+            # the fleet-wide infra condition has cleared, so the
+            # consecutive-pass counter starts fresh next time. Queried by
+            # this pass's correlation ID (same pattern as sink_clears
+            # above) so the count is exact for this pass with no
+            # allow-list to drift.
+            #
+            # Round-2 #1383 review: the reset must NOT fire merely because
+            # zero ``check_infra_blocked`` events were emitted -- that is
+            # also true when the pass reviewed no PRs at all (empty queue,
+            # ``limit=0`` with no candidates, ...). Resetting on an
+            # idle pass during a live outage silently clears
+            # ``consecutive_passes``/``last_escalation`` and can prevent
+            # the AC3 persistence escalation from ever firing. Gate on
+            # ``reviews`` (PRs actually reviewed this pass) being
+            # non-empty so the reset means "we looked and the coast was
+            # clear", not "we didn't look".
+            infra_blocked_this_pass = len(
+                query_events(
+                    self.paths.state_file,
+                    kind="check_infra_blocked",
+                    correlation_id=cid,
+                )
+            )
+            reviewed_this_pass = len(result.data.get("reviews", []))
+            if reviewed_this_pass > 0 and infra_blocked_this_pass == 0:
+                repo_key = str(self.repo_root)
+                window = _infra_blocked_window.get(repo_key)
+                if window is not None and window.get("consecutive_passes", 0) > 0:
+                    _infra_blocked_window[repo_key] = {
+                        "consecutive_passes": 0,
+                        "last_escalation": None,
+                        "last_pass_cid": None,
+                    }
             # Issue #1314 item 3: operator-queue depth gauge. Emitted after
             # ``_loop_body`` so the gauge reflects post-pass state (the
             # de-escalation sweep inside ``_loop_body`` may have cleared some
