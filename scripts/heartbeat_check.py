@@ -1586,15 +1586,29 @@ def _review_claim_timestamp(
     below would date the claim by that stale prior dispatch and overcount the
     age by the full inter-cycle gap (a false 138m ANOMALY observed on pr-1395).
 
-    Detect this case structurally: the on-disk pending decision is head-stamped
-    (``record_decision`` at packet build writes ``reviewed_head_sha`` = the new
-    PR head), while state.json's ``reviewed_head_sha`` is the prior cycle's
-    reviewed head.  A difference means the packet was rebuilt for a head that
-    has not been reviewed yet.  Anchor on the packet-rebuild evidence -- the
-    ``review-prompt.md`` mtime, rewritten on every ``review()`` packet build --
-    instead of the stale state.json dispatch timestamp.  ``pr_dir`` and
-    ``decision`` are optional so direct unit callers (and the pre-fix tests)
-    keep the original state.json-only behavior.
+    Detect this case structurally: a pending on-disk decision while status is
+    ``review_dispatch_completed`` is ALREADY the contradiction that proves a
+    packet rebuild (``record_review`` writes a terminal decision; only a packet
+    build resets it to ``pending``).  Anchor on the packet-rebuild evidence --
+    the ``review-prompt.md`` mtime, rewritten on every ``review()`` packet
+    build -- instead of the stale state.json dispatch timestamp.  ``pr_dir``
+    and ``decision`` are optional so direct unit callers (and the pre-fix
+    tests) keep the original state.json-only behavior.
+
+    Issue #1436: the #1403 fix gated the rebuild anchor on the on-disk
+    decision's ``reviewed_head_sha`` DIFFERING from state.json's.  That misses
+    a packet rebuilt for the SAME head (conflict-path re-review,
+    verdict-missed retry, manual re-request): the SHA equality lets the guard
+    fall through and the newest-timestamp fallback dates the claim by the
+    prior cycle's ``review_dispatched_at`` (false 467m ANOMALY on pr-1432).
+    The SHA comparison is now only a tiebreak for the missing-prompt-file
+    case; the primary gate is ``status == completed and decision == pending``.
+
+    The prompt mtime is guarded against being OLDER than the prior cycle's
+    ``review_dispatched_at`` (clock skew / a packet that was not actually
+    rebuilt): the newer of the two is used, so this can only shrink a false
+    age and never hide a genuinely stale claim from before the completed
+    cycle.
     """
     status = pr_state.get("review_dispatch_status")
     if status == "review_dispatch_dispatched":
@@ -1604,26 +1618,33 @@ def _review_claim_timestamp(
     if status == "review_dispatch_failed":
         return pr_state.get("review_dispatch_failed_at")
 
-    # Issue #1403: completed prior cycle whose packet was rebuilt for a newer
-    # head.  See the docstring for why state.json's dispatch timestamps are
-    # stale here.  The on-disk pending decision's ``reviewed_head_sha`` is the
-    # new packet head; state.json's is the prior cycle's reviewed head.  They
-    # differ exactly when the packet was rebuilt for a not-yet-reviewed head.
+    # Issue #1403/#1436: completed prior cycle whose packet was rebuilt.  See
+    # the docstring for why state.json's dispatch timestamps are stale here.
+    # A pending on-disk decision while status is completed is the structural
+    # contradiction that proves a rebuild -- regardless of whether the head
+    # advanced (#1403, differing SHA) or stayed put (#1436, same SHA).
     if (
         status == "review_dispatch_completed"
         and pr_dir is not None
         and isinstance(decision, dict)
         and decision.get("decision") == "pending"
-        and decision.get("reviewed_head_sha")
-        and decision.get("reviewed_head_sha") != pr_state.get("reviewed_head_sha")
     ):
         prompt_path = pr_dir / "review-prompt.md"
         if prompt_path.exists():
-            return (
-                datetime.fromtimestamp(prompt_path.stat().st_mtime, tz=timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
+            prompt_dt = datetime.fromtimestamp(prompt_path.stat().st_mtime, tz=timezone.utc)
+            # Guard against the prompt mtime being OLDER than the prior
+            # cycle's dispatch (clock skew / unrebuilt packet): use the newer
+            # of the two, so this can only shrink a false age and never hide a
+            # genuinely stale claim from before the completed cycle.
+            dispatch_raw = pr_state.get("review_dispatched_at")
+            dispatch_dt = parse_iso(dispatch_raw) if dispatch_raw else None
+            if dispatch_dt is not None and dispatch_dt > prompt_dt:
+                return dispatch_raw
+            return prompt_dt.isoformat().replace("+00:00", "Z")
+        # Prompt file missing: the SHA comparison survives only as a tiebreak
+        # here.  A differing SHA still indicates a rebuilt packet, but without
+        # the prompt mtime we have no rebuild timestamp; fall back to current
+        # behavior (the newest-timestamp fallback below) either way.
 
     newest: str | None = None
     newest_dt: datetime | None = None
