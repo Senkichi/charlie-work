@@ -18289,6 +18289,108 @@ def test_merge_ready_mergequeue_check_failure_still_routes_to_rework(tmp_path: P
     assert check_failure_events[0]["payload"]["failed_checks"] == ["Tests passed"]
 
 
+def test_merge_ready_self_revoked_stale_head_no_false_alarm(tmp_path: Path) -> None:
+    """Issue #1402: when reconcile's own ``detect_mergequeue_not_approved``
+    (#819 gap fix) revokes ``mergequeue`` because the approval is pinned to a
+    stale head, and ``merge_ready``'s carry-forward then re-validates and
+    re-applies the label in the same pass, the cross-pass
+    ``mergequeue_label_reverted`` signal must NOT be folded into
+    ``mergequeue_handoff_failed``. The label was removed by our own code
+    (cooperative self-revocation), not by Aviator's #823 silent rejection --
+    so the counter must stay at 0 and no alarm must fire.
+
+    Simulates the exact PR #1843 sequence: pass 1 hands off to Aviator
+    (status="mergequeue"), Aviator rebases the branch (head moves), reconcile
+    revokes the label (stale-head, records ``mergequeue_revoked_reason``),
+    pass 2 carry-forwards the approval and re-applies the label."""
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    new_head = "sha-rebased-1843"
+    pr_number = 456
+
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[pr_number] = diff_text
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(pr_number, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    # Pass 1: fresh handoff, succeeds. Status becomes "mergequeue".
+    first = app.merge_ready(pr_number, merge=True)
+    assert first.data["mergequeue_label_applied"] is True
+    assert first.data["consecutive_failed_merge_attempts"] == 0
+    assert load_state(paths.state_file)["prs"][str(pr_number)]["status"] == "mergequeue"
+
+    # Simulate reconcile's cooperative self-revocation: Aviator rebased the
+    # branch (head moves), the approval is now at a stale head, reconcile
+    # revokes the label and records the reason in state.
+    state = load_state(paths.state_file)
+    state["prs"][str(pr_number)]["mergequeue_revoked_reason"] = "stale_head_pending_carry_forward"
+    save_state(paths.state_file, state)
+    fake_gh.prs[0]["headRefOid"] = new_head
+    fake_gh.diffs[pr_number] = diff_text  # same diff -> patch-id matches -> carry-forward
+
+    # Pass 2: carry-forward re-validates the approval at the new head and
+    # re-applies the mergequeue label. The label was absent (reconcile removed
+    # it) and prior status was "mergequeue", so mergequeue_label_reverted is
+    # True -- but mergequeue_self_revoked_stale_head is also True, so
+    # mergequeue_handoff_failed must be False. No counter increment, no alarm.
+    second = app.merge_ready(pr_number, merge=True)
+    assert second.data["mergequeue_label_applied"] is True
+    assert second.data["consecutive_failed_merge_attempts"] == 0
+    assert second.data["merge_attempt_alarm"] is False
+
+    # The self-revocation reason must be cleared so a subsequent Aviator #823
+    # rejection is not misread as a stale self-revocation.
+    state = load_state(paths.state_file)
+    assert state["prs"][str(pr_number)].get("mergequeue_revoked_reason") is None
+
+
+def test_merge_ready_aviator_revert_without_self_revocation_reason_still_counts(
+    tmp_path: Path,
+) -> None:
+    """Issue #1402 regression guard: a genuine Aviator #823 silent rejection
+    (no ``mergequeue_revoked_reason`` recorded -- the label was stripped by
+    Aviator, not by reconcile) must still increment the counter and eventually
+    fire the alarm. This is the exact same scenario as the pre-#1402
+    ``test_merge_ready_mergequeue_silent_revert_increments_counter_across_passes``
+    test, but explicitly seeds an ABSENT ``mergequeue_revoked_reason`` to prove
+    the self-revocation exclusion does not swallow the #823 path."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    # Pass 1: fresh handoff, succeeds.
+    first = app.merge_ready(456, merge=True)
+    assert first.data["consecutive_failed_merge_attempts"] == 0
+
+    # Explicitly ensure no self-revocation reason is set (Aviator stripped the
+    # label, not reconcile). The key may be present as None from pass 1's
+    # label re-add write, but it must NOT be "stale_head_pending_carry_forward".
+    state = load_state(paths.state_file)
+    assert (
+        state["prs"]["456"].get("mergequeue_revoked_reason") != "stale_head_pending_carry_forward"
+    )
+
+    # Pass 2: label absent (FakeGitHub.add_pr_label doesn't mutate labels),
+    # no self-revocation reason -> genuine #823 path -> counter increments.
+    second = app.merge_ready(456, merge=True)
+    assert second.data["mergequeue_label_applied"] is True
+    assert second.data["consecutive_failed_merge_attempts"] == 1
+    assert second.data["merge_attempt_alarm"] is False
+
+
 def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
     # The P0: the counter used to derive from state["events"], which
     # append_event truncates to the last 200 - evicting a PR's earlier

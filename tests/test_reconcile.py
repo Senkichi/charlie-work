@@ -4381,7 +4381,9 @@ def test_detect_mergequeue_not_approved_regression_pr_695(tmp_path: Path) -> Non
     assert len(reconcile_events) == 1
     assert reconcile_events[0]["payload"]["kind"] == "mergequeue_revoked"
     assert reconcile_events[0]["payload"]["pr_number"] == 695
-    assert new_state["prs"] == {}
+    # Issue #1402: apply_fixes now records the revocation reason in state so
+    # merge_ready can distinguish self-revocation from #823 rejection.
+    assert new_state["prs"] == {"695": {"mergequeue_revoked_reason": "not_approved"}}
 
 
 def test_detect_mergequeue_not_approved_leaves_approved_at_head_alone(tmp_path: Path) -> None:
@@ -4613,6 +4615,141 @@ def test_apply_fixes_mergequeue_revoked_records_label_write_failure() -> None:
     assert any(
         "label_write_failed: true" in e.get("payload", {}).get("fix_actions", []) for e in events
     )
+
+
+def test_detect_mergequeue_not_approved_stale_head_records_revocation_reason(
+    tmp_path: Path,
+) -> None:
+    """Issue #1402: a stale-head revocation (approved at an older head, the
+    #819 cooperative self-revocation case) must carry
+    ``mergequeue_revoked_reason='stale_head_pending_carry_forward'`` on the
+    DriftItem so ``merge_ready`` can distinguish it from Aviator's #823 silent
+    rejection and avoid the false handoff-failure alarm."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    pr = {
+        **_pr(703, "OPEN"),
+        "headRefOid": "sha-703-new",
+        "labels": [{"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    _write_review_decision(
+        tmp_path, config, 703, {"decision": "approved", "reviewed_head_sha": "sha-703-old"}
+    )
+
+    drift = detect_mergequeue_not_approved(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].mergequeue_revoked_reason == "stale_head_pending_carry_forward"
+
+
+def test_detect_mergequeue_not_approved_not_approved_records_revocation_reason(
+    tmp_path: Path,
+) -> None:
+    """Issue #1402: a genuine not-approved revocation (request_changes verdict,
+    the PR #695 case) must carry ``mergequeue_revoked_reason='not_approved'``
+    so it is distinguishable from the stale-head self-revocation."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    pr = {
+        **_pr(695, "OPEN"),
+        "headRefOid": "sha-695-live",
+        "labels": [{"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    _write_review_decision(
+        tmp_path,
+        config,
+        695,
+        {"decision": "request_changes", "reviewed_head_sha": "sha-695-live"},
+    )
+
+    drift = detect_mergequeue_not_approved(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].mergequeue_revoked_reason == "not_approved"
+
+
+def test_detect_mergequeue_not_approved_missing_decision_records_not_approved(
+    tmp_path: Path,
+) -> None:
+    """Issue #1402: a missing decision file (never reviewed) must also carry
+    ``mergequeue_revoked_reason='not_approved'``."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    pr = {
+        **_pr(701, "OPEN"),
+        "headRefOid": "sha-701",
+        "labels": [{"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+
+    drift = detect_mergequeue_not_approved(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].mergequeue_revoked_reason == "not_approved"
+
+
+def test_apply_fixes_mergequeue_revoked_writes_reason_to_state(tmp_path: Path) -> None:
+    """Issue #1402: ``apply_fixes`` must persist
+    ``mergequeue_revoked_reason`` to ``state["prs"][n]`` so ``merge_ready``
+    can read it cross-pass. Verifies the stale-head reason is written; the
+    not-approved reason is covered by the symmetric structure."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="mergequeue_revoked",
+            issue_number=None,
+            pr_number=695,
+            detail="PR #695 carries mergequeue but is not approved at its current head",
+            fix_actions=(f"remove label {mergequeue_label!r} from PR #695",),
+            remove_labels=(mergequeue_label,),
+            mergequeue_revoked_reason="stale_head_pending_carry_forward",
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert (
+        new_state["prs"]["695"]["mergequeue_revoked_reason"] == "stale_head_pending_carry_forward"
+    )
+    # The reconcile event also carries the reason for observability.
+    events = [e for e in new_state.get("events", []) if e.get("kind") == "reconcile"]
+    assert any(
+        e.get("payload", {}).get("mergequeue_revoked_reason") == "stale_head_pending_carry_forward"
+        for e in events
+    )
+
+
+def test_apply_fixes_mergequeue_revoked_without_reason_does_not_write_field(
+    tmp_path: Path,
+) -> None:
+    """Issue #1402: a ``mergequeue_revoked`` DriftItem without a
+    ``mergequeue_revoked_reason`` (e.g. from a pre-#1402 reconcile or a
+    hand-constructed drift item) must not synthesize a reason -- the field
+    stays absent so ``merge_ready`` treats the revocation as a #823 case
+    (the safe default)."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="mergequeue_revoked",
+            issue_number=None,
+            pr_number=695,
+            detail="PR #695 carries mergequeue but is not approved at its current head",
+            fix_actions=(f"remove label {mergequeue_label!r} from PR #695",),
+            remove_labels=(mergequeue_label,),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert "mergequeue_revoked_reason" not in new_state["prs"].get("695", {})
 
 
 def test_reconcile_dry_run_fix_does_not_mutate_local_state(tmp_path: Path) -> None:
