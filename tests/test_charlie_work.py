@@ -51989,6 +51989,380 @@ def test_dispatch_fresh_worktree_foreign_writer_does_not_increment_dispatch_fail
     assert state["issues"]["123"].get("dispatch_failed_at") is None
 
 
+def _blocked_env_timestamps(n: int) -> list[str]:
+    """``n`` recent ISO timestamps for pre-seeding ``blocked_environment_at``."""
+    return [
+        (datetime.now(UTC) - timedelta(minutes=i)).isoformat().replace("+00:00", "Z")
+        for i in range(n)
+    ]
+
+
+def test_dispatch_fresh_blocked_environment_reap_resets_counter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1423: at the fresh-dispatch blocked-environment cap exhaustion,
+    a successful foreign-writer reap resets ``blocked_environment_at`` and
+    records the reap in ``foreign_writer_reaps`` instead of escalating."""
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+            max_foreign_writer_reaps=2,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pre-seed: two prior blocked passes (at the cap), so this pass's failure
+    # pushes len(blocked_environment_at) to 3 > max_auto_redispatch(2) and
+    # enters the reap branch.
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "dispatch_failed",
+            "blocked_environment_at": _blocked_env_timestamps(2),
+        }
+        save_state(paths.state_file, state)
+
+    wt_path = tmp_path / "wt-foreign"
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="worktree has a live foreign writer",
+                failure_kind="worktree_foreign_writer",
+                pid=1234,
+                worktree_path=str(wt_path),
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    reap_calls: list[int] = []
+
+    def _fake_reap(failed_result, _config, _state_file, issue_number):
+        reap_calls.append(issue_number)
+        return True
+
+    monkeypatch.setattr("charlie_work.workflow._try_reap_blocked_foreign_writer", _fake_reap)
+
+    result = app.dispatch(limit=1)
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    # Reap succeeded: status is dispatch_failed (NOT escalated), counter reset.
+    assert state["issues"]["123"]["status"] == "dispatch_failed"
+    assert state["issues"]["123"]["blocked_environment_at"] == []
+    # The reap was recorded so a persistently-blocked worktree eventually escalates.
+    assert len(state["issues"]["123"].get("foreign_writer_reaps", [])) == 1
+    assert reap_calls == [123]
+
+
+def test_dispatch_rework_blocked_environment_reap_resets_counter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1423: at the rework-dispatch blocked-environment cap exhaustion
+    (Site 3 — the post-dispatch safety net), a successful foreign-writer reap
+    resets ``blocked_environment_at`` and records the reap in
+    ``foreign_writer_reaps`` instead of escalating.
+
+    Site 3 is defense-in-depth: the pre-filter (Site 2) uses ``>=`` and Site 3
+    uses ``>``, so in normal flow Site 2 always catches an at-cap issue before
+    Site 3 can fire. Site 3 is reachable when Site 2's reap succeeds (resetting
+    the counter) and ``max_auto_redispatch=0`` so the post-dispatch
+    ``len([now]) > 0`` fires Site 3. This test uses that path: Site 2 reaps
+    (recording reap #1), the dispatch fails, and Site 3 reaps again (recording
+    reap #2). Two reaps confirm Site 3 fired — without it, only reap #1 would
+    be recorded and ``blocked_environment_at`` would hold one entry.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.config import WRITER_MARKER_FILENAME
+    from charlie_work.worktree import worktree_path_for_branch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=0,
+            redispatch_window_minutes=240,
+            max_foreign_writer_reaps=2,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "rework-prompt.md").write_text("Fix the issues", encoding="utf-8")
+
+    # Materialize a marker at the worktree path derived from the PR head ref
+    # so Site 2 (pre-filter) reaps and lets the issue proceed to dispatch.
+    branch_pre = str(fake_gh.prs[0]["headRefName"])
+    wt_path_pre = worktree_path_for_branch(tmp_path, branch_pre, app._layout.worktrees)
+    wt_path_pre.mkdir(parents=True, exist_ok=True)
+    marker = {
+        "pid": 1234,
+        "session_id": "foreign-session",
+        "started_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z"),
+        "kind": "worker",
+        "process_start_time": 1234567890.0,
+    }
+    (wt_path_pre / WRITER_MARKER_FILENAME).write_text(json.dumps(marker), encoding="utf-8")
+
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
+    # _reap_idle_foreign_writer is shared by Site 2 (inline) and Site 3 (via
+    # _try_reap_blocked_foreign_writer). Return True without removing the
+    # marker so Site 3 can read it too.
+    monkeypatch.setattr(
+        "charlie_work.workflow._reap_idle_foreign_writer",
+        lambda worktree_path, pid, session_id, marker, _config, **_kw: True,
+    )
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="worktree has a live foreign writer",
+                failure_kind="worktree_foreign_writer",
+                pid=1234,
+                worktree_path=str(wt_path_pre),
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    result = app.dispatch_rework()
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    # Both Site 2 and Site 3 reaped: two reap timestamps recorded. If Site 3
+    # had not fired, only one reap would be recorded and
+    # blocked_environment_at would hold one entry (the post-dispatch failure).
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["issues"]["123"]["blocked_environment_at"] == []
+    assert len(state["issues"]["123"].get("foreign_writer_reaps", [])) == 2
+
+
+def test_dispatch_rework_pre_escalation_safety_net_reaps_foreign_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1423: the rework candidate pre-filter loop's blocked-environment
+    safety net reaps an idle foreign writer before escalating. The marker is
+    read from the worktree path derived from the PR's head ref; on a
+    successful reap the issue proceeds as a legitimate candidate instead of
+    being escalated."""
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.config import WRITER_MARKER_FILENAME
+    from charlie_work.worktree import worktree_path_for_branch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+            max_foreign_writer_reaps=2,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "blocked_environment_at": _blocked_env_timestamps(2),
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "rework-prompt.md").write_text("Fix the issues", encoding="utf-8")
+
+    # Materialize the worktree dir the safety net derives from the PR head ref,
+    # with a live writer marker so the reap path has something to read.
+    branch_pre = str(fake_gh.prs[0]["headRefName"])
+    wt_path_pre = worktree_path_for_branch(tmp_path, branch_pre, app._layout.worktrees)
+    wt_path_pre.mkdir(parents=True, exist_ok=True)
+    marker = {
+        "pid": 1234,
+        "session_id": "foreign-session",
+        "started_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z"),
+        "kind": "worker",
+        "process_start_time": 1234567890.0,
+    }
+    (wt_path_pre / WRITER_MARKER_FILENAME).write_text(json.dumps(marker), encoding="utf-8")
+
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
+    reap_calls: list[int] = []
+
+    def _fake_reap(worktree_path, pid, session_id, marker, _config, **_kw):
+        reap_calls.append(pid)
+        return True
+
+    monkeypatch.setattr("charlie_work.workflow._reap_idle_foreign_writer", _fake_reap)
+
+    # The actual dispatch after the reap succeeds so the issue is dispatched.
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=True,
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    app.dispatch_rework()
+
+    # The safety net reaped the foreign writer instead of escalating.
+    assert reap_calls == [1234]
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] != "escalated"
+    assert state["issues"]["123"]["blocked_environment_at"] == []
+    assert len(state["issues"]["123"].get("foreign_writer_reaps", [])) == 1
+
+
+def test_dispatch_fresh_blocked_environment_reap_cap_escalates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1423 review: once ``foreign_writer_reaps`` reaches
+    ``max_foreign_writer_reaps``, the cap-exhaustion site escalates instead of
+    reaping again — a persistently-blocked worktree cannot loop forever
+    between reap and redispatch."""
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+            max_foreign_writer_reaps=2,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pre-seed: blocked_environment_at at the cap AND foreign_writer_reaps
+    # already at max_foreign_writer_reaps(2). The reap must NOT be attempted;
+    # the issue must escalate.
+    paths.root.mkdir(parents=True, exist_ok=True)
+    reap_ts = _blocked_env_timestamps(2)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "dispatch_failed",
+            "blocked_environment_at": _blocked_env_timestamps(2),
+            "foreign_writer_reaps": reap_ts,
+        }
+        save_state(paths.state_file, state)
+
+    wt_path = tmp_path / "wt-foreign"
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="worktree has a live foreign writer",
+                failure_kind="worktree_foreign_writer",
+                pid=1234,
+                worktree_path=str(wt_path),
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    def _reap_must_not_run(_failed_result, _config, _state_file, _issue_number):
+        raise AssertionError("reap must not be attempted once the reap cap is reached")
+
+    monkeypatch.setattr(
+        "charlie_work.workflow._try_reap_blocked_foreign_writer", _reap_must_not_run
+    )
+
+    result = app.dispatch(limit=1)
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    # Escalated, NOT reaped.
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "dispatch_blocked_environment"
+    # The reap counter is unchanged (no new reap recorded).
+    assert state["issues"]["123"]["foreign_writer_reaps"] == reap_ts
+
+
 def test_cleanup_stale_session_tmp_files_removes_stranded_tmp(
     tmp_path: Path,
 ) -> None:
