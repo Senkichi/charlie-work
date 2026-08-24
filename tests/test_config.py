@@ -1825,3 +1825,13 @@ def test_build_config_from_data_require_worker_github_token_rejects_non_bool() -
     """Issue #1001: dispatch.require_worker_github_token must be a bool."""
     with pytest.raises(ConfigError, match="require_worker_github_token.*must be a bool"):
         build_config_from_data({"dispatch": {"require_worker_github_token": "true"}})
+
+
+def test_provider_suspended_is_deterministic_escalation_failure_kind() -> None:
+    """Issue #1342: ``provider_suspended`` must sit in
+    DETERMINISTIC_ESCALATION_FAILURE_KINDS so a suspended provider account
+    escalates to an operator on the first occurrence instead of burning the
+    auto-redispatch cap on a deterministic external billing failure."""
+    from charlie_work.config import DETERMINISTIC_ESCALATION_FAILURE_KINDS
+
+    assert "provider_suspended" in DETERMINISTIC_ESCALATION_FAILURE_KINDS
