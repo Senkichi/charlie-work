@@ -7854,6 +7854,91 @@ def test_rescue_capture_excludes_scaffolding(
     remove_worktree(repo, info2.path, branch=branch_name)
 
 
+def test_rescue_capture_excludes_launcher_owned_shim_dirt(
+    tmp_path: Path,
+) -> None:
+    """Issue #1391: launcher-owned shim dirt (``.devin/``, ``.git_worktree_dir/``,
+    and a ``PR_BODY*.md`` scratch file) mixed with real tracked worker edits is
+    excluded from the captured rescue tree, while the real worker edits are
+    preserved.
+
+    Calls ``_capture_worktree_work_to_rescue_ref`` directly so the exclusion
+    pathspecs in the capture function are the only thing under test -- the
+    ``_worker_authored_dirty`` matcher that also ignores launcher-owned dirt
+    is not on this code path, so a regression in the capture exclusions cannot
+    be masked by the dirty check refusing to trigger.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    branch_name = "agent/issue-1391-rescue-shim-dirt"
+    info = create_worktree(repo, branch_name, base_ref="origin/main")
+
+    # Real worker edits: a tracked modification + an untracked worker file.
+    # These MUST appear in the rescue tree.
+    worker_readme = "modified by worker\n"
+    (info.path / "README.md").write_text(worker_readme, encoding="utf-8")
+    worker_new = "real worker edit\n"
+    (info.path / "worker_real_edit.txt").write_text(worker_new, encoding="utf-8")
+
+    # Launcher-owned shim dirt. These MUST NOT appear in the rescue tree.
+    (info.path / ".devin").mkdir(exist_ok=True)
+    (info.path / ".devin" / "config.json").write_text('{"shim": true}\n', encoding="utf-8")
+    (info.path / ".git_worktree_dir").mkdir(exist_ok=True)
+    (info.path / ".git_worktree_dir" / "marker").write_text("shim marker\n", encoding="utf-8")
+    # A PR_BODY*.md variant -- the glob exclusion must catch it.
+    pr_body = "draft PR body\n"
+    (info.path / "PR_BODY_1391.md").write_text(pr_body, encoding="utf-8")
+
+    capture = worktree_module._capture_worktree_work_to_rescue_ref(
+        repo, info.path, issue_number=1391
+    )
+
+    assert capture.error is None, f"capture failed: {capture.error}"
+    assert capture.ref_name is not None
+    assert capture.ref_name.startswith(RESCUE_REF_PREFIX)
+    rescue_ref = capture.ref_name
+
+    # Real worker edits ARE present in the rescue tree, byte-for-byte.
+    assert _git(repo, "show", f"{rescue_ref}:README.md").stdout == worker_readme
+    assert _git(repo, "show", f"{rescue_ref}:worker_real_edit.txt").stdout == worker_new
+
+    # Launcher-owned shim paths are EXCLUDED from the rescue tree: ``git show``
+    # for each shim path fails (non-zero exit) because the path does not exist
+    # in the captured tree.
+    for shim_path in (
+        ".devin/config.json",
+        ".git_worktree_dir/marker",
+        "PR_BODY_1391.md",
+    ):
+        show_result = subprocess.run(
+            ["git", "show", f"{rescue_ref}:{shim_path}"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        assert show_result.returncode != 0, (
+            f"shim path {shim_path!r} leaked into the rescue tree; "
+            f"git show returned {show_result.returncode} with stdout="
+            f"{show_result.stdout!r}"
+        )
+
+    # Sanity: no path under a launcher-owned directory or matching the PR body
+    # family appears anywhere in the captured tree.
+    tree_paths = _git(repo, "ls-tree", "-r", "--name-only", rescue_ref).stdout.splitlines()
+    leaked = [
+        p
+        for p in tree_paths
+        if p.startswith(".devin/")
+        or p.startswith(".git_worktree_dir/")
+        or p.startswith("PR_BODY")
+        or p in (".worker-pr-body.md", "_pr_body.md")
+    ]
+    assert leaked == [], f"launcher-owned shim paths leaked into rescue tree: {leaked}"
+
+    # Clean up.
+    remove_worktree(repo, info.path, branch=branch_name)
+
+
 def test_rescue_capture_emits_event_retrievable_via_query_events(
     tmp_path: Path,
 ) -> None:
