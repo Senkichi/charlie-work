@@ -36608,6 +36608,70 @@ def test_parse_blockers_ignores_downstream_reference_to_self() -> None:
     assert parse_blockers(body) == []
 
 
+def test_parse_blockers_quoted_backtick_phrase_does_not_self_block() -> None:
+    """Issue #1454 regression: an issue whose body quotes ANOTHER issue's
+    blocker declaration inside a Markdown backtick code span must not be
+    classified as blocked by the quoted number.
+
+    Reproduces the #1927 incident shape: a bug report ABOUT the parser
+    flapping on #887/#888 quoted their trigger phrase on its own line, with
+    no preceding issue ref in the clause, so the old backward-only guard
+    could not suppress it and the describing issue self-gated on #886.
+    """
+    from charlie_work.github import parse_blockers
+
+    body = (
+        "## Symptom\n\n"
+        "The parser flaps on #887 and #888.\n\n"
+        "Their bodies contain the trigger phrase:\n\n"
+        "`blocked by #886`\n\n"
+        "which the parser reads as a self-declaration.\n"
+    )
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_quoted_double_quote_phrase_does_not_self_block() -> None:
+    """Issue #1454: a trigger phrase inside straight double quotes is quoted
+    prose, not a self-declaration."""
+    from charlie_work.github import parse_blockers
+
+    body = (
+        "## Symptom\n\n"
+        'The parser sees the literal phrase "blocked by #886" in #887\'s '
+        "body and misreads it as a self-declaration.\n"
+    )
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_forward_foreign_ref_does_not_self_block() -> None:
+    """Issue #1454: a match whose clause carries another #NNN AFTER it (e.g.
+    an issue-referencing parenthetical) describes that other issue, not this
+    one. The old guard only looked backward and missed this."""
+    from charlie_work.github import parse_blockers
+
+    body = (
+        "## Symptom\n\n"
+        "The trigger phrase blocked by #886 (see #887) appears verbatim in "
+        "the upstream body.\n"
+    )
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_genuine_declaration_still_gates() -> None:
+    """Issue #1454 regression: a genuine first-person blocker declaration
+    (the #887/#888 shape) must still gate. The quoted-phrase fix must not
+    suppress real declarations."""
+    from charlie_work.github import parse_blockers
+
+    assert parse_blockers("This issue is blocked by #743") == [743]
+    assert parse_blockers("Blocked by #743, #744") == [743, 744]
+    assert parse_blockers("Depends on #123") == [123]
+    assert parse_blockers("Blocked-by: #456") == [456]
+    # Genuine declaration with surrounding prose but no foreign issue ref.
+    body = "## Summary\n\nFix the parser.\n\nBlocked by #886\n"
+    assert parse_blockers(body) == [886]
+
+
 def test_detect_prose_only_dependencies_do_not_dispatch_before() -> None:
     """Test detection of 'do not dispatch before' pattern (issue #225)."""
     from charlie_work.github import detect_prose_only_dependencies

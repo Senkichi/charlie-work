@@ -2555,15 +2555,43 @@ _BLOCKER_PATTERNS = [
 _CLAUSE_BOUNDARY_CHARS = ".!?\n"
 _ISSUE_REF = re.compile(r"#\d+")
 
+# Markdown backtick code span: an opening run of backticks, content, and a
+# closing run of the SAME length. Capturing group 2 is the span content.
+_CODE_SPAN_RE = re.compile(r"(`+)(.+?)(\1)", flags=re.DOTALL)
+# Balanced straight-double-quote span. Group 1 is the quoted content.
+_DOUBLE_QUOTE_SPAN_RE = re.compile(r'"([^"]*)"')
 
-def _clause_preceding(text: str, match_start: int) -> str:
-    """Return the text of the sentence/line leading up to a match.
 
-    Bounded by the closest preceding sentence terminator (".", "!", "?") or
-    line break, so each bullet/sentence is judged independently.
+def _inside_code_span(text: str, start: int, end: int) -> bool:
+    """True if the [start, end) range falls inside a Markdown backtick code span."""
+    for m in _CODE_SPAN_RE.finditer(text):
+        if m.start(2) <= start and end <= m.end(2):
+            return True
+    return False
+
+
+def _inside_quoted_span(text: str, start: int, end: int) -> bool:
+    """True if the [start, end) range falls inside a straight-double-quote span."""
+    for m in _DOUBLE_QUOTE_SPAN_RE.finditer(text):
+        if m.start(1) <= start and end <= m.end(1):
+            return True
+    return False
+
+
+def _clause_bounds(text: str, match_start: int, match_end: int) -> tuple[int, int]:
+    """Return the (start, end) offsets of the sentence/line containing a match.
+
+    Bounded by the closest preceding AND following sentence terminator
+    (".", "!", "?") or line break, so each bullet/sentence is judged
+    independently. The boundary characters themselves are excluded from the
+    returned range.
     """
-    boundary = max(text.rfind(ch, 0, match_start) for ch in _CLAUSE_BOUNDARY_CHARS)
-    return text[boundary + 1 : match_start]
+    start_boundary = max(text.rfind(ch, 0, match_start) for ch in _CLAUSE_BOUNDARY_CHARS)
+    start = start_boundary + 1 if start_boundary != -1 else 0
+    end_candidates = [text.find(ch, match_end) for ch in _CLAUSE_BOUNDARY_CHARS]
+    end_candidates = [p for p in end_candidates if p != -1]
+    end = min(end_candidates) if end_candidates else len(text)
+    return start, end
 
 
 def is_infrastructure_failure(job: dict[str, Any], annotations: list[dict[str, Any]]) -> bool:
@@ -2609,10 +2637,21 @@ def parse_blockers(text: str) -> list[int]:
     Handles comma-separated lists (e.g., "Blocked by #743, #744").
 
     A match is only treated as the CURRENT issue declaring its own blocker
-    if no other issue reference appears earlier in the same sentence/line.
-    This excludes prose like "#168, #169, and #170 all build on this and are
-    blocked by #159" — which describes those OTHER issues as blocked, not
-    a self-declaration by whichever issue contains that text.
+    when it reads as a first-person declaration about THIS issue. Three guards
+    enforce that, in order of structural strength:
+
+    1. **Quoted/code exclusion** — a match falling inside a Markdown backtick
+       code span or a straight-double-quote span is prose quoting another
+       issue's blocker declaration, not a self-declaration. This is the fix
+       for issue #1454: an issue describing another issue's blocker phrase
+       (backticked, quoted, or parenthetically annotated) must not self-gate.
+    2. **Foreign-issue-ref exclusion** — a match whose containing
+       sentence/line carries ANY other ``#NNN`` reference (before OR after
+       the match, and not part of the match itself) describes those OTHER
+       issues, not this one. This generalizes the original backward-only
+       ``_clause_preceding`` guard (issue #159) to also look forward, so
+       issue-referencing parentheticals after the match are excluded too.
+    3. The remaining matches are honored as genuine self-declarations.
 
     Returns an empty list if no blockers are found.
     """
@@ -2623,7 +2662,28 @@ def parse_blockers(text: str) -> list[int]:
     # Check if they appear in blocker context
     for pattern in _BLOCKER_PATTERNS:
         for match in pattern.finditer(text):
-            if _ISSUE_REF.search(_clause_preceding(text, match.start())):
+            match_start, match_end = match.start(), match.end()
+
+            # Guard 1: a match inside a code span or quoted span is quoted
+            # prose describing another issue, not a self-declaration.
+            if _inside_code_span(text, match_start, match_end):
+                continue
+            if _inside_quoted_span(text, match_start, match_end):
+                continue
+
+            # Guard 2: any OTHER #NNN in the containing clause (not part of
+            # this match) means the clause is about a different issue.
+            clause_start, clause_end = _clause_bounds(text, match_start, match_end)
+            clause = text[clause_start:clause_end]
+            match_rel_start = match_start - clause_start
+            match_rel_end = match_end - clause_start
+            has_foreign_ref = False
+            for ref in _ISSUE_REF.finditer(clause):
+                if ref.start() >= match_rel_start and ref.end() <= match_rel_end:
+                    continue  # part of the match itself
+                has_foreign_ref = True
+                break
+            if has_foreign_ref:
                 continue
 
             # Extract the full match and find all #N references within it
