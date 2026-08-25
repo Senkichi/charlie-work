@@ -15,9 +15,20 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from charlie_work.config import OrchestratorConfig
+import pytest
+
+from charlie_work.config import (
+    ConfigError,
+    DeescalationConfig,
+    MainCiReclaimConfig,
+    OrchestratorConfig,
+    ReconcilePassConfig,
+    WorktreeReclamationConfig,
+    build_config_from_data,
+)
 from charlie_work.layout import status_snapshot_path
 from charlie_work.paths import runtime_paths
+from charlie_work.state import empty_state, save_state
 from charlie_work.workflow import OrchestratorApp
 
 
@@ -110,7 +121,11 @@ def test_status_serves_from_fresh_snapshot(tmp_path: Path) -> None:
     result = app.status()
 
     assert result.ok is True
-    assert result.data == cached_data
+    # The cached payload's domain fields are preserved verbatim; the
+    # freshness fields (snapshot_written_at / cache_age_seconds) are injected
+    # by _read_status_snapshot and are asserted separately below.
+    assert result.data["ready_issue_count"] == 42
+    assert result.data["available_issue_count"] == 7
     # Zero GitHub API calls — the cache was served, not the live path.
     assert gh.issue_list_calls == 0
 
@@ -231,7 +246,13 @@ def test_write_then_read_roundtrip(tmp_path: Path) -> None:
     # Second call: should serve from cache (zero new API calls).
     result_cached = app.status()
     assert gh.issue_list_calls == calls_after_write
-    assert result_cached.data == result_live.data
+    # Domain fields match; freshness fields differ by design (live has None,
+    # cached has the snapshot timestamp + age).
+    assert result_cached.data["ready_issue_count"] == result_live.data["ready_issue_count"]
+    assert result_cached.data["snapshot_written_at"] is not None
+    assert result_cached.data["cache_age_seconds"] is not None
+    assert result_live.data["snapshot_written_at"] is None
+    assert result_live.data["cache_age_seconds"] is None
 
 
 def test_write_status_snapshot_does_not_recurse(tmp_path: Path) -> None:
@@ -251,3 +272,144 @@ def test_write_status_snapshot_does_not_recurse(tmp_path: Path) -> None:
     assert envelope["data"]["ready_issue_count"] == 1
     # And the live computation must have run (GitHub API calls were made).
     assert gh.issue_list_calls > 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #1463 review: cache freshness surfaced into the data dict
+# ---------------------------------------------------------------------------
+
+
+def test_status_cached_data_includes_freshness_fields(tmp_path: Path) -> None:
+    """A cached response includes ``snapshot_written_at`` and
+    ``cache_age_seconds`` in the ``data`` dict so consumers (heartbeat_check,
+    humans) can distinguish a cached response from a live one without
+    inspecting ``CommandResult.message`` (which ``run_fleet_status``
+    discards)."""
+    app, _gh = _make_app(tmp_path)
+    _write_snapshot(tmp_path, {"ready_issue_count": 5}, age_seconds=30)
+
+    result = app.status()
+
+    assert result.ok is True
+    assert result.data["snapshot_written_at"] is not None
+    # cache_age_seconds should be approximately 30 (within a tolerance).
+    assert 25 <= result.data["cache_age_seconds"] <= 60
+
+
+def test_status_live_data_includes_null_freshness_fields(tmp_path: Path) -> None:
+    """A live (non-cached) response includes ``snapshot_written_at=None`` and
+    ``cache_age_seconds=None`` so consumers can positively identify a fresh
+    computation, not merely infer it from the absence of a cache."""
+    app, _gh = _make_app(tmp_path)
+
+    result = app.status()
+
+    assert result.ok is True
+    assert result.data["snapshot_written_at"] is None
+    assert result.data["cache_age_seconds"] is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #1463 review: integration tests driving a full app.loop() pass
+# ---------------------------------------------------------------------------
+
+
+def _build_loop_app(root: Path, *, dry_run: bool) -> OrchestratorApp:
+    """Build an OrchestratorApp wired for a minimal ``loop()`` pass.
+
+    Mirrors ``test_write_gate_dry_run_loop.py``'s ``_build_app``: disables the
+    four cadence-gated lanes that emit events unconditionally on a due pass
+    (deescalation, worktree_reclamation, main_ci_reclaim, reconcile_pass) so
+    the snapshot-write is the only filesystem artifact this test needs to
+    reason about. Uses the shared ``FakeGitHub`` from ``_fakes_github``.
+    """
+    from _fakes_github import FakeGitHub
+
+    config = OrchestratorConfig(
+        deescalation=DeescalationConfig(enabled=False),
+        worktree_reclamation=WorktreeReclamationConfig(enabled=False),
+        main_ci_reclaim=MainCiReclaimConfig(enabled=False),
+        reconcile_pass=ReconcilePassConfig(enabled=False),
+    )
+    paths = runtime_paths(root, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    save_state(paths.state_file, empty_state())
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = []
+
+    app = OrchestratorApp(root, paths, config, fake_gh, dry_run=dry_run)
+    # The sessions dir must exist so iter_workers does not error.
+    sessions_dir = root / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    return app
+
+
+def test_loop_pass_writes_status_snapshot(tmp_path: Path) -> None:
+    """A full ``app.loop()`` pass (non-dry-run) writes
+    ``status-snapshot.json`` as a side effect — the real production wiring
+    (``_loop_impl`` -> ``_write_status_snapshot``), not a direct unit call."""
+    frozen_now = datetime.now(UTC) + timedelta(hours=1)
+    app = _build_loop_app(tmp_path / "live", dry_run=False)
+    snapshot_path = app._status_snapshot_file
+
+    assert not snapshot_path.exists(), "precondition: no snapshot yet"
+
+    result = app.loop(limit=0, now=frozen_now)
+
+    assert result.ok, f"loop pass must succeed for the snapshot write to run: {result.message}"
+    assert snapshot_path.exists(), (
+        "a non-dry-run loop pass must write status-snapshot.json so "
+        "`fleet status --json` can serve from the cache"
+    )
+    envelope = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert "snapshot_written_at" in envelope
+    assert isinstance(envelope["data"], dict)
+
+
+def test_loop_pass_dry_run_does_not_write_status_snapshot(tmp_path: Path) -> None:
+    """A ``dry_run=True`` ``app.loop()`` pass must NOT write
+    ``status-snapshot.json`` — the dry-run invariant (cf. #1412, #1413) that
+    gates every other loop-pass filesystem write. A dry-run pass writing the
+    snapshot would poison the cache with preview-only data that a subsequent
+    ``fleet status --json`` would serve as if it were real."""
+    frozen_now = datetime.now(UTC) + timedelta(hours=1)
+    app = _build_loop_app(tmp_path / "dry", dry_run=True)
+    snapshot_path = app._status_snapshot_file
+
+    assert not snapshot_path.exists(), "precondition: no snapshot yet"
+
+    result = app.loop(limit=0, now=frozen_now)
+
+    assert result.ok, f"loop pass must succeed even in dry-run: {result.message}"
+    assert not snapshot_path.exists(), (
+        "a dry_run=True loop pass must not write status-snapshot.json — "
+        "the dry-run invariant (cf. #1412, #1413) gates every loop-pass "
+        "filesystem write, including the status-snapshot cache"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1463 review: config-validation tests for status_snapshot_ttl_seconds
+# ---------------------------------------------------------------------------
+
+
+def test_status_snapshot_ttl_seconds_rejects_non_int() -> None:
+    """``runtime.status_snapshot_ttl_seconds`` must be an int; a string value
+    must raise ConfigError."""
+    with pytest.raises(ConfigError, match="status_snapshot_ttl_seconds.*must be an int"):
+        build_config_from_data({"runtime": {"status_snapshot_ttl_seconds": "900"}})
+
+
+def test_status_snapshot_ttl_seconds_rejects_bool() -> None:
+    """``bool`` is a subclass of ``int`` in Python but must be rejected —
+    ``True`` would silently mean a 1-second TTL."""
+    with pytest.raises(ConfigError, match="status_snapshot_ttl_seconds.*must be an int"):
+        build_config_from_data({"runtime": {"status_snapshot_ttl_seconds": True}})
+
+
+def test_status_snapshot_ttl_seconds_rejects_negative() -> None:
+    """A negative TTL is nonsensical; must raise ConfigError."""
+    with pytest.raises(ConfigError, match="status_snapshot_ttl_seconds.*must be >= 0"):
+        build_config_from_data({"runtime": {"status_snapshot_ttl_seconds": -1}})

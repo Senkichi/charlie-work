@@ -6874,6 +6874,13 @@ class OrchestratorApp:
                 operator_claimed,
                 ready_open_count=len(issues),
             ),
+            # Issue #1463 review: freshness signals so consumers
+            # (``heartbeat_check.py``, humans) can distinguish a live
+            # computation (both ``None``) from a cached snapshot (timestamp +
+            # age). See ``_read_status_snapshot`` for the cached-side
+            # injection.
+            "snapshot_written_at": None,
+            "cache_age_seconds": None,
         }
 
         # Add runners section if feature is enabled and observation succeeded
@@ -6928,6 +6935,18 @@ class OrchestratorApp:
         data = envelope.get("data")
         if not isinstance(data, dict):
             return None
+        # Issue #1463 review: surface cache freshness into the ``data`` dict
+        # itself, not just ``CommandResult.message`` (which ``run_fleet_status``
+        # discards). ``snapshot_written_at`` / ``cache_age_seconds`` let
+        # ``heartbeat_check.py`` and human operators distinguish a fresh live
+        # response (both ``None``) from a cached one (timestamp + age), so a
+        # stale-but-still-within-TTL snapshot can never be mistaken for a
+        # current reading. Injected here rather than stored in the envelope's
+        # ``data`` so the written snapshot never carries a stale freshness
+        # field of its own.
+        data = dict(data)
+        data["snapshot_written_at"] = written_at
+        data["cache_age_seconds"] = round(age, 1)
         return CommandResult(True, "status complete (cached)", data)
 
     def _write_status_snapshot(self) -> None:
@@ -20356,8 +20375,11 @@ class OrchestratorApp:
             # from this pass's dispatch/intake work, so the live status
             # computation here is far cheaper than a cold ``fleet status``
             # invocation. Best-effort: ``_write_status_snapshot`` logs and
-            # swallows all failures.
-            self._write_status_snapshot()
+            # swallows all failures. Gated on ``not self.dry_run``: a dry-run
+            # pass must not touch the filesystem (cf. #1412, #1413 -- the same
+            # dry-run invariant that gates every other loop-pass write).
+            if not self.dry_run:
+                self._write_status_snapshot()
             return result
 
     def _maybe_probe_quota_recovery(self, *, now: datetime | None = None) -> None:
