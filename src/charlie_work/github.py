@@ -2645,6 +2645,10 @@ def parse_blockers(text: str) -> list[int]:
        issue's blocker declaration, not a self-declaration. This is the fix
        for issue #1454: an issue describing another issue's blocker phrase
        (backticked, quoted, or parenthetically annotated) must not self-gate.
+       The span search is scoped to the containing clause (see guard 2) so an
+       unrelated stray backtick or quote ELSEWHERE in the body cannot pair
+       with a later one to envelope a genuine declaration and silently drop
+       it -- a real false-negative risk in this backtick-heavy codebase.
     2. **Foreign-issue-ref exclusion** — a match whose containing
        sentence/line carries ANY other ``#NNN`` reference (before OR after
        the match, and not part of the match itself) describes those OTHER
@@ -2664,19 +2668,27 @@ def parse_blockers(text: str) -> list[int]:
         for match in pattern.finditer(text):
             match_start, match_end = match.start(), match.end()
 
-            # Guard 1: a match inside a code span or quoted span is quoted
-            # prose describing another issue, not a self-declaration.
-            if _inside_code_span(text, match_start, match_end):
-                continue
-            if _inside_quoted_span(text, match_start, match_end):
-                continue
-
-            # Guard 2: any OTHER #NNN in the containing clause (not part of
-            # this match) means the clause is about a different issue.
+            # Both guards judge the match against its containing clause, so
+            # compute the clause window once and reuse it. Scoping the span
+            # check to the clause is what prevents an unrelated stray
+            # backtick/quote elsewhere in the body from swallowing a genuine
+            # declaration (issue #1454 rework).
             clause_start, clause_end = _clause_bounds(text, match_start, match_end)
             clause = text[clause_start:clause_end]
             match_rel_start = match_start - clause_start
             match_rel_end = match_end - clause_start
+
+            # Guard 1: a match inside a code span or quoted span WITHIN the
+            # clause is quoted prose describing another issue, not a
+            # self-declaration. Searched on the clause substring so a span
+            # opening outside this clause cannot envelope the match.
+            if _inside_code_span(clause, match_rel_start, match_rel_end):
+                continue
+            if _inside_quoted_span(clause, match_rel_start, match_rel_end):
+                continue
+
+            # Guard 2: any OTHER #NNN in the containing clause (not part of
+            # this match) means the clause is about a different issue.
             has_foreign_ref = False
             for ref in _ISSUE_REF.finditer(clause):
                 if ref.start() >= match_rel_start and ref.end() <= match_rel_end:

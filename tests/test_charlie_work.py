@@ -36674,6 +36674,41 @@ def test_parse_blockers_genuine_declaration_still_gates() -> None:
     assert parse_blockers(body) == [886]
 
 
+def test_parse_blockers_stray_backtick_elsewhere_does_not_swallow_declaration() -> None:
+    """Issue #1454 rework: an unrelated/unbalanced backtick ELSEWHERE in the
+    body must not pair with a later backtick to form a code span that
+    envelopes a genuine 'Blocked by #NNN' declaration and silently drop it.
+
+    The body below has a stray opening backtick on the first line and a
+    closing backtick on the last line. Against the whole-document span scan
+    (the pre-rework guard 1) the regex ``(`+)(.+?)(\\1)`` with re.DOTALL
+    matches one span whose content runs from "broken thing." through
+    "Blocked by #159" through "See also ", so the declaration is
+    misclassified as quoted prose and dropped -- a false negative. Scoping
+    the span search to the containing clause (bounded by newlines) leaves
+    the clause "Blocked by #159" with no backticks, so the declaration gates.
+    """
+    from charlie_work.github import parse_blockers
+
+    body = "TODO: fix the `broken thing.\nBlocked by #159\nSee also `foo`.\n"
+    assert parse_blockers(body) == [159]
+
+
+def test_parse_blockers_stray_double_quote_elsewhere_does_not_swallow_declaration() -> None:
+    """Issue #1454 rework: an unrelated/unbalanced straight double quote
+    ELSEWHERE in the body must not pair with a later quote to envelope a
+    genuine declaration. Same false-negative shape as the backtick case:
+    ``"([^"]*)"`` matches from the first quote to the next, swallowing the
+    declaration line in between when scanned over the whole document.
+    Scoping to the clause leaves "Blocked by #743" with no quotes, so it
+    gates.
+    """
+    from charlie_work.github import parse_blockers
+
+    body = 'The error was "connection refused.\nBlocked by #743\nThen it said "done".\n'
+    assert parse_blockers(body) == [743]
+
+
 def test_detect_prose_only_dependencies_do_not_dispatch_before() -> None:
     """Test detection of 'do not dispatch before' pattern (issue #225)."""
     from charlie_work.github import detect_prose_only_dependencies
