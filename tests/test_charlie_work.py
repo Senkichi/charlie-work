@@ -11145,7 +11145,7 @@ auto_merge:
   mergequeue_wedge_hours: -1
 """
     )
-    with pytest.raises(ConfigError, match="mergequeue_wedge_hours"):
+    with pytest.raises(ConfigError, match="must not be negative"):
         load_config(config_file)
 
 
@@ -11157,7 +11157,7 @@ auto_merge:
   mergequeue_wedge_hours: "soon"
 """
     )
-    with pytest.raises(ConfigError, match="mergequeue_wedge_hours"):
+    with pytest.raises(ConfigError, match="must be a number"):
         load_config(config_file)
 
 
@@ -18327,11 +18327,25 @@ def test_merge_ready_mergequeue_mode_labels_instead_of_merging(tmp_path: Path) -
     assert persisted["status"] != "merged"
 
 
-def test_merge_ready_mergequeue_stamps_and_preserves_dwell_tracking(tmp_path: Path) -> None:
+def test_merge_ready_mergequeue_stamps_and_preserves_dwell_tracking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Issue #1401: merge_ready stamps mergequeue_since/mergequeue_head_sha when
     a PR enters Aviator's queue, preserves them across passes while the head is
     frozen (so the wedge watchdog can measure true no-progress dwell), and
     resets them when the head advances (Aviator rebased -> progress, not a wedge)."""
+    # utc_now() strips microseconds, so two merge_ready calls within the same
+    # wall-clock second produce identical timestamps. Mock it with a per-call
+    # counter so the "head advanced -> fresh dwell window" assertion is
+    # deterministic, not a race against the clock.
+    _utc_call = 0
+
+    def _fake_utc_now() -> str:
+        nonlocal _utc_call
+        _utc_call += 1
+        return f"2026-01-01T00:00:{_utc_call:02d}Z"
+
+    monkeypatch.setattr("charlie_work.workflow.utc_now", _fake_utc_now)
     config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
