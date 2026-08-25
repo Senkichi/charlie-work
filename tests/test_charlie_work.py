@@ -40694,9 +40694,12 @@ def test_redispatch_timestamps_pruned_outside_window(tmp_path: Path) -> None:
 def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     """Test that redispatch_at is only written by known call sites."""
     # This test verifies by code inspection that redispatch_at is only written in:
-    # 1. dispatch_rework normal paths (success + failure + no-op rework pre-dispatch).
-    # 2. _classify_dead_sessions_and_update_throttle_state normal paths.
-    # 3. _reap_restore_rework_requested (issue #315 review finding 2).
+    # 1. dispatch_rework normal paths (success + no-op rework pre-dispatch) --
+    #    workflow.py, OrchestratorApp.dispatch_rework.
+    # 2. _classify_dead_sessions_and_update_throttle_state normal paths --
+    #    dead_worker_reap.py (issue #1317: moved verbatim from workflow.py).
+    # 3. _reap_restore_rework_requested (issue #315 review finding 2) --
+    #    dead_worker_reap.py (issue #1317: moved verbatim from workflow.py).
     # Escalated paths now consolidate on _escalate_issue and pass redispatch_at
     # through issue_extra, so direct entry["redispatch_at"] assignments only
     # remain in the non-escalated branches below.
@@ -40713,15 +40716,27 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     # dispatch_selection.py dropped the naive count to 4 with zero change to
     # any real write site -- a false regression signal, the opposite failure
     # mode from AC7's hazard test but the same root cause (name/text search
-    # over source that doesn't distinguish code from prose). Both files are
-    # scanned and summed via real ast.Assign nodes so neither a docstring
+    # over source that doesn't distinguish code from prose). All three files
+    # are scanned and summed via real ast.Assign nodes so neither a docstring
     # quote nor a future extraction of one of the three named call sites can
     # produce a false pass or a false failure here.
+    #
+    # issue #1317: the dead-worker/session-reap extraction moved call sites 2
+    # and 3 above out of workflow.py into dead_worker_reap.py verbatim -- the
+    # writers still exist, only their module changed (confirmed real split:
+    # workflow.py=2, dispatch_selection.py=0, dead_worker_reap.py=2, total
+    # unchanged at 4). dead_worker_reap.py is added to the scan so this guard
+    # keeps failing if a genuinely NEW, unknown writer appears in any of the
+    # three files, rather than going blind to two known call sites because
+    # they changed address.
     import ast
 
     workflow_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
     dispatch_selection_path = (
         Path(__file__).parents[1] / "src" / "charlie_work" / "dispatch_selection.py"
+    )
+    dead_worker_reap_path = (
+        Path(__file__).parents[1] / "src" / "charlie_work" / "dead_worker_reap.py"
     )
 
     def _count_redispatch_at_assignments(path: Path) -> int:
@@ -40742,12 +40757,15 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
         return count
 
     # Any unexpected increase means a new call site is writing redispatch_at.
-    redispatch_assignments = _count_redispatch_at_assignments(
-        workflow_path
-    ) + _count_redispatch_at_assignments(dispatch_selection_path)
+    redispatch_assignments = (
+        _count_redispatch_at_assignments(workflow_path)
+        + _count_redispatch_at_assignments(dispatch_selection_path)
+        + _count_redispatch_at_assignments(dead_worker_reap_path)
+    )
     assert redispatch_assignments == 4, (
         'Expected 4 real entry["redispatch_at"] assignment statements across '
-        f"workflow.py and dispatch_selection.py, found {redispatch_assignments}"
+        "workflow.py, dispatch_selection.py, and dead_worker_reap.py, found "
+        f"{redispatch_assignments}"
     )
 
 
