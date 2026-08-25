@@ -237,6 +237,13 @@ DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS: frozenset[str] = frozenset(
         # which never sets status "escalated". The kind alone never
         # identifies an escalation transition.
         "ci_run_never_created",
+        # Issue #1131: a rework-label skip diagnostic, not an escalation
+        # transition. Emitted inside ``record_review`` (which does perform
+        # escalation elsewhere), so the AST-based discovery in
+        # ``test_deescalation.py`` picks it up -- but the kind alone never
+        # identifies an escalation: it fires when rework routing is
+        # suppressed for a CLOSED issue, the opposite of an escalation.
+        "rework_label_skipped_issue_closed",
     }
 )
 
@@ -1229,6 +1236,36 @@ def arm_deescalation_pass(data: dict[str, Any], next_deescalation_at: str) -> di
     """
     section = _deescalation_pass(data)
     section["next_deescalation_at"] = next_deescalation_at
+    return {**data, "deescalation_pass": section}
+
+
+def is_operator_queue_review_due(data: dict[str, Any]) -> bool:
+    """True when the operator-queue depth gauge should run (issue #1314 item 2).
+
+    Same "absent schedule is due immediately" semantics as
+    ``is_deescalation_due`` -- a fresh deploy or a 0-interval config (the
+    default, meaning "every pass") is always due, and a malformed timestamp
+    is treated as due rather than wedging the gauge off forever.
+    """
+    next_at = _deescalation_pass(data).get("next_operator_queue_review_at")
+    if not next_at:
+        return True
+    try:
+        next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
+        return datetime.now(UTC) >= next_time
+    except (ValueError, TypeError):
+        return True
+
+
+def arm_operator_queue_review(
+    data: dict[str, Any], next_operator_queue_review_at: str
+) -> dict[str, Any]:
+    """Schedule the next operator-queue depth gauge check (issue #1314 item 2).
+
+    Returns a new state dict; does not mutate ``data``.
+    """
+    section = _deescalation_pass(data)
+    section["next_operator_queue_review_at"] = next_operator_queue_review_at
     return {**data, "deescalation_pass": section}
 
 

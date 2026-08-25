@@ -842,13 +842,36 @@ _RATCHET_BASELINE: dict[str, int] = {
     "state_migration.py": 1,
     "supervise.py": 11,
     "supervisor_lifecycle.py": 3,
+    # Issue #1131: +2 raw primitives in record_review's rework-label-skip
+    # guard (_record_event + save_state for rework_label_skipped_issue_closed).
+    # These match the existing raw pattern in record_review (which has not
+    # yet been converted to WriteGate -- see #1264/#1324), so routing them
+    # through self.write_gate would trigger R9's exclusive-use predicate on
+    # the whole function and flag every pre-existing raw call. The ratchet
+    # holds at the new count until record_review's full conversion.
     # Issue #1393: +11 raw calls for the blocked-environment dispatch path
     # (separate blocked_environment_at counter, distinct escalation reason,
     # candidate-filtering safety net, and stranded .json.tmp cleanup). These
     # are out-of-wave raw sites in unconverted territory, same class as the
     # pre-existing 270 — the ratchet holds at the new count.
-    "workflow.py": 281,
-    "worktree.py": 1,
+    # Issue #1314: +2 raw calls for the operator-queue depth gauge
+    # (_maybe_emit_operator_queue_depth: one save_state + one _record_event
+    # -> append_event). Same out-of-wave raw-site class as the pre-existing
+    # 281 — the ratchet holds at the new count.
+    # Combined baseline after merging #1131 (+2), #1393 (+11), and #1314 (+2)
+    # onto the pre-existing 270: 285.
+    "workflow.py": 285,
+    # Issue #1423: +2 raw primitives in _reap_idle_foreign_writer (log_event
+    # for the foreign_writer_reaped instrumentation event, and kill_orphan_pid
+    # for sweeping the reaped writer's orphan processes). This is a standalone
+    # function in worktree.py, not an OrchestratorApp method, so it has no
+    # self.write_gate receiver and cannot use Convention A without a
+    # write_gate parameter threaded through every caller — the same
+    # out-of-wave pattern as the #1393 blocked-environment sites. The
+    # log_event call is best-effort (wrapped in try/except), and
+    # kill_orphan_pid is a process-kill primitive, not a state write. The
+    # ratchet holds at the new count until worktree.py's conversion wave.
+    "worktree.py": 3,
 }
 
 

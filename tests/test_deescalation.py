@@ -47,7 +47,7 @@ from pathlib import Path
 
 import pytest
 
-from charlie_work.instrumentation import log_event
+from charlie_work.instrumentation import event_counts_by_kind, log_event
 from charlie_work.janitor import JanitorVerdict
 from charlie_work.state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
@@ -61,7 +61,7 @@ from charlie_work.worktree import worktree_path_for_branch
 from charlie_work.workflow import OrchestratorApp
 
 from _helpers import _second_mergequeue_pr
-from _unescalate_fixtures import _app, _events
+from _unescalate_fixtures import _app, _dry_run_app, _events
 
 
 def test_deescalation_sweep_clears_mechanical_and_leaves_judgment_untouched(
@@ -1462,3 +1462,140 @@ def test_sweep_does_not_reset_rework_counter_for_non_rework_reason(
     assert "escalation_reason" not in state["issues"]["123"]
     cleared = _events(state, "deescalation_cleared")
     assert cleared[0]["payload"]["rework_budget_reset"] is True
+
+
+# --- issue #1327: dry-run state/label divergence ---
+
+
+def _seed_escalated_mechanical(tmp_path: Path, app: OrchestratorApp) -> None:
+    """Seed issue 123 / PR 456 as an escalated ``mechanical`` issue on a
+    janitor-green, OPEN, mergeable PR -- exactly the fixture
+    ``test_deescalation_sweep_clears_mechanical_and_leaves_judgment_untouched``
+    proves the sweep DOES clear under ``dry_run=False``."""
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "escalation_reason": "session_failed_escalated",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "session_failed_escalated",
+            "reason_class": "mechanical",
+        }
+        save_state(app.paths.state_file, state)
+
+
+def test_deescalation_sweep_dry_run_leaves_state_and_labels_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Issue #1327: under ``dry_run=True`` the de-escalation sweep must not
+    clear ``status`` in ``state.json`` while the paired GitHub label
+    transition is suppressed at the sink -- that divergence is exactly the
+    invariant ("issue workflow state is stored as GitHub labels on the issue
+    and mirrored to state.json") this repo exists to preserve.
+
+    The sweep's raw ``save_state`` calls (the headline mutation at the
+    clear site, the cadence-arm write, the cap-exhaustion marker, and the
+    per-pass summary event) must all be routed through ``self.write_gate``
+    so they are suppressed in lockstep with the already-gated
+    ``transition()`` call. Binding decision C1.2 ("no event at all under
+    dry-run") applies one level up: a dry-run sweep pass must be
+    byte-identical to a pass that never ran.
+
+    Positive control: the same seed under ``dry_run=False`` (the existing
+    ``test_deescalation_sweep_clears_mechanical_and_leaves_judgment_untouched``)
+    really does clear the issue and apply the label edge -- so this is NOT
+    an empty-queue fixture that passes without ever reaching the converted
+    code.
+    """
+    app = _dry_run_app(tmp_path)
+    _seed_escalated_mechanical(tmp_path, app)
+
+    before_bytes = app.paths.state_file.read_bytes()
+    events_before = sum(event_counts_by_kind(app.paths.state_file).values())
+
+    app._maybe_deescalate_mechanical()
+
+    # C1.2: state.json byte-identical to a pass that never ran.
+    assert app.paths.state_file.read_bytes() == before_bytes, (
+        "issue #1327: a dry_run=True de-escalation sweep must not clear "
+        "status in state.json -- the paired label transition is already "
+        "suppressed at the GitHub sink, so a state write here diverges the "
+        "two systems of record"
+    )
+    state = load_state(app.paths.state_file)
+    issue_123 = state["issues"]["123"]
+    assert issue_123["status"] == "escalated", (
+        "the mechanical escalation must not be cleared under dry-run"
+    )
+    assert issue_123["reason_class"] == "mechanical"
+    assert issue_123["escalation_reason"] == "session_failed_escalated"
+    assert "auto_deescalation_count" not in issue_123
+    # The PR record's escalation_reason must also be untouched.
+    assert state["prs"]["456"]["escalation_reason"] == "session_failed_escalated"
+    # No cadence-arm write either: ``deescalation_pass`` must not appear.
+    assert "deescalation_pass" not in state
+
+    # C1.2: zero new events.db rows -- "no event at all under dry-run".
+    events_after = sum(event_counts_by_kind(app.paths.state_file).values())
+    assert events_after == events_before, (
+        f"issue #1327: dry_run=True sweep emitted events (events.db row "
+        f"count moved from {events_before} to {events_after}) -- the "
+        f"deescalation_cleared / deescalation_pass_completed / "
+        f"deescalation_cap_exhausted emitters must all be gated"
+    )
+    assert _events(state, "deescalation_cleared") == []
+    assert _events(state, "deescalation_pass_completed") == []
+
+    # The GitHub label transition is gated at the sink already; assert it
+    # here too so a future regression at either layer is caught.
+    assert app.gh.labels_added == []
+    assert app.gh.labels_removed == []
+
+
+def test_deescalate_mechanical_issue_dry_run_does_not_clear_status(
+    tmp_path: Path,
+) -> None:
+    """Issue #1327, per-issue entry point: ``_deescalate_mechanical_issue``
+    itself (not just the sweep wrapper) must not clear ``status`` in
+    ``state.json`` under ``dry_run=True``. This is the function that owns
+    the headline mutation -- the raw ``save_state`` that writes
+    ``status: PASSIVE_OPEN_STATUS`` -- so it is tested directly, not only
+    through ``_maybe_deescalate_mechanical``.
+    """
+    app = _dry_run_app(tmp_path)
+    _seed_escalated_mechanical(tmp_path, app)
+
+    before_bytes = app.paths.state_file.read_bytes()
+    events_before = sum(event_counts_by_kind(app.paths.state_file).values())
+
+    outcome = app._deescalate_mechanical_issue(123)
+
+    # Under dry-run the issue must NOT be reported as cleared -- the state
+    # write that records the clear is suppressed, so reporting ``cleared``
+    # would itself be a divergence between the return value and state.json.
+    assert not outcome.get("cleared"), (
+        f"_deescalate_mechanical_issue must not report a clear under "
+        f"dry_run=True (outcome={outcome}) -- the state write backing that "
+        f"report is suppressed by WriteGate"
+    )
+
+    assert app.paths.state_file.read_bytes() == before_bytes, (
+        "issue #1327: _deescalate_mechanical_issue must not write state.json "
+        "under dry_run=True -- the headline status-clearing save_state is "
+        "the divergence this issue exists to fix"
+    )
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert "auto_deescalation_count" not in state["issues"]["123"]
+
+    events_after = sum(event_counts_by_kind(app.paths.state_file).values())
+    assert events_after == events_before, (
+        "issue #1327: _deescalate_mechanical_issue must emit zero events under dry_run=True"
+    )
+    assert app.gh.labels_added == []
+    assert app.gh.labels_removed == []
