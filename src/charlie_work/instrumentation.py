@@ -409,6 +409,16 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "venv_pth_mismatch": "warning",
         "venv_pth_repaired": "warning",
         "worktree_foreign_writer": "warning",
+        # Issue #1444: the module-map section could not be derived from the
+        # live tree at packet build time (unparseable file, missing package
+        # dir, I/O error). Warning, not error: the dispatch proceeds with an
+        # omitted section -- the worker loses placement steering for this one
+        # packet, but no work is lost and the next packet rebuilds the map
+        # against the then-current tree. The consumer is heartbeat_check.py's
+        # check_warning_events, which reads every level='warning' row from
+        # events.db (derived from the level column, never a hardcoded kind
+        # list), so this kind is visible to the operator the moment it fires.
+        "worker_module_map_failed": "warning",
         # Issue #1393: a pre-launch environment block (e.g.
         # worktree_foreign_writer) prevented a dispatch from starting. Warning,
         # not error: the issue is not terminal — the cap may not yet be
