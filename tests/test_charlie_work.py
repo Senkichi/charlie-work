@@ -2553,6 +2553,7 @@ def test_validate_field_lists_passes_when_gh_lists_all_fields(monkeypatch, tmp_p
             "isCrossRepository",
             "mergeable",
             "headRefOid",
+            "closedAt",
             "databaseId",
             "status",
             "createdAt",
@@ -8520,8 +8521,15 @@ def test_dispatch_reviews_records_review_effort_arm_on_state_and_event(
     claim_events = [e for e in state["events"] if e.get("kind") == "review_dispatch_claim"]
     assert len(claim_events) == 1
     assignments = claim_events[0]["payload"]["review_effort_assignments"]
+    # Issue #1439: the structure-aware turn cap is resolved alongside the
+    # review_effort arm and mirrored into the same assignment record.
     assert assignments == [
-        {"pr_number": 100, "review_effort_arm": "treatment", "review_effort_used": "high"}
+        {
+            "pr_number": 100,
+            "review_effort_arm": "treatment",
+            "review_effort_used": "high",
+            "review_turn_cap": config.review_dispatch.review_max_turns,
+        }
     ]
 
 
@@ -15984,6 +15992,526 @@ def test_janitor_required_check_infra_failure_stays_blocked(tmp_path: Path) -> N
     assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
+# ---------------------------------------------------------------------------
+# Issue #1383: infra_blocked routing -- AC1 through AC4
+# ---------------------------------------------------------------------------
+
+
+class _FakeGitHubWithInfraBlockedJob(FakeGitHubWithChecksAndAnnotations):
+    """FakeGitHub whose ``actions_job`` returns a configurable per-job-id mapping.
+
+    Simulates the Actions API response for a budget-exhausted / runner-outage
+    job: zero steps, FAILURE conclusion, optionally a billing annotation.
+    """
+
+    def __init__(
+        self,
+        checks: list[dict[str, Any]] | None = None,
+        annotations_by_check_run_id: dict[int, list[dict[str, Any]]] | None = None,
+        jobs_by_check_run_id: dict[int, dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(checks, annotations_by_check_run_id)
+        self._jobs = jobs_by_check_run_id or {}
+
+    def actions_job(self, job_id: int) -> dict[str, Any] | None:
+        return self._jobs.get(job_id)
+
+
+def test_infra_blocked_budget_failure_no_rework(tmp_path: Path) -> None:
+    """AC1: a simulated check run failing in under 10 seconds with zero steps
+    and a budget annotation is classified ``infra_blocked`` and dispatches no
+    rework."""
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _FakeGitHubWithInfraBlockedJob(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        annotations_by_check_run_id={
+            9001: [
+                {
+                    "message": "The job was not started because your spending limit needs to be increased."
+                }
+            ],
+        },
+        jobs_by_check_run_id={
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    # AC1: no rework dispatched
+    assert result.ok is False
+    assert result.data.get("infra_blocked") is True
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+    # The issue is NOT transitioned to in_progress (no rework)
+    assert (123, config.labels.in_progress) not in fake_gh.labels_added
+
+
+def test_infra_blocked_no_rework_counter_incremented(tmp_path: Path) -> None:
+    """AC2: attempt counters remain unchanged after an infra_blocked pass."""
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _FakeGitHubWithInfraBlockedJob(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.review(456)
+
+    state = load_state(paths.state_file)
+    pr_state = state.get("prs", {}).get("456", {})
+    # No rework attempts recorded for the infra_blocked PR
+    assert pr_state.get("no_op_rework_attempts", 0) == 0
+    assert pr_state.get("check_rerun_attempts", {}).get("Tests passed", 0) == 0
+
+
+def test_infra_blocked_then_genuine_failure_routes_to_rework(tmp_path: Path) -> None:
+    """AC2: a later genuine test failure on the same PR still routes to rework normally."""
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Pass 1: infra_blocked (zero-step FAILURE)
+    fake_gh_infra = _FakeGitHubWithInfraBlockedJob(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh_infra)
+    result1 = app.review(456)
+    assert result1.data.get("infra_blocked") is True
+
+    # Pass 2: genuine test failure (real test step failed)
+    fake_gh_real = _FakeGitHubWithInfraBlockedJob(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9002},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            9002: {
+                "conclusion": "FAILURE",
+                "steps": [
+                    {"name": "Set up job", "conclusion": "SUCCESS"},
+                    {"name": "Run tests", "conclusion": "FAILURE"},
+                ],
+            },
+        },
+    )
+    fake_gh_real.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app2 = OrchestratorApp(tmp_path, paths, config, fake_gh_real)
+    result2 = app2.review(456)
+
+    # AC2: genuine failure routes to rework normally
+    assert result2.ok is True  # review packet generated (rework dispatched)
+    assert result2.data.get("infra_blocked") is not True
+
+
+def test_infra_blocked_persistence_one_escalation_per_window(tmp_path: Path) -> None:
+    """AC3: persistence across N passes emits exactly one operator escalation
+    event per window, not one event per PR per pass."""
+    from charlie_work.config import InfraBlockedConfig
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()  # reset cross-pass state from other tests
+
+    config = _required_checks_config(
+        infra_blocked=InfraBlockedConfig(persistence_passes=2, escalation_window_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    def make_infra_blocked_fake() -> _FakeGitHubWithInfraBlockedJob:
+        return _FakeGitHubWithInfraBlockedJob(
+            checks=[
+                {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+                {"name": "Lint & Format", "bucket": "pass"},
+                {"name": "Pre-commit", "state": "SUCCESS"},
+            ],
+            jobs_by_check_run_id={
+                9001: {"conclusion": "FAILURE", "steps": []},
+            },
+        )
+
+    # Pass 1: infra_blocked, but persistence_passes=2 so no escalation yet
+    app1 = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    app1.review(456)
+    escalated_1 = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated_1) == 0
+
+    # Pass 2: persistence threshold reached -> one escalation
+    app2 = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    app2.review(456)
+    escalated_2 = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated_2) == 1
+
+    # Pass 3: same window -> no additional escalation
+    app3 = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    app3.review(456)
+    escalated_3 = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated_3) == 1  # still exactly one
+
+
+def test_infra_blocked_multiple_prs_one_pass_no_premature_escalation(
+    tmp_path: Path,
+) -> None:
+    """AC3 (rework finding): multiple infra-blocked PRs encountered within a
+    single loop pass must increment ``consecutive_passes`` at most ONCE for
+    that pass, not once per PR. Without the correlation_id gate on the
+    increment, N concurrent infra-blocked PRs in one pass reach
+    ``persistence_passes=N`` and fire ``infra_blocked_escalated`` within
+    that single pass -- contradicting the documented "persistence across N
+    passes, not per PR per pass" design.
+
+    This test simulates a single pass (one ``correlation_context``) that
+    encounters three infra-blocked PRs by calling ``review()`` three times
+    within that context. With ``persistence_passes=3``, the bug would fire
+    escalation on the third call within the same pass; the fix holds the
+    counter at 1 for the whole pass, so no escalation fires until two more
+    passes observe infra-blocked PRs.
+    """
+    from charlie_work.config import InfraBlockedConfig
+    from charlie_work.instrumentation import correlation_context
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+
+    config = _required_checks_config(
+        infra_blocked=InfraBlockedConfig(persistence_passes=3, escalation_window_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    def make_infra_blocked_fake() -> _FakeGitHubWithInfraBlockedJob:
+        return _FakeGitHubWithInfraBlockedJob(
+            checks=[
+                {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+                {"name": "Lint & Format", "bucket": "pass"},
+                {"name": "Pre-commit", "state": "SUCCESS"},
+            ],
+            jobs_by_check_run_id={
+                9001: {"conclusion": "FAILURE", "steps": []},
+            },
+        )
+
+    # A single pass: one correlation_context, three infra-blocked review()
+    # calls (simulating three PRs encountered in the same pass). The
+    # infra_blocked branch is idempotent (no state/label mutation, early
+    # return), so repeated calls for the same PR exercise the same counter
+    # path as distinct PRs would.
+    app = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    with correlation_context() as cid:
+        app.review(456)
+        app.review(456)
+        app.review(456)
+
+    # The counter incremented exactly once for this pass, not three times.
+    repo_key = str(tmp_path)
+    assert _infra_blocked_window[repo_key]["consecutive_passes"] == 1, (
+        f"expected one increment for pass {cid!r}, got "
+        f"{_infra_blocked_window[repo_key]['consecutive_passes']!r}"
+    )
+    # persistence_passes=3 not reached within a single pass -> no escalation.
+    escalated = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated) == 0, escalated
+
+    # A second pass (new correlation_context) increments again -> counter=2,
+    # still below threshold -> no escalation.
+    app2 = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    with correlation_context():
+        app2.review(456)
+    assert _infra_blocked_window[repo_key]["consecutive_passes"] == 2
+    escalated_2 = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated_2) == 0
+
+    # A third pass reaches persistence_passes=3 -> exactly one escalation.
+    app3 = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    with correlation_context():
+        app3.review(456)
+    assert _infra_blocked_window[repo_key]["consecutive_passes"] == 3
+    escalated_3 = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated_3) == 1
+
+
+def test_infra_blocked_window_resets_when_pass_reviews_clear_prs(tmp_path: Path) -> None:
+    """Rework finding: the ``_loop_impl`` branch that resets
+    ``_infra_blocked_window`` when a pass reviews PRs and finds none
+    infra-blocked (the fleet-wide infra condition has cleared). A pass
+    that reviews at least one clear PR must zero the consecutive-pass
+    counter so the next outage starts fresh, rather than carrying stale
+    persistence forward.
+
+    ``FakeGitHub()`` ships a janitor-green PR 456 with passing required
+    checks, so ``loop(limit=0)`` runs a full pass (intake, dispatch, the
+    review lane, the post-pass reset sweep) that actually reviews PR 456
+    and emits no ``check_infra_blocked`` events for this pass's
+    correlation_id -- exactly the "we looked and the coast was clear"
+    condition that triggers the reset.
+    """
+    from charlie_work.workflow import _infra_blocked_window
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pre-populate the window as if prior passes observed infra-blocked PRs.
+    repo_key = str(tmp_path)
+    _infra_blocked_window[repo_key] = {
+        "consecutive_passes": 2,
+        "last_escalation": datetime.now(UTC),
+        "last_pass_cid": "stale-cid-from-prior-pass",
+    }
+
+    result = app.loop(limit=0)
+
+    # The pass reviewed PR 456 (green) and found no infra-blocked PRs -> the
+    # window was reset.
+    assert len(result.data["reviews"]) >= 1
+    window = _infra_blocked_window[repo_key]
+    assert window["consecutive_passes"] == 0
+    assert window["last_escalation"] is None
+    assert window["last_pass_cid"] is None
+
+
+def test_infra_blocked_window_not_reset_when_pass_reviews_zero_prs(tmp_path: Path) -> None:
+    """Round-2 #1383 regression: a pass that reviews ZERO PRs during a live
+    outage must NOT reset ``_infra_blocked_window``. The prior reset logic
+    conflated "zero ``check_infra_blocked`` events emitted" with "we looked
+    and the coast was clear" -- but a pass that reviews nothing also emits
+    zero such events, so an idle pass during a live outage silently cleared
+    ``consecutive_passes``/``last_escalation`` and could prevent the AC3
+    persistence escalation from ever firing.
+
+    Distinct from ``test_infra_blocked_window_resets_when_pass_reviews_clear_prs``
+    (which reviews a green PR and DOES reset): here the PR/issue queue is
+    empty so the review lane runs over zero PRs.
+    """
+    from charlie_work.workflow import _infra_blocked_window
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Empty queue: no PRs and no issues, so the review lane reviews nothing.
+    fake_gh.prs = []
+    fake_gh.issues = []
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pre-populate the window as if prior passes observed infra-blocked PRs
+    # (a live outage is in progress).
+    repo_key = str(tmp_path)
+    prior_last_esc = datetime.now(UTC)
+    _infra_blocked_window[repo_key] = {
+        "consecutive_passes": 2,
+        "last_escalation": prior_last_esc,
+        "last_pass_cid": "stale-cid-from-prior-pass",
+    }
+
+    result = app.loop(limit=0)
+
+    # The pass reviewed zero PRs -> the window must be preserved, not reset.
+    assert len(result.data["reviews"]) == 0
+    window = _infra_blocked_window[repo_key]
+    assert window["consecutive_passes"] == 2
+    assert window["last_escalation"] == prior_last_esc
+    assert window["last_pass_cid"] == "stale-cid-from-prior-pass"
+
+
+def test_infra_blocked_check_infra_blocked_event_emitted(tmp_path: Path) -> None:
+    """AC4: the ``check_infra_blocked`` event is emitted and has a consumer
+    (heartbeat_check.py's ``check_infra_blocked_events``)."""
+    from charlie_work.instrumentation import _LEVEL_BY_KIND
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _FakeGitHubWithInfraBlockedJob(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.review(456)
+
+    blocked_events = query_events(paths.state_file, kind="check_infra_blocked")
+    assert len(blocked_events) == 1
+    assert blocked_events[0]["payload"]["pr_number"] == 456
+    assert "Tests passed" in blocked_events[0]["payload"]["checks"]
+    # The event kind is registered at warning level
+    assert _LEVEL_BY_KIND["check_infra_blocked"] == "warning"
+    # The escalation kind is registered at error level
+    assert _LEVEL_BY_KIND["infra_blocked_escalated"] == "error"
+
+
+def test_infra_blocked_config_parses_from_yaml(tmp_path: Path) -> None:
+    """The infra_blocked config section is parsed from YAML correctly."""
+    from charlie_work.config import load_config
+
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "auto_merge:\n"
+        "  required_checks: [Tests passed]\n"
+        "  infra_blocked:\n"
+        "    enabled: true\n"
+        "    instant_fail_seconds: 15\n"
+        "    annotation_patterns: [billing exhausted, quota exceeded]\n"
+        "    persistence_passes: 5\n"
+        "    escalation_window_minutes: 120\n",
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    cfg = config.auto_merge.infra_blocked
+    assert cfg.enabled is True
+    assert cfg.instant_fail_seconds == 15
+    assert cfg.annotation_patterns == ("billing exhausted", "quota exceeded")
+    assert cfg.persistence_passes == 5
+    assert cfg.escalation_window_minutes == 120
+
+
+def test_infra_blocked_does_not_shadow_cancelled_auto_rerun_path(tmp_path: Path) -> None:
+    """Round-3 review finding: the #1383 ``_enrich_checks_infra_blocked``
+    helper gates on ``state == "FAILURE"``, so it must NOT reclassify a
+    ``CANCELLED`` (or ``INFRA_FAILURE``/``TIMED_OUT``) required check. The
+    pre-existing #841 ``is_infra_failure_block`` auto-rerun+escalate path is
+    fed by ``run_janitor`` over those conclusions and must still fire
+    post-#1383. This test confirms a ``CANCELLED`` required check -- carrying
+    a ``databaseId`` and a zero-step job that WOULD match
+    ``is_infra_blocked_check`` if the gate admitted it -- still routes to
+    ``infra_rerun`` (not ``infra_blocked``) with the #1383 classifier enabled
+    (its default). The ``databaseId`` + zero-step job exercise the gate so a
+    mutation that broadens it to ``CANCELLED`` is caught."""
+
+    class _FakeGitHubWithInfraJobAndRerun(_FakeGitHubWithInfraBlockedJob):
+        """Combines actions_job (for the enrichment gate) with rerun capture
+        (for the #841 auto-rerun assertion)."""
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.rerun_calls: list[list[str]] = []
+
+        def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):  # noqa: ANN202
+            if len(args) >= 2 and args[0] == "run" and args[1] == "rerun":
+                self.rerun_calls.append(list(args))
+                return "DRY-RUN: gh run rerun " + " ".join(args[2:])
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+    config = _required_checks_config()  # InfraBlockedConfig.enabled defaults to True
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
+    fake_gh = _FakeGitHubWithInfraJobAndRerun(
+        checks=[
+            {"name": "Tests passed", "state": "CANCELLED", "link": link, "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            # Zero-step FAILURE job that is_infra_blocked_check WOULD classify
+            # -- but the outer gate excludes CANCELLED check-state, so this
+            # job is never consulted and the check stays CANCELLED.
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    # The #841 auto-rerun path fired for the CANCELLED check.
+    assert result.ok is False
+    assert result.data.get("infra_rerun_run_ids") == [12345]
+    assert len(fake_gh.rerun_calls) == 1
+    # The #1383 infra_blocked hold path did NOT fire.
+    assert result.data.get("infra_blocked") is not True
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+    # No check_infra_blocked event was emitted -- the CANCELLED check is not
+    # in the infra_blocked population.
+    blocked_events = query_events(paths.state_file, kind="check_infra_blocked")
+    assert len(blocked_events) == 0
+
+
+def test_merge_ready_infra_blocked_failure_blocks_merge_in_blocked_bucket(
+    tmp_path: Path,
+) -> None:
+    """Round-3 review finding: ``merge_ready()`` uses the shared
+    ``_enrich_checks_infra_blocked`` helper, which rewrites a zero-step
+    FAILURE required check to ``INFRA_BLOCKED`` (not ``INFRA_FAILURE`` as the
+    old inline enrichment did). The check must land in
+    ``CheckSummary.infra_blocked`` (not ``infra_failed``) and block the merge
+    (``can_merge=False``, ``merged=False``). Both buckets block merge via
+    ``CheckSummary.ready``, so the merge gate is unchanged -- only the bucket
+    differs. This is the merge_ready()-path coverage the round-1/2 tests
+    lacked (only review()'s new path was covered)."""
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _FakeGitHubWithInfraBlockedJob(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    # Plant an approved review decision so merge_ready reaches the check gate.
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    result = app.merge_ready(456, merge=True)
+
+    # The zero-step FAILURE check blocks merge via the infra_blocked bucket.
+    assert result.data["can_merge"] is False
+    assert result.data["merged"] is False
+    assert fake_gh.merged == []
+    checks = result.data["checks"]
+    assert checks["infra_blocked"] == ("Tests passed",)
+    assert checks["infra_failed"] == ()
+    assert checks["failed"] == ()
+
+
 def test_janitor_required_check_repeated_failure_escalates(tmp_path: Path) -> None:
     """Issue #376: repeated check-failure reworks escalate via the
     request_changes cap. Issue #1266: max_rework_cycles_exceeded is
@@ -18288,6 +18816,108 @@ def test_merge_ready_mergequeue_check_failure_still_routes_to_rework(tmp_path: P
     assert check_failure_events[0]["payload"]["failed_checks"] == ["Tests passed"]
 
 
+def test_merge_ready_self_revoked_stale_head_no_false_alarm(tmp_path: Path) -> None:
+    """Issue #1402: when reconcile's own ``detect_mergequeue_not_approved``
+    (#819 gap fix) revokes ``mergequeue`` because the approval is pinned to a
+    stale head, and ``merge_ready``'s carry-forward then re-validates and
+    re-applies the label in the same pass, the cross-pass
+    ``mergequeue_label_reverted`` signal must NOT be folded into
+    ``mergequeue_handoff_failed``. The label was removed by our own code
+    (cooperative self-revocation), not by Aviator's #823 silent rejection --
+    so the counter must stay at 0 and no alarm must fire.
+
+    Simulates the exact PR #1843 sequence: pass 1 hands off to Aviator
+    (status="mergequeue"), Aviator rebases the branch (head moves), reconcile
+    revokes the label (stale-head, records ``mergequeue_revoked_reason``),
+    pass 2 carry-forwards the approval and re-applies the label."""
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    new_head = "sha-rebased-1843"
+    pr_number = 456
+
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[pr_number] = diff_text
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(pr_number, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    # Pass 1: fresh handoff, succeeds. Status becomes "mergequeue".
+    first = app.merge_ready(pr_number, merge=True)
+    assert first.data["mergequeue_label_applied"] is True
+    assert first.data["consecutive_failed_merge_attempts"] == 0
+    assert load_state(paths.state_file)["prs"][str(pr_number)]["status"] == "mergequeue"
+
+    # Simulate reconcile's cooperative self-revocation: Aviator rebased the
+    # branch (head moves), the approval is now at a stale head, reconcile
+    # revokes the label and records the reason in state.
+    state = load_state(paths.state_file)
+    state["prs"][str(pr_number)]["mergequeue_revoked_reason"] = "stale_head_pending_carry_forward"
+    save_state(paths.state_file, state)
+    fake_gh.prs[0]["headRefOid"] = new_head
+    fake_gh.diffs[pr_number] = diff_text  # same diff -> patch-id matches -> carry-forward
+
+    # Pass 2: carry-forward re-validates the approval at the new head and
+    # re-applies the mergequeue label. The label was absent (reconcile removed
+    # it) and prior status was "mergequeue", so mergequeue_label_reverted is
+    # True -- but mergequeue_self_revoked_stale_head is also True, so
+    # mergequeue_handoff_failed must be False. No counter increment, no alarm.
+    second = app.merge_ready(pr_number, merge=True)
+    assert second.data["mergequeue_label_applied"] is True
+    assert second.data["consecutive_failed_merge_attempts"] == 0
+    assert second.data["merge_attempt_alarm"] is False
+
+    # The self-revocation reason must be cleared so a subsequent Aviator #823
+    # rejection is not misread as a stale self-revocation.
+    state = load_state(paths.state_file)
+    assert state["prs"][str(pr_number)].get("mergequeue_revoked_reason") is None
+
+
+def test_merge_ready_aviator_revert_without_self_revocation_reason_still_counts(
+    tmp_path: Path,
+) -> None:
+    """Issue #1402 regression guard: a genuine Aviator #823 silent rejection
+    (no ``mergequeue_revoked_reason`` recorded -- the label was stripped by
+    Aviator, not by reconcile) must still increment the counter and eventually
+    fire the alarm. This is the exact same scenario as the pre-#1402
+    ``test_merge_ready_mergequeue_silent_revert_increments_counter_across_passes``
+    test, but explicitly seeds an ABSENT ``mergequeue_revoked_reason`` to prove
+    the self-revocation exclusion does not swallow the #823 path."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    # Pass 1: fresh handoff, succeeds.
+    first = app.merge_ready(456, merge=True)
+    assert first.data["consecutive_failed_merge_attempts"] == 0
+
+    # Explicitly ensure no self-revocation reason is set (Aviator stripped the
+    # label, not reconcile). The key may be present as None from pass 1's
+    # label re-add write, but it must NOT be "stale_head_pending_carry_forward".
+    state = load_state(paths.state_file)
+    assert (
+        state["prs"]["456"].get("mergequeue_revoked_reason") != "stale_head_pending_carry_forward"
+    )
+
+    # Pass 2: label absent (FakeGitHub.add_pr_label doesn't mutate labels),
+    # no self-revocation reason -> genuine #823 path -> counter increments.
+    second = app.merge_ready(456, merge=True)
+    assert second.data["mergequeue_label_applied"] is True
+    assert second.data["consecutive_failed_merge_attempts"] == 1
+    assert second.data["merge_attempt_alarm"] is False
+
+
 def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
     # The P0: the counter used to derive from state["events"], which
     # append_event truncates to the last 200 - evicting a PR's earlier
@@ -19913,6 +20543,7 @@ def test_merge_ready_failed_attempt_alarm_fires_once_at_threshold(tmp_path: Path
         "failed",
         "missing",
         "infra_failed",
+        "infra_blocked",
         "unavailable",
     }
 
@@ -44576,7 +45207,7 @@ def test_classify_dead_sessions_salvage_push_failure_fallback(tmp_path: Path) ->
     gh.pr_create_return = 101
 
     original_push_branch = workflow_module.push_branch
-    workflow_module.push_branch = lambda repo, br, worktree_path=None: (
+    workflow_module.push_branch = lambda repo, br, worktree_path=None, **kw: (
         False,
         "simulated push failure",
     )
@@ -51687,7 +52318,7 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
 
     salvage_calls: list[tuple[Any, ...]] = []
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         salvage_calls.append((repo_root, branch, worktree_path, base_ref))
         return SalvagePushResult(
             pushed=True,
@@ -51748,6 +52379,92 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
     assert salvage_events[0]["payload"]["new_remote_sha"] == "newsha123"
 
 
+def test_orphaned_worker_salvage_push_threads_dry_run_to_salvage_push_stranded_commits(
+    tmp_path: Path,
+) -> None:
+    """Issue #1326 regression: ``_detect_and_handle_orphaned_workers`` must
+    thread ``write_gate.dry_run`` into ``salvage_push_stranded_commits`` (the
+    higher-traffic call site at workflow.py:2218-2224). Under a dry-run
+    WriteGate the salvage stand-in must receive ``dry_run=True`` -- the
+    existing ``fake_salvage`` stand-ins in this file were only patched for
+    signature compatibility and never asserted the value, so a regression
+    that drops the kwarg would pass silently. This test pins the value.
+    """
+    import charlie_work.workflow as workflow_module
+    from charlie_work.worktree import SalvagePushResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1326"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForSalvage(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 500,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-1326",
+                }
+            ]
+
+    fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
+
+    salvage_calls: list[dict[str, Any]] = []
+
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
+        salvage_calls.append(
+            {
+                "repo_root": repo_root,
+                "branch": branch,
+                "worktree_path": worktree_path,
+                "base_ref": base_ref,
+                "dry_run": dry_run,
+            }
+        )
+        return SalvagePushResult(
+            pushed=True,
+            old_remote_sha="abc123",
+            new_remote_sha="newsha123",
+            commit_count=1,
+        )
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
+    ):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            write_gate=_wg(paths.state_file, dry_run=True),
+        )
+
+    # The salvage stand-in must have been called exactly once for the orphaned
+    # issue's branch, and -- the point of this test -- dry_run must be True.
+    assert len(salvage_calls) == 1
+    assert salvage_calls[0]["branch"] == "agent/issue-1326"
+    assert salvage_calls[0]["dry_run"] is True
+
+
 def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
     tmp_path: Path,
 ) -> None:
@@ -51794,7 +52511,7 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         return SalvagePushResult(
             pushed=False,
             error="push_failed: network timeout",
@@ -51879,7 +52596,7 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         return SalvagePushResult(pushed=False, skip_reason="up_to_date", old_remote_sha="abc123")
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -51950,7 +52667,7 @@ def test_orphaned_worker_salvage_push_skips_cross_repository_pr(tmp_path: Path) 
 
     salvage_calls: list[tuple[Any, ...]] = []
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         salvage_calls.append((repo_root, branch, worktree_path, base_ref))
         return SalvagePushResult(pushed=False, skip_reason="should_never_be_called")
 

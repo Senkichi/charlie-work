@@ -33,6 +33,7 @@ from .claude_code import (
 )
 from .checks import (
     CheckSummary,
+    is_infra_blocked_check,
     summarize_checks,
 )
 from .citation_check import (
@@ -47,6 +48,7 @@ from .config import (
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
     OrchestratorConfig,
     PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS,
+    ReviewDispatchConfig,
 )
 from .env_sanitize import worker_github_token_findings
 from .file_lock import try_acquire_byte_range_lock
@@ -81,7 +83,6 @@ from .github import (
     defang_closing_keywords,
     detect_prose_only_dependencies,
     get_github_issue_dependencies,
-    is_infrastructure_failure,
     issue_numbers_mentioned_by_pr,
     label_names,
     linked_issue_number,
@@ -205,7 +206,13 @@ from .state import (
     utc_now,
     without_review_dispatch_claim,
 )
-from .instrumentation import correlation_context, log_event, query_events, record_loop_pass
+from .instrumentation import (
+    correlation_context,
+    current_correlation_id,
+    log_event,
+    query_events,
+    record_loop_pass,
+)
 from .preflight import (
     PreflightPaths,
     emit_preflight_refusal,
@@ -553,6 +560,85 @@ def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
     if current_file:
         files.append((current_file, added, deleted))
     return total, files
+
+
+def _max_touched_file_line_count(diff: str, repo_root: Path) -> int:
+    """Return the largest line count among files touched by ``diff`` (issue #1439).
+
+    The review turn cap scales with the size of the files a diff touches, not
+    the diff itself: a PR threading a 25k-line monolith costs the reviewer far
+    more grep -> Read-window navigation than the diff's line count suggests.
+    File sizes are read from ``repo_root`` (the orchestrator's checkout). For
+    files not present there (e.g. newly added in the PR), the per-file added
+    line count from the diff is used as the size -- a new file's size IS its
+    added lines. Returns 0 for an empty diff.
+    """
+    _total, files = _diff_file_summary(diff)
+    max_lines = 0
+    for name, added, _deleted in files:
+        if not name:
+            continue
+        candidate = name
+        # Unified diff ``+++`` paths are prefixed with ``b/``; strip it so the
+        # path resolves under ``repo_root``. A literal ``b/...`` file would be
+        # vanishingly rare and only makes the lookup miss (falling back to the
+        # added-line count), never reads the wrong file.
+        if candidate.startswith("b/"):
+            candidate = candidate[2:]
+        path = repo_root / candidate
+        line_count = 0
+        if path.exists() and path.is_file():
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    line_count = sum(1 for _ in handle)
+            except OSError:
+                line_count = 0
+        else:
+            # New file (not present at repo_root): its size is the added lines.
+            line_count = added
+        if line_count > max_lines:
+            max_lines = line_count
+    return max_lines
+
+
+def structure_turn_cap_multiplier(
+    max_touched_file_lines: int, config: ReviewDispatchConfig
+) -> int:
+    """Structure-aware multiplier for the review turn cap (issue #1439).
+
+    Returns ``turn_cap_large_file_multiplier`` (clamped to
+    ``turn_cap_max_multiplier``) when ``max_touched_file_lines`` exceeds
+    ``turn_cap_large_file_threshold``, else 1. A threshold of 0 disables the
+    structure bonus (every diff uses the base cap).
+    """
+    threshold = config.turn_cap_large_file_threshold
+    if threshold <= 0:
+        return 1
+    if max_touched_file_lines > threshold:
+        return min(config.turn_cap_large_file_multiplier, config.turn_cap_max_multiplier)
+    return 1
+
+
+def resolve_review_turn_cap(
+    base_max_turns: int,
+    structure_multiplier: int,
+    miss_streak: int,
+    config: ReviewDispatchConfig,
+) -> int:
+    """Final reviewer turn cap after structure + miss-escalation (issue #1439).
+
+    ``effective_multiplier = min(structure_multiplier + miss_streak,
+    turn_cap_max_multiplier)``, clamped to a floor of 1.
+    ``final_cap = base_max_turns * effective_multiplier``. A ``base_max_turns``
+    of 0 (unlimited) stays 0.
+    """
+    if base_max_turns <= 0:
+        return 0
+    effective = min(
+        max(structure_multiplier + miss_streak, 1),
+        config.turn_cap_max_multiplier,
+    )
+    return base_max_turns * effective
 
 
 def _diff_size_section(diff: str, threshold: int, diff_path: Path) -> str:
@@ -1896,6 +1982,21 @@ def summarize_loop_errors(
 # "in the sink" means. Issue #1083.
 _SINK_STATUSES: frozenset[str] = frozenset({"escalated", "blocked"})
 
+# Issue #1383: cross-pass infra_blocked escalation tracking. The
+# OrchestratorApp instance is rebuilt per repo per pass (fleet_loop), so
+# instance-level state cannot track "persistence across N passes." This
+# module-level dict, keyed by repo_root string, survives across passes
+# within the same supervisor process -- exactly the scope AC3 needs:
+# "one operator escalation per window, not one per PR per pass." Each
+# entry records the consecutive-pass count of infra_blocked observations,
+# the datetime of the last ``infra_blocked_escalated`` emission (or None
+# if none has been emitted yet), and the correlation_id of the pass that
+# last incremented the counter (so multiple infra-blocked PRs encountered
+# within the same ``review()`` pass increment the counter at most once).
+# Reset to zero/None/None when a pass observes no infra_blocked PRs (the
+# infra condition cleared).
+_infra_blocked_window: dict[str, dict[str, Any]] = {}
+
 
 def sink_census(state: dict[str, Any]) -> set[int]:
     """Return the set of issue numbers currently parked in the sink.
@@ -2253,7 +2354,11 @@ def _detect_and_handle_orphaned_workers(
                 continue
             worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
             result = salvage_push_stranded_commits(
-                repo_root, branch, worktree_path, base_ref=config.dispatch.base_ref
+                repo_root,
+                branch,
+                worktree_path,
+                base_ref=config.dispatch.base_ref,
+                dry_run=write_gate.dry_run,
             )
             if result.pushed:
                 salvage_pushes[issue_number] = {
@@ -4985,6 +5090,32 @@ def _classify_dead_sessions_and_update_throttle_state(
                 }
             )
 
+            # Issue #1342: emit a distinct error-level event on the FIRST
+            # detection of a provider account suspension so the operator learns
+            # about a billing problem in minutes, not after the redispatch cap
+            # drains. ``provider_suspended`` is terminal (no cooldown) and sits
+            # in DETERMINISTIC_ESCALATION_FAILURE_KINDS, so the no-open-PR path
+            # below escalates the issue to operator-queue on this same pass —
+            # there is no redispatch, hence exactly one episode and no spam.
+            # The sidecar was just reaped, so the next pass won't re-see this
+            # worker — the event fires once per episode by construction.
+            if w.adapter_kind == "api" and failure_kind == "provider_suspended":
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    state = write_gate.append_event(
+                        state,
+                        "api_worker_provider_suspended",
+                        {
+                            "issue_number": w.issue_number,
+                            "pid": w.pid,
+                            "process_start_time": w.process_start_time,
+                            "provider": w.provider,
+                            "failure_kind": failure_kind,
+                        },
+                        level="error",
+                    )
+                    write_gate.save_state(state)
+
             # Issue #118: reconcile labels for dead sessions with no open PR
             if w.issue_number not in open_prs_by_issue:
                 try:
@@ -5484,15 +5615,15 @@ def _attempt_salvage(
     skip emits ``salvage_skipped_already_landed`` instead of opening a vestigial
     duplicate PR, and the caller treats it as "handled" (no redispatch).
 
-    NOTE (issue #1264, W6 PR3 disclosure): the ``push_branch`` call below is
-    an unconditional, unguarded real ``git push`` -- outside WriteGate's
-    declared 6-primitive surface (state.json/events.db/label-transition/
-    process-kill) and therefore NOT gated by ``write_gate`` here. This is a
-    real dry-run leak (filed separately; see the PR3 handoff) that this PR
-    does not fix -- gating an external git push was never in R6's scope
-    (kill_process was the one sanctioned new primitive) and freelancing a
-    7th WriteGate primitive without design review would repeat exactly the
-    mistake R6b's STOP-and-report exists to prevent.
+    NOTE (issue #1326): the ``push_branch`` call below threads
+    ``dry_run=write_gate.dry_run`` so a dry-run invocation does not issue a
+    real ``git push``. This is explicit-threading (mirroring
+    ``_reconcile_locked``'s convention) rather than a 7th WriteGate primitive
+    -- gating an external git push through WriteGate was an open design
+    question (see issue #1326's remedy section) and the simplest correct
+    fix is to thread the flag directly. Downstream state writes and label
+    transitions remain gated by ``write_gate``; the ``gh pr create`` in
+    ``_open_salvage_pr`` is gated at the ``GitHub`` client sink level.
     """
     write_gate = require_write_gate(write_gate)
     already_landed, skip_reason = _salvage_already_landed(
@@ -5526,7 +5657,9 @@ def _attempt_salvage(
             write_gate.save_state(state)
         return True, None
 
-    push_ok, push_error = push_branch(repo_root, branch, worktree_path=worktree_path)
+    push_ok, push_error = push_branch(
+        repo_root, branch, worktree_path=worktree_path, dry_run=write_gate.dry_run
+    )
     if not push_ok:
         return False, push_error
 
@@ -5712,6 +5845,7 @@ def _is_pending_only(summary: CheckSummary) -> bool:
         and not summary.failed
         and not summary.missing
         and not summary.infra_failed
+        and not summary.infra_blocked
         and not summary.unavailable
     )
 
@@ -5738,6 +5872,8 @@ def _format_merge_attempt_alarm_message(
         buckets.append(f"failed: {', '.join(summary.failed)}")
     if summary.infra_failed:
         buckets.append(f"infra_failed: {', '.join(summary.infra_failed)}")
+    if summary.infra_blocked:
+        buckets.append(f"infra_blocked: {', '.join(summary.infra_blocked)}")
     if summary.unavailable:
         # gh reported no parseable check list at all (see summarize_checks'
         # `checks is None` branch) — distinct from "all required checks
@@ -8902,6 +9038,56 @@ class OrchestratorApp:
             data,
         )
 
+    def _enrich_checks_infra_blocked(
+        self, checks: list[dict[str, Any]] | None, required: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        """Reclassify FAILURE required checks as ``INFRA_BLOCKED`` at the
+        check-ingestion data boundary (issue #1383).
+
+        Single point of enforcement for the infra_blocked classification: a
+        required check whose FAILED job shows structural evidence of a
+        non-started job (zero non-setup steps / instant-fail) or a
+        config-listed billing annotation is rewritten to the
+        ``INFRA_BLOCKED`` marker state before ``summarize_checks`` (and
+        therefore the janitor gate / rework-routing decision) ever sees it.
+        ``summarize_checks`` then routes it to ``CheckSummary.infra_blocked``
+        rather than ``failed``, so it never enters the "required checks
+        failed -> dispatch rework" path and never burns a rework attempt.
+
+        Kept as an OrchestratorApp method (not a pure function in
+        ``checks.py``) because the structural + annotation signals require
+        two ``gh`` API calls per FAILURE check (``actions_job`` /
+        ``check_run_annotations``) -- I/O that the pure
+        ``summarize_checks``/``is_infra_blocked_check`` layer must not
+        perform. Both API methods return safe empty values (``None`` / ``[]``)
+        on any GitHub failure and never raise, so an unenrichable check
+        degrades to ordinary ``failed`` routing rather than crashing
+        ingestion -- mirroring the existing ``merge_ready`` enrichment this
+        replaces.
+
+        Called before the janitor gate in ``review()`` (the rework-routing
+        path) and in ``merge_ready()`` (the merge-execution path) so both
+        paths classify budget-failed checks identically.
+        """
+        if not checks or not required:
+            return list(checks or [])
+        cfg = self.config.auto_merge.infra_blocked
+        if not cfg.enabled:
+            return list(checks)
+        required_set = set(required)
+        enriched: list[dict[str, Any]] = []
+        for check in checks:
+            name = str(check.get("name") or "")
+            if name in required_set and str(check.get("state") or "").upper() == "FAILURE":
+                check_run_id = check.get("databaseId")
+                if isinstance(check_run_id, int):
+                    job = self.gh.actions_job(check_run_id)
+                    annotations = self.gh.check_run_annotations(check_run_id)
+                    if job is not None and is_infra_blocked_check(job, annotations, cfg):
+                        check = {**check, "state": "INFRA_BLOCKED"}
+            enriched.append(check)
+        return enriched
+
     @_guard_state_lock
     def review(
         self,
@@ -9197,6 +9383,19 @@ class OrchestratorApp:
 
         issue = self.gh.issue_view(issue_number) if issue_number is not None else {}
         checks = self.gh.pr_checks(pr_number)
+        # Issue #1383: reclassify fleet-wide infra failures (Actions budget /
+        # runner outage) as INFRA_BLOCKED at the data boundary, BEFORE the
+        # janitor gate / rework-routing decision. A budget-failed check has a
+        # FAILURE conclusion (not CANCELLED/INFRA_FAILURE), so without this
+        # enrichment it lands in summary.failed and is routed to rework --
+        # burning no-op rework caps on a healthy PR. Enriching here is the
+        # single point of enforcement; the janitor and merge_ready both see
+        # the reclassified checks.
+        checks_unavailable = checks is None
+        if not checks_unavailable:
+            checks = self._enrich_checks_infra_blocked(
+                checks, self.config.auto_merge.required_checks
+            )
 
         # Load PR state for no-op rework detection (only if PR has verdict history)
         pr_state = None
@@ -9696,6 +9895,89 @@ class OrchestratorApp:
                     },
                 )
 
+            # Issue #1383: infra_blocked required checks (fleet-wide Actions
+            # budget/runner outage) are held without dispatching rework and
+            # without burning rework/no-op attempt counters. The PR is not
+            # transitioned to review_started (there is nothing for the worker
+            # to fix), no request_changes verdict is recorded, and the
+            # check-failure rework route below is skipped entirely. A distinct
+            # ``check_infra_blocked`` warning event is emitted per affected PR
+            # so the heartbeat consumer (AC4) and the cross-pass escalation
+            # tracker can see it. The operator-facing
+            # ``infra_blocked_escalated`` error event is emitted at most once
+            # per ``escalation_window_minutes`` window across ALL affected PRs
+            # (AC3), not once per PR per pass -- tracked in the module-level
+            # ``_infra_blocked_window`` dict because the app instance is
+            # rebuilt per pass.
+            if verdict.is_infra_blocked_block:
+                log_event(
+                    self.paths.state_file,
+                    "check_infra_blocked",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "checks": list(verdict.infra_blocked_checks),
+                    },
+                    repo=self.repo_root.name,
+                    level="warning",
+                )
+                # Cross-pass persistence tracking + windowed escalation.
+                cfg = self.config.auto_merge.infra_blocked
+                repo_key = str(self.repo_root)
+                window = _infra_blocked_window.setdefault(
+                    repo_key,
+                    {
+                        "consecutive_passes": 0,
+                        "last_escalation": None,
+                        "last_pass_cid": None,
+                    },
+                )
+                # Issue #1383: increment at most once per loop pass (per
+                # correlation_id), not once per infra-blocked PR encountered
+                # within review(). Without this gate, N concurrent
+                # infra-blocked PRs in one pass would reach
+                # persistence_passes=N in a single pass and fire
+                # ``infra_blocked_escalated`` immediately, contradicting AC3
+                # ("persistence across N passes, not per PR per pass"). The
+                # same correlation_id-dedup pattern is used by the
+                # reset-on-clear logic in ``_loop_impl``. When no correlation
+                # context is active (direct ``review()`` calls outside
+                # ``loop()``, e.g. in tests), ``cid`` is None and each call
+                # increments -- matching the pre-fix direct-call behavior.
+                cid = current_correlation_id()
+                if cid is None or window.get("last_pass_cid") != cid:
+                    window["consecutive_passes"] = window.get("consecutive_passes", 0) + 1
+                    window["last_pass_cid"] = cid
+                last_esc = window.get("last_escalation")
+                now_dt = datetime.now(UTC)
+                should_escalate = window["consecutive_passes"] >= cfg.persistence_passes
+                if should_escalate and (
+                    last_esc is None
+                    or (now_dt - last_esc).total_seconds() >= cfg.escalation_window_minutes * 60
+                ):
+                    log_event(
+                        self.paths.state_file,
+                        "infra_blocked_escalated",
+                        {
+                            "consecutive_passes": window["consecutive_passes"],
+                            "persistence_passes": cfg.persistence_passes,
+                            "window_minutes": cfg.escalation_window_minutes,
+                        },
+                        repo=self.repo_root.name,
+                        level="error",
+                    )
+                    window["last_escalation"] = now_dt
+                return CommandResult(
+                    False,
+                    f"PR #{pr_number} infra-blocked (billing/runner outage): "
+                    + ", ".join(verdict.infra_blocked_checks),
+                    {
+                        "infra_blocked": True,
+                        "checks": list(verdict.infra_blocked_checks),
+                        "checks_unavailable": False,
+                    },
+                )
+
             if issue_number is not None and verdict.is_check_failure_block:
                 transition(self.gh, self.config.labels, issue_number, "review_started")
                 summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
@@ -10057,6 +10339,18 @@ class OrchestratorApp:
         # regenerates because headRefOid is treated as the packet's only input.
         pr_json = _slim_pr_json(pr)
         pr_json["prompt_template_sha"] = self._review_template_sha()
+        # Issue #1439: stamp the structure-aware turn-cap multiplier into the
+        # packet so the reviewer launch reads a structure-aware budget instead
+        # of the flat ``review_max_turns``. The multiplier (not the absolute
+        # cap) is stored so the dispatch path can re-derive the final cap from
+        # the live ``review_max_turns`` config + the per-PR miss streak at
+        # launch time -- a packet may outlive a config edit, and the base cap
+        # is config's to own.
+        _max_touched_lines = _max_touched_file_line_count(diff, self.repo_root)
+        pr_json["review_turn_cap_structure_multiplier"] = structure_turn_cap_multiplier(
+            _max_touched_lines, self.config.review_dispatch
+        )
+        pr_json["review_turn_cap_max_touched_lines"] = _max_touched_lines
         self._write_json(pr_dir / "pr.json", pr_json)
         self._write_json(pr_dir / "checks.json", checks)
         diff_path = pr_dir / "diff.patch"
@@ -10458,6 +10752,17 @@ class OrchestratorApp:
                 # must not carry forward and immediately count against the
                 # fresh attempt budget (issue #1069).
                 "review_log_unreadable_streak": 0,
+                # Issue #1439: reset the turn-limit miss streak on a fresh
+                # dispatch cycle (new head). A same-head rebuild must NOT zero
+                # it -- mirroring review_dispatch_attempt_count's same-head
+                # preservation (issue #1351) -- or the cap-aware backstop
+                # never converges and a PR that keeps hitting the turn limit
+                # on the same head redispatches forever at the base cap.
+                "review_turn_limit_miss_streak": (
+                    0
+                    if _fresh_dispatch_cycle
+                    else int(_existing_pr_state.get("review_turn_limit_miss_streak", 0))
+                ),
                 # A clean janitor pass ends the no-op-rework epoch (the
                 # janitor's no-op check passing means content actually
                 # moved): without this reset, attempts consumed by a long-
@@ -10495,6 +10800,14 @@ class OrchestratorApp:
                     "issue_number": issue_number,
                     "cross_family_ok": cf_result.ok if cf_result else None,
                     "cross_family_reused": cf_result.reused if cf_result else None,
+                    # Issue #1439: structure-aware turn cap stamped into the
+                    # packet, mirrored into the event for auditability.
+                    "review_turn_cap_structure_multiplier": pr_json.get(
+                        "review_turn_cap_structure_multiplier", 1
+                    ),
+                    "review_turn_cap_max_touched_lines": pr_json.get(
+                        "review_turn_cap_max_touched_lines", 0
+                    ),
                 },
                 state_path=self.paths.state_file,
             )
@@ -11178,10 +11491,25 @@ class OrchestratorApp:
                             # turn-limit death, so a session that never
                             # reached turn 1 must not set it -- that death is
                             # environmental and says nothing about this PR.
+                            # Issue #1439: a turn-limit death increments the
+                            # per-PR miss streak so the NEXT dispatch's cap
+                            # escalates one step instead of relaunching with
+                            # the identical flat budget. Non-turn-limit deaths
+                            # (launch_failed, died_mid_session) do NOT
+                            # increment -- those have disjoint remediations and
+                            # counting them here would conflate a quota/launch
+                            # outage with a genuine "reviewer ran out of
+                            # navigation budget" signal.
+                            _is_turn_limit_miss = outcome.reason == REVIEW_MISS_TURN_LIMIT
+                            _prior_streak = int(ps.get("review_turn_limit_miss_streak", 0))
+                            _new_streak = (
+                                _prior_streak + 1 if _is_turn_limit_miss else _prior_streak
+                            )
                             state["prs"][str(pr_number)] = {
                                 **ps,
                                 "review_miss_summary_posted": True,
                                 "review_turn_limit_summary_posted": (outcome.did_substantial_work),
+                                "review_turn_limit_miss_streak": _new_streak,
                             }
                             state = append_event(
                                 state,
@@ -11200,6 +11528,11 @@ class OrchestratorApp:
                                     # distinguish "no cause captured" from
                                     # "cause field absent".
                                     "cause": outcome.terminating_cause,
+                                    # Issue #1439: mirror the post-increment
+                                    # streak into the event so a downstream
+                                    # query can reconstruct the cap escalation
+                                    # history without a join back to state.
+                                    "turn_limit_miss_streak": _new_streak,
                                 },
                                 state_path=self.paths.state_file,
                             )
@@ -12267,6 +12600,8 @@ class OrchestratorApp:
         # ``reason="merge_conflict"``), including the same attempt cap and
         # escalation to ``agent:human-needed``.
         max_attempts = self.config.review_dispatch.max_review_dispatch_attempts
+        # Issue #1439: backstop cap on consecutive turn-limit misses.
+        max_turn_limit_misses = self.config.review_dispatch.max_consecutive_turn_limit_misses
         # Issue #586's repair set used to be collected here, from the PRs this
         # candidate loop skipped. Issue #1088: that made the sweep unreachable,
         # because this loop runs below the ``review_dispatch.enabled`` early
@@ -12413,12 +12748,28 @@ class OrchestratorApp:
                     # which the cap escalates honestly on a dead claim.
                     continue
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
-                if attempt_count >= max_attempts and pr_state.get("status") != "escalated":
+                # Issue #1439: a PR whose consecutive turn-limit miss streak
+                # has reached the backstop cap escalates with a distinct
+                # reason so the diagnosis points at "reviewer ran out of
+                # navigation budget on a monolith" rather than the generic
+                # "every reviewer died without a verdict". Both reasons route
+                # to ``agent:human-needed`` via the same mechanical edge below.
+                _turn_limit_streak = int(pr_state.get("review_turn_limit_miss_streak", 0))
+                _escalation_reason: str | None = None
+                if (
+                    max_turn_limit_misses > 0
+                    and _turn_limit_streak >= max_turn_limit_misses
+                    and pr_state.get("status") != "escalated"
+                ):
+                    _escalation_reason = "max_consecutive_turn_limit_misses_exceeded"
+                elif attempt_count >= max_attempts and pr_state.get("status") != "escalated":
+                    _escalation_reason = "max_review_dispatch_attempts_exceeded"
+                if _escalation_reason is not None:
                     issue_num = pr_state.get("issue_number") or c.get("issue")
                     state = _escalate_issue(
                         state,
                         issue_num,
-                        reason="max_review_dispatch_attempts_exceeded",
+                        reason=_escalation_reason,
                         reason_class="mechanical",
                         pr_number=int(c["pr"]),
                         pr_extra={
@@ -12437,7 +12788,10 @@ class OrchestratorApp:
                             "pr_number": c["pr"],
                             "issue_number": issue_num,
                             "attempt_count": attempt_count,
-                            "reason": "max_review_dispatch_attempts_exceeded",
+                            "reason": _escalation_reason,
+                            # Issue #1439: surface the streak that drove the
+                            # turn-limit backstop escalation for diagnosis.
+                            "turn_limit_miss_streak": _turn_limit_streak,
                         },
                     )
                     changed = True
@@ -12563,6 +12917,12 @@ class OrchestratorApp:
             # uses exactly this value instead of re-deriving it (agreement
             # by construction, not by convention).
             resolved_review_efforts: dict[int, str] = {}
+            # Issue #1439: resolve the structure-aware turn cap ONCE here at
+            # claim time (mirroring resolved_review_efforts) and thread it
+            # through to the launch call below, so the cap the reviewer runs
+            # with is the cap recorded on the claim -- not a re-derivation that
+            # could diverge if the miss streak changes between claim and launch.
+            resolved_review_turn_caps: dict[int, int] = {}
             for candidate in selected:
                 pr_number = candidate["pr"]
                 pr_state = state["prs"].get(str(pr_number), {})
@@ -12571,6 +12931,20 @@ class OrchestratorApp:
                     pr_number, self.config.review_dispatch, self.config.claude_code
                 )
                 resolved_review_efforts[pr_number] = review_effort_used
+                # Issue #1439: read the structure multiplier stamped into the
+                # packet at build time (review()) and the per-PR turn-limit
+                # miss streak, then resolve the final cap. A missing packet
+                # (e.g. a pre-#1439 packet) yields multiplier 1 -- the base
+                # cap, preserving the pre-fix flat budget.
+                _structure_mult = self._read_packet_turn_cap_multiplier(pr_number)
+                _miss_streak = int(pr_state.get("review_turn_limit_miss_streak", 0))
+                _resolved_cap = resolve_review_turn_cap(
+                    self.config.review_dispatch.review_max_turns,
+                    _structure_mult,
+                    _miss_streak,
+                    self.config.review_dispatch,
+                )
+                resolved_review_turn_caps[pr_number] = _resolved_cap
                 state["prs"][str(pr_number)] = {
                     **pr_state,
                     "number": pr_number,
@@ -12586,12 +12960,17 @@ class OrchestratorApp:
                     "review_miss_summary_posted": False,
                     "review_effort_arm": review_effort_arm,
                     "review_effort_used": review_effort_used,
+                    # Issue #1439: record the resolved cap on the dispatch
+                    # record so the launch and any post-mortem read the same
+                    # value without re-deriving it.
+                    "review_turn_cap": _resolved_cap,
                 }
                 review_effort_assignments.append(
                     {
                         "pr_number": pr_number,
                         "review_effort_arm": review_effort_arm,
                         "review_effort_used": review_effort_used,
+                        "review_turn_cap": _resolved_cap,
                     }
                 )
             if selected:
@@ -12694,6 +13073,12 @@ class OrchestratorApp:
                     # telemetry) -- pass it through so launch_claude_worker
                     # uses this value directly instead of re-resolving it.
                     "resolved_review_effort": resolved_review_efforts.get(pr_number),
+                    # Issue #1439: structure-aware turn cap resolved at claim
+                    # time from the packet's structure multiplier + the per-PR
+                    # miss streak. Overrides the flat ``review_max_turns`` so a
+                    # PR threading a monolith gets a raised budget and a
+                    # turn-limit miss escalates the next dispatch's cap.
+                    "max_turns_override": resolved_review_turn_caps.get(pr_number),
                 }
 
                 record = launch_claude_worker(
@@ -13675,6 +14060,11 @@ class OrchestratorApp:
                 # reviewer pipeline is healthy, so any prior
                 # persistent-unreadable condition is resolved (issue #1069).
                 "review_log_unreadable_streak": 0,
+                # Issue #1439: a recorded verdict ends the turn-limit miss
+                # streak -- the reviewer reached a conclusion, so any prior
+                # turn-limit deaths no longer count toward the cap-aware
+                # backstop on a future review cycle.
+                "review_turn_limit_miss_streak": 0,
                 # Reset the cross-family parse-failure bound (issue #784
                 # AC-8): a real verdict was just recorded -- whether a
                 # genuine parse or this method's own "abandon" call from
@@ -14008,6 +14398,10 @@ class OrchestratorApp:
         # this keeps the pair consistent with the other _last_head baselines).
         "review_dispatch_attempt_last_head",
         "review_log_unreadable_streak",
+        # Issue #1439: turn-limit miss streak must not survive a re-arm, or
+        # the cap-aware backstop would re-escalate instantly on the next
+        # turn-limit death.
+        "review_turn_limit_miss_streak",
         "request_changes_count",
         "conflict_rework_attempts",
         "conflict_rework_attempts_last_head",
@@ -14827,6 +15221,22 @@ class OrchestratorApp:
             and existing_pr_state.get("status") == "mergequeue"
             and self.config.auto_merge.mergequeue_label not in label_names(pr)
         )
+        # Issue #1402: distinguish reconcile's own cooperative self-revocation
+        # (stale-head approval, pending carry-forward re-validation -- the #819
+        # gap fix) from Aviator's #823 silent rejection. reconcile records
+        # ``mergequeue_revoked_reason`` in ``state["prs"][n]`` when IT removes
+        # the label; its absence means the label disappeared for some other
+        # reason (Aviator stripped it, or a pre-#1402 reconcile pass that did
+        # not record the reason). Only ``"stale_head_pending_carry_forward"``
+        # is a self-revocation -- ``"not_approved"`` is a genuine revocation
+        # whose counter-increment path is already suppressed by ``can_merge``
+        # being False (the decision is not ``"approved"``), so it does not
+        # need the same exclusion.
+        mergequeue_self_revoked_stale_head = bool(
+            mergequeue_label_reverted
+            and existing_pr_state.get("mergequeue_revoked_reason")
+            == "stale_head_pending_carry_forward"
+        )
         issue_number = linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
@@ -15219,24 +15629,28 @@ class OrchestratorApp:
             summary = summarize_checks(None, self.config.auto_merge.required_checks)
             enriched_checks: list[dict[str, Any]] = []
         else:
-            # Enrich check data with infrastructure failure detection for FAILED checks
-            # This implements detection signals 1 (zero-step jobs) and 2 (billing annotations)
-            # from issue #210, keeping summarize_checks pure by enriching at the data boundary
-            enriched_checks = []
-            for check in checks:
-                state = str(check.get("state") or "").upper()
-                if state == "FAILURE":
-                    # Check if this failure is due to infrastructure issues
-                    check_run_id = check.get("databaseId")
-                    if check_run_id and isinstance(check_run_id, int):
-                        # The databaseId from gh pr checks IS the GitHub Actions job id
-                        job = self.gh.actions_job(check_run_id)
-                        annotations = self.gh.check_run_annotations(check_run_id)
-                        if job and is_infrastructure_failure(job, annotations):
-                            # Reclassify as infrastructure failure by setting state to a marker
-                            # that summarize_checks will route to infra_failed
-                            check = {**check, "state": "INFRA_FAILURE"}
-                enriched_checks.append(check)
+            # Issue #1383: use the shared data-boundary enrichment so the
+            # merge path classifies infra_blocked checks identically to the
+            # review path. The old inline enrichment reclassified a FAILURE
+            # check with an infra signature to ``INFRA_FAILURE`` (routing it
+            # to ``CheckSummary.infra_failed``); the shared helper rewrites
+            # the same population to ``INFRA_BLOCKED`` instead, so those
+            # checks now land in ``CheckSummary.infra_blocked`` rather than
+            # ``infra_failed``. Both buckets block merge (``CheckSummary.ready``
+            # is False for either), so the merge gate is unchanged -- only the
+            # bucket/failure-message differs. ``infra_failed`` is NOT emptied
+            # for its original population: ``_enrich_checks_infra_blocked``
+            # only touches ``FAILURE``-conclusion checks, so genuine
+            # ``CANCELLED``/``INFRA_FAILURE``/``TIMED_OUT`` checks still route
+            # to ``infra_failed`` exactly as before (the #841 auto-rerun path
+            # in ``review()`` is fed by ``run_janitor``, which sees raw checks
+            # -- it never enriched FAILURE to INFRA_FAILURE pre-#1383, so the
+            # #1383 change reroutes zero-step FAILURE from
+            # ``is_check_failure_block`` (rework) to ``is_infra_blocked_block``
+            # (hold), not from ``is_infra_failure_block``).
+            enriched_checks = self._enrich_checks_infra_blocked(
+                checks, self.config.auto_merge.required_checks
+            )
             summary = summarize_checks(enriched_checks, self.config.auto_merge.required_checks)
         # Run containment check for worker edits leaked into operator checkout
         diff = self.gh.pr_diff(pr_number)
@@ -15404,6 +15818,14 @@ class OrchestratorApp:
                             "number": pr_number,
                             "issue_number": issue_number,
                             "status": "mergequeue",
+                            # Issue #1402: clear the self-revocation reason now
+                            # that the label has been re-applied (carry-forward
+                            # re-validated the approval), so a subsequent
+                            # Aviator #823 silent rejection is not misread as a
+                            # stale self-revocation. Setting to None (rather
+                            # than deleting the key) keeps the entry shape
+                            # stable for callers that .get() it defensively.
+                            "mergequeue_revoked_reason": None,
                         }
                         # Issue #823 ordering hazard: do NOT zero the counter
                         # when this re-add is recovering from a cross-pass
@@ -15531,7 +15953,7 @@ class OrchestratorApp:
         # (non-)dispatch of check-failure-rework are.
         mergequeue_handoff_failed = bool(
             self.config.auto_merge.mergequeue_label and mergequeue_label_applied is False
-        ) or (mergequeue_label_reverted and can_merge)
+        ) or (mergequeue_label_reverted and can_merge and not mergequeue_self_revoked_stale_head)
         # Conflict-rework dispatch is debounced to the failed-attempt alarm
         # threshold so a single transient/stale CONFLICTING reading does not
         # clobber an approved verdict. Re-read the issue status and the PR
@@ -16101,19 +16523,11 @@ class OrchestratorApp:
             summary = summarize_checks(None, self.config.auto_merge.required_checks)
             enriched_checks: list[dict[str, Any]] = []
         else:
-            # Enrich check data with infrastructure failure detection — same
-            # read-only logic as the real path (issue #210).
-            enriched_checks = []
-            for check in checks:
-                check_state = str(check.get("state") or "").upper()
-                if check_state == "FAILURE":
-                    check_run_id = check.get("databaseId")
-                    if check_run_id and isinstance(check_run_id, int):
-                        job = self.gh.actions_job(check_run_id)
-                        annotations = self.gh.check_run_annotations(check_run_id)
-                        if job and is_infrastructure_failure(job, annotations):
-                            check = {**check, "state": "INFRA_FAILURE"}
-                enriched_checks.append(check)
+            # Issue #1383: shared data-boundary enrichment, same as the real
+            # merge_ready path -- see _enrich_checks_infra_blocked.
+            enriched_checks = self._enrich_checks_infra_blocked(
+                checks, self.config.auto_merge.required_checks
+            )
             summary = summarize_checks(enriched_checks, self.config.auto_merge.required_checks)
 
         diff = self.gh.pr_diff(pr_number)
@@ -19374,6 +19788,41 @@ class OrchestratorApp:
                     correlation_id=cid,
                 )
             )
+            # Issue #1383: reset the cross-pass infra_blocked window when a
+            # pass reviews at least one PR and finds none infra-blocked --
+            # the fleet-wide infra condition has cleared, so the
+            # consecutive-pass counter starts fresh next time. Queried by
+            # this pass's correlation ID (same pattern as sink_clears
+            # above) so the count is exact for this pass with no
+            # allow-list to drift.
+            #
+            # Round-2 #1383 review: the reset must NOT fire merely because
+            # zero ``check_infra_blocked`` events were emitted -- that is
+            # also true when the pass reviewed no PRs at all (empty queue,
+            # ``limit=0`` with no candidates, ...). Resetting on an
+            # idle pass during a live outage silently clears
+            # ``consecutive_passes``/``last_escalation`` and can prevent
+            # the AC3 persistence escalation from ever firing. Gate on
+            # ``reviews`` (PRs actually reviewed this pass) being
+            # non-empty so the reset means "we looked and the coast was
+            # clear", not "we didn't look".
+            infra_blocked_this_pass = len(
+                query_events(
+                    self.paths.state_file,
+                    kind="check_infra_blocked",
+                    correlation_id=cid,
+                )
+            )
+            reviewed_this_pass = len(result.data.get("reviews", []))
+            if reviewed_this_pass > 0 and infra_blocked_this_pass == 0:
+                repo_key = str(self.repo_root)
+                window = _infra_blocked_window.get(repo_key)
+                if window is not None and window.get("consecutive_passes", 0) > 0:
+                    _infra_blocked_window[repo_key] = {
+                        "consecutive_passes": 0,
+                        "last_escalation": None,
+                        "last_pass_cid": None,
+                    }
             # Issue #1314 item 3: operator-queue depth gauge. Emitted after
             # ``_loop_body`` so the gauge reflects post-pass state (the
             # de-escalation sweep inside ``_loop_body`` may have cleared some
@@ -24656,6 +25105,29 @@ class OrchestratorApp:
             return None
         value = data.get("headRefOid")
         return str(value) if value is not None else None
+
+    def _read_packet_turn_cap_multiplier(self, pr_number: int) -> int:
+        """Return the structure-aware turn-cap multiplier stamped into the
+        review packet for ``pr_number`` (issue #1439), or 1 if no packet
+        exists, the packet predates the field, or it cannot be read.
+
+        A missing/old packet yielding 1 preserves the pre-#1439 flat
+        ``review_max_turns`` budget -- the base cap, no structure bonus.
+        """
+        pr_json_path = self.paths.prs / f"pr-{pr_number}" / "pr.json"
+        if not pr_json_path.exists():
+            return 1
+        try:
+            with pr_json_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return 1
+        if not isinstance(data, dict):
+            return 1
+        value = data.get("review_turn_cap_structure_multiplier", 1)
+        if not isinstance(value, int) or isinstance(value, bool):
+            return 1
+        return max(value, 1)
 
     def _cross_family_report_current(
         self,

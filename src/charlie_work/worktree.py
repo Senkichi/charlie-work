@@ -1093,6 +1093,7 @@ def salvage_push_stranded_commits(
     worktree_path: Path,
     *,
     base_ref: str = "",
+    dry_run: bool = False,
 ) -> SalvagePushResult:
     """Fast-forward-push committed-but-unpushed work from a dead worker's worktree.
 
@@ -1117,6 +1118,12 @@ def salvage_push_stranded_commits(
       has never seen means someone else pushed -- diverged, skip.
 
     Never raises; every failure comes back as a value.
+
+    Issue #1326: ``dry_run=True`` threads through to ``push_branch``, which
+    short-circuits before the ``git push`` subprocess call. The read-only
+    probing above (rev-parse, ls-remote, merge-base, rev-list) still runs --
+    those are the same read-only git/network calls the orchestrator makes
+    under dry-run elsewhere -- but no real push reaches ``origin``.
     """
     try:
         branch = require_valid_ref_name(branch, context="salvage_push branch")
@@ -1220,7 +1227,7 @@ def salvage_push_stranded_commits(
         if commit_count == 0:
             return SalvagePushResult(pushed=False, skip_reason="no_commits_beyond_base")
 
-    ok, push_error = push_branch(repo_root, branch, worktree_path)
+    ok, push_error = push_branch(repo_root, branch, worktree_path, dry_run=dry_run)
     if not ok:
         return SalvagePushResult(
             pushed=False,
@@ -4165,17 +4172,35 @@ def inspect_worktree_state(
 
 
 def push_branch(
-    repo_root: Path, branch: str, worktree_path: Path | None = None
+    repo_root: Path,
+    branch: str,
+    worktree_path: Path | None = None,
+    *,
+    dry_run: bool = False,
 ) -> tuple[bool, str | None]:
     """Push ``branch`` to origin and verify via ``git ls-remote``.
 
     Returns ``(ok, error)``. Pushes can fail silently on some transports, so the
     remote branch tip is explicitly checked and compared to the local branch tip.
+
+    Issue #1326: ``dry_run=True`` short-circuits before the ``git push``
+    subprocess call, returning ``(True, None)`` -- the natural "nothing
+    happened" result shape (the push neither failed nor produced a remote tip
+    to verify). This mirrors ``_reconcile_locked``'s explicit-threading
+    convention: the orchestrator's ``dry_run`` flag is threaded directly,
+    rather than going through ``WriteGate`` (which covers state.json /
+    events.db / label-transition / process-kill primitives, not git-level
+    mutations). Downstream callers' own state writes and label transitions
+    remain gated by ``WriteGate``; the ``gh pr create`` that follows in
+    ``_attempt_salvage`` is gated at the ``GitHub`` client sink level.
     """
     try:
         branch = require_valid_ref_name(branch, context="push_branch branch")
     except ValueError as exc:
         return False, str(exc)
+
+    if dry_run:
+        return True, None
 
     cwd = worktree_path if worktree_path else repo_root
     push_result = run_captured(
