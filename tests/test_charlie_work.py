@@ -40293,7 +40293,11 @@ def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    # Issue #1325: dry_run=True suppresses sidecar writes (failure_kind stays
+    # None), so this test must use dry_run=False to verify the sidecar is
+    # actually classified. The stalled PID (99999) does not exist, so
+    # kill_process_tree is a no-op — no real process is harmed.
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
 
     # Create a session record for issue 123 with a live PID and stale log
     sessions_dir = app._layout.sessions_dir

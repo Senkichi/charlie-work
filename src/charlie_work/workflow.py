@@ -1484,10 +1484,18 @@ def _detect_and_handle_stalled_sessions(
     dispatch in the same pass).
 
     Issue #1325: all process kills (``kill_process_tree``,
-    ``kill_orphan_pid``) and state/event writes (``append_event``,
-    ``save_state``, the budget-exceeded sidecar write) now route through
-    ``write_gate`` so a ``dry_run=True`` gate suppresses them exactly as
-    ``--dry-run`` promises. The ``write_gate`` parameter follows the
+    ``kill_orphan_pid``), state/event writes (``append_event``,
+    ``save_state``), and sidecar writes (``update_worker_log_stat``, the
+    budget-exceeded sidecar write, ``classify_and_record``,
+    ``update_session_record_with_failure_classification`` /
+    ``update_worker_record_with_failure_classification``) are gated on
+    ``write_gate.dry_run`` so a ``dry_run=True`` gate suppresses them
+    exactly as ``--dry-run`` promises. The sidecar-writing helpers
+    themselves do not accept a ``write_gate``/``dry_run`` parameter; they
+    are gated at the call site instead, keeping the change scoped to this
+    function (the subject of #1325) and avoiding a caller sweep across
+    the dead-session lane and other consumers that intentionally write
+    sidecars unconditionally. The ``write_gate`` parameter follows the
     Convention B explicit-threading pattern (``require_write_gate()``)
     already used by ``_sweep_orphan_processes_for_dead_sessions`` and the
     dead-session lane.
@@ -1539,7 +1547,15 @@ def _detect_and_handle_stalled_sessions(
 
         # Update log stat fields for progress tracking. This also clears any
         # stale rate-limit defer deadline when the log has resumed growing.
-        update_worker_log_stat(sessions_dir, w)
+        # Issue #1325: gated on ``write_gate.dry_run`` so the sidecar is not
+        # mutated under ``--dry-run``. Detection (``classify_worker_health``,
+        # ``real_activity_probe_for``) operates on the pre-fetched
+        # ``WorkerView`` from ``iter_workers`` and does not re-read the
+        # sidecar, so skipping this write does not affect this pass's
+        # classification — it only suppresses the sidecar mutation for the
+        # next pass, which is exactly what ``--dry-run`` promises.
+        if not write_gate.dry_run:
+            update_worker_log_stat(sessions_dir, w)
 
         # Issues #280/#301: corroborate sidecar mtime against real-session activity
         # (sessions.db message_nodes, per-PID Devin log mtime, and Claude Code
@@ -1562,7 +1578,11 @@ def _detect_and_handle_stalled_sessions(
         # period and was the very mechanism that opened Finding 1's pass-2
         # phantom-sidecar window.
         new_count = _next_inconclusive_probe_deferred_count(w, probe, health)
-        update_worker_log_stat(sessions_dir, w, inconclusive_probe_deferred_count=new_count)
+        # Issue #1325: gated on ``write_gate.dry_run`` so the sidecar is not
+        # mutated under ``--dry-run``. The counter is a persisted cross-pass
+        # escalation cap; under dry-run it must not advance on disk.
+        if not write_gate.dry_run:
+            update_worker_log_stat(sessions_dir, w, inconclusive_probe_deferred_count=new_count)
 
         # Issue #484: in-flight api per-session budget kill. Independent of the
         # STALLED/DEAD classification below — an api worker over its
@@ -1648,7 +1668,12 @@ def _detect_and_handle_stalled_sessions(
                         config.runtime.throttle_resume_margin_s,
                     )
                     if defer_until is not None:
-                        update_worker_log_stat(sessions_dir, w, rate_limit_defer_until=defer_until)
+                        # Issue #1325: gated on ``write_gate.dry_run`` so the
+                        # sidecar is not mutated under ``--dry-run``.
+                        if not write_gate.dry_run:
+                            update_worker_log_stat(
+                                sessions_dir, w, rate_limit_defer_until=defer_until
+                            )
                         with state_lock(state_file):
                             state = load_state(state_file)
                             state = set_throttled_until(
@@ -1696,45 +1721,59 @@ def _detect_and_handle_stalled_sessions(
             # existing "skip if already classified" short-circuit. Best-effort
             # and read-only: any DB problem degrades to extraction_error and
             # this never changes what happens next.
-            classify_and_record(sessions_dir, config, w, now=now)
+            # Issue #1325: gated on ``write_gate.dry_run`` so the sidecar is
+            # not mutated under ``--dry-run``. The return value is discarded
+            # at this call site, so suppressing the call has no downstream
+            # effect on this pass's event payload (which itself is suppressed
+            # under dry-run via ``write_gate.append_event``).
+            if not write_gate.dry_run:
+                classify_and_record(sessions_dir, config, w, now=now)
 
             # Classify the sidecar (adapter-specific dispatch): log-tail
             # classification runs first, falling back to failure_kind "stalled"
             # only when the log shows no provider throttle signature.
+            # Issue #1325: gated on ``write_gate.dry_run`` so the sidecar is
+            # not mutated under ``--dry-run``. Under dry-run the return values
+            # stay ``None``, which means no ``throttled_until`` is persisted
+            # (``write_gate.save_state`` is already a no-op) and the event
+            # payload (itself suppressed via ``write_gate.append_event``)
+            # would carry ``failure_kind=None`` — consistent with "nothing
+            # happened," which is exactly what ``--dry-run`` promises.
             resolved_failure_kind: str | None = None
             throttled_until: str | None = None
-            if w.adapter_kind == "devin":
-                resolved_failure_kind, throttled_until = (
-                    update_session_record_with_failure_classification(
-                        sessions_dir,
-                        w.issue_number,
-                        fallback_kind="stalled",
-                        config=config,
+            if not write_gate.dry_run:
+                if w.adapter_kind == "devin":
+                    resolved_failure_kind, throttled_until = (
+                        update_session_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="stalled",
+                            config=config,
+                        )
                     )
-                )
-            elif w.adapter_kind == "claude-code":
-                resolved_failure_kind, throttled_until = (
-                    update_worker_record_with_failure_classification(
-                        sessions_dir,
-                        w.issue_number,
-                        fallback_kind="stalled",
-                        config=config,
+                elif w.adapter_kind == "claude-code":
+                    resolved_failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="stalled",
+                            config=config,
+                        )
                     )
-                )
-            elif w.adapter_kind == "api":
-                # api sidecars share the claude-code classification helper but
-                # land as issue-<n>.api.json and get provider-auth classification
-                # (issue #484). adapter_kind="api" selects both the sidecar
-                # suffix and the auth-pattern check inside _classify_session_failure.
-                resolved_failure_kind, throttled_until = (
-                    update_worker_record_with_failure_classification(
-                        sessions_dir,
-                        w.issue_number,
-                        fallback_kind="stalled",
-                        config=config,
-                        adapter_kind="api",
+                elif w.adapter_kind == "api":
+                    # api sidecars share the claude-code classification helper but
+                    # land as issue-<n>.api.json and get provider-auth classification
+                    # (issue #484). adapter_kind="api" selects both the sidecar
+                    # suffix and the auth-pattern check inside _classify_session_failure.
+                    resolved_failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="stalled",
+                            config=config,
+                            adapter_kind="api",
+                        )
                     )
-                )
 
             if resolved_failure_kind and throttled_until:
                 # A throttle signature was found in the log tail even though

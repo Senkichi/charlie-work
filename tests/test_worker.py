@@ -2183,20 +2183,28 @@ def test_detect_and_handle_stalled_sessions_dry_run_suppresses_kills_and_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Issue #1325: under ``dry_run=True`` the stall reaper must not kill
-    processes and must not write to ``state.json``/``events.db``.
+    processes, must not write to ``state.json``/``events.db``, and must not
+    mutate the worker's sidecar file.
 
     Before the fix, ``_detect_and_handle_stalled_sessions`` had no
     ``write_gate`` parameter: ``kill_process_tree``, ``kill_orphan_pid``,
-    ``append_event``, ``save_state``, and the budget-exceeded sidecar write
-    were all unconditional. A ``--dry-run`` pass could terminate live worker
-    processes and permanently mutate shared state -- exactly the side
-    effects ``--dry-run`` exists to suppress.
+    ``append_event``, ``save_state``, the budget-exceeded sidecar write,
+    ``update_worker_log_stat``, ``classify_and_record``, and the
+    failure-classification helpers were all unconditional. A ``--dry-run``
+    pass could terminate live worker processes and permanently mutate
+    shared state -- exactly the side effects ``--dry-run`` exists to
+    suppress.
 
     This test drives a STALLED worker through the reaper with a
     ``dry_run=True`` gate and asserts:
       1. ``kill_process_tree`` is never called (no process kills).
       2. ``state.json`` is never written (no ``session_stalled`` event).
-      3. The function still returns the stalled entry (detection is
+      3. The worker's sidecar file contents are byte-identical to the
+         pre-call snapshot -- ``update_worker_log_stat``,
+         ``classify_and_record``, and the failure-classification helpers
+         are all gated on ``write_gate.dry_run`` and do not mutate the
+         sidecar under ``--dry-run``.
+      4. The function still returns the stalled entry (detection is
          read-only and must keep working under dry-run so the caller can
          reason about what *would* happen).
     """
@@ -2205,6 +2213,15 @@ def test_detect_and_handle_stalled_sessions_dry_run_suppresses_kills_and_writes(
     issue_number = 1325
     log_text = "Working on task...\nLast line\n"
     sessions_dir, state_file, _ = _make_stalled_devin_session(tmp_path, issue_number, log_text)
+
+    # Snapshot the sidecar before the call so we can assert byte-identical
+    # contents after. This is the assertion that catches ungated sidecar
+    # writes (update_worker_log_stat, classify_and_record, the
+    # failure-classification helpers) -- the narrower ``not state_file.exists()``
+    # check alone missed them because those helpers write to the *sidecar*,
+    # not to state.json.
+    sidecar_path = devin_sidecar_path(sessions_dir, issue_number)
+    sidecar_before = sidecar_path.read_bytes()
 
     killed: list[int] = []
     monkeypatch.setattr(
@@ -2233,6 +2250,95 @@ def test_detect_and_handle_stalled_sessions_dry_run_suppresses_kills_and_writes(
     # disk. ``load_state`` on a non-existent path returns a default empty
     # state, so the in-memory pipeline ran, but nothing persisted.
     assert not state_file.exists()
+
+    # The sidecar file is byte-identical to the pre-call snapshot. This
+    # catches ungated sidecar writes that the ``not state_file.exists()``
+    # check above cannot detect (sidecar writes go to the sidecar, not
+    # state.json).
+    assert sidecar_path.read_bytes() == sidecar_before
+
+
+def test_detect_and_handle_stalled_sessions_dry_run_suppresses_api_budget_exceeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1325: under ``dry_run=True`` the api-budget-exceeded branch
+    must not kill the process, must not mutate the sidecar, and must not
+    emit a ``session_budget_exceeded`` event.
+
+    Before the fix, the budget-exceeded branch's ``kill_process_tree`` and
+    sidecar write were gated, but the ``session_budget_exceeded`` event
+    write was already routed through ``write_gate.append_event`` (a no-op
+    under dry-run). However, the sidecar write at the top of the branch
+    (``failure_kind="budget_exceeded"``) was the only sidecar write in the
+    function that *was* gated in the original PR -- the surrounding
+    ``update_worker_log_stat`` calls that run unconditionally for every
+    worker were not. This test asserts the full branch is suppressed under
+    dry-run, matching the coverage already added for the STALLED/DEAD
+    branch.
+    """
+    from charlie_work import workflow
+
+    issue_number = 1326
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / f"issue-{issue_number}.claude.log"
+    log_path.write_text("Working on task...\nLast line\n", encoding="utf-8")
+
+    sidecar_path = claude_sidecar_path(sessions_dir, issue_number, "api")
+    record = ClaudeWorkerRecord(
+        issue_number=issue_number,
+        branch=f"agent/issue-{issue_number}",
+        worktree_path=str(tmp_path / "worktree"),
+        prompt_path=str(tmp_path / "prompt.md"),
+        command=("claude", "prompt.md"),
+        pid=88888,
+        started_at=(datetime.now(UTC) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+        failure_kind=None,
+        process_start_time=1710000000.0,
+        reclaimed=None,
+        adapter_kind="api",
+        provider="example",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+    sidecar_before = sidecar_path.read_bytes()
+
+    killed: list[int] = []
+    monkeypatch.setattr(
+        "charlie_work.write_gate.kill_process_tree",
+        lambda pid, start_time=None: killed.append(pid) or [pid],
+    )
+    monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
+    # Force the budget check to fire so the api-budget-exceeded branch is
+    # exercised without needing a real events.jsonl + token-usage setup.
+    monkeypatch.setattr("charlie_work.worker._api_session_over_budget", lambda view, config: True)
+
+    config = OrchestratorConfig()
+
+    state_file = tmp_path / "state.json"
+    result = workflow._detect_and_handle_stalled_sessions(
+        sessions_dir,
+        state_file,
+        config,
+        write_gate=_wg(state_file, dry_run=True),
+    )
+
+    # Detection still works -- the budget-exceeded entry is returned.
+    assert result == [{"issue": issue_number, "pid": 88888}]
+
+    # No process kills under dry_run.
+    assert killed == []
+
+    # No state.json was written.
+    assert not state_file.exists()
+
+    # The sidecar file is byte-identical -- no ``failure_kind=budget_exceeded``
+    # mutation, no ``update_worker_log_stat`` progress-field mutation.
+    assert sidecar_path.read_bytes() == sidecar_before
 
 
 def test_detect_and_handle_stalled_sessions_emits_provider_suspended_event(
