@@ -1,11 +1,12 @@
 """Additive dry-run write gate for ``OrchestratorApp`` (issue #1264, W6 PR1).
 
-``WriteGate`` is a per-instance wrapper around the six write primitives an
+``WriteGate`` is a per-instance wrapper around the seven write primitives an
 ``OrchestratorApp`` method can reach: ``state.save_state``,
 ``state.append_event``, the ``_record_event``-shaped forwarding wrapper
 (``record_event`` here), ``instrumentation.log_event``, ``labels.transition``,
-and (issue #1264, W6 PR3, R6a) ``process_utils.kill_orphan_pid`` via
-``kill_process``. Each gate method takes the same arguments as the
+(issue #1264, W6 PR3, R6a) ``process_utils.kill_orphan_pid`` via
+``kill_process``, and (issue #1325) ``process_utils.kill_process_tree`` via
+``kill_process_tree``. Each gate method takes the same arguments as the
 primitive it wraps (minus the ``state_path``/``repo`` binding, which the
 gate auto-supplies from its own fields, mirroring how
 ``OrchestratorApp._record_event`` auto-binds those today) and adds exactly
@@ -15,7 +16,9 @@ value for its shape (the input state dict unchanged for the state-threading
 methods, ``None`` for ``log_event`` and ``kill_process`` alike -- the raw
 ``kill_orphan_pid`` primitive itself always returns ``None``, so this is not
 a synthetic dry-run-only value but the same value a real call already
-produces -- and the library's own
+produces -- ``[]`` for ``kill_process_tree`` -- the same value a real call
+already produces when start-time verification fails or the process is already
+gone -- and the library's own
 ``TransitionResult(TransitionOutcome.NOTHING_CHANGED, [], [])`` for
 ``transition``).
 
@@ -55,7 +58,7 @@ from .config import LabelConfig
 from .github import GitHubLike
 from .instrumentation import log_event
 from .labels import TransitionOutcome, TransitionResult, transition
-from .process_utils import kill_orphan_pid
+from .process_utils import kill_orphan_pid, kill_process_tree
 from .state import append_event, save_state
 
 
@@ -182,6 +185,24 @@ class WriteGate:
         if self.dry_run:
             return None
         return kill_orphan_pid(pid)
+
+    def kill_process_tree(self, pid: int, expected_start_time: float | None = None) -> list[int]:
+        """Gate ``process_utils.kill_process_tree``. Dry-run: no kill, returns ``[]``.
+
+        Issue #1325: ``_detect_and_handle_stalled_sessions`` kills stalled
+        worker process trees in addition to orphan PIDs. ``kill_process_tree``
+        returns the list of PIDs it reaped (root + children), which callers
+        embed in the subsequent ``session_stalled``/``session_budget_exceeded``
+        event payload. Under dry-run the natural "nothing happened" value is
+        ``[]`` -- the same value a real call already produces when start-time
+        verification fails or the process is already gone -- so the event
+        payload (which itself is suppressed under dry-run via
+        ``write_gate.append_event``) would carry an empty ``killed_pids`` list
+        if it were emitted. Not a synthetic dry-run-only sentinel.
+        """
+        if self.dry_run:
+            return []
+        return kill_process_tree(pid, expected_start_time)
 
 
 def require_write_gate(write_gate: object) -> "WriteGate":
