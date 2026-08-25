@@ -12,11 +12,14 @@ fall-back-to-live semantics.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from charlie_work.cli import build_parser, run_fleet_status
 from charlie_work.config import (
     ConfigError,
     DeescalationConfig,
@@ -413,3 +416,102 @@ def test_status_snapshot_ttl_seconds_rejects_negative() -> None:
     """A negative TTL is nonsensical; must raise ConfigError."""
     with pytest.raises(ConfigError, match="status_snapshot_ttl_seconds.*must be >= 0"):
         build_config_from_data({"runtime": {"status_snapshot_ttl_seconds": -1}})
+
+
+# ---------------------------------------------------------------------------
+# Issue #1463 review: --no-cache CLI flag threads through to status()
+# ---------------------------------------------------------------------------
+
+
+def _write_fleet_registry_with_one_repo(tmp_path: Path) -> Path:
+    """Write a fleet.json (under the conftest-redirected fleet dir) with one
+    valid repo entry whose ``repo_root`` exists, so ``run_fleet_status`` reaches
+    the ``OrchestratorApp.status()`` call instead of skipping it as stale.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+    now = datetime.now(UTC)
+    entries = {
+        "owner/repo": {
+            "repo_root": str(repo_root),
+            "name_with_owner": "owner/repo",
+            "config_path": str(repo_root / "orchestrator.config.yaml"),
+            "state_dir": str(repo_root / ".var" / "charlie-work"),
+            "first_seen": now.isoformat().replace("+00:00", "Z"),
+            "last_seen": now.isoformat().replace("+00:00", "Z"),
+        },
+    }
+    (fleet_dir / "fleet.json").write_text(
+        json.dumps({"version": 1, "repos": entries}), encoding="utf-8"
+    )
+    return repo_root
+
+
+@contextmanager
+def _mock_fleet_status_deps():
+    """Patch the cli-module deps ``run_fleet_status`` uses so it never touches
+    the filesystem or GitHub, and yield the mock ``OrchestratorApp`` instance
+    so the caller can inspect ``status.call_args``.
+
+    Mirrors the patch surface in ``test_issue_1372_fleet_registry_stale.py``'s
+    ``run_fleet_status`` test: ``load_layered_config``, ``runtime_paths``,
+    ``GitHub``, ``OrchestratorApp``, ``compute_api_worker_fleet_report``.
+    """
+    with (
+        patch("charlie_work.cli.load_layered_config") as mock_cfg,
+        patch("charlie_work.cli.runtime_paths") as mock_paths,
+        patch("charlie_work.cli.GitHub") as mock_gh,
+        patch("charlie_work.cli.OrchestratorApp") as mock_app,
+        patch("charlie_work.cli.compute_api_worker_fleet_report") as mock_report,
+    ):
+        mock_cfg.return_value = OrchestratorConfig()
+        mock_p = MagicMock()
+        mock_p.root = Path(".")
+        mock_paths.return_value = mock_p
+        mock_gh.return_value = MagicMock()
+        mock_a = MagicMock()
+        mock_a.status.return_value = MagicMock(ok=True, data={"ready_issue_count": 0})
+        mock_app.return_value = mock_a
+        mock_report.return_value = None
+        yield mock_a
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_use_cache"),
+    [
+        (["fleet", "status"], True),
+        (["fleet", "status", "--no-cache"], False),
+    ],
+    ids=["default-threads-use_cache-True", "no-cache-threads-use_cache-False"],
+)
+def test_no_cache_cli_flag_threads_use_cache_into_status(
+    tmp_path: Path, argv: list[str], expected_use_cache: bool
+) -> None:
+    """Issue #1463 review: the ``--no-cache`` CLI flag is the operator-facing
+    mechanism this issue calls for. This test drives it end-to-end through
+    ``build_parser()`` / ``run_fleet_status`` (not just ``app.status(...)``
+    directly), confirming:
+
+    * ``fleet status`` (no flag) threads ``use_cache=True`` into
+      ``OrchestratorApp.status()`` — the cache-serving default.
+    * ``fleet status --no-cache`` threads ``use_cache=False`` — the live
+      bypass.
+
+    Both branches are exercised by parametrization so a regression in either
+    direction (flag dropped, flag inverted, default flipped) is caught.
+    """
+    _write_fleet_registry_with_one_repo(tmp_path)
+    args = build_parser().parse_args(argv)
+
+    with _mock_fleet_status_deps() as mock_app:
+        result = run_fleet_status(args)
+
+    assert result.ok is True
+    mock_app.status.assert_called_once()
+    assert mock_app.status.call_args.kwargs.get("use_cache") is expected_use_cache, (
+        f"argv={argv} should thread use_cache={expected_use_cache} into "
+        f"OrchestratorApp.status(); got call_args={mock_app.status.call_args}"
+    )
