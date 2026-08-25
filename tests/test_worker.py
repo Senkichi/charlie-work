@@ -2341,6 +2341,95 @@ def test_detect_and_handle_stalled_sessions_dry_run_suppresses_api_budget_exceed
     assert sidecar_path.read_bytes() == sidecar_before
 
 
+def test_detect_and_handle_stalled_sessions_dry_run_suppresses_rate_limit_defer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1325: under ``dry_run=True`` the STALLED + rate-limit-defer
+    branch (workflow.py ~1671-1695) must not mutate the sidecar's
+    ``rate_limit_defer_until`` field, must not emit a
+    ``session_rate_limit_deferred`` event, and must not write ``state.json``.
+
+    The non-dry-run counterpart is
+    ``test_stalled_worker_with_rate_limit_signature_is_deferred``. This test
+    reuses the same fixture (``_make_stalled_devin_session`` with the
+    rate-limit log tail) and the same ``WatchdogConfig`` so the only
+    independent variable is ``write_gate.dry_run``. A future revert of the
+    ``if not write_gate.dry_run:`` guard around the
+    ``update_worker_log_stat(..., rate_limit_defer_until=defer_until)`` call
+    at workflow.py ~1673-1676 would set ``rate_limit_defer_until`` on the
+    sidecar under dry-run and fail the byte-identical assertion below.
+    """
+    from charlie_work import workflow
+
+    issue_number = 1327
+    log_text = (
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n"
+    )
+    sessions_dir, state_file, _ = _make_stalled_devin_session(tmp_path, issue_number, log_text)
+
+    # The fixture writes the sidecar with rate_limit_defer_until=None, which
+    # is exactly the branch-entry condition (``w.rate_limit_defer_until is
+    # None``). Snapshot the bytes so the assertion catches any mutation,
+    # not just the rate_limit_defer_until field.
+    sidecar_path = devin_sidecar_path(sessions_dir, issue_number)
+    sidecar_before = sidecar_path.read_bytes()
+    assert json.loads(sidecar_before)["rate_limit_defer_until"] is None
+
+    killed: list[int] = []
+    monkeypatch.setattr(
+        "charlie_work.write_gate.kill_process_tree",
+        lambda pid, start_time=None: killed.append(pid) or [pid],
+    )
+    monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
+
+    config = OrchestratorConfig(
+        watchdog=WatchdogConfig(
+            rate_limit_defer_enabled=True,
+            rate_limit_defer_slack_minutes=2,
+        )
+    )
+
+    frozen_now = datetime.now(UTC)
+    result = workflow._detect_and_handle_stalled_sessions(
+        sessions_dir,
+        state_file,
+        config,
+        write_gate=_wg(state_file, dry_run=True),
+        now=frozen_now,
+    )
+
+    # Detection still works -- the rate-limit signature is recognized and
+    # the worker is deferred (not killed), so no stalled entry is returned.
+    assert result == []
+    assert killed == []
+
+    # No state.json was written -- ``write_gate.save_state`` is a no-op
+    # under dry_run, so the file the gate would have written does not exist.
+    assert not state_file.exists()
+
+    # No ``session_rate_limit_deferred`` event was recorded. The event is
+    # routed through ``write_gate.append_event`` (a no-op under dry_run) and
+    # ``write_gate.save_state`` never persists, so there is no state.json to
+    # inspect -- the ``not state_file.exists()`` check above covers both.
+    # Belt-and-suspenders: assert no events.db was created either.
+    assert not (state_file.parent / "events.db").exists()
+
+    # The sidecar's ``rate_limit_defer_until`` field is unchanged (still
+    # None) -- the ``update_worker_log_stat(..., rate_limit_defer_until=...)``
+    # call at workflow.py ~1673-1676 is gated on ``write_gate.dry_run``.
+    sidecar_after = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert sidecar_after["rate_limit_defer_until"] is None
+
+    # The sidecar file is byte-identical to the pre-call snapshot. This is
+    # the assertion that catches an ungated ``update_worker_log_stat`` call
+    # on this branch -- the field-level check above would miss a different
+    # field being mutated (e.g. ``last_activity_at``).
+    assert sidecar_path.read_bytes() == sidecar_before
+
+
 def test_detect_and_handle_stalled_sessions_emits_provider_suspended_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
