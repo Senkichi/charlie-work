@@ -18,6 +18,7 @@ $branch_name
 
 $issue_body_block$issue_comments
 
+$module_map
 $section_scope_contract
 
 $section_spec_letter
