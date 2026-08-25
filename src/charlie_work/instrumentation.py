@@ -218,6 +218,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "session_salvaged": "error",
         "session_stalled": "error",
         "spec_review_failed": "error",
+        # Issue #1453: a worker deliberately concluded the task is structurally
+        # impossible and declared a ``blocked`` outcome. Terminal for the issue
+        # -- escalated to the operator queue with zero redispatches -> error,
+        # parallel to session_failed_escalated / orphan_sweep_redispatch_escalated.
+        "worker_declared_blocked": "error",
         # Issue #1274 (W17): stale_checks_retrigger_attempts reached
         # stale_checks_max_retriggers and the check suite is still missing --
         # no code-fix rework path exists for a run GitHub never created, so
