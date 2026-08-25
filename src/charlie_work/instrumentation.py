@@ -454,6 +454,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # the intended follow-up mechanism working as designed, mirroring
         # flake_rerun_triggered / infra_rerun_triggered below.
         "ci_retriggered_stale_checks": "info",
+        # Issue #1451: the ci_run_never_created remediation declined to
+        # close/reopen a CONFLICTING PR (GitHub cannot build refs/pull/N/merge
+        # while conflicted, so no pull_request workflow run can be created for
+        # ANY event) and routed to the existing merge-conflict rework path
+        # instead. Info, not warning: this is the chooser correctly
+        # discriminating, mirroring ci_retriggered_stale_checks' level.
+        "ci_retrigger_skipped_conflicting": "info",
         "ci_run_never_created": "info",
         "closed_unmerged_pr_state_converged": "info",
         "containment_check": "info",
