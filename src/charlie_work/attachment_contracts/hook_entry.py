@@ -28,13 +28,14 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Mapping
 
 from charlie_work.attachment_contracts.baseline import BASELINE_FILENAME, TamperError
 from charlie_work.attachment_contracts.baseline import load as load_baseline
 from charlie_work.attachment_contracts.check import check_file
-from charlie_work.attachment_contracts.model import Finding
+from charlie_work.attachment_contracts.model import AdvisoryRecord, Finding
 
 _ADVISORY_LOG_REL = Path(".var/attachment-contracts/advisories.jsonl")
 _ACTIONABLE_SEVERITIES = frozenset({"block", "error"})
@@ -92,12 +93,84 @@ def _append_advisory_log(root: Path, findings: list[Finding]) -> None:
                             "file": f.file,
                             "identity": f.identity,
                             "message": f.message,
+                            # Issue #1460: structural fields for the review
+                            # packet's redirects-not-taken section.
+                            # ``redirect`` comes straight from
+                            # ``Finding.redirect`` -- never parsed back out of
+                            # ``message`` -- and ``timestamp`` is recorded at
+                            # write time so the review packet can reason
+                            # about advisory recency.
+                            "redirect": f.redirect,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
                         }
                     )
                     + "\n"
                 )
     except OSError:
         pass  # best-effort only; never block on log-write failure
+
+
+def advisory_log_exists(root: Path) -> bool:
+    """True when the advisories log file exists under ``root`` (issue #1460).
+
+    Distinguishes "log unavailable" (file missing -- the review packet
+    cannot compute redirects-not-taken and must say so) from "log available
+    but empty" (file exists with zero/no matching records -- a legitimate
+    clean-pass case) for callers of ``read_advisories``, whose own return
+    value is ``()`` in both cases.
+    """
+    return (root / _ADVISORY_LOG_REL).is_file()
+
+
+def read_advisories(root: Path) -> tuple[AdvisoryRecord, ...]:
+    """Read every advisory record logged under ``root`` (issue #1460).
+
+    Tolerant of old-shape records written before ``redirect``/``timestamp``
+    existed (both default to ``None`` on ``AdvisoryRecord``), and best-effort
+    on malformed lines: a line that isn't valid JSON, isn't an object, or is
+    missing a required field is skipped rather than raising -- this reader
+    feeds an advisory-only review section, never a blocking gate. A missing
+    log file yields an empty tuple (nothing to report, not an error).
+    """
+    log_path = root / _ADVISORY_LOG_REL
+    try:
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ()
+
+    records: list[AdvisoryRecord] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        try:
+            severity = str(raw["severity"])
+            file_ = str(raw["file"])
+            identity = str(raw["identity"])
+            message = str(raw["message"])
+        except KeyError:
+            continue
+        redirect_raw = raw.get("redirect")
+        redirect = str(redirect_raw) if isinstance(redirect_raw, str) else None
+        timestamp_raw = raw.get("timestamp")
+        timestamp = str(timestamp_raw) if isinstance(timestamp_raw, str) else None
+        records.append(
+            AdvisoryRecord(
+                severity=severity,  # type: ignore[arg-type]
+                file=file_,
+                identity=identity,
+                message=message,
+                redirect=redirect,
+                timestamp=timestamp,
+            )
+        )
+    return tuple(records)
 
 
 def _extract_file_path(payload: object) -> str | None:

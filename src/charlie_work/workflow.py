@@ -97,6 +97,28 @@ from .pr_create_retry import create_pr_with_retry
 from .issue_comments import render_issue_comments
 from .markdown_fence import fenced_block
 from .module_map import build_module_map
+from .attachment_contracts import baseline as attachment_baseline
+from .attachment_contracts import hook_entry as attachment_hook_entry
+from .attachment_contracts.model import AdvisoryRecord
+from .attachment_contracts.review_delta import (
+    BudgetSection,
+    build_budget_findings,
+    reconstruct_baseline_head_text,
+)
+
+# LOAD-BEARING RE-EXPORT -- NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# below marks a deliberate re-export, not a lint concession.
+#
+# Issue #1460: the attachment-budget dispatch clause and packet-section
+# renderer live in `charlie_work.attachment_budget_prompt`, following the
+# #1442 ratchet's prescribed remedy for over-cap files (extract + re-export
+# through this facade block, matching the `.dispatch_selection` /
+# `.escalation` / `.verdict_parsing` / `.rework_prompts` / `.ci_findings` /
+# `.backlog_reachability` / `.stalled_review_reap` lineage above).
+from .attachment_budget_prompt import (  # noqa: F401  (deliberate re-export)
+    ATTACHMENT_BUDGET_CLAUSE as _ATTACHMENT_BUDGET_CLAUSE,
+    render_attachment_budget_section,
+)
 from .janitor import (
     _calculate_patch_id,
     _diff_content_signature,
@@ -104,6 +126,7 @@ from .janitor import (
     check_test_adequacy,
     detect_cross_pr_revert,
     is_stale_ci_verdict,
+    iter_diff_files,
     required_check_citation_names,
     run_janitor,
     DiffContentSignature,
@@ -4291,6 +4314,14 @@ WORKER_PROMPT_KEYS: frozenset[str] = frozenset(
         # ``worker_module_map_failed`` warning event), never a dispatch
         # failure.
         "module_map",
+        # Issue #1460: the attachment-point placement clause, gated on
+        # `.attachment-budgets.json` presence. Empty string when the marker
+        # is absent or fails to load (fail-soft: omitted clause + a
+        # ``worker_attachment_budget_failed`` warning event), never a
+        # dispatch failure. Deliberately NOT added to REWORK_PROMPT_KEYS --
+        # the rework lane receives budget findings via the review packet's
+        # `$attachment_budget_section` instead.
+        "attachment_budget",
     }
 )
 REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
@@ -10753,6 +10784,12 @@ class OrchestratorApp:
             else None
         )
 
+        # Issue #1460: attachment-budget review-packet section. Cheap gate
+        # first -- most PRs touch neither `.attachment-budgets.json` nor a
+        # baselined host file, so the reconstruct/build path below is
+        # skipped for them entirely (section renders "").
+        attachment_budget_section = self._build_attachment_budget_section(diff)
+
         # Issue #1036: compare-and-swap the head immediately before committing
         # this packet's outputs (prompt + decision). ``pr`` was snapshotted
         # once, at the top of this method, and everything since -- diff
@@ -10870,6 +10907,7 @@ class OrchestratorApp:
                 "diff_size_section": diff_size_section,
                 "ci_status_section": ci_status_section,
                 "over_cap_section": over_cap_section,
+                "attachment_budget_section": attachment_budget_section,
                 "prior_review_section": prior_review_section,
             },
         )
@@ -17180,6 +17218,91 @@ class OrchestratorApp:
                 report_path=report_path,
             )
         return self._cross_family_section(result.report_path), result
+
+    def _build_attachment_budget_section(self, diff: str) -> str:
+        """Build ``$attachment_budget_section`` for the review packet (#1460).
+
+        Cheap gate first: if `.attachment-budgets.json` is absent, or this
+        diff touches neither the baseline file itself nor any file that
+        currently hosts a baselined attachment point, the section renders
+        ``""`` -- the vast majority of PRs never approach this feature at
+        all, so nothing past the gate (diff-hunk reconstruction, advisories
+        read) runs for them.
+
+        Once gated in: the base-commit baseline text is read best-effort
+        (a ``TamperError``/``OSError`` degrades to "no entries", same as a
+        missing file -- this section is advisory-only and must never raise);
+        the PR-head text is reconstructed from the diff (or read straight off
+        disk when the baseline file itself isn't part of this diff); a
+        reconstruction failure sets ``head_unreadable`` rather than guessing.
+        Advisories are read best-effort too, with "log file doesn't exist"
+        (``advisory_log_exists`` False) distinguished from "log exists but
+        has nothing relevant" -- only the former sets
+        ``advisories_unavailable``.
+        """
+        marker_path = self.repo_root / attachment_baseline.BASELINE_FILENAME
+        if not marker_path.is_file():
+            return ""
+
+        changed_files = _diff_content_signature(diff).changed_files
+        baseline_touched = attachment_baseline.BASELINE_FILENAME in changed_files
+
+        try:
+            base_document = attachment_baseline.load(marker_path)
+            base_entries = attachment_baseline.entries_of(base_document)
+        except (attachment_baseline.TamperError, OSError):
+            base_entries = ()
+        hosts_baselined = changed_files & {entry.file for entry in base_entries}
+
+        if not (baseline_touched or hosts_baselined):
+            return ""
+
+        try:
+            base_baseline_text: str | None = marker_path.read_text(encoding="utf-8")
+        except OSError:
+            base_baseline_text = None
+
+        if baseline_touched:
+            file_diff_lines: list[str] = []
+            is_new_baseline_file = False
+            for name, is_new, hunks in iter_diff_files(diff):
+                if name == attachment_baseline.BASELINE_FILENAME:
+                    file_diff_lines = hunks
+                    is_new_baseline_file = is_new
+                    break
+            head_baseline_text = reconstruct_baseline_head_text(
+                None if is_new_baseline_file else base_baseline_text,
+                "\n".join(file_diff_lines),
+            )
+        else:
+            # Baseline file itself untouched by this diff: its head content
+            # is its base content.
+            head_baseline_text = base_baseline_text
+
+        if baseline_touched and head_baseline_text is None:
+            section = BudgetSection(
+                bumps=(),
+                blocking_bumps=(),
+                saturated_touched=(),
+                redirects_not_taken=(),
+                head_unreadable=True,
+                advisories_unavailable=False,
+            )
+        else:
+            advisories: tuple[AdvisoryRecord, ...] | None
+            if attachment_hook_entry.advisory_log_exists(self.repo_root):
+                advisories = attachment_hook_entry.read_advisories(self.repo_root)
+            else:
+                advisories = None
+            section = build_budget_findings(
+                base_baseline_text=base_baseline_text,
+                head_baseline_text=head_baseline_text,
+                changed_files=changed_files,
+                baseline_touched=baseline_touched,
+                advisories=advisories,
+            )
+
+        return render_attachment_budget_section(section)
 
     def _build_prior_review_section(
         self,
@@ -24580,6 +24703,55 @@ class OrchestratorApp:
             )
             return ""
 
+    def _build_attachment_budget_value(self, issue_number: int) -> str:
+        """Derive the attachment-budget dispatch clause (issue #1460).
+
+        Marker-file presence is the ONLY activation switch: a repo that has
+        never run `attachment_contracts baseline` (no `.attachment-budgets.json`
+        at the repo root) gets an empty clause, silently -- this feature is
+        opt-in per repo, not a default every worker prompt must carry.
+
+        When the marker file IS present, its structural validity is checked
+        via `baseline.load` (not just existence) before the clause is
+        emitted, so a hand-corrupted or tampered baseline never ships
+        placement instructions that reference a broken `check-file` command.
+        Fail-soft, mirroring `_build_module_map_value`'s contract exactly: a
+        `TamperError` yields an empty clause (omitted section) plus a
+        `worker_attachment_budget_failed` warning event, never a dispatch
+        failure.
+
+        `log_event` (not `self._record_event`) is used for the same reason
+        `_build_module_map_value` uses it: `_write_worker_prompt` runs
+        outside a state-lock context, so the module-level, lock-free
+        primitive is the only one available here.
+        """
+        marker_path = self.repo_root / attachment_baseline.BASELINE_FILENAME
+        if not marker_path.is_file():
+            return ""
+        try:
+            attachment_baseline.load(marker_path)
+        except (attachment_baseline.TamperError, OSError, ValueError) as exc:
+            # ``TamperError`` covers baseline's own structural checks
+            # (schema version, entry shape, duplicate keys); ``ValueError``
+            # additionally covers a bare ``json.JSONDecodeError`` (a subclass
+            # of ``ValueError``) from genuinely malformed JSON, which
+            # ``baseline.loads`` does not wrap into a ``TamperError`` itself.
+            # ``OSError`` guards a read race between the ``is_file()`` check
+            # above and this read. Mirrors ``hook_entry._resolve_mode``'s
+            # except clause for the same reason.
+            log_event(
+                self.paths.state_file,
+                "worker_attachment_budget_failed",
+                {
+                    "issue_number": issue_number,
+                    "error": str(exc),
+                },
+                repo=self.repo_root.name,
+                level="warning",
+            )
+            return ""
+        return _ATTACHMENT_BUDGET_CLAUSE
+
     def _write_worker_prompt(
         self, issue: dict[str, Any], *, template: str | None = None, dry_run: bool = False
     ) -> Path:
@@ -24611,6 +24783,12 @@ class OrchestratorApp:
                 # failure. ``_build_module_map_value`` is the single point of
                 # enforcement for that fail-soft contract.
                 "module_map": self._build_module_map_value(issue_number),
+                # Issue #1460: the attachment-point placement clause, gated
+                # solely on `.attachment-budgets.json`'s presence. Fail-soft
+                # like module_map: a malformed baseline yields an empty
+                # string (omitted clause) plus a
+                # ``worker_attachment_budget_failed`` warning event.
+                "attachment_budget": self._build_attachment_budget_value(issue_number),
             },
         )
         # Issue #714: enforce the no-merge contract on the *rendered output*

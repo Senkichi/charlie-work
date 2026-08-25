@@ -648,6 +648,7 @@ def test_worker_prompt_renders_issue_values() -> None:
             "worker_model_tier": "capable",
             "issue_comments": "",
             "module_map": "",
+            "attachment_budget": "",
         },
     )
 
@@ -669,6 +670,7 @@ def test_claude_code_worker_prompt_renders_issue_values() -> None:
             "worker_model_tier": "capable",
             "issue_comments": "",
             "module_map": "",
+            "attachment_budget": "",
         },
     )
 

@@ -424,6 +424,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # events.db (derived from the level column, never a hardcoded kind
         # list), so this kind is visible to the operator the moment it fires.
         "worker_module_map_failed": "warning",
+        # Issue #1460: the attachment-budget dispatch clause could not be
+        # built (`.attachment-budgets.json` present but fails structural
+        # validation via `baseline.load`). Warning, not error: fail-soft
+        # mirrors `worker_module_map_failed` -- the dispatch proceeds with an
+        # omitted clause, never a dispatch failure.
+        "worker_attachment_budget_failed": "warning",
         # Issue #1393: a pre-launch environment block (e.g.
         # worktree_foreign_writer) prevented a dispatch from starting. Warning,
         # not error: the issue is not terminal — the cap may not yet be
