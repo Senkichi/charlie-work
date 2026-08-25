@@ -2302,7 +2302,31 @@ def _detect_and_handle_orphaned_workers(
     # number; each value carries the label-write outcome and the scope
     # gate's reason.
     cross_repo_scope_escalations: dict[int, dict[str, Any]] = {}
+    # Issue #1453: issues escalated to the operator queue because the worker
+    # itself declared the task structurally impossible (a ``blocked`` outcome
+    # in ``.worker-outcome.json``).  The worker deliberately concluded it
+    # cannot do the task (e.g. cross-repo scope, missing dependency); without
+    # this channel the orphan sweep would redispatch to another worker that
+    # hits the identical wall, burning the full redispatch cap.  Keyed by
+    # issue number; each value carries the label-write outcome and the
+    # worker's ``reason_kind`` / ``detail`` so the operator queue entry is
+    # actionable without reading the worktree.
+    worker_declared_blocked_escalations: dict[int, dict[str, Any]] = {}
+    # Issue #1453: pre-computed worker outcomes for all no-PR orphans, read
+    # once before the first pre-lock loop so the blocked-outcome check can
+    # fire before reclaim adds ``automated-ready``.  Reused by the second
+    # loop (pushed-branch candidates) without re-reading.
+    worker_outcomes: dict[int, dict[str, Any] | None] = {}
     issues_by_number: dict[int, dict[str, Any]] = {}
+    # Issue #935 / #1453: compute repo_root and worktrees_dir once, before any
+    # of the pre-lock loops, so the first loop (reclaim/escalation) can read
+    # worker outcomes for the blocked-outcome check and the second loop
+    # (pushed-branch candidates) can reuse the same pre-computed outcomes.
+    repo_root = getattr(gh, "repo_root", None)
+    worktrees_dir = None
+    if repo_root is not None:
+        worktrees_dir = resolved_layout(config, repo_root).worktrees
+
     if no_pr_orphans:
         for issue in gh.issue_list(state="open"):
             number = issue.get("number")
@@ -2311,11 +2335,38 @@ def _detect_and_handle_orphaned_workers(
         # Issue #1244: pre-compute the fleet's managed repo names and the
         # dispatching repo name once for the whole loop — the fleet registry
         # is read from disk and gh.name_with_owner() is a network call.
-        sweep_repo_root = getattr(gh, "repo_root", None)
+        sweep_repo_root = repo_root
         sweep_fleet_repos = managed_repo_names(fleet_dir_override)
         sweep_dispatching_repo_name = (
             _dispatching_repo_name(gh, sweep_repo_root) if sweep_repo_root is not None else ""
         )
+
+        # Issue #1453: pre-read worker outcomes for all no-PR orphans so the
+        # first loop (reclaim/escalation) can detect a ``blocked`` outcome
+        # BEFORE reclaiming (which would add ``automated-ready`` and trigger a
+        # fruitless redispatch). The durable terminal status is authoritative
+        # because it is written after the worker exits and survives worktree
+        # removal; the worktree file is the live fallback. Stored for the
+        # second loop to reuse without re-reading.
+        for issue_number in no_pr_orphans:
+            issue = issues_by_number.get(issue_number)
+            if issue is None:
+                continue
+            entry = state.get("issues", {}).get(str(issue_number), {})
+            branch = entry.get("branch_name") if isinstance(entry, dict) else None
+            if not branch:
+                branch = (
+                    f"{config.dispatch.branch_prefix}-{issue_number}-"
+                    f"{slugify(str(issue.get('title') or 'work'))}"
+                )
+            worktree_path = None
+            if repo_root is not None and worktrees_dir is not None:
+                worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
+            terminal = find_worker_terminal_status(sessions_dir, issue_number)
+            terminal_outcome = terminal.get("worker_outcome") if terminal else None
+            worktree_outcome = read_worker_outcome(worktree_path) if worktree_path else None
+            worker_outcomes[issue_number] = terminal_outcome or worktree_outcome
+
         for issue_number in no_pr_orphans:
             issue = issues_by_number.get(issue_number)
             if issue is None:
@@ -2337,6 +2388,37 @@ def _detect_and_handle_orphaned_workers(
             # fully reconciled issues, or terminal-only ones, both correctly
             # fall through here without any GitHub call).
             if not active_labels:
+                continue
+
+            # Issue #1453: a worker that deliberately concluded it CANNOT do
+            # the task writes a ``blocked`` outcome in
+            # ``.worker-outcome.json`` instead of exiting PR-less with no
+            # signal.  Without this channel the orphan sweep classifies the
+            # dead worker as ``dead_worker_no_open_pr`` and redispatches --
+            # to another worker that hits the identical wall, burning the
+            # full redispatch cap.  The worker's own declaration is the most
+            # authoritative signal: check it FIRST, before the zero-artifact
+            # and cross-repo heuristic escalations, and route directly to the
+            # operator queue with zero redispatches.  The pre-lock label
+            # relabeling (remove active, add human-needed as fallback) mirrors
+            # the zero-artifact / cross-repo scope pattern; the post-lock
+            # ``reap_escalations`` transition applies the operator-queue
+            # label edge.
+            worker_outcome = worker_outcomes.get(issue_number)
+            if isinstance(worker_outcome, dict) and worker_outcome.get("outcome") == "blocked":
+                label_write_ok = True
+                for label in sorted(active_labels):
+                    if not gh.remove_issue_label(issue_number, label):
+                        label_write_ok = False
+                if config.labels.human_needed not in issue_labels:
+                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
+                        label_write_ok = False
+                worker_declared_blocked_escalations[issue_number] = {
+                    "removed_labels": sorted(active_labels),
+                    "label_write_ok": label_write_ok,
+                    "reason_kind": str(worker_outcome.get("reason_kind") or "unknown"),
+                    "detail": str(worker_outcome.get("detail") or ""),
+                }
                 continue
 
             # Issue #1153: before relabeling to ``automated-ready`` for
@@ -2410,10 +2492,8 @@ def _detect_and_handle_orphaned_workers(
     # outside the state lock because it can touch origin. The second lock below
     # will use these pre-computed candidates to decide whether to open the PR
     # itself instead of re-dispatching.
-    repo_root = getattr(gh, "repo_root", None)
-    worktrees_dir = None
-    if repo_root is not None:
-        worktrees_dir = resolved_layout(config, repo_root).worktrees
+    # ``repo_root`` / ``worktrees_dir`` were computed above, before the first
+    # pre-lock loop, so the blocked-outcome check could read worker outcomes.
 
     # Issue #1248: salvage-push committed-but-unpushed work from dead workers'
     # worktrees BEFORE anything below classifies them. A worker that finished
@@ -2507,12 +2587,11 @@ def _detect_and_handle_orphaned_workers(
         if repo_root is not None and worktrees_dir is not None:
             worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
 
-        # The durable terminal status is authoritative because it is written
-        # after the worker exits and survives worktree removal.
-        terminal = find_worker_terminal_status(sessions_dir, issue_number)
-        terminal_outcome = terminal.get("worker_outcome") if terminal else None
-        worktree_outcome = read_worker_outcome(worktree_path) if worktree_path else None
-        worker_outcome = terminal_outcome or worktree_outcome
+        # Issue #1453: reuse the outcome pre-computed above (before the first
+        # pre-lock loop) instead of re-reading the terminal status and
+        # worktree file.  The blocked-outcome check already ran in the first
+        # loop; here we only need the outcome for the push/PR-failure signal.
+        worker_outcome = worker_outcomes.get(issue_number)
 
         reported_push = (
             isinstance(worker_outcome, dict)
@@ -3194,6 +3273,46 @@ def _detect_and_handle_orphaned_workers(
                         )
                     )
                     state["issues"][str(issue_number)] = entry
+                    continue
+
+                # Issue #1453: check whether the worker itself declared the
+                # task structurally impossible (a ``blocked`` outcome in
+                # ``.worker-outcome.json``, computed above, outside the state
+                # lock).  The worker's own declaration is the most
+                # authoritative signal -- check it FIRST, before the
+                # zero-artifact and cross-repo heuristic escalations, so a
+                # deliberate blocked analysis routes directly to the operator
+                # queue with zero redispatches instead of burning the full
+                # redispatch cap re-dispatching structurally impossible tasks.
+                # The event payload carries ``reason_kind`` and ``detail`` so
+                # the operator queue entry is actionable without reading the
+                # worktree.
+                blocked_escalation = worker_declared_blocked_escalations.get(issue_number)
+                if blocked_escalation is not None:
+                    state = _escalate_issue(
+                        state,
+                        issue_number,
+                        reason="worker_declared_blocked",
+                        reason_class="mechanical",
+                    )
+                    escalated_entry = state["issues"][str(issue_number)]
+                    escalated_entry["orphan_flagged_at"] = utc_now()
+                    state["issues"][str(issue_number)] = escalated_entry
+                    sweep_events.append(
+                        (
+                            "worker_declared_blocked",
+                            {
+                                "issue_number": issue_number,
+                                "previous_status": "dispatched",
+                                "reason": "worker_declared_blocked",
+                                "reason_kind": blocked_escalation["reason_kind"],
+                                "detail": blocked_escalation["detail"],
+                                "removed_labels": blocked_escalation["removed_labels"],
+                                "label_write_ok": blocked_escalation["label_write_ok"],
+                            },
+                        )
+                    )
+                    reap_escalations.append(issue_number)
                     continue
 
                 # Issue #1153: check whether this issue was escalated to
@@ -18057,7 +18176,66 @@ class OrchestratorApp:
         (``status == "escalated"``) makes this whole method unreachable on
         every subsequent pass, the same way it already does for the
         retrigger action itself (scope fence item 3/b on issue #1274).
+
+        Issue #1451: the mergeable state of the PR is checked BEFORE any
+        remedy is chosen -- single point of enforcement for the
+        discrimination. On a CONFLICTING PR, close/reopen (and the
+        empty-commit fallback) can never create a CI run: GitHub cannot
+        build ``refs/pull/N/merge`` while the branch conflicts, so no
+        ``pull_request`` workflow run is created for ANY event (opened,
+        reopened, synchronize) until the conflict is resolved. Retriggering
+        there burns a ``stale_checks_retrigger_attempts`` slot and a
+        close/reopen notification cycle with zero possible effect. Route to
+        the existing merge-conflict rework path instead -- the same
+        ``_route_janitor_gate_failure_to_rework`` wrapper the janitor gate
+        itself uses for ``is_merge_conflict_block`` -- recording a
+        ``ci_retrigger_skipped_conflicting`` event (deduped per head) for
+        diagnosability. ``UNKNOWN`` (GitHub still computing mergeable)
+        defers to the next pass rather than retriggering blind -- a
+        close/reopen on a PR whose mergeable state is not yet settled could
+        either waste the attempt (if it resolves to CONFLICTING) or fire
+        prematurely (if it resolves to MERGEABLE but GitHub has not yet
+        created the run). ``MERGEABLE`` and any other value proceed with the
+        current behavior below.
         """
+        mergeable = str(pr.get("mergeable") or "").upper()
+        if mergeable == "CONFLICTING":
+            # Dedup per head: a CONFLICTING PR can sit for many passes while
+            # the rework worker resolves the conflict; emit the skip event
+            # only when the head changes (mirrors the ci_run_never_created
+            # per-head dedup pattern) so events.db stays diagnosable without
+            # a per-pass spam loop.
+            last_skipped_head = existing_pr_state.get("ci_retrigger_skipped_conflicting_head")
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                state["prs"][str(pr_number)] = {
+                    **state["prs"].get(str(pr_number), {}),
+                    "ci_retrigger_skipped_conflicting_head": head_sha,
+                }
+                if last_skipped_head != head_sha:
+                    state = self._record_event(
+                        state,
+                        "ci_retrigger_skipped_conflicting",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "head_sha": head_sha,
+                        },
+                    )
+                save_state(self.paths.state_file, state)
+            return self._route_janitor_gate_failure_to_rework(
+                pr,
+                issue_number,
+                attempts_key="conflict_rework_attempts",
+                max_attempts=self.config.review.max_conflict_rework_attempts,
+                reason="merge_conflict",
+                router=self._request_merge_conflict_rework,
+            )
+        if mergeable == "UNKNOWN":
+            # GitHub is still computing mergeable -- defer to the next pass
+            # rather than retriggering blind (issue #1451).
+            return None
+
         raw_attempts = existing_pr_state.get("stale_checks_retrigger_attempts", 0)
         attempts = raw_attempts if isinstance(raw_attempts, int) else 0
         max_retriggers = self.config.review.stale_checks_max_retriggers
