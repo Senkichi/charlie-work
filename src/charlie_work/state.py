@@ -268,9 +268,16 @@ def clear_escalation(entry: dict[str, Any]) -> dict[str, Any]:
     single-point inverse of the escalation write path and must be used on
     every code path that clears an escalation, so ``reason_class`` can never
     survive after its ``escalation_reason`` is removed.
+
+    Issue #1461: also clears ``escalation_reasons_seen`` so a de-escalated
+    issue gets a genuinely fresh escalation history on re-escalation --
+    without this, a per-lane dedup guard that checks membership in the list
+    would permanently suppress the lane that previously escalated, even
+    after the operator or auto-sweep cleared the escalation.
     """
     entry.pop("escalation_reason", None)
     entry.pop("reason_class", None)
+    entry.pop("escalation_reasons_seen", None)
     return entry
 
 
@@ -278,14 +285,15 @@ def clear_escalation_on_issue_prs(state: dict[str, Any], issue_number: int) -> b
     """Mirror-clear escalation fields on every PR record linked to an issue.
 
     The escalation write path (``_escalate_issue``) writes
-    ``escalation_reason`` to *both* the issue record and the PR record.
-    Before this helper existed, every ``clear_escalation`` call site cleared
-    the issue-side fields only, leaving a stale ``escalation_reason`` on the
-    PR record.  The downstream rework router
-    (``_route_janitor_gate_failure_to_rework``) short-circuits on
-    ``existing_pr_state.get("escalation_reason")``, so an issue whose
-    escalation was "cleared" still routed nowhere -- a visible stuck state
-    converted into silence (issue #1093).
+    ``escalation_reason`` and ``escalation_reasons_seen`` to *both* the issue
+    record and the PR record.  Before this helper existed, every
+    ``clear_escalation`` call site cleared the issue-side fields only, leaving
+    a stale ``escalation_reason`` on the PR record.  The downstream rework
+    router (``_route_janitor_gate_failure_to_rework``) short-circuits on
+    ``existing_pr_state.get("escalation_reasons_seen")`` (issue #1461: was
+    ``escalation_reason``), so an issue whose escalation was "cleared" still
+    routed nowhere -- a visible stuck state converted into silence (issue
+    #1093).
 
     This helper is the single-point mirror-clear: call it at every
     ``clear_escalation`` site that has a resolved issue number, and the PR

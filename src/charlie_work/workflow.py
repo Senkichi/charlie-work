@@ -14703,6 +14703,9 @@ class OrchestratorApp:
         # PR and the same head is still stuck.
         "ci_run_never_created_head",
         "escalation_reason",
+        # Issue #1461: clear the append-only escalation history so a re-arm
+        # gives every lane a genuinely fresh dedup slate.
+        "escalation_reasons_seen",
         "label_error",
         # Issue #1099: the per-head cross-family regeneration record holds both
         # budgets. Leaving it behind makes the re-arm inert -- loop() reads the
@@ -14730,6 +14733,9 @@ class OrchestratorApp:
         "orphan_redispatch_at",
         "orphan_redispatch_counted_dispatch",
         "escalation_reason",
+        # Issue #1461: clear the append-only escalation history so a re-arm
+        # gives every lane a genuinely fresh dedup slate.
+        "escalation_reasons_seen",
         # Issue #783: a human-authorized manual unescalate clears the reason
         # class (the escalation itself is gone) and resets the auto
         # de-escalation counter -- unlike the automated sweep, which never
@@ -18411,13 +18417,18 @@ class OrchestratorApp:
         readability parity with the rest of this file and because it is
         directly testable independent of that structural argument.
 
+        Issue #1461: the check uses ``escalation_reasons_seen`` (the
+        append-only list maintained by ``_escalate_issue``) instead of the
+        single ``escalation_reason`` field, so a cross-lane clobber that
+        overwrites the single field does not blind this guard.
+
         Returns None (never re-escalates, never emits a duplicate event) when
         the dedup guard trips; otherwise always returns a ``CommandResult``
         (``ok=False``) describing the escalation, mirroring the infra-rerun
         exhaustion block's return shape.
         """
         exhaustion_reason = "stale_checks_retrigger_exhausted"
-        if existing_pr_state.get("escalation_reason") == exhaustion_reason:
+        if exhaustion_reason in frozenset(existing_pr_state.get("escalation_reasons_seen") or []):
             return None
 
         with state_lock(self.paths.state_file):
@@ -18623,13 +18634,22 @@ class OrchestratorApp:
         # straight to the attempts-increment/dispatch logic and silently
         # redispatch a fresh rework attempt on the very next pass --
         # defeating the stall escalation the moment it fires.
+        #
+        # Issue #1461: the check uses ``escalation_reasons_seen`` (an
+        # append-only list maintained by ``_escalate_issue``) instead of the
+        # single ``escalation_reason`` field. A different lane's escalation
+        # clobbers the single field, which used to blind this guard on the
+        # next pass -- the lane re-proceeded, re-incremented attempts_key
+        # past the cap, and re-fired ``janitor_rework_escalated``. The list
+        # is stable across cross-lane clobbers, so the guard reliably
+        # recognizes this lane's own prior escalation regardless of what the
+        # current single field says.
         current_escalation_reasons = frozenset(
             {f"{attempts_key}_cap_exceeded", f"{attempts_key}_stall_exceeded"}
         )
-        if (
-            issue_state.get("escalation_reason") in current_escalation_reasons
-            or existing_pr_state.get("escalation_reason") in current_escalation_reasons
-        ):
+        issue_seen = frozenset(issue_state.get("escalation_reasons_seen") or [])
+        pr_seen = frozenset(existing_pr_state.get("escalation_reasons_seen") or [])
+        if current_escalation_reasons & (issue_seen | pr_seen):
             return None
         rework_pending = issue_status in ("rework_requested", "dispatched", "dispatch_pending")
         counted_head = existing_pr_state.get(last_head_key)
@@ -21016,8 +21036,9 @@ class OrchestratorApp:
             fresh_state["issues"][issue_key] = updated_issue_entry
             # Issue #1093: mirror-clear the PR record's escalation fields so
             # the rework router's short-circuit on
-            # ``existing_pr_state.get("escalation_reason")`` no longer fires
-            # after the sweep clears the issue.  Also reset the per-mechanism
+            # ``existing_pr_state.get("escalation_reasons_seen")`` (issue
+            # #1461: was ``escalation_reason``) no longer fires after the
+            # sweep clears the issue.  Also reset the per-mechanism
             # rework counter that ACTUALLY gates the cleared escalation_reason
             # on the open PR once per escalation episode -- resetting only
             # ``request_changes_count`` left the no_op/conflict lanes' real
