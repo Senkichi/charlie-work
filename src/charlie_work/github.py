@@ -2560,6 +2560,10 @@ _ISSUE_REF = re.compile(r"#\d+")
 _CODE_SPAN_RE = re.compile(r"(`+)(.+?)(\1)", flags=re.DOTALL)
 # Balanced straight-double-quote span. Group 1 is the quoted content.
 _DOUBLE_QUOTE_SPAN_RE = re.compile(r'"([^"]*)"')
+# Opening fence of a fenced code block: a line beginning with a run of 3+
+# backticks or tildes (optionally followed by an info string). CommonMark
+# allows up to 3 leading spaces; we tolerate any leading whitespace.
+_FENCE_OPEN_RE = re.compile(r"^[ \t]*([`~]{3,})")
 
 
 def _inside_code_span(text: str, start: int, end: int) -> bool:
@@ -2574,6 +2578,67 @@ def _inside_quoted_span(text: str, start: int, end: int) -> bool:
     """True if the [start, end) range falls inside a straight-double-quote span."""
     for m in _DOUBLE_QUOTE_SPAN_RE.finditer(text):
         if m.start(1) <= start and end <= m.end(1):
+            return True
+    return False
+
+
+def _fenced_block_ranges(text: str) -> list[tuple[int, int]]:
+    """Return the ``(start, end)`` char-offset ranges of fenced code blocks.
+
+    A fenced block starts with a line beginning with a run of 3+ backticks or
+    tildes (optionally followed by an info string, e.g. ```` ```python ````)
+    and ends at the next line beginning with a closing fence of the same
+    character and at least the same length. An unclosed fence runs to the end
+    of the text. Each returned range spans from the start of the opening fence
+    line up to (excluding) the closing fence line, so any content line between
+    the fences is contained in the range.
+    """
+    ranges: list[tuple[int, int]] = []
+    pos = 0
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    block_start = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip(" \t")
+        if not in_fence:
+            m = _FENCE_OPEN_RE.match(stripped)
+            if m:
+                fence_char = m.group(1)[0]
+                fence_len = len(m.group(1))
+                block_start = pos
+                in_fence = True
+        else:
+            close_m = re.match(
+                rf"{re.escape(fence_char)}{{{fence_len},}}[ \t]*$",
+                stripped.rstrip("\r\n"),
+            )
+            if close_m:
+                # Range covers opening fence line through last content line;
+                # the closing fence line itself is excluded.
+                ranges.append((block_start, pos))
+                in_fence = False
+                fence_char = ""
+                fence_len = 0
+        pos += len(line)
+    if in_fence:
+        # Unclosed fence runs to end of text.
+        ranges.append((block_start, len(text)))
+    return ranges
+
+
+def _inside_fenced_block(text: str, start: int, end: int) -> bool:
+    """True if the ``[start, end)`` range falls inside a fenced code block.
+
+    Unlike inline code spans, fenced blocks are multi-line Markdown constructs
+    whose opening and closing fence markers sit on separate lines from the
+    content. Clause bounds (which break on newlines) therefore cannot detect
+    them -- the content line is its own clause with no fence markers in it --
+    so this check runs against the full document with absolute offsets, not
+    the clause substring.
+    """
+    for r_start, r_end in _fenced_block_ranges(text):
+        if r_start <= start and end <= r_end:
             return True
     return False
 
@@ -2641,14 +2706,19 @@ def parse_blockers(text: str) -> list[int]:
     enforce that, in order of structural strength:
 
     1. **Quoted/code exclusion** — a match falling inside a Markdown backtick
-       code span or a straight-double-quote span is prose quoting another
-       issue's blocker declaration, not a self-declaration. This is the fix
-       for issue #1454: an issue describing another issue's blocker phrase
-       (backticked, quoted, or parenthetically annotated) must not self-gate.
-       The span search is scoped to the containing clause (see guard 2) so an
-       unrelated stray backtick or quote ELSEWHERE in the body cannot pair
-       with a later one to envelope a genuine declaration and silently drop
-       it -- a real false-negative risk in this backtick-heavy codebase.
+       code span, a triple-backtick (or ``~~~``) fenced code block, or a
+       straight-double-quote span is prose quoting another issue's blocker
+       declaration, not a self-declaration. This is the fix for issue #1454:
+       an issue describing another issue's blocker phrase (backticked, quoted,
+       or parenthetically annotated) must not self-gate. The inline span
+       search is scoped to the containing clause (see guard 2) so an unrelated
+       stray backtick or quote ELSEWHERE in the body cannot pair with a later
+       one to envelope a genuine declaration and silently drop it -- a real
+       false-negative risk in this backtick-heavy codebase. Fenced code blocks
+       are multi-line constructs whose fence markers sit on separate lines
+       from the content, so clause bounds (which break on newlines) cannot
+       detect them; the fenced-block check therefore runs against the full
+       document with absolute offsets, not the clause substring.
     2. **Foreign-issue-ref exclusion** — a match whose containing
        sentence/line carries ANY other ``#NNN`` reference (before OR after
        the match, and not part of the match itself) describes those OTHER
@@ -2668,19 +2738,29 @@ def parse_blockers(text: str) -> list[int]:
         for match in pattern.finditer(text):
             match_start, match_end = match.start(), match.end()
 
-            # Both guards judge the match against its containing clause, so
-            # compute the clause window once and reuse it. Scoping the span
-            # check to the clause is what prevents an unrelated stray
-            # backtick/quote elsewhere in the body from swallowing a genuine
-            # declaration (issue #1454 rework).
+            # Guard 1a: a match inside a fenced code block (triple-backtick or
+            # ~~~) is quoted prose, not a self-declaration. Fenced blocks are
+            # multi-line constructs whose fence markers sit on separate lines
+            # from the content, so the clause-scoped inline span checks below
+            # cannot detect them (the content line is its own clause with no
+            # fence markers). This check therefore runs against the full
+            # document with absolute offsets (issue #1454 rework round 2).
+            if _inside_fenced_block(text, match_start, match_end):
+                continue
+
+            # Both remaining guards judge the match against its containing
+            # clause, so compute the clause window once and reuse it. Scoping
+            # the inline span check to the clause is what prevents an unrelated
+            # stray backtick/quote elsewhere in the body from swallowing a
+            # genuine declaration (issue #1454 rework).
             clause_start, clause_end = _clause_bounds(text, match_start, match_end)
             clause = text[clause_start:clause_end]
             match_rel_start = match_start - clause_start
             match_rel_end = match_end - clause_start
 
-            # Guard 1: a match inside a code span or quoted span WITHIN the
-            # clause is quoted prose describing another issue, not a
-            # self-declaration. Searched on the clause substring so a span
+            # Guard 1b: a match inside an inline code span or quoted span
+            # WITHIN the clause is quoted prose describing another issue, not
+            # a self-declaration. Searched on the clause substring so a span
             # opening outside this clause cannot envelope the match.
             if _inside_code_span(clause, match_rel_start, match_rel_end):
                 continue

@@ -36709,6 +36709,58 @@ def test_parse_blockers_stray_double_quote_elsewhere_does_not_swallow_declaratio
     assert parse_blockers(body) == [743]
 
 
+def test_parse_blockers_fenced_code_block_does_not_self_gate() -> None:
+    """Issue #1454 rework round 2: a 'Blocked by #NNN' line inside a real
+    multi-line triple-backtick fenced code block (fence markers on separate
+    lines from the content) must NOT self-gate.
+
+    The clause-scoped inline span guard (round 1) cannot detect this: clause
+    bounds break on newlines, so the fenced content line ``blocked by #886``
+    is its own clause with no fence markers in it, and the declaration is
+    misclassified as a genuine self-declaration. The fenced-block check runs
+    against the full document with absolute offsets and suppresses it.
+    """
+    from charlie_work.github import parse_blockers
+
+    body = (
+        "## Symptom\n\n"
+        "The upstream issue's body contains:\n\n"
+        "```python\n"
+        "blocked by #886\n"
+        "```\n\n"
+        "which the parser used to misread as a self-declaration.\n"
+    )
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_fenced_code_block_tilde_fence_does_not_self_gate() -> None:
+    """Issue #1454 rework round 2: ``~~~`` fences are equivalent to triple-
+    backtick fences in CommonMark and must be detected the same way."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Example\n\n~~~\nblocked by #886\n~~~\n"
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_fenced_block_with_language_tag_does_not_self_gate() -> None:
+    """Issue #1454 rework round 2: an opening fence carrying an info string
+    (e.g. ```` ```bash ````) must still be recognized as a fence."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Repro\n\n```bash\n$ echo 'blocked by #886'\n```\n"
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_genuine_declaration_outside_fenced_block_still_gates() -> None:
+    """Issue #1454 rework round 2: a genuine declaration on a line OUTSIDE a
+    fenced block must still gate. The fenced-block guard must not over-suppress
+    real declarations that merely share a document with a fenced block."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Summary\n\nFix the parser.\n\n```python\nblocked by #886\n```\n\nBlocked by #743\n"
+    assert parse_blockers(body) == [743]
+
+
 def test_detect_prose_only_dependencies_do_not_dispatch_before() -> None:
     """Test detection of 'do not dispatch before' pattern (issue #225)."""
     from charlie_work.github import detect_prose_only_dependencies
