@@ -187,7 +187,12 @@ def test_rubric_text_present_in_built_packet_default(tmp_path: Path) -> None:
     assert "## File-size cap" in packet
     assert "REPORTABLE FINDING" in packet
     # The rubric references the cap source generically, not a hardcoded number.
-    assert "file_size_cap_lines" in packet
+    # The source is the ``review_dispatch:`` config section (ReviewDispatchConfig),
+    # NOT the unrelated ``review:`` section (ReviewConfig) -- issue #1445 review
+    # finding: the prose must name the correct namespace so reviewers read the
+    # cap from its actual source.
+    assert "review_dispatch.file_size_cap_lines" in packet
+    assert "review.file_size_cap_lines" not in packet
     assert "#1442" in packet
     assert "#1283-era extractions" in packet
     # Disabled -> no dynamic section text, and no unresolved placeholder.

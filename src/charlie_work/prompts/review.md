@@ -84,7 +84,7 @@ $static_probe_section
 
 New code added to a file that is over the repo size cap is a REPORTABLE FINDING
 (tag it Important). The cap is whatever the repo's size-cap signal source
-defines -- today the `review.file_size_cap_lines` config knob, and once issue
+defines -- today the `review_dispatch.file_size_cap_lines` config knob, and once issue
 #1442's high-water-mark line-count ratchet (or its successor structural signal)
 lands, that threshold. Do not duplicate or hardcode a number here; read the cap
 from that source. The suggested remedy is extraction of the new code to a
