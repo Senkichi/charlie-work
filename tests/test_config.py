@@ -251,6 +251,38 @@ def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
     assert config.review_dispatch.max_local_review_processes == 4
 
 
+def test_load_config_review_dispatch_file_size_cap_lines_override(tmp_path: Path) -> None:
+    """Issue #1445: ``review_dispatch.file_size_cap_lines`` is read from YAML
+    via the ``_RD_INT_KEYS`` wiring in ``build_config_from_data`` -- the
+    ``review_dispatch:`` section (``ReviewDispatchConfig``), not the unrelated
+    ``review:`` section (``ReviewConfig``)."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  file_size_cap_lines: 1234
+""",
+    )
+    config = load_config(config_file)
+    assert config.review_dispatch.file_size_cap_lines == 1234
+
+
+def test_load_config_review_dispatch_file_size_cap_lines_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    """Issue #1445: ``_RD_INT_KEYS`` validation rejects a non-int
+    ``file_size_cap_lines`` in the ``review_dispatch:`` section."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  file_size_cap_lines: "not-an-int"
+""",
+    )
+    with pytest.raises(ConfigError, match="review_dispatch.*file_size_cap_lines.*must be an int"):
+        load_config(config_file)
+
+
 def test_load_config_quota_probe_defaults() -> None:
     """QuotaProbeConfig defaults: enabled, flat 15-minute interval, Haiku."""
     config = load_config(Path("nonexistent.yaml"))
