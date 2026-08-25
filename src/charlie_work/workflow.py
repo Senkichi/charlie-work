@@ -48,6 +48,7 @@ from .config import (
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
     OrchestratorConfig,
     PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS,
+    ReviewDispatchConfig,
 )
 from .env_sanitize import worker_github_token_findings
 from .file_lock import try_acquire_byte_range_lock
@@ -142,9 +143,11 @@ from .worktree import (
     OPERATOR_MARKER_SESSION_ID,
     WorktreeProbeFailedError,
     _worktree_refuse_to_reset_reason,
+    _reap_idle_foreign_writer,
     clean_worktrees,
     inspect_worktree_state,
     push_branch,
+    read_worktree_marker,
     read_worker_outcome,
     remote_branch_ahead_count,
     remote_branch_head_sha,
@@ -254,6 +257,7 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
     _windowed_worker_death_at,
     _windowed_orphan_redispatch_at,
     _windowed_blocked_environment_at,
+    _windowed_foreign_writer_reaps,
     _is_review_dispatchable,
     _select_review_dispatch_candidates,
 )
@@ -556,6 +560,85 @@ def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
     if current_file:
         files.append((current_file, added, deleted))
     return total, files
+
+
+def _max_touched_file_line_count(diff: str, repo_root: Path) -> int:
+    """Return the largest line count among files touched by ``diff`` (issue #1439).
+
+    The review turn cap scales with the size of the files a diff touches, not
+    the diff itself: a PR threading a 25k-line monolith costs the reviewer far
+    more grep -> Read-window navigation than the diff's line count suggests.
+    File sizes are read from ``repo_root`` (the orchestrator's checkout). For
+    files not present there (e.g. newly added in the PR), the per-file added
+    line count from the diff is used as the size -- a new file's size IS its
+    added lines. Returns 0 for an empty diff.
+    """
+    _total, files = _diff_file_summary(diff)
+    max_lines = 0
+    for name, added, _deleted in files:
+        if not name:
+            continue
+        candidate = name
+        # Unified diff ``+++`` paths are prefixed with ``b/``; strip it so the
+        # path resolves under ``repo_root``. A literal ``b/...`` file would be
+        # vanishingly rare and only makes the lookup miss (falling back to the
+        # added-line count), never reads the wrong file.
+        if candidate.startswith("b/"):
+            candidate = candidate[2:]
+        path = repo_root / candidate
+        line_count = 0
+        if path.exists() and path.is_file():
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    line_count = sum(1 for _ in handle)
+            except OSError:
+                line_count = 0
+        else:
+            # New file (not present at repo_root): its size is the added lines.
+            line_count = added
+        if line_count > max_lines:
+            max_lines = line_count
+    return max_lines
+
+
+def structure_turn_cap_multiplier(
+    max_touched_file_lines: int, config: ReviewDispatchConfig
+) -> int:
+    """Structure-aware multiplier for the review turn cap (issue #1439).
+
+    Returns ``turn_cap_large_file_multiplier`` (clamped to
+    ``turn_cap_max_multiplier``) when ``max_touched_file_lines`` exceeds
+    ``turn_cap_large_file_threshold``, else 1. A threshold of 0 disables the
+    structure bonus (every diff uses the base cap).
+    """
+    threshold = config.turn_cap_large_file_threshold
+    if threshold <= 0:
+        return 1
+    if max_touched_file_lines > threshold:
+        return min(config.turn_cap_large_file_multiplier, config.turn_cap_max_multiplier)
+    return 1
+
+
+def resolve_review_turn_cap(
+    base_max_turns: int,
+    structure_multiplier: int,
+    miss_streak: int,
+    config: ReviewDispatchConfig,
+) -> int:
+    """Final reviewer turn cap after structure + miss-escalation (issue #1439).
+
+    ``effective_multiplier = min(structure_multiplier + miss_streak,
+    turn_cap_max_multiplier)``, clamped to a floor of 1.
+    ``final_cap = base_max_turns * effective_multiplier``. A ``base_max_turns``
+    of 0 (unlimited) stays 0.
+    """
+    if base_max_turns <= 0:
+        return 0
+    effective = min(
+        max(structure_multiplier + miss_streak, 1),
+        config.turn_cap_max_multiplier,
+    )
+    return base_max_turns * effective
 
 
 def _diff_size_section(diff: str, threshold: int, diff_path: Path) -> str:
@@ -2271,7 +2354,11 @@ def _detect_and_handle_orphaned_workers(
                 continue
             worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
             result = salvage_push_stranded_commits(
-                repo_root, branch, worktree_path, base_ref=config.dispatch.base_ref
+                repo_root,
+                branch,
+                worktree_path,
+                base_ref=config.dispatch.base_ref,
+                dry_run=write_gate.dry_run,
             )
             if result.pushed:
                 salvage_pushes[issue_number] = {
@@ -5528,15 +5615,15 @@ def _attempt_salvage(
     skip emits ``salvage_skipped_already_landed`` instead of opening a vestigial
     duplicate PR, and the caller treats it as "handled" (no redispatch).
 
-    NOTE (issue #1264, W6 PR3 disclosure): the ``push_branch`` call below is
-    an unconditional, unguarded real ``git push`` -- outside WriteGate's
-    declared 6-primitive surface (state.json/events.db/label-transition/
-    process-kill) and therefore NOT gated by ``write_gate`` here. This is a
-    real dry-run leak (filed separately; see the PR3 handoff) that this PR
-    does not fix -- gating an external git push was never in R6's scope
-    (kill_process was the one sanctioned new primitive) and freelancing a
-    7th WriteGate primitive without design review would repeat exactly the
-    mistake R6b's STOP-and-report exists to prevent.
+    NOTE (issue #1326): the ``push_branch`` call below threads
+    ``dry_run=write_gate.dry_run`` so a dry-run invocation does not issue a
+    real ``git push``. This is explicit-threading (mirroring
+    ``_reconcile_locked``'s convention) rather than a 7th WriteGate primitive
+    -- gating an external git push through WriteGate was an open design
+    question (see issue #1326's remedy section) and the simplest correct
+    fix is to thread the flag directly. Downstream state writes and label
+    transitions remain gated by ``write_gate``; the ``gh pr create`` in
+    ``_open_salvage_pr`` is gated at the ``GitHub`` client sink level.
     """
     write_gate = require_write_gate(write_gate)
     already_landed, skip_reason = _salvage_already_landed(
@@ -5570,7 +5657,9 @@ def _attempt_salvage(
             write_gate.save_state(state)
         return True, None
 
-    push_ok, push_error = push_branch(repo_root, branch, worktree_path=worktree_path)
+    push_ok, push_error = push_branch(
+        repo_root, branch, worktree_path=worktree_path, dry_run=write_gate.dry_run
+    )
     if not push_ok:
         return False, push_error
 
@@ -5856,6 +5945,55 @@ def _is_rerun_already_running_error(error: str) -> bool:
     ...) do not contain this phrase and should not be treated as retryable.
     """
     return "already running" in error.lower()
+
+
+def _try_reap_blocked_foreign_writer(
+    failed_result: Any,
+    config: OrchestratorConfig,
+    state_file: Path,
+    issue_number: int,
+) -> bool:
+    """Attempt to reap an idle foreign writer at the blocked-environment cap.
+
+    Issue #1423: when the ``blocked_environment_at`` counter exhausts the
+    ``max_auto_redispatch`` cap for a ``worktree_foreign_writer`` failure,
+    the default action is to escalate the issue to a human. But a writer that
+    was active on earlier passes and has since gone idle is a zombie the fleet
+    itself launched and forgot — escalating it wastes a human's attention on
+    a process the stall detector would have reaped if it could see it.
+
+    This helper reads the marker from the failed dispatch's worktree path and
+    delegates to ``_reap_idle_foreign_writer`` (the same activity probe + kill
+    path the marker check uses). When the writer is idle past the threshold,
+    it is reaped and the caller resets the counter instead of escalating.
+    When the writer is still active, the caller escalates as before —
+    escalation is reserved for a writer that is alive *and* active.
+
+    Returns ``True`` when the writer was reaped, ``False`` otherwise (including
+    when the failed result is not a foreign-writer block or the marker is gone).
+    """
+    if failed_result is None:
+        return False
+    failure_kind = getattr(failed_result, "failure_kind", None)
+    if failure_kind != "worktree_foreign_writer":
+        return False
+    pid = getattr(failed_result, "pid", None)
+    worktree_path_str = getattr(failed_result, "worktree_path", None)
+    if not pid or not worktree_path_str:
+        return False
+    worktree_path = Path(worktree_path_str)
+    marker = read_worktree_marker(worktree_path)
+    if marker is None:
+        return False
+    return _reap_idle_foreign_writer(
+        worktree_path,
+        pid,
+        marker.get("session_id"),
+        marker,
+        config,
+        state_file=state_file,
+        issue_number=issue_number,
+    )
 
 
 def _has_other_open_pr(
@@ -8333,28 +8471,75 @@ class OrchestratorApp:
                         blocking_error = failed_result.error if failed_result else None
                         entry["blocked_environment_at"] = blocked_environment_at
                         if len(blocked_environment_at) > self.config.watchdog.max_auto_redispatch:
-                            status = "escalated"
-                            dispatched_at = None
-                            state = _escalate_issue(
-                                state,
+                            # Issue #1423: before escalating a blocked-environment
+                            # cap exhaustion for a foreign writer, attempt to reap
+                            # it one more time. A writer that was active on earlier
+                            # passes but has since gone idle is reaped here instead
+                            # of escalating a zombie to a human. Escalation is
+                            # reserved for a writer that is alive *and* active.
+                            #
+                            # Review finding: bound the number of auto-reaps per
+                            # issue before falling back to escalation. Each
+                            # successful reap resets ``blocked_environment_at`` to
+                            # ``[]``, so without a separate cross-pass cap a
+                            # persistently-blocked worktree loops forever between
+                            # reap and redispatch. ``foreign_writer_reaps`` is a
+                            # windowed counter that survives the reset; once it
+                            # reaches ``max_foreign_writer_reaps`` the issue
+                            # escalates instead of reaping again.
+                            max_reaps = self.config.watchdog.max_foreign_writer_reaps
+                            prior_reaps = _windowed_foreign_writer_reaps(
+                                entry,
+                                window_minutes=self.config.watchdog.redispatch_window_minutes,
+                            )
+                            if len(prior_reaps) < max_reaps and _try_reap_blocked_foreign_writer(
+                                failed_result,
+                                self.config,
+                                self.paths.state_file,
                                 request.issue_number,
-                                reason="dispatch_blocked_environment",
-                                reason_class="mechanical",
-                                issue_extra=entry,
-                            )
-                            entry = dict(state["issues"][str(request.issue_number)])
-                            state = self._record_event(
-                                state,
-                                "session_failed_escalated",
-                                {
-                                    "issue_number": request.issue_number,
-                                    "previous_status": "dispatch_pending",
-                                    "reason": "dispatch_blocked_environment",
-                                    "failure_kind": failure_kind,
-                                    "blocking_error": blocking_error,
-                                    "blocked_environment_count": len(blocked_environment_at),
-                                },
-                            )
+                            ):
+                                entry["blocked_environment_at"] = []
+                                entry["foreign_writer_reaps"] = prior_reaps + [
+                                    now.isoformat().replace("+00:00", "Z")
+                                ]
+                                status = "dispatch_failed"
+                                dispatched_at = None
+                                clear_escalation(entry)
+                                clear_escalation_on_issue_prs(state, request.issue_number)
+                                state = self._record_event(  # event-consumer: audit-only -- records a foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
+                                    state,
+                                    "dispatch_blocked_environment_reaped",
+                                    {
+                                        "issue_number": request.issue_number,
+                                        "failure_kind": failure_kind,
+                                        "pid": failed_result.pid if failed_result else None,
+                                        "blocked_environment_count": len(blocked_environment_at),
+                                        "foreign_writer_reap_count": len(prior_reaps) + 1,
+                                    },
+                                )
+                            else:
+                                status = "escalated"
+                                dispatched_at = None
+                                state = _escalate_issue(
+                                    state,
+                                    request.issue_number,
+                                    reason="dispatch_blocked_environment",
+                                    reason_class="mechanical",
+                                    issue_extra=entry,
+                                )
+                                entry = dict(state["issues"][str(request.issue_number)])
+                                state = self._record_event(
+                                    state,
+                                    "session_failed_escalated",
+                                    {
+                                        "issue_number": request.issue_number,
+                                        "previous_status": "dispatch_pending",
+                                        "reason": "dispatch_blocked_environment",
+                                        "failure_kind": failure_kind,
+                                        "blocking_error": blocking_error,
+                                        "blocked_environment_count": len(blocked_environment_at),
+                                    },
+                                )
                         else:
                             status = "dispatch_failed"
                             dispatched_at = None
@@ -10147,6 +10332,18 @@ class OrchestratorApp:
         # regenerates because headRefOid is treated as the packet's only input.
         pr_json = _slim_pr_json(pr)
         pr_json["prompt_template_sha"] = self._review_template_sha()
+        # Issue #1439: stamp the structure-aware turn-cap multiplier into the
+        # packet so the reviewer launch reads a structure-aware budget instead
+        # of the flat ``review_max_turns``. The multiplier (not the absolute
+        # cap) is stored so the dispatch path can re-derive the final cap from
+        # the live ``review_max_turns`` config + the per-PR miss streak at
+        # launch time -- a packet may outlive a config edit, and the base cap
+        # is config's to own.
+        _max_touched_lines = _max_touched_file_line_count(diff, self.repo_root)
+        pr_json["review_turn_cap_structure_multiplier"] = structure_turn_cap_multiplier(
+            _max_touched_lines, self.config.review_dispatch
+        )
+        pr_json["review_turn_cap_max_touched_lines"] = _max_touched_lines
         self._write_json(pr_dir / "pr.json", pr_json)
         self._write_json(pr_dir / "checks.json", checks)
         diff_path = pr_dir / "diff.patch"
@@ -10548,6 +10745,17 @@ class OrchestratorApp:
                 # must not carry forward and immediately count against the
                 # fresh attempt budget (issue #1069).
                 "review_log_unreadable_streak": 0,
+                # Issue #1439: reset the turn-limit miss streak on a fresh
+                # dispatch cycle (new head). A same-head rebuild must NOT zero
+                # it -- mirroring review_dispatch_attempt_count's same-head
+                # preservation (issue #1351) -- or the cap-aware backstop
+                # never converges and a PR that keeps hitting the turn limit
+                # on the same head redispatches forever at the base cap.
+                "review_turn_limit_miss_streak": (
+                    0
+                    if _fresh_dispatch_cycle
+                    else int(_existing_pr_state.get("review_turn_limit_miss_streak", 0))
+                ),
                 # A clean janitor pass ends the no-op-rework epoch (the
                 # janitor's no-op check passing means content actually
                 # moved): without this reset, attempts consumed by a long-
@@ -10585,6 +10793,14 @@ class OrchestratorApp:
                     "issue_number": issue_number,
                     "cross_family_ok": cf_result.ok if cf_result else None,
                     "cross_family_reused": cf_result.reused if cf_result else None,
+                    # Issue #1439: structure-aware turn cap stamped into the
+                    # packet, mirrored into the event for auditability.
+                    "review_turn_cap_structure_multiplier": pr_json.get(
+                        "review_turn_cap_structure_multiplier", 1
+                    ),
+                    "review_turn_cap_max_touched_lines": pr_json.get(
+                        "review_turn_cap_max_touched_lines", 0
+                    ),
                 },
                 state_path=self.paths.state_file,
             )
@@ -11268,10 +11484,25 @@ class OrchestratorApp:
                             # turn-limit death, so a session that never
                             # reached turn 1 must not set it -- that death is
                             # environmental and says nothing about this PR.
+                            # Issue #1439: a turn-limit death increments the
+                            # per-PR miss streak so the NEXT dispatch's cap
+                            # escalates one step instead of relaunching with
+                            # the identical flat budget. Non-turn-limit deaths
+                            # (launch_failed, died_mid_session) do NOT
+                            # increment -- those have disjoint remediations and
+                            # counting them here would conflate a quota/launch
+                            # outage with a genuine "reviewer ran out of
+                            # navigation budget" signal.
+                            _is_turn_limit_miss = outcome.reason == REVIEW_MISS_TURN_LIMIT
+                            _prior_streak = int(ps.get("review_turn_limit_miss_streak", 0))
+                            _new_streak = (
+                                _prior_streak + 1 if _is_turn_limit_miss else _prior_streak
+                            )
                             state["prs"][str(pr_number)] = {
                                 **ps,
                                 "review_miss_summary_posted": True,
                                 "review_turn_limit_summary_posted": (outcome.did_substantial_work),
+                                "review_turn_limit_miss_streak": _new_streak,
                             }
                             state = append_event(
                                 state,
@@ -11290,6 +11521,11 @@ class OrchestratorApp:
                                     # distinguish "no cause captured" from
                                     # "cause field absent".
                                     "cause": outcome.terminating_cause,
+                                    # Issue #1439: mirror the post-increment
+                                    # streak into the event so a downstream
+                                    # query can reconstruct the cap escalation
+                                    # history without a join back to state.
+                                    "turn_limit_miss_streak": _new_streak,
                                 },
                                 state_path=self.paths.state_file,
                             )
@@ -12357,6 +12593,8 @@ class OrchestratorApp:
         # ``reason="merge_conflict"``), including the same attempt cap and
         # escalation to ``agent:human-needed``.
         max_attempts = self.config.review_dispatch.max_review_dispatch_attempts
+        # Issue #1439: backstop cap on consecutive turn-limit misses.
+        max_turn_limit_misses = self.config.review_dispatch.max_consecutive_turn_limit_misses
         # Issue #586's repair set used to be collected here, from the PRs this
         # candidate loop skipped. Issue #1088: that made the sweep unreachable,
         # because this loop runs below the ``review_dispatch.enabled`` early
@@ -12503,12 +12741,28 @@ class OrchestratorApp:
                     # which the cap escalates honestly on a dead claim.
                     continue
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
-                if attempt_count >= max_attempts and pr_state.get("status") != "escalated":
+                # Issue #1439: a PR whose consecutive turn-limit miss streak
+                # has reached the backstop cap escalates with a distinct
+                # reason so the diagnosis points at "reviewer ran out of
+                # navigation budget on a monolith" rather than the generic
+                # "every reviewer died without a verdict". Both reasons route
+                # to ``agent:human-needed`` via the same mechanical edge below.
+                _turn_limit_streak = int(pr_state.get("review_turn_limit_miss_streak", 0))
+                _escalation_reason: str | None = None
+                if (
+                    max_turn_limit_misses > 0
+                    and _turn_limit_streak >= max_turn_limit_misses
+                    and pr_state.get("status") != "escalated"
+                ):
+                    _escalation_reason = "max_consecutive_turn_limit_misses_exceeded"
+                elif attempt_count >= max_attempts and pr_state.get("status") != "escalated":
+                    _escalation_reason = "max_review_dispatch_attempts_exceeded"
+                if _escalation_reason is not None:
                     issue_num = pr_state.get("issue_number") or c.get("issue")
                     state = _escalate_issue(
                         state,
                         issue_num,
-                        reason="max_review_dispatch_attempts_exceeded",
+                        reason=_escalation_reason,
                         reason_class="mechanical",
                         pr_number=int(c["pr"]),
                         pr_extra={
@@ -12527,7 +12781,10 @@ class OrchestratorApp:
                             "pr_number": c["pr"],
                             "issue_number": issue_num,
                             "attempt_count": attempt_count,
-                            "reason": "max_review_dispatch_attempts_exceeded",
+                            "reason": _escalation_reason,
+                            # Issue #1439: surface the streak that drove the
+                            # turn-limit backstop escalation for diagnosis.
+                            "turn_limit_miss_streak": _turn_limit_streak,
                         },
                     )
                     changed = True
@@ -12653,6 +12910,12 @@ class OrchestratorApp:
             # uses exactly this value instead of re-deriving it (agreement
             # by construction, not by convention).
             resolved_review_efforts: dict[int, str] = {}
+            # Issue #1439: resolve the structure-aware turn cap ONCE here at
+            # claim time (mirroring resolved_review_efforts) and thread it
+            # through to the launch call below, so the cap the reviewer runs
+            # with is the cap recorded on the claim -- not a re-derivation that
+            # could diverge if the miss streak changes between claim and launch.
+            resolved_review_turn_caps: dict[int, int] = {}
             for candidate in selected:
                 pr_number = candidate["pr"]
                 pr_state = state["prs"].get(str(pr_number), {})
@@ -12661,6 +12924,20 @@ class OrchestratorApp:
                     pr_number, self.config.review_dispatch, self.config.claude_code
                 )
                 resolved_review_efforts[pr_number] = review_effort_used
+                # Issue #1439: read the structure multiplier stamped into the
+                # packet at build time (review()) and the per-PR turn-limit
+                # miss streak, then resolve the final cap. A missing packet
+                # (e.g. a pre-#1439 packet) yields multiplier 1 -- the base
+                # cap, preserving the pre-fix flat budget.
+                _structure_mult = self._read_packet_turn_cap_multiplier(pr_number)
+                _miss_streak = int(pr_state.get("review_turn_limit_miss_streak", 0))
+                _resolved_cap = resolve_review_turn_cap(
+                    self.config.review_dispatch.review_max_turns,
+                    _structure_mult,
+                    _miss_streak,
+                    self.config.review_dispatch,
+                )
+                resolved_review_turn_caps[pr_number] = _resolved_cap
                 state["prs"][str(pr_number)] = {
                     **pr_state,
                     "number": pr_number,
@@ -12676,12 +12953,17 @@ class OrchestratorApp:
                     "review_miss_summary_posted": False,
                     "review_effort_arm": review_effort_arm,
                     "review_effort_used": review_effort_used,
+                    # Issue #1439: record the resolved cap on the dispatch
+                    # record so the launch and any post-mortem read the same
+                    # value without re-deriving it.
+                    "review_turn_cap": _resolved_cap,
                 }
                 review_effort_assignments.append(
                     {
                         "pr_number": pr_number,
                         "review_effort_arm": review_effort_arm,
                         "review_effort_used": review_effort_used,
+                        "review_turn_cap": _resolved_cap,
                     }
                 )
             if selected:
@@ -12784,6 +13066,12 @@ class OrchestratorApp:
                     # telemetry) -- pass it through so launch_claude_worker
                     # uses this value directly instead of re-resolving it.
                     "resolved_review_effort": resolved_review_efforts.get(pr_number),
+                    # Issue #1439: structure-aware turn cap resolved at claim
+                    # time from the packet's structure multiplier + the per-PR
+                    # miss streak. Overrides the flat ``review_max_turns`` so a
+                    # PR threading a monolith gets a raised budget and a
+                    # turn-limit miss escalates the next dispatch's cap.
+                    "max_turns_override": resolved_review_turn_caps.get(pr_number),
                 }
 
                 record = launch_claude_worker(
@@ -13765,6 +14053,11 @@ class OrchestratorApp:
                 # reviewer pipeline is healthy, so any prior
                 # persistent-unreadable condition is resolved (issue #1069).
                 "review_log_unreadable_streak": 0,
+                # Issue #1439: a recorded verdict ends the turn-limit miss
+                # streak -- the reviewer reached a conclusion, so any prior
+                # turn-limit deaths no longer count toward the cap-aware
+                # backstop on a future review cycle.
+                "review_turn_limit_miss_streak": 0,
                 # Reset the cross-family parse-failure bound (issue #784
                 # AC-8): a real verdict was just recorded -- whether a
                 # genuine parse or this method's own "abandon" call from
@@ -14098,6 +14391,10 @@ class OrchestratorApp:
         # this keeps the pair consistent with the other _last_head baselines).
         "review_dispatch_attempt_last_head",
         "review_log_unreadable_streak",
+        # Issue #1439: turn-limit miss streak must not survive a re-arm, or
+        # the cap-aware backstop would re-escalate instantly on the next
+        # turn-limit death.
+        "review_turn_limit_miss_streak",
         "request_changes_count",
         "conflict_rework_attempts",
         "conflict_rework_attempts_last_head",
@@ -21801,6 +22098,78 @@ class OrchestratorApp:
                     window_minutes=self.config.watchdog.redispatch_window_minutes,
                 )
                 if len(prior_blocked) >= self.config.watchdog.max_auto_redispatch:
+                    # Issue #1423: before escalating a stuck blocked-environment
+                    # cap, attempt to reap an idle foreign writer from the
+                    # worktree. If the writer has gone idle since the last
+                    # blocked pass, reaping it clears the path for dispatch
+                    # instead of escalating a zombie. The marker is read from
+                    # the worktree path derived from the PR's head ref.
+                    #
+                    # Review finding: bound the number of auto-reaps per issue
+                    # before falling back to escalation (see the fresh-dispatch
+                    # site for the full rationale). The cap is checked against
+                    # the snapshot entry here; the reap timestamp is appended
+                    # inside the lock below.
+                    max_reaps = self.config.watchdog.max_foreign_writer_reaps
+                    prior_reaps = _windowed_foreign_writer_reaps(
+                        issue_entry_pre,
+                        window_minutes=self.config.watchdog.redispatch_window_minutes,
+                    )
+                    reap_cap_ok = len(prior_reaps) < max_reaps
+                    branch_pre = str(pr_data.get("headRefName") or "")
+                    if branch_pre and reap_cap_ok:
+                        wt_path_pre = worktree_path_for_branch(
+                            self.repo_root, branch_pre, self._layout.worktrees
+                        )
+                        marker_pre = read_worktree_marker(wt_path_pre)
+                        if marker_pre is not None:
+                            pid_pre = marker_pre.get("pid")
+                            if (
+                                isinstance(pid_pre, int)
+                                and pid_pre > 0
+                                and is_pid_alive(pid_pre, None)
+                                and _reap_idle_foreign_writer(
+                                    wt_path_pre,
+                                    pid_pre,
+                                    marker_pre.get("session_id"),
+                                    marker_pre,
+                                    self.config,
+                                    state_file=self.paths.state_file,
+                                    issue_number=issue_number,
+                                )
+                            ):
+                                # Writer reaped: clear the counter so the issue
+                                # proceeds as a legitimate candidate, and record
+                                # the reap so a persistently-blocked worktree
+                                # eventually escalates instead of looping.
+                                with state_lock(self.paths.state_file):
+                                    state = load_state(self.paths.state_file)
+                                    issue_entry = state["issues"].get(str(issue_number), {})
+                                    if isinstance(issue_entry, dict):
+                                        issue_entry["blocked_environment_at"] = []
+                                        existing_reaps = _windowed_foreign_writer_reaps(
+                                            issue_entry,
+                                            window_minutes=self.config.watchdog.redispatch_window_minutes,
+                                        )
+                                        issue_entry["foreign_writer_reaps"] = existing_reaps + [
+                                            datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                                        ]
+                                        state["issues"][str(issue_number)] = issue_entry
+                                        state = append_event(  # event-consumer: audit-only -- records a pre-escalation foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
+                                            state,
+                                            "dispatch_blocked_environment_reaped",
+                                            {
+                                                "issue_number": issue_number,
+                                                "pid": pid_pre,
+                                                "blocked_environment_count": len(prior_blocked),
+                                                "foreign_writer_reap_count": len(existing_reaps)
+                                                + 1,
+                                            },
+                                            state_path=self.paths.state_file,
+                                        )
+                                        save_state(self.paths.state_file, state)
+                                filtered_candidates.append(issue)
+                                continue
                     blocked_environment_escalated.append(issue_number)
                     continue
 
@@ -22736,6 +23105,48 @@ class OrchestratorApp:
                         ) + [now.isoformat().replace("+00:00", "Z")]
                         blocking_error = failed_result.error if failed_result else None
                         if len(blocked_environment_at) > self.config.watchdog.max_auto_redispatch:
+                            # Issue #1423: before escalating a blocked-environment
+                            # cap exhaustion for a foreign writer, attempt to reap
+                            # it one more time. A writer that was active on earlier
+                            # passes but has since gone idle is reaped here instead
+                            # of escalating a zombie to a human. Escalation is
+                            # reserved for a writer that is alive *and* active.
+                            #
+                            # Review finding: bound the number of auto-reaps per
+                            # issue before falling back to escalation (see the
+                            # fresh-dispatch site for the full rationale).
+                            max_reaps = self.config.watchdog.max_foreign_writer_reaps
+                            prior_reaps = _windowed_foreign_writer_reaps(
+                                entry,
+                                window_minutes=self.config.watchdog.redispatch_window_minutes,
+                            )
+                            if len(prior_reaps) < max_reaps and _try_reap_blocked_foreign_writer(
+                                failed_result,
+                                self.config,
+                                self.paths.state_file,
+                                request.issue_number,
+                            ):
+                                entry["status"] = "rework_requested"
+                                entry["dispatched_at"] = None
+                                entry["blocked_environment_at"] = []
+                                entry["foreign_writer_reaps"] = prior_reaps + [
+                                    now.isoformat().replace("+00:00", "Z")
+                                ]
+                                state["issues"][str(request.issue_number)] = entry
+                                state = append_event(  # event-consumer: audit-only -- records a rework-dispatch foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
+                                    state,
+                                    "rework_dispatch_blocked_environment_reaped",
+                                    {
+                                        "issue_number": request.issue_number,
+                                        "failure_kind": failure_kind,
+                                        "pid": failed_result.pid if failed_result else None,
+                                        "blocked_environment_count": len(blocked_environment_at),
+                                        "foreign_writer_reap_count": len(prior_reaps) + 1,
+                                    },
+                                    state_path=self.paths.state_file,
+                                )
+                                save_state(self.paths.state_file, state)
+                                continue
                             # Escalate with the environment reason and the
                             # blocking path so the operator sees "remove
                             # C:\...\wt", not "worker quality cap exceeded."
@@ -24687,6 +25098,29 @@ class OrchestratorApp:
             return None
         value = data.get("headRefOid")
         return str(value) if value is not None else None
+
+    def _read_packet_turn_cap_multiplier(self, pr_number: int) -> int:
+        """Return the structure-aware turn-cap multiplier stamped into the
+        review packet for ``pr_number`` (issue #1439), or 1 if no packet
+        exists, the packet predates the field, or it cannot be read.
+
+        A missing/old packet yielding 1 preserves the pre-#1439 flat
+        ``review_max_turns`` budget -- the base cap, no structure bonus.
+        """
+        pr_json_path = self.paths.prs / f"pr-{pr_number}" / "pr.json"
+        if not pr_json_path.exists():
+            return 1
+        try:
+            with pr_json_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return 1
+        if not isinstance(data, dict):
+            return 1
+        value = data.get("review_turn_cap_structure_multiplier", 1)
+        if not isinstance(value, int) or isinstance(value, bool):
+            return 1
+        return max(value, 1)
 
     def _cross_family_report_current(
         self,

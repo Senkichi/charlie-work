@@ -1000,6 +1000,7 @@ def launch_claude_worker(
     provider: str = "",
     resolved_review_effort: str | None = None,
     model_override: str | None = None,
+    max_turns_override: int | None = None,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree/checkout and launch a headless Claude Code
     worker (or reviewer) in it.
@@ -1061,6 +1062,16 @@ def launch_claude_worker(
     claude_code section's. When omitted (the default), the claude_code
     section's model is pinned exactly as before — the single enforcement
     point stays ``_apply_model_pin``, never an ``adapter_kind`` branch.
+
+    ``max_turns_override``, when provided on a ``review=True`` launch, is
+    pinned as the ``--max-turns`` value instead of
+    ``resolved_config.review_dispatch.review_max_turns``. Issue #1439: the
+    dispatch path resolves a structure-aware cap (raised for diffs touching
+    large files, escalated one step per consecutive turn-limit miss) and
+    passes it here so the reviewer runs with that budget rather than the flat
+    config default. When omitted (``None``), the flat config default is used
+    exactly as before -- preserving every direct caller and unit test that
+    does not opt into the structure-aware cap.
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
@@ -1124,9 +1135,17 @@ def launch_claude_worker(
     if review:
         # Cap agentic turns for reviewer sessions to prevent unbounded
         # codebase exploration and runaway token spend. 0 = unlimited.
-        command_template = _apply_max_turns_pin(
-            command_template, resolved_config.review_dispatch.review_max_turns
+        # Issue #1439: ``max_turns_override`` (resolved by the dispatch path
+        # from the packet's structure multiplier + the per-PR turn-limit miss
+        # streak) takes precedence over the flat config default so a PR
+        # threading a monolith gets a raised budget. ``None`` preserves the
+        # pre-#1439 flat ``review_max_turns`` behaviour for direct callers.
+        _review_max_turns = (
+            max_turns_override
+            if max_turns_override is not None
+            else resolved_config.review_dispatch.review_max_turns
         )
+        command_template = _apply_max_turns_pin(command_template, _review_max_turns)
 
     try:
         if review:
@@ -1453,7 +1472,9 @@ def launch_claude_worker(
     )
 
     try:
-        write_worktree_marker(worktree.path, process.pid, session_id)
+        write_worktree_marker(
+            worktree.path, process.pid, session_id, process_start_time=process_start_time
+        )
     except OSError:
         # Best-effort marker write must not derail a successful launch.
         pass

@@ -417,6 +417,17 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # cap IS exhausted goes through session_failed_escalated (error).
         "dispatch_blocked_environment": "warning",
         "rework_dispatch_blocked_environment": "warning",
+        # Issue #1423: a foreign writer that was alive but idle past the stall
+        # threshold was reaped (killed + marker cleaned) instead of blocking
+        # dispatch or escalating to a human. Warning, not error: the reap is a
+        # recovery, not a fault — the zombie is gone and dispatch proceeds. The
+        # sibling ``dispatch_blocked_environment_reaped`` /
+        # ``rework_dispatch_blocked_environment_reaped`` record the same reap at
+        # the blocked-environment cap exhaustion point (counter reset + retry
+        # instead of escalation).
+        "foreign_writer_reaped": "warning",
+        "dispatch_blocked_environment_reaped": "warning",
+        "rework_dispatch_blocked_environment_reaped": "warning",
         # Issue #849: rescue capture preserves work before a reset. Warning
         # level because it means a worktree had uncommitted work that was
         # about to be lost — the capture succeeded, but the condition that
