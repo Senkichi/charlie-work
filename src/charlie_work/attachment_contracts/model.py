@@ -108,6 +108,24 @@ class Redirect:
 
 
 @dataclass(frozen=True)
+class AdvisoryRecord:
+    """One PreToolUse advisory logged to ``.var/attachment-contracts/advisories.jsonl``
+    (issue #1460's review packet reads these to compute redirects-not-taken).
+
+    ``redirect``/``timestamp`` are optional so old records written before
+    issue #1460 (which lack both fields) still parse -- ``read_advisories``
+    tolerates their absence rather than treating them as malformed.
+    """
+
+    severity: Severity
+    file: str
+    identity: str
+    message: str
+    redirect: str | None = None
+    timestamp: str | None = None
+
+
+@dataclass(frozen=True)
 class ScaffoldPlan:
     """G2 pre-wired scaffold: rendered content for the redirect destination.
 
