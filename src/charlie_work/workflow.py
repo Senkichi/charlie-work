@@ -96,6 +96,7 @@ from .closing_reference import (
 from .pr_create_retry import create_pr_with_retry
 from .issue_comments import render_issue_comments
 from .markdown_fence import fenced_block
+from .module_map import build_module_map
 from .janitor import (
     _calculate_patch_id,
     _diff_content_signature,
@@ -2444,7 +2445,11 @@ def _detect_and_handle_orphaned_workers(
                 continue
             worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
             result = salvage_push_stranded_commits(
-                repo_root, branch, worktree_path, base_ref=config.dispatch.base_ref
+                repo_root,
+                branch,
+                worktree_path,
+                base_ref=config.dispatch.base_ref,
+                dry_run=write_gate.dry_run,
             )
             if result.pushed:
                 salvage_pushes[issue_number] = {
@@ -4107,6 +4112,12 @@ WORKER_PROMPT_KEYS: frozenset[str] = frozenset(
         "issue_comments",
         "branch_name",
         "worker_model_tier",
+        # Issue #1444: the module-map section, derived from the live tree at
+        # packet build time by ``build_module_map``. Empty string when the map
+        # could not be derived (fail-soft: omitted section + a
+        # ``worker_module_map_failed`` warning event), never a dispatch
+        # failure.
+        "module_map",
     }
 )
 REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
@@ -5701,15 +5712,15 @@ def _attempt_salvage(
     skip emits ``salvage_skipped_already_landed`` instead of opening a vestigial
     duplicate PR, and the caller treats it as "handled" (no redispatch).
 
-    NOTE (issue #1264, W6 PR3 disclosure): the ``push_branch`` call below is
-    an unconditional, unguarded real ``git push`` -- outside WriteGate's
-    declared 6-primitive surface (state.json/events.db/label-transition/
-    process-kill) and therefore NOT gated by ``write_gate`` here. This is a
-    real dry-run leak (filed separately; see the PR3 handoff) that this PR
-    does not fix -- gating an external git push was never in R6's scope
-    (kill_process was the one sanctioned new primitive) and freelancing a
-    7th WriteGate primitive without design review would repeat exactly the
-    mistake R6b's STOP-and-report exists to prevent.
+    NOTE (issue #1326): the ``push_branch`` call below threads
+    ``dry_run=write_gate.dry_run`` so a dry-run invocation does not issue a
+    real ``git push``. This is explicit-threading (mirroring
+    ``_reconcile_locked``'s convention) rather than a 7th WriteGate primitive
+    -- gating an external git push through WriteGate was an open design
+    question (see issue #1326's remedy section) and the simplest correct
+    fix is to thread the flag directly. Downstream state writes and label
+    transitions remain gated by ``write_gate``; the ``gh pr create`` in
+    ``_open_salvage_pr`` is gated at the ``GitHub`` client sink level.
     """
     write_gate = require_write_gate(write_gate)
     already_landed, skip_reason = _salvage_already_landed(
@@ -5743,7 +5754,9 @@ def _attempt_salvage(
             write_gate.save_state(state)
         return True, None
 
-    push_ok, push_error = push_branch(repo_root, branch, worktree_path=worktree_path)
+    push_ok, push_error = push_branch(
+        repo_root, branch, worktree_path=worktree_path, dry_run=write_gate.dry_run
+    )
     if not push_ok:
         return False, push_error
 
@@ -24244,6 +24257,38 @@ class OrchestratorApp:
             sanitize=defang_closing_keywords,
         )
 
+    def _build_module_map_value(self, issue_number: int) -> str:
+        """Derive the module-map section from the live tree (issue #1444).
+
+        Single point of enforcement for the fail-soft contract: a repo layout
+        ``build_module_map`` cannot parse yields an empty string (an omitted
+        section) plus a ``worker_module_map_failed`` warning event logged to
+        events.db, never a dispatch failure. The worker loses placement
+        steering for this one packet; the next packet rebuilds the map against
+        the then-current tree.
+
+        ``log_event`` (not ``self._record_event``) is used because
+        ``_write_worker_prompt`` runs outside a state-lock context -- the
+        caller (``intake`` / ``_dispatch_impl``) gathers network results and
+        builds prompts before taking the state lock for label/status writes.
+        """
+        package_dir = self.repo_root / "src" / "charlie_work"
+        src_root = self.repo_root / "src"
+        try:
+            return build_module_map(package_dir, src_root)
+        except (OSError, SyntaxError, ValueError) as exc:
+            log_event(
+                self.paths.state_file,
+                "worker_module_map_failed",
+                {
+                    "issue_number": issue_number,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                repo=self.repo_root.name,
+                level="warning",
+            )
+            return ""
+
     def _write_worker_prompt(
         self, issue: dict[str, Any], *, template: str | None = None, dry_run: bool = False
     ) -> Path:
@@ -24268,6 +24313,13 @@ class OrchestratorApp:
                 "issue_comments": self._render_issue_comments(issue),
                 "branch_name": self._branch_name(issue),
                 "worker_model_tier": self.config.dispatch.worker_model_tier,
+                # Issue #1444: the module-map section, derived from the live
+                # tree at packet build time. Fail-soft: a parse failure yields
+                # an empty string (omitted section) plus a
+                # ``worker_module_map_failed`` warning event, never a dispatch
+                # failure. ``_build_module_map_value`` is the single point of
+                # enforcement for that fail-soft contract.
+                "module_map": self._build_module_map_value(issue_number),
             },
         )
         # Issue #714: enforce the no-merge contract on the *rendered output*
