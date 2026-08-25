@@ -1,0 +1,323 @@
+"""Baseline: freeze-on-adopt, ratchet-down, bump validation, tamper guard.
+
+`.attachment-budgets.json` is GENERATED only (via the `baseline` CLI command).
+Entries are saturated points only, sorted by (kind, file, identity) for stable
+diffs. Serialization is fully deterministic: sorted entries, indent=1, sorted
+keys, trailing newline — so two runs against the same scan produce byte-
+identical output.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from charlie_work.attachment_contracts.model import (
+    BaselineEntry,
+    Bump,
+    Finding,
+    SaturationVerdict,
+)
+
+SCHEMA_VERSION = 1
+BASELINE_FILENAME = ".attachment-budgets.json"
+
+
+class TamperError(ValueError):
+    """A baseline file failed structural or referential validation."""
+
+
+def _bump_to_dict(bump: Bump) -> dict[str, object]:
+    return {"to": bump.to, "reason": bump.reason, "actor": bump.actor, "ack": bump.ack}
+
+
+def _bump_from_dict(raw: dict[str, object]) -> Bump:
+    return Bump(
+        to=int(raw["to"]),  # type: ignore[arg-type]
+        reason=str(raw["reason"]),
+        actor=str(raw["actor"]),  # type: ignore[arg-type]
+        ack=str(raw.get("ack", "")),
+    )
+
+
+def _entry_to_dict(entry: BaselineEntry) -> dict[str, object]:
+    return {
+        "kind": entry.kind,
+        "identity": entry.identity,
+        "file": entry.file,
+        "member_count": entry.member_count,
+        "boundary": entry.boundary,
+        "bumps": [_bump_to_dict(b) for b in entry.bumps],
+    }
+
+
+def _entry_from_dict(raw: dict[str, object]) -> BaselineEntry:
+    bumps_raw = raw.get("bumps", [])
+    if not isinstance(bumps_raw, list):
+        raise TamperError(f"entries[].bumps must be a list, got {type(bumps_raw)!r}")
+    return BaselineEntry(
+        kind=str(raw["kind"]),  # type: ignore[arg-type]
+        identity=str(raw["identity"]),
+        file=str(raw["file"]),
+        member_count=int(raw["member_count"]),  # type: ignore[arg-type]
+        boundary=float(raw["boundary"]),  # type: ignore[arg-type]
+        bumps=tuple(_bump_from_dict(b) for b in bumps_raw),
+    )
+
+
+def _entry_sort_key(entry: BaselineEntry) -> tuple[str, str, str]:
+    return (entry.kind, entry.file, entry.identity)
+
+
+def generate(
+    verdicts: tuple[SaturationVerdict, ...],
+    *,
+    generated_by: str,
+    generated_at: str,
+    floor: int,
+) -> dict[str, object]:
+    """Build the baseline document (as a plain dict, ready for dump()) from verdicts.
+
+    Only saturated points are entered; freshly generated entries carry no bumps.
+    """
+    entries = [
+        BaselineEntry(
+            kind=v.point.kind,
+            identity=v.point.identity,
+            file=v.point.file,
+            member_count=v.point.member_count,
+            boundary=v.boundary,
+        )
+        for v in verdicts
+        if v.saturated
+    ]
+    entries.sort(key=_entry_sort_key)
+    return {
+        "version": SCHEMA_VERSION,
+        "generated_by": generated_by,
+        "generated_at": generated_at,
+        "floor": floor,
+        "entries": [_entry_to_dict(e) for e in entries],
+    }
+
+
+def dumps(document: dict[str, object]) -> str:
+    """Deterministic JSON: sorted entries, indent=1, sorted keys, trailing newline."""
+    entries_raw = document.get("entries", [])
+    ordered_entries = sorted(
+        entries_raw,  # type: ignore[arg-type]
+        key=lambda e: (e["kind"], e["file"], e["identity"]),
+    )
+    normalized = {**document, "entries": ordered_entries}
+    return json.dumps(normalized, indent=1, sort_keys=True) + "\n"
+
+
+def dump(document: dict[str, object], path: Path) -> None:
+    path.write_text(dumps(document), encoding="utf-8")
+
+
+def loads(text: str) -> dict[str, object]:
+    document = json.loads(text)
+    if not isinstance(document, dict):
+        raise TamperError("baseline root must be a JSON object")
+    if document.get("version") != SCHEMA_VERSION:
+        raise TamperError(f"unsupported baseline version: {document.get('version')!r}")
+    entries_raw = document.get("entries")
+    if not isinstance(entries_raw, list):
+        raise TamperError("baseline 'entries' must be a list")
+    # Validate every entry parses; surfaces structural tamper immediately.
+    for raw in entries_raw:
+        if not isinstance(raw, dict):
+            raise TamperError(f"baseline entry must be an object, got {type(raw)!r}")
+        _entry_from_dict(raw)
+    return document  # type: ignore[return-value]
+
+
+def load(path: Path) -> dict[str, object]:
+    return loads(path.read_text(encoding="utf-8"))
+
+
+def entries_of(document: dict[str, object]) -> tuple[BaselineEntry, ...]:
+    return tuple(_entry_from_dict(raw) for raw in document["entries"])  # type: ignore[union-attr,arg-type]
+
+
+def validate_bump(bump: Bump) -> str | None:
+    """Return an error message if `bump` is invalid, else None.
+
+    G4: actor=worker REQUIRES a non-empty ack referencing an external source
+    (issue URL / dispatch-prompt id / human handle). Interactive bumps self-ack
+    (ack may be empty for actor=interactive).
+    """
+    if not bump.reason.strip():
+        return "bump.reason must be non-empty"
+    if bump.actor == "worker" and not bump.ack.strip():
+        return (
+            "G4: worker bump requires a non-empty external ack "
+            "(issue URL / dispatch-prompt id / human handle)"
+        )
+    if bump.actor not in ("interactive", "worker"):
+        return f"bump.actor must be 'interactive' or 'worker', got {bump.actor!r}"
+    return None
+
+
+def _entry_key(entry: BaselineEntry) -> tuple[str, str, str]:
+    return (entry.kind, entry.file, entry.identity)
+
+
+def _verdict_key(verdict: SaturationVerdict) -> tuple[str, str, str]:
+    return (verdict.point.kind, verdict.point.file, verdict.point.identity)
+
+
+def _effective_ceiling(entry: BaselineEntry) -> int:
+    """The highest member_count this entry currently permits without a Finding.
+
+    That is the baselined member_count itself, or the highest bump.to if bumps
+    exist (bumps only ever raise the ceiling; validity of each bump is checked
+    separately by validate_bump at bump-authoring time).
+    """
+    if not entry.bumps:
+        return entry.member_count
+    return max(entry.member_count, max(b.to for b in entry.bumps))
+
+
+def compare(
+    current: tuple[SaturationVerdict, ...],
+    baseline_document: dict[str, object],
+) -> tuple[list[Finding], dict[str, object]]:
+    """Compare current saturation verdicts against the baseline.
+
+    Returns (findings, ratcheted_document):
+    - A currently-saturated point above its baseline's effective ceiling with
+      no covering bump -> Finding(block).
+    - A baselined point now saturated at or below its ceiling -> clean.
+    - A baselined point no longer saturated, or saturated but with a strictly
+      lower member_count than the baseline -> ratchet down (entry rewritten to
+      the lower count; bumps for a point are dropped once ratcheted, since a
+      bump raising an old, higher ceiling no longer applies to a lower one).
+    - A currently-saturated point with no baseline entry at all -> newly
+      saturated; not a Finding here (that is what `baseline` regeneration is
+      for) but it IS added to the ratcheted document so the baseline stays a
+      complete freeze-on-adopt snapshot.
+    The input document is never mutated; a new document dict is returned.
+    """
+    baseline_entries = {_entry_key(e): e for e in entries_of(baseline_document)}
+    current_by_key = {_verdict_key(v): v for v in current if v.saturated}
+
+    findings: list[Finding] = []
+    new_entries: list[BaselineEntry] = []
+
+    for key, verdict in current_by_key.items():
+        point = verdict.point
+        baseline_entry = baseline_entries.get(key)
+        if baseline_entry is None:
+            # Newly saturated: freeze it into the ratcheted baseline, no Finding.
+            new_entries.append(
+                BaselineEntry(
+                    kind=point.kind,
+                    identity=point.identity,
+                    file=point.file,
+                    member_count=point.member_count,
+                    boundary=verdict.boundary,
+                )
+            )
+            continue
+
+        ceiling = _effective_ceiling(baseline_entry)
+        if point.member_count > ceiling:
+            findings.append(
+                Finding(
+                    severity="block",
+                    file=point.file,
+                    identity=point.identity,
+                    message=(
+                        f"{point.identity} ({point.kind}) has {point.member_count} "
+                        f"members, exceeding baselined ceiling {ceiling}. Add a bump "
+                        "or move new members to a redirect destination."
+                    ),
+                    redirect=None,
+                )
+            )
+            new_entries.append(baseline_entry)
+        elif point.member_count < baseline_entry.member_count:
+            # Ratchet down: strictly improved, drop stale bumps for this point.
+            new_entries.append(
+                BaselineEntry(
+                    kind=point.kind,
+                    identity=point.identity,
+                    file=point.file,
+                    member_count=point.member_count,
+                    boundary=verdict.boundary,
+                )
+            )
+        else:
+            new_entries.append(baseline_entry)
+
+    # Points baselined before but no longer saturated at all are simply absent
+    # from `new_entries` (the loop above only ever visits currently-saturated
+    # points) — that is the "ratchet down to not tracked" case, handled by
+    # omission rather than an explicit branch.
+    sorted_entries = sorted(new_entries, key=_entry_sort_key)
+    ratcheted = {
+        "version": SCHEMA_VERSION,
+        "generated_by": baseline_document.get("generated_by", ""),
+        "generated_at": baseline_document.get("generated_at", ""),
+        "floor": baseline_document.get("floor", 0),
+        "entries": [_entry_to_dict(e) for e in sorted_entries],
+    }
+    return findings, ratcheted
+
+
+def check_tamper(
+    current: tuple[SaturationVerdict, ...],
+    baseline_document: dict[str, object],
+) -> list[Finding]:
+    """Tamper guard: a baseline entry raised without a covering bump record.
+
+    Recomputes what each unchanged point's baseline SHOULD show. If the
+    on-disk baseline's member_count for a point is HIGHER than what the point
+    itself currently reports, and no bump on that entry accounts for the
+    difference, that is tamper (someone hand-edited the JSON to raise a
+    ceiling) -> Finding(error).
+    """
+    current_by_key = {_verdict_key(v): v for v in current}
+    findings: list[Finding] = []
+
+    for entry in entries_of(baseline_document):
+        key = (entry.kind, entry.file, entry.identity)
+        verdict = current_by_key.get(key)
+        actual_count = verdict.point.member_count if verdict is not None else None
+
+        for bump in entry.bumps:
+            error = validate_bump(bump)
+            if error is not None:
+                findings.append(
+                    Finding(
+                        severity="error",
+                        file=entry.file,
+                        identity=entry.identity,
+                        message=f"invalid bump on {entry.identity}: {error}",
+                        redirect=None,
+                    )
+                )
+
+        if actual_count is not None and entry.member_count > actual_count:
+            # Baseline claims more members than the point actually has, and
+            # there is no bump whose `to` matches the inflated member_count —
+            # the entry itself was hand-raised.
+            covered = any(b.to == entry.member_count for b in entry.bumps)
+            if not covered:
+                findings.append(
+                    Finding(
+                        severity="error",
+                        file=entry.file,
+                        identity=entry.identity,
+                        message=(
+                            f"tamper: baseline member_count {entry.member_count} for "
+                            f"{entry.identity} exceeds actual {actual_count} with no "
+                            "covering bump"
+                        ),
+                        redirect=None,
+                    )
+                )
+
+    return findings
