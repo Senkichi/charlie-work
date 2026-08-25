@@ -65,6 +65,30 @@ def test_marker_valid_yields_nonempty_clause_with_check_file(tmp_path: Path) -> 
     assert rows == []
 
 
+def test_marker_valid_clause_instructs_worker_to_post_advisories_comment(
+    tmp_path: Path,
+) -> None:
+    """Issue #1466: the dispatch clause must instruct the worker to publish
+    the advisories PR comment with the stable marker line, so the review-
+    packet builder's PR-comment channel has something to read."""
+    from charlie_work.attachment_contracts.hook_entry import ADVISORY_COMMENT_MARKER
+
+    baseline_doc = generate((), generated_by="test", generated_at="2026-08-25T00:00:00Z", floor=1)
+    (tmp_path / BASELINE_FILENAME).write_text(dumps(baseline_doc), encoding="utf-8")
+    app = _app(tmp_path)
+
+    value = app._build_attachment_budget_value(issue_number=2)
+
+    assert ADVISORY_COMMENT_MARKER in value, (
+        "dispatch clause must tell the worker to start the advisories PR "
+        "comment with the stable marker line"
+    )
+    # The clause must name the schema fields so the worker posts the right
+    # shape -- not a free-form comment the builder cannot parse.
+    for field in ("severity", "file", "identity", "message", "redirect", "timestamp"):
+        assert field in value, f"dispatch clause must name the `{field}` schema field"
+
+
 def test_marker_malformed_yields_empty_clause_and_warning_event(tmp_path: Path) -> None:
     (tmp_path / BASELINE_FILENAME).write_text("not valid json {{{", encoding="utf-8")
     app = _app(tmp_path)

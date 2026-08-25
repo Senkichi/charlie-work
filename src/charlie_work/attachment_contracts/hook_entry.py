@@ -40,6 +40,52 @@ from charlie_work.attachment_contracts.model import AdvisoryRecord, Finding
 _ADVISORY_LOG_REL = Path(".var/attachment-contracts/advisories.jsonl")
 _ACTIONABLE_SEVERITIES = frozenset({"block", "error"})
 
+# Issue #1466: the stable first-line marker a worker writes on the PR comment
+# it publishes to surface triggered advisories. The review-packet builder
+# (``OrchestratorApp._build_attachment_budget_section``) scans PR issue-level
+# comments for one whose body starts with this marker (prefix test, matching
+# ``ORCHESTRATOR_COMMENT_MARKER``'s discipline) and parses the fenced JSON
+# block that follows it into ``AdvisoryRecord`` entries via
+# ``parse_advisories_comment``. The ``v1`` suffix is a schema version so a
+# future shape change can coexist with stale comments from an older worker
+# without the builder misparsing either side.
+ADVISORY_COMMENT_MARKER = "<!-- attachment-advisories v1 -->"
+
+
+def _advisory_record_from_raw(raw: object) -> AdvisoryRecord | None:
+    """Build a single ``AdvisoryRecord`` from one decoded JSON value.
+
+    Shared by ``read_advisories`` (JSONL log) and ``parse_advisories_comment``
+    (PR-comment fenced JSON array) so the two channels cannot drift on
+    schema. Returns ``None`` for anything that is not a JSON object or is
+    missing a required field (``severity``/``file``/``identity``/
+    ``message``) -- the caller skips it rather than raising, since both
+    channels feed an advisory-only review section, never a blocking gate.
+    ``redirect``/``timestamp`` are optional so old-shape records written
+    before issue #1460 still parse.
+    """
+    if not isinstance(raw, dict):
+        return None
+    try:
+        severity = str(raw["severity"])
+        file_ = str(raw["file"])
+        identity = str(raw["identity"])
+        message = str(raw["message"])
+    except KeyError:
+        return None
+    redirect_raw = raw.get("redirect")
+    redirect = str(redirect_raw) if isinstance(redirect_raw, str) else None
+    timestamp_raw = raw.get("timestamp")
+    timestamp = str(timestamp_raw) if isinstance(timestamp_raw, str) else None
+    return AdvisoryRecord(
+        severity=severity,  # type: ignore[arg-type]
+        file=file_,
+        identity=identity,
+        message=message,
+        redirect=redirect,
+        timestamp=timestamp,
+    )
+
 
 def _find_baseline_root(target: Path) -> Path | None:
     """Walk upward from `target` looking for `.attachment-budgets.json`."""
@@ -147,29 +193,70 @@ def read_advisories(root: Path) -> tuple[AdvisoryRecord, ...]:
             raw = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(raw, dict):
-            continue
-        try:
-            severity = str(raw["severity"])
-            file_ = str(raw["file"])
-            identity = str(raw["identity"])
-            message = str(raw["message"])
-        except KeyError:
-            continue
-        redirect_raw = raw.get("redirect")
-        redirect = str(redirect_raw) if isinstance(redirect_raw, str) else None
-        timestamp_raw = raw.get("timestamp")
-        timestamp = str(timestamp_raw) if isinstance(timestamp_raw, str) else None
-        records.append(
-            AdvisoryRecord(
-                severity=severity,  # type: ignore[arg-type]
-                file=file_,
-                identity=identity,
-                message=message,
-                redirect=redirect,
-                timestamp=timestamp,
-            )
-        )
+        record = _advisory_record_from_raw(raw)
+        if record is not None:
+            records.append(record)
+    return tuple(records)
+
+
+def parse_advisories_comment(body: str) -> tuple[AdvisoryRecord, ...] | None:
+    """Parse the worker-published advisories PR comment (issue #1466).
+
+    The comment body MUST start (after leading whitespace) with
+    ``ADVISORY_COMMENT_MARKER``; a body that does not is not an advisories
+    comment and this returns ``None`` -- the caller treats that as "no PR-
+    comment channel present" and falls back to the local advisories log.
+
+    The marker is followed by a fenced JSON block (``\\`\\`\\`json ... \\`\\`\\`\\``)
+    containing a JSON array of records in the same schema
+    ``read_advisories`` parses (one object per advisory, fields
+    ``severity``/``file``/``identity``/``message``/``redirect``/``timestamp``).
+    Returns the parsed ``AdvisoryRecord`` tuple, or ``()`` when the marker is
+    present but the fence is missing/empty/malformed -- a present marker with
+    no parseable records is still a present channel (distinguished from
+    ``None``, which means "no channel at all"), so the caller does NOT fall
+    back to the local log and the review packet renders an empty
+    redirects-not-taken list rather than the "log not available" NOTE.
+
+    Best-effort on malformed content, mirroring ``read_advisories``: a fence
+    whose body is not valid JSON, is not an array, or contains non-object /
+    missing-field elements yields the records that DID parse (possibly
+    ``()``), never raises -- this feeds an advisory-only review section.
+    """
+    if not isinstance(body, str) or not body.lstrip().startswith(ADVISORY_COMMENT_MARKER):
+        return None
+
+    # Extract the first fenced block after the marker. A fenced block opens
+    # with a line of three-or-more backticks (optionally tagged ``json``) and
+    # closes with the next line of three-or-more backticks. Anything between
+    # is the JSON payload. Tolerant of ``\\r\\n`` line endings.
+    lines = body.splitlines()
+    fence_open_index: int | None = None
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            fence_open_index = i
+            break
+    if fence_open_index is None:
+        return ()
+    fence_body: list[str] = []
+    for line in lines[fence_open_index + 1 :]:
+        if line.lstrip().startswith("```"):
+            break
+        fence_body.append(line)
+    payload_text = "\n".join(fence_body).strip()
+    if not payload_text:
+        return ()
+    try:
+        decoded = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(decoded, list):
+        return ()
+    records: list[AdvisoryRecord] = []
+    for element in decoded:
+        record = _advisory_record_from_raw(element)
+        if record is not None:
+            records.append(record)
     return tuple(records)
 
 
