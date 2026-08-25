@@ -31250,12 +31250,14 @@ def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
             **state["prs"]["456"],
             "status": "escalated",
             "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+            "escalation_reasons_seen": ["conflict_rework_attempts_cap_exceeded"],
             "conflict_rework_attempts": 3,
         }
         state["issues"]["123"] = {
             **state["issues"]["123"],
             "status": "escalated",
             "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+            "escalation_reasons_seen": ["conflict_rework_attempts_cap_exceeded"],
         }
         save_state(paths.state_file, state)
 

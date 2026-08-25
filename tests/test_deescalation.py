@@ -125,9 +125,11 @@ def test_deescalation_sweep_clears_mechanical_and_leaves_judgment_untouched(
 
     # Issue #1093: the PR record's escalation_reason must be mirror-cleared
     # alongside the issue's, so the rework router's short-circuit on
-    # existing_pr_state.get("escalation_reason") no longer fires.
+    # existing_pr_state.get("escalation_reasons_seen") (issue #1461: was
+    # "escalation_reason") no longer fires.
     pr_456 = state["prs"]["456"]
     assert "escalation_reason" not in pr_456
+    assert "escalation_reasons_seen" not in pr_456
 
     # The judgment issue on an identically-shaped PR is completely untouched.
     issue_124 = state["issues"]["124"]
@@ -1073,8 +1075,10 @@ def test_deescalation_clears_worktree_unsafe_when_worktree_cleaned(
     assert issue_123["status"] == PASSIVE_OPEN_STATUS
     assert "escalation_reason" not in issue_123
     assert issue_123["auto_deescalation_count"] == 1
-    # Issue #1093: PR-side escalation_reason mirror-cleared.
+    # Issue #1093: PR-side escalation_reason mirror-cleared
+    # (issue #1461: escalation_reasons_seen also cleared).
     assert "escalation_reason" not in state["prs"]["456"]
+    assert "escalation_reasons_seen" not in state["prs"]["456"]
 
 
 # ---------------------------------------------------------------------------
@@ -1130,6 +1134,7 @@ def test_sweep_mirror_clears_pr_escalation_reason(tmp_path: Path) -> None:
     # PR-side: also cleared — this is the #1093 fix.
     pr_456 = state["prs"]["456"]
     assert "escalation_reason" not in pr_456
+    assert "escalation_reasons_seen" not in pr_456
 
 
 def test_sweep_resets_over_cap_rework_counter_on_first_clear(

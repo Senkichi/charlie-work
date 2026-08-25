@@ -200,24 +200,57 @@ def _escalate_issue(
     ``terminal_since`` (issue #947) records when this issue most recently
     entered a terminal state via this helper, so a periodic sweep can alert
     on an issue parked in ``agent:human-needed`` past a configurable age
-    instead of that state being silently invisible. It is unconditionally
-    refreshed on every call (not just the first): a re-escalation after a
-    de-escalation is a fresh terminal episode, not a continuation of the old
-    one.
+    instead of that state being silently invisible. It is refreshed on the
+    first escalation of a given reason within an episode, but NOT on a
+    re-escalation of the same reason (issue #1461): a cross-lane clobber
+    that re-fires the same lane's escalation used to reset this clock on
+    every pass, delaying the staleness alert for exactly the PRs stuck
+    longest in escalation. A re-escalation after a de-escalation (which
+    clears ``escalation_reasons_seen``) is still a fresh terminal episode.
+
+    ``escalation_reasons_seen`` (issue #1461) is an append-only list of every
+    distinct ``reason`` this entry has been escalated with within the current
+    episode. It is the single point of enforcement that lets each per-lane
+    dedup guard check "did THIS lane already escalate?" by membership in the
+    list, instead of equality against the single ``escalation_reason`` field
+    -- which a different lane's escalation clobbers on every call. Both the
+    issue and PR records carry the list so a guard that checks either record
+    (the janitor lane checks both) sees the full history. The list is cleared
+    alongside ``escalation_reason`` by ``clear_escalation`` (state.py) and by
+    ``charlie unescalate``'s reset-field tuples, so a de-escalated issue gets
+    a genuinely fresh history on re-escalation.
     """
     state.setdefault("issues", {})
     state.setdefault("prs", {})
 
+    def _append_seen(entry: dict[str, Any], r: str) -> list[str]:
+        """Append ``r`` to ``escalation_reasons_seen`` if not already present.
+
+        Returns the updated list so the caller can use it for the
+        ``terminal_since`` freshness decision without re-reading the entry.
+        """
+        seen = list(entry.get("escalation_reasons_seen") or [])
+        if r not in seen:
+            seen.append(r)
+        entry["escalation_reasons_seen"] = seen
+        return seen
+
     if issue_number is not None:
         issue_key = str(issue_number)
+        prior_issue = state["issues"].get(issue_key, {})
+        # Issue #1461: only refresh terminal_since when this reason is new to
+        # the episode (not already in escalation_reasons_seen). A re-escalation
+        # of the same reason -- the cross-lane clobber path -- must not reset
+        # the staleness clock.
+        prior_seen = prior_issue.get("escalation_reasons_seen") or []
+        fresh_episode = reason not in prior_seen
         issue_entry: dict[str, Any] = {
-            **state["issues"].get(issue_key, {}),
+            **prior_issue,
             "number": issue_number,
             "status": status,
             "escalation_reason": reason,
             "reason_class": escalation_reason_class(reason_class),
             "merge_alert": "OK",
-            "terminal_since": utc_now(),
         }
         if issue_extra:
             issue_entry.update(issue_extra)
@@ -228,7 +261,13 @@ def _escalate_issue(
         issue_entry["escalation_reason"] = reason
         issue_entry["reason_class"] = escalation_reason_class(reason_class)
         issue_entry["merge_alert"] = "OK"
-        issue_entry["terminal_since"] = utc_now()
+        _append_seen(issue_entry, reason)
+        # terminal_since: refresh only on a fresh episode (issue #1461).
+        # Re-assert after extras so a caller cannot accidentally drop it.
+        if fresh_episode:
+            issue_entry["terminal_since"] = utc_now()
+        else:
+            issue_entry["terminal_since"] = prior_issue.get("terminal_since") or utc_now()
         state["issues"][issue_key] = issue_entry
 
     if pr_number is not None:
@@ -243,6 +282,7 @@ def _escalate_issue(
         # same required reason that justifies the status.
         pr_entry["status"] = status
         pr_entry["escalation_reason"] = reason
+        _append_seen(pr_entry, reason)
         state["prs"][pr_key] = pr_entry
 
     return state
