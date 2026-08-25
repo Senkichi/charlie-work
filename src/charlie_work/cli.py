@@ -291,7 +291,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     fleet = subparsers.add_parser("fleet")
     fleet_sub = fleet.add_subparsers(dest="fleet_command", required=True)
-    fleet_sub.add_parser("status")
+    fleet_status_parser = fleet_sub.add_parser("status")
+    fleet_status_parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "Bypass the status-snapshot cache (issue #1463) and compute the "
+            "full live status. Use when you need a guaranteed-fresh view "
+            "rather than the last loop pass's snapshot."
+        ),
+    )
     fleet_sub.add_parser("review-queue")
     fleet_sub.add_parser("operator-queue")
 
@@ -1413,7 +1423,7 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
             paths = runtime_paths(repo_root, config.runtime.state_dir)
             gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=True)
             app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
-            result = app.status()
+            result = app.status(use_cache=not getattr(args, "no_cache", False))
             per_repo[repo_key] = result.data
         except (RepoNotFoundError, ConfigError, GitHubError, OSError) as exc:
             errors.append({"repo_key": repo_key, "error": str(exc)})

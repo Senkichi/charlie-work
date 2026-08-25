@@ -1104,6 +1104,16 @@ class RuntimeConfig:
     # state_lock. Set to 0 to disable pruning (stale entries are skipped but
     # never removed).
     fleet_registry_stale_grace_days: int = 7
+    # Issue #1463: freshness window (seconds) for the per-repo status-snapshot
+    # cache. The loop pass writes ``status()``'s result to
+    # ``status-snapshot.json`` at the end of every pass; ``fleet status --json``
+    # serves from that snapshot (lock-free, no GitHub API calls) when it is
+    # younger than this TTL, falling back to a live computation when stale.
+    # Default 900s (15 min) comfortably exceeds the observed healthy loop-pass
+    # cadence (median ~10.4m) so a running supervisor always produces a fresh
+    # snapshot before the previous one expires. Set to 0 to disable caching
+    # (always compute live).
+    status_snapshot_ttl_seconds: int = 900
 
 
 @dataclass(frozen=True)
@@ -2736,6 +2746,18 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'runtime' key 'fleet_registry_stale_grace_days' "
                 f"must be >= 0, got {stale_grace_days}"
+            )
+    status_snapshot_ttl = runtime_data.get("status_snapshot_ttl_seconds")
+    if status_snapshot_ttl is not None:
+        if not isinstance(status_snapshot_ttl, int) or isinstance(status_snapshot_ttl, bool):
+            raise ConfigError(
+                "config section 'runtime' key 'status_snapshot_ttl_seconds' "
+                f"must be an int, got {type(status_snapshot_ttl).__name__}"
+            )
+        if status_snapshot_ttl < 0:
+            raise ConfigError(
+                "config section 'runtime' key 'status_snapshot_ttl_seconds' "
+                f"must be >= 0, got {status_snapshot_ttl}"
             )
     # Parse preflight sub-section (issue #1363).
     preflight_data = runtime_data.get("preflight")
