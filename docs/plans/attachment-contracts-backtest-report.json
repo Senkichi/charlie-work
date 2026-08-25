@@ -67,7 +67,6 @@
     "class:src/charlie_work/github.py:GitHub",
     "class:src/charlie_work/wedge_watchdog.py:WedgeWatchdog",
     "class:src/charlie_work/workflow.py:OrchestratorApp",
-    "class:tests/test_issue_956.py:_SalvageTestGitHub",
     "test_module:tests/test_api_budget.py:tests/test_api_budget.py::module",
     "test_module:tests/test_charlie_work.py:tests/test_charlie_work.py::module",
     "test_module:tests/test_claude_code_adapter.py:tests/test_claude_code_adapter.py::module",
@@ -89,7 +88,7 @@
     "test_module:tests/test_worker_health.py:tests/test_worker_health.py::module",
     "test_module:tests/test_worktree.py:tests/test_worktree.py::module"
    ],
-   "saturated_count": 24,
+   "saturated_count": 23,
    "sha": "1ead8585f58f832c5442dc3d7173a662348e150a"
   },
   {
@@ -101,7 +100,6 @@
     "class:src/charlie_work/github.py:GitHub",
     "class:src/charlie_work/wedge_watchdog.py:WedgeWatchdog",
     "class:src/charlie_work/workflow.py:OrchestratorApp",
-    "class:tests/_salvage_fixtures.py:_SalvageTestGitHub",
     "test_module:tests/test_api_budget.py:tests/test_api_budget.py::module",
     "test_module:tests/test_charlie_work.py:tests/test_charlie_work.py::module",
     "test_module:tests/test_checks.py:tests/test_checks.py::module",
@@ -126,7 +124,7 @@
     "test_module:tests/test_worker_stop_gate.py:tests/test_worker_stop_gate.py::module",
     "test_module:tests/test_worktree.py:tests/test_worktree.py::module"
    ],
-   "saturated_count": 27,
+   "saturated_count": 26,
    "sha": "7373d47b2d0cf4612dd5600de9f66c320000ac1f"
   },
   {
@@ -138,8 +136,6 @@
     "class:src/charlie_work/github.py:GitHub",
     "class:src/charlie_work/wedge_watchdog.py:WedgeWatchdog",
     "class:src/charlie_work/workflow.py:OrchestratorApp",
-    "class:tests/_salvage_fixtures.py:_SalvageTestGitHub",
-    "class:tests/test_state_decision_cache_enforcement.py:_PrStateWriteVisitor",
     "test_module:tests/test_api_budget.py:tests/test_api_budget.py::module",
     "test_module:tests/test_charlie_work.py:tests/test_charlie_work.py::module",
     "test_module:tests/test_checks.py:tests/test_checks.py::module",
@@ -166,7 +162,7 @@
     "test_module:tests/test_worker_stop_gate.py:tests/test_worker_stop_gate.py::module",
     "test_module:tests/test_worktree.py:tests/test_worktree.py::module"
    ],
-   "saturated_count": 30,
+   "saturated_count": 28,
    "sha": "9de0b9fc14279ef3578424bfb8fa6687d6eb12a9"
   }
  ]

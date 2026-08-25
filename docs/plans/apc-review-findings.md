@@ -1,253 +1,150 @@
-# APC pilot — adversarial review, round 1 (this file)
+# Attachment-Point Contracts — Adversarial Review Findings (Round 3)
 
-Reviewer: automated adversarial pass. Date: 2026-08-24.
+**Reviewer:** delegate (adversarial, round 3)
+**Date:** 2026-08-24
+**Scope:** `src/charlie_work/attachment_contracts/`, `tests/attachment_contracts/`,
+`.attachment-budgets.json`, `.github/workflows/attachment-contracts.yml`,
+`docs/specs/attachment-point-contracts-spec.md`,
+`docs/plans/attachment-contracts-backtest-report.md`,
+decision doc `llibrary/docs/plans/2026-08-24-god-object-mitigation-DECISION.md` §1.1–1.4.
 
-**Numbering note.** The source already cites prior-round numbers in comments
-(`finding #1`, `#3a/b/c`, `#4`, `#5`, `#7`) and the spec cites a "round-1 review
-(finding #6)". Those are a *different, earlier* review. To avoid collision this
-round numbers findings **independently, starting at #8**. When a code comment says
-`finding #N` with N<=7 it refers to the earlier round, not this file.
+## Verdict
 
-Scope of the 7 requested checks and their verdicts are in the PASS section at the
-bottom. Outstanding count = correctness / spec-violation / safety only; stylistic
-notes are listed separately and are NOT counted.
-
----
-
-## Outstanding findings
-
-### #8 — [HIGH · BLOCKING] Deliverable-0 gate is in FAIL, and `counterexamples_clean` is structurally near-unsatisfiable for the module set it names
-
-Evidence:
-- `docs/plans/attachment-contracts-backtest-report.md:3` — **`Overall: FAIL`**.
-- Same report line 14: `counterexamples_clean` FAIL — "only 3/13 counterexample
-  module(s) actually produced an AP ... below the 50% coverage floor", listing
-  10 modules that "emitted no AP in any sample": `event_kinds.py, fleet_paths.py,
-  git_pull_blockers.py, logging_setup.py, markdown_fence.py, prompt_sections.py,
-  rescue.py, safe_path.py, safe_ref.py, throttle_signatures.py`.
-- Decision doc §1.1 (G1 / Deliverable 0): "The rest of the pilot is gated on
-  Deliverable 0 passing."
-
-Why it is structural, not transient: `archetypes.scan_tree` emits an
-`AttachmentPoint` only for class / Typer-app / blueprint / ledger archetypes. The
-10 modules above are bare-function modules (no class, no app object), so they
-*cannot* produce an AP by construction. `_criterion_counterexamples_clean`
-(`backtest.py`, `_COUNTEREXAMPLE_MIN_COVERAGE = 0.5`) requires >=50% of the 13
-named counterexamples to have produced an AP before "zero saturations" is allowed
-to count as a pass; the ceiling is 3/13 = 23%, so the criterion is pinned at FAIL
-regardless of the actual (correct) zero-false-positive result. The positive
-control therefore validates *nothing* about the archetypes it names — and in
-particular cannot detect class-level over-firing (see #9), because none of its
-counterexamples is a legitimately multi-method class.
-
-Impact: the pilot's own hard gate is unmet, yet the committed baseline
-(`.attachment-budgets.json`, generated 2026-08-25) and the CI workflow are already
-in the tree. Either the gate passed under different criteria than what is committed,
-or the pilot advanced past a FAIL.
-
-Fix: replace the bare-function modules in `COUNTEREXAMPLE_MODULES` with
-counterexamples that actually mint an AP under the current archetypes (small
-real classes / a small Typer app that must remain unsaturated), OR redefine the
-criterion so "module scanned, produced no AP, therefore trivially not a false
-positive" counts toward coverage instead of being excluded from it. Do not ship
-the baseline/CI until Deliverable 0 is green under the committed criteria.
-
-### #9 — [MEDIUM] `class` outlier boundary is corrupted by zero-member classes; 6-method fixtures are frozen as "god objects"
-
-Evidence (live scan, `python -m charlie_work.attachment_contracts scan --root .`):
-- `class`: n=531, Q1=0, Q3=2, IQR=2, **boundary=5.0**, and **148 of 531 class APs
-  have member_count == 0** (`class Foo: pass`, Protocols, empty dataclasses).
-- `.attachment-budgets.json` consequently freezes as saturated: `WorkerView` (6),
-  `WriteGate` (6), `TestRequireValidRev` (6), `TestResolveCliBinary` (6), two
-  6-member `FakeGitHub` test fixtures, `_SalvageTestGitHub` (7), etc.
-
-Root cause: the 148 zero-member classes anchor Q1 at 0, so IQR collapses to 2 and
-the Tukey fence lands at Q3 + 1.5·IQR = 5. A 6-method class is not a god object;
-it is being flagged because ~28% of the population is empty-bodied. This is a
-structural defect, not a Week-1 tuning knob — no boundary tuning removes the
-downward pull of the empty classes. Related: nothing guards `IQR == 0`
-(`outliers.py`), where the fence degenerates to strict `> Q3` with zero tolerance;
-`FLOOR` only guards `n < 4`.
-
-Impact: an inflated baseline full of false-positive freezes, and — once Week-2
-enforce lands — false blocks on any 5→6-method class growth. The G1 control (see
-#8) structurally cannot catch this because it names no multi-method class.
-
-Fix: require `member_count >= 1` to enter the outlier population for the `class`
-kind (an AP with no bound members is not evidence about the god-object
-distribution), and add an explicit `IQR == 0` degenerate-fence guard.
-
-### #10 — [MEDIUM · SAFETY] G4 actor-split is self-attested and forgeable
-
-Evidence: `baseline.py:157-173` (`validate_bump`):
-```
-if bump.actor == "worker" and not bump.ack.strip():
-    return "G4: worker bump requires a non-empty external ack ..."
-if bump.actor not in ("interactive", "worker"):
-    return ...
-```
-- `actor` is a plain field read from the baseline JSON (`_bump_from_dict`,
-  `baseline.py:34-40`: `actor=str(raw["actor"])`). Nothing binds it to the real
-  execution context (no `CHARLIE_FLEET_WORKER` / `CLAUDE_CODE_UNATTENDED` check at
-  validate time).
-- No code path anywhere *generates* a bump — `grep` shows `Bump(...)` is
-  constructed only in `_bump_from_dict` (deserialization) and tests. So the actor
-  field is always hand-typed into the committed JSON.
-- `ack` is validated for non-emptiness only. `ack: "x"` passes; there is no
-  format/reference validation despite the message demanding an "issue URL /
-  dispatch-prompt id / human handle".
-
-Impact: the exact laundering G4 claims to close (decision doc §1.1 G4: "a worker
-that can write code can trivially write its own token") is still open. A worker
-authoring a bump sets `actor: "interactive"` (ack then not required) or supplies a
-junk ack, and the gate passes. The only real control is out-of-band PR review of
-the baseline diff — which is a human process, not the enforced-invariant G4 was
-sold as.
-
-Fix: G4 cannot be enforced from a self-declared field. Either (a) drop the actor
-distinction and require *every* bump to carry an externally-verifiable ack token
-that is format-checked (URL/issue-id regex), or (b) sign/attest bumps out of band
-(e.g. a required approver in CODEOWNERS on the baseline file) and stop claiming the
-JSON field enforces it. At minimum, validate ack shape rather than non-emptiness.
-
-### #11 — [MEDIUM] `compare()` silently drops the baseline `mode` key → a routine `--ratchet` disables the hook's interactive-enforce block
-
-Evidence:
-- `baseline.py:273-279` — `compare()` builds `ratcheted` from a fixed key set
-  (`version`, `generated_by`, `generated_at`, `floor`, `entries`); a `mode` key
-  present in the input document is not carried forward.
-- `__main__.py:103-105` — `_cmd_baseline --ratchet` does
-  `document = load(...)` → `compare(...)` → `dump(ratcheted, baseline_path)`,
-  writing the stripped document back over the file.
-- `hook_entry.py:60-69` — `_resolve_mode` reads `document.get("mode", "advise")`;
-  absence ⇒ `"advise"`.
-
-Impact: if an operator sets `mode: enforce` in the committed baseline to arm the
-PreToolUse interactive block, the next `baseline --ratchet` (the encouraged
-happy-path maintenance action) silently reverts it to `advise`, with no finding and
-a diff that reads as a normal ratchet. A safety control turns itself off during
-routine maintenance. (CI enforcement is controlled by deleting `--report-only`
-from the workflow yaml, per `__main__.py:8-9`, so CI is unaffected — the blast
-radius is the hook-side interactive block only. Still a silent downgrade of an
-enforcement surface.)
-
-Fix: preserve unknown top-level keys in `compare()` —
-`ratcheted = {**baseline_document, "entries": [...]}` — or make `mode` env-only
-and delete the baseline-key path from `_resolve_mode` and the spec so the two
-enforcement surfaces don't disagree.
-
-### #12 — [MEDIUM] `loads()` lets `KeyError`/`ValueError` escape as a non-`TamperError`, breaking the Week-1 "step can never fail the job" guarantee for exactly the tamper vector it targets
-
-Evidence:
-- `baseline.py:54-65` / `34-40` — `_entry_from_dict` / `_bump_from_dict` extract
-  fields with bare `str(raw["kind"])`, `int(raw["member_count"])`,
-  `float(raw["boundary"])`, `int(raw["to"])`, `str(raw["actor"])`. A missing key
-  raises `KeyError`; a non-numeric `member_count`/`boundary` raises `ValueError`.
-  `loads()` guards *structural* shape (wrong version, non-list entries, non-dict
-  entry, duplicate key, non-list bumps → `TamperError`) but NOT field extraction.
-- `check.py:88-101` — `check_tree` wraps `baseline_mod.load(...)` in
-  `except baseline_mod.TamperError` only. A `KeyError`/`ValueError` is not caught,
-  so it propagates out of `check_tree`.
-- `__main__.py:159` vs `164-165` — `_cmd_check_tree` calls `check_tree(...)` at
-  159 and only returns 0 for `--report-only` at 164. The crash happens *before*
-  the report-only short-circuit.
-- `attachment-contracts.yml` comment claims `--report-only` "can never fail the
-  job". That is false for a hand-tampered baseline with a missing/non-numeric
-  field — the workflow step dies with an uncaught traceback and nonzero exit,
-  bypassing the annotation/Finding pipeline entirely, for precisely the tamper the
-  guard exists to catch. Same unguarded escape in `_load_previous_baseline_document`
-  (`__main__.py:148-151` catches only `TamperError`).
-
-Note: at the PreToolUse hook this is fail-open (`hook_entry.main`'s
-`except Exception: return 0`), so hook safety is preserved; the impact is CI-only.
-
-Fix: wrap the field extraction in `_entry_from_dict` / `_bump_from_dict` in
-`try/except (KeyError, ValueError, TypeError)` and re-raise as `TamperError`, so
-every malformed baseline surfaces as a structured Finding rather than a crash and
-honors the report-only contract.
+- **Outstanding (correctness / spec-violation / safety):** 1 — #14
+- **Blocking (gates the Week-2 enforce flip):** 0
+- **Verified fixed since round 2:** #9 (core regression), #10, #13
+- Week-1 shadow (`--report-only`) is **not** blocked by any finding — the CI job cannot
+  fail in report-only mode. #14 is a latent Week-2 false-positive risk, not a Week-1 gate.
+- **140 tests pass** under Windows/uv (`uv run python -m pytest tests/attachment_contracts`).
 
 ---
 
-## Non-outstanding notes (NOT counted — stylistic / robustness / informational)
+## OUTSTANDING
 
-- **Interactive enforce hook exits 2 on an AST parse failure of the edited file.**
-  `check_file` → `_parse_failure_finding` severity `"error"` → exit 2 in enforce.
-  This is *stronger* than G6's "parse failures must never silently pass" (decision
-  doc §1.1 G6: fail toward the CI hard-stop), not a divergence — blocking at the
-  hook is a superset of fail-closed. UX cost only: transiently-unparseable
-  intermediate edits get blocked for interactive humans (workers are advisory).
-  Note, not a defect.
-- **Test quality is mixed, not uniformly behavioral.** `test_outliers.py` and
-  `test_baseline.py` hand-compute expected values (genuinely behavioral). But
-  `test_check.py::_freeze_baseline` and `test_hook_entry.py::_freeze_baseline_at`
-  derive the baseline by running `scan_tree`→`saturate_all`→`generate` — the code
-  under test — so their "clean when file matches baseline" assertions are
-  self-consistency for the generation half; the *growth* assertions layered on top
-  are behavioral. `test_check.py` states an expected `boundary == 2` in a comment
-  (lines ~43-47) but nothing asserts it.
-- **FLOOR=4 docstring justification is mathematically loose** (n=2,3 also yield
-  distinct order statistics); the value/behavior is fine, only the rationale text
-  overstates the case.
-- **APC hook is not wired in `cw-apc/.claude/settings.json`** (only
-  merge_preflight / git_push_lint / worker_stop_gate are). This is by design — the
-  PreToolUse hook is operator-gated in `~/.claude` — but it means the interactive
-  block path is not exercised end-to-end inside this repo.
-- **`_STRUCTURAL_DIR_SUFFIXES` is a misnomer** — matched by exact directory-name
-  membership, not suffix. Behavior matches the spec ("any dir named generated /
-  vendor"); the name misleads.
-- **`run_backtest` temp cleanup** relies on `TemporaryDirectory` → `shutil.rmtree`
-  after per-sample `git worktree remove --force`; if a remove ever failed, the
-  rmtree would run over the leftover worktree. Theoretical junction-follow risk
-  only — backtest worktrees carry no `.venv` junction — but worth a guard if the
-  fixture ever grows one.
+### #14 — MEDIUM — Structural-triviality detector's test-double arm is prefix-only; test-support fixtures leak into the `class` population and get frozen as false positives
 
----
+**Files:** `src/charlie_work/attachment_contracts/archetypes.py:33` (`_TEST_DOUBLE_NAME_RE`),
+`:224-244` (`_is_test_double_name` / `_is_structurally_trivial`); committed
+`.attachment-budgets.json` (frozen entry `_SalvageTestGitHub`).
 
-## Verified PASSES (the 7 requested checks)
+**Status — this is the narrowed residual of round-2 #9.** The core round-2 regression is
+**fixed**: the class fence rose from the regressed 3.5 back to **6.0**, and 465
+structurally-trivial classes (Protocols, Exception subclasses, empty `@dataclass` shells,
+function-nested fixtures, `Fake*`/`Test*`-prefixed doubles) are now excluded from the
+saturation population. Independently recomputed from a live scan, the class fence and the
+frozen set match the committed baseline exactly:
 
-1. **No line-count metric anywhere.** `grep` across the package finds no LOC/line
-   metric feeding a decision; the only line-ish reads are prose and
-   `changed_file_count` (codemod-shape heuristic, a file count, not lines).
-   Saturation is purely member-count per AP.
-2. **Grafts G1-G6 implemented, not just named** — G1 backtest exists (but see #8);
-   G2 redirect scaffold present; G3 exclude-set + codemod skip wired
-   (`select_samples` + `Excludes`); G4 present but forgeable (#10);
-   G5 pinned-baseline compare/ratchet present; G6 AST-parse-failure →
-   `Finding(error)` at both hook (advisory) and CI (blocking), verified via
-   `archetypes.scan_tree` routing SyntaxError/UnicodeDecodeError/OSError to
-   `parse_failures`. **G4 self-ack:** yes, a worker CAN self-ack (#10).
-   **G6 parse failure:** advisory at hook (exit 0 with G6 context), blocking at CI
-   (`error` → nonzero), which is the intended fail-toward-CI asymmetry.
-3. **Saturation math correct.** Nearest-rank quartiles with ceil convention
-   (`_nearest_rank_quartile`: `rank = max(1, min(n, ceil(q*n)))`); strict `>`
-   (`outliers.py:89`, `saturated = p.member_count > boundary`); FLOOR=4 honored
-   (`population < FLOOR` → not saturated); ledgers excluded from the population
-   (`outliers.py:65`, `is_linear_ledger` filter). Boundary values in the committed
-   baseline reproduce from the live scan (class 5.0, test_module 41.0).
-4. **Baseline determinism + tamper guards work.** `dumps` sorts keys and entries,
-   fixed indent, trailing newline (deterministic). `check_tamper`
-   (`baseline.py:335-388`) detects a single-snapshot baseline>actual with no
-   covering bump; `check_ratchet_tamper` (`283-332`) detects a member_count rise
-   vs the previous committed baseline (the raise-to-match laundering vector). Both
-   verified to fire on a hand-raised entry. `loads()` rejects duplicate
-   `(kind,file,identity)` and wrong version. (Escape gap for missing/non-numeric
-   fields is #12.)
-5. **Hook safety.** No baseline found upward → `return 0` (no-op outside piloted
-   repos). Unattended (`CHARLIE_FLEET_WORKER=1` / `CLAUDE_CODE_UNATTENDED=1`) can
-   NEVER reach `return 2` — the unattended/non-enforce branch short-circuits to
-   `return 0` before the interactive-enforce exit. Malformed stdin → `return 0`.
-   `except Exception: return 0` (fail-open). Fail-open at hook, fail-closed at CI
-   confirmed (G6).
-6. **Windows correctness.** Subprocess calls are list-form with explicit `cwd=`
-   (no shell, no POSIX-only assumptions); AP identities use `PurePosixPath` /
-   `as_posix()` for stable cross-platform keys; worktrees removed via
-   `git worktree remove --force` (never `rm -rf`, honoring the junction hazard).
-7. **Tests** — see the non-outstanding note on test quality; core numeric logic is
-   hand-computed and behavioral, hook/CI parity is exercised, with the two
-   self-consistency caveats noted.
+- class pop n=55, q1=1.0, q3=3.0, iqr=2.0, **boundary=6.0**; frozen = `GitHub`(53),
+  `OrchestratorApp`(134), `WedgeWatchdog`(9), `_PrStateWriteVisitor`(10),
+  `_SalvageTestGitHub`(7). The round-2 4-member test doubles (`FakeClock`, `FakeApp`, …)
+  are gone (now structurally trivial).
+
+**The residual defect:** `_TEST_DOUBLE_NAME_RE = ^_?(Fake|Test)[A-Za-z0-9_]*$` anchors the
+double marker at the **start** of the name only. This repo's actual test doubles use
+**infix / compound** names, which the regex misses:
+
+- `_SalvageTestGitHub` (7 members, `tests/_salvage_fixtures.py`) — a fake GitHub client
+  (instantiated with `repo_root=`, `closing_issue_numbers=`, `pr_view_raises=` in
+  `tests/test_closing_reference.py`). It is **frozen as a saturated `class` right now**.
+  At the Week-2 enforce flip, adding an 8th method to this fake hard-fails CI.
+- `_NoOpGitHub` (5 members, `tests/test_worker.py`) — a test double, exactly **one method
+  below the fence**. One added method makes it a new saturated AP (blocked via the #13
+  new-AP path at Week-2).
+- `CachingFakeGitHub` (3), `_RecordingFakeRun` (2) — fakes currently well under the fence
+  but sitting in the population as if they were real service classes.
+
+So 2 of the 5 frozen `class` entries are test-side, one (`_SalvageTestGitHub`) is an
+unambiguous false positive, and the exposure grows as the test suite grows. (The other
+test-side entry, `_PrStateWriteVisitor`, an `ast.NodeVisitor` with `visit_*` methods, is a
+genuine multi-method class — freezing it is defensible, not counted.)
+
+**Why prefix-matching is the wrong layer:** it is exactly the brittle name-list pattern
+CLAUDE.md and the spec warn against — every new double-naming convention
+(`Mock*`/`Stub*`/`Spy*`/`Dummy*`/`NoOp*`/`Recording*`, or any infix `*Fake*`) needs the
+regex widened by hand. Widening the regex would chase the symptom.
+
+**Fix (single point of enforcement, structural, no name list):** exclude from the `class`
+saturation population any `class` AP whose `file` is under `tests/` and that is not the
+`Test*` method-holder the `test_module` archetype already counts — i.e. test-support /
+fixture classes are not production god-object risk and belong out of the distribution the
+same way ledgers and Protocols are. The scan already walks `src/` and `tests/` separately
+(`iter_source_files`), so the `tests/`-prefix split is derived from the tree layout, not a
+hand-maintained list. This removes `_SalvageTestGitHub`, `_NoOpGitHub`, `CachingFakeGitHub`,
+and `_RecordingFakeRun` from the population in one structural rule, and the test-side
+saturation signal remains covered by the `test_module` archetype. Then re-freeze the
+baseline and confirm the frozen `class` set is production-only (`GitHub`, `OrchestratorApp`,
+`WedgeWatchdog`). Add a regression test: a multi-method fixture class under `tests/` with a
+non-`Fake`/`Test` prefix is not saturated.
+
+**Not blocking Week-1** (report-only cannot fail) and not a mis-freeze of any *production*
+class; recorded as MEDIUM because it is a real false positive today and a growing one, and
+the decision doc's go/expand gate requires an acceptable false-positive rate.
 
 ---
 
-### Counts
-- Outstanding (correctness / spec / safety): **5** (#8-#12)
-- Blocking: **1** (#8 — pilot's own Deliverable-0 gate is FAIL)
+## VERIFIED FIXED (round-2 findings, re-checked this pass)
+
+### #9 — FIXED (core regression) — class fence no longer pulled onto legitimate classes
+
+Round 2's blocking defect was the member-count filter compressing the fence to 3.5 and
+freezing many 4-member test doubles. The fix added `AttachmentPoint.is_structurally_trivial`
+(`model.py:40`), computed structurally in `archetypes.py:_is_structurally_trivial`
+(`:228-244`) — Protocol bases, `Exception` subclasses, empty `@dataclass` shells,
+**function-nested classes** (`_iter_classdefs` tracks `nested_in_function`, `:144-178`,
+catching inline test doubles a name check misses), and `Fake*`/`Test*`-prefixed names —
+and excludes them from the population in `outliers.py:82-86`, the same way ledgers are.
+Verified independently: fence is now **6.0** (above the original round-1 5.0), 465 classes
+excluded as trivial, and the round-2 4-member doubles no longer appear. Narrowed residual
+tracked as **#14** above.
+
+### #10 — FIXED — G4 actor-split no longer forgeable
+
+`baseline.py:validate_bump` (`:181-216`) now requires a shape-checked, non-empty `ack` on
+**every** bump regardless of `actor` (`:205-215`), with `_ACK_SHAPE` (`:178`) accepting only
+an http(s) URL, a `#123` / `owner/repo#123` issue ref, or a `source:id` handle. The round-2
+discriminating vector — `Bump(actor="interactive", ack="")` from a worker that mislabels
+its own actor — is now rejected (empty ack fails for both actors). The docstring correctly
+records that binding `actor` to real execution context is out of scope for a
+comparison-only validator (backstopped by CODEOWNERS on the baseline diff). Gap closed.
+
+### #13 — FIXED — new already-saturated AP now blocked when a baseline exists
+
+`baseline.py:compare()` `baseline_entry is None` branch (`:276-305`) now emits a
+`Finding(block)` for a currently-saturated point with no baseline entry, and still snapshots
+it into the ratcheted document. The docstring (`:253-264`) correctly establishes that
+`compare()` is only reached once a baseline file exists (both call sites guard on it; true
+freeze-on-adopt is handled by `generate()`), so a new saturated AP here is a new god-object,
+not adoption. Two regression tests present:
+`test_baseline.py:339 test_compare_new_saturated_point_with_no_baseline_entry_blocks` and
+`test_check.py:153 test_check_tree_new_saturated_ap_with_existing_baseline_blocks`.
+
+---
+
+## SEVEN REQUIRED CHECKS
+
+| # | Check | Verdict | Evidence |
+|---|-------|---------|----------|
+| 1 | No line-count metric anywhere | **PASS** | Grep over `src/`, `tests/`, CI yaml: no member metric derives from lines. The two `.splitlines()` hits are `excludes.py:77` (parsing `.git-blame-ignore-revs`) and `backtest.py:475` (parsing `git log` output); `changed_file_count` is a **file** count for G3 codemod detection, not lines. Member count = `len(members)` from AST binding (`model.py:43`). |
+| 2 | Grafts G1–G6 implemented | **PASS** | G1 backtest positive control (`backtest.py`, report Overall PASS, orchestrator+test_charlie_work saturated at all 4 samples); G2 scaffold redirect (`redirect.py`); G3 exclude-set (`excludes.py`, one sanctioned `exclude_globs` + structural dirs + codemod-shape); G4 ack-on-every-bump (`baseline.py:181-216`, #10 closed); G5 pinned-set KPI/churn overlay (informational, present); G6 parse-failure → `error` Finding, never dropped: **fail-open at hook** (blanket `except Exception: return 0`, `hook_entry.py:210-214`) yet **fail-toward-stop at CI** and interactively in enforce (empirically: `check_tree` emits an error Finding → `__main__` exit 1). |
+| 3 | Saturation math | **PASS** | Independently recomputed from a live scan: nearest-rank ceil quartiles, class fence q3=3.0 iqr=2.0 **boundary=6.0**, test_module **41.0** — both match the committed baseline exactly. Strict `>` (exact-tie-not-saturated, `test_outliers.py:63-76`); FLOOR=4 honored; ledgers and structurally-trivial points excluded from the population and given no verdict. |
+| 4 | Baseline determinism + tamper guard | **PASS** | Deterministic serialization (sorted entries, indent=1, sort_keys). Two-layer tamper guard: single-snapshot `check_tamper` (hand-raised `member_count=999` detected, `test_check.py:180`) and diff-based `check_ratchet_tamper` (raise-to-match). Empirically confirmed: a `53→60` hand-raise vs the previous baseline yields an `error` Finding. |
+| 5 | Hook safety | **PASS** | Empirically: malformed stdin → 0; unattended (`CHARLIE_FLEET_WORKER=1` **or** `CLAUDE_CODE_UNATTENDED=1`) + `mode=enforce` + real block finding → **0** (never exit 2); interactive + enforce + block → 2; interactive + advise → 0; no baseline above target → 0; `except Exception → 0`. `_resolve_mode` env override cannot defeat the unattended guard (`if unattended or mode != "enforce"`). |
+| 6 | Windows correctness | **PASS** | Repo-relative POSIX identities via `as_posix()`; `target.resolve().relative_to(root)` with a `ValueError → return 0` fallback for cross-drive/outside-root; subprocess calls pass arg **lists** (no `shell=True`, no POSIX-only assumptions); worktrees torn down via `git worktree remove --force`, never `rm -rf`. 140 tests pass under Windows/uv. |
+| 7 | Tests behavioral, not self-consistency | **PASS** | `test_outliers.py` hand-computes quartiles/IQR/boundary and the strict-`>` tie case. `test_baseline.py`/`test_check.py` assert concrete severities/counts for growth, tamper, ratchet, G4 ack, #13 new-AP, and G6 parse-failure. `test_check.py` uses code-under-test only to *freeze* the baseline fixture; the load-bearing assertions (block/error/redirect) are behavioral. |
+
+---
+
+## NON-COUNTED NOTES (design tradeoffs / defense-in-depth — not outstanding)
+
+- **Ledger-shaped method names exempt a class from saturation.** A `class` whose methods
+  form a dominant `<prefix><int>` contiguous sequence (≥3 members, ≥80% dominance, gaps ≤2)
+  is reclassified `migration_runner`/`is_linear_ledger` and excluded — observed while
+  fuzzing a 200-method `m0..m199` payload. This is the spec-sanctioned structural ledger
+  exemption (`ledger.py`), and a real service class with numerically-suffixed methods is
+  rare and a self-defeating evasion (unusable API). Design tradeoff, not a defect.
+- `backtest.py:_worktree_remove` shells `git worktree remove --force` via `_run_git`
+  (`check=True`) inside `run_backtest`'s `finally`; if teardown fails it masks the original
+  scan exception. Offline tooling only; prefer swallowing in the cleanup path. (Carried from
+  round 2, still non-counted.)
+- A linear-ledger AP that loses its `<prefix><int>` shape flips `kind` and silently enters
+  the class distribution; low likelihood, worth a comment near `ledger.py`. (Carried.)

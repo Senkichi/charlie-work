@@ -225,15 +225,40 @@ def _is_test_double_name(node: ast.ClassDef) -> bool:
     return _TEST_DOUBLE_NAME_RE.match(node.name) is not None
 
 
+def _is_under_tests_dir(path: str) -> bool:
+    """True iff `path` (repo-relative posix) lives under `tests/`.
+
+    Derived from tree layout via `PurePosixPath.parts`, not a hand-maintained
+    name list or prefix regex -- structurally the same split
+    `iter_source_files` already walks (`src/` vs `tests/`).
+    """
+    parts = PurePosixPath(path).parts
+    return len(parts) > 0 and parts[0] == "tests"
+
+
 def _is_structurally_trivial(
-    node: ast.ClassDef, members: tuple[str, ...], nested_in_function: bool
+    node: ast.ClassDef, members: tuple[str, ...], nested_in_function: bool, path: str
 ) -> bool:
     """True iff `node` is not a coherent unit of saturation risk (finding #9).
 
-    Structural (AST-shape/naming-convention/lexical-scope) tests only, no
-    hand-maintained list of specific class names -- same standard
+    Structural (AST-shape/naming-convention/lexical-scope/tree-layout) tests
+    only, no hand-maintained list of specific class names -- same standard
     `_looks_like_test_module` and `classify_ledger` already meet elsewhere in
     this package.
+
+    Round-3 review finding #14: `_TEST_DOUBLE_NAME_RE` only catches
+    doubles that are name-prefixed `Fake*`/`Test*`. Infix/compound-named
+    fixtures under `tests/` (`_SalvageTestGitHub`, `_NoOpGitHub`,
+    `CachingFakeGitHub`, `_RecordingFakeRun`, ...) slipped through and got
+    frozen into the saturation population as if they were production
+    service classes -- and every new double-naming convention would need
+    the regex widened by hand, which is exactly the brittle name-list
+    pattern this package is built to avoid. Any class defined in a file
+    under `tests/` is test-support by construction, not production
+    god-object risk; its saturation signal is already covered by the
+    `test_module` archetype (`_test_module_point`), so it is excluded from
+    the `class` population wholesale -- one structural rule derived from
+    the tree layout the scan already walks, not a per-name check.
     """
     return (
         nested_in_function
@@ -241,6 +266,7 @@ def _is_structurally_trivial(
         or _is_exception_subclass(node)
         or _is_empty_dataclass(node, members)
         or _is_test_double_name(node)
+        or _is_under_tests_dir(path)
     )
 
 
@@ -266,7 +292,7 @@ def _class_points(tree: ast.Module, path: str) -> list[AttachmentPoint]:
                     file=path,
                     members=members,
                     is_structurally_trivial=_is_structurally_trivial(
-                        node, members, nested_in_function
+                        node, members, nested_in_function, path
                     ),
                 )
             )

@@ -25,22 +25,6 @@
    "member_count": 134
   },
   {
-   "boundary": 6.0,
-   "bumps": [],
-   "file": "tests/_salvage_fixtures.py",
-   "identity": "_SalvageTestGitHub",
-   "kind": "class",
-   "member_count": 7
-  },
-  {
-   "boundary": 6.0,
-   "bumps": [],
-   "file": "tests/test_state_decision_cache_enforcement.py",
-   "identity": "_PrStateWriteVisitor",
-   "kind": "class",
-   "member_count": 10
-  },
-  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_api_budget.py",
@@ -242,7 +226,7 @@
   }
  ],
  "floor": 4,
- "generated_at": "2026-08-25T05:53:45.138423+00:00",
+ "generated_at": "2026-08-25T06:12:35.790112+00:00",
  "generated_by": "charlie_work.attachment_contracts 0.1.0",
  "version": 1
 }

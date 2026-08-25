@@ -263,6 +263,41 @@ def test_test_prefixed_double_flagged_structurally_trivial() -> None:
     assert point.is_structurally_trivial is True
 
 
+INFIX_NAMED_FIXTURE_SRC = """
+class CachingFakeGitHub:
+    def get(self): ...
+    def post(self): ...
+    def patch(self): ...
+    def delete(self): ...
+    def close(self): ...
+"""
+
+
+def test_infix_named_fixture_under_tests_dir_flagged_structurally_trivial() -> None:
+    # Round-3 review finding #14: `_TEST_DOUBLE_NAME_RE` is prefix-only and
+    # misses infix/compound double names (`CachingFakeGitHub`,
+    # `_SalvageTestGitHub`, `_NoOpGitHub`, `_RecordingFakeRun`, ...). A
+    # multi-method fixture class living under `tests/` must be excluded from
+    # the `class` saturation population regardless of its name -- the
+    # tree-layout rule, not the name regex, is what has to catch this.
+    point = scan_source(INFIX_NAMED_FIXTURE_SRC, "tests/_fixtures.py")[0]
+    assert point.identity == "CachingFakeGitHub"
+    assert point.kind == "class"
+    assert point.member_count == 5
+    assert point.is_structurally_trivial is True
+
+
+def test_same_infix_named_class_under_src_dir_not_flagged_by_name_alone() -> None:
+    # Companion to the above: the exclusion is derived from the `tests/`
+    # tree-layout split, not from the class name -- an identically-named,
+    # identically-shaped class under `src/` is real production code and
+    # must remain eligible for the saturation population.
+    point = scan_source(INFIX_NAMED_FIXTURE_SRC, "src/pkg/caching_fake_github.py")[0]
+    assert point.identity == "CachingFakeGitHub"
+    assert point.kind == "class"
+    assert point.is_structurally_trivial is False
+
+
 MIGRATION_CONTIGUOUS_SRC = """
 class Migrator:
     def _migrate_v1(self):
