@@ -1,60 +1,93 @@
 ## Linked issue
 
-Closes #1383
+Closes #1444
 
 ## What changed
 
-A fleet-wide Actions budget/runner outage causes required checks to fail with a `FAILURE` conclusion (not `CANCELLED`/`INFRA_FAILURE`) within seconds and with zero executed steps. The existing janitor gate treated these as ordinary code failures, routing healthy PRs through repeated no-op rework cycles that burned rework/no-op caps and eventually escalated them with `no_op_rework_cap_exceeded`.
+Worker dispatch prompts now carry a **module map** section derived at packet build time from the live `src/charlie_work/` tree. For every `.py` module under the package, the section lists the dotted module name, the first line of its docstring, and its public-surface size (`__all__` length if defined, else the count of top-level names not starting with `_`).
 
-This PR adds a distinct `infra_blocked` classification at the check-ingestion data boundary, before the rework-routing decision:
+This is the generation-time half of the god-file dynamic tracked in #1317 (extraction) and #1442 (CI ratchet stopgap): extraction removes lines, but nothing steered new lines away from the monolith, so it regrew. The map gives a worker a picture of what modules exist and what belongs where, so the largest file no longer wins by default gravity.
 
-- **`InfraBlockedConfig`** (nested under `auto_merge`) holds the annotation patterns, instant-fail threshold, and persistence/window escalation knobs — all config-driven, not hardcoded in business logic.
-- **`is_infra_blocked_check`** in `checks.py` is the single classifier: structural signals (zero non-setup steps, instant-fail) preferred over string matching, with config-listed annotation patterns as an independent signal.
-- **`_enrich_checks_infra_blocked`** in `workflow.py` reclassifies `FAILURE` required checks to `INFRA_BLOCKED` before `summarize_checks`, used by both `review()` (rework routing) and `merge_ready()` (merge execution) — replacing the old inline `merge_ready`-only enrichment that missed this failure class.
-- **`CheckSummary.infra_blocked`** is a new bucket distinct from `infra_failed` (per-PR #841); `JanitorVerdict.is_infra_blocked_block` mirrors `is_infra_failure_block`.
-- **`review()`** holds the PR without dispatching rework, without incrementing attempt counters, and emits a `check_infra_blocked` warning event. Cross-pass persistence emits exactly one `infra_blocked_escalated` error event per configured window (not per PR per pass), tracked via a module-level dict that survives app instance rebuilds.
-- **`heartbeat_check.py`**'s new `check_infra_blocked_events` is the consumer (AC4).
-- **`github.is_infrastructure_failure`** delegates to the new classifier with a default config, preserving backward compatibility.
+### Files
+
+- **`src/charlie_work/module_map.py`** (new) — `build_module_map(package_dir, src_root)` walks the package directory with `pathlib` and parses each `.py` file with `ast` (zero imports — avoids side effects and heavy deps at packet build time). Returns the full markdown section, or an empty string when the package dir is absent/empty. Raises `OSError`/`SyntaxError`/`ValueError` on parse failures so the caller can record the event and degrade; it does not swallow exceptions itself, keeping the single point of enforcement for "dispatch never fails on a map error" at the call site.
+- **`src/charlie_work/workflow.py`** — `_build_module_map_value(issue_number)` is the fail-soft wrapper: it calls `build_module_map` and, on a parse failure, logs a `worker_module_map_failed` warning event to `events.db` and returns `""` (omitted section). `_write_worker_prompt` passes the result as the `module_map` value. `module_map` is added to `WORKER_PROMPT_KEYS` so the drift check (`check_prompt_template_drift`) stays honest. `log_event` (not `self._record_event`) is used because `_write_worker_prompt` runs outside a state-lock context.
+- **`src/charlie_work/instrumentation.py`** — registers `worker_module_map_failed` at `warning` level in `_LEVEL_BY_KIND`.
+- **`src/charlie_work/prompts/worker.md`** and **`worker_claude_code.md`** — reference `$module_map` between the issue body and the scope contract, so the worker sees the module layout before deciding where to place code.
+- **Tests** — `tests/test_module_map.py` (new, 12 tests); updated `ISSUE_VALUES` in `tests/test_prompt_sections.py` and two render tests in `tests/test_charlie_work.py` to supply the new `module_map` placeholder.
+
+### Hard constraints (from the issue)
+
+1. **The map is NEVER a hand-maintained list.** `build_module_map` walks the tree with `pathlib.rglob("*.py")` and parses with `ast`. There are zero hardcoded module names in `module_map.py` — verified by `test_newly_added_module_appears_with_no_config_change` (a module added to the tree after the first build appears in the second build with no config change) and `test_build_module_map_lists_modules_with_docstring_and_public_surface`.
+2. **Map generation fails soft.** `_build_module_map_value` catches `OSError`/`SyntaxError`/`ValueError`, logs `worker_module_map_failed`, and returns `""`. Verified by `test_unparseable_file_omits_section_and_logs_warning_event` (a `SyntaxError` file → empty `module_map` + one warning event in `events.db`) and `test_missing_package_dir_omits_section_without_event` (a missing package dir → empty string, no failure event).
 
 ### Acceptance criteria
 
-- **AC1**: A simulated check run failing in under 10 seconds with zero steps and a budget annotation is classified `infra_blocked` and dispatches no rework. ✓ (`test_infra_blocked_budget_failure_no_rework`)
-- **AC2**: Attempt counters remain unchanged after an `infra_blocked` pass; a later genuine test failure on the same PR still routes to rework normally. ✓ (`test_infra_blocked_no_rework_counter_incremented`, `test_infra_blocked_then_genuine_failure_routes_to_rework`)
-- **AC3**: Persistence across N passes emits exactly one operator escalation event per window, not one event per PR per pass. ✓ (`test_infra_blocked_persistence_one_escalation_per_window`)
-- **AC4**: The new event kind has a consumer. ✓ (`test_infra_blocked_check_infra_blocked_event_emitted`, `check_infra_blocked_events` in heartbeat_check.py)
+1. **Zero hardcoded module names.** ✅ — derivation is `rglob("*.py")` + `ast.parse`; no module name appears as a literal in `module_map.py`.
+2. **A newly added module appears with no config change.** ✅ — `test_newly_added_module_appears_with_no_config_change`.
+3. **Prompt-size cost measured and reported.** The map for this repo (76 modules) is **7,201 chars / 82 lines**. The base `worker.md` prompt (no map) is 12,710 chars; with the map it is 19,911 chars — a **~56.7% overhead** on the base prompt. The cost is bounded by the module count (one table row per `.py` file) and grows only as the tree grows.
+4. **Event kind + consumer.** ✅ — `worker_module_map_failed` is registered at `warning` in `_LEVEL_BY_KIND`. The consumer is `scripts/heartbeat_check.py::check_warning_events`, which reads every `level='warning'` row from `events.db` (derived from the persisted `level` column, never a hardcoded kind list — see its docstring). Verified by `test_worker_module_map_failed_registered_as_warning`.
 
 ## Verification
 
 ```
-uv run --extra dev pytest tests/test_checks.py tests/test_infrastructure_failure.py tests/test_janitor.py tests/test_event_kind_consumers.py tests/test_instrumentation.py tests/test_config.py -q --tb=short
-........................................................................ [ 16%]
-........................................................................ [ 32%]
-........................................................................ [ 48%]
-........................................................................ [ 65%]
-........................................................................ [ 81%]
-........................................................................ [ 97%]
-..........                                                               [100%]
-442 passed
+uv run --extra dev pytest tests/test_module_map.py tests/test_prompt_sections.py tests/test_prompt_template_drift_check.py tests/test_prompt_render_contract.py tests/test_fix_prompt_template_drift.py tests/test_instrumentation.py tests/test_markdown_fence.py tests/test_issue_comments.py tests/test_doctor.py tests/test_janitor.py --tb=short
+455 passed in 249.03s (0:04:09)
 ```
 
 ```
-uv run --extra dev pytest tests/test_charlie_work.py -q --tb=short -k "infra or rerun or rework or cancelled or merge_ready or merge_attempt or janitor"
-..............................                                           [100%]
-246 passed
-```
-
-```
-uv run ruff check src/ scripts/ tests/test_checks.py tests/test_charlie_work.py
+uv run ruff check .
 All checks passed!
+
+uv run ruff format .
+282 files left unchanged
 ```
+
+### Mutation check
+
+Reverted each fixed artifact to its merge-base version (`git checkout 87df489 -- <path>`) and confirmed the regression tests fail, then restored the fix and confirmed they pass.
+
+**1. `src/charlie_work/instrumentation.py`** (removed `worker_module_map_failed` from `_LEVEL_BY_KIND`):
+```
+uv run --extra dev pytest tests/test_module_map.py::test_worker_module_map_failed_registered_as_warning --tb=short
+FAILED tests/test_module_map.py::test_worker_module_map_failed_registered_as_warning
+E   AssertionError: assert 'worker_module_map_failed' in mappingproxy({...})
+1 failed
+```
+After restore: `1 passed`.
+
+**2. `src/charlie_work/workflow.py`** (removed `module_map` from `WORKER_PROMPT_KEYS`, `_build_module_map_value`, and the values dict):
+```
+uv run --extra dev pytest tests/test_module_map.py::test_module_map_is_a_worker_prompt_key tests/test_module_map.py::test_unparseable_file_omits_section_and_logs_warning_event tests/test_module_map.py::test_write_worker_prompt_includes_module_map_from_live_tree --tb=short
+FAILED tests/test_module_map.py::test_module_map_is_a_worker_prompt_key - Ass...
+FAILED tests/test_module_map.py::test_unparseable_file_omits_section_and_logs_warning_event
+FAILED tests/test_module_map.py::test_write_worker_prompt_includes_module_map_from_live_tree
+3 failed
+```
+(The `OrchestratorApp` constructor raised `PromptOverrideDriftError` because the templates reference `$module_map` but the writer no longer supplies it — the drift guard catching the regression at the single point of enforcement.) After restore: `12 passed`.
+
+**3. `src/charlie_work/prompts/worker.md` + `worker_claude_code.md`** (removed `$module_map`):
+```
+uv run --extra dev pytest tests/test_module_map.py::test_write_worker_prompt_includes_module_map_from_live_tree --tb=short
+FAILED tests/test_module_map.py::test_write_worker_prompt_includes_module_map_from_live_tree
+E   AssertionError: assert '## Module map' in '# Devin Worker Task: Issue #1\n...'
+1 failed
+```
+After restore: `12 passed`.
+
+### Invariant enumeration (fail-soft paths in `_build_module_map_value`)
+
+The fail-soft contract ("dispatch never fails on a map error; omitted section + warning event") has exactly these exit paths in `_build_module_map_value`:
+1. `build_module_map` returns a non-empty string → returned directly (success, no event). ✅
+2. `build_module_map` returns `""` (missing/empty package dir) → returned directly (omitted section, no event — the map is absent, not broken). ✅
+3. `build_module_map` raises `OSError`/`SyntaxError`/`ValueError` → caught, `worker_module_map_failed` logged at `warning`, `""` returned (omitted section + event). ✅
+
+There are no other `return` or `raise` statements between the `try` and the method's end.
 
 ## Risks / uncertain areas
 
-- **Routing change for FAILURE checks with an infra signature (both `review()` and `merge_ready()`)**: `_enrich_checks_infra_blocked` only ever writes `state="INFRA_BLOCKED"`, never `"INFRA_FAILURE"`. This is a real routing change in *both* paths, and the earlier draft's claim that "the existing `infra_failed` routing ... is unchanged" was false and is corrected here.
-  - **`review()`**: pre-#1383, `review()` passed *raw* checks to `run_janitor` (no FAILURE→INFRA_FAILURE enrichment existed there — that enrichment was `merge_ready`-only). A zero-step FAILURE check therefore landed in `CheckSummary.failed` → `is_check_failure_block` → rework dispatch (the exact cap-burning bug #1383 fixes). Post-#1383 it is rewritten to `INFRA_BLOCKED` → `CheckSummary.infra_blocked` → `is_infra_blocked_block` → hold. So the reroute in `review()` is from `is_check_failure_block` (rework) to `is_infra_blocked_block` (hold) — **not** from `is_infra_failure_block` (auto-rerun). The #841 `is_infra_failure_block` auto-rerun+escalate path is fed by `run_janitor` over `CANCELLED`/`INFRA_FAILURE`/`TIMED_OUT` checks, which `_enrich_checks_infra_blocked` does not touch (it gates on `state == "FAILURE"`), so that path is preserved for its intended population. A regression test (`test_infra_blocked_does_not_shadow_cancelled_auto_rerun_path`) confirms a `CANCELLED` required check still routes to `infra_rerun` (not `infra_blocked`) with the #1383 classifier enabled.
-  - **`merge_ready()`**: the old inline enrichment reclassified a FAILURE-with-infra-signal check to `INFRA_FAILURE` → `infra_failed`; the shared helper rewrites the same population to `INFRA_BLOCKED` → `infra_blocked`. Both buckets block merge (`CheckSummary.ready` is `False` for either), so the merge gate is unchanged — only the bucket/failure-message differs. `merge_ready` never performed per-PR infra reruns (it uses `summarize_checks`, not `run_janitor`), so no rerun path is retired here. A test (`test_merge_ready_infra_blocked_failure_blocks_merge_in_blocked_bucket`) asserts a zero-step FAILURE required check lands in `infra_blocked` (not `infra_failed`) and `merge_ready` reports `can_merge=False`/`merged=False`.
-  - **Decision on structural-only signals (no corroborating annotation)**: per issue #1383's explicit guidance ("Prefer the zero-steps + instant-fail structural signal over string matching where the API exposes it"), a zero-step / setup-only / missing-`steps`-key FAILURE is classified `infra_blocked` even without a budget annotation. Rationale: a job that executed zero code-carrying steps carries no signal about the PR's code, so routing it to rework is the bug #1383 fixes. The `is_infra_failure_block` auto-rerun path is not an alternative for this population — it requires a `CANCELLED`/`INFRA_FAILURE`/`TIMED_OUT` conclusion, not `FAILURE`.
-- **Module-level `_infra_blocked_window` dict**: Cross-pass state is tracked in a module-level dict keyed by repo_root string, surviving app instance rebuilds within the same supervisor process. On supervisor restart, the counter resets — acceptable since the escalation window is time-bounded and a restart is itself a signal the operator is present.
-- **`is_infra_blocked_check` `enabled` check**: The `config.enabled` gate is checked in the classifier itself (not just the caller), so `is_infrastructure_failure` (which passes a default config) still classifies when called directly. This is intentional: the legacy wrapper should preserve its pre-#1383 behavior of detecting zero-step/billing-annotation failures.
+- **Prompt-size overhead (~57%).** The map adds 7,201 chars to a ~12,710-char base prompt. This is a meaningful per-packet cost. It is bounded by the module count and is the explicit trade-off the issue asks for (placement steering vs. prompt budget). If this becomes a problem for very large repos, a future change could cap the map to the largest N modules or elide modules with a public surface of 0 — but that is out of scope for this issue, which asks for the full map.
+- **`ast.parse` on every packet build.** For this repo (76 modules), `build_module_map` runs in well under a second. It is called once per `_write_worker_prompt` (once per issue at intake/dispatch), not per loop pass. No caching is added; the tree can change between packets by design (a newly added module must appear in the next packet).
+- **Public-surface size is a proxy.** `__all__` length (when defined) or the top-level non-underscore name count is a rough measure of a module's public surface. It does not distinguish re-exports from genuine definitions. This matches the issue's specification exactly.
 
 Generated with [Devin](https://devin.ai)

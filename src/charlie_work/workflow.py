@@ -96,6 +96,7 @@ from .closing_reference import (
 from .pr_create_retry import create_pr_with_retry
 from .issue_comments import render_issue_comments
 from .markdown_fence import fenced_block
+from .module_map import build_module_map
 from .janitor import (
     _calculate_patch_id,
     _diff_content_signature,
@@ -599,6 +600,96 @@ def _max_touched_file_line_count(diff: str, repo_root: Path) -> int:
         if line_count > max_lines:
             max_lines = line_count
     return max_lines
+
+
+@dataclass(frozen=True)
+class OverCapFileFinding:
+    """One file whose post-diff line count exceeds the repo size cap and whose
+    diff adds code to it (issue #1445).
+
+    ``line_count`` is the post-diff line count (base file at ``repo_root`` plus
+    the diff's net added lines, or the added-line count for a new file).
+    ``added_lines`` is the diff's gross added content lines for this file --
+    the quantity the rubric flags as "new code added to an over-cap file".
+    """
+
+    filename: str
+    line_count: int
+    cap: int
+    added_lines: int
+
+
+def _over_cap_file_findings(
+    diff: str, repo_root: Path, cap: int
+) -> tuple[OverCapFileFinding, ...]:
+    """Detect files this diff adds code to that are over the repo size cap.
+
+    Returns findings only for files that (a) have at least one added content
+    line in the diff and (b) whose post-diff line count exceeds ``cap``. A
+    ``cap`` of 0 disables the check (returns ``()``) -- mirrors
+    ``turn_cap_large_file_threshold``'s 0-disables convention.
+
+    File sizes are read from ``repo_root`` (the orchestrator's checkout) plus
+    the diff's net added lines, mirroring ``_max_touched_file_line_count``; a
+    new file's size is its added lines. Best-effort: a file that cannot be read
+    is skipped, never raises -- the same posture as the static probe and
+    ``check_operator_containment``.
+    """
+    if cap <= 0:
+        return ()
+    _total, files = _diff_file_summary(diff)
+    findings: list[OverCapFileFinding] = []
+    for name, added, deleted in files:
+        if not name or added <= 0:
+            continue
+        # Unified diff ``+++`` paths are prefixed with ``b/``; strip it so the
+        # path resolves under ``repo_root`` and the reported filename is the
+        # repo-relative path (not the diff's ``b/``-prefixed form). A literal
+        # ``b/...`` file would be vanishingly rare and only makes the lookup
+        # miss (falling back to the added-line count), never reads the wrong
+        # file -- mirrors ``_max_touched_file_line_count``'s stance.
+        filename = name[2:] if name.startswith("b/") else name
+        path = repo_root / filename
+        if path.exists() and path.is_file():
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    base = sum(1 for _ in handle)
+            except OSError:
+                continue
+            line_count = base + added - deleted
+        else:
+            # New file (not present at repo_root): its size is the added lines.
+            line_count = added
+        if line_count > cap:
+            findings.append(OverCapFileFinding(filename, line_count, cap, added))
+    return tuple(findings)
+
+
+def render_over_cap_section(findings: tuple[OverCapFileFinding, ...] | None) -> str:
+    """Render the ``$over_cap_section`` packet block (issue #1445).
+
+    Returns ``""`` when ``findings`` is ``None`` (cap disabled -- the caller in
+    ``review()`` passes ``None`` when ``file_size_cap_lines`` is 0), mirroring
+    ``render_static_probe_section``'s disabled contract. When enabled, this
+    ALWAYS renders visible text -- even with zero findings -- rather than ``"``
+    for a clean pass, mirroring ``render_static_probe_section``'s never-silent
+    contract: an advisory probe that goes silent on a clean run is
+    indistinguishable, from the rendered packet alone, from one that never ran.
+    """
+    if findings is None:
+        return ""
+    if not findings:
+        return "File-size cap: no over-cap additions in this diff.\n"
+    lines = ["**Over-cap file additions (issue #1445):**"]
+    for finding in findings:
+        lines.append(
+            f"- `{finding.filename}`: {finding.line_count} lines "
+            f"(cap {finding.cap}), +{finding.added_lines} added -- "
+            "REPORTABLE FINDING. Suggested remedy: extract the new code to a "
+            "domain module (facade re-export block in the monolith, "
+            "implementation in the module), matching the #1283-era extractions."
+        )
+    return "\n".join(lines) + "\n"
 
 
 def structure_turn_cap_multiplier(
@@ -4140,6 +4231,12 @@ WORKER_PROMPT_KEYS: frozenset[str] = frozenset(
         "issue_comments",
         "branch_name",
         "worker_model_tier",
+        # Issue #1444: the module-map section, derived from the live tree at
+        # packet build time by ``build_module_map``. Empty string when the map
+        # could not be derived (fail-soft: omitted section + a
+        # ``worker_module_map_failed`` warning event), never a dispatch
+        # failure.
+        "module_map",
     }
 )
 REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
@@ -10586,6 +10683,18 @@ class OrchestratorApp:
         ci_status_section = _ci_status_section(
             checks, self.config.auto_merge.required_checks, pr_dir / "checks.json"
         )
+        # Issue #1445: over-cap file-addition finding. Advisory-only, never
+        # blocking -- the rubric line in review.md flags an over-cap addition
+        # as a REPORTABLE FINDING and this probe surfaces the concrete files.
+        # ``file_size_cap_lines`` of 0 (default) disables the probe: the section
+        # renders "" (rubric prose stays present), mirroring the
+        # ``coverage_probe.enabled=False`` disabled contract.
+        _file_size_cap = self.config.review_dispatch.file_size_cap_lines
+        over_cap_section = render_over_cap_section(
+            _over_cap_file_findings(diff, self.repo_root, _file_size_cap)
+            if _file_size_cap > 0
+            else None
+        )
 
         # Issue #1036: compare-and-swap the head immediately before committing
         # this packet's outputs (prompt + decision). ``pr`` was snapshotted
@@ -10703,6 +10812,7 @@ class OrchestratorApp:
                 "static_probe_section": static_probe_section,
                 "diff_size_section": diff_size_section,
                 "ci_status_section": ci_status_section,
+                "over_cap_section": over_cap_section,
                 "prior_review_section": prior_review_section,
             },
         )
@@ -24266,6 +24376,38 @@ class OrchestratorApp:
             sanitize=defang_closing_keywords,
         )
 
+    def _build_module_map_value(self, issue_number: int) -> str:
+        """Derive the module-map section from the live tree (issue #1444).
+
+        Single point of enforcement for the fail-soft contract: a repo layout
+        ``build_module_map`` cannot parse yields an empty string (an omitted
+        section) plus a ``worker_module_map_failed`` warning event logged to
+        events.db, never a dispatch failure. The worker loses placement
+        steering for this one packet; the next packet rebuilds the map against
+        the then-current tree.
+
+        ``log_event`` (not ``self._record_event``) is used because
+        ``_write_worker_prompt`` runs outside a state-lock context -- the
+        caller (``intake`` / ``_dispatch_impl``) gathers network results and
+        builds prompts before taking the state lock for label/status writes.
+        """
+        package_dir = self.repo_root / "src" / "charlie_work"
+        src_root = self.repo_root / "src"
+        try:
+            return build_module_map(package_dir, src_root)
+        except (OSError, SyntaxError, ValueError) as exc:
+            log_event(
+                self.paths.state_file,
+                "worker_module_map_failed",
+                {
+                    "issue_number": issue_number,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                repo=self.repo_root.name,
+                level="warning",
+            )
+            return ""
+
     def _write_worker_prompt(
         self, issue: dict[str, Any], *, template: str | None = None, dry_run: bool = False
     ) -> Path:
@@ -24290,6 +24432,13 @@ class OrchestratorApp:
                 "issue_comments": self._render_issue_comments(issue),
                 "branch_name": self._branch_name(issue),
                 "worker_model_tier": self.config.dispatch.worker_model_tier,
+                # Issue #1444: the module-map section, derived from the live
+                # tree at packet build time. Fail-soft: a parse failure yields
+                # an empty string (omitted section) plus a
+                # ``worker_module_map_failed`` warning event, never a dispatch
+                # failure. ``_build_module_map_value`` is the single point of
+                # enforcement for that fail-soft contract.
+                "module_map": self._build_module_map_value(issue_number),
             },
         )
         # Issue #714: enforce the no-merge contract on the *rendered output*

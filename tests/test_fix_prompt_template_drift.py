@@ -161,6 +161,7 @@ def test_packaged_review_template_is_satisfied_by_its_call_site() -> None:
             "static_probe_section": "",
             "diff_size_section": "",
             "ci_status_section": "",
+            "over_cap_section": "",
             "prior_review_section": "",
         },
     )
