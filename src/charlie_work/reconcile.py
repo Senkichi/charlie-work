@@ -54,6 +54,7 @@ from .review_decision import review_decision as _resolve_review_decision
 from .state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     ESCALATION_REASON_CLASS_BY_EVENT_KIND,
+    ESCALATION_REASON_CLASSES,
     ORCHESTRATOR_OWNED_ISSUE_STATUSES,
     PASSIVE_OPEN_STATUS,
     append_event,
@@ -106,6 +107,16 @@ class DriftItem:
     # Unused by every other kind.
     reason: str | None = None
     failure_kind: str | None = None
+    # Issue #1402: structured "why" for ``mergequeue_revoked`` drift items, so
+    # ``merge_ready`` can distinguish reconcile's own cooperative self-revocation
+    # (stale-head approval, pending carry-forward re-validation -- the #819 gap
+    # fix) from Aviator's silent #823 rejection. ``"stale_head_pending_carry_forward"``
+    # means the recorded decision IS ``"approved"`` but at an older head a rebase
+    # has since moved past; ``"not_approved"`` covers every other cause (missing
+    # decision file, ``request_changes``/never-reviewed verdict). Written to
+    # ``state["prs"][n]["mergequeue_revoked_reason"]`` by ``apply_fixes`` so
+    # ``merge_ready`` can read it cross-pass. Unused by every other kind.
+    mergequeue_revoked_reason: str | None = None
 
 
 # State-machine statuses that mean "this issue is in the orchestrator's pipeline".
@@ -309,6 +320,13 @@ def _normalize_reconcile_pr(pr: dict[str, Any]) -> dict[str, Any]:
             "labels": pr.get("labels", []),
             "isCrossRepository": is_cross_repository,
             "headRefOid": head.get("sha"),
+            # Issue #1398: the REST ``pulls`` endpoint names this ``closed_at``
+            # (snake_case); normalize to the ``gh pr list --json`` camelCase
+            # ``closedAt`` so the closed-unmerged convergence rules can ask
+            # whether the issue's active session postdates the PR close (the
+            # redispatch shape the un-gate sweep produces). ``None`` for
+            # OPEN/merged-by-state PRs and for any payload that omits it.
+            "closedAt": pr.get("closed_at"),
         }
 
     return pr
@@ -576,8 +594,8 @@ def _mergequeue_revocation_detail(
     pr_number: int,
     head_sha: str,
     mergequeue_label: str,
-) -> str:
-    """Human-readable explanation for why ``mergequeue`` is being revoked.
+) -> tuple[str, str]:
+    """Human-readable explanation and structured reason for a ``mergequeue`` revocation.
 
     Distinguishes "genuinely not approved" (missing/unreadable decision
     file, or a recorded ``request_changes``/never-reviewed verdict -- the
@@ -589,20 +607,34 @@ def _mergequeue_revocation_detail(
     stale-head case alone is not safe either), but the emitted detail/event
     payload makes the distinction explicit rather than collapsing both into
     one indistinguishable string.
+
+    Returns ``(detail, reason)`` where ``detail`` is the human-readable
+    explanation and ``reason`` is the structured path identifier
+    (``"stale_head_pending_carry_forward"`` or ``"not_approved"``) that
+    ``apply_fixes`` writes to ``state["prs"][n]["mergequeue_revoked_reason"]``
+    so ``merge_ready`` can distinguish reconcile's own cooperative
+    self-revocation from Aviator's #823 silent rejection (issue #1402).
     """
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     resolved = _resolve_review_decision(paths.prs / f"pr-{pr_number}", None, head_sha)
     if resolved.missing:
-        return f"no readable review-decision.json for PR #{pr_number}"
+        return (
+            f"no readable review-decision.json for PR #{pr_number}",
+            "not_approved",
+        )
     verdict = resolved.decision
     if verdict != "approved":
-        return f"recorded decision is {verdict!r}, not 'approved'"
+        return (
+            f"recorded decision is {verdict!r}, not 'approved'",
+            "not_approved",
+        )
     reviewed_head = resolved.reviewed_head_sha
     reviewed_head_display = str(reviewed_head)[:12] if reviewed_head else repr(reviewed_head)
     return (
         f"approved at stale head {reviewed_head_display} but current head is "
         f"{head_sha[:12]} -- deferring re-validation to merge_ready's carry-forward "
-        f"check rather than {mergequeue_label!r} staying authorized on an unvalidated head"
+        f"check rather than {mergequeue_label!r} staying authorized on an unvalidated head",
+        "stale_head_pending_carry_forward",
     )
 
 
@@ -725,7 +757,7 @@ def detect_mergequeue_not_approved(
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=config.dispatch.branch_prefix,
         )
-        reason = _mergequeue_revocation_detail(
+        reason_detail, revoked_reason = _mergequeue_revocation_detail(
             config, repo_root, pr_number, head_sha, mergequeue_label
         )
         drift.append(
@@ -735,11 +767,12 @@ def detect_mergequeue_not_approved(
                 pr_number=pr_number,
                 detail=(
                     f"PR #{pr_number} carries {mergequeue_label!r} but is not approved "
-                    f"at its current head {head_sha[:12]} ({reason}); revoking to close "
+                    f"at its current head {head_sha[:12]} ({reason_detail}); revoking to close "
                     "the irrevocable-mergequeue gap (issue #819)"
                 ),
                 fix_actions=(f"remove label {mergequeue_label!r} from PR #{pr_number}",),
                 remove_labels=(mergequeue_label,),
+                mergequeue_revoked_reason=revoked_reason,
             )
         )
     return drift
@@ -921,6 +954,98 @@ def detect_mergequeue_wedged(
     return drift
 
 
+def _parse_iso_utc(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 timestamp (``Z`` or ``+00:00`` suffix) to a UTC datetime.
+
+    Returns ``None`` for missing or malformed input. This is the established
+    idiom in this codebase (state.py, worker.py, wedge_watchdog.py); it is
+    duplicated here as a module-local helper so the closed-unmerged convergence
+    rules stay in this module without a cross-module import for one parse.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _closed_pr_superseded_by_newer_session(
+    issue_entry: dict[str, Any] | None,
+    pr_number: int,
+    pr_closed_at: str | None,
+    *,
+    linked_pr_numbers: set[int] | None = None,
+) -> bool:
+    """Return True when a CLOSED-unmerged PR is NOT the issue's current PR
+    because the issue's active session postdates the PR close -- the
+    redispatch shape the un-gate sweep produces (issue #1398).
+
+    The closed-unmerged convergence rules (``closed_unmerged_pr_active_labels``
+    and ``closed_unmerged_pr_issue_state_converged``) key only on "issue is
+    OPEN and has an active status / active label" and "this PR is CLOSED
+    unmerged". They never asked whether the issue's *current* active state
+    belongs to a newer session than the closed PR. After an un-escalate +
+    re-dispatch (close the dirty salvage PR, re-arm the issue), the stale
+    closed PR stays linked to the issue forever, so every reconcile pass
+    stripped the new session's state -- detaching a still-live worker from
+    the orchestrator's tracking and re-selecting it as a fresh dispatch
+    candidate every pass (burning a concurrency-governor slot each time).
+
+    Two independent signals, either of which proves the closed PR is stale:
+
+    1. The issue's recorded ``pr_number`` points to a *different* PR than the
+       closed one AND that referenced PR actually appears among the issue's
+       linked/fetched PRs (``linked_pr_numbers``) -- the issue has moved on
+       to a newer, real PR.
+    2. The issue's ``dispatched_at`` (the current dispatch session's start)
+       postdates the PR's ``closedAt`` -- the active session began after this
+       PR died, i.e. a redispatch the un-gate sweep intended.
+
+    Signal 1 requires corroboration: a bare ``pr_number`` mismatch is NOT
+    proof of a newer session, because ``state.json``'s ``pr_number`` can be
+    stale or wrong for reasons unrelated to a legitimate newer PR (a botched
+    salvage, a hand edit, a race that left a dangling reference). Treating a
+    stale reference as proof would permanently skip both issue-side
+    closed-unmerged convergence rules with no other rule able to reconverge
+    the issue -- the same #558/#1066 permanent-stuck failure class this
+    codebase has repeatedly had to fix. Requiring the referenced number to
+    appear among the fetched PRs (or falling through to the dispatched_at
+    signal) keeps the skip gated on positive evidence, so a stale reference
+    lets convergence fire and the issue still reaches a terminal state.
+
+    Returns False when there is no positive evidence of a newer session, so
+    the rule fires exactly as before for a closed PR that genuinely is the
+    issue's current (dead) PR -- this guard never weakens the existing
+    convergence for the case #558/#1066 exist to handle.
+    """
+    if not isinstance(issue_entry, dict):
+        return False
+    current_pr = issue_entry.get("pr_number")
+    if current_pr is not None:
+        try:
+            current_pr_int = int(current_pr)
+        except (TypeError, ValueError):
+            current_pr_int = None
+        if (
+            current_pr_int is not None
+            and current_pr_int != pr_number
+            and linked_pr_numbers is not None
+            and current_pr_int in linked_pr_numbers
+        ):
+            return True
+    dispatched_at = issue_entry.get("dispatched_at")
+    if dispatched_at and pr_closed_at:
+        session_start = _parse_iso_utc(dispatched_at)
+        closed_at = _parse_iso_utc(pr_closed_at)
+        if session_start is not None and closed_at is not None and session_start > closed_at:
+            return True
+    return False
+
+
 def detect_drift(
     gh: GitHubLike,
     state: dict[str, Any],
@@ -981,9 +1106,19 @@ def detect_drift(
     # _escalation_label) rather than a second hardcoded label pair, so the
     # label-repair consumers below and the staleness alert further down can
     # never drift out of sync about what "escalated and parked" looks like.
+    # Issue #1314 item 4: iterate ``ESCALATION_REASON_CLASSES`` instead of a
+    # hand-picked ``"mechanical"`` literal so a future third reason_class is
+    # automatically included here -- this is the one site that would silently
+    # under-enumerate instead of failing closed if the enum grew and this set
+    # stayed literal. ``_escalation_edge`` resolves each reason_class to its
+    # edge (mechanical -> operator_queued, judgment -> escalated), and
+    # ``_escalation_label`` resolves that edge to the label it adds; the set
+    # deduplicates, so two reason_classes that park on the same label (e.g.
+    # any future class that passes through unchanged to "escalated") produce
+    # a one-element set, not a duplicate.
     escalation_parked_labels = {
-        _escalation_label(labels_cfg, "escalated"),
-        _escalation_label(labels_cfg, _escalation_edge("escalated", "mechanical")),
+        _escalation_label(labels_cfg, _escalation_edge("escalated", reason_class))
+        for reason_class in ESCALATION_REASON_CLASSES
     }
     prs = _fetch_prs(gh)
     issues = _fetch_issues(gh)
@@ -1006,6 +1141,25 @@ def detect_drift(
     drift: list[DriftItem] = []
     prs_linking_issue: dict[int, list[dict[str, Any]]] = {}
     open_prs_by_issue: dict[int, list[dict[str, Any]]] = {}
+    # Issue #1398 rework: pre-compute the set of PR numbers linking each issue
+    # from the *complete* fetched snapshot. ``prs_linking_issue`` above is
+    # populated incrementally during the PR loop below, so it is only partial
+    # when the CLOSED branch (which runs inside that loop) consults it. This
+    # full map lets ``_closed_pr_superseded_by_newer_session`` corroborate a
+    # ``pr_number`` mismatch against real linked PRs rather than trusting a
+    # stale ``state.json`` reference (see the function's signal-1 docstring).
+    linked_pr_numbers_by_issue: dict[int, set[int]] = {}
+    for _pr in prs:
+        _pr_num = _pr.get("number")
+        if _pr_num is None:
+            continue
+        _issue_num = linked_issue_number(
+            _pr,
+            is_cross_repository=_pr.get("isCrossRepository"),
+            branch_prefix=config.dispatch.branch_prefix,
+        )
+        if _issue_num is not None:
+            linked_pr_numbers_by_issue.setdefault(_issue_num, set()).add(int(_pr_num))
     # Track issues already handled by session relabel to avoid double-emission
     # with issue_active_label_no_open_pr (both fire for dead-session-with-no-PR-ever)
     issues_handled_by_session_relabel: set[int] = set()
@@ -1067,7 +1221,32 @@ def detect_drift(
         elif gh_state == "CLOSED":
             issue = issues_by_number.get(issue_number) if issue_number is not None else None
             issue_active_labels = label_names(issue) & labels_cfg.active if issue else set()
-            if issue is not None and issue_active_labels:
+            # Issue #1398: fetch the issue's state entry and the PR's close
+            # time once for both issue-side closed-unmerged rules. A closed
+            # PR that is NOT the issue's current PR (the issue's active
+            # session postdates the PR close, or its pr_number points
+            # elsewhere) is a stale salvage PR left linked after an
+            # un-escalate + re-dispatch -- the new session's labels/status
+            # must not be stripped. See _closed_pr_superseded_by_newer_session.
+            issue_entry = (
+                state.get("issues", {}).get(str(issue_number))
+                if issue_number is not None
+                else None
+            )
+            pr_closed_at = pr.get("closedAt")
+            if (
+                issue is not None
+                and issue_active_labels
+                and not (
+                    issue_number is not None
+                    and _closed_pr_superseded_by_newer_session(
+                        issue_entry if isinstance(issue_entry, dict) else None,
+                        pr_number,
+                        pr_closed_at,
+                        linked_pr_numbers=linked_pr_numbers_by_issue.get(issue_number),
+                    )
+                )
+            ):
                 drift.append(
                     DriftItem(
                         kind="closed_unmerged_pr_active_labels",
@@ -1159,9 +1338,18 @@ def detect_drift(
             # general ACTIVE_STATE_STATUSES membership), so this exclusion
             # does not reintroduce that path's per-pass gh.issue_view() cost.
             if issue is not None and _issue_state(issue) == "OPEN" and issue_number is not None:
-                issue_entry = state.get("issues", {}).get(str(issue_number))
                 issue_status = issue_entry.get("status") if isinstance(issue_entry, dict) else None
-                if issue_status in ACTIVE_STATE_STATUSES - DORMANT_CONVERGENCE_EXCLUDED_STATUSES:
+                if (
+                    issue_status in ACTIVE_STATE_STATUSES - DORMANT_CONVERGENCE_EXCLUDED_STATUSES
+                    and not (
+                        _closed_pr_superseded_by_newer_session(
+                            issue_entry if isinstance(issue_entry, dict) else None,
+                            pr_number,
+                            pr_closed_at,
+                            linked_pr_numbers=linked_pr_numbers_by_issue.get(issue_number),
+                        )
+                    )
+                ):
                     drift.append(
                         DriftItem(
                             kind="closed_unmerged_pr_issue_state_converged",
@@ -2577,7 +2765,25 @@ def apply_fixes(
                         fix_actions=tuple(fix_actions),
                         remove_labels=item.remove_labels,
                         add_labels=item.add_labels,
+                        mergequeue_revoked_reason=item.mergequeue_revoked_reason,
                     )
+                # Issue #1402: record *why* reconcile revoked ``mergequeue``
+                # so ``merge_ready`` can distinguish its own cooperative
+                # self-revocation (stale-head, pending carry-forward
+                # re-validation) from Aviator's #823 silent rejection. Only
+                # written for ``mergequeue_revoked`` items that carry a
+                # structured reason; ``aviator_stale_blocked`` leaves the
+                # field untouched.
+                if (
+                    item.kind == "mergequeue_revoked"
+                    and item.mergequeue_revoked_reason is not None
+                ):
+                    pr_key = str(item.pr_number)
+                    existing_pr = new_prs.get(pr_key, {})
+                    new_prs[pr_key] = {
+                        **existing_pr,
+                        "mergequeue_revoked_reason": item.mergequeue_revoked_reason,
+                    }
 
         elif item.kind == "mergequeue_wedged":
             # Issue #1401: a PR wedged in Aviator's merge queue is pulled out
@@ -2979,6 +3185,8 @@ def apply_fixes(
             reconcile_payload["reason"] = item.reason
         if item.failure_kind is not None:
             reconcile_payload["failure_kind"] = item.failure_kind
+        if item.mergequeue_revoked_reason is not None:
+            reconcile_payload["mergequeue_revoked_reason"] = item.mergequeue_revoked_reason
         new_state = append_event(
             new_state,
             "reconcile",

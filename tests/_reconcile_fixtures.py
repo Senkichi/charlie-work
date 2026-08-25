@@ -136,6 +136,7 @@ def _pr(
     body: str = "",
     title: str = "",
     is_cross_repository: bool = False,
+    closed_at: str | None = None,
 ) -> dict[str, Any]:
     return {
         "number": number,
@@ -147,6 +148,10 @@ def _pr(
         "state": state,
         "labels": [],
         "isCrossRepository": is_cross_repository,
+        # Issue #1398: closedAt is part of RECONCILE_PR_FIELDS so the
+        # closed-unmerged convergence rules can compare the PR's close time
+        # against the issue's active-session start. None for OPEN PRs.
+        "closedAt": closed_at,
     }
 
 

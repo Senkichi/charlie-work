@@ -15,13 +15,19 @@ three approved PRs stranded unmergeable. job-cannon's ``ci.yml`` header
 documents the same trap and the correct primitive (a runner LABEL as the
 capacity semaphore, scheduler-enforced, queues instead of cancelling).
 
-What survives from #1388 is the ``timeout-minutes`` raise to 45. These tests
-guard both facts by parsing the workflow YAML statically:
+What survives from #1388 is the ``timeout-minutes`` raise. Issue #1434
+raised it further from 45 to 75 (the ``suite`` runner-label semaphore
+#1404 bounds cw Tests to 2 concurrent, but the host also carries
+job-cannon's two ``suite`` legs plus dispatch-tree pytest sessions; a
+suite that runs 7:38 solo at -n 2 took 43.7 min with three siblings, and
+45m left only ~12% headroom -- overnight 2026-08-23/24, 9 of 16 completed
+Tests runs were cap-killed at 45m). These tests guard both facts by
+parsing the workflow YAML statically:
 
 1. The Tests job has NO job-level ``concurrency`` block (any group key, any
    ``cancel-in-progress`` value -- the pending-cancel semantics apply to all
    of them).
-2. ``timeout-minutes`` stays >= 45.
+2. ``timeout-minutes`` stays >= 75.
 """
 
 from __future__ import annotations
@@ -86,19 +92,25 @@ def test_workflow_level_concurrency_is_per_ref() -> None:
 
 
 def test_tests_timeout_minutes_raised_from_30() -> None:
-    """The Tests job ``timeout-minutes`` must be at least 45.
+    """The Tests job ``timeout-minutes`` must be at least 75.
 
     30 min was the value that produced the #1254 false reds: under contention
     the suite stretched to 29:43 and the 30m job timeout killed it at the
-    finish line. Until a runner-label semaphore bounds concurrent Tests jobs,
-    contention from concurrent Tests jobs, sibling repos' CI and the dispatch
-    tree persists, so the timeout must survive it. 45 min is ~1.9x the
-    uncontended max (23.72m) and ~1.5x the observed contended runtime (30m).
+    finish line. 45 min (#1254 raise) cleared the then-observed contended
+    runtime (30m) by ~1.5x but was itself overtaken: the ``suite`` runner-label
+    semaphore (#1404) bounds cw Tests to 2 concurrent, yet the host also
+    carries job-cannon's two ``suite`` legs plus dispatch-tree pytest
+    sessions, so per-repo semaphores cannot see each other and a suite that
+    runs 7:38 solo at -n 2 took 43.7 min with three siblings. 45m left only
+    ~12% headroom and overnight 2026-08-23/24, 9 of 16 completed Tests runs
+    were cap-killed at 45m (#1434). 75 min clears the worst measured
+    contended runtime (43.7m) by ~70% while still catching genuine hangs.
     """
     tests_job = _tests_job()
     timeout = tests_job.get("timeout-minutes")
     assert timeout is not None, "ci.yml Tests job has no timeout-minutes"
-    assert timeout >= 45, (
-        f"ci.yml Tests job timeout-minutes is {timeout}, expected >= 45 -- "
-        "30 produced false reds under contention (issue #1254)"
+    assert timeout >= 75, (
+        f"ci.yml Tests job timeout-minutes is {timeout}, expected >= 75 -- "
+        "45 produced false reds under sustained cross-repo contention "
+        "(issue #1434; 30 produced false reds under contention, issue #1254)"
     )
