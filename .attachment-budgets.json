@@ -1,23 +1,7 @@
 {
  "entries": [
   {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "src/charlie_work/claude_code.py",
-   "identity": "ClaudeWorkerRecord",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "src/charlie_work/config.py",
-   "identity": "LabelConfig",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
+   "boundary": 6.0,
    "bumps": [],
    "file": "src/charlie_work/github.py",
    "identity": "GitHub",
@@ -25,15 +9,7 @@
    "member_count": 53
   },
   {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "src/charlie_work/github.py",
-   "identity": "GitHubLike",
-   "kind": "class",
-   "member_count": 41
-  },
-  {
-   "boundary": 3.5,
+   "boundary": 6.0,
    "bumps": [],
    "file": "src/charlie_work/wedge_watchdog.py",
    "identity": "WedgeWatchdog",
@@ -41,23 +17,7 @@
    "member_count": 9
   },
   {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "src/charlie_work/worker.py",
-   "identity": "WorkerView",
-   "kind": "class",
-   "member_count": 6
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "src/charlie_work/workflow.py",
-   "identity": "ConcurrencyGovernorResult",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
+   "boundary": 6.0,
    "bumps": [],
    "file": "src/charlie_work/workflow.py",
    "identity": "OrchestratorApp",
@@ -65,39 +25,7 @@
    "member_count": 134
   },
   {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "src/charlie_work/write_gate.py",
-   "identity": "WriteGate",
-   "kind": "class",
-   "member_count": 6
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/_cli_fixtures.py",
-   "identity": "_FakeGitHub",
-   "kind": "class",
-   "member_count": 9
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/_fakes_github.py",
-   "identity": "FakeGitHub",
-   "kind": "class",
-   "member_count": 45
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/_reconcile_fixtures.py",
-   "identity": "FakeGitHub",
-   "kind": "class",
-   "member_count": 10
-  },
-  {
-   "boundary": 3.5,
+   "boundary": 6.0,
    "bumps": [],
    "file": "tests/_salvage_fixtures.py",
    "identity": "_SalvageTestGitHub",
@@ -105,204 +33,12 @@
    "member_count": 7
   },
   {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_backlog_reachability.py",
-   "identity": "FakeGh",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_charlie_work.py",
-   "identity": "test_dispatch_caps_externally_merged_issue_lookups_at_finalize_limit.FakeGitHubCappedOutsideWindow",
-   "kind": "class",
-   "member_count": 5
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_charlie_work.py",
-   "identity": "test_dispatch_reachability_blocker_lookups_are_batched.FakeGitHubBatched",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_charlie_work.py",
-   "identity": "test_loop_corrects_escalated_label_divergence_via_reconcile_pass.EscalatedDivergenceGitHub",
-   "kind": "class",
-   "member_count": 7
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_charlie_work.py",
-   "identity": "test_reconcile_exit_ok_when_drift_fixed.DriftGitHub",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_charlie_work.py",
-   "identity": "test_sweep_orphan_processes_called_from_production_loop.FakeGitHubForSweep",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_load_state_locked.py",
-   "identity": "FakeGitHub",
-   "kind": "class",
-   "member_count": 5
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_pr_create_retry.py",
-   "identity": "_FakePrCreator",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_process_utils.py",
-   "identity": "test_is_pid_alive_access_denied_returns_false_with_monkeypatched_openprocess._FakeKernel32",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_process_utils.py",
-   "identity": "test_is_pid_alive_get_exit_code_failure_fallthrough_uses_start_time_identity._FakeKernel32",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_process_utils.py",
-   "identity": "test_is_pid_alive_invalid_parameter_dead_pid_unchanged._FakeKernel32",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_rework_prompts_split.py",
-   "identity": "_write_event_call_sites._Visitor",
-   "kind": "class",
-   "member_count": 5
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_safe_ref.py",
-   "identity": "TestRequireValidRefName",
-   "kind": "class",
-   "member_count": 26
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_safe_ref.py",
-   "identity": "TestRequireValidRev",
-   "kind": "class",
-   "member_count": 6
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_safe_ref.py",
-   "identity": "TestRequireValidSha",
-   "kind": "class",
-   "member_count": 12
-  },
-  {
-   "boundary": 3.5,
+   "boundary": 6.0,
    "bumps": [],
    "file": "tests/test_state_decision_cache_enforcement.py",
    "identity": "_PrStateWriteVisitor",
    "kind": "class",
    "member_count": 10
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_subprocess_runner.py",
-   "identity": "TestHiddenConsoleKwargsWindows",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_subprocess_runner.py",
-   "identity": "TestNoConsoleWindowKwargsWindows",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_subprocess_runner.py",
-   "identity": "TestResolveCliBinary",
-   "kind": "class",
-   "member_count": 6
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_supervise.py",
-   "identity": "FakeApp",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_supervise.py",
-   "identity": "FakeClock",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_wedge_watchdog.py",
-   "identity": "FakeProcess",
-   "kind": "class",
-   "member_count": 4
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_worker.py",
-   "identity": "_NoOpGitHub",
-   "kind": "class",
-   "member_count": 5
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_worker.py",
-   "identity": "test_workflow_classify_dead_sessions_reaps_probe_error_sidecar.FakeGitHub",
-   "kind": "class",
-   "member_count": 6
-  },
-  {
-   "boundary": 3.5,
-   "bumps": [],
-   "file": "tests/test_worker.py",
-   "identity": "test_workflow_classify_dead_sessions_reaps_sidecar.FakeGitHub",
-   "kind": "class",
-   "member_count": 6
   },
   {
    "boundary": 41.0,
@@ -506,7 +242,7 @@
   }
  ],
  "floor": 4,
- "generated_at": "2026-08-25T05:19:57.627577+00:00",
+ "generated_at": "2026-08-25T05:53:45.138423+00:00",
  "generated_by": "charlie_work.attachment_contracts 0.1.0",
  "version": 1
 }

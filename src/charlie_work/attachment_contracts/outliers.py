@@ -68,10 +68,23 @@ def saturate(points: tuple[AttachmentPoint, ...], kind: Kind) -> tuple[Saturatio
     # the IQR and pulling the Tukey fence in on everything else. Such points
     # never carry a verdict of their own -- they cannot be evidence of
     # saturation either (member_count=0 can never exceed a boundary >= 0).
-    non_ledger = tuple(
-        p for p in same_kind if not p.is_linear_ledger and p.member_count >= 1
+    #
+    # Round-2 review finding #9 (regression): filtering zero-member points
+    # alone was not enough -- 220/383 non-zero `class` APs are SINGLE-member
+    # (Protocols, one-method dataclasses, Fake*/Test* doubles), and removing
+    # only the zero tail compressed Q1 upward onto that single-member mass,
+    # pulling the fence DOWN (5.0 -> 3.5) onto legitimate multi-method
+    # classes. The real defect is that `class` is not one archetype:
+    # structurally-trivial classes (Protocol bases, Exception subclasses,
+    # empty @dataclass shells, Fake*/Test* doubles -- see archetypes.py) are
+    # excluded from the population the same way ledgers are, regardless of
+    # their member count.
+    eligible = tuple(
+        p
+        for p in same_kind
+        if not p.is_linear_ledger and not p.is_structurally_trivial and p.member_count >= 1
     )
-    counts = [p.member_count for p in non_ledger]
+    counts = [p.member_count for p in eligible]
     population = len(counts)
 
     if population < FLOOR:
@@ -84,7 +97,7 @@ def saturate(points: tuple[AttachmentPoint, ...], kind: Kind) -> tuple[Saturatio
                 boundary=0.0,
                 population=population,
             )
-            for p in non_ledger
+            for p in eligible
         )
 
     q1, q3 = _quartiles(counts)
@@ -107,7 +120,7 @@ def saturate(points: tuple[AttachmentPoint, ...], kind: Kind) -> tuple[Saturatio
                 boundary=boundary,
                 population=population,
             )
-            for p in non_ledger
+            for p in eligible
         )
 
     return tuple(
@@ -119,7 +132,7 @@ def saturate(points: tuple[AttachmentPoint, ...], kind: Kind) -> tuple[Saturatio
             boundary=boundary,
             population=population,
         )
-        for p in non_ledger
+        for p in eligible
     )
 
 

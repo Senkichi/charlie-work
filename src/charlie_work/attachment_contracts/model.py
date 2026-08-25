@@ -31,6 +31,13 @@ class AttachmentPoint:
     file: str  # repo-relative posix path
     members: tuple[str, ...]
     is_linear_ledger: bool = False
+    # Round-2 review finding #9: `class` is not one archetype -- Protocol
+    # bases, Exception subclasses, empty @dataclass shells, and Fake*/Test*
+    # doubles share the population with real service classes and drag the
+    # Tukey fence the wrong way. Structurally-trivial classes are still
+    # scanned and reported (unlike an exclude-set entry) but excluded from
+    # the saturation population, the same way ledgers are (see outliers.py).
+    is_structurally_trivial: bool = False
 
     @property
     def member_count(self) -> int:

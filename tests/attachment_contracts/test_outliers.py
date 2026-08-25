@@ -11,7 +11,11 @@ from charlie_work.attachment_contracts.outliers import FLOOR, saturate, saturate
 
 
 def _point(
-    identity: str, count: int, kind: str = "class", ledger: bool = False
+    identity: str,
+    count: int,
+    kind: str = "class",
+    ledger: bool = False,
+    trivial: bool = False,
 ) -> AttachmentPoint:
     return AttachmentPoint(
         kind=kind,  # type: ignore[arg-type]
@@ -19,6 +23,7 @@ def _point(
         file=f"src/{identity}.py",
         members=tuple(f"m{i}" for i in range(count)),
         is_linear_ledger=ledger,
+        is_structurally_trivial=trivial,
     )
 
 
@@ -109,6 +114,24 @@ def test_ledger_points_excluded_from_distribution_and_never_saturated() -> None:
     # sorted=[1,2,3,4]; q1 rank=1->1; q3 rank=3->3; iqr=2; boundary=3+3=6.
     for v in verdicts:
         assert v.boundary == 6.0
+
+
+def test_structurally_trivial_points_excluded_from_distribution_and_never_saturated() -> None:
+    # Round-2 review finding #9 (regression): single-member trivial classes
+    # (Protocols, Fake* doubles, etc.) must not enter the population -- they
+    # get no verdict at all, the same treatment as ledgers.
+    real = (_point("a", 1), _point("b", 2), _point("c", 3), _point("d", 10))
+    trivial = tuple(_point(f"trivial{i}", 1, trivial=True) for i in range(20))
+    points = real + trivial
+
+    verdicts = saturate(points, "class")
+    identities = {v.point.identity for v in verdicts}
+
+    assert identities == {"a", "b", "c", "d"}
+    assert all(v.population == 4 for v in verdicts)
+    verdict_by_id = {v.point.identity: v for v in verdicts}
+    assert verdict_by_id["d"].boundary == 6.0
+    assert verdict_by_id["d"].saturated is True
 
 
 def test_saturate_only_considers_matching_kind() -> None:

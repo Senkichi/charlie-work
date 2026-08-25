@@ -181,35 +181,38 @@ _ACK_SHAPE = re.compile(r"^(https?://\S+|[\w./-]*#\d+|[A-Za-z][\w.-]*:[\w./-]+)$
 def validate_bump(bump: Bump) -> str | None:
     """Return an error message if `bump` is invalid, else None.
 
-    G4: actor=worker REQUIRES a non-empty ack that is SHAPED like an external
-    reference (issue URL / "#123" / "owner/repo#123" / "source:id" dispatch
-    id or human handle) -- not merely non-empty (round-2 review finding #10:
-    an ack of "x" previously passed). Interactive bumps self-ack (ack may be
-    empty for actor=interactive) -- the actor distinction itself is a spec
-    contract (spec's baseline.py section: "Interactive bumps self-ack") and
-    is not removed here; binding `actor` to the real execution context (a
-    worker cannot mislabel itself "interactive") is a self-declared-field
-    problem no comparison-only validator can close from the JSON alone --
-    round-2 review #10 notes the real backstop is out-of-band review of the
-    baseline diff (e.g. CODEOWNERS on `.attachment-budgets.json`).
+    G4 (round-2 review finding #10): a shape-checked, non-empty `ack` is
+    REQUIRED on every bump, regardless of `actor`. Round-1 hardened only the
+    worker branch (a junk ack like "x" on a worker bump is rejected), but the
+    discriminating vector was untouched: `actor` is a self-declared field
+    unbound to execution context, so `Bump(actor="interactive", ack="")` --
+    a worker that mislabels itself -- sailed through the ack requirement
+    entirely. Requiring the same shape-checked ack for BOTH actors closes
+    that mislabel vector outright: there is no longer anything to gain by
+    claiming "interactive". The `actor` field itself is kept (the spec's
+    baseline schema pins it, and it remains useful provenance/audit data,
+    plus the real backstop for `actor` truthfulness is out-of-band review of
+    the baseline diff, e.g. CODEOWNERS on `.attachment-budgets.json` -- no
+    comparison-only validator can bind a self-declared field to the actual
+    execution context from the JSON alone); "interactive bumps self-ack"
+    now means an interactive actor's own handle satisfies the same shape
+    check (e.g. "handle:senkichi"), not that the ack requirement is waived.
     """
     if not bump.reason.strip():
         return "bump.reason must be non-empty"
     if bump.actor not in ("interactive", "worker"):
         return f"bump.actor must be 'interactive' or 'worker', got {bump.actor!r}"
-    if bump.actor == "worker":
-        ack = bump.ack.strip()
-        if not ack:
-            return (
-                "G4: worker bump requires a non-empty external ack "
-                "(issue URL / dispatch-prompt id / human handle)"
-            )
-        if not _ACK_SHAPE.match(ack):
-            return (
-                f"G4: worker bump ack {ack!r} does not look like an external "
-                "reference (expected an issue URL, '#123' / 'owner/repo#123', "
-                "or 'source:id')"
-            )
+    ack = bump.ack.strip()
+    if not ack:
+        return (
+            "G4: bump requires a non-empty ack "
+            "(issue URL / dispatch-prompt id / human handle) regardless of actor"
+        )
+    if not _ACK_SHAPE.match(ack):
+        return (
+            f"G4: bump ack {ack!r} does not look like an external reference "
+            "(expected an issue URL, '#123' / 'owner/repo#123', or 'source:id')"
+        )
     return None
 
 
@@ -247,10 +250,18 @@ def compare(
       lower member_count than the baseline -> ratchet down (entry rewritten to
       the lower count; bumps for a point are dropped once ratcheted, since a
       bump raising an old, higher ceiling no longer applies to a lower one).
-    - A currently-saturated point with no baseline entry at all -> newly
-      saturated; not a Finding here (that is what `baseline` regeneration is
-      for) but it IS added to the ratcheted document so the baseline stays a
-      complete freeze-on-adopt snapshot.
+    - A currently-saturated point with no baseline entry at all -> Finding
+      (block), because a committed baseline document already exists whenever
+      `compare()` is called (both call sites -- check_tree and `baseline
+      --ratchet` -- guard on the baseline file existing before calling this;
+      the genuine "no baseline anywhere yet" freeze-on-adopt case never
+      reaches compare() at all, it is handled entirely by `generate()`). A
+      new AP appearing already saturated is therefore a NEW god-object, not
+      an adoption artifact (round-2 review finding #13: this branch used to
+      freeze it silently with no Finding, so a brand-new 50-method class
+      entered completely unchecked). It IS still added to the ratcheted
+      document so the baseline stays a complete snapshot of the tree's
+      current state -- the enforcement is the Finding, not the omission.
     The input document is never mutated; a new document dict is returned.
     """
     baseline_entries = {_entry_key(e): e for e in entries_of(baseline_document)}
@@ -263,7 +274,25 @@ def compare(
         point = verdict.point
         baseline_entry = baseline_entries.get(key)
         if baseline_entry is None:
-            # Newly saturated: freeze it into the ratcheted baseline, no Finding.
+            # Finding #13: a baseline document already exists at every call
+            # site of compare() (see docstring) -- this is a brand-new AP
+            # appearing already saturated, not adoption. Block it the same
+            # way growth past an existing ceiling is blocked, and still
+            # snapshot it into the ratcheted document.
+            findings.append(
+                Finding(
+                    severity="block",
+                    file=point.file,
+                    identity=point.identity,
+                    message=(
+                        f"{point.identity} ({point.kind}) is a new attachment point, "
+                        f"already saturated at {point.member_count} members, with no "
+                        "baseline entry. Add a bump or move new members to a redirect "
+                        "destination, or run `baseline --ratchet` after review."
+                    ),
+                    redirect=None,
+                )
+            )
             new_entries.append(
                 BaselineEntry(
                     kind=point.kind,

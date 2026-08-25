@@ -79,6 +79,7 @@ def suggest(point: AttachmentPoint, scan: ScanResult) -> Redirect:
         for p in scan.points
         if p.kind == point.kind
         and not p.is_linear_ledger
+        and not p.is_structurally_trivial
         and (p.file, p.identity) != (point.file, point.identity)
         and (p.file, p.identity) not in saturated_keys
     ]

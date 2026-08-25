@@ -144,6 +144,123 @@ def test_plain_class_includes_dunders_and_async_methods() -> None:
     assert point.identity == "Widget"
     assert point.members == ("__init__", "render", "fetch")
     assert point.is_linear_ledger is False
+    assert point.is_structurally_trivial is False
+
+
+# ---------------------------------------------------------------------------
+# Structurally-trivial classes (round-2 review finding #9): still scanned and
+# reported as `class` APs, but flagged so outliers.py excludes them from the
+# saturation population.
+# ---------------------------------------------------------------------------
+
+PROTOCOL_SRC = """
+from typing import Protocol
+
+class Renderer(Protocol):
+    def render(self) -> str: ...
+    def close(self) -> None: ...
+"""
+
+EXCEPTION_SRC = """
+class ConfigError(Exception):
+    def __init__(self, msg):
+        super().__init__(msg)
+    def context(self):
+        return {}
+"""
+
+EMPTY_DATACLASS_SRC = """
+from dataclasses import dataclass
+
+@dataclass
+class Point:
+    x: int
+    y: int
+"""
+
+DATACLASS_WITH_REAL_METHOD_SRC = """
+from dataclasses import dataclass
+
+@dataclass
+class Vector:
+    x: int
+    y: int
+    def magnitude(self):
+        return (self.x ** 2 + self.y ** 2) ** 0.5
+"""
+
+FAKE_DOUBLE_SRC = """
+class FakeClock:
+    def now(self):
+        ...
+    def advance(self, seconds):
+        ...
+    def freeze(self):
+        ...
+    def reset(self):
+        ...
+"""
+
+PRIVATE_FAKE_DOUBLE_SRC = """
+class _FakeKernel32:
+    def a(self): ...
+    def b(self): ...
+    def c(self): ...
+    def d(self): ...
+"""
+
+TEST_DOUBLE_SRC = """
+class TestSubject:
+    def a(self): ...
+    def b(self): ...
+    def c(self): ...
+    def d(self): ...
+"""
+
+
+def test_protocol_base_flagged_structurally_trivial() -> None:
+    point = scan_source(PROTOCOL_SRC, "src/pkg/proto.py")[0]
+    assert point.kind == "class"
+    assert point.is_structurally_trivial is True
+
+
+def test_exception_subclass_flagged_structurally_trivial() -> None:
+    point = scan_source(EXCEPTION_SRC, "src/pkg/errors.py")[0]
+    assert point.kind == "class"
+    assert point.is_structurally_trivial is True
+
+
+def test_empty_dataclass_flagged_structurally_trivial() -> None:
+    point = scan_source(EMPTY_DATACLASS_SRC, "src/pkg/point.py")[0]
+    assert point.kind == "class"
+    assert point.members == ()
+    assert point.is_structurally_trivial is True
+
+
+def test_dataclass_with_real_method_not_flagged() -> None:
+    # A dataclass with a non-dunder method is a real behavioral unit, not a
+    # trivial data shell -- only ALL-dunder-member dataclasses are trivial.
+    point = scan_source(DATACLASS_WITH_REAL_METHOD_SRC, "src/pkg/vector.py")[0]
+    assert point.kind == "class"
+    assert point.is_structurally_trivial is False
+
+
+def test_fake_double_flagged_structurally_trivial() -> None:
+    point = scan_source(FAKE_DOUBLE_SRC, "tests/test_x.py")[0]
+    assert point.identity == "FakeClock"
+    assert point.is_structurally_trivial is True
+
+
+def test_underscore_fake_double_flagged_structurally_trivial() -> None:
+    point = scan_source(PRIVATE_FAKE_DOUBLE_SRC, "tests/test_x.py")[0]
+    assert point.identity == "_FakeKernel32"
+    assert point.is_structurally_trivial is True
+
+
+def test_test_prefixed_double_flagged_structurally_trivial() -> None:
+    point = scan_source(TEST_DOUBLE_SRC, "tests/test_x.py")[0]
+    assert point.identity == "TestSubject"
+    assert point.is_structurally_trivial is True
 
 
 MIGRATION_CONTIGUOUS_SRC = """

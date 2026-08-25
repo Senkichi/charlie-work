@@ -8,6 +8,7 @@ module or class names. `scan_source` is a pure function over one file's text;
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path, PurePosixPath
 from typing import Iterator, Mapping
 
@@ -16,6 +17,20 @@ from charlie_work.attachment_contracts.ledger import classify_ledger
 from charlie_work.attachment_contracts.model import AttachmentPoint, Kind, ScanResult
 
 _ROUTE_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
+
+# Round-2 review finding #9: `class` is not a coherent archetype. Protocols,
+# Exception subclasses, empty @dataclass shells, and test doubles all share
+# the population with real service classes and are heterogeneous by
+# construction -- no single member-count filter can separate them, so they
+# are identified structurally at scan time (see `_is_structurally_trivial`)
+# and excluded from the saturation population entirely (outliers.py), the
+# same way ledgers are.
+_EXCEPTION_BASE_NAMES = frozenset({"Exception", "BaseException"})
+# Naming-shape detection, same precedent as `_looks_like_test_module` below:
+# a structural pattern applied uniformly, not an enumerated list of specific
+# class names. `Fake*` / `_Fake*` / `Test*` is the convention this repo's own
+# test suite already uses for doubles (see docstring on `_iter_classdefs`).
+_TEST_DOUBLE_NAME_RE = re.compile(r"^_?(Fake|Test)[A-Za-z0-9_]*$")
 
 
 def _walk_dfs(node: ast.AST) -> Iterator[ast.AST]:
@@ -127,10 +142,10 @@ def _blueprint_points(tree: ast.Module, path: str) -> list[AttachmentPoint]:
 
 
 def _iter_classdefs(
-    node: ast.AST, scope: tuple[str, ...] = ()
-) -> Iterator[tuple[ast.ClassDef, str]]:
-    """Yield (class_node, identity) for every `ClassDef` reachable from
-    `node`, deterministic pre-order.
+    node: ast.AST, scope: tuple[str, ...] = (), in_function: bool = False
+) -> Iterator[tuple[ast.ClassDef, str, bool]]:
+    """Yield (class_node, identity, nested_in_function) for every `ClassDef`
+    reachable from `node`, deterministic pre-order.
 
     A top-level class keeps a bare-name identity (`ClassName`) for baseline
     stability. A class nested inside a function or another class gets its
@@ -142,21 +157,96 @@ def _iter_classdefs(
     tests) collide on identity: baseline.py keys entries by (kind, file,
     identity), so a bare-name collision silently drops one on ratchet
     writeback.
+
+    `nested_in_function` is True for a class defined anywhere inside a
+    function body (directly, or via an enclosing class also nested in a
+    function) -- round-2 review finding #9: a class scoped to one function's
+    body is a local fixture/closure-scoped helper/test double by
+    construction, not a reusable service class, regardless of what it is
+    named. This is what actually catches the bulk of this repo's own
+    `*GitHub` test doubles (defined inline inside `test_*` functions), which
+    a `Fake*`/`Test*` name-prefix check alone misses.
     """
     for child in ast.iter_child_nodes(node):
         if isinstance(child, ast.ClassDef):
             identity = ".".join((*scope, child.name)) if scope else child.name
-            yield child, identity
-            yield from _iter_classdefs(child, (*scope, child.name))
+            yield child, identity, in_function
+            yield from _iter_classdefs(child, (*scope, child.name), in_function)
         elif _is_def(child):
-            yield from _iter_classdefs(child, (*scope, child.name))
+            yield from _iter_classdefs(child, (*scope, child.name), True)
         else:
-            yield from _iter_classdefs(child, scope)
+            yield from _iter_classdefs(child, scope, in_function)
+
+
+def _base_names(node: ast.ClassDef) -> list[str]:
+    """Structural base-class names: `Name` and the attr of `module.Name`."""
+    names: list[str] = []
+    for base in node.bases:
+        if isinstance(base, ast.Name):
+            names.append(base.id)
+        elif isinstance(base, ast.Attribute):
+            names.append(base.attr)
+    return names
+
+
+def _decorator_names(node: ast.ClassDef) -> list[str]:
+    """Structural decorator names: `Name`/`module.Name`, called or bare."""
+    names: list[str] = []
+    for dec in node.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(target, ast.Name):
+            names.append(target.id)
+        elif isinstance(target, ast.Attribute):
+            names.append(target.attr)
+    return names
+
+
+def _is_protocol_base(node: ast.ClassDef) -> bool:
+    return "Protocol" in _base_names(node)
+
+
+def _is_exception_subclass(node: ast.ClassDef) -> bool:
+    return any(
+        name in _EXCEPTION_BASE_NAMES or name.endswith(("Error", "Exception"))
+        for name in _base_names(node)
+    )
+
+
+def _is_empty_dataclass(node: ast.ClassDef, members: tuple[str, ...]) -> bool:
+    if "dataclass" not in _decorator_names(node):
+        return False
+    # No non-dunder methods at all (fields aren't FunctionDefs, so a plain
+    # `@dataclass` with only field annotations has members == ()) -- a real
+    # behavioral method makes it a legitimate unit of saturation risk.
+    return all(m.startswith("__") and m.endswith("__") for m in members)
+
+
+def _is_test_double_name(node: ast.ClassDef) -> bool:
+    return _TEST_DOUBLE_NAME_RE.match(node.name) is not None
+
+
+def _is_structurally_trivial(
+    node: ast.ClassDef, members: tuple[str, ...], nested_in_function: bool
+) -> bool:
+    """True iff `node` is not a coherent unit of saturation risk (finding #9).
+
+    Structural (AST-shape/naming-convention/lexical-scope) tests only, no
+    hand-maintained list of specific class names -- same standard
+    `_looks_like_test_module` and `classify_ledger` already meet elsewhere in
+    this package.
+    """
+    return (
+        nested_in_function
+        or _is_protocol_base(node)
+        or _is_exception_subclass(node)
+        or _is_empty_dataclass(node, members)
+        or _is_test_double_name(node)
+    )
 
 
 def _class_points(tree: ast.Module, path: str) -> list[AttachmentPoint]:
     points: list[AttachmentPoint] = []
-    for node, identity in _iter_classdefs(tree):
+    for node, identity, nested_in_function in _iter_classdefs(tree):
         members = tuple(child.name for child in node.body if _is_def(child))
         if classify_ledger(members):
             points.append(
@@ -170,7 +260,15 @@ def _class_points(tree: ast.Module, path: str) -> list[AttachmentPoint]:
             )
         else:
             points.append(
-                AttachmentPoint(kind="class", identity=identity, file=path, members=members)
+                AttachmentPoint(
+                    kind="class",
+                    identity=identity,
+                    file=path,
+                    members=members,
+                    is_structurally_trivial=_is_structurally_trivial(
+                        node, members, nested_in_function
+                    ),
+                )
             )
     return points
 

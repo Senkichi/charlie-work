@@ -80,6 +80,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
                 "file": p.file,
                 "member_count": p.member_count,
                 "is_linear_ledger": p.is_linear_ledger,
+                "is_structurally_trivial": p.is_structurally_trivial,
             }
             for p in scan.points
         ],

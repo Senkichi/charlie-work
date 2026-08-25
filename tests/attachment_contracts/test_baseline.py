@@ -166,9 +166,32 @@ def test_worker_bump_with_ack_accepted() -> None:
     assert validate_bump(bump) is None
 
 
-def test_interactive_bump_without_ack_accepted() -> None:
+def test_interactive_bump_without_ack_rejected() -> None:
+    # Round-2 review finding #10: round-1 validated the worker branch only,
+    # so a worker that mislabeled itself `actor="interactive"` bypassed the
+    # ack requirement entirely (`Bump(actor="interactive", ack="")` used to
+    # pass). Both actors now require the same shape-checked ack, closing the
+    # mislabel vector: there is nothing to gain by claiming "interactive".
     bump = Bump(to=20, reason="reviewed and approved", actor="interactive", ack="")
+    error = validate_bump(bump)
+    assert error is not None
+    assert "G4" in error
+
+
+def test_interactive_bump_with_shaped_ack_accepted() -> None:
+    bump = Bump(
+        to=20, reason="reviewed and approved", actor="interactive", ack="handle:senkichi"
+    )
     assert validate_bump(bump) is None
+
+
+def test_interactive_bump_with_junk_ack_rejected() -> None:
+    # A mislabeled worker gains nothing: a junk ack is rejected for
+    # actor="interactive" exactly as it is for actor="worker".
+    bump = Bump(to=20, reason="reviewed and approved", actor="interactive", ack="x")
+    error = validate_bump(bump)
+    assert error is not None
+    assert "G4" in error
 
 
 def test_worker_bump_with_junk_ack_rejected() -> None:
@@ -281,7 +304,7 @@ def test_compare_no_longer_saturated_drops_from_baseline() -> None:
 
 
 def test_compare_bump_raises_effective_ceiling() -> None:
-    bump = Bump(to=20, reason="reviewed", actor="interactive", ack="")
+    bump = Bump(to=20, reason="reviewed", actor="interactive", ack="handle:senkichi")
     baseline_entry = BaselineEntry(
         kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0, bumps=(bump,)
     )
@@ -313,13 +336,23 @@ def test_compare_preserves_unknown_top_level_keys() -> None:
     assert ratcheted["mode"] == "enforce"
 
 
-def test_compare_newly_saturated_point_added_without_finding() -> None:
+def test_compare_new_saturated_point_with_no_baseline_entry_blocks() -> None:
+    # Round-2 review finding #13: compare() is only ever called once a
+    # baseline document already exists (check_tree / `baseline --ratchet`
+    # both guard on the file being present) -- the true freeze-on-adopt
+    # case ("no baseline anywhere yet") never reaches compare() at all, it
+    # is handled entirely by generate(). So a currently-saturated point with
+    # no matching entry here is a brand-new god-object, not an adoption
+    # artifact, and must block -- silently freezing it (the old behavior)
+    # let a fresh 50-method class enter completely unchecked.
     doc = _doc_with_entries()
     current = (_verdict("new_point", 10, boundary=6.0, saturated=True),)
 
     findings, ratcheted = compare(current, doc)
 
-    assert findings == []
+    assert len(findings) == 1
+    assert findings[0].severity == "block"
+    assert findings[0].identity == "new_point"
     ratcheted_entries = entries_of(ratcheted)
     assert len(ratcheted_entries) == 1
     assert ratcheted_entries[0].identity == "new_point"
@@ -347,7 +380,8 @@ def test_tamper_detects_hand_raised_member_count() -> None:
 
 
 def test_tamper_clean_when_covered_by_matching_bump() -> None:
-    bump = Bump(to=50, reason="reviewed spike", actor="interactive", ack="")
+    # Finding #10: interactive bumps require a shaped ack too, now.
+    bump = Bump(to=50, reason="reviewed spike", actor="interactive", ack="handle:senkichi")
     baseline_entry = BaselineEntry(
         kind="class", identity="a", file="src/a.py", member_count=50, boundary=6.0, bumps=(bump,)
     )
@@ -460,7 +494,7 @@ def test_ratchet_tamper_bump_does_not_excuse_a_member_count_raise() -> None:
     # itself rising -- legitimate bump usage raises the ceiling while leaving
     # member_count untouched (see test_compare_bump_raises_effective_ceiling).
     # A rise in member_count is tamper regardless of bumps.
-    bump = Bump(to=20, reason="reviewed", actor="interactive", ack="")
+    bump = Bump(to=20, reason="reviewed", actor="interactive", ack="handle:senkichi")
     previous = _doc_with_entries(
         BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0)
     )

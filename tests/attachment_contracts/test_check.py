@@ -150,6 +150,28 @@ def test_check_tree_no_baseline_yields_no_block_findings(tmp_path: Path) -> None
     assert all(f.severity != "block" for f in findings)
 
 
+def test_check_tree_new_saturated_ap_with_existing_baseline_blocks(tmp_path: Path) -> None:
+    # Round-2 review finding #13: with a baseline already committed, a
+    # brand-new file containing an already-saturated AP must not be frozen
+    # silently -- it needs an explicit bump/redirect, same as growth past an
+    # existing ceiling.
+    _build_repo(tmp_path, big_member_count=8)
+    _freeze_baseline(tmp_path)
+
+    # A far larger outlier than `big` so it is still saturated after it
+    # joins the population and shifts Q3/IQR upward.
+    (tmp_path / "src" / "pkg" / "new_big.py").write_text(
+        _big_class_source(50).replace("class Big:", "class NewBig:"), encoding="utf-8"
+    )
+
+    findings = check_tree(tmp_path)
+
+    block_findings = [f for f in findings if f.severity == "block"]
+    assert len(block_findings) == 1
+    assert block_findings[0].identity == "NewBig"
+    assert block_findings[0].file == "src/pkg/new_big.py"
+
+
 def test_check_tree_tamper_detects_hand_raised_baseline(tmp_path: Path) -> None:
     _build_repo(tmp_path, big_member_count=20)
     _freeze_baseline(tmp_path)
