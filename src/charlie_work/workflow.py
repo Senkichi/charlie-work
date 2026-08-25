@@ -18149,7 +18149,66 @@ class OrchestratorApp:
         (``status == "escalated"``) makes this whole method unreachable on
         every subsequent pass, the same way it already does for the
         retrigger action itself (scope fence item 3/b on issue #1274).
+
+        Issue #1451: the mergeable state of the PR is checked BEFORE any
+        remedy is chosen -- single point of enforcement for the
+        discrimination. On a CONFLICTING PR, close/reopen (and the
+        empty-commit fallback) can never create a CI run: GitHub cannot
+        build ``refs/pull/N/merge`` while the branch conflicts, so no
+        ``pull_request`` workflow run is created for ANY event (opened,
+        reopened, synchronize) until the conflict is resolved. Retriggering
+        there burns a ``stale_checks_retrigger_attempts`` slot and a
+        close/reopen notification cycle with zero possible effect. Route to
+        the existing merge-conflict rework path instead -- the same
+        ``_route_janitor_gate_failure_to_rework`` wrapper the janitor gate
+        itself uses for ``is_merge_conflict_block`` -- recording a
+        ``ci_retrigger_skipped_conflicting`` event (deduped per head) for
+        diagnosability. ``UNKNOWN`` (GitHub still computing mergeable)
+        defers to the next pass rather than retriggering blind -- a
+        close/reopen on a PR whose mergeable state is not yet settled could
+        either waste the attempt (if it resolves to CONFLICTING) or fire
+        prematurely (if it resolves to MERGEABLE but GitHub has not yet
+        created the run). ``MERGEABLE`` and any other value proceed with the
+        current behavior below.
         """
+        mergeable = str(pr.get("mergeable") or "").upper()
+        if mergeable == "CONFLICTING":
+            # Dedup per head: a CONFLICTING PR can sit for many passes while
+            # the rework worker resolves the conflict; emit the skip event
+            # only when the head changes (mirrors the ci_run_never_created
+            # per-head dedup pattern) so events.db stays diagnosable without
+            # a per-pass spam loop.
+            last_skipped_head = existing_pr_state.get("ci_retrigger_skipped_conflicting_head")
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                state["prs"][str(pr_number)] = {
+                    **state["prs"].get(str(pr_number), {}),
+                    "ci_retrigger_skipped_conflicting_head": head_sha,
+                }
+                if last_skipped_head != head_sha:
+                    state = self._record_event(
+                        state,
+                        "ci_retrigger_skipped_conflicting",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "head_sha": head_sha,
+                        },
+                    )
+                save_state(self.paths.state_file, state)
+            return self._route_janitor_gate_failure_to_rework(
+                pr,
+                issue_number,
+                attempts_key="conflict_rework_attempts",
+                max_attempts=self.config.review.max_conflict_rework_attempts,
+                reason="merge_conflict",
+                router=self._request_merge_conflict_rework,
+            )
+        if mergeable == "UNKNOWN":
+            # GitHub is still computing mergeable -- defer to the next pass
+            # rather than retriggering blind (issue #1451).
+            return None
+
         raw_attempts = existing_pr_state.get("stale_checks_retrigger_attempts", 0)
         attempts = raw_attempts if isinstance(raw_attempts, int) else 0
         max_retriggers = self.config.review.stale_checks_max_retriggers
