@@ -2,6 +2,16 @@
 
 stdin JSON: `{"tool_name": "Write|Edit|MultiEdit", "tool_input": {"file_path": ...}}`.
 
+PreToolUse fires BEFORE the write lands, so the on-disk file is still the
+pre-edit version. `_compute_proposed_content` reconstructs what the file will
+read after the edit (full content for Write, old_string/new_string applied
+for Edit/MultiEdit) and passes it to `check_file` as a content override, so
+the verdict is against the edit that is actually about to happen. When the
+proposed content can't be determined (unrecognized tool, malformed payload,
+`old_string` not found, or no on-disk base yet) this falls back to the
+on-disk file, same as before -- so this is best-effort pre-edit feedback, not
+a guarantee; CI's full-tree check remains the real, authoritative gate.
+
 - No `.attachment-budgets.json` found walking up from the target file -> exit 0
   silently (fast no-op outside piloted repos).
 - Unattended (`CHARLIE_FLEET_WORKER=1` or `CLAUDE_CODE_UNATTENDED=1`) -> ALWAYS
@@ -100,6 +110,58 @@ def _extract_file_path(payload: object) -> str | None:
     return file_path if isinstance(file_path, str) and file_path else None
 
 
+def _apply_string_edit(content: str, old: str, new: str, replace_all: bool) -> str:
+    if replace_all:
+        return content.replace(old, new)
+    index = content.find(old)
+    if index == -1:
+        return content
+    return content[:index] + new + content[index + len(old) :]
+
+
+def _compute_proposed_content(
+    tool_name: object, tool_input: object, current_text: str | None
+) -> str | None:
+    """Reconstruct the file's content as it will read AFTER this PreToolUse
+    edit lands, so the hook can evaluate the pending edit instead of the
+    stale pre-edit on-disk file (PreToolUse fires before the write happens).
+
+    Returns None when the proposed content cannot be determined (unknown
+    tool, malformed payload, an `old_string` that doesn't match the current
+    text, or -- for Edit/MultiEdit -- no on-disk base to apply against yet):
+    the caller falls back to the current on-disk check in that case, same as
+    before this fix, rather than guessing.
+    """
+    if not isinstance(tool_input, dict):
+        return None
+    if tool_name == "Write":
+        content = tool_input.get("content")
+        return content if isinstance(content, str) else None
+    if current_text is None:
+        return None
+    if tool_name == "Edit":
+        old = tool_input.get("old_string")
+        new = tool_input.get("new_string")
+        if not isinstance(old, str) or not isinstance(new, str):
+            return None
+        return _apply_string_edit(current_text, old, new, bool(tool_input.get("replace_all")))
+    if tool_name == "MultiEdit":
+        edits = tool_input.get("edits")
+        if not isinstance(edits, list):
+            return None
+        text = current_text
+        for edit in edits:
+            if not isinstance(edit, dict):
+                return None
+            old = edit.get("old_string")
+            new = edit.get("new_string")
+            if not isinstance(old, str) or not isinstance(new, str):
+                return None
+            text = _apply_string_edit(text, old, new, bool(edit.get("replace_all")))
+        return text
+    return None
+
+
 def main(
     stdin: IO[str] | None = None,
     stdout: IO[str] | None = None,
@@ -130,7 +192,26 @@ def main(
     except ValueError:
         return 0  # target somehow outside root
 
-    findings = check_file(rel_path, root)
+    current_text: str | None
+    try:
+        current_text = (root / rel_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        current_text = None  # new file, or unreadable -- fall back gracefully below
+
+    proposed_text = _compute_proposed_content(
+        payload.get("tool_name") if isinstance(payload, dict) else None,
+        payload.get("tool_input") if isinstance(payload, dict) else None,
+        current_text,
+    )
+    content_overrides = {rel_path: proposed_text} if proposed_text is not None else None
+
+    try:
+        findings = check_file(rel_path, root, content_overrides=content_overrides)
+    except Exception:
+        # Fail-open against ANY unforeseen scan error, not only the decode/OS
+        # cases archetypes.py now guards itself: the hook's contract is
+        # advisory-only and must never crash into a blocking exit code.
+        return 0
     actionable = [f for f in findings if f.severity in _ACTIONABLE_SEVERITIES]
     if not actionable:
         return 0

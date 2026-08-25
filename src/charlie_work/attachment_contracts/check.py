@@ -11,6 +11,7 @@ never diverge in behavior — there is exactly one comparison algorithm.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Mapping
 
 from charlie_work.attachment_contracts import baseline as baseline_mod
 from charlie_work.attachment_contracts.archetypes import scan_tree
@@ -54,8 +55,21 @@ def _enrich_with_redirect(finding: Finding, scan: ScanResult) -> Finding:
     )
 
 
-def check_tree(root: Path) -> list[Finding]:
+def check_tree(
+    root: Path,
+    *,
+    content_overrides: Mapping[str, str] | None = None,
+    previous_baseline_document: dict[str, object] | None = None,
+) -> list[Finding]:
     """Full-tree scan + baseline compare + tamper guard + G6.
+
+    `content_overrides` is forwarded to `scan_tree` so a caller (the
+    PreToolUse hook) can evaluate a pending edit's proposed content instead
+    of the stale on-disk file. `previous_baseline_document`, when given,
+    enables the diff-based ratchet-tamper guard (raise-to-match laundering,
+    finding #1) -- it is optional and CI-only (it needs a prior commit's
+    baseline as an independent reference point) because the per-edit hook
+    path has no git context and should stay cheap.
 
     Returns an empty list when the tree is clean. Absence of a committed
     baseline is not itself a Finding (freeze-on-adopt has not happened yet in
@@ -63,7 +77,7 @@ def check_tree(root: Path) -> list[Finding]:
     conditions produce Findings.
     """
     excludes = load_excludes(root)
-    scan = scan_tree(root, excludes)
+    scan = scan_tree(root, excludes, content_overrides=content_overrides)
 
     findings: list[Finding] = [_parse_failure_finding(pf) for pf in scan.parse_failures]
 
@@ -91,16 +105,28 @@ def check_tree(root: Path) -> list[Finding]:
                 for f in compare_findings
             )
             findings.extend(baseline_mod.check_tamper(verdicts, document))
+            findings.extend(
+                baseline_mod.check_ratchet_tamper(previous_baseline_document, document)
+            )
 
     findings.sort(key=lambda f: (_SEVERITY_RANK.get(f.severity, 99), f.file, f.identity))
     return findings
 
 
-def check_file(path: str, root: Path) -> list[Finding]:
+def check_file(
+    path: str,
+    root: Path,
+    *,
+    content_overrides: Mapping[str, str] | None = None,
+) -> list[Finding]:
     """Single-file view of `check_tree`: every Finding whose `file` is `path`.
 
     Delegating to `check_tree` keeps hook and CI behavior identical by
     construction — there is no second comparison algorithm to drift out of
     sync with the first.
     """
-    return [f for f in check_tree(root) if f.file == path]
+    return [
+        f
+        for f in check_tree(root, content_overrides=content_overrides)
+        if f.file == path
+    ]

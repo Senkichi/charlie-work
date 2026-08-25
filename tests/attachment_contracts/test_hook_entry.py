@@ -200,3 +200,139 @@ def test_clean_file_produces_no_output(tmp_path: Path) -> None:
     assert code == 0
     assert out == ""
     assert err == ""
+
+
+# ---------------------------------------------------------------------------
+# finding #4: evaluate the PENDING edit, not the stale on-disk file
+# ---------------------------------------------------------------------------
+
+
+def _run_payload(payload: dict, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+    stdin = io.StringIO(json.dumps(payload))
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    code = main(stdin=stdin, stdout=stdout, stderr=stderr, env=env or {})
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def test_write_evaluates_proposed_content_not_stale_disk(tmp_path: Path) -> None:
+    # Baseline frozen at 20 members; on-disk file is STILL at 20 (unchanged) --
+    # only the pending Write's `content` grows Big past budget. Before the
+    # fix, the hook read the on-disk (still-clean) file and found nothing.
+    _build_repo(tmp_path, big_member_count=20)
+    _freeze_baseline_at(tmp_path, big_member_count=20)
+    target = tmp_path / "src" / "pkg" / "big.py"
+    assert target.read_text(encoding="utf-8") == _big_class_source(20)
+
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": str(target), "content": _big_class_source(30)},
+    }
+    code, out, err = _run_payload(payload)
+
+    assert code == 0
+    assert err == ""
+    payload_out = json.loads(out)
+    assert "Big" in payload_out["hookSpecificOutput"]["additionalContext"]
+    # On-disk file must be untouched by the hook itself.
+    assert target.read_text(encoding="utf-8") == _big_class_source(20)
+
+
+def test_edit_old_new_string_evaluates_proposed_content(tmp_path: Path) -> None:
+    _build_repo(tmp_path, big_member_count=20)
+    _freeze_baseline_at(tmp_path, big_member_count=20)
+    target = tmp_path / "src" / "pkg" / "big.py"
+    on_disk = target.read_text(encoding="utf-8")
+    extra_methods = "\n".join(f"    def n{i}x(self): pass" for i in range(10))
+    new_text = on_disk + extra_methods + "\n"
+
+    payload = {
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": str(target),
+            "old_string": on_disk,
+            "new_string": new_text,
+        },
+    }
+    code, out, err = _run_payload(payload)
+
+    assert code == 0
+    payload_out = json.loads(out)
+    assert "Big" in payload_out["hookSpecificOutput"]["additionalContext"]
+    assert target.read_text(encoding="utf-8") == on_disk  # hook never writes
+
+
+def test_edit_with_unmatched_old_string_falls_back_to_on_disk(tmp_path: Path) -> None:
+    # old_string doesn't match current content (proposal can't be computed) --
+    # must degrade to the on-disk check, not crash.
+    _build_repo(tmp_path, big_member_count=2)
+    _freeze_baseline_at(tmp_path, big_member_count=2)
+    target = tmp_path / "src" / "pkg" / "a.py"
+
+    payload = {
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": str(target),
+            "old_string": "this text is not in the file",
+            "new_string": "replacement",
+        },
+    }
+    code, out, err = _run_payload(payload)
+
+    assert code == 0
+    assert out == ""
+    assert err == ""
+
+
+def test_multiedit_evaluates_sequential_proposed_edits(tmp_path: Path) -> None:
+    _build_repo(tmp_path, big_member_count=20)
+    _freeze_baseline_at(tmp_path, big_member_count=20)
+    target = tmp_path / "src" / "pkg" / "big.py"
+    on_disk = target.read_text(encoding="utf-8")
+
+    payload = {
+        "tool_name": "MultiEdit",
+        "tool_input": {
+            "file_path": str(target),
+            "edits": [
+                {
+                    "old_string": on_disk,
+                    "new_string": on_disk + "    def extra1x(self): pass\n",
+                },
+                {
+                    "old_string": "    def extra1x(self): pass\n",
+                    "new_string": "\n".join(
+                        f"    def extra{i}x(self): pass" for i in range(1, 11)
+                    )
+                    + "\n",
+                },
+            ],
+        },
+    }
+    code, out, err = _run_payload(payload)
+
+    assert code == 0
+    payload_out = json.loads(out)
+    assert "Big" in payload_out["hookSpecificOutput"]["additionalContext"]
+
+
+# ---------------------------------------------------------------------------
+# fail-open: an unforeseen scan error must never crash into a blocking exit
+# ---------------------------------------------------------------------------
+
+
+def test_unforeseen_scan_error_fails_open(tmp_path: Path, monkeypatch) -> None:
+    _build_repo(tmp_path, big_member_count=2)
+    _freeze_baseline_at(tmp_path, big_member_count=2)
+    target = tmp_path / "src" / "pkg" / "a.py"
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("unexpected scan failure")
+
+    monkeypatch.setattr("charlie_work.attachment_contracts.hook_entry.check_file", _boom)
+
+    code, out, err = _run(target)
+
+    assert code == 0
+    assert out == ""
+    assert err == ""

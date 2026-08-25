@@ -126,10 +126,23 @@ def loads(text: str) -> dict[str, object]:
     if not isinstance(entries_raw, list):
         raise TamperError("baseline 'entries' must be a list")
     # Validate every entry parses; surfaces structural tamper immediately.
+    seen_keys: set[tuple[str, str, str]] = set()
     for raw in entries_raw:
         if not isinstance(raw, dict):
             raise TamperError(f"baseline entry must be an object, got {type(raw)!r}")
-        _entry_from_dict(raw)
+        entry = _entry_from_dict(raw)
+        key = _entry_key(entry)
+        if key in seen_keys:
+            # Duplicate (kind, file, identity) collides in every identity-keyed
+            # map this module builds (compare(), check_tamper(), ratchet
+            # writeback) -- last-write-wins would silently DROP one entry the
+            # moment `--ratchet` rewrites the file. Reject at load time
+            # instead of losing a frozen entry to a silent overwrite.
+            raise TamperError(
+                f"duplicate baseline entry for kind={key[0]!r} file={key[1]!r} "
+                f"identity={key[2]!r}"
+            )
+        seen_keys.add(key)
     return document  # type: ignore[return-value]
 
 
@@ -265,6 +278,58 @@ def compare(
         "entries": [_entry_to_dict(e) for e in sorted_entries],
     }
     return findings, ratcheted
+
+
+def check_ratchet_tamper(
+    previous_document: dict[str, object] | None,
+    current_document: dict[str, object],
+) -> list[Finding]:
+    """Diff-based tamper guard: closes the raise-to-match laundering gap.
+
+    `check_tamper` (below) compares the baseline against the CURRENT actual
+    scan only. It is blind when an attacker raises a frozen entry's
+    `member_count` in lockstep with real growth: both numbers end up equal,
+    so nothing looks anomalous within a single snapshot. Detecting that
+    requires an independent reference point -- the previous commit's
+    baseline -- which is why this is a separate function taking it
+    explicitly, rather than something `check_tamper` could re-derive from
+    `current_document` alone.
+
+    Under every legitimate write path (`generate()` for a fresh entry,
+    `compare()`'s ratchet), an EXISTING entry's `member_count` field is only
+    ever left unchanged or lowered -- raising the effective ceiling for real
+    growth is expressed purely through `bumps`, never by rewriting
+    `member_count` itself (see `compare()`'s ratchet branches). So for any
+    identity present in both documents, ANY rise in `member_count` did not
+    come from this package's own tooling -- it is tamper, full stop.
+
+    `previous_document` is None when there is nothing to diff against yet
+    (e.g. the very first committed baseline) -- no findings are possible.
+    """
+    if previous_document is None:
+        return []
+    previous_entries = {_entry_key(e): e for e in entries_of(previous_document)}
+    findings: list[Finding] = []
+    for entry in entries_of(current_document):
+        prev = previous_entries.get(_entry_key(entry))
+        if prev is None or entry.member_count <= prev.member_count:
+            continue
+        findings.append(
+            Finding(
+                severity="error",
+                file=entry.file,
+                identity=entry.identity,
+                message=(
+                    f"tamper: baseline member_count for {entry.identity} rose "
+                    f"{prev.member_count} -> {entry.member_count} since the previous "
+                    "committed baseline. member_count is immutable-once-frozen except "
+                    "via a strictly-lower ratchet; a rise can only be a hand-edit "
+                    "(raise legitimate growth via a validly-acked bump instead)."
+                ),
+                redirect=None,
+            )
+        )
+    return findings
 
 
 def check_tamper(

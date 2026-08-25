@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from charlie_work.attachment_contracts.archetypes import scan_source, scan_tree
+from charlie_work.attachment_contracts.archetypes import iter_source_files, scan_source, scan_tree
 from charlie_work.attachment_contracts.excludes import Excludes
 
 TYPER_SRC = """
@@ -381,3 +381,87 @@ def test_scan_tree_missing_src_and_tests_dirs_returns_empty(tmp_path: Path) -> N
     result = scan_tree(tmp_path, Excludes())
     assert result.points == ()
     assert result.parse_failures == ()
+
+
+# ---------------------------------------------------------------------------
+# finding #7's root cause: same-named nested local classes get disambiguated
+# identities so they never collide in baseline.py's (kind, file, identity) key
+# ---------------------------------------------------------------------------
+
+_DUPLICATE_NESTED_CLASS_SRC = """
+def test_one():
+    class FakeGitHub:
+        def a(self): pass
+
+def test_two():
+    class FakeGitHub:
+        def b(self): pass
+        def c(self): pass
+"""
+
+
+def test_same_named_nested_classes_get_distinct_qualified_identities() -> None:
+    points = scan_source(_DUPLICATE_NESTED_CLASS_SRC, "tests/test_worker.py")
+    class_points = [p for p in points if p.kind == "class"]
+
+    identities = [p.identity for p in class_points]
+    assert len(identities) == len(set(identities)), f"collided: {identities}"
+    assert identities == ["test_one.FakeGitHub", "test_two.FakeGitHub"]
+
+
+def test_top_level_class_identity_stays_bare_for_baseline_stability() -> None:
+    points = scan_source("class Widget:\n    def render(self): pass\n", "src/w.py")
+    assert points[0].identity == "Widget"
+
+
+# ---------------------------------------------------------------------------
+# finding #2: a decode/OS failure on the read must not crash the tree scan
+# ---------------------------------------------------------------------------
+
+
+def test_scan_tree_routes_undecodable_file_to_parse_failures(tmp_path: Path) -> None:
+    src_dir = tmp_path / "src" / "pkg"
+    src_dir.mkdir(parents=True)
+    (src_dir / "good.py").write_text(CLASS_WITH_ASYNC_SRC, encoding="utf-8")
+    # Invalid UTF-8 byte sequence -- read_text(encoding="utf-8") raises
+    # UnicodeDecodeError, previously uncaught (outside the SyntaxError-only
+    # try/except), crashing the whole scan.
+    (src_dir / "bad_encoding.py").write_bytes(b"\xff\xfe garbage not utf-8")
+
+    result = scan_tree(tmp_path, Excludes())
+
+    assert "src/pkg/bad_encoding.py" in result.parse_failures
+    assert any(p.file == "src/pkg/good.py" for p in result.points)
+
+
+# ---------------------------------------------------------------------------
+# iter_source_files: the full scanned-file universe (finding #3b's dependency)
+# ---------------------------------------------------------------------------
+
+
+def test_iter_source_files_includes_files_with_no_archetype_match(tmp_path: Path) -> None:
+    src_dir = tmp_path / "src" / "pkg"
+    src_dir.mkdir(parents=True)
+    (src_dir / "bare.py").write_text("def helper():\n    pass\n", encoding="utf-8")
+
+    files = iter_source_files(tmp_path, Excludes())
+
+    assert files == ("src/pkg/bare.py",)
+    # bare.py has no class/typer/blueprint archetype -- confirms scan_tree's
+    # points would NOT have seen this file at all without iter_source_files.
+    scanned = scan_tree(tmp_path, Excludes())
+    assert scanned.points == ()
+
+
+def test_scan_tree_honors_content_overrides(tmp_path: Path) -> None:
+    src_dir = tmp_path / "src" / "pkg"
+    src_dir.mkdir(parents=True)
+    (src_dir / "a.py").write_text("class OnDisk:\n    def m(self): pass\n", encoding="utf-8")
+
+    result = scan_tree(
+        tmp_path,
+        Excludes(),
+        content_overrides={"src/pkg/a.py": "class Overridden:\n    def m(self): pass\n"},
+    )
+
+    assert [p.identity for p in result.points] == ["Overridden"]

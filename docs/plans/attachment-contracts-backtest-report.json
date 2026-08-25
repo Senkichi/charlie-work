@@ -1,6 +1,10 @@
 {
- "cluster_b_detail": "0 bare-function module(s) registering only via module-ledger archetype (expected partial miss)",
- "cluster_b_score": 0,
+ "available_month_labels": [
+  "2026-07",
+  "2026-08"
+ ],
+ "cluster_b_detail": "128 module(s) scanned with no AP archetype matched at all: d28ce28f0eae42ce1da0eba742f41cf24966f24d:src/devin_orchestrator/__init__.py, d28ce28f0eae42ce1da0eba742f41cf24966f24d:src/devin_orchestrator/__main__.py, d28ce28f0eae42ce1da0eba742f41cf24966f24d:src/devin_orchestrator/cli.py, d28ce28f0eae42ce1da0eba742f41cf24966f24d:src/devin_orchestrator/prompts.py, d28ce28f0eae42ce1da0eba742f41cf24966f24d:src/devin_orchestrator/state.py, 197a85b49a812715a4a872551d0fec538bd1e9ea:src/charlie_work/__init__.py, 197a85b49a812715a4a872551d0fec538bd1e9ea:src/charlie_work/__main__.py, 197a85b49a812715a4a872551d0fec538bd1e9ea:src/charlie_work/api_worker.py, 197a85b49a812715a4a872551d0fec538bd1e9ea:src/charlie_work/cli.py, 197a85b49a812715a4a872551d0fec538bd1e9ea:src/charlie_work/env_sanitize.py",
+ "cluster_b_score": 128,
  "criteria": [
   {
    "detail": "saturated at all 4 samples where present",
@@ -18,12 +22,13 @@
    "passed": true
   },
   {
-   "detail": "zero false-positive saturations; positive control: 3/13 counterexample module(s) actually produced an AP (queried), 10 emitted no AP in any sample (untested by this gate, not a validated pass): event_kinds.py, fleet_paths.py, git_pull_blockers.py, logging_setup.py, markdown_fence.py, prompt_sections.py, rescue.py, safe_path.py, safe_ref.py, throttle_signatures.py",
+   "detail": "INCONCLUSIVE (treated as FAIL): only 3/13 counterexample module(s) actually produced an AP (queried) \u2014 below the 50% coverage floor required for zero false positives to count as a validated pass; positive control: 3/13 counterexample module(s) actually produced an AP (queried), 10 emitted no AP in any sample (untested by this gate): event_kinds.py, fleet_paths.py, git_pull_blockers.py, logging_setup.py, markdown_fence.py, prompt_sections.py, rescue.py, safe_path.py, safe_ref.py, throttle_signatures.py",
    "name": "counterexamples_clean",
-   "passed": true
+   "passed": false
   }
  ],
- "passed": true,
+ "passed": false,
+ "requested_months": 6,
  "samples": [
   {
    "date": "2026-07-01",
@@ -50,15 +55,16 @@
     "class:src/charlie_work/github.py:GitHubLike",
     "class:src/charlie_work/worker.py:WorkerView",
     "class:src/charlie_work/workflow.py:OrchestratorApp",
-    "class:tests/test_charlie_work.py:EscalatedDivergenceGitHub",
     "class:tests/test_charlie_work.py:FakeGitHub",
+    "class:tests/test_charlie_work.py:test_loop_corrects_escalated_label_divergence_via_reconcile_pass.EscalatedDivergenceGitHub",
     "class:tests/test_cli.py:_FakeGitHub",
     "class:tests/test_reconcile.py:FakeGitHub",
     "class:tests/test_safe_ref.py:TestRequireValidRefName",
     "class:tests/test_safe_ref.py:TestRequireValidRev",
     "class:tests/test_safe_ref.py:TestRequireValidSha",
     "class:tests/test_subprocess_runner.py:TestResolveCliBinary",
-    "class:tests/test_worker.py:FakeGitHub",
+    "class:tests/test_worker.py:test_workflow_classify_dead_sessions_reaps_probe_error_sidecar.FakeGitHub",
+    "class:tests/test_worker.py:test_workflow_classify_dead_sessions_reaps_sidecar.FakeGitHub",
     "test_module:tests/test_charlie_work.py:tests/test_charlie_work.py::module",
     "test_module:tests/test_claude_code_adapter.py:tests/test_claude_code_adapter.py::module",
     "test_module:tests/test_fleet_dispatch.py:tests/test_fleet_dispatch.py::module",
@@ -67,7 +73,7 @@
     "test_module:tests/test_runner_allocation.py:tests/test_runner_allocation.py::module",
     "test_module:tests/test_worktree.py:tests/test_worktree.py::module"
    ],
-   "saturated_count": 20,
+   "saturated_count": 21,
    "sha": "197a85b49a812715a4a872551d0fec538bd1e9ea"
   },
   {
@@ -85,12 +91,12 @@
     "class:src/charlie_work/workflow.py:ConcurrencyGovernorResult",
     "class:src/charlie_work/workflow.py:OrchestratorApp",
     "class:tests/test_backlog_reachability.py:FakeGh",
-    "class:tests/test_charlie_work.py:DriftGitHub",
-    "class:tests/test_charlie_work.py:EscalatedDivergenceGitHub",
     "class:tests/test_charlie_work.py:FakeGitHub",
-    "class:tests/test_charlie_work.py:FakeGitHubBatched",
-    "class:tests/test_charlie_work.py:FakeGitHubCappedOutsideWindow",
-    "class:tests/test_charlie_work.py:FakeGitHubForSweep",
+    "class:tests/test_charlie_work.py:test_dispatch_caps_externally_merged_issue_lookups_at_finalize_limit.FakeGitHubCappedOutsideWindow",
+    "class:tests/test_charlie_work.py:test_dispatch_reachability_blocker_lookups_are_batched.FakeGitHubBatched",
+    "class:tests/test_charlie_work.py:test_loop_corrects_escalated_label_divergence_via_reconcile_pass.EscalatedDivergenceGitHub",
+    "class:tests/test_charlie_work.py:test_reconcile_exit_ok_when_drift_fixed.DriftGitHub",
+    "class:tests/test_charlie_work.py:test_sweep_orphan_processes_called_from_production_loop.FakeGitHubForSweep",
     "class:tests/test_cli.py:_FakeGitHub",
     "class:tests/test_issue_956.py:_SalvageTestGitHub",
     "class:tests/test_load_state_locked.py:FakeGitHub",
@@ -104,8 +110,9 @@
     "class:tests/test_subprocess_runner.py:TestResolveCliBinary",
     "class:tests/test_supervise.py:FakeClock",
     "class:tests/test_wedge_watchdog.py:FakeProcess",
-    "class:tests/test_worker.py:FakeGitHub",
     "class:tests/test_worker.py:_NoOpGitHub",
+    "class:tests/test_worker.py:test_workflow_classify_dead_sessions_reaps_probe_error_sidecar.FakeGitHub",
+    "class:tests/test_worker.py:test_workflow_classify_dead_sessions_reaps_sidecar.FakeGitHub",
     "test_module:tests/test_api_budget.py:tests/test_api_budget.py::module",
     "test_module:tests/test_charlie_work.py:tests/test_charlie_work.py::module",
     "test_module:tests/test_claude_code_adapter.py:tests/test_claude_code_adapter.py::module",
@@ -127,7 +134,7 @@
     "test_module:tests/test_worker_health.py:tests/test_worker_health.py::module",
     "test_module:tests/test_worktree.py:tests/test_worktree.py::module"
    ],
-   "saturated_count": 50,
+   "saturated_count": 51,
    "sha": "1ead8585f58f832c5442dc3d7173a662348e150a"
   },
   {
@@ -145,12 +152,13 @@
     "class:tests/_fakes_github.py:FakeGitHub",
     "class:tests/_reconcile_fixtures.py:FakeGitHub",
     "class:tests/_salvage_fixtures.py:_SalvageTestGitHub",
-    "class:tests/test_charlie_work.py:EscalatedDivergenceGitHub",
+    "class:tests/test_charlie_work.py:test_loop_corrects_escalated_label_divergence_via_reconcile_pass.EscalatedDivergenceGitHub",
     "class:tests/test_safe_ref.py:TestRequireValidRefName",
     "class:tests/test_safe_ref.py:TestRequireValidRev",
     "class:tests/test_safe_ref.py:TestRequireValidSha",
     "class:tests/test_subprocess_runner.py:TestResolveCliBinary",
-    "class:tests/test_worker.py:FakeGitHub",
+    "class:tests/test_worker.py:test_workflow_classify_dead_sessions_reaps_probe_error_sidecar.FakeGitHub",
+    "class:tests/test_worker.py:test_workflow_classify_dead_sessions_reaps_sidecar.FakeGitHub",
     "test_module:tests/test_api_budget.py:tests/test_api_budget.py::module",
     "test_module:tests/test_charlie_work.py:tests/test_charlie_work.py::module",
     "test_module:tests/test_checks.py:tests/test_checks.py::module",
@@ -175,7 +183,7 @@
     "test_module:tests/test_worker_stop_gate.py:tests/test_worker_stop_gate.py::module",
     "test_module:tests/test_worktree.py:tests/test_worktree.py::module"
    ],
-   "saturated_count": 38,
+   "saturated_count": 39,
    "sha": "7373d47b2d0cf4612dd5600de9f66c320000ac1f"
   },
   {
@@ -194,13 +202,14 @@
     "class:tests/_fakes_github.py:FakeGitHub",
     "class:tests/_reconcile_fixtures.py:FakeGitHub",
     "class:tests/_salvage_fixtures.py:_SalvageTestGitHub",
-    "class:tests/test_charlie_work.py:EscalatedDivergenceGitHub",
+    "class:tests/test_charlie_work.py:test_loop_corrects_escalated_label_divergence_via_reconcile_pass.EscalatedDivergenceGitHub",
     "class:tests/test_safe_ref.py:TestRequireValidRefName",
     "class:tests/test_safe_ref.py:TestRequireValidRev",
     "class:tests/test_safe_ref.py:TestRequireValidSha",
     "class:tests/test_state_decision_cache_enforcement.py:_PrStateWriteVisitor",
     "class:tests/test_subprocess_runner.py:TestResolveCliBinary",
-    "class:tests/test_worker.py:FakeGitHub",
+    "class:tests/test_worker.py:test_workflow_classify_dead_sessions_reaps_probe_error_sidecar.FakeGitHub",
+    "class:tests/test_worker.py:test_workflow_classify_dead_sessions_reaps_sidecar.FakeGitHub",
     "test_module:tests/test_api_budget.py:tests/test_api_budget.py::module",
     "test_module:tests/test_charlie_work.py:tests/test_charlie_work.py::module",
     "test_module:tests/test_checks.py:tests/test_checks.py::module",
@@ -227,7 +236,7 @@
     "test_module:tests/test_worker_stop_gate.py:tests/test_worker_stop_gate.py::module",
     "test_module:tests/test_worktree.py:tests/test_worktree.py::module"
    ],
-   "saturated_count": 42,
+   "saturated_count": 43,
    "sha": "9de0b9fc14279ef3578424bfb8fa6687d6eb12a9"
   }
  ]

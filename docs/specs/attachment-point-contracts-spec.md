@@ -162,9 +162,17 @@ plan (the hook prints it; callers decide).
 
 ## check.py — the two entry points
 
-- `check_file(path, root) -> list[Finding]`: single-file scan (sub-second), compare
-  against committed baseline. Used by the hook. Parse failure -> Finding(error) (G6 —
-  fail TOWARD CI, never silently pass).
+- `check_file(path, root) -> list[Finding]`: single-file VIEW over a full-tree scan
+  (delegates to `check_tree` and filters to `path`), compare against committed baseline.
+  Used by the hook. **Not sub-second on a repo this package's own size (~3s
+  measured)**: a single point's saturation verdict depends on its whole archetype
+  distribution's outlier boundary, so classifying one file correctly requires scanning
+  the tree, not just that file. This is a deliberate parity tradeoff (hook and CI share
+  exactly one comparison algorithm, so they can never diverge in behavior) traded
+  against hook latency; round-1 review (finding #6) confirmed the tradeoff is
+  real and this line is the amendment closing that gap rather than leaving spec and
+  behavior in conflict. Parse failure -> Finding(error) (G6 — fail TOWARD CI, never
+  silently pass).
 - `check_tree(root) -> list[Finding]`: full scan + baseline compare + tamper guard +
   G6 (any parse_failures -> error findings).
 Exit codes for `__main__`: 0 clean, 1 findings-with-error/block (CI fail), 0 with

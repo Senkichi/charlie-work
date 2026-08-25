@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from charlie_work.attachment_contracts.archetypes import scan_tree
 from charlie_work.attachment_contracts.backtest import ANCHOR_SHAS, run_backtest, write_report
 from charlie_work.attachment_contracts.baseline import (
     BASELINE_FILENAME,
+    TamperError,
     compare,
     dump,
     load,
@@ -31,6 +33,7 @@ from charlie_work.attachment_contracts.baseline import (
 from charlie_work.attachment_contracts.baseline import (
     generate as generate_baseline,
 )
+from charlie_work.attachment_contracts.baseline import loads as load_baseline_text
 from charlie_work.attachment_contracts.check import check_file, check_tree
 from charlie_work.attachment_contracts.excludes import load_excludes
 from charlie_work.attachment_contracts.model import Finding
@@ -122,9 +125,38 @@ def _cmd_check_file(args: argparse.Namespace) -> int:
     return 1 if _is_blocking(findings) else 0
 
 
+def _load_previous_baseline_document(root: Path, base_ref: str) -> dict[str, object] | None:
+    """Fetch `.attachment-budgets.json` as it read at `base_ref`, for the G4
+    diff-based ratchet-tamper guard (finding #1). Returns None -- meaning
+    "nothing to diff against, skip that check for this run" -- whenever it
+    genuinely can't be resolved: the ref doesn't exist, the file didn't exist
+    yet at that ref (freeze-on-adopt's first commit), or this isn't a git
+    checkout at all. Never raises: the base-ref lookup is a bonus check, not
+    a precondition for `check-tree` to run at all.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{base_ref}:{BASELINE_FILENAME}"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return load_baseline_text(result.stdout)
+    except TamperError:
+        return None
+
+
 def _cmd_check_tree(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
-    findings = check_tree(root)
+    previous_document = (
+        _load_previous_baseline_document(root, args.base_ref) if args.base_ref else None
+    )
+    findings = check_tree(root, previous_baseline_document=previous_document)
     if args.github_annotations:
         for f in findings:
             print(_github_annotation(f))
@@ -167,6 +199,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_check_tree.add_argument("--root", default=".")
     p_check_tree.add_argument("--report-only", action="store_true")
     p_check_tree.add_argument("--github-annotations", action="store_true")
+    p_check_tree.add_argument(
+        "--base-ref",
+        default=None,
+        help=(
+            "git ref to diff the committed baseline against for the ratchet-tamper "
+            "guard (finding #1). Omit to skip that check (e.g. outside CI)."
+        ),
+    )
     p_check_tree.set_defaults(func=_cmd_check_tree)
 
     p_backtest = sub.add_parser("backtest", help="G1 positive-control backtest over git history.")

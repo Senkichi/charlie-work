@@ -21,7 +21,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from charlie_work.attachment_contracts.excludes import load_excludes
+from charlie_work.attachment_contracts.excludes import Excludes, load_excludes
 from charlie_work.attachment_contracts.model import AttachmentPoint, Kind, ScanResult
 from charlie_work.attachment_contracts.outliers import saturate
 
@@ -65,6 +65,7 @@ class CommitRef:
     sha: str
     date: str  # ISO "YYYY-MM-DD", commit author date
     label: str  # e.g. "2026-03" (first-of-month) or "anchor"
+    changed_file_count: int = 0  # G3: feeds Excludes.is_codemod_commit
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,10 @@ class SampleResult:
     points: tuple[AttachmentPoint, ...]
     saturated_keys: frozenset[tuple[Kind, str, str]]  # (kind, file, identity)
     parse_failures: tuple[str, ...] = ()
+    # Every scanned file, not just files that produced an AttachmentPoint --
+    # needed to see bare-function / no-archetype-match modules at all (the
+    # Cluster-B probe; see `_cluster_b_informational`).
+    scanned_files: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -90,10 +95,15 @@ class BacktestVerdict:
     criteria: tuple[CriterionResult, ...]
     cluster_b_score: int  # informational only, never gates pass/fail
     cluster_b_detail: str
+    requested_months: int = 0  # honest reporting: requested vs available window
 
     @property
     def passed(self) -> bool:
         return all(c.passed for c in self.criteria)
+
+    @property
+    def available_month_labels(self) -> tuple[str, ...]:
+        return tuple(sorted({s.ref.label for s in self.samples if s.ref.label != "anchor"}))
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +115,7 @@ def select_samples(
     commits: tuple[CommitRef, ...],
     months: int,
     anchor_shas: tuple[str, ...] = ANCHOR_SHAS,
+    excludes: Excludes | None = None,
 ) -> tuple[CommitRef, ...]:
     """Pick the first commit of each of the most recent `months` calendar
     months present in `commits`, plus the explicit anchor commits.
@@ -115,12 +126,29 @@ def select_samples(
     `commits` and always included, even if their month was not otherwise
     selected — they are explicit, not derived. Deduplicated by sha; result is
     sorted chronologically by date.
+
+    G3: when `excludes` is given, the "first commit of the month" pick skips
+    any commit that is blame-ignored or codemod-shaped (falling through to
+    the next-earliest commit that month), so a bulk-reformat commit doesn't
+    become the sample representing real, human-driven growth for that month.
+    Anchors are explicit spec-named checkpoints and are never filtered by
+    this — they are included regardless.
     """
+
+    def _is_excluded(ref: CommitRef) -> bool:
+        if excludes is None:
+            return False
+        return ref.sha in excludes.blame_ignore_shas or excludes.is_codemod_commit(
+            ref.changed_file_count
+        )
+
     by_month: dict[str, CommitRef] = {}
     for ref in sorted(commits, key=lambda r: r.date):
+        if _is_excluded(ref):
+            continue
         month_key = ref.date[:7]  # "YYYY-MM"
         if month_key not in by_month:
-            by_month[month_key] = ref  # first (earliest) commit of that month
+            by_month[month_key] = ref  # first (earliest) non-excluded commit of that month
 
     recent_months = sorted(by_month.keys())[-months:] if months > 0 else []
     selected: dict[str, CommitRef] = {
@@ -226,16 +254,28 @@ def _criterion_test_worktree_at_anchors(
     return CriterionResult(name="test_worktree_saturated_at_anchors", passed=passed, detail=detail)
 
 
+# A "zero false positives" result only counts as a validated pass when at
+# least this fraction of the 13 counterexamples actually appeared in the
+# scanned AP inventory -- below the floor, "zero hits" is dominated by
+# untested queries (modules that never emitted an AP at all) rather than
+# real negatives, which is exactly the hole G1 exists to close (finding #3a).
+_COUNTEREXAMPLE_MIN_COVERAGE = 0.5
+
+
 def _criterion_counterexamples_clean(samples: tuple[SampleResult, ...]) -> CriterionResult:
-    """ZERO of the 13 counterexample modules may produce a saturated AP.
+    """ZERO of the 13 counterexample modules may produce a saturated AP --
+    AND enough of them must have been queryable at all for that zero to mean
+    something.
 
     A module that never emits an AttachmentPoint at all (e.g. a bare-function
     module with no class/router archetype) trivially satisfies "never
     saturated" — that is an untested query, not evidence the outlier test
     handles it correctly. Track which counterexample modules actually
     appeared in the scanned AP inventory (the positive control) separately
-    from which ones triggered a false-positive saturation (the gate), so the
-    report cannot imply coverage it doesn't have.
+    from which ones triggered a false-positive saturation (the gate). A
+    control that could not have failed is not a pass, so coverage below
+    `_COUNTEREXAMPLE_MIN_COVERAGE` makes this criterion FAIL even with zero
+    hits, rather than reporting a green that overclaims what was checked.
     """
     hits: list[str] = []
     scanned: set[str] = set()
@@ -248,16 +288,27 @@ def _criterion_counterexamples_clean(samples: tuple[SampleResult, ...]) -> Crite
             if _is_saturated(sample, point):
                 hits.append(f"{sample.ref.sha}:{point.file}:{point.identity}")
     not_scanned = sorted(set(COUNTEREXAMPLE_MODULES) - scanned)
-    passed = not hits
-    detail = "zero false-positive saturations" if passed else f"false positives: {', '.join(hits)}"
+    coverage = len(scanned) / len(COUNTEREXAMPLE_MODULES)
+    passed = not hits and coverage >= _COUNTEREXAMPLE_MIN_COVERAGE
+    if hits:
+        detail = f"false positives: {', '.join(hits)}"
+    elif coverage < _COUNTEREXAMPLE_MIN_COVERAGE:
+        detail = (
+            f"INCONCLUSIVE (treated as FAIL): only {len(scanned)}/{len(COUNTEREXAMPLE_MODULES)} "
+            f"counterexample module(s) actually produced an AP (queried) — below the "
+            f"{_COUNTEREXAMPLE_MIN_COVERAGE:.0%} coverage floor required for zero false "
+            "positives to count as a validated pass"
+        )
+    else:
+        detail = "zero false-positive saturations"
     detail += (
         f"; positive control: {len(scanned)}/{len(COUNTEREXAMPLE_MODULES)} counterexample "
         f"module(s) actually produced an AP (queried)"
     )
     if not_scanned:
         detail += (
-            f", {len(not_scanned)} emitted no AP in any sample (untested by this gate, "
-            f"not a validated pass): {', '.join(not_scanned)}"
+            f", {len(not_scanned)} emitted no AP in any sample (untested by this gate): "
+            f"{', '.join(not_scanned)}"
         )
     return CriterionResult(name="counterexamples_clean", passed=passed, detail=detail)
 
@@ -265,36 +316,33 @@ def _criterion_counterexamples_clean(samples: tuple[SampleResult, ...]) -> Crite
 def _cluster_b_informational(samples: tuple[SampleResult, ...]) -> tuple[int, str]:
     """Informational only (reported, never gates pass/fail).
 
-    Counts, per sample, bare-function (module-level) files whose responsibility
-    surface is captured only as a `migration_runner` module-ledger AP or not
-    captured by any class/typer/blueprint archetype at all — i.e. cases where
-    a bare-function module's growth would register via the `class`/module
-    archetypes only partially, which is the expected, documented gap.
+    Counts, per sample, files that were scanned but matched NO archetype at
+    all (no class/typer/blueprint/migration_runner/test_module AttachmentPoint
+    of any kind) -- the bare-function / no-archetype-coverage gap G1's
+    Cluster-B probe exists to surface (finding #3b: the previous
+    `kind == "migration_runner"` counter could never fire, because a
+    non-ledger bare-function module produces zero points to begin with --
+    it was structurally guaranteed to read 0, not measured). `scanned_files`
+    (every file the scan walked, independent of whether it produced a point)
+    is what makes a bare module visible to this probe at all.
     """
     hits = 0
     examples: list[str] = []
     for sample in samples:
-        files_with_class_or_router_ap = {
-            p.file
-            for p in sample.points
-            if p.kind in ("class", "typer_app", "click_group", "blueprint")
-        }
-        for point in sample.points:
-            if point.kind == "migration_runner" and point.identity.startswith("module:"):
-                if point.file not in files_with_class_or_router_ap:
-                    hits += 1
-                    examples.append(f"{sample.ref.sha}:{point.file}")
-    detail = (
-        f"{hits} bare-function module(s) registering only via module-ledger archetype "
-        f"(expected partial miss)"
-    )
+        files_with_any_archetype = {p.file for p in sample.points}
+        for file in sorted(sample.scanned_files - files_with_any_archetype):
+            hits += 1
+            examples.append(f"{sample.ref.sha}:{file}")
+    detail = f"{hits} module(s) scanned with no AP archetype matched at all"
     if examples:
         detail += f": {', '.join(examples[:10])}"
     return hits, detail
 
 
 def evaluate(
-    samples: tuple[SampleResult, ...], anchor_shas: tuple[str, ...] = ANCHOR_SHAS
+    samples: tuple[SampleResult, ...],
+    anchor_shas: tuple[str, ...] = ANCHOR_SHAS,
+    requested_months: int = 0,
 ) -> BacktestVerdict:
     """Evaluate the PASS criteria (spec section `backtest.py`) over `samples`."""
     criteria = (
@@ -309,6 +357,7 @@ def evaluate(
         criteria=criteria,
         cluster_b_score=cluster_b_score,
         cluster_b_detail=cluster_b_detail,
+        requested_months=requested_months,
     )
 
 
@@ -322,6 +371,17 @@ def render_markdown(verdict: BacktestVerdict) -> str:
     lines.append(f"**Overall: {'PASS' if verdict.passed else 'FAIL'}**")
     lines.append("")
     lines.append(f"Samples: {len(verdict.samples)}")
+    lines.append("")
+    month_labels = verdict.available_month_labels
+    anchor_count = sum(1 for s in verdict.samples if s.ref.label == "anchor")
+    lines.append(
+        f"Sample window (honest, finding #3c): {len(month_labels)} distinct calendar "
+        f"month(s) available in this history "
+        f"({', '.join(month_labels) if month_labels else 'none'}), requested "
+        f"{verdict.requested_months}; plus {anchor_count} explicit anchor(s). This is NOT "
+        f"necessarily a {verdict.requested_months}-month control -- read it as coverage over "
+        "whatever history the repo actually has, plus the named anchors."
+    )
     lines.append("")
     lines.append("## Criteria")
     lines.append("")
@@ -352,6 +412,8 @@ def render_json(verdict: BacktestVerdict) -> str:
         ],
         "cluster_b_score": verdict.cluster_b_score,
         "cluster_b_detail": verdict.cluster_b_detail,
+        "requested_months": verdict.requested_months,
+        "available_month_labels": list(verdict.available_month_labels),
         "samples": [
             {
                 "sha": s.ref.sha,
@@ -385,14 +447,33 @@ def _run_git(repo_path: Path, *args: str) -> str:
 
 
 def load_commit_log(repo_path: Path, branch: str = "main") -> tuple[CommitRef, ...]:
-    """`git log` on `branch`, one CommitRef per commit (full sha + author date)."""
-    output = _run_git(repo_path, "log", "--pretty=format:%H|%ad", "--date=short", branch)
+    """`git log` on `branch`, one CommitRef per commit (full sha + author date +
+    changed file count -- G3's `is_codemod_commit` input).
+
+    `--name-only` output is grouped into per-commit blocks by a `@@`-prefixed
+    header line (`@@` is not a legal path character, so it can't collide with
+    a real filename) so each block's line count becomes `changed_file_count`.
+    """
+    output = _run_git(
+        repo_path, "log", "--pretty=format:@@%H|%ad", "--date=short", "--name-only", branch
+    )
     refs: list[CommitRef] = []
+    sha = ""
+    date = ""
+    file_count = 0
+
+    def _flush() -> None:
+        if sha:
+            refs.append(CommitRef(sha=sha, date=date, label="", changed_file_count=file_count))
+
     for line in output.splitlines():
-        if not line.strip():
-            continue
-        sha, _, date = line.partition("|")
-        refs.append(CommitRef(sha=sha, date=date, label=""))
+        if line.startswith("@@"):
+            _flush()
+            sha, _, date = line[2:].partition("|")
+            file_count = 0
+        elif line.strip():
+            file_count += 1
+    _flush()
     return tuple(refs)
 
 
@@ -400,7 +481,7 @@ def _scan_sample(repo_root: Path, ref: CommitRef) -> SampleResult:
     excludes = load_excludes(repo_root)
     # Imported lazily to avoid a hard import-time dependency cycle between
     # backtest.py and archetypes.py during concurrent development.
-    from charlie_work.attachment_contracts.archetypes import scan_tree
+    from charlie_work.attachment_contracts.archetypes import iter_source_files, scan_tree
 
     scan: ScanResult = scan_tree(repo_root, excludes)
     kinds = sorted({p.kind for p in scan.points})
@@ -416,6 +497,7 @@ def _scan_sample(repo_root: Path, ref: CommitRef) -> SampleResult:
         points=scan.points,
         saturated_keys=frozenset(saturated_keys),
         parse_failures=scan.parse_failures,
+        scanned_files=frozenset(iter_source_files(repo_root, excludes)),
     )
 
 
@@ -440,8 +522,9 @@ def run_backtest(
     """Full orchestration: sample commits, materialize each into a disposable
     detached worktree under `repo_path`'s parent, scan + saturate, tear down.
     """
+    excludes = load_excludes(repo_path)
     commits = load_commit_log(repo_path, branch=branch)
-    samples_to_run = select_samples(commits, months, anchor_shas)
+    samples_to_run = select_samples(commits, months, anchor_shas, excludes=excludes)
 
     results: list[SampleResult] = []
     parent_dir = repo_path.resolve().parent
@@ -454,7 +537,7 @@ def run_backtest(
             finally:
                 _worktree_remove(repo_path, worktree_dir)
 
-    return evaluate(tuple(results), anchor_shas)
+    return evaluate(tuple(results), anchor_shas, requested_months=months)
 
 
 def write_report(verdict: BacktestVerdict, out_dir: Path) -> tuple[Path, Path]:

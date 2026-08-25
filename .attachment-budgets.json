@@ -84,7 +84,7 @@
    "boundary": 5.0,
    "bumps": [],
    "file": "tests/test_charlie_work.py",
-   "identity": "EscalatedDivergenceGitHub",
+   "identity": "test_loop_corrects_escalated_label_divergence_via_reconcile_pass.EscalatedDivergenceGitHub",
    "kind": "class",
    "member_count": 7
   },
@@ -132,7 +132,7 @@
    "boundary": 5.0,
    "bumps": [],
    "file": "tests/test_worker.py",
-   "identity": "FakeGitHub",
+   "identity": "test_workflow_classify_dead_sessions_reaps_probe_error_sidecar.FakeGitHub",
    "kind": "class",
    "member_count": 6
   },
@@ -140,7 +140,7 @@
    "boundary": 5.0,
    "bumps": [],
    "file": "tests/test_worker.py",
-   "identity": "FakeGitHub",
+   "identity": "test_workflow_classify_dead_sessions_reaps_sidecar.FakeGitHub",
    "kind": "class",
    "member_count": 6
   },
@@ -346,7 +346,7 @@
   }
  ],
  "floor": 4,
- "generated_at": "2026-08-25T03:41:02.728308+00:00",
+ "generated_at": "2026-08-25T04:39:49.322632+00:00",
  "generated_by": "charlie_work.attachment_contracts 0.1.0",
  "version": 1
 }

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 
 from charlie_work.attachment_contracts.baseline import (
+    TamperError,
+    check_ratchet_tamper,
     check_tamper,
     compare,
     dumps,
@@ -335,3 +337,134 @@ def test_tamper_no_finding_when_matches_and_no_bumps() -> None:
     findings = check_tamper(current, doc)
 
     assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# check_ratchet_tamper(): closes the raise-to-match laundering gap (finding #1)
+# ---------------------------------------------------------------------------
+
+
+def test_ratchet_tamper_detects_raise_to_match_laundering() -> None:
+    # The empirical proof case from the round-1 review: baseline hand-raised
+    # from 134 to 135 in lockstep with real growth, no bump -- both
+    # `compare()` and `check_tamper()` are blind to this; only a diff against
+    # the PREVIOUS committed baseline can see it.
+    previous = _doc_with_entries(
+        BaselineEntry(
+            kind="class", identity="OrchestratorApp", file="src/x.py", member_count=134,
+            boundary=5.0,
+        )
+    )
+    current = _doc_with_entries(
+        BaselineEntry(
+            kind="class", identity="OrchestratorApp", file="src/x.py", member_count=135,
+            boundary=5.0,
+        )
+    )
+
+    findings = check_ratchet_tamper(previous, current)
+
+    assert len(findings) == 1
+    assert findings[0].severity == "error"
+    assert "tamper" in findings[0].message
+    assert "134" in findings[0].message and "135" in findings[0].message
+
+
+def test_ratchet_tamper_clean_when_unchanged() -> None:
+    entry = BaselineEntry(
+        kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0
+    )
+    previous = _doc_with_entries(entry)
+    current = _doc_with_entries(entry)
+
+    assert check_ratchet_tamper(previous, current) == []
+
+
+def test_ratchet_tamper_clean_on_legitimate_ratchet_down() -> None:
+    previous = _doc_with_entries(
+        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0)
+    )
+    current = _doc_with_entries(
+        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=5, boundary=6.0)
+    )
+
+    assert check_ratchet_tamper(previous, current) == []
+
+
+def test_ratchet_tamper_clean_for_a_brand_new_entry() -> None:
+    previous = _doc_with_entries()
+    current = _doc_with_entries(
+        BaselineEntry(kind="class", identity="new", file="src/n.py", member_count=10, boundary=6.0)
+    )
+
+    assert check_ratchet_tamper(previous, current) == []
+
+
+def test_ratchet_tamper_no_findings_when_no_previous_document() -> None:
+    current = _doc_with_entries(
+        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=999, boundary=6.0)
+    )
+
+    assert check_ratchet_tamper(None, current) == []
+
+
+def test_ratchet_tamper_bump_does_not_excuse_a_member_count_raise() -> None:
+    # Even a validly-acked bump does NOT justify the member_count FIELD
+    # itself rising -- legitimate bump usage raises the ceiling while leaving
+    # member_count untouched (see test_compare_bump_raises_effective_ceiling).
+    # A rise in member_count is tamper regardless of bumps.
+    bump = Bump(to=20, reason="reviewed", actor="interactive", ack="")
+    previous = _doc_with_entries(
+        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0)
+    )
+    current = _doc_with_entries(
+        BaselineEntry(
+            kind="class", identity="a", file="src/a.py", member_count=15, boundary=6.0,
+            bumps=(bump,),
+        )
+    )
+
+    findings = check_ratchet_tamper(previous, current)
+
+    assert len(findings) == 1
+
+
+# ---------------------------------------------------------------------------
+# loads(): duplicate (kind, file, identity) entries are rejected (finding #7)
+# ---------------------------------------------------------------------------
+
+
+def test_loads_rejects_duplicate_identity_entries() -> None:
+    doc = _doc_with_entries(
+        BaselineEntry(
+            kind="class", identity="FakeGitHub", file="tests/test_worker.py",
+            member_count=6, boundary=5.0,
+        ),
+        BaselineEntry(
+            kind="class", identity="FakeGitHub", file="tests/test_worker.py",
+            member_count=6, boundary=5.0,
+        ),
+    )
+    text = dumps(doc)
+
+    import pytest
+
+    with pytest.raises(TamperError):
+        loads(text)
+
+
+def test_loads_allows_same_identity_in_different_files() -> None:
+    doc = _doc_with_entries(
+        BaselineEntry(
+            kind="class", identity="FakeGitHub", file="tests/_fakes_github.py",
+            member_count=45, boundary=5.0,
+        ),
+        BaselineEntry(
+            kind="class", identity="FakeGitHub", file="tests/_reconcile_fixtures.py",
+            member_count=10, boundary=5.0,
+        ),
+    )
+    text = dumps(doc)
+
+    reloaded = loads(text)
+    assert len(entries_of(reloaded)) == 2

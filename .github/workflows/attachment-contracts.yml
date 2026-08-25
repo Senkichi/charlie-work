@@ -29,7 +29,14 @@ jobs:
     runs-on: [self-hosted, Windows, X64, light]
     timeout-minutes: 15
     steps:
+      # fetch-depth: 0 (full history) is required so `--base-ref` below can
+      # `git show <base>:.attachment-budgets.json` -- the diff-based
+      # ratchet-tamper guard (round-1 review finding #1: raise-to-match
+      # laundering) needs the PREVIOUS commit's baseline as an independent
+      # reference point, which a shallow clone would not have.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       # setup-uv@v7 replaced with a PATH-append (#1115): the action's runner
       # Node process crashed twice in 12 min with a libuv assertion
       # (async.c:94, upstream flake class) on this box, and on a self-hosted
@@ -98,4 +105,12 @@ jobs:
       # required -- the job stops being informational and starts blocking
       # merges the moment that flag is removed.
       - name: Check tree (report-only)
-        run: uv run python -m charlie_work.attachment_contracts check-tree --report-only --github-annotations
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base_ref="${{ github.event.pull_request.base.sha }}"
+          else
+            base_ref="${{ github.event.before }}"
+          fi
+          uv run python -m charlie_work.attachment_contracts check-tree \
+            --report-only --github-annotations --base-ref "$base_ref"
