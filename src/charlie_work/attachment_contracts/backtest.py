@@ -227,14 +227,38 @@ def _criterion_test_worktree_at_anchors(
 
 
 def _criterion_counterexamples_clean(samples: tuple[SampleResult, ...]) -> CriterionResult:
+    """ZERO of the 13 counterexample modules may produce a saturated AP.
+
+    A module that never emits an AttachmentPoint at all (e.g. a bare-function
+    module with no class/router archetype) trivially satisfies "never
+    saturated" — that is an untested query, not evidence the outlier test
+    handles it correctly. Track which counterexample modules actually
+    appeared in the scanned AP inventory (the positive control) separately
+    from which ones triggered a false-positive saturation (the gate), so the
+    report cannot imply coverage it doesn't have.
+    """
     hits: list[str] = []
+    scanned: set[str] = set()
     for sample in samples:
         for point in sample.points:
             module_name = Path(point.file).name
-            if module_name in COUNTEREXAMPLE_MODULES and _is_saturated(sample, point):
+            if module_name not in COUNTEREXAMPLE_MODULES:
+                continue
+            scanned.add(module_name)
+            if _is_saturated(sample, point):
                 hits.append(f"{sample.ref.sha}:{point.file}:{point.identity}")
+    not_scanned = sorted(set(COUNTEREXAMPLE_MODULES) - scanned)
     passed = not hits
     detail = "zero false-positive saturations" if passed else f"false positives: {', '.join(hits)}"
+    detail += (
+        f"; positive control: {len(scanned)}/{len(COUNTEREXAMPLE_MODULES)} counterexample "
+        f"module(s) actually produced an AP (queried)"
+    )
+    if not_scanned:
+        detail += (
+            f", {len(not_scanned)} emitted no AP in any sample (untested by this gate, "
+            f"not a validated pass): {', '.join(not_scanned)}"
+        )
     return CriterionResult(name="counterexamples_clean", passed=passed, detail=detail)
 
 
