@@ -425,9 +425,13 @@ def test_every_pr_create_call_site_routes_through_the_validator() -> None:
             offenders.append(path.name)
 
     # Positive control: this scan must actually find the two known call
-    # sites (workflow.py, reconcile.py) or the "zero offenders" result below
-    # would be indistinguishable from "the scan never matched anything".
-    assert "workflow.py" in scanned_with_call_site
+    # sites (dead_worker_reap.py, reconcile.py) or the "zero offenders"
+    # result below would be indistinguishable from "the scan never matched
+    # anything". Issue #1317 moved the workflow.py call site (inside
+    # _open_salvage_pr / _open_pr_for_orphaned_branch) verbatim into
+    # dead_worker_reap.py; the call site itself is unchanged, only its
+    # module.
+    assert "dead_worker_reap.py" in scanned_with_call_site
     assert "reconcile.py" in scanned_with_call_site
 
     assert offenders == [], (
@@ -463,8 +467,10 @@ def test_every_pr_create_call_site_routes_through_the_retry_wrapper() -> None:
 
     # Positive control: the scan must actually find real wrapper usage, or
     # an empty `bypass_offenders` below would be indistinguishable from
-    # "the scan never matched anything".
-    assert "workflow.py" in wrapper_consumers
+    # "the scan never matched anything". See the #1317 note above the other
+    # positive control in this file -- the call site moved from workflow.py
+    # to dead_worker_reap.py verbatim.
+    assert "dead_worker_reap.py" in wrapper_consumers
     assert "reconcile.py" in wrapper_consumers
 
     assert bypass_offenders == [], (
@@ -647,7 +653,7 @@ def test_open_salvage_pr_logs_rewritten_event_when_validator_changes_body(
             target_issue_open=None,
         )
 
-    monkeypatch.setattr("charlie_work.workflow.validate_closing_reference", _fake_validate)
+    monkeypatch.setattr("charlie_work.dead_worker_reap.validate_closing_reference", _fake_validate)
 
     state_file = tmp_path / "state.json"
     state_file.write_text(json.dumps({"events": []}), encoding="utf-8")

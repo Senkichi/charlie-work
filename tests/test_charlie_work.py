@@ -38136,9 +38136,9 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
     with (
         patch("charlie_work.devin_shell.read_session_records", return_value=[fake_record]),
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.dead_worker_reap.kill_process_tree", return_value=[99999]),
         patch(
-            "charlie_work.workflow.sweep_orphan_processes",
+            "charlie_work.dead_worker_reap.sweep_orphan_processes",
             return_value=[{"pid": 3492, "name": "python.exe", "command_line": "python worker.py"}],
         ),  # Fixed mock return
         patch(
@@ -38251,8 +38251,8 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     before = datetime.now(UTC)
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -38325,8 +38325,8 @@ def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path:
     before = datetime.now(UTC)
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -38377,8 +38377,8 @@ def test_stall_reap_falls_back_to_stalled_when_no_throttle_signature(tmp_path: P
 
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -38431,8 +38431,8 @@ def test_dispatch_defers_after_stall_reap_sets_throttled_until(tmp_path: Path) -
 
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -38546,7 +38546,9 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
         patch("charlie_work.claude_code.read_worker_records", return_value=[dead_worker]),
         patch("charlie_work.devin_shell.is_session_alive", side_effect=lambda r: r.pid != 1000),
         patch("charlie_work.claude_code.is_worker_alive", side_effect=lambda r: r.pid != 1002),
-        patch("charlie_work.workflow.sweep_orphan_processes", side_effect=mock_sweep_orphan),
+        patch(
+            "charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=mock_sweep_orphan
+        ),
         patch("charlie_work.workflow.os.name", "nt"),  # Force Windows path
         patch("subprocess.run", side_effect=mock_subprocess_run),
     ):
@@ -45184,7 +45186,12 @@ def test_classify_dead_sessions_no_commits_relabels_to_ready(tmp_path: Path) -> 
 
 def test_classify_dead_sessions_salvage_push_failure_fallback(tmp_path: Path) -> None:
     """Issue #252: a failed salvage push records failure and falls back to relabel."""
-    from charlie_work import workflow as workflow_module
+    # Issue #1317: push_branch is called bare-name from inside _attempt_salvage,
+    # which moved (verbatim) to dead_worker_reap.py -- so the bare-name lookup
+    # now resolves via dead_worker_reap.py's own globals, not workflow.py's.
+    # Patch it there, not on the (still-valid) workflow.py facade re-export of
+    # _classify_dead_sessions_and_update_throttle_state itself.
+    from charlie_work import dead_worker_reap as workflow_module
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
@@ -45408,10 +45415,10 @@ def test_stall_lane_api_budget_kill_over_cap(tmp_path: Path) -> None:
     with (
         patch("charlie_work.worker.is_worker_alive", return_value=True),
         patch(
-            "charlie_work.workflow.kill_process_tree",
+            "charlie_work.dead_worker_reap.kill_process_tree",
             side_effect=lambda pid, *_a, **_kw: killed_pids.extend([pid]) or [pid],
         ),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -45478,8 +45485,8 @@ def test_stall_lane_api_provider_auth_classification(tmp_path: Path) -> None:
     before = datetime.now(UTC)
     with (
         patch("charlie_work.worker.is_worker_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99998]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.kill_process_tree", return_value=[99998]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 

@@ -861,6 +861,15 @@ _RATCHET_BASELINE: dict[str, int] = {
     # Combined baseline after merging #1131 (+2), #1393 (+11), and #1314 (+2)
     # onto the pre-existing 270: 285.
     "workflow.py": 285,
+    # Issue #1317: verbatim extraction of the dead-worker/session-reap
+    # family out of workflow.py into dead_worker_reap.py (byte-identical
+    # move, no write-path changes). These 11 raw sites are the same
+    # pre-existing calls that were already counted inside workflow.py's
+    # baseline above -- relocated, not new. workflow.py's own actual count
+    # drops accordingly (285 -> 266 at this PR), which the shrink-only
+    # ratchet accepts without a baseline edit; only the newly-introduced
+    # module needs its own entry.
+    "dead_worker_reap.py": 11,
     # Issue #1423: +2 raw primitives in _reap_idle_foreign_writer (log_event
     # for the foreign_writer_reaped instrumentation event, and kill_orphan_pid
     # for sweeping the reaped writer's orphan processes). This is a standalone
