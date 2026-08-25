@@ -736,6 +736,16 @@ class ReviewDispatchConfig:
     # human instead of redispatching with a further-raised (but already-maxed)
     # cap. 0 disables the backstop.
     max_consecutive_turn_limit_misses: int = 3
+    # Issue #1445: repo file-size cap (lines). A diff that adds code to a file
+    # whose post-diff line count exceeds this cap is a REPORTABLE FINDING in the
+    # review packet (the review rubric references this cap generically rather
+    # than hardcoding a number). 0 disables the over-cap finding probe -- the
+    # rubric prose stays present but no dynamic finding section is rendered.
+    # This knob is the cap source the rubric line points at; once issue #1442's
+    # high-water-mark line-count ratchet (or its successor structural signal)
+    # lands, that source should rebind/replace this value rather than the
+    # rubric or probe hardcoding a constant of their own.
+    file_size_cap_lines: int = 0
 
 
 @dataclass(frozen=True)
@@ -2218,6 +2228,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         "turn_cap_large_file_multiplier",
         "turn_cap_max_multiplier",
         "max_consecutive_turn_limit_misses",
+        "file_size_cap_lines",
     )
     for _rd_key in _RD_INT_KEYS:
         _rd_val = review_dispatch_data.get(_rd_key)
