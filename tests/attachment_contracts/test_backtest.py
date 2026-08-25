@@ -156,6 +156,27 @@ def test_counterexamples_clean_passes_when_coverage_meets_floor_and_zero_hits() 
     assert "zero false-positive" in result.detail
 
 
+def test_counterexamples_clean_counts_bare_function_module_toward_coverage() -> None:
+    # Round-2 review finding #8: a bare-function module (no class/router
+    # archetype -> zero AttachmentPoints) that WAS actually walked by the
+    # scanner must count toward coverage. Previously coverage was measured by
+    # "produced an AP", which made this scenario permanently untestable for
+    # 10 of the 13 spec-named counterexamples regardless of how many samples
+    # covered them -- pinning the whole criterion at FAIL.
+    bare_modules = COUNTEREXAMPLE_MODULES[:7]
+    sample = SampleResult(
+        ref=_ref("s1", "2026-06-01"),
+        points=(),  # no archetype matched any of these bare-function modules
+        saturated_keys=frozenset(),
+        scanned_files=frozenset(f"src/{m}" for m in bare_modules),
+    )
+
+    result = _criterion_counterexamples_clean((sample,))
+
+    assert result.passed is True
+    assert "zero false-positive" in result.detail
+
+
 def test_counterexamples_clean_fails_on_any_actual_hit_regardless_of_coverage() -> None:
     module = COUNTEREXAMPLE_MODULES[0]
     points = tuple(_point("class", "X", f"src/{m}", 3) for m in COUNTEREXAMPLE_MODULES[:7])

@@ -62,7 +62,15 @@ def saturate(points: tuple[AttachmentPoint, ...], kind: Kind) -> tuple[Saturatio
     are not in this call's population; call once per kind.
     """
     same_kind = tuple(p for p in points if p.kind == kind)
-    non_ledger = tuple(p for p in same_kind if not p.is_linear_ledger)
+    # An AP with zero bound members is not evidence about the god-object
+    # distribution for its kind (round-2 review finding #9): a population
+    # padded with empty classes/Protocols/etc. drags Q1 down to 0, collapsing
+    # the IQR and pulling the Tukey fence in on everything else. Such points
+    # never carry a verdict of their own -- they cannot be evidence of
+    # saturation either (member_count=0 can never exceed a boundary >= 0).
+    non_ledger = tuple(
+        p for p in same_kind if not p.is_linear_ledger and p.member_count >= 1
+    )
     counts = [p.member_count for p in non_ledger]
     population = len(counts)
 
@@ -82,6 +90,25 @@ def saturate(points: tuple[AttachmentPoint, ...], kind: Kind) -> tuple[Saturatio
     q1, q3 = _quartiles(counts)
     iqr = q3 - q1
     boundary = q3 + 1.5 * iqr
+
+    if iqr == 0.0:
+        # Degenerate fence (finding #9): with zero spread in the population,
+        # Tukey's rule collapses to a strict `> Q3` test with no statistical
+        # tolerance at all -- any point one member above a totally uniform
+        # population would "saturate" on arithmetic alone, not on being an
+        # actual outlier. Report the real q3/boundary for visibility but
+        # treat nothing as saturated until the population actually spreads.
+        return tuple(
+            SaturationVerdict(
+                point=p,
+                saturated=False,
+                q3=q3,
+                iqr=0.0,
+                boundary=boundary,
+                population=population,
+            )
+            for p in non_ledger
+        )
 
     return tuple(
         SaturationVerdict(

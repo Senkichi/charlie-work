@@ -264,27 +264,33 @@ _COUNTEREXAMPLE_MIN_COVERAGE = 0.5
 
 def _criterion_counterexamples_clean(samples: tuple[SampleResult, ...]) -> CriterionResult:
     """ZERO of the 13 counterexample modules may produce a saturated AP --
-    AND enough of them must have been queryable at all for that zero to mean
-    something.
+    AND enough of them must have actually been present in the tree at some
+    sample for that zero to mean something.
 
-    A module that never emits an AttachmentPoint at all (e.g. a bare-function
-    module with no class/router archetype) trivially satisfies "never
-    saturated" — that is an untested query, not evidence the outlier test
-    handles it correctly. Track which counterexample modules actually
-    appeared in the scanned AP inventory (the positive control) separately
-    from which ones triggered a false-positive saturation (the gate). A
-    control that could not have failed is not a pass, so coverage below
-    `_COUNTEREXAMPLE_MIN_COVERAGE` makes this criterion FAIL even with zero
-    hits, rather than reporting a green that overclaims what was checked.
+    Round-2 review finding #8: coverage previously meant "module produced an
+    AttachmentPoint", which made the criterion structurally near-unsatisfiable
+    -- most of these 13 are legitimately bare-function modules with no
+    class/router archetype, so they can NEVER mint an AP and were being
+    treated as untested no matter how many samples covered them. But a
+    bare-function module that was actually walked by the scanner and
+    correctly produced no AP IS the evidence this control exists to gather:
+    the archetype detector did not invent a false attachment point for it.
+    "Untested" should mean the file was never even in the checkout at any
+    sampled commit (renamed, added later, etc.) -- that is what
+    `scanned_files` (every file the scan walked, independent of whether it
+    produced a point) lets this distinguish from "present and clean".
     """
     hits: list[str] = []
     scanned: set[str] = set()
     for sample in samples:
+        for file in sample.scanned_files:
+            module_name = Path(file).name
+            if module_name in COUNTEREXAMPLE_MODULES:
+                scanned.add(module_name)
         for point in sample.points:
             module_name = Path(point.file).name
             if module_name not in COUNTEREXAMPLE_MODULES:
                 continue
-            scanned.add(module_name)
             if _is_saturated(sample, point):
                 hits.append(f"{sample.ref.sha}:{point.file}:{point.identity}")
     not_scanned = sorted(set(COUNTEREXAMPLE_MODULES) - scanned)
@@ -295,20 +301,20 @@ def _criterion_counterexamples_clean(samples: tuple[SampleResult, ...]) -> Crite
     elif coverage < _COUNTEREXAMPLE_MIN_COVERAGE:
         detail = (
             f"INCONCLUSIVE (treated as FAIL): only {len(scanned)}/{len(COUNTEREXAMPLE_MODULES)} "
-            f"counterexample module(s) actually produced an AP (queried) — below the "
-            f"{_COUNTEREXAMPLE_MIN_COVERAGE:.0%} coverage floor required for zero false "
-            "positives to count as a validated pass"
+            f"counterexample module(s) were actually present in the tree at any sample "
+            f"(queried) — below the {_COUNTEREXAMPLE_MIN_COVERAGE:.0%} coverage floor "
+            "required for zero false positives to count as a validated pass"
         )
     else:
         detail = "zero false-positive saturations"
     detail += (
         f"; positive control: {len(scanned)}/{len(COUNTEREXAMPLE_MODULES)} counterexample "
-        f"module(s) actually produced an AP (queried)"
+        f"module(s) were present in the tree at some sample (queried)"
     )
     if not_scanned:
         detail += (
-            f", {len(not_scanned)} emitted no AP in any sample (untested by this gate): "
-            f"{', '.join(not_scanned)}"
+            f", {len(not_scanned)} were never present in the tree at any sample "
+            f"(untested by this gate): {', '.join(not_scanned)}"
         )
     return CriterionResult(name="counterexamples_clean", passed=passed, detail=detail)
 

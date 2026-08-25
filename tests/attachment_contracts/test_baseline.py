@@ -171,6 +171,36 @@ def test_interactive_bump_without_ack_accepted() -> None:
     assert validate_bump(bump) is None
 
 
+def test_worker_bump_with_junk_ack_rejected() -> None:
+    # Round-2 review finding #10: ack was validated for non-emptiness only,
+    # so a junk ack like "x" passed. Now the shape must look like an
+    # external reference.
+    bump = Bump(to=20, reason="spike", actor="worker", ack="x")
+    error = validate_bump(bump)
+    assert error is not None
+    assert "G4" in error
+
+
+def test_worker_bump_with_issue_number_ack_accepted() -> None:
+    bump = Bump(to=20, reason="spike", actor="worker", ack="#42")
+    assert validate_bump(bump) is None
+
+
+def test_worker_bump_with_owner_repo_issue_ack_accepted() -> None:
+    bump = Bump(to=20, reason="spike", actor="worker", ack="owner/repo#42")
+    assert validate_bump(bump) is None
+
+
+def test_worker_bump_with_url_ack_accepted() -> None:
+    bump = Bump(to=20, reason="spike", actor="worker", ack="https://example.com/issues/1")
+    assert validate_bump(bump) is None
+
+
+def test_worker_bump_with_dispatch_handle_ack_accepted() -> None:
+    bump = Bump(to=20, reason="spike", actor="worker", ack="dispatch:abc123")
+    assert validate_bump(bump) is None
+
+
 def test_bump_without_reason_rejected() -> None:
     bump = Bump(to=20, reason="   ", actor="interactive", ack="")
     error = validate_bump(bump)
@@ -264,6 +294,23 @@ def test_compare_bump_raises_effective_ceiling() -> None:
     ratcheted_entries = entries_of(ratcheted)
     assert ratcheted_entries[0].member_count == 10
     assert ratcheted_entries[0].bumps == (bump,)
+
+
+def test_compare_preserves_unknown_top_level_keys() -> None:
+    # Round-2 review finding #11: `compare()` (the engine behind
+    # `baseline --ratchet`) previously rebuilt the document from a fixed key
+    # allowlist, silently dropping an operator-set "mode" key on every
+    # routine ratchet -- reverting the PreToolUse hook's enforce mode back to
+    # "advise" with no finding.
+    baseline_entry = BaselineEntry(
+        kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0
+    )
+    doc = {**_doc_with_entries(baseline_entry), "mode": "enforce"}
+    current = (_verdict("a", 5, boundary=6.0, saturated=True),)
+
+    _findings, ratcheted = compare(current, doc)
+
+    assert ratcheted["mode"] == "enforce"
 
 
 def test_compare_newly_saturated_point_added_without_finding() -> None:
@@ -446,6 +493,78 @@ def test_loads_rejects_duplicate_identity_entries() -> None:
         ),
     )
     text = dumps(doc)
+
+    import pytest
+
+    with pytest.raises(TamperError):
+        loads(text)
+
+
+# ---------------------------------------------------------------------------
+# loads(): malformed field extraction surfaces as TamperError, never a bare
+# KeyError/ValueError escape (finding #12)
+# ---------------------------------------------------------------------------
+
+
+def test_loads_rejects_entry_missing_required_key() -> None:
+    doc = {
+        "version": 1,
+        "generated_by": "x",
+        "generated_at": "t",
+        "floor": 4,
+        "entries": [{"kind": "class", "identity": "a", "file": "src/a.py", "boundary": 6.0}],
+    }
+    text = json.dumps(doc)
+
+    import pytest
+
+    with pytest.raises(TamperError):
+        loads(text)
+
+
+def test_loads_rejects_entry_with_non_numeric_member_count() -> None:
+    doc = {
+        "version": 1,
+        "generated_by": "x",
+        "generated_at": "t",
+        "floor": 4,
+        "entries": [
+            {
+                "kind": "class",
+                "identity": "a",
+                "file": "src/a.py",
+                "member_count": "not-a-number",
+                "boundary": 6.0,
+                "bumps": [],
+            }
+        ],
+    }
+    text = json.dumps(doc)
+
+    import pytest
+
+    with pytest.raises(TamperError):
+        loads(text)
+
+
+def test_loads_rejects_bump_missing_required_key() -> None:
+    doc = {
+        "version": 1,
+        "generated_by": "x",
+        "generated_at": "t",
+        "floor": 4,
+        "entries": [
+            {
+                "kind": "class",
+                "identity": "a",
+                "file": "src/a.py",
+                "member_count": 10,
+                "boundary": 6.0,
+                "bumps": [{"to": 20, "actor": "worker"}],  # missing "reason"
+            }
+        ],
+    }
+    text = json.dumps(doc)
 
     import pytest
 

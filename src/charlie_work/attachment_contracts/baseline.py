@@ -10,6 +10,7 @@ identical output.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from charlie_work.attachment_contracts.model import (
@@ -32,12 +33,20 @@ def _bump_to_dict(bump: Bump) -> dict[str, object]:
 
 
 def _bump_from_dict(raw: dict[str, object]) -> Bump:
-    return Bump(
-        to=int(raw["to"]),  # type: ignore[arg-type]
-        reason=str(raw["reason"]),
-        actor=str(raw["actor"]),  # type: ignore[arg-type]
-        ack=str(raw.get("ack", "")),
-    )
+    try:
+        return Bump(
+            to=int(raw["to"]),  # type: ignore[arg-type]
+            reason=str(raw["reason"]),
+            actor=str(raw["actor"]),  # type: ignore[arg-type]
+            ack=str(raw.get("ack", "")),
+        )
+    except (KeyError, ValueError, TypeError) as exc:
+        # Finding #12: a missing or non-numeric field must surface as a
+        # structured TamperError -- never as a bare KeyError/ValueError that
+        # escapes check_tree's `except TamperError` and crashes the CI step,
+        # defeating the report-only "can never fail the job" contract for
+        # exactly the tamper vector it exists to catch.
+        raise TamperError(f"malformed bump entry: {exc}") from exc
 
 
 def _entry_to_dict(entry: BaselineEntry) -> dict[str, object]:
@@ -55,14 +64,20 @@ def _entry_from_dict(raw: dict[str, object]) -> BaselineEntry:
     bumps_raw = raw.get("bumps", [])
     if not isinstance(bumps_raw, list):
         raise TamperError(f"entries[].bumps must be a list, got {type(bumps_raw)!r}")
-    return BaselineEntry(
-        kind=str(raw["kind"]),  # type: ignore[arg-type]
-        identity=str(raw["identity"]),
-        file=str(raw["file"]),
-        member_count=int(raw["member_count"]),  # type: ignore[arg-type]
-        boundary=float(raw["boundary"]),  # type: ignore[arg-type]
-        bumps=tuple(_bump_from_dict(b) for b in bumps_raw),
-    )
+    try:
+        return BaselineEntry(
+            kind=str(raw["kind"]),  # type: ignore[arg-type]
+            identity=str(raw["identity"]),
+            file=str(raw["file"]),
+            member_count=int(raw["member_count"]),  # type: ignore[arg-type]
+            boundary=float(raw["boundary"]),  # type: ignore[arg-type]
+            bumps=tuple(_bump_from_dict(b) for b in bumps_raw),
+        )
+    except (KeyError, ValueError, TypeError) as exc:
+        # Finding #12: same rationale as _bump_from_dict -- a missing key or a
+        # non-numeric member_count/boundary must become a structured Finding
+        # via TamperError, not an uncaught crash that bypasses --report-only.
+        raise TamperError(f"malformed baseline entry: {exc}") from exc
 
 
 def _entry_sort_key(entry: BaselineEntry) -> tuple[str, str, str]:
@@ -154,22 +169,47 @@ def entries_of(document: dict[str, object]) -> tuple[BaselineEntry, ...]:
     return tuple(_entry_from_dict(raw) for raw in document["entries"])  # type: ignore[union-attr,arg-type]
 
 
+# Finding #10 (at minimum: validate ack SHAPE, not just non-emptiness).
+# Accepts an http(s) URL, a bare or "owner/repo"-qualified issue/PR reference
+# (`#123`, `owner/repo#123`), or an explicit "source:id" handle (dispatch-
+# prompt id / human handle, e.g. "dispatch:abc123" or "handle:senkichi").
+# A one-character junk ack like "ack: 'x'" (round-2 review's example) does
+# not match any of these and is now rejected instead of merely non-empty.
+_ACK_SHAPE = re.compile(r"^(https?://\S+|[\w./-]*#\d+|[A-Za-z][\w.-]*:[\w./-]+)$")
+
+
 def validate_bump(bump: Bump) -> str | None:
     """Return an error message if `bump` is invalid, else None.
 
-    G4: actor=worker REQUIRES a non-empty ack referencing an external source
-    (issue URL / dispatch-prompt id / human handle). Interactive bumps self-ack
-    (ack may be empty for actor=interactive).
+    G4: actor=worker REQUIRES a non-empty ack that is SHAPED like an external
+    reference (issue URL / "#123" / "owner/repo#123" / "source:id" dispatch
+    id or human handle) -- not merely non-empty (round-2 review finding #10:
+    an ack of "x" previously passed). Interactive bumps self-ack (ack may be
+    empty for actor=interactive) -- the actor distinction itself is a spec
+    contract (spec's baseline.py section: "Interactive bumps self-ack") and
+    is not removed here; binding `actor` to the real execution context (a
+    worker cannot mislabel itself "interactive") is a self-declared-field
+    problem no comparison-only validator can close from the JSON alone --
+    round-2 review #10 notes the real backstop is out-of-band review of the
+    baseline diff (e.g. CODEOWNERS on `.attachment-budgets.json`).
     """
     if not bump.reason.strip():
         return "bump.reason must be non-empty"
-    if bump.actor == "worker" and not bump.ack.strip():
-        return (
-            "G4: worker bump requires a non-empty external ack "
-            "(issue URL / dispatch-prompt id / human handle)"
-        )
     if bump.actor not in ("interactive", "worker"):
         return f"bump.actor must be 'interactive' or 'worker', got {bump.actor!r}"
+    if bump.actor == "worker":
+        ack = bump.ack.strip()
+        if not ack:
+            return (
+                "G4: worker bump requires a non-empty external ack "
+                "(issue URL / dispatch-prompt id / human handle)"
+            )
+        if not _ACK_SHAPE.match(ack):
+            return (
+                f"G4: worker bump ack {ack!r} does not look like an external "
+                "reference (expected an issue URL, '#123' / 'owner/repo#123', "
+                "or 'source:id')"
+            )
     return None
 
 
@@ -270,11 +310,15 @@ def compare(
     # points) — that is the "ratchet down to not tracked" case, handled by
     # omission rather than an explicit branch.
     sorted_entries = sorted(new_entries, key=_entry_sort_key)
+    # Finding #11: preserve every top-level key already in the document
+    # (e.g. an operator-set "mode": "enforce") instead of rebuilding from a
+    # fixed key allowlist. A routine `baseline --ratchet` must never silently
+    # strip a key it doesn't know about -- that previously reverted the
+    # PreToolUse hook's enforce mode back to "advise" with no finding and a
+    # diff that reads as a normal ratchet.
     ratcheted = {
+        **baseline_document,
         "version": SCHEMA_VERSION,
-        "generated_by": baseline_document.get("generated_by", ""),
-        "generated_at": baseline_document.get("generated_at", ""),
-        "floor": baseline_document.get("floor", 0),
         "entries": [_entry_to_dict(e) for e in sorted_entries],
     }
     return findings, ratcheted

@@ -17,10 +17,9 @@ from charlie_work.attachment_contracts.archetypes import scan_tree
 from charlie_work.attachment_contracts.hook_entry import main
 from charlie_work.attachment_contracts.outliers import saturate_all
 
-_SMALL_CLASS = """
+_SMALL_CLASS_TEMPLATE = """
 class {name}:
-    def alpha(self): pass
-    def beta(self): pass
+{methods}
 """
 
 _BIG_CLASS_TEMPLATE = """
@@ -36,11 +35,19 @@ def _big_class_source(count: int) -> str:
     return _BIG_CLASS_TEMPLATE.format(methods=methods)
 
 
+def _small_class_source(name: str, count: int) -> str:
+    methods = "\n".join(f"    def s{i}x(self): pass" for i in range(count))
+    return _SMALL_CLASS_TEMPLATE.format(name=name, methods=methods)
+
+
 def _build_repo(root: Path, big_member_count: int = 25) -> None:
+    # A/B/C carry distinct member counts (2/3/4) so Q1 != Q3 -- a uniform
+    # population would trip the IQR==0 degenerate-fence guard (finding #9)
+    # and Big would never register as saturated.
     (root / "src" / "pkg").mkdir(parents=True)
-    (root / "src" / "pkg" / "a.py").write_text(_SMALL_CLASS.format(name="A"), encoding="utf-8")
-    (root / "src" / "pkg" / "b.py").write_text(_SMALL_CLASS.format(name="B"), encoding="utf-8")
-    (root / "src" / "pkg" / "c.py").write_text(_SMALL_CLASS.format(name="C"), encoding="utf-8")
+    (root / "src" / "pkg" / "a.py").write_text(_small_class_source("A", 2), encoding="utf-8")
+    (root / "src" / "pkg" / "b.py").write_text(_small_class_source("B", 3), encoding="utf-8")
+    (root / "src" / "pkg" / "c.py").write_text(_small_class_source("C", 4), encoding="utf-8")
     (root / "src" / "pkg" / "big.py").write_text(
         _big_class_source(big_member_count), encoding="utf-8"
     )

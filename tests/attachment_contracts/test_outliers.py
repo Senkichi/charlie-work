@@ -118,6 +118,47 @@ def test_saturate_only_considers_matching_kind() -> None:
     assert {v.point.identity for v in verdicts} == {"a", "b"}
 
 
+def test_zero_member_points_excluded_from_population_and_get_no_verdict() -> None:
+    # Round-2 review finding #9: 148/531 real class APs are zero-member
+    # (Protocols, `class Foo: pass`, empty dataclasses); they anchor Q1 at 0
+    # and collapse the IQR, dragging the boundary down onto legitimate
+    # multi-method classes. A zero-member AP is not evidence about the
+    # god-object distribution and must not enter the population or receive a
+    # verdict of its own (member_count=0 could never be saturated anyway).
+    zero_member = tuple(_point(f"empty{i}", 0) for i in range(5))
+    real = (_point("a", 1), _point("b", 2), _point("c", 3), _point("d", 10))
+    points = zero_member + real
+
+    verdicts = saturate(points, "class")
+    identities = {v.point.identity for v in verdicts}
+
+    assert identities == {"a", "b", "c", "d"}
+    assert all(v.population == 4 for v in verdicts)
+    # Same boundary as test_at_floor_saturates_extreme_outlier: the 5
+    # zero-member points must not have polluted q1/q3.
+    verdict_by_id = {v.point.identity: v for v in verdicts}
+    assert verdict_by_id["d"].boundary == 6.0
+    assert verdict_by_id["d"].saturated is True
+
+
+def test_iqr_zero_degenerate_fence_never_saturates() -> None:
+    # Round-2 review finding #9: with zero spread (q1 == q3), Tukey's fence
+    # collapses to a strict `> Q3` test with no tolerance at all. A uniform
+    # population of 4-member points plus one 5-member point would otherwise
+    # "saturate" on pure arithmetic, not on being a real outlier.
+    points = (
+        _point("a", 4),
+        _point("b", 4),
+        _point("c", 4),
+        _point("d", 4),
+        _point("e", 5),
+    )
+    verdicts = {v.point.identity: v for v in saturate(points, "class")}
+    assert all(v.saturated is False for v in verdicts.values())
+    assert verdicts["e"].iqr == 0.0
+    assert verdicts["e"].q3 == 4.0
+
+
 def test_saturate_all_concatenates_across_kinds() -> None:
     points = (
         _point("a1", 1, kind="class"),
