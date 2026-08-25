@@ -45207,7 +45207,7 @@ def test_classify_dead_sessions_salvage_push_failure_fallback(tmp_path: Path) ->
     gh.pr_create_return = 101
 
     original_push_branch = workflow_module.push_branch
-    workflow_module.push_branch = lambda repo, br, worktree_path=None: (
+    workflow_module.push_branch = lambda repo, br, worktree_path=None, **kw: (
         False,
         "simulated push failure",
     )
@@ -52318,7 +52318,7 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
 
     salvage_calls: list[tuple[Any, ...]] = []
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         salvage_calls.append((repo_root, branch, worktree_path, base_ref))
         return SalvagePushResult(
             pushed=True,
@@ -52379,6 +52379,92 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
     assert salvage_events[0]["payload"]["new_remote_sha"] == "newsha123"
 
 
+def test_orphaned_worker_salvage_push_threads_dry_run_to_salvage_push_stranded_commits(
+    tmp_path: Path,
+) -> None:
+    """Issue #1326 regression: ``_detect_and_handle_orphaned_workers`` must
+    thread ``write_gate.dry_run`` into ``salvage_push_stranded_commits`` (the
+    higher-traffic call site at workflow.py:2218-2224). Under a dry-run
+    WriteGate the salvage stand-in must receive ``dry_run=True`` -- the
+    existing ``fake_salvage`` stand-ins in this file were only patched for
+    signature compatibility and never asserted the value, so a regression
+    that drops the kwarg would pass silently. This test pins the value.
+    """
+    import charlie_work.workflow as workflow_module
+    from charlie_work.worktree import SalvagePushResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1326"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForSalvage(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 500,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-1326",
+                }
+            ]
+
+    fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
+
+    salvage_calls: list[dict[str, Any]] = []
+
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
+        salvage_calls.append(
+            {
+                "repo_root": repo_root,
+                "branch": branch,
+                "worktree_path": worktree_path,
+                "base_ref": base_ref,
+                "dry_run": dry_run,
+            }
+        )
+        return SalvagePushResult(
+            pushed=True,
+            old_remote_sha="abc123",
+            new_remote_sha="newsha123",
+            commit_count=1,
+        )
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
+    ):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            write_gate=_wg(paths.state_file, dry_run=True),
+        )
+
+    # The salvage stand-in must have been called exactly once for the orphaned
+    # issue's branch, and -- the point of this test -- dry_run must be True.
+    assert len(salvage_calls) == 1
+    assert salvage_calls[0]["branch"] == "agent/issue-1326"
+    assert salvage_calls[0]["dry_run"] is True
+
+
 def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
     tmp_path: Path,
 ) -> None:
@@ -52425,7 +52511,7 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         return SalvagePushResult(
             pushed=False,
             error="push_failed: network timeout",
@@ -52510,7 +52596,7 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         return SalvagePushResult(pushed=False, skip_reason="up_to_date", old_remote_sha="abc123")
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -52581,7 +52667,7 @@ def test_orphaned_worker_salvage_push_skips_cross_repository_pr(tmp_path: Path) 
 
     salvage_calls: list[tuple[Any, ...]] = []
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         salvage_calls.append((repo_root, branch, worktree_path, base_ref))
         return SalvagePushResult(pushed=False, skip_reason="should_never_be_called")
 
