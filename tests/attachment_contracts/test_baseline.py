@@ -179,9 +179,7 @@ def test_interactive_bump_without_ack_rejected() -> None:
 
 
 def test_interactive_bump_with_shaped_ack_accepted() -> None:
-    bump = Bump(
-        to=20, reason="reviewed and approved", actor="interactive", ack="handle:senkichi"
-    )
+    bump = Bump(to=20, reason="reviewed and approved", actor="interactive", ack="handle:senkichi")
     assert validate_bump(bump) is None
 
 
@@ -432,13 +430,19 @@ def test_ratchet_tamper_detects_raise_to_match_laundering() -> None:
     # the PREVIOUS committed baseline can see it.
     previous = _doc_with_entries(
         BaselineEntry(
-            kind="class", identity="OrchestratorApp", file="src/x.py", member_count=134,
+            kind="class",
+            identity="OrchestratorApp",
+            file="src/x.py",
+            member_count=134,
             boundary=5.0,
         )
     )
     current = _doc_with_entries(
         BaselineEntry(
-            kind="class", identity="OrchestratorApp", file="src/x.py", member_count=135,
+            kind="class",
+            identity="OrchestratorApp",
+            file="src/x.py",
+            member_count=135,
             boundary=5.0,
         )
     )
@@ -500,7 +504,11 @@ def test_ratchet_tamper_bump_does_not_excuse_a_member_count_raise() -> None:
     )
     current = _doc_with_entries(
         BaselineEntry(
-            kind="class", identity="a", file="src/a.py", member_count=15, boundary=6.0,
+            kind="class",
+            identity="a",
+            file="src/a.py",
+            member_count=15,
+            boundary=6.0,
             bumps=(bump,),
         )
     )
@@ -518,12 +526,18 @@ def test_ratchet_tamper_bump_does_not_excuse_a_member_count_raise() -> None:
 def test_loads_rejects_duplicate_identity_entries() -> None:
     doc = _doc_with_entries(
         BaselineEntry(
-            kind="class", identity="FakeGitHub", file="tests/test_worker.py",
-            member_count=6, boundary=5.0,
+            kind="class",
+            identity="FakeGitHub",
+            file="tests/test_worker.py",
+            member_count=6,
+            boundary=5.0,
         ),
         BaselineEntry(
-            kind="class", identity="FakeGitHub", file="tests/test_worker.py",
-            member_count=6, boundary=5.0,
+            kind="class",
+            identity="FakeGitHub",
+            file="tests/test_worker.py",
+            member_count=6,
+            boundary=5.0,
         ),
     )
     text = dumps(doc)
@@ -609,12 +623,18 @@ def test_loads_rejects_bump_missing_required_key() -> None:
 def test_loads_allows_same_identity_in_different_files() -> None:
     doc = _doc_with_entries(
         BaselineEntry(
-            kind="class", identity="FakeGitHub", file="tests/_fakes_github.py",
-            member_count=45, boundary=5.0,
+            kind="class",
+            identity="FakeGitHub",
+            file="tests/_fakes_github.py",
+            member_count=45,
+            boundary=5.0,
         ),
         BaselineEntry(
-            kind="class", identity="FakeGitHub", file="tests/_reconcile_fixtures.py",
-            member_count=10, boundary=5.0,
+            kind="class",
+            identity="FakeGitHub",
+            file="tests/_reconcile_fixtures.py",
+            member_count=10,
+            boundary=5.0,
         ),
     )
     text = dumps(doc)

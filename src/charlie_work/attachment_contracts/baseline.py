@@ -154,8 +154,7 @@ def loads(text: str) -> dict[str, object]:
             # moment `--ratchet` rewrites the file. Reject at load time
             # instead of losing a frozen entry to a silent overwrite.
             raise TamperError(
-                f"duplicate baseline entry for kind={key[0]!r} file={key[1]!r} "
-                f"identity={key[2]!r}"
+                f"duplicate baseline entry for kind={key[0]!r} file={key[1]!r} identity={key[2]!r}"
             )
         seen_keys.add(key)
     return document  # type: ignore[return-value]

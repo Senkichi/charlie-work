@@ -308,9 +308,7 @@ def test_multiedit_evaluates_sequential_proposed_edits(tmp_path: Path) -> None:
                 },
                 {
                     "old_string": "    def extra1x(self): pass\n",
-                    "new_string": "\n".join(
-                        f"    def extra{i}x(self): pass" for i in range(1, 11)
-                    )
+                    "new_string": "\n".join(f"    def extra{i}x(self): pass" for i in range(1, 11))
                     + "\n",
                 },
             ],

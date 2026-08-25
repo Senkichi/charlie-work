@@ -145,9 +145,7 @@ def test_counterexamples_clean_fails_when_coverage_below_floor() -> None:
 
 def test_counterexamples_clean_passes_when_coverage_meets_floor_and_zero_hits() -> None:
     # >= half of the 13 counterexamples queried, none saturated.
-    points = tuple(
-        _point("class", "X", f"src/{m}", 3) for m in COUNTEREXAMPLE_MODULES[:7]
-    )
+    points = tuple(_point("class", "X", f"src/{m}", 3) for m in COUNTEREXAMPLE_MODULES[:7])
     sample = _sample("s1", points, frozenset())
 
     result = _criterion_counterexamples_clean((sample,))

@@ -397,9 +397,7 @@ def scan_tree(
     parse_failures: list[str] = []
     for rel in iter_source_files(root, excludes):
         try:
-            text = overrides[rel] if rel in overrides else (root / rel).read_text(
-                encoding="utf-8"
-            )
+            text = overrides[rel] if rel in overrides else (root / rel).read_text(encoding="utf-8")
             points.extend(scan_source(text, rel))
         except (SyntaxError, UnicodeDecodeError, OSError):
             # Unparseable source, undecodable bytes, or an unreadable file

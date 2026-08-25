@@ -125,8 +125,4 @@ def check_file(
     construction — there is no second comparison algorithm to drift out of
     sync with the first.
     """
-    return [
-        f
-        for f in check_tree(root, content_overrides=content_overrides)
-        if f.file == path
-    ]
+    return [f for f in check_tree(root, content_overrides=content_overrides) if f.file == path]
