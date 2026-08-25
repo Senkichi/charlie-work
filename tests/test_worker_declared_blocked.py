@@ -124,6 +124,17 @@ def test_blocked_outcome_routes_to_operator_queue_on_first_pass(
     assert (issue_number, config.labels.human_needed) in fake_gh.labels_added
     assert (issue_number, config.labels.ready) not in fake_gh.labels_added
 
+    # Post-lock transition() actually applies the operator-queue label edge
+    # the issue/PR title promises -- the pre-lock human_needed add above is a
+    # fallback, the durable routing target is config.labels.operator_queue.
+    # The operator_queued edge (resolved by _escalation_edge("escalated",
+    # "mechanical")) adds operator_queue and removes every other workflow
+    # label, including the pre-lock human_needed fallback, so verifying both
+    # directions catches a regression that drops the post-lock transition
+    # while leaving the transient pre-lock label in place.
+    assert (issue_number, config.labels.operator_queue) in fake_gh.labels_added
+    assert (issue_number, config.labels.human_needed) in fake_gh.labels_removed
+
     # The worker_declared_blocked event carries reason_kind and detail so the
     # operator queue entry is actionable without reading the worktree.
     blocked_events = [
