@@ -174,7 +174,12 @@ def entries_of(document: dict[str, object]) -> tuple[BaselineEntry, ...]:
 # prompt id / human handle, e.g. "dispatch:abc123" or "handle:senkichi").
 # A one-character junk ack like "ack: 'x'" (round-2 review's example) does
 # not match any of these and is now rejected instead of merely non-empty.
-_ACK_SHAPE = re.compile(r"^(https?://\S+|[\w./-]*#\d+|[A-Za-z][\w.-]*:[\w./-]+)$")
+#
+# The alternatives are named groups (not just grouped) so that
+# ``bump_ack_is_external`` (issue #1460) can single-source off THIS regex --
+# telling a URL/#123 ack apart from the self-declared "source:id" handle form
+# by which named group matched, instead of duplicating a second ack regex.
+_ACK_SHAPE = re.compile(r"^(?:https?://\S+|[\w./-]*#\d+|(?P<source_id>[A-Za-z][\w.-]*:[\w./-]+))$")
 
 
 def validate_bump(bump: Bump) -> str | None:
@@ -223,16 +228,70 @@ def _verdict_key(verdict: SaturationVerdict) -> tuple[str, str, str]:
     return (verdict.point.kind, verdict.point.file, verdict.point.identity)
 
 
-def _effective_ceiling(entry: BaselineEntry) -> int:
+def effective_ceiling(entry: BaselineEntry) -> int:
     """The highest member_count this entry currently permits without a Finding.
 
     That is the baselined member_count itself, or the highest bump.to if bumps
     exist (bumps only ever raise the ceiling; validity of each bump is checked
     separately by validate_bump at bump-authoring time).
+
+    Public: issue #1460's review-packet section (``review_delta.py``) needs
+    this to compute the saturation ceiling for the review-side G4 check
+    without duplicating the max-of-member_count-and-bumps logic.
     """
     if not entry.bumps:
         return entry.member_count
     return max(entry.member_count, max(b.to for b in entry.bumps))
+
+
+def bump_ack_is_external(bump: Bump) -> bool:
+    """True only for a URL / ``#123`` / ``owner/repo#123`` ack form.
+
+    False for the ``source:id`` handle form and for an empty ack. Single-
+    sourced off ``_ACK_SHAPE`` (the same regex ``validate_bump`` uses): the
+    ``source:id`` alternative is its only named group, so "external" is
+    simply "matched, and not via that named group" -- no second ack regex.
+    Used by the review packet (issue #1460) to flag a worker-authored bump
+    whose ack is merely shape-valid (passes ``validate_bump``) but not an
+    external, citable justification -- a worker may not author its own bump
+    acknowledgement.
+    """
+    ack = bump.ack.strip()
+    if not ack:
+        return False
+    match = _ACK_SHAPE.match(ack)
+    if match is None:
+        return False
+    return match.group("source_id") is None
+
+
+def new_bumps(
+    base_document: dict[str, object],
+    head_document: dict[str, object],
+) -> tuple[tuple[BaselineEntry, Bump], ...]:
+    """Bumps present in ``head_document`` but not in ``base_document``.
+
+    Pure, no I/O: both documents are already-loaded baseline dicts (typically
+    from ``loads()``). A bump is identified by
+    ``(entry.identity, bump.to, bump.actor, bump.ack)`` -- keyed on the
+    entry's identity rather than the full ``(kind, file, identity)`` tuple
+    because a bump is meaningful per-identity regardless of a coincidental
+    kind/file rename; two entries can only collide on identity if they are
+    the same conceptual attachment point. Order is stable: entries sorted by
+    ``_entry_sort_key``, bumps in each entry's own list order.
+    """
+    base_keys: set[tuple[str, int, str, str]] = set()
+    for entry in entries_of(base_document):
+        for bump in entry.bumps:
+            base_keys.add((entry.identity, bump.to, bump.actor, bump.ack))
+
+    result: list[tuple[BaselineEntry, Bump]] = []
+    for entry in sorted(entries_of(head_document), key=_entry_sort_key):
+        for bump in entry.bumps:
+            key = (entry.identity, bump.to, bump.actor, bump.ack)
+            if key not in base_keys:
+                result.append((entry, bump))
+    return tuple(result)
 
 
 def compare(
@@ -303,7 +362,7 @@ def compare(
             )
             continue
 
-        ceiling = _effective_ceiling(baseline_entry)
+        ceiling = effective_ceiling(baseline_entry)
         if point.member_count > ceiling:
             findings.append(
                 Finding(
