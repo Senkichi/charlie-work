@@ -452,6 +452,15 @@ from .stalled_review_reap import (  # noqa: F401  (deliberate re-export)
     _classify_review_dispatch_stalled_level,
     _append_sweep_events,
 )
+from .queue_sync_coverage import (  # noqa: F401  (deliberate re-export)
+    _QUEUE_SYNC_RETRY_ATTEMPTS,
+    _QUEUE_SYNC_RETRY_BACKOFF_SECONDS,
+    _QUEUE_SYNC_RETRY_SLEEP,
+    _QueueSyncCoverageResult,
+    _fetch_commit_retrying,
+    _fetch_compare_retrying,
+    _queue_sync_merge_covered,
+)
 
 # Issue #1106: a rework session that dies at CLI startup (before the worker's
 # first tool action) is not a no-op/conflict rework attempt — the cap counters
@@ -1959,6 +1968,7 @@ UNAUTHORIZED_MERGE_ACK_KEY = "unauthorized_merge_acknowledged"
 # stays reported (and keeps pinning ok=False) until it is explicitly acked.
 # Presence here silences the event, never the finding.
 UNAUTHORIZED_MERGE_DETECTED_KEY = "unauthorized_merge_detected"
+
 
 # Issue #934: an operator who legitimately adjudicates and merges a worker PR
 # whose recorded review decision is stale, absent, or pending has no way to
@@ -24921,150 +24931,65 @@ class OrchestratorApp:
             repo_root=self.repo_root,
         )
 
+    def _fetch_commit_retrying(self, sha: str, *, leg: str) -> tuple[dict[str, Any] | None, str]:
+        """Thin delegate to ``queue_sync_coverage._fetch_commit_retrying``.
+
+        Kept as a bound method (rather than inlining the free-function call
+        at each call site) so any existing or future monkeypatch of
+        ``self._fetch_commit_retrying`` keeps working, mirroring
+        ``_write_rework_prompt``'s wrapper shape.
+        """
+        return _fetch_commit_retrying(self.gh, sha, leg=leg)
+
+    def _fetch_compare_retrying(
+        self, base: str, head: str, *, leg: str
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Thin delegate to ``queue_sync_coverage._fetch_compare_retrying``."""
+        return _fetch_compare_retrying(self.gh, base, head, leg=leg)
+
     def _queue_sync_merge_covered(
         self,
         pr: dict[str, Any],
         reviewed_head_sha: str | None,
         live_head_sha: str | None,
-    ) -> bool:
-        """Return True iff the merged head is an approval-covered queue sync-merge.
+    ) -> _QueueSyncCoverageResult:
+        """Thin delegate to ``queue_sync_coverage._queue_sync_merge_covered``.
 
-        Issue #1194: Aviator's mergequeue syncs a PR branch with main before
-        merging, so the merged head is a bot-authored merge commit whose
-        parents are the approved head and a main commit — a structural false
-        positive for the #502 tripwire's strict SHA equality. Recognize that
-        shape, and only that shape, as covered by the recorded approval. All
-        four conditions must hold (fail closed on every missing or ambiguous
-        signal — an unanswerable question keeps the finding firing, and the
-        existing ack flow remains the escape hatch):
+        See that function's docstring for the full four-condition predicate
+        (issue #1194) and the retry/indeterminate contract (job-cannon PRs
+        #1888, #1916, #1904, #1895).
 
-        1. the live head is a merge commit with exactly two parents;
-        2. exactly one parent IS the approved ``reviewed_head_sha``;
-        3. the other parent is reachable from the base branch as it stood
-           immediately BEFORE this PR's merge — anchored at the merge
-           commit's first parent, NOT at current main. Post-merge, current
-           main reaches everything the PR carried (including a smuggled
-           second parent) through the merge commit itself, so a naive
-           "reachable from main" test is vacuously true and enforces
-           nothing. Reachability from pre-merge main is the discriminating
-           form: nothing this PR introduced can be reachable from there.
-           This condition is the load-bearing one — it bounds the merged
-           content to (approved head + prior main) regardless of who
-           authored the commit;
-        4. the merge commit's author login is the configured
-           ``auto_merge.queue_bot_login`` and its committer is GitHub's
-           web-flow (both identity signals, same rationale as
-           ``_verify_synced_head``: either alone is spoofable via crafted
-           git metadata). Identity is defense-in-depth on top of (3), not a
-           substitute for it. Unset ``queue_bot_login`` disables recognition
-           entirely — the tripwire behaves exactly as before #1194.
-
-        Suppressions are audit-logged (``unauthorized_merge_queue_sync_covered``,
-        events.db via ``log_event`` — this path holds no state lock) so every
-        exercised gate exception leaves a queryable trail; consumer is the
-        operator auditing tripwire behavior, mirroring the skip-event pattern.
+        ``queue_sync_coverage.py`` is deliberately pure (issue #1264's
+        per-module WriteGate raw-primitive-call ratchet -- a new module
+        starts at baseline 0, so a raw ``log_event`` call moved there would
+        read as new growth even though it was already present, and already
+        counted, in this file). This wrapper therefore emits the
+        ``unauthorized_merge_queue_sync_covered`` audit event itself on a
+        covered result, exactly where that raw call already lived (and was
+        already counted) before the extraction.
         """
         queue_bot_login = self.config.auto_merge.queue_bot_login
-        if not queue_bot_login:
-            return False
-        if not reviewed_head_sha or not live_head_sha:
-            return False
-
-        head_result = self.gh.commit(live_head_sha)
-        head_commit = (
-            head_result.value
-            if isinstance(head_result, GitHubRunResult)
-            and head_result.ok
-            and isinstance(head_result.value, dict)
-            else None
+        result = _queue_sync_merge_covered(
+            self.gh,
+            queue_bot_login,
+            pr,
+            reviewed_head_sha,
+            live_head_sha,
         )
-        if not head_commit:
-            return False
-
-        parents = [
-            str(p.get("sha"))
-            for p in (head_commit.get("parents") or [])
-            if isinstance(p, dict) and p.get("sha")
-        ]
-        if len(parents) != 2:
-            return False
-        matching = [p for p in parents if p == reviewed_head_sha]
-        if len(matching) != 1:
-            # Zero matches: not a sync of the approved head. Two matches: a
-            # degenerate both-parents-approved merge — nothing to sync, so
-            # nothing this path needs to bless; fail closed.
-            return False
-        other_parent = next(p for p in parents if p != reviewed_head_sha)
-
-        # Identity (condition 4). Checked before the extra API calls of
-        # condition 3 purely to keep the miss path cheap; order does not
-        # affect the verdict since all conditions are conjunctive.
-        author = head_commit.get("author")
-        author_login = author.get("login") if isinstance(author, dict) else None
-        committer = head_commit.get("committer")
-        committer_login = committer.get("login") if isinstance(committer, dict) else None
-        commit_meta = head_commit.get("commit")
-        commit_committer = commit_meta.get("committer") if isinstance(commit_meta, dict) else None
-        committer_name = (
-            commit_committer.get("name") if isinstance(commit_committer, dict) else None
-        )
-        if (
-            author_login != queue_bot_login
-            or committer_login != "web-flow"
-            or committer_name != "GitHub"
-        ):
-            return False
-
-        # Condition 3: anchor at pre-merge main via the landing merge
-        # commit's first parent. GitHub commits merges on the base branch,
-        # so parents[0] of merge_commit_sha is the base tip this merge
-        # advanced. If the queue fast-forwarded instead (merge commit == the
-        # sync commit itself), parents[0] is the approved head, the compare
-        # below cannot succeed, and the finding keeps firing — fail closed.
-        merge_commit_sha = pr.get("mergeCommitOid")
-        if not merge_commit_sha:
-            return False
-        landing_result = self.gh.commit(str(merge_commit_sha))
-        landing_commit = (
-            landing_result.value
-            if isinstance(landing_result, GitHubRunResult)
-            and landing_result.ok
-            and isinstance(landing_result.value, dict)
-            else None
-        )
-        if not landing_commit:
-            return False
-        landing_parents = [
-            str(p.get("sha"))
-            for p in (landing_commit.get("parents") or [])
-            if isinstance(p, dict) and p.get("sha")
-        ]
-        if not landing_parents:
-            return False
-        pre_merge_base = landing_parents[0]
-
-        comparison = self.gh.compare(pre_merge_base, other_parent)
-        if not isinstance(comparison, dict):
-            return False
-        # "identical"/"behind" mean other_parent introduces zero commits not
-        # already on pre-merge main; "ahead"/"diverged" (or anything else)
-        # mean it carries content this approval never covered.
-        if comparison.get("status") not in ("identical", "behind"):
-            return False
-
-        log_event(
-            self.paths.state_file,
-            "unauthorized_merge_queue_sync_covered",
-            {
-                "pr": pr.get("number"),
-                "reviewed_head_sha": reviewed_head_sha,
-                "live_head_sha": live_head_sha,
-                "sync_parent": other_parent,
-                "pre_merge_base": pre_merge_base,
-                "queue_bot_login": queue_bot_login,
-            },
-        )
-        return True
+        if result.covered:
+            log_event(
+                self.paths.state_file,
+                "unauthorized_merge_queue_sync_covered",
+                {
+                    "pr": pr.get("number"),
+                    "reviewed_head_sha": reviewed_head_sha,
+                    "live_head_sha": live_head_sha,
+                    "sync_parent": result.sync_parent,
+                    "pre_merge_base": result.pre_merge_base,
+                    "queue_bot_login": queue_bot_login,
+                },
+            )
+        return result
 
     def _detect_unauthorized_merges(
         self, merged_prs: list[dict[str, Any]] | None = None
@@ -25165,12 +25090,12 @@ class OrchestratorApp:
             # evaluated lazily: only for approved decisions with a genuine
             # head mismatch and no override, so the common paths (matching
             # head, unapproved, overridden) never pay its API calls.
-            queue_sync_covered = (
-                approved
-                and not head_matches
-                and not override_authorized
-                and self._queue_sync_merge_covered(pr, reviewed_head_sha, live_head_sha)
+            coverage_result = (
+                self._queue_sync_merge_covered(pr, reviewed_head_sha, live_head_sha)
+                if approved and not head_matches and not override_authorized
+                else None
             )
+            queue_sync_covered = coverage_result is not None and coverage_result.covered
             if (
                 (not approved or not head_matches)
                 and not override_authorized
@@ -25181,17 +25106,30 @@ class OrchestratorApp:
                     is_cross_repository=pr.get("isCrossRepository"),
                     branch_prefix=prefix,
                 )
-                candidates.append(
-                    {
-                        "pr": pr_number,
-                        "issue": issue_number,
-                        "head": head,
-                        "decision": decision_value,
-                        "reviewed_head_sha": reviewed_head_sha,
-                        "live_head_sha": live_head_sha,
-                        "review_dispatch_enabled": review_dispatch_enabled,
-                    }
-                )
+                candidate: dict[str, Any] = {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "head": head,
+                    "decision": decision_value,
+                    "reviewed_head_sha": reviewed_head_sha,
+                    "live_head_sha": live_head_sha,
+                    "review_dispatch_enabled": review_dispatch_enabled,
+                }
+                # coverage_result is only non-None when _queue_sync_merge_covered
+                # actually ran (approved + head mismatch + no override) and did
+                # not return covered=True -- i.e. exactly the cases this
+                # candidate is being appended for. Distinguish "the API never
+                # answered" (indeterminate) from "the shape was checked and
+                # rejected" (not_covered) in the finding itself, so triage does
+                # not have to re-derive it from events.db.
+                if coverage_result is not None:
+                    if coverage_result.indeterminate:
+                        candidate["coverage_check"] = "indeterminate"
+                        candidate["coverage_check_error"] = coverage_result.reason
+                    else:
+                        candidate["coverage_check"] = "not_covered"
+                        candidate["coverage_reason"] = coverage_result.reason
+                candidates.append(candidate)
         reported = self._apply_unauthorized_merge_baseline(candidates)
         # Announce on the bounded set, never on raw candidates: the arming pass
         # deliberately reports nothing, and an acked finding is deliberately
@@ -25446,6 +25384,14 @@ class OrchestratorApp:
                         "reviewed_head_sha": candidate.get("reviewed_head_sha"),
                         "live_head_sha": candidate.get("live_head_sha"),
                         "review_dispatch_enabled": candidate.get("review_dispatch_enabled"),
+                        # Issue #1194 retry fix: present only for candidates that
+                        # went through _queue_sync_merge_covered (approved +
+                        # head-mismatch + no override) and were not covered --
+                        # None for every other finding shape (unapproved,
+                        # missing decision, ...). See _QueueSyncCoverageResult.
+                        "coverage_check": candidate.get("coverage_check"),
+                        "coverage_check_error": candidate.get("coverage_check_error"),
+                        "coverage_reason": candidate.get("coverage_reason"),
                     }
                 state[key] = record
                 for candidate in fresh:
@@ -25460,6 +25406,9 @@ class OrchestratorApp:
                             "reviewed_head_sha": candidate.get("reviewed_head_sha"),
                             "live_head_sha": candidate.get("live_head_sha"),
                             "review_dispatch_enabled": candidate.get("review_dispatch_enabled"),
+                            "coverage_check": candidate.get("coverage_check"),
+                            "coverage_check_error": candidate.get("coverage_check_error"),
+                            "coverage_reason": candidate.get("coverage_reason"),
                         },
                     )
                 save_state(self.paths.state_file, state)
