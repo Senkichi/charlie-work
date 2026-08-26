@@ -1957,6 +1957,56 @@ UNAUTHORIZED_MERGE_ACK_KEY = "unauthorized_merge_acknowledged"
 # Presence here silences the event, never the finding.
 UNAUTHORIZED_MERGE_DETECTED_KEY = "unauthorized_merge_detected"
 
+# Retry budget for the transient-fetch legs of _queue_sync_merge_covered
+# (commit() x2, compare() x1). A single flaky `gh api` call on any leg used
+# to fail the whole four-condition check closed indistinguishably from a
+# genuinely-uncovered shape, misreporting a transient GitHub API blip as an
+# unauthorized_merge_detected finding (evidence: job-cannon PRs #1888, #1916,
+# #1904, #1895 each logged 326-376 unauthorized_merge_queue_sync_covered
+# events against exactly one unauthorized_merge_detected -- overwhelmingly a
+# covered shape, with one pass where some leg's gh api call failed
+# transiently; which leg is not recoverable from that evidence). Only FETCH
+# failures are retried (commit() not ok, or compare() returning None); a
+# determined non-covered shape (wrong parent count, identity mismatch,
+# "ahead"/"diverged" status, ...) never retries -- retrying a query that
+# already answered would not change the answer.
+_QUEUE_SYNC_RETRY_ATTEMPTS = 3
+_QUEUE_SYNC_RETRY_BACKOFF_SECONDS = (1, 2)
+
+# Patchable indirection so tests never sleep for real: tests replace this
+# module-level name (monkeypatch.setattr(workflow, "_QUEUE_SYNC_RETRY_SLEEP",
+# fake)) rather than mocking time.sleep globally.
+_QUEUE_SYNC_RETRY_SLEEP = time.sleep
+
+
+@dataclass(frozen=True)
+class _QueueSyncCoverageResult:
+    """Outcome of `_queue_sync_merge_covered`'s per-leg fetch-and-classify.
+
+    `covered=True` iff all four conditions in `_queue_sync_merge_covered`'s
+    docstring held after retries. When `covered=False`, `indeterminate`
+    distinguishes *why* the caller should still fail closed:
+
+    - `indeterminate=True`: a FETCH leg (commit() or compare()) never
+      succeeded after retrying -- the shape could not be evaluated, not that
+      it was evaluated and rejected. `reason` names the leg and carries the
+      last error.
+    - `indeterminate=False`: the shape was fully evaluated and determined not
+      to be a covered queue sync-merge (e.g. wrong parent count, identity
+      mismatch, comparison status "ahead"/"diverged"). `reason` names which
+      condition failed.
+
+    Both cases still fail closed (the caller still emits
+    unauthorized_merge_detected) -- this dataclass only makes the two reasons
+    distinguishable in the event payload instead of collapsing both into the
+    same silent False.
+    """
+
+    covered: bool
+    indeterminate: bool = False
+    reason: str = ""
+
+
 # Issue #934: an operator who legitimately adjudicates and merges a worker PR
 # whose recorded review decision is stale, absent, or pending has no way to
 # record that adjudication, so every legitimate operator merge becomes a
@@ -24917,13 +24967,60 @@ class OrchestratorApp:
             repo_root=self.repo_root,
         )
 
+    def _fetch_commit_retrying(self, sha: str, *, leg: str) -> tuple[dict[str, Any] | None, str]:
+        """Fetch a commit via ``self.gh.commit()``, retrying only on fetch failure.
+
+        Returns ``(commit_dict, "")`` on success, or ``(None, "<leg>: <error>")``
+        if every attempt in ``_QUEUE_SYNC_RETRY_ATTEMPTS`` failed to fetch --
+        a FETCH failure (rate limit, TLS blip, transport error), not a
+        determined answer, so it is retried with
+        ``_QUEUE_SYNC_RETRY_BACKOFF_SECONDS`` backoff between attempts.
+        """
+        last_error = ""
+        for attempt in range(_QUEUE_SYNC_RETRY_ATTEMPTS):
+            result = self.gh.commit(sha)
+            if (
+                isinstance(result, GitHubRunResult)
+                and result.ok
+                and isinstance(result.value, dict)
+            ):
+                return result.value, ""
+            last_error = (
+                result.error
+                if isinstance(result, GitHubRunResult) and result.error
+                else f"commit {sha} fetch failed"
+            )
+            if attempt < _QUEUE_SYNC_RETRY_ATTEMPTS - 1:
+                _QUEUE_SYNC_RETRY_SLEEP(_QUEUE_SYNC_RETRY_BACKOFF_SECONDS[attempt])
+        return None, f"{leg}: {last_error}"
+
+    def _fetch_compare_retrying(
+        self, base: str, head: str, *, leg: str
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Fetch a comparison via ``self.gh.compare()``, retrying only on fetch failure.
+
+        ``compare()`` returns ``None`` on any failure (errors as values, not
+        raised) -- indistinguishable at that boundary from a real ``None``
+        meaning "no data", so every ``None`` is treated as a FETCH failure
+        and retried, same as ``_fetch_commit_retrying``.
+        """
+        last_error = ""
+        for attempt in range(_QUEUE_SYNC_RETRY_ATTEMPTS):
+            result = self.gh.compare(base, head)
+            if isinstance(result, dict):
+                return result, ""
+            last_error = "compare returned no data"
+            if attempt < _QUEUE_SYNC_RETRY_ATTEMPTS - 1:
+                _QUEUE_SYNC_RETRY_SLEEP(_QUEUE_SYNC_RETRY_BACKOFF_SECONDS[attempt])
+        return None, f"{leg}: {last_error}"
+
     def _queue_sync_merge_covered(
         self,
         pr: dict[str, Any],
         reviewed_head_sha: str | None,
         live_head_sha: str | None,
-    ) -> bool:
-        """Return True iff the merged head is an approval-covered queue sync-merge.
+    ) -> _QueueSyncCoverageResult:
+        """Classify whether the merged head is an approval-covered queue sync-merge.
 
         Issue #1194: Aviator's mergequeue syncs a PR branch with main before
         merging, so the merged head is a bot-authored merge commit whose
@@ -24959,23 +25056,33 @@ class OrchestratorApp:
         events.db via ``log_event`` — this path holds no state lock) so every
         exercised gate exception leaves a queryable trail; consumer is the
         operator auditing tripwire behavior, mirroring the skip-event pattern.
+
+        Returns a ``_QueueSyncCoverageResult`` rather than a bare ``bool``:
+        the three ``gh`` API calls this makes (two ``commit()``, one
+        ``compare()``) each retry transient FETCH failures up to
+        ``_QUEUE_SYNC_RETRY_ATTEMPTS`` times, but a determined non-covered
+        shape never retries. If a fetch leg still fails after retrying, the
+        result fails closed (``covered=False``) exactly as before, but is
+        marked ``indeterminate=True`` so the caller's
+        ``unauthorized_merge_detected`` payload can say "the API never
+        answered" instead of misreporting "the shape was checked and
+        rejected".
         """
         queue_bot_login = self.config.auto_merge.queue_bot_login
         if not queue_bot_login:
-            return False
+            return _QueueSyncCoverageResult(
+                covered=False, reason="auto_merge.queue_bot_login not configured"
+            )
         if not reviewed_head_sha or not live_head_sha:
-            return False
+            return _QueueSyncCoverageResult(
+                covered=False, reason="missing reviewed_head_sha or live_head_sha"
+            )
 
-        head_result = self.gh.commit(live_head_sha)
-        head_commit = (
-            head_result.value
-            if isinstance(head_result, GitHubRunResult)
-            and head_result.ok
-            and isinstance(head_result.value, dict)
-            else None
+        head_commit, head_error = self._fetch_commit_retrying(
+            live_head_sha, leg="live_head_commit"
         )
-        if not head_commit:
-            return False
+        if head_commit is None:
+            return _QueueSyncCoverageResult(covered=False, indeterminate=True, reason=head_error)
 
         parents = [
             str(p.get("sha"))
@@ -24983,13 +25090,20 @@ class OrchestratorApp:
             if isinstance(p, dict) and p.get("sha")
         ]
         if len(parents) != 2:
-            return False
+            return _QueueSyncCoverageResult(
+                covered=False, reason=f"live head has {len(parents)} parent(s), expected 2"
+            )
         matching = [p for p in parents if p == reviewed_head_sha]
         if len(matching) != 1:
             # Zero matches: not a sync of the approved head. Two matches: a
             # degenerate both-parents-approved merge — nothing to sync, so
             # nothing this path needs to bless; fail closed.
-            return False
+            return _QueueSyncCoverageResult(
+                covered=False,
+                reason=(
+                    f"{len(matching)} of 2 parents match reviewed_head_sha, expected exactly 1"
+                ),
+            )
         other_parent = next(p for p in parents if p != reviewed_head_sha)
 
         # Identity (condition 4). Checked before the extra API calls of
@@ -25009,7 +25123,13 @@ class OrchestratorApp:
             or committer_login != "web-flow"
             or committer_name != "GitHub"
         ):
-            return False
+            return _QueueSyncCoverageResult(
+                covered=False,
+                reason=(
+                    f"identity mismatch: author={author_login!r} "
+                    f"committer={committer_login!r} committer_name={committer_name!r}"
+                ),
+            )
 
         # Condition 3: anchor at pre-merge main via the landing merge
         # commit's first parent. GitHub commits merges on the base branch,
@@ -25019,34 +25139,39 @@ class OrchestratorApp:
         # below cannot succeed, and the finding keeps firing — fail closed.
         merge_commit_sha = pr.get("mergeCommitOid")
         if not merge_commit_sha:
-            return False
-        landing_result = self.gh.commit(str(merge_commit_sha))
-        landing_commit = (
-            landing_result.value
-            if isinstance(landing_result, GitHubRunResult)
-            and landing_result.ok
-            and isinstance(landing_result.value, dict)
-            else None
+            return _QueueSyncCoverageResult(covered=False, reason="pr missing mergeCommitOid")
+        landing_commit, landing_error = self._fetch_commit_retrying(
+            str(merge_commit_sha), leg="landing_commit"
         )
-        if not landing_commit:
-            return False
+        if landing_commit is None:
+            return _QueueSyncCoverageResult(
+                covered=False, indeterminate=True, reason=landing_error
+            )
         landing_parents = [
             str(p.get("sha"))
             for p in (landing_commit.get("parents") or [])
             if isinstance(p, dict) and p.get("sha")
         ]
         if not landing_parents:
-            return False
+            return _QueueSyncCoverageResult(covered=False, reason="landing commit has no parents")
         pre_merge_base = landing_parents[0]
 
-        comparison = self.gh.compare(pre_merge_base, other_parent)
-        if not isinstance(comparison, dict):
-            return False
+        comparison, compare_error = self._fetch_compare_retrying(
+            pre_merge_base, other_parent, leg="compare"
+        )
+        if comparison is None:
+            return _QueueSyncCoverageResult(
+                covered=False, indeterminate=True, reason=compare_error
+            )
         # "identical"/"behind" mean other_parent introduces zero commits not
         # already on pre-merge main; "ahead"/"diverged" (or anything else)
         # mean it carries content this approval never covered.
-        if comparison.get("status") not in ("identical", "behind"):
-            return False
+        status = comparison.get("status")
+        if status not in ("identical", "behind"):
+            return _QueueSyncCoverageResult(
+                covered=False,
+                reason=f"compare status {status!r}, expected identical or behind",
+            )
 
         log_event(
             self.paths.state_file,
@@ -25060,7 +25185,7 @@ class OrchestratorApp:
                 "queue_bot_login": queue_bot_login,
             },
         )
-        return True
+        return _QueueSyncCoverageResult(covered=True)
 
     def _detect_unauthorized_merges(
         self, merged_prs: list[dict[str, Any]] | None = None
@@ -25161,12 +25286,12 @@ class OrchestratorApp:
             # evaluated lazily: only for approved decisions with a genuine
             # head mismatch and no override, so the common paths (matching
             # head, unapproved, overridden) never pay its API calls.
-            queue_sync_covered = (
-                approved
-                and not head_matches
-                and not override_authorized
-                and self._queue_sync_merge_covered(pr, reviewed_head_sha, live_head_sha)
+            coverage_result = (
+                self._queue_sync_merge_covered(pr, reviewed_head_sha, live_head_sha)
+                if approved and not head_matches and not override_authorized
+                else None
             )
+            queue_sync_covered = coverage_result is not None and coverage_result.covered
             if (
                 (not approved or not head_matches)
                 and not override_authorized
@@ -25177,17 +25302,30 @@ class OrchestratorApp:
                     is_cross_repository=pr.get("isCrossRepository"),
                     branch_prefix=prefix,
                 )
-                candidates.append(
-                    {
-                        "pr": pr_number,
-                        "issue": issue_number,
-                        "head": head,
-                        "decision": decision_value,
-                        "reviewed_head_sha": reviewed_head_sha,
-                        "live_head_sha": live_head_sha,
-                        "review_dispatch_enabled": review_dispatch_enabled,
-                    }
-                )
+                candidate: dict[str, Any] = {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "head": head,
+                    "decision": decision_value,
+                    "reviewed_head_sha": reviewed_head_sha,
+                    "live_head_sha": live_head_sha,
+                    "review_dispatch_enabled": review_dispatch_enabled,
+                }
+                # coverage_result is only non-None when _queue_sync_merge_covered
+                # actually ran (approved + head mismatch + no override) and did
+                # not return covered=True -- i.e. exactly the cases this
+                # candidate is being appended for. Distinguish "the API never
+                # answered" (indeterminate) from "the shape was checked and
+                # rejected" (not_covered) in the finding itself, so triage does
+                # not have to re-derive it from events.db.
+                if coverage_result is not None:
+                    if coverage_result.indeterminate:
+                        candidate["coverage_check"] = "indeterminate"
+                        candidate["coverage_check_error"] = coverage_result.reason
+                    else:
+                        candidate["coverage_check"] = "not_covered"
+                        candidate["coverage_reason"] = coverage_result.reason
+                candidates.append(candidate)
         reported = self._apply_unauthorized_merge_baseline(candidates)
         # Announce on the bounded set, never on raw candidates: the arming pass
         # deliberately reports nothing, and an acked finding is deliberately
@@ -25442,6 +25580,14 @@ class OrchestratorApp:
                         "reviewed_head_sha": candidate.get("reviewed_head_sha"),
                         "live_head_sha": candidate.get("live_head_sha"),
                         "review_dispatch_enabled": candidate.get("review_dispatch_enabled"),
+                        # Issue #1194 retry fix: present only for candidates that
+                        # went through _queue_sync_merge_covered (approved +
+                        # head-mismatch + no override) and were not covered --
+                        # None for every other finding shape (unapproved,
+                        # missing decision, ...). See _QueueSyncCoverageResult.
+                        "coverage_check": candidate.get("coverage_check"),
+                        "coverage_check_error": candidate.get("coverage_check_error"),
+                        "coverage_reason": candidate.get("coverage_reason"),
                     }
                 state[key] = record
                 for candidate in fresh:
@@ -25456,6 +25602,9 @@ class OrchestratorApp:
                             "reviewed_head_sha": candidate.get("reviewed_head_sha"),
                             "live_head_sha": candidate.get("live_head_sha"),
                             "review_dispatch_enabled": candidate.get("review_dispatch_enabled"),
+                            "coverage_check": candidate.get("coverage_check"),
+                            "coverage_check_error": candidate.get("coverage_check_error"),
+                            "coverage_reason": candidate.get("coverage_reason"),
                         },
                     )
                 save_state(self.paths.state_file, state)

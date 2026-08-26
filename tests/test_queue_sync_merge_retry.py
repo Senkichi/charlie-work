@@ -215,9 +215,7 @@ def test_queue_sync_merge_covered_exhausted_retries_indeterminate(
     from charlie_work import workflow as workflow_module
 
     sleeps: list[float] = []
-    monkeypatch.setattr(
-        workflow_module, "_QUEUE_SYNC_RETRY_SLEEP", sleeps.append, raising=False
-    )
+    monkeypatch.setattr(workflow_module, "_QUEUE_SYNC_RETRY_SLEEP", sleeps.append, raising=False)
 
     app, paths, fake_gh = _queue_sync_app(tmp_path)
     _arm_queue_sync_fixture(fake_gh, paths)
