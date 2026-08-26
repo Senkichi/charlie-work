@@ -40,6 +40,7 @@ from .citation_check import (
     CitationVerdict,
     drift_fingerprint as citation_drift_fingerprint,
     drifted_verdicts as drifted_citation_verdicts,
+    format_verdict_status_cell,
     verify_citations,
 )
 from .config import (
@@ -8949,6 +8950,10 @@ class OrchestratorApp:
                                         "line": v.citation.line,
                                         "end_line": v.citation.end_line,
                                         "status": v.status.value,
+                                        "resolved_path": v.resolved_path.replace("\\", "/")
+                                        if v.resolved_path
+                                        else None,
+                                        "candidates": list(v.candidates) if v.candidates else None,
                                     }
                                     for v in drift_verdicts
                                 ],
@@ -26390,13 +26395,7 @@ class OrchestratorApp:
         lines.append("| citation | status |")
         lines.append("|---|---|")
         for v in drifted:
-            status_cell = v.status.value
-            if v.resolved_path:
-                # Surface where the file actually moved to for STALE_PREFIX
-                # verdicts so the worker can grep in the right place.
-                resolved_display = v.resolved_path.replace("\\", "/")
-                status_cell = f"{status_cell} (now at `{resolved_display}`)"
-            lines.append(f"| `{v.citation.raw}` | {status_cell} |")
+            lines.append(f"| `{v.citation.raw}` | {format_verdict_status_cell(v)} |")
         body = "\n".join(lines)
         issue_dir = self.paths.issues / f"issue-{issue_number}"
         try:
