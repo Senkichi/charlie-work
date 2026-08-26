@@ -3,15 +3,29 @@
 Extracted from ``workflow.py`` (file-size ratchet, issue #1442): the
 per-leg fetch-and-classify logic behind ``OrchestratorApp.
 _queue_sync_merge_covered`` grew the monolith past its high-water mark, so
-it moves here verbatim (only the ``self.gh`` / ``self.config`` / ``self.paths``
-implicit access becomes explicit ``gh`` / ``queue_bot_login`` / ``state_file``
-parameters, mirroring the ``_escalate_issue`` free-function precedent in
-``escalation.py``). ``workflow.py`` re-exports every symbol here via a facade
-import block, and ``OrchestratorApp._queue_sync_merge_covered`` /
-``_fetch_commit_retrying`` / ``_fetch_compare_retrying`` stay as thin
-delegating methods (the same shape already used for ``_write_rework_prompt``)
-so existing call sites, tests, and any future monkeypatch of the bound method
-keep working unchanged.
+it moves here (only the ``self.gh`` / ``self.config`` implicit access becomes
+explicit ``gh`` / ``queue_bot_login`` parameters, mirroring the
+``_escalate_issue`` free-function precedent in ``escalation.py``).
+``workflow.py`` re-exports every symbol here via a facade import block, and
+``OrchestratorApp._queue_sync_merge_covered`` / ``_fetch_commit_retrying`` /
+``_fetch_compare_retrying`` stay as thin delegating methods (the same shape
+already used for ``_write_rework_prompt``) so existing call sites, tests, and
+any future monkeypatch of the bound method keep working unchanged.
+
+Deliberately pure -- issue #1264's per-module WriteGate raw-primitive-call
+ratchet (``tests/test_write_gate_enforcement.py``,
+``test_write_gate_no_unaccounted_raw_primitive_calls``) tracks a shrink-only
+per-module count of un-gated calls to primitives like ``log_event``; a new
+module starts at baseline 0, so a raw ``log_event`` call moved in here (even
+though it was already present, and already accounted for, in workflow.py
+before this extraction) would read as brand-new growth and trip the ratchet.
+This module therefore never imports or calls ``log_event`` -- the one
+``unauthorized_merge_queue_sync_covered`` audit event
+``_queue_sync_merge_covered`` used to emit directly now happens in
+``OrchestratorApp._queue_sync_merge_covered``'s thin wrapper in
+``workflow.py``, exactly where that raw call already lived (and was already
+counted) pre-extraction, using the ``sync_parent`` / ``pre_merge_base``
+fields ``_QueueSyncCoverageResult`` carries for exactly this purpose.
 
 Issue #1194: Aviator's mergequeue syncs a PR branch with main before merging,
 so the merged head is a bot-authored merge commit whose parents are the
@@ -37,11 +51,9 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from .github import GitHubRunResult
-from .instrumentation import log_event
 
 # Retry budget for the transient-fetch legs of _queue_sync_merge_covered
 # (commit() x2, compare() x1). A single flaky `gh api` call on any leg used
@@ -86,11 +98,20 @@ class _QueueSyncCoverageResult:
     unauthorized_merge_detected) -- this dataclass only makes the two reasons
     distinguishable in the event payload instead of collapsing both into the
     same silent False.
+
+    ``sync_parent`` / ``pre_merge_base`` are populated only when
+    ``covered=True``: this module is deliberately pure (issue #1264's
+    per-module WriteGate ratchet -- see the module docstring) and never
+    calls ``log_event`` itself, so the caller needs these two computed
+    values to build the ``unauthorized_merge_queue_sync_covered`` audit
+    event payload exactly as it did before this module existed.
     """
 
     covered: bool
     indeterminate: bool = False
     reason: str = ""
+    sync_parent: str | None = None
+    pre_merge_base: str | None = None
 
 
 def _fetch_commit_retrying(gh: Any, sha: str, *, leg: str) -> tuple[dict[str, Any] | None, str]:
@@ -140,7 +161,6 @@ def _fetch_compare_retrying(
 
 def _queue_sync_merge_covered(
     gh: Any,
-    state_file: Path,
     queue_bot_login: str | None,
     pr: dict[str, Any],
     reviewed_head_sha: str | None,
@@ -178,10 +198,13 @@ def _queue_sync_merge_covered(
        substitute for it. Unset ``queue_bot_login`` disables recognition
        entirely — the tripwire behaves exactly as before #1194.
 
-    Suppressions are audit-logged (``unauthorized_merge_queue_sync_covered``,
-    events.db via ``log_event`` — this path holds no state lock) so every
-    exercised gate exception leaves a queryable trail; consumer is the
-    operator auditing tripwire behavior, mirroring the skip-event pattern.
+    Suppressions are audit-logged by the caller (``unauthorized_merge_queue_sync_covered``,
+    events.db via ``log_event`` -- this module is deliberately pure and never
+    calls ``log_event`` itself, see the module docstring; the returned
+    ``sync_parent`` / ``pre_merge_base`` fields carry what the caller needs
+    to build that event) so every exercised gate exception leaves a
+    queryable trail; consumer is the operator auditing tripwire behavior,
+    mirroring the skip-event pattern.
 
     Returns a ``_QueueSyncCoverageResult`` rather than a bare ``bool``:
     the three ``gh`` API calls this makes (two ``commit()``, one
@@ -288,16 +311,9 @@ def _queue_sync_merge_covered(
             reason=f"compare status {status!r}, expected identical or behind",
         )
 
-    log_event(
-        state_file,
-        "unauthorized_merge_queue_sync_covered",
-        {
-            "pr": pr.get("number"),
-            "reviewed_head_sha": reviewed_head_sha,
-            "live_head_sha": live_head_sha,
-            "sync_parent": other_parent,
-            "pre_merge_base": pre_merge_base,
-            "queue_bot_login": queue_bot_login,
-        },
+    # Pure by design (see module docstring): the caller emits
+    # unauthorized_merge_queue_sync_covered using these two fields, exactly
+    # where that raw log_event call already lived pre-extraction.
+    return _QueueSyncCoverageResult(
+        covered=True, sync_parent=other_parent, pre_merge_base=pre_merge_base
     )
-    return _QueueSyncCoverageResult(covered=True)

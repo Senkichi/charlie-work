@@ -24953,17 +24953,39 @@ class OrchestratorApp:
 
         See that function's docstring for the full four-condition predicate
         (issue #1194) and the retry/indeterminate contract (job-cannon PRs
-        #1888, #1916, #1904, #1895). This wrapper only threads the instance's
-        ``gh`` client, state file, and configured queue bot login through.
+        #1888, #1916, #1904, #1895).
+
+        ``queue_sync_coverage.py`` is deliberately pure (issue #1264's
+        per-module WriteGate raw-primitive-call ratchet -- a new module
+        starts at baseline 0, so a raw ``log_event`` call moved there would
+        read as new growth even though it was already present, and already
+        counted, in this file). This wrapper therefore emits the
+        ``unauthorized_merge_queue_sync_covered`` audit event itself on a
+        covered result, exactly where that raw call already lived (and was
+        already counted) before the extraction.
         """
-        return _queue_sync_merge_covered(
+        queue_bot_login = self.config.auto_merge.queue_bot_login
+        result = _queue_sync_merge_covered(
             self.gh,
-            self.paths.state_file,
-            self.config.auto_merge.queue_bot_login,
+            queue_bot_login,
             pr,
             reviewed_head_sha,
             live_head_sha,
         )
+        if result.covered:
+            log_event(
+                self.paths.state_file,
+                "unauthorized_merge_queue_sync_covered",
+                {
+                    "pr": pr.get("number"),
+                    "reviewed_head_sha": reviewed_head_sha,
+                    "live_head_sha": live_head_sha,
+                    "sync_parent": result.sync_parent,
+                    "pre_merge_base": result.pre_merge_base,
+                    "queue_bot_login": queue_bot_login,
+                },
+            )
+        return result
 
     def _detect_unauthorized_merges(
         self, merged_prs: list[dict[str, Any]] | None = None
