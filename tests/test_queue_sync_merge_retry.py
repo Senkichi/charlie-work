@@ -212,10 +212,17 @@ def test_queue_sync_merge_covered_exhausted_retries_indeterminate(
     (1s + 2s) of real backoff it would otherwise cost, and the recorded sleep
     args (``[1, 2]``) double as a check on the backoff schedule itself.
     """
-    from charlie_work import workflow as workflow_module
+    # _QUEUE_SYNC_RETRY_SLEEP lives in queue_sync_coverage.py (issue #1442
+    # extraction) -- workflow.py only re-exports the name via its facade
+    # import block, and the retry loop that reads it resolves the bare name
+    # against its OWN defining module's globals, not the re-exporting
+    # facade. Patching charlie_work.workflow here would silently no-op.
+    from charlie_work import queue_sync_coverage as queue_sync_coverage_module
 
     sleeps: list[float] = []
-    monkeypatch.setattr(workflow_module, "_QUEUE_SYNC_RETRY_SLEEP", sleeps.append, raising=False)
+    monkeypatch.setattr(
+        queue_sync_coverage_module, "_QUEUE_SYNC_RETRY_SLEEP", sleeps.append, raising=False
+    )
 
     app, paths, fake_gh = _queue_sync_app(tmp_path)
     _arm_queue_sync_fixture(fake_gh, paths)
