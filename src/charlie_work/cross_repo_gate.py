@@ -38,11 +38,18 @@ cross-repo target. Two shapes of "expected absent" candidate showed up in
 production:
 
 - **Evidence/authority citations** — a path cited as the source of the bug
-  report or the design rationale (``Authority: <path> section 4 rows 5-6``,
-  ``See <path>``), not as code the worker is meant to touch. #1452's original
-  body cited ``job_finder/*`` paths this way to document where a false-alarm
-  report came from; #1460 cited an ``llibrary`` decision doc as the design
-  authority for the feature.
+  report or the design rationale (``Authority: <path> section 4 rows 5-6``),
+  not as code the worker is meant to touch. #1452's original body cited
+  ``job_finder/*`` paths this way to document where a false-alarm report
+  came from; #1460 cited an ``llibrary`` decision doc as the design
+  authority for the feature. The marker vocabulary is deliberately narrow
+  (``authority``, ``evidence``, ``cited in``, ``rationale``, and the
+  ``section N`` / ``rows N-M`` suffixes) — it excludes ``see``, ``per``, and
+  ``line N``, which are also the ordinary way a bug report cites the file
+  the worker must *edit* (``See `job_finder/matcher.py` line 42 — the loop
+  never breaks``). Treating those as evidence markers would make a genuine
+  wrong-repo issue cited that way go all-neutral and abstain into dispatch —
+  the more expensive false-negative direction described above.
 - **Runtime-artifact write destinations** — a path the issue's *own*
   deliverable will create at runtime (``advisories are logged to
   .var/attachment-contracts/advisories.jsonl``), which by definition cannot
@@ -141,20 +148,35 @@ _PLACEHOLDER_SEGMENT = re.compile(r"^(?:[A-Za-z]+-N|.*[<>].*)$")
 _GLOB_METACHAR = re.compile(r"[*?\[\]]")
 
 # Evidence/authority-citation markers (issues #1452, #1460): a candidate
-# preceded by one of these words in its own paragraph is being cited as a
+# preceded by one of these words in its own clause is being cited as a
 # reference that explains or backs the issue, not as a file the worker is
 # expected to touch.
+#
+# Deliberately narrow. "see" and "per" were dropped: they are also the
+# ordinary way a bug report cites the file the worker must EDIT ("See
+# `job_finder/matcher.py` line 42 -- the loop never breaks"), so keeping
+# them made a genuine wrong-repo issue whose only candidates are cited that
+# way go all-neutral and abstain -- a false negative, which is the more
+# expensive failure mode per the module docstring (it costs a contaminated
+# sibling checkout, not just one manual triage action). Only markers that
+# are unambiguously about *authority/rationale for the issue*, never about
+# *where the bug lives*, stay in this list.
 _EVIDENCE_MARKER_RE = re.compile(
-    r"\b(?:authority|evidence|see|per|cited\s+in|rationale)\b",
+    r"\b(?:authority|evidence|cited\s+in|rationale)\b",
     re.IGNORECASE,
 )
 
-# Evidence/authority citation SUFFIX markers: "section 4", "rows 5-6",
-# "line 12" following a candidate in the same paragraph is the same citation
-# signal, just placed after the path instead of before it (issue #1460's
+# Evidence/authority citation SUFFIX markers: "section 4", "rows 5-6"
+# following a candidate in the same paragraph is the same citation signal,
+# just placed after the path instead of before it (issue #1460's
 # "Authority: <path> section 4 rows 5-6").
+#
+# "line N" was dropped: it is the ordinary way a bug report pinpoints the
+# file the worker must edit ("`job_finder/matcher.py` line 42 -- the loop
+# never breaks"), not an evidence-citation signal -- keeping it risked the
+# same false-negative direction as "see"/"per" above.
 _EVIDENCE_SUFFIX_RE = re.compile(
-    r"\b(?:section|rows?|line)\s+\d+",
+    r"\b(?:section|rows?)\s+\d+",
     re.IGNORECASE,
 )
 
@@ -180,9 +202,10 @@ _PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t]*\n")
 
 # Clause-boundary punctuation *within* a paragraph. A preceding marker word
 # must appear in the candidate's own clause, not merely somewhere earlier in
-# the same paragraph -- "See example.com/x.aspx for context; the actual bug
-# is in `src/real.py`" must NOT neutralize ``src/real.py`` just because
-# "See" opened an unrelated earlier clause in the same sentence.
+# the same paragraph -- "Authority: docs/decisions/x.md section 2; the
+# actual bug is in `src/real.py`" must NOT neutralize ``src/real.py`` just
+# because "Authority" opened an unrelated earlier clause in the same
+# sentence.
 #
 # Deliberately excludes ``:`` and bare newlines: a label like "Authority:"
 # or "Evidence:" is a single semantic unit with what follows it (including
@@ -502,9 +525,9 @@ def _is_context_neutral(before: str, after: str) -> bool:
     ``before`` (not the whole paragraph) so a marker word that opened an
     unrelated earlier clause in the same paragraph/sentence cannot
     neutralize a candidate it has nothing to do with. The suffix check
-    (``section N`` / ``rows N-M`` / ``line N``) stays paragraph-scoped: it
-    only ever matches immediately after the candidate, so there is no
-    equivalent "unrelated earlier clause" to guard against.
+    (``section N`` / ``rows N-M``) stays paragraph-scoped: it only ever
+    matches immediately after the candidate, so there is no equivalent
+    "unrelated earlier clause" to guard against.
     """
     clause_before = _current_clause(before)
     if _EVIDENCE_MARKER_RE.search(clause_before) or _EVIDENCE_SUFFIX_RE.search(after):

@@ -93,6 +93,28 @@ def test_1460_shaped_body_abstains_with_both_candidates_neutral(tmp_path: Path) 
     assert "abstaining" in result.reason
 
 
+def test_authority_citation_alone_still_abstains_with_narrowed_markers(
+    tmp_path: Path,
+) -> None:
+    """Review guard: dropping "see"/"per"/"line N" from the evidence
+    vocabulary must not break the marker words that stayed. A single
+    "Authority: <path> section N" citation -- no "see", no "per", no
+    "logged to" -- is still enough on its own to classify the candidate
+    neutral and abstain."""
+    repo = tmp_path / "repo"
+    _init_git_repo_with_var_gitignore(repo)
+    evidence_path = "docs/decisions/x.md"
+    body = f"Authority: `{evidence_path}` section 2"
+
+    result = cross_repo_gate(body, repo)
+
+    assert result.passed is True
+    assert result.referenced_paths == ()
+    assert result.missing_paths == ()
+    assert result.neutral_paths == (evidence_path,)
+    assert "abstaining" in result.reason
+
+
 # --- (c): genuinely wrong-repo bodies still escalate ----------------------
 
 
@@ -143,6 +165,37 @@ def test_plain_absent_path_body_still_escalates(tmp_path: Path) -> None:
 
     assert result.passed is False
     assert set(result.referenced_paths) == {"src/foo.py", "tests/test_foo.py"}
+    assert result.neutral_paths == ()
+
+
+def test_see_and_line_pinpoint_citation_still_escalates(tmp_path: Path) -> None:
+    """Review guard: "see `path` line N" is the ordinary way a bug report
+    pinpoints the file the worker must EDIT, not an evidence/authority
+    citation -- "see" and "line N" were deliberately dropped from the
+    marker vocabulary so this body does not go all-neutral and abstain
+    into dispatch against the wrong repo. Both candidates are repo-shaped
+    (real, non-ignored `src/`/`tests/` dirs exist) but missing -- the gate
+    must still escalate."""
+    repo = tmp_path / "repo"
+    _init_git_repo_with_var_gitignore(repo)
+    (repo / "src").mkdir()
+    (repo / "tests").mkdir()
+    body = (
+        "See `src/charlie_work/nonexistent_module.py` line 42 for the bug; "
+        "also `tests/test_nonexistent.py` line 7"
+    )
+
+    result = cross_repo_gate(body, repo)
+
+    assert result.passed is False
+    assert set(result.referenced_paths) == {
+        "src/charlie_work/nonexistent_module.py",
+        "tests/test_nonexistent.py",
+    }
+    assert set(result.missing_paths) == {
+        "src/charlie_work/nonexistent_module.py",
+        "tests/test_nonexistent.py",
+    }
     assert result.neutral_paths == ()
 
 
