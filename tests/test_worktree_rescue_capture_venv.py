@@ -81,9 +81,7 @@ def test_filter_redundant_add_exclusions_drops_ignored_literal(tmp_path: Path) -
     (repo_root / "kept_dir").mkdir()
     (repo_root / "kept_dir" / "f.txt").write_text("x\n", encoding="utf-8")
 
-    filtered = _filter_redundant_add_exclusions(
-        repo_root, [".venv", "kept_dir", "does_not_exist"]
-    )
+    filtered = _filter_redundant_add_exclusions(repo_root, [".venv", "kept_dir", "does_not_exist"])
 
     assert filtered == ["kept_dir"]
 

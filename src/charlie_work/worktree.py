@@ -1894,9 +1894,7 @@ def _is_glob_pathspec(target: str) -> bool:
     return any(ch in target for ch in ("*", "?", "["))
 
 
-def _filter_redundant_add_exclusions(
-    worktree_path: Path, targets: Sequence[str]
-) -> list[str]:
+def _filter_redundant_add_exclusions(worktree_path: Path, targets: Sequence[str]) -> list[str]:
     """Drop literal (non-glob) exclusion targets that would trip git's
     ignored-file advice/error without changing what gets staged (issue: git
     2.45.1.windows.1's ``git add -A -- . ':(exclude)<path>'`` exits 1 with
@@ -1971,9 +1969,7 @@ def _build_rescue_capture_exclusions(
     # here.
     glob_targets = ["PR_BODY*.md", ".pr_body*.md"]
 
-    filtered = _filter_redundant_add_exclusions(
-        worktree_path, [*literal_targets, *glob_targets]
-    )
+    filtered = _filter_redundant_add_exclusions(worktree_path, [*literal_targets, *glob_targets])
     return [f":(exclude){t}" for t in filtered]
 
 
@@ -2004,9 +2000,7 @@ def _capture_worktree_work_to_rescue_ref(
     # declared scaffolding paths — pruned of any literal exclusion that
     # would trip git's ignored-file advice/error (see
     # _filter_redundant_add_exclusions).
-    exclusions = _build_rescue_capture_exclusions(
-        worktree_path, injected_paths, materialize_dirs
-    )
+    exclusions = _build_rescue_capture_exclusions(worktree_path, injected_paths, materialize_dirs)
 
     add_result = run_captured(
         ["git", "add", "-A", "--", ".", *exclusions],
@@ -3175,9 +3169,7 @@ def create_worktree(
             _clean_captured_worktree(check_path, capture_injected)
             return
         if capture.error:
-            raise WorktreeUnsafeError(
-                f"{unsafe_reason}; rescue capture failed: {capture.error}"
-            )
+            raise WorktreeUnsafeError(f"{unsafe_reason}; rescue capture failed: {capture.error}")
         raise WorktreeUnsafeError(unsafe_reason)
 
     def _clean_captured_worktree(wt_path: Path, clean_injected: tuple[str, ...]) -> None:
