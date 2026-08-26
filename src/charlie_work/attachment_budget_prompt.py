@@ -49,6 +49,19 @@ reserved for cases with an external, cited justification (an issue or PR
 reference) supplied by the dispatch prompt or a human -- a worker may not
 author its own bump justification, and a review-time gate will block any
 bump whose acknowledgement you invented.
+
+If ANY placement advisory fired during this session (the hook appends each
+to `.var/attachment-contracts/advisories.jsonl` in your worktree), publish
+a single PR comment surfacing them so the review packet can read it: the
+comment body MUST start with the marker line `<!-- attachment-advisories v1 -->`
+followed by a fenced `json` block containing a JSON array of your advisory
+records, each an object with the fields `severity`, `file`, `identity`,
+`message`, `redirect`, `timestamp` (the same schema the hook logs). Post it
+once at PR-open time and again on any subsequent push that fires new
+advisories, replacing the prior comment's content. The review-packet
+builder reads this PR-comment channel in preference to your worktree-local
+log (which it generally cannot see); without it, the redirects-not-taken
+section of your review packet renders a "log not available" NOTE.
 """
 
 

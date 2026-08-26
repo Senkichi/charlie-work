@@ -10788,7 +10788,7 @@ class OrchestratorApp:
         # first -- most PRs touch neither `.attachment-budgets.json` nor a
         # baselined host file, so the reconstruct/build path below is
         # skipped for them entirely (section renders "").
-        attachment_budget_section = self._build_attachment_budget_section(diff)
+        attachment_budget_section = self._build_attachment_budget_section(diff, pr_number)
 
         # Issue #1036: compare-and-swap the head immediately before committing
         # this packet's outputs (prompt + decision). ``pr`` was snapshotted
@@ -17219,7 +17219,56 @@ class OrchestratorApp:
             )
         return self._cross_family_section(result.report_path), result
 
-    def _build_attachment_budget_section(self, diff: str) -> str:
+    def _read_advisories_from_pr_comment(
+        self, pr_number: int
+    ) -> tuple[AdvisoryRecord, ...] | None:
+        """Read worker-published advisories from the PR-comment channel (#1466).
+
+        Scans the PR's issue-level comments (a PR is also an issue, so its
+        top-level comments live at ``repos/{owner}/{repo}/issues/<n>/comments``)
+        for the most recent one whose body starts with
+        ``ADVISORY_COMMENT_MARKER`` and parses it via
+        ``attachment_hook_entry.parse_advisories_comment``.
+
+        Returns ``None`` when no marker comment is present (the caller falls
+        back to the local advisories log), or a tuple (possibly ``()``) when
+        one is -- a present marker with no parseable records is still a
+        present channel, so the caller does NOT fall back and the review
+        packet renders an empty redirects-not-taken list rather than the
+        "log not available" NOTE.
+
+        The most-recent marker comment wins: a worker re-posts the comment on
+        each push, so the latest one reflects the current head's advisories
+        and any older marker comment is stale. ``_gh_api_list`` returns
+        comments in chronological order (GitHub's default for that endpoint),
+        so the last match in the list is the newest.
+
+        Fail-soft: any GitHub API error (``_gh_api_list`` swallows them and
+        returns ``[]``) yields ``None`` -- a transient API failure degrades to
+        the local-log fallback rather than blocking packet generation, since
+        this section is advisory-only.
+        """
+        owner_repo = "{owner}/{repo}"
+        comments = _gh_api_list(self.gh, f"repos/{owner_repo}/issues/{pr_number}/comments")
+        marker_body: str | None = None
+        for item in comments:
+            body = item.get("body")
+            if isinstance(body, str) and body.lstrip().startswith(
+                attachment_hook_entry.ADVISORY_COMMENT_MARKER
+            ):
+                marker_body = body
+        if marker_body is None:
+            return None
+        parsed = attachment_hook_entry.parse_advisories_comment(marker_body)
+        # ``parse_advisories_comment`` returns ``None`` only for a body that
+        # does not start with the marker -- which the loop above already
+        # guaranteed -- so this is always a tuple here. Guard anyway so a
+        # future change to the parser's contract cannot make this method
+        # silently return ``None`` for a present-but-malformed marker comment
+        # (which would wrongly trigger the local-log fallback).
+        return parsed if parsed is not None else ()
+
+    def _build_attachment_budget_section(self, diff: str, pr_number: int) -> str:
         """Build ``$attachment_budget_section`` for the review packet (#1460).
 
         Cheap gate first: if `.attachment-budgets.json` is absent, or this
@@ -17235,10 +17284,24 @@ class OrchestratorApp:
         the PR-head text is reconstructed from the diff (or read straight off
         disk when the baseline file itself isn't part of this diff); a
         reconstruction failure sets ``head_unreadable`` rather than guessing.
-        Advisories are read best-effort too, with "log file doesn't exist"
+
+        Advisories are read best-effort, with "log file doesn't exist"
         (``advisory_log_exists`` False) distinguished from "log exists but
         has nothing relevant" -- only the former sets
         ``advisories_unavailable``.
+
+        Issue #1466: the advisories source is now a two-tier fallback. The
+        PR-comment channel is tried FIRST -- the worker publishes a single
+        machine-readable PR comment (marker ``ADVISORY_COMMENT_MARKER`` +
+        fenced JSON array of its ``AdvisoryRecord`` entries) at PR-open time
+        and on subsequent pushes, because the worker's worktree-local
+        ``.var/attachment-contracts/advisories.jsonl`` is generally invisible
+        to the orchestrator's ``repo_root``. When a marker comment is present
+        (``parse_advisories_comment`` returns a tuple, even ``()``), that
+        channel wins and the local log is not consulted. Only when NO marker
+        comment exists does the builder fall back to the local advisories
+        file; and only when NEITHER channel is available does
+        ``advisories_unavailable`` fire the "log not available" NOTE.
         """
         marker_path = self.repo_root / attachment_baseline.BASELINE_FILENAME
         if not marker_path.is_file():
@@ -17290,7 +17353,16 @@ class OrchestratorApp:
             )
         else:
             advisories: tuple[AdvisoryRecord, ...] | None
-            if attachment_hook_entry.advisory_log_exists(self.repo_root):
+            # Issue #1466: prefer the worker-published PR-comment channel.
+            # ``_read_advisories_from_pr_comment`` returns ``None`` when no
+            # marker comment is present (fall back to the local log) and a
+            # tuple (possibly ``()``) when one is (that channel wins, even
+            # if empty -- a present marker with no records is a clean pass,
+            # not an unavailable channel).
+            pr_comment_advisories = self._read_advisories_from_pr_comment(pr_number)
+            if pr_comment_advisories is not None:
+                advisories = pr_comment_advisories
+            elif attachment_hook_entry.advisory_log_exists(self.repo_root):
                 advisories = attachment_hook_entry.read_advisories(self.repo_root)
             else:
                 advisories = None
