@@ -111,8 +111,9 @@ def test_1452_original_shape_no_evidence_marker_still_escalates(tmp_path: Path) 
         "job_finder/web/scheduler/_jobs.py",
         "job_finder/web/scheduler/_runner.py",
     )
-    body = "None of the files are missing. All flagged paths exist under real directories:\n" + "\n".join(
-        f"- `{p}`" for p in foreign_paths
+    body = (
+        "None of the files are missing. All flagged paths exist under real directories:\n"
+        + "\n".join(f"- `{p}`" for p in foreign_paths)
     )
 
     result = cross_repo_gate(body, repo)
