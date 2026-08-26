@@ -19046,6 +19046,18 @@ class OrchestratorApp:
             escalation_reason = f"{attempts_key}_cap_exceeded"
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
+                # Diagnostic only -- does not gate the cap trip or change
+                # escalation_reason (that string is matched against
+                # escalation_reasons_seen by the same-lane oscillation guard
+                # above; mutating it would blind that guard). A worker that
+                # never launched (issue's dispatched_at never set, or
+                # cleared back to null by a failed dispatch_rework attempt)
+                # means every counted "attempt" here was actually a
+                # pre-launch worktree refusal, not a worker that ran and
+                # produced a no-op/conflicting result -- a materially
+                # different situation for whoever triages the escalation.
+                current_issue_state = state.get("issues", {}).get(str(issue_number), {})
+                worker_launched = bool(current_issue_state.get("dispatched_at"))
                 state = _escalate_issue(
                     state,
                     issue_number,
@@ -19057,6 +19069,7 @@ class OrchestratorApp:
                         # Issue #1106: clear startup-death flags on escalate.
                         "last_rework_failure_kind": None,
                         "last_rework_was_startup_death": False,
+                        "worker_launched": worker_launched,
                     },
                 )
                 state = self._record_event(
@@ -19068,6 +19081,7 @@ class OrchestratorApp:
                         "reason": reason,
                         "escalation_reason": escalation_reason,
                         "attempts": attempts,
+                        "worker_launched": worker_launched,
                     },
                 )
                 save_state(self.paths.state_file, state)
