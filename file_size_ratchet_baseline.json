@@ -21,7 +21,7 @@
   "src/charlie_work/verdict_parsing.py": 826,
   "src/charlie_work/worker.py": 1467,
   "src/charlie_work/workflow.py": 26515,
-  "src/charlie_work/worktree.py": 5304,
+  "src/charlie_work/worktree.py": 5303,
   "tests/test_api_budget.py": 1076,
   "tests/test_api_worker.py": 891,
   "tests/test_charlie_work.py": 53673,

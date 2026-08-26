@@ -379,3 +379,40 @@ def _collect_escalated_label_subjects(
                 continue
             subjects.setdefault(issue_number, None)
     return [(pr_number, issue_number) for issue_number, pr_number in sorted(subjects.items())]
+
+
+def _worker_launched_before_cap_escalation(state: dict[str, Any], issue_number: int) -> bool:
+    """Did a worker ever actually launch before a rework-attempts cap tripped?
+
+    Diagnostic only -- the caller (workflow.py's
+    ``_route_janitor_gate_failure_to_rework``) folds this into
+    ``pr_extra``/the escalation event payload, never into
+    ``escalation_reason`` itself, since that string is matched against
+    ``escalation_reasons_seen`` by the same-lane oscillation guard and
+    mutating it would blind that guard.
+
+    A worker that never launched (the issue's ``dispatched_at`` was never
+    set, or was cleared back to null by a failed ``dispatch_rework``
+    attempt -- e.g. a pre-launch worktree refusal) means every counted
+    "attempt" was a refusal before a worker ever ran, not a worker that ran
+    and produced a no-op/conflicting result. That is a materially different
+    situation for whoever triages the escalation.
+    """
+    issue_state = state.get("issues", {}).get(str(issue_number), {})
+    return bool(issue_state.get("dispatched_at"))
+
+
+def _cap_escalation_pr_extra(
+    attempts_key: str, attempts: int, worker_launched: bool
+) -> dict[str, Any]:
+    """Build the ``pr_extra`` dict for a rework-attempts-cap escalation.
+
+    Issue #1106: clears startup-death flags on escalate. Issue (this fix):
+    adds ``worker_launched`` -- see ``_worker_launched_before_cap_escalation``.
+    """
+    return {
+        attempts_key: attempts,
+        "last_rework_failure_kind": None,
+        "last_rework_was_startup_death": False,
+        "worker_launched": worker_launched,
+    }
