@@ -4085,6 +4085,7 @@ def _reap_restore_rework_requested(
             worker.branch,
             Path(worker.worktree_path),
             base_ref=config.dispatch.base_ref,
+            dry_run=write_gate.dry_run,
         )
 
     # Issue #1239: when stranded commits were published, reset to
@@ -24009,6 +24010,7 @@ class OrchestratorApp:
             branch,
             wt_path,
             base_ref=self.config.dispatch.base_ref,
+            dry_run=self.write_gate.dry_run,
         )
         if not result.pushed:
             return False
