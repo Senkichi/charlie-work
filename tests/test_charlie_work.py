@@ -18579,7 +18579,7 @@ def test_merge_ready_event_persists_gate_inputs_distinguishing_false_causes(
     paths_ci = runtime_paths(tmp_path / "ci", config_ci.runtime.state_dir)
     fake_gh_ci = FakeGitHubWithChecks(checks=[{"name": "Tests passed", "state": "FAILURE"}])
     app_ci = OrchestratorApp(tmp_path / "ci", paths_ci, config_ci, fake_gh_ci)
-    app_ci.record_review(456, "approved", summary="ok")
+    app_ci.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
     app_ci.merge_ready(456, merge=False)
     payload_ci = _last_merge_ready_payload(paths_ci.state_file)
 
@@ -18625,7 +18625,7 @@ def test_merge_ready_event_persists_gate_inputs_distinguishing_false_causes(
         },
     ]
     app_sync = OrchestratorApp(tmp_path / "sync", paths_sync, config_sync, fake_gh_sync)
-    app_sync.record_review(456, "approved", summary="ok")
+    app_sync.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
     app_sync.merge_ready(456, merge=False)
     payload_sync = _last_merge_ready_payload(paths_sync.state_file)
 
