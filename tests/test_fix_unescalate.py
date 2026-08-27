@@ -601,7 +601,7 @@ def test_unescalate_refuses_worktree_unsafe_when_worktree_still_dirty(
         state["issues"]["123"] = {
             "number": 123,
             "status": "escalated",
-            "escalation_reason": "worktree_unsafe",
+            "escalation_reason": "worktree_unsafe_shim_dirt",
             "reason_class": "mechanical",
             "branch_name": branch,
         }
@@ -616,7 +616,7 @@ def test_unescalate_refuses_worktree_unsafe_when_worktree_still_dirty(
 
     state = load_state(app.paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
-    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe_shim_dirt"
     # The dirty worktree content survives.
     assert (wt_path / "worker_wip.txt").read_text(encoding="utf-8") == "uncommitted work\n"
 

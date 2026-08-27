@@ -47,6 +47,7 @@ from .config import (
     AutoMergeConfig,
     CrossFamilyConfig,
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
+    DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
     OrchestratorConfig,
     PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS,
     ReviewDispatchConfig,
@@ -167,6 +168,7 @@ from .safe_ref import require_valid_sha
 from .worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
+    WORKTREE_UNSAFE_KINDS,
     WorktreeProbeFailedError,
     _worktree_refuse_to_reset_reason,
     _reap_idle_foreign_writer,
@@ -4152,6 +4154,12 @@ def _reap_restore_rework_requested(
         ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+        # Issue #807: a deterministic judgment failure (e.g. genuine local
+        # commits on the worktree branch) escalates immediately like a
+        # terminal_failure but as ``reason_class="judgment"`` so the
+        # de-escalation sweep never auto-clears it.
+        deterministic_judgment = failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+        immediate_escalation = terminal_failure or deterministic_judgment
 
         # Issue #1134: a worker that died before pushing leaves the PR head
         # unchanged, but that is NOT a no-op — the worker may have completed
@@ -4164,28 +4172,29 @@ def _reap_restore_rework_requested(
         worker_death_at = _windowed_worker_death_at(
             entry, window_minutes=config.watchdog.redispatch_window_minutes
         )
-        if not terminal_failure:
+        if not immediate_escalation:
             worker_death_at = worker_death_at + [
                 datetime.now(UTC).isoformat().replace("+00:00", "Z")
             ]
 
         no_op_count = max(0, len(redispatch_at) - len(worker_death_at))
         death_count = len(worker_death_at)
-        death_loop = not terminal_failure and death_count > config.watchdog.max_auto_redispatch
+        death_loop = not immediate_escalation and death_count > config.watchdog.max_auto_redispatch
         no_op_loop = (
-            not terminal_failure
+            not immediate_escalation
             and not death_loop
             and no_op_count > config.watchdog.max_auto_redispatch
         )
-        should_escalate = terminal_failure or death_loop or no_op_loop
+        should_escalate = immediate_escalation or death_loop or no_op_loop
 
         if should_escalate:
-            if terminal_failure:
+            if immediate_escalation:
                 reason = failure_kind
             elif death_loop:
                 reason = "worker_death_loop"
             else:
                 reason = "redispatch_cap_exceeded"
+            reason_class = "judgment" if deterministic_judgment else "mechanical"
             # Preserve worker_pid/worker_process_start_time (issue #282): the
             # recovery probe still needs the fingerprint even after escalation.
             issue_extra: dict[str, Any] = {
@@ -4200,7 +4209,7 @@ def _reap_restore_rework_requested(
                 "reason": "dead_rework_session_escalated",
                 "redispatch_count": len(redispatch_at),
             }
-            if not terminal_failure:
+            if not immediate_escalation:
                 # Persist the death record regardless of which cap fired —
                 # the death still happened, and the consumption side
                 # (_dispatch_rework_impl) reads it from state.
@@ -4221,7 +4230,7 @@ def _reap_restore_rework_requested(
                 state,
                 worker.issue_number,
                 reason=reason,
-                reason_class="mechanical",
+                reason_class=reason_class,
                 issue_extra=issue_extra,
             )
             state = write_gate.append_event(
@@ -4234,7 +4243,7 @@ def _reap_restore_rework_requested(
             entry["status"] = "rework_requested"
             entry["dispatched_at"] = None
             entry["redispatch_at"] = redispatch_at
-            if not terminal_failure:
+            if not immediate_escalation:
                 entry["worker_death_at"] = worker_death_at
             # Preserve worker_pid (issues #165, #282, #295)
             state["issues"][str(worker.issue_number)] = entry
@@ -4271,8 +4280,13 @@ def _reap_restore_rework_requested(
     # Transition labels: escalate (operator_queue for mechanical reasons,
     # human_needed reserved for judgment), or rework_requested (needs_rework),
     # removing the stale in_progress label from the failed launch.
+    # Issue #807: the edge must follow reason_class so a deterministic judgment
+    # failure (genuine local commits) lands agent:human-needed, not
+    # agent:operator-queue. reason_class is only assigned inside the
+    # should_escalate branch above, and this ternary only reads it when
+    # should_escalate is true, so it is always bound on this access.
     edge = (
-        _escalation_edge("redispatch_escalated", "mechanical")
+        _escalation_edge("redispatch_escalated", reason_class)
         if should_escalate
         else "rework_requested"
     )
@@ -4912,21 +4926,29 @@ def _route_dead_worker_to_pre_review_rework(
         ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-        if terminal_failure or len(redispatch_at) > config.watchdog.max_auto_redispatch:
+        # Issue #807: a deterministic judgment failure escalates immediately
+        # but as ``reason_class="judgment"`` so the de-escalation sweep
+        # never auto-clears it.
+        deterministic_judgment = failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+        immediate_escalation = terminal_failure or deterministic_judgment
+        if immediate_escalation or len(redispatch_at) > config.watchdog.max_auto_redispatch:
             # Issue #783: merge conflict / rework-branch conflict / stale-CI
             # redispatch cap are all process failures, not judgment calls.
+            # Issue #807: a deterministic judgment failure (genuine local
+            # commits) is a judgment call, not a process failure.
+            reason_class = "judgment" if deterministic_judgment else "mechanical"
             state = _escalate_issue(
                 state,
                 issue_number,
-                reason=(failure_kind if terminal_failure else "redispatch_cap_exceeded"),
-                reason_class="mechanical",
+                reason=(failure_kind if immediate_escalation else "redispatch_cap_exceeded"),
+                reason_class=reason_class,
                 issue_extra={
                     "redispatch_at": redispatch_at,
                     "pre_review_rework_reason": reason,
                 },
             )
             write_gate.save_state(state)
-            edge = _escalation_edge("redispatch_escalated", "mechanical")
+            edge = _escalation_edge("redispatch_escalated", reason_class)
             result = write_gate.transition(gh, config.labels, issue_number, edge)
             if result.outcome != TransitionOutcome.APPLIED:
                 entry = state["issues"].get(str(issue_number), {})
@@ -5152,8 +5174,8 @@ def _classify_dead_sessions_and_update_throttle_state(
 
             if (
                 failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-                and w.issue_number not in open_prs_by_issue
-            ):
+                or failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+            ) and w.issue_number not in open_prs_by_issue:
                 try:
                     issue = gh.issue_view(w.issue_number)
                 except Exception:
@@ -5168,9 +5190,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # a human without attempting the cheap safe action (push the
                 # branch + open a PR) inverts the priority: salvage-the-commit
                 # first, human adjudication only when salvage fails.
+                # Issue #807: ``worktree_unsafe`` is split at detection time
+                # into ``worktree_unsafe_shim_dirt`` and
+                # ``worktree_unsafe_local_commits``; both are covered by
+                # ``WORKTREE_UNSAFE_KINDS``. The ``ahead_count > 0`` gate below
+                # naturally filters shim dirt (uncommitted modifications, no
+                # commits ahead) so salvage only fires for genuine local
+                # commits — the case it was designed for.
                 salvaged_from_unsafe = False
                 if (
-                    failure_kind == "worktree_unsafe"
+                    failure_kind in WORKTREE_UNSAFE_KINDS
                     and repo_root is not None
                     and w.branch
                     and active_labels
@@ -5211,11 +5240,17 @@ def _classify_dead_sessions_and_update_throttle_state(
                         ) + [now.isoformat().replace("+00:00", "Z")]
                         # Issue #783: a deterministic launch failure kind is a
                         # process failure, not a judgment call -- mechanical.
+                        # Issue #807: a deterministic judgment failure kind
+                        # (genuine local commits) is a judgment call -- judgment.
+                        deterministic_judgment = (
+                            failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                        )
+                        reason_class = "judgment" if deterministic_judgment else "mechanical"
                         state = _escalate_issue(
                             state,
                             w.issue_number,
                             reason=failure_kind,
-                            reason_class="mechanical",
+                            reason_class=reason_class,
                             issue_extra={"redispatch_at": redispatch_at},
                         )
                         state["issues"][str(w.issue_number)].pop("worker_pid", None)
@@ -5225,7 +5260,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             gh,
                             config.labels,
                             w.issue_number,
-                            _escalation_edge("redispatch_escalated", "mechanical"),
+                            _escalation_edge("redispatch_escalated", reason_class),
                         )
                         state = write_gate.append_event(
                             state,
@@ -5537,23 +5572,32 @@ def _classify_dead_sessions_and_update_throttle_state(
                     # same block, so it bypasses the redispatch-count cap entirely
                     # and escalates on the very first occurrence.
                     terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                    # Issue #807: a deterministic judgment failure escalates
+                    # immediately but as ``reason_class="judgment"``.
+                    deterministic_judgment = (
+                        failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                    )
+                    immediate_escalation = terminal_failure or deterministic_judgment
                     if (
-                        terminal_failure
+                        immediate_escalation
                         or len(redispatch_at) > config.watchdog.max_auto_redispatch
                     ):
                         # Escalate to human review instead of relabeling to ready
                         reason = (
                             failure_kind
-                            if terminal_failure and failure_kind is not None
+                            if immediate_escalation and failure_kind is not None
                             else "redispatch_cap_exceeded"
                         )
                         # Issue #783: dead worker session / redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
+                        # Issue #807: a deterministic judgment failure (genuine
+                        # local commits) is a judgment call -- judgment.
+                        reason_class = "judgment" if deterministic_judgment else "mechanical"
                         state = _escalate_issue(
                             state,
                             w.issue_number,
                             reason=reason,
-                            reason_class="mechanical",
+                            reason_class=reason_class,
                             issue_extra={"redispatch_at": redispatch_at},
                         )
                         # Issue #282: preserve the liveness fingerprint for the
@@ -5565,7 +5609,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             gh,
                             config.labels,
                             w.issue_number,
-                            _escalation_edge("redispatch_escalated", "mechanical"),
+                            _escalation_edge("redispatch_escalated", reason_class),
                         )
                         state = write_gate.append_event(
                             state,
@@ -8843,11 +8887,12 @@ class OrchestratorApp:
                             else:
                                 status = "escalated"
                                 dispatched_at = None
+                                reason_class = "mechanical"
                                 state = _escalate_issue(
                                     state,
                                     request.issue_number,
                                     reason="dispatch_blocked_environment",
-                                    reason_class="mechanical",
+                                    reason_class=reason_class,
                                     issue_extra=entry,
                                 )
                                 entry = dict(state["issues"][str(request.issue_number)])
@@ -8898,26 +8943,35 @@ class OrchestratorApp:
                             and failed_result.failure_kind
                             in DETERMINISTIC_ESCALATION_FAILURE_KINDS
                         )
+                        # Issue #807: a deterministic judgment failure escalates
+                        # immediately but as ``reason_class="judgment"``.
+                        deterministic_judgment = (
+                            failed_result is not None
+                            and failed_result.failure_kind
+                            in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                        )
+                        immediate_escalation = terminal_failure or deterministic_judgment
                         entry["dispatch_failed_at"] = all_attempts
                         if (
-                            terminal_failure
+                            immediate_escalation
                             or len(recent) > self.config.watchdog.max_auto_redispatch
                         ):
                             status = "escalated"
                             dispatched_at = None
+                            reason_class = "judgment" if deterministic_judgment else "mechanical"
                             state = _escalate_issue(
                                 state,
                                 request.issue_number,
                                 reason=(
                                     failed_result.failure_kind
                                     if (
-                                        terminal_failure
+                                        immediate_escalation
                                         and failed_result is not None
                                         and failed_result.failure_kind is not None
                                     )
                                     else "dispatch_failed_cap_exceeded"
                                 ),
-                                reason_class="mechanical",
+                                reason_class=reason_class,
                                 issue_extra=entry,
                             )
                             # Re-read the escalation fields _escalate_issue merged in,
@@ -9058,7 +9112,10 @@ class OrchestratorApp:
                     # deterministic launch failure that retrying cannot fix
                     # (escalation_reason carries the failure_kind) — escalate to
                     # human-needed and remove the issue from the dispatch pool.
-                    edge = _escalation_edge("redispatch_escalated", "mechanical")
+                    # Issue #807: a deterministic judgment failure uses
+                    # ``reason_class="judgment"`` so the label lands on
+                    # human-needed, not operator_queued.
+                    edge = _escalation_edge("redispatch_escalated", reason_class)
                     result = transition(
                         self.gh,
                         self.config.labels,
@@ -14894,10 +14951,14 @@ class OrchestratorApp:
         # changed nothing causal — the next rework dispatch reproduces the
         # escalation deterministically. Re-run the safety check and refuse to
         # clear while the worktree still fails it.
+        # Issue #807: ``worktree_unsafe`` is split into
+        # ``worktree_unsafe_shim_dirt`` and ``worktree_unsafe_local_commits``;
+        # both are covered by ``WORKTREE_UNSAFE_KINDS`` so the safety re-check
+        # fires for either kind.
         if (
             issue_number is not None
             and issue_stuck
-            and issue_state.get("escalation_reason") == "worktree_unsafe"
+            and issue_state.get("escalation_reason") in WORKTREE_UNSAFE_KINDS
         ):
             unsafe_reason = self._worktree_still_unsafe(issue_number, state)
             if unsafe_reason:
@@ -21043,7 +21104,11 @@ class OrchestratorApp:
         # operation that changed nothing causal — the next rework dispatch
         # reproduces the escalation deterministically. Re-run the safety
         # check and skip clearing while the worktree still fails it.
-        if issue_entry.get("escalation_reason") == "worktree_unsafe":
+        # Issue #807: ``worktree_unsafe`` is split into
+        # ``worktree_unsafe_shim_dirt`` and ``worktree_unsafe_local_commits``;
+        # both are covered by ``WORKTREE_UNSAFE_KINDS`` so the safety re-check
+        # fires for either kind.
+        if issue_entry.get("escalation_reason") in WORKTREE_UNSAFE_KINDS:
             unsafe_reason = self._worktree_still_unsafe(issue_number, state)
             if unsafe_reason:
                 return _deescalation_skip("worktree_still_unsafe", issue_number)
@@ -23731,19 +23796,30 @@ class OrchestratorApp:
                         entry, window_minutes=self.config.watchdog.redispatch_window_minutes
                     ) + [now.isoformat().replace("+00:00", "Z")]
                     terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                    # Issue #807: a deterministic judgment failure escalates
+                    # immediately but as ``reason_class="judgment"``.
+                    deterministic_judgment = (
+                        failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                    )
+                    immediate_escalation = terminal_failure or deterministic_judgment
                     if (
-                        terminal_failure
+                        immediate_escalation
                         or len(redispatch_at) > self.config.watchdog.max_auto_redispatch
                     ):
                         # Escalate to human review
-                        reason = failure_kind if terminal_failure else "redispatch_cap_exceeded"
+                        reason = (
+                            failure_kind if immediate_escalation else "redispatch_cap_exceeded"
+                        )
                         # Issue #783: dead worker session / redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
+                        # Issue #807: a deterministic judgment failure (genuine
+                        # local commits) is a judgment call -- judgment.
+                        reason_class = "judgment" if deterministic_judgment else "mechanical"
                         state = _escalate_issue(
                             state,
                             request.issue_number,
                             reason=reason,
-                            reason_class="mechanical",
+                            reason_class=reason_class,
                             issue_extra={
                                 "redispatch_at": redispatch_at,
                                 "dispatched_at": None,
@@ -23751,7 +23827,7 @@ class OrchestratorApp:
                         )
                         entry = state["issues"][str(request.issue_number)]
                         save_state(self.paths.state_file, state)
-                        edge = _escalation_edge("redispatch_escalated", "mechanical")
+                        edge = _escalation_edge("redispatch_escalated", reason_class)
                         result = transition(
                             self.gh,
                             self.config.labels,

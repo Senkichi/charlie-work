@@ -72,11 +72,21 @@ def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, 
 DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
     {
         "worker_blocked",
-        "worktree_unsafe",
+        "worktree_unsafe_shim_dirt",
         "rework_branch_conflict",
         "cross_repo_hop",
         "provider_suspended",
     }
+)
+# Issue #807: failure kinds that escalate immediately (like
+# DETERMINISTIC_ESCALATION_FAILURE_KINDS) but as ``reason_class="judgment"``
+# rather than ``"mechanical"``, so the de-escalation sweep never auto-clears
+# them. ``worktree_unsafe_local_commits`` — genuine unpushed local commits on
+# the worktree branch — is a judgment call: returning the issue to dispatch
+# actively fights the safety system that raised the escalation and risks a
+# second writer on a branch that already has divergent local work.
+DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
+    {"worktree_unsafe_local_commits"}
 )
 # Deliberately excluded: "worktree_probe_failed" (see worktree.WorktreeProbeFailedError).
 # A failed safety probe (e.g. git status --porcelain hitting an index lock) is
