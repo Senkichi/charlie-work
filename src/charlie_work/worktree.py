@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import fnmatch
 import json
-import logging
 import os
 import re
 import shutil
@@ -50,6 +49,7 @@ from .rescue_capture_exclusions import (  # noqa: F401  (deliberate re-export)
     _filter_redundant_add_exclusions,
     _is_glob_pathspec,
 )
+from .base_branch import resolve_base_branch_name  # noqa: F401  (deliberate re-export)
 
 _DEFAULT_TIMEOUT_SECONDS = 60
 # Shorter timeout for network-touching git commands (ls-remote, fetch) so a
@@ -4146,74 +4146,6 @@ def push_branch(
     if local_sha_result.stdout.strip() == remote_sha:
         return True, None
     return False, f"remote branch {branch} does not match local tip after push"
-
-
-def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
-    """Convert a base ref (e.g. ``origin/main`` or ``HEAD``) into a branch name.
-
-    ``gh pr create --base`` expects a simple branch name. Remote-tracking refs
-    are stripped to their local branch name; ``HEAD`` falls back to the current
-    branch. When ``base_ref`` is empty or unrecognized and the ``HEAD`` probe
-    fails, the default branch is derived from the repository's remote HEAD
-    (reusing ``_resolve_default_branch_ref``, which reads
-    ``git symbolic-ref refs/remotes/origin/HEAD`` and heals an unset symref via
-    ``git remote set-head origin --auto``) instead of a hardcoded literal, so a
-    repo whose default branch is ``master``/``trunk`` is not silently compared
-    against a nonexistent ``origin/main`` — including the incident state from
-    #239/#1250 where the symref was deleted after clone. The literal ``"main"``
-    survives only as a last resort when the repo itself provides no answer (no
-    origin remote, or an origin whose default branch cannot be healed), and its
-    use is logged so the guess is visible. This function never raises.
-    """
-    if base_ref.startswith("refs/remotes/origin/"):
-        return base_ref[len("refs/remotes/origin/") :]
-    if base_ref.startswith("refs/heads/"):
-        return base_ref[len("refs/heads/") :]
-    if base_ref.startswith("origin/"):
-        return base_ref[len("origin/") :]
-    if base_ref == "HEAD":
-        current_branch = run_captured(
-            ["git", "branch", "--show-current"],
-            cwd=repo_root,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-        )
-        if current_branch.ok and current_branch.stdout.strip():
-            return current_branch.stdout.strip()
-    # Derive the default branch from the repository's remote HEAD instead of a
-    # hardcoded literal. Reuse ``_resolve_default_branch_ref`` rather than
-    # re-reading the symref here so the unset-symref case is healed via
-    # ``git remote set-head origin --auto`` (issue #239 / #1250): a clone whose
-    # ``refs/remotes/origin/HEAD`` was deleted still resolves to the real
-    # default branch instead of silently falling back to ``main``. That helper
-    # returns ``"origin/<branch>"`` when origin is present, ``"HEAD"`` for a
-    # pure-local repo with no origin, and raises ``RuntimeError`` when an origin
-    # exists but its default branch cannot be healed. This function never
-    # raises, so the RuntimeError is caught and logged here.
-    try:
-        default_ref = _resolve_default_branch_ref(repo_root)
-    except RuntimeError as exc:
-        logging.getLogger(__name__).warning(
-            "resolve_base_branch_name: could not derive default branch from repo "
-            "at %s (base_ref=%r): %s; falling back to hardcoded 'main'.",
-            repo_root,
-            base_ref,
-            exc,
-        )
-        return "main"
-    if default_ref.startswith("origin/"):
-        derived = default_ref[len("origin/") :]
-        if derived:
-            return derived
-    # ``default_ref == "HEAD"``: pure-local repo with no origin remote, so there
-    # is no remote default branch to derive. The literal ``"main"`` is the last
-    # resort and its use is logged so the guess is visible.
-    logging.getLogger(__name__).warning(
-        "resolve_base_branch_name: could not derive default branch from repo "
-        "at %s (base_ref=%r); falling back to hardcoded 'main'.",
-        repo_root,
-        base_ref,
-    )
-    return "main"
 
 
 def salvage_branch_empty_diff(repo_root: Path, branch: str, base_ref: str) -> bool:
