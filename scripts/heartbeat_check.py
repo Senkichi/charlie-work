@@ -12,7 +12,11 @@ Run via:
 Output contract (stdout): one line per check, either
     OK <check>: <compact facts>
     ANOMALY <check>: <what tripped, with numbers and the threshold>
-Exit code 0 if no anomalies, 1 if any.
+    SUPPRESSED <check>: [#<issue> until <date>] <what tripped> (issue #1361 --
+        a registry-matched, non-expired anomaly: visible but does not flip
+        the exit code)
+Exit code 0 if no anomalies (including suppressed ones), 1 if any anomaly is
+unsuppressed or a suppression itself has expired.
 """
 
 from __future__ import annotations
@@ -20,7 +24,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -31,6 +37,38 @@ from typing import Any
 import psutil
 import yaml
 
+# Issue #1271: the single declared source of truth for which warning-level
+# kinds are normal-operation signals (see the frozenset's own docstring).
+# Imported, never re-declared or hardcoded here, so check_warning_events'
+# bucketing stays correct as that set changes without this file needing an
+# edit. Unlike the rest of this module (see the stale-open-issue-mention
+# section docstring below for why it otherwise avoids importing
+# charlie_work), this one string-literal set is worth importing directly:
+# duplicating it here would be exactly the kind of hardcoded list that
+# drifts from the registry it is supposed to mirror.
+#
+# Imported from `charlie_work.event_kinds` specifically, NEVER from
+# `charlie_work.instrumentation` -- that module imports `ci_fleet` at
+# module load, and this script must stay importable even when `ci_fleet`
+# isn't (that's the entire reason it is stdlib-only; see scripts/README.md).
+# `event_kinds` is a genuine leaf: no charlie_work or ci_fleet imports of
+# its own, so importing it can never reach ci_fleet transitively.
+#
+# Guarded with try/except, not a bare import: this script is routinely run
+# via `uv run --active`, which resolves against whatever venv happens to be
+# active rather than this project's own -- a documented failure mode in this
+# fleet (see the `uv-worktree-virtualenv-shadowing` project memory) where
+# `charlie_work` itself is not importable at all, not merely `ci_fleet`.
+# `scripts/README.md`'s invariant is "a broken package install can never
+# break the check that would detect it" -- unconditional, not scoped to
+# ci_fleet -- so a missing `charlie_work` degrades this script to the exact
+# pre-#1271 behavior (no bucketing; every warning kind goes to the flat
+# detailed list) instead of crashing on import.
+try:
+    from charlie_work.event_kinds import EXPECTED_OPERATIONAL_KINDS
+except ImportError:
+    EXPECTED_OPERATIONAL_KINDS: frozenset[str] = frozenset()
+
 # --------------------------------------------------------------------------
 # CONSTANTS
 # --------------------------------------------------------------------------
@@ -40,6 +78,19 @@ ISSUE_LIST_LIMIT = 200
 MERGED_PR_LOOKBACK_LIMIT = 5
 
 QUEUED_STALE_MINUTES = 20
+
+# armable-backlog (2026-08-23): "plenty to work on" = one full wave of armed,
+# unclaimed issues (dispatch.max_concurrent_sessions); fallback when the cap
+# is unreadable. Gating labels mark an open issue as *triaged but deliberately
+# not armed*, so it leaves the un-triaged "armable" pool; keep this set in step
+# with the label taxonomy both repos share (`needs-design`, `human-action`,
+# `blocked`) plus GitHub's default terminal labels.
+ARMABLE_RUNWAY_FLOOR_DEFAULT = 3
+ARMED_LABEL = "automated-ready"
+ARMABLE_GATING_LABELS: frozenset[str] = frozenset(
+    {"blocked", "needs-design", "human-action", "question", "wontfix", "duplicate", "invalid"}
+)
+ARMABLE_PREVIEW_LIMIT = 8
 REVIEW_CLAIM_STALE_MINUTES = 45
 LOG_FRESHNESS_STALE_MINUTES = 30
 # Measured production cadence (charlie-work `loop_started` gaps, last 39
@@ -71,7 +122,43 @@ MERGEQUEUE_STALL_BEATS = 2
 GRAPHQL_RATE_LIMIT_MIN_REMAINING = 500
 DISPATCH_THROTTLE_MAX_MINUTES = 30
 MIN_BEAT_INTERVAL_MINUTES = 10
-CHARLIE_STATUS_TIMEOUT_SECONDS = 60
+# Issue #1438: `charlie fleet status --json` wall time is ~60s on this host
+# (dominated by remote API calls). A timeout equal to the typical runtime is a
+# coin flip, not a bound -- the lookup degraded on any beat that landed a hair
+# past the line (reproduced at 59.955s against a 60s timeout). 120s makes the
+# bound a real outlier detector (2x the median) instead of the median itself.
+# The result is fetched ONCE per heartbeat run (in main(), before the per-repo
+# loop) and threaded into every consumer, so this timeout is paid at most once
+# per beat, not once per consumer per repo.
+CHARLIE_STATUS_TIMEOUT_SECONDS = 120
+
+# in-progress-stale worktree mtime threshold (issue #1379). The events-based
+# check flags an issue when its GitHub updatedAt hasn't moved across 2 beats,
+# but long-running workers routinely emit no events for 40-60+ minutes while
+# actively working (events fire at dispatch/PR/exit boundaries, not during
+# implementation). Before flagging, the check also looks at the newest file
+# mtime under the issue's worker worktree: a healthy worker's worktree shows
+# file activity (edits, pytest cache, compiled bytecode) far more frequently
+# than events fire.
+#
+# The threshold separates the two cases observed on 2026-08-21: the false
+# positives (#1372) had worktree mtimes 4 seconds to 17 minutes old (alive),
+# while the true positive (#1744) had a worktree mtime ~48 minutes old (dead).
+# 30 minutes sits between them with margin on both sides (~13m below the dead
+# case, ~13m above the oldest alive case). Do not lower this without revisiting
+# those data points -- too-low reintroduces the alert fatigue the issue was
+# filed to fix; too-high lets a genuinely dead worker run longer before
+# surfacing.
+IN_PROGRESS_STALE_WORKTREE_MINUTES = 30
+
+# Bound on files scanned per worktree in _newest_worktree_mtime (issue #1379
+# acceptance: "scan cost bounded"). The scan short-circuits as soon as a file
+# newer than the stale window is found, so this cap only bounds the worst case
+# (a genuinely dead worktree with many stale files). 5000 comfortably covers a
+# typical worktree's non-.git file count; a worktree with >5000 files all older
+# than the window is overwhelmingly likely to be dead, and the cap fails toward
+# flagging (conservative), never toward green.
+_WORKTREE_MTIME_SCAN_FILE_CAP = 5000
 
 # Supervisor heartbeat freshness (issue #627). The supervisor writes
 # supervisor-heartbeat.json at the top of every loop iteration. On a live
@@ -88,6 +175,24 @@ CHARLIE_STATUS_TIMEOUT_SECONDS = 60
 SUPERVISOR_HEARTBEAT_FILENAME = "supervisor-heartbeat.json"
 SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER = 2
 SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
+
+# Disk-free thresholds (issue #1359): the 2026-08-19 outage drained C: to 0
+# bytes free over ~3.5 days at ~4 MB/s while every fleet pass failed with
+# `OSError: [Errno 28] No space left on device` and state.json went stale in
+# both lanes -- with zero early warning, because this script had no disk-space
+# check. A coarse threshold would have surfaced this days before ENOSPC.
+#
+# Defaults: WARN below 100 GB or 5% free; ANOMALY below 20 GB or 1% free. The
+# ANOMALY flips the exit code exactly like other anomalies; the WARN goes
+# through `report.warn` (routine-operational, never flips the exit code) so a
+# low-but-not-critical volume surfaces without making the check permanently
+# red. This script has no per-check config file -- thresholds are constants
+# here, matching every other threshold in this block (LOOP_PASS_STALE_MINUTES,
+# SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER, ...); override by editing this file.
+DISK_FREE_WARN_BYTES = 100 * 1024**3  # 100 GB
+DISK_FREE_WARN_RATIO = 0.05  # 5%
+DISK_FREE_ANOMALY_BYTES = 20 * 1024**3  # 20 GB
+DISK_FREE_ANOMALY_RATIO = 0.01  # 1%
 
 # check_stale_open_issue_mentions (issue #902): two bulk API sources plus one
 # free local one, per the issue's "API economy matters" constraint -- never a
@@ -126,15 +231,167 @@ class RepoInfo:
     config_path: Path
 
 
+@dataclass(frozen=True)
+class SuppressionEntry:
+    """One entry from `scripts/heartbeat-suppressions.yaml` (issue #1361).
+
+    `check` is the *base* check name as emitted, with no repo suffix (e.g.
+    ``"stale-open-issue-mentions"``, never ``"stale-open-issue-mentions
+    Senkichi/charlie-work"``). Per-repo checks build their emitted check
+    string as ``f"{base} {repo.slug}"`` (the convention already used by every
+    per-repo check in this file); `Report._match` reconstructs that same
+    convention to test a candidate entry against an emitted check string, so
+    this dataclass itself never needs to know which checks are per-repo.
+    """
+
+    check: str
+    issue: int
+    expires: str  # ISO date (YYYY-MM-DD), UTC
+    repo: str | None = None
+    match: str = ""
+    note: str = ""
+
+    def is_expired(self, now: datetime) -> bool:
+        """An entry expiring today counts as expired (issue #1361 AC7)."""
+        try:
+            expires_date = datetime.strptime(self.expires, "%Y-%m-%d").date()
+        except ValueError:
+            return True  # malformed dates are caught at load time; fail closed regardless
+        return now.date() >= expires_date
+
+
+SUPPRESSION_REGISTRY_FILENAME = "heartbeat-suppressions.yaml"
+
+
+def suppression_registry_path() -> Path:
+    """Resolve the suppression registry path, next to this script by default.
+
+    ``CHARLIE_WORK_HEARTBEAT_SUPPRESSIONS`` overrides it -- tests must always
+    set this (or pass an explicit path to `load_suppression_registry`
+    directly) rather than relying on the default, since after this file ships
+    the default path resolves to the real seeded registry.
+    """
+    override = os.environ.get("CHARLIE_WORK_HEARTBEAT_SUPPRESSIONS")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent / SUPPRESSION_REGISTRY_FILENAME
+
+
+def _is_iso_date(value: str) -> bool:
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def load_suppression_registry(path: Path) -> tuple[list[SuppressionEntry], str | None]:
+    """Load and validate the suppression registry.
+
+    Returns ``(entries, error)``. A missing file is not an error: it means
+    zero suppressions, exactly today's (pre-#1361) behavior. A malformed
+    file or entry returns ``([], error)`` -- fail closed: the entries list
+    comes back empty so a bad edit can never silently suppress anything
+    (only ever ADD an anomaly, this error, plus every previously-suppressed
+    condition resurfacing as a raw, unsuppressed ANOMALY -- the safe
+    direction to fail in).
+    """
+    if not path.exists():
+        return [], None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [], f"{path}: unreadable: {exc}"
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        return [], f"{path}: YAML parse error: {exc}"
+    if data is None:
+        return [], None
+    if not isinstance(data, list):
+        return [], f"{path}: expected a YAML list at the top level, got {type(data).__name__}"
+
+    entries: list[SuppressionEntry] = []
+    for idx, raw_entry in enumerate(data):
+        if not isinstance(raw_entry, dict):
+            return [], f"{path}: entry {idx} is not a mapping"
+        check = raw_entry.get("check")
+        if not isinstance(check, str) or not check:
+            return [], f"{path}: entry {idx} missing required string field 'check'"
+        issue = raw_entry.get("issue")
+        if not isinstance(issue, int) or isinstance(issue, bool):
+            return [], f"{path}: entry {idx} missing required integer field 'issue'"
+        expires = raw_entry.get("expires")
+        if not isinstance(expires, str) or not _is_iso_date(expires):
+            return [], f"{path}: entry {idx} missing/invalid required ISO date field 'expires'"
+        repo = raw_entry.get("repo")
+        if repo is not None and not isinstance(repo, str):
+            return [], f"{path}: entry {idx} field 'repo' must be a string"
+        match = raw_entry.get("match", "")
+        if not isinstance(match, str):
+            return [], f"{path}: entry {idx} field 'match' must be a string"
+        note = raw_entry.get("note", "")
+        if not isinstance(note, str):
+            return [], f"{path}: entry {idx} field 'note' must be a string"
+        entries.append(
+            SuppressionEntry(
+                check=check, issue=issue, expires=expires, repo=repo, match=match, note=note
+            )
+        )
+    return entries, None
+
+
 @dataclass
 class Report:
     lines: list[str] = field(default_factory=list)
     anomaly: bool = False
+    suppressions: list[SuppressionEntry] = field(default_factory=list)
+    now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    _matched_indices: set[int] = field(default_factory=set, repr=False, compare=False)
 
     def ok(self, check: str, facts: str) -> None:
         self.lines.append(f"OK {check}: {facts}")
 
+    def _find_suppression(self, check: str, detail: str) -> tuple[int, SuppressionEntry] | None:
+        """Match an emitted check string against the registry.
+
+        A registry entry's `check` is the base name; per-repo checks emit
+        ``f"{base} {repo}"`` (see `SuppressionEntry`'s docstring), so an
+        entry with a `repo` matches only that exact combined string, and an
+        entry with no `repo` matches the base name as a whole leading
+        component (never a bare substring -- ``"dispatch"`` must not match
+        ``"dispatch-coverage ..."``). `match`, when set, must additionally
+        appear as a substring of `detail` -- never of the whole line and
+        never a hash of it, since detail contains counts that change every
+        beat (issue #1361 constraint).
+        """
+        for idx, entry in enumerate(self.suppressions):
+            if entry.repo is not None:
+                if check != f"{entry.check} {entry.repo}":
+                    continue
+            else:
+                if check != entry.check and not check.startswith(f"{entry.check} "):
+                    continue
+            if entry.match and entry.match not in detail:
+                continue
+            return idx, entry
+        return None
+
     def anom(self, check: str, detail: str) -> None:
+        found = self._find_suppression(check, detail)
+        if found is not None:
+            idx, entry = found
+            self._matched_indices.add(idx)
+            if entry.is_expired(self.now):
+                self.lines.append(
+                    f"ANOMALY {check}: [suppression #{entry.issue} EXPIRED {entry.expires}] {detail}"
+                )
+                self.anomaly = True
+            else:
+                self.lines.append(
+                    f"SUPPRESSED {check}: [#{entry.issue} until {entry.expires}] {detail}"
+                )
+            return
         self.lines.append(f"ANOMALY {check}: {detail}")
         self.anomaly = True
 
@@ -142,13 +399,40 @@ class Report:
         """Surface a non-fatal finding.
 
         Unlike `anom`, this does not set `self.anomaly`, so it never flips
-        `main()`'s exit code. Issue #946: warning-level events (e.g.
-        `dispatch_stale`) are worth surfacing but several existing
-        `_WARNING_KINDS` members are normal-operation events, not faults --
-        alarming on them would make this check permanently red and get
-        ignored within a day.
+        `main()`'s exit code. Issue #946: warning-level events are worth
+        surfacing but several existing `_WARNING_KINDS` members are
+        normal-operation events, not faults (see `EXPECTED_OPERATIONAL_KINDS`,
+        issue #1271, for exactly which ones) -- alarming on them would make
+        this check permanently red and get ignored within a day.
+
+        Never suppressed: issue #1361 deliberately scopes the suppression
+        registry to ANOMALY lines only -- WARN already does not affect the
+        exit code, so suppressing it would add complexity for no behavior
+        change.
         """
         self.lines.append(f"WARN {check}: {detail}")
+
+    def suppression_summary(self) -> str | None:
+        """`OK suppressions: active=N expired=M unmatched=K`, or None.
+
+        Returns None when the registry is empty (missing file or a malformed
+        one, which loads as zero entries) -- AC5 says the summary appears
+        "whenever the registry is non-empty", and with zero entries there is
+        nothing to summarize. `active`/`expired` classify registry entries by
+        their own expiry date, independent of whether anything matched this
+        run; `unmatched` is the orthogonal count of entries that matched zero
+        `anom()` calls this run -- issue #1361's signal that a condition has
+        cleared and the entry is a candidate for deletion (surfaced, never
+        auto-deleted).
+        """
+        if not self.suppressions:
+            return None
+        active = sum(1 for e in self.suppressions if not e.is_expired(self.now))
+        expired = len(self.suppressions) - active
+        unmatched = sum(
+            1 for idx in range(len(self.suppressions)) if idx not in self._matched_indices
+        )
+        return f"active={active} expired={expired} unmatched={unmatched}"
 
 
 # --------------------------------------------------------------------------
@@ -298,6 +582,174 @@ def save_state(state: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+# --------------------------------------------------------------------------
+# Worker worktree mtime signal (issue #1379)
+# --------------------------------------------------------------------------
+#
+# These helpers are stdlib-only reimplementations of layout/worktree helpers
+# this script cannot import (see scripts/README.md's "stdlib-only" invariant).
+# They mirror:
+#   - charlie_work.layout.worktrees_dir(state_root) -> state_root / "worktrees"
+#   - charlie_work.worktree._slugify(branch)
+#   - charlie_work.worktree.worktree_path_for_branch(root, branch, worktrees_dir)
+# If those ever diverge, tests/test_heartbeat_check.py's worktree-mtime tests
+# will catch it (they build the worktree dir the same way the orchestrator
+# does, via the same slugify, so a slug mismatch surfaces as a missing dir).
+
+
+def _slugify_branch(branch: str) -> str:
+    """Mirror ``charlie_work.worktree._slugify`` (stdlib-only reimplementation).
+
+    The production function lives in ``charlie_work.worktree``; this script
+    cannot import it (stdlib-only invariant, scripts/README.md). The two must
+    agree so the worktree path derived here matches the one the orchestrator
+    created. ``tests/test_heartbeat_check.py`` exercises the same derivation
+    against real branch names, so a drift surfaces as a missing-dir test
+    failure rather than a silent false ANOMALY.
+    """
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", branch).strip("-")
+    slug = re.sub(r"-+", "-", slug)
+    return slug[:80].rstrip("-") or "worktree"
+
+
+def _resolved_worktrees_dir(repo: RepoInfo) -> Path:
+    """Resolve the worktrees root for ``repo``, honouring ``claude_code.worktrees_dir``.
+
+    Mirrors ``charlie_work.paths.resolved_layout``'s worktrees resolution
+    (issue #1379 review): ``claude_code.worktrees_dir`` is a sentinel-style
+    override -- ``None``/empty means "derive from ``runtime.state_dir``"
+    (``<state_dir>/worktrees``), a non-empty value is an explicit path
+    (absolute returned as-is, relative joined to ``repo_root``). This script
+    cannot import ``charlie_work.config``/``paths`` (stdlib-only invariant,
+    scripts/README), so the resolution is reimplemented locally against the
+    config dict ``load_orchestrator_config`` already returns -- the same
+    reimplement-locally treatment ``fleet_dir`` and the stale-open-issue-mention
+    primitives use. A broken/unreadable config degrades to the default
+    (fail-toward-flagging: a missing worktree dir reads as ANOMALY, not OK).
+    """
+    default = repo.state_dir / "worktrees"
+    config, _error = load_orchestrator_config(repo.config_path)
+    raw = config.get("claude_code", {}).get("worktrees_dir")
+    if not raw or not isinstance(raw, str):
+        return default
+    candidate = Path(raw)
+    return candidate if candidate.is_absolute() else repo.repo_root / candidate
+
+
+def _worktree_path_for_branch(
+    repo: RepoInfo, branch: str, worktrees_dir: Path | None = None
+) -> Path:
+    """Return the worktree dir for ``branch`` under ``repo``'s worktrees root.
+
+    Mirrors ``charlie_work.worktree.worktree_path_for_branch``. The worktrees
+    root defaults to ``_resolved_worktrees_dir(repo)`` (which honours
+    ``claude_code.worktrees_dir``); pass ``worktrees_dir`` to override it
+    once (e.g. a caller that resolves it once for many branches). ``repo.state_dir``
+    is the state root (the directory holding ``state.json``, as registered in
+    fleet.json).
+    """
+    root = worktrees_dir if worktrees_dir is not None else _resolved_worktrees_dir(repo)
+    return root / _slugify_branch(branch)
+
+
+def _load_state_issues(repo: RepoInfo) -> dict[str, Any]:
+    """Load the ``issues`` map from ``repo``'s ``state.json``.
+
+    Returns ``{}`` on any read/parse failure or missing file -- the caller
+    (``check_in_progress_staleness``) degrades to events-only behavior when no
+    ``branch_name`` is found, which is the correct (fail-toward-flagging)
+    direction for a corrupt state file.
+    """
+    state_json = repo.state_dir / "state.json"
+    if not state_json.exists():
+        return {}
+    try:
+        data = json.loads(state_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    issues = data.get("issues")
+    if not isinstance(issues, dict):
+        return {}
+    return issues
+
+
+def _is_reparse_point(path: str) -> bool:
+    """True if ``path`` is a reparse point (Windows junction or any symlink).
+
+    ``os.path.islink`` does NOT detect Windows directory junctions (verified
+    empirically on this host: ``islink`` returns ``False`` for a junction
+    while the reparse-point file attribute is set), and ``os.walk`` with
+    ``followlinks=False`` recurses straight through a junction regardless --
+    so a ``dirs[:]`` filter built on ``islink`` alone lets the scan walk a
+    ``.venv`` junction into a shared venv whose mtimes reflect *other*
+    worktrees' test runs, not this worker's activity. That can mask a
+    genuinely dead worker (issue #1379 review). This check is what keeps the
+    scan out of such a junction: ``islink`` catches POSIX symlinks (and
+    Windows symlinks), and the reparse-point attribute catches Windows
+    junctions that ``islink`` misses.
+    """
+    if os.path.islink(path):
+        return True
+    if sys.platform == "win32":
+        try:
+            attrs = os.lstat(path).st_file_attributes
+        except (OSError, AttributeError):
+            return False
+        return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    return False
+
+
+def _newest_worktree_mtime(
+    worktree: Path,
+    *,
+    threshold: datetime,
+    file_cap: int = _WORKTREE_MTIME_SCAN_FILE_CAP,
+) -> datetime | None:
+    """Newest file mtime under ``worktree``, excluding ``.git/``. Bounded scan.
+
+    Returns ``None`` when the directory does not exist or contains no scannable
+    files. Short-circuits as soon as a file at or after ``threshold`` is found
+    (the caller only needs to know whether ANY file is fresher than the stale
+    window), so the ``file_cap`` only bounds the worst case -- a dead worktree
+    whose every file is older than the window. The cap fails toward flagging
+    (returns the newest-so-far, which is stale), never toward green.
+
+    Windows notes (issue #1379): uses the newest *file* mtime, not directory
+    mtimes (dir mtimes do not propagate on Windows). Excludes ``.git/``
+    (background git ops are not worker activity). Does not recurse into
+    junctions/symlinks via ``_is_reparse_point`` (a ``.venv`` junction can
+    point at a shared venv whose mtimes reflect other worktrees' test runs,
+    not this worker's activity); ``os.path.islink`` alone is insufficient
+    because it does not detect Windows junctions.
+    """
+    if not worktree.is_dir():
+        return None
+    newest: datetime | None = None
+    scanned = 0
+    for root, dirs, files in os.walk(worktree, followlinks=False):
+        # Exclude .git (background git ops) and do not recurse into
+        # junctions/symlinks. _is_reparse_point catches Windows junctions
+        # that os.path.islink misses (issue #1379 review).
+        dirs[:] = [d for d in dirs if d != ".git" and not _is_reparse_point(os.path.join(root, d))]
+        for fname in files:
+            scanned += 1
+            if scanned > file_cap:
+                return newest
+            fpath = os.path.join(root, fname)
+            try:
+                mtime = os.path.getmtime(fpath)
+            except OSError:
+                continue
+            mt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+            if newest is None or mt > newest:
+                newest = mt
+                if mt >= threshold:
+                    return newest
+    return newest
+
+
 def load_orchestrator_config(config_path: Path) -> tuple[dict[str, Any], str | None]:
     """Load an orchestrator.config.yaml.
 
@@ -341,6 +793,107 @@ def get_dispatch_cap(config_path: Path) -> int | None:
     return cap if isinstance(cap, int) else None
 
 
+def _last_dispatch_drain_signal(state_dir: Path) -> dict[str, Any] | None:
+    """Read the last ``dispatch`` event's concurrency governor from events.db.
+
+    Returns the parsed payload dict of the most recent ``dispatch`` event in
+    ``state_dir/events.db`` (which carries ``concurrency_governor`` and
+    ``deferred_by_concurrency_count``), or ``None`` when no events.db exists,
+    the events table is absent, no ``dispatch`` row is recorded, or the
+    payload is unparseable. Mirrors the stdlib-only events.db access pattern
+    in ``check_loop_pass_freshness`` / ``check_error_events`` rather than
+    importing ``charlie_work.instrumentation`` -- this script stays importable
+    when ``ci_fleet`` is not installed (see the module header).
+
+    The ``concurrency_governor`` sub-payload is written by
+    ``workflow.py``'s dispatch path and carries ``dispatch_limit``,
+    ``fleet_concurrency_limit`` / ``fleet_live_session_count`` (present only
+    when the fleet governor is enabled), and the per-repo
+    ``concurrency_limit`` / ``live_session_count`` / ``available_slots``.
+    ``deferred_by_concurrency_count`` is a sibling top-level field counting
+    every ordered candidate the cap turned away this pass.
+    """
+    db_path = state_dir / "events.db"
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error:
+        return None
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                return None
+            # ORDER BY id DESC: id is AUTOINCREMENT, so the highest id is the
+            # most recent insert. This avoids the ISO-T/Z-vs-SQLite-space
+            # timestamp-format trap documented on check_loop_pass_freshness
+            # (lexicographic ts ordering happens to work for ISO-8601, but id
+            # is the insertion order and is unambiguously monotonic).
+            row = conn.execute(
+                "SELECT payload FROM events WHERE kind = 'dispatch' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _governor_drain_note(
+    persisting_count: int,
+    governor: dict[str, Any],
+    deferred_by_concurrency_count: int | None,
+) -> str | None:
+    """Build the ``draining at cap`` note from a dispatch event's governor.
+
+    Returns a human-readable drain note when the governor shows the backlog
+    is draining at the allowed rate (fleet-wide cap saturated, or the
+    effective dispatch limit was at or below the deferred backlog), or
+    ``None`` when the governor shows free slots -- the caller keeps the
+    anomaly in that case (issue #1424: the #1398 head-of-line case is real).
+
+    The condition mirrors the one stated in issue #1424:
+    ``fleet_live_session_count >= fleet_concurrency_limit`` (when the fleet
+    governor is enabled) OR ``dispatch_limit <= deferred_by_concurrency_count``.
+    """
+    cg = governor.get("concurrency_governor") if isinstance(governor, dict) else None
+    if not isinstance(cg, dict):
+        return None
+    fleet_cap = cg.get("fleet_concurrency_limit")
+    fleet_live = cg.get("fleet_live_session_count")
+    dispatch_limit = cg.get("dispatch_limit")
+
+    fleet_at_cap = (
+        isinstance(fleet_cap, int) and isinstance(fleet_live, int) and fleet_live >= fleet_cap
+    )
+    deferred_at_cap = (
+        isinstance(dispatch_limit, int)
+        and isinstance(deferred_by_concurrency_count, int)
+        and dispatch_limit <= deferred_by_concurrency_count
+    )
+
+    if not (fleet_at_cap or deferred_at_cap):
+        return None
+
+    parts = [f"backlog={persisting_count} draining at cap"]
+    if fleet_at_cap:
+        parts.append(f"fleet_live={fleet_live}/fleet_cap={fleet_cap}")
+    if deferred_at_cap and isinstance(dispatch_limit, int):
+        parts.append(f"dispatch_limit={dispatch_limit}")
+    return " ".join(parts)
+
+
 def check_orchestrator_config(report: Report, repo: RepoInfo) -> None:
     """Surface a present-but-broken orchestrator.config.yaml as a loud anomaly.
 
@@ -373,10 +926,12 @@ def check_orchestrator_config(report: Report, repo: RepoInfo) -> None:
 # charlie_work.github already has `issue_numbers_mentioned_by_pr` (a same-repo
 # PR title/body scanner) and `iter_unnegated_closing_keyword_matches` (a
 # negation-aware `#N` scanner used by `closing_keyword_gate.py`). This script
-# deliberately does NOT import charlie_work (see the module docstring and
-# `fleet_dir`), so the small negation/quote-stripping heuristics below are a
-# minimal, self-contained reimplementation for this one check rather than a
-# reuse of those functions. Two differences from `issue_numbers_mentioned_by_pr`
+# deliberately does NOT import charlie_work.github, or any other
+# ci_fleet-reachable charlie_work module (see the module docstring, `fleet_dir`,
+# and the `charlie_work.event_kinds` import's own comment for the one narrow,
+# stdlib-only exception), so the small negation/quote-stripping heuristics
+# below are a minimal, self-contained reimplementation for this one check
+# rather than a reuse of those functions. Two differences from `issue_numbers_mentioned_by_pr`
 # are intentional, not drift:
 #
 # 1. Bare `#N` is matched, not just `issue #N` / closing-keyword `#N`. Issue
@@ -627,9 +1182,30 @@ def check_dispatch_coverage(
         cur_dispatchable = set(dispatchable)
         persisting = sorted(prev_dispatchable & cur_dispatchable)
         if persisting:
-            if cap is not None and len(in_progress) >= cap:
-                # Backlog exceeding the drain rate while every dispatch slot is
-                # occupied is designed behavior, not a dispatch failure.
+            # Issue #1424: the governor that actually bounds dispatch is
+            # fleet-wide (fleet_live_session_count vs fleet_concurrency_limit
+            # across all repos), not the per-repo cap. A repo at 2/5 with the
+            # sibling repo holding the other slots reads as a dispatch failure
+            # under the per-repo denominator when it is designed behaviour.
+            # Derive the drain condition from the last dispatch event's
+            # concurrency_governor payload in this repo's events.db; fall back
+            # to the per-repo cap check only when no governor data is
+            # available (fresh install with no dispatch events yet).
+            last_dispatch = _last_dispatch_drain_signal(repo.state_dir)
+            if last_dispatch is not None:
+                deferred_count = last_dispatch.get("deferred_by_concurrency_count")
+                drain_note = _governor_drain_note(len(persisting), last_dispatch, deferred_count)
+                if drain_note is None:
+                    # The governor shows free slots and the issues still
+                    # persist -- the #1398 head-of-line case, which is real.
+                    reasons.append(
+                        f"issue(s) {persisting} dispatchable across 2 consecutive beats "
+                        "(threshold: must clear within 1 beat)"
+                    )
+            elif cap is not None and len(in_progress) >= cap:
+                # Fallback: no dispatch event in events.db yet (fresh install).
+                # Backlog exceeding the drain rate while every dispatch slot
+                # is occupied is designed behavior, not a dispatch failure.
                 drain_note = (
                     f"backlog={len(persisting)} draining at cap "
                     f"(in_progress={len(in_progress)}/cap={cap})"
@@ -683,8 +1259,113 @@ def check_dispatch_coverage(
 
     check_dispatch_throttle(report, repo, now=resolved_now)
     check_in_progress_staleness(
-        report, repo, in_progress, prev_repo_state, new_repo_state, skip_delta
+        report, repo, in_progress, prev_repo_state, new_repo_state, skip_delta, now=now
     )
+
+
+def check_armable_backlog(
+    report: Report,
+    repo: RepoInfo,
+    blocked_numbers: set[int] | None,
+    blocked_err: str,
+) -> None:
+    """Is the armed runway thin while un-triaged, armable issues sit idle?
+
+    ``dispatch-coverage`` asks "did the fleet pick up what is armed?"; this
+    check asks the question upstream of it: "is there enough armed work for
+    the fleet to pick up, and if not, is that because the backlog is
+    genuinely empty or because nobody has triaged it?" (2026-08-23: both
+    lanes were about to idle with 12 + 39 open issues carrying no label at
+    all -- neither ``automated-ready`` nor any gating label -- so the fleet
+    starved with work available.)
+
+    Three buckets over the open issues:
+
+    * ``runway``  -- ``automated-ready``, no ``agent:*`` label, not blocked:
+      what dispatch can take next. Healthy when ``>= floor``.
+    * ``active``  -- carries an ``agent:*`` label (in flight / terminal).
+    * ``armable`` -- no ``agent:*`` label, not ``automated-ready``, and no
+      *gating* label (``ARMABLE_GATING_LABELS``) or blocked-by-dependency
+      entry. This is the un-triaged pool: every issue here is either a
+      missed arm or a missed gate, and a triage pass drives it to zero.
+
+    Verdict:
+
+    * runway ``>= floor``                      -> OK (plenty to work on)
+    * runway ``< floor`` and armable is empty  -> OK (genuinely empty)
+    * runway ``< floor`` and armable non-empty -> ANOMALY: triage needed
+
+    ``floor`` is the repo's ``dispatch.max_concurrent_sessions`` cap (one
+    full wave of work), falling back to ``ARMABLE_RUNWAY_FLOOR_DEFAULT``.
+
+    Degraded blocked-issue lookup (``blocked_err``) can only *inflate* both
+    ``runway`` and ``armable``: an inflated runway can turn an anomaly into
+    a false OK, an inflated armable can turn an OK into a false anomaly. The
+    caveat is surfaced on whichever verdict is emitted rather than guessed
+    around.
+    """
+    check = f"armable-backlog {repo.slug}"
+    args = [
+        "issue",
+        "list",
+        "-R",
+        repo.slug,
+        "--state",
+        "open",
+        "--json",
+        "number,labels",
+        "--limit",
+        str(ISSUE_LIST_LIMIT),
+    ]
+    ok, data, err = run_gh_json(args, repo.repo_root)
+    if not ok:
+        report.anom(check, err)
+        return
+
+    runway: list[int] = []
+    active = 0
+    gated = 0
+    armable: list[int] = []
+    for issue in data:
+        number = issue["number"]
+        names = {label["name"] for label in issue.get("labels", [])}
+        if any(n.startswith("agent:") for n in names):
+            active += 1
+            continue
+        is_blocked = blocked_numbers is not None and number in blocked_numbers
+        if is_blocked or names & ARMABLE_GATING_LABELS:
+            gated += 1
+            continue
+        if ARMED_LABEL in names:
+            runway.append(number)
+        else:
+            armable.append(number)
+
+    cap = get_dispatch_cap(repo.config_path) if repo.config_path else None
+    floor = cap if cap is not None else ARMABLE_RUNWAY_FLOOR_DEFAULT
+    facts = (
+        f"runway={len(runway)} floor={floor} armable={len(armable)} "
+        f"active={active} gated={gated} open={len(data)}"
+    )
+    caveat = f" (blocked-issue lookup degraded: {blocked_err})" if blocked_err else ""
+
+    if len(runway) >= floor:
+        report.ok(check, f"plenty armed; {facts}{caveat}")
+    elif not armable:
+        report.ok(
+            check, f"runway thin but backlog genuinely empty of armable issues; {facts}{caveat}"
+        )
+    else:
+        preview = sorted(armable)[:ARMABLE_PREVIEW_LIMIT]
+        more = len(armable) - len(preview)
+        suffix = f" (+{more} more)" if more > 0 else ""
+        report.anom(
+            check,
+            f"runway thin ({len(runway)} < floor {floor}) while {len(armable)} "
+            f"un-triaged armable issue(s) sit idle: {preview}{suffix} -- triage: "
+            f"label each `{ARMED_LABEL}` or one of {sorted(ARMABLE_GATING_LABELS)}"
+            f"; {facts}{caveat}",
+        )
 
 
 def check_in_progress_staleness(
@@ -694,12 +1375,33 @@ def check_in_progress_staleness(
     prev_repo_state: dict[str, Any],
     new_repo_state: dict[str, Any],
     skip_delta: bool,
+    *,
+    now: datetime | None = None,
 ) -> None:
     """Flag agent:in-progress issues whose updatedAt hasn't moved across 2 beats.
 
     Persists {issue_number: updatedAt} per repo in the state file so the next
     beat can compare. Entries for issues no longer in-progress are pruned
     automatically since cur_map is rebuilt fresh from this beat's data.
+
+    Issue #1379: events-stale does not mean the worker is dead. Long-running
+    workers emit events only at dispatch/PR/exit boundaries, not during
+    implementation, so a healthy worker routinely shows zero new events across
+    2 beats. Before flagging, the check also looks at the newest file mtime
+    under the issue's worker worktree (the state record carries ``branch_name``;
+    the worktree dir is derived from it). Worktree mtime cleanly separates a
+    healthy worker (files modified seconds-to-minutes ago) from a dead one (no
+    file activity for tens of minutes).
+
+    Decision matrix:
+    - events fresh (updatedAt moved) -> OK (not in the stale set at all).
+    - events stale AND worktree mtime fresh -> OK, naming the mtime signal.
+    - events stale AND worktree mtime stale -> ANOMALY, with BOTH ages in the
+      line ("no events across 2 beats; worktree idle Nm") so the true-dead case
+      reads unambiguously.
+    - events stale AND worktree dir missing -> ANOMALY (events-only, today's
+      behavior), with "no worktree found" in the line. Absence of the directory
+      must not read as activity (fail toward flagging, not toward green).
     """
     check = f"in-progress-stale {repo.slug}"
     prev_map: dict[str, str] = prev_repo_state.get("in_progress", {})
@@ -710,6 +1412,8 @@ def check_in_progress_staleness(
         new_repo_state["in_progress"] = prev_map
         report.ok(check, f"tracked={len(prev_map)} stale=0{DELTA_SKIP_SUFFIX}")
         return
+
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
 
     cur_map: dict[str, str] = {}
     stale: list[int] = []
@@ -722,10 +1426,76 @@ def check_in_progress_staleness(
 
     new_repo_state["in_progress"] = cur_map
 
-    if stale:
-        report.anom(check, f"issue(s) {sorted(stale)} no activity across 2 beats (threshold: 2)")
-    else:
+    if not stale:
         report.ok(check, f"tracked={len(cur_map)} stale=0")
+        return
+
+    # Issue #1379: before flagging events-stale issues, check the worker's
+    # worktree for recent file activity as a second liveness signal.
+    state_issues = _load_state_issues(repo)
+    threshold = resolved_now - timedelta(minutes=IN_PROGRESS_STALE_WORKTREE_MINUTES)
+    # Resolve the worktrees root once (honours claude_code.worktrees_dir, issue
+    # #1379 review) instead of re-reading the config per stale issue.
+    worktrees_root = _resolved_worktrees_dir(repo)
+    truly_stale_details: list[str] = []
+    worktree_fresh: list[str] = []
+
+    for number in sorted(stale):
+        entry = state_issues.get(str(number))
+        branch = entry.get("branch_name") if isinstance(entry, dict) else None
+        if not branch:
+            # No branch recorded in state: cannot locate a worktree. Keep
+            # events-only behavior (fail toward flagging, not toward green).
+            truly_stale_details.append(f"#{number}: no events across 2 beats; no worktree found")
+            continue
+        worktree = _worktree_path_for_branch(repo, branch, worktrees_dir=worktrees_root)
+        if not worktree.is_dir():
+            # Worktree missing entirely: absence must not read as activity.
+            truly_stale_details.append(f"#{number}: no events across 2 beats; no worktree found")
+            continue
+        newest = _newest_worktree_mtime(worktree, threshold=threshold)
+        if newest is not None and newest >= threshold:
+            age_min = (resolved_now - newest).total_seconds() / 60
+            worktree_fresh.append(f"#{number} worktree mtime {round(age_min)}m")
+        else:
+            wt_age = (
+                round((resolved_now - newest).total_seconds() / 60) if newest is not None else 0
+            )
+            truly_stale_details.append(
+                f"#{number}: no events across 2 beats; worktree idle {wt_age}m"
+            )
+
+    if truly_stale_details:
+        detail = "; ".join(truly_stale_details) + " (threshold: 2 beats)"
+        report.anom(check, detail)
+    else:
+        facts = (
+            f"tracked={len(cur_map)} events-stale={len(stale)} "
+            f"worktree-fresh={len(worktree_fresh)}"
+        )
+        if worktree_fresh:
+            facts += "; " + ", ".join(worktree_fresh)
+        report.ok(check, facts)
+
+
+def _read_review_decision_payload(decision_path: Path) -> dict[str, Any] | None:
+    """Read and parse a packet's ``review-decision.json``.
+
+    Returns the parsed dict, or ``None`` when the file is missing, unreadable,
+    or not a JSON object. A missing/unreadable file is treated as an open
+    claim by :func:`_claim_is_open` (the placeholder has not been overwritten
+    with a terminal verdict), so ``None`` here means "open, but no payload to
+    inspect" rather than "definitely closed".
+    """
+    if not decision_path.exists():
+        return None
+    try:
+        data = json.loads(decision_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
 
 
 def _claim_is_open(decision_path: Path) -> bool:
@@ -736,13 +1506,8 @@ def _claim_is_open(decision_path: Path) -> bool:
     missing file, a still-"pending" file, or an unparseable file all mean the
     claim has not been resolved yet.
     """
-    if not decision_path.exists():
-        return True
-    try:
-        data = json.loads(decision_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return True
-    if not isinstance(data, dict):
+    data = _read_review_decision_payload(decision_path)
+    if data is None:
         return True
     return data.get("decision") == "pending"
 
@@ -792,7 +1557,12 @@ def _reviewer_pid_alive(entry: dict[str, Any]) -> bool | None:
     return abs(current_start_time - expected) <= 1.0
 
 
-def _review_claim_timestamp(pr_state: dict[str, Any]) -> str | None:
+def _review_claim_timestamp(
+    pr_state: dict[str, Any],
+    *,
+    pr_dir: Path | None = None,
+    decision: dict[str, Any] | None = None,
+) -> str | None:
     """Return the most relevant claim timestamp for an open review.
 
     The orchestrator's ground truth is ``state.json``:
@@ -804,6 +1574,41 @@ def _review_claim_timestamp(pr_state: dict[str, Any]) -> str | None:
     For unknown/missing status, fall back to the newest present timestamp.  This
     replaces the packet-directory ``st_mtime`` that never updates across redispatch
     retries (issue #517).
+
+    Issue #1403: ``review_dispatch_completed`` is a special case.  After a review
+    cycle finishes, ``record_review`` stamps ``review_dispatch_status`` to
+    ``review_dispatch_completed`` and never touches ``review_dispatched_at``.
+    When the rework cycle rebuilds the packet for a new head, the on-disk
+    ``review-decision.json`` is back to ``pending`` (so the claim is open again)
+    but state.json still carries the PRIOR cycle's ``review_dispatched_at`` --
+    ``dispatch_reviews()`` only refreshes it when it actually launches the next
+    reviewer, which may be waiting on a CI check.  The newest-timestamp fallback
+    below would date the claim by that stale prior dispatch and overcount the
+    age by the full inter-cycle gap (a false 138m ANOMALY observed on pr-1395).
+
+    Detect this case structurally: a pending on-disk decision while status is
+    ``review_dispatch_completed`` is ALREADY the contradiction that proves a
+    packet rebuild (``record_review`` writes a terminal decision; only a packet
+    build resets it to ``pending``).  Anchor on the packet-rebuild evidence --
+    the ``review-prompt.md`` mtime, rewritten on every ``review()`` packet
+    build -- instead of the stale state.json dispatch timestamp.  ``pr_dir``
+    and ``decision`` are optional so direct unit callers (and the pre-fix
+    tests) keep the original state.json-only behavior.
+
+    Issue #1436: the #1403 fix gated the rebuild anchor on the on-disk
+    decision's ``reviewed_head_sha`` DIFFERING from state.json's.  That misses
+    a packet rebuilt for the SAME head (conflict-path re-review,
+    verdict-missed retry, manual re-request): the SHA equality lets the guard
+    fall through and the newest-timestamp fallback dates the claim by the
+    prior cycle's ``review_dispatched_at`` (false 467m ANOMALY on pr-1432).
+    The SHA comparison is now only a tiebreak for the missing-prompt-file
+    case; the primary gate is ``status == completed and decision == pending``.
+
+    The prompt mtime is guarded against being OLDER than the prior cycle's
+    ``review_dispatched_at`` (clock skew / a packet that was not actually
+    rebuilt): the newer of the two is used, so this can only shrink a false
+    age and never hide a genuinely stale claim from before the completed
+    cycle.
     """
     status = pr_state.get("review_dispatch_status")
     if status == "review_dispatch_dispatched":
@@ -812,6 +1617,34 @@ def _review_claim_timestamp(pr_state: dict[str, Any]) -> str | None:
         return pr_state.get("review_dispatch_pending_at")
     if status == "review_dispatch_failed":
         return pr_state.get("review_dispatch_failed_at")
+
+    # Issue #1403/#1436: completed prior cycle whose packet was rebuilt.  See
+    # the docstring for why state.json's dispatch timestamps are stale here.
+    # A pending on-disk decision while status is completed is the structural
+    # contradiction that proves a rebuild -- regardless of whether the head
+    # advanced (#1403, differing SHA) or stayed put (#1436, same SHA).
+    if (
+        status == "review_dispatch_completed"
+        and pr_dir is not None
+        and isinstance(decision, dict)
+        and decision.get("decision") == "pending"
+    ):
+        prompt_path = pr_dir / "review-prompt.md"
+        if prompt_path.exists():
+            prompt_dt = datetime.fromtimestamp(prompt_path.stat().st_mtime, tz=timezone.utc)
+            # Guard against the prompt mtime being OLDER than the prior
+            # cycle's dispatch (clock skew / unrebuilt packet): use the newer
+            # of the two, so this can only shrink a false age and never hide a
+            # genuinely stale claim from before the completed cycle.
+            dispatch_raw = pr_state.get("review_dispatched_at")
+            dispatch_dt = parse_iso(dispatch_raw) if dispatch_raw else None
+            if dispatch_dt is not None and dispatch_dt > prompt_dt:
+                return dispatch_raw
+            return prompt_dt.isoformat().replace("+00:00", "Z")
+        # Prompt file missing: the SHA comparison survives only as a tiebreak
+        # here.  A differing SHA still indicates a rebuilt packet, but without
+        # the prompt mtime we have no rebuild timestamp; fall back to current
+        # behavior (the newest-timestamp fallback below) either way.
 
     newest: str | None = None
     newest_dt: datetime | None = None
@@ -865,6 +1698,7 @@ def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | Non
 
     resolved_now = now if now is not None else datetime.now(timezone.utc)
     open_claims = 0
+    escalated_claims = 0
     stale: list[str] = []
     claims: list[tuple[int, int, str]] = []
     for entry in sorted(prs_dir.iterdir()):
@@ -881,16 +1715,43 @@ def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | Non
             # PR already resolved (merged/closed); claim dir is stale history
             # from before reap, not evidence of a live stuck review.
             continue
-        if not _claim_is_open(entry / "review-decision.json"):
+        # Read the on-disk decision once (issue #1403): _claim_is_open and the
+        # completed-cycle-rebuilt-packet detection in _review_claim_timestamp
+        # both need it, and re-reading races with a concurrent record_review.
+        decision_payload = _read_review_decision_payload(entry / "review-decision.json")
+        if decision_payload is None:
+            # Missing/unreadable file: open claim, no payload to inspect.
+            is_open = True
+        else:
+            is_open = decision_payload.get("decision") == "pending"
+        if not is_open:
             continue
-
-        open_claims += 1
 
         pr_state = prs_state.get(str(pr_number), {}) if isinstance(prs_state, dict) else {}
         if not isinstance(pr_state, dict):
             pr_state = {}
 
-        timestamp = _review_claim_timestamp(pr_state)
+        # Issue #1357: an escalated PR (``status == "escalated"`` in state.json,
+        # ``agent:human-needed`` on the issue) never completes a review -- the
+        # escalation gate stops further dispatch, so the placeholder
+        # ``decision="pending"`` file written at packet-build time is accurate
+        # history, not a liveness signal. Counting it as an open claim trips
+        # ANOMALY on every heartbeat indefinitely. Skip the open-claim/stale
+        # accounting for escalated entries and surface them separately in the
+        # facts string instead. The packet and its pending decision file are
+        # reused on unescalate (same-head packet semantics, #1351/#1352), so
+        # the scoping belongs in this liveness check -- forging a terminal
+        # decision or deleting the packet would corrupt review state to quiet
+        # a monitor. The ``status`` field read here is the same one
+        # ``charlie_work.escalation._escalation_flags`` keys on, so the
+        # definition of "escalated" stays single-sourced.
+        if pr_state.get("status") == "escalated":
+            escalated_claims += 1
+            continue
+
+        open_claims += 1
+
+        timestamp = _review_claim_timestamp(pr_state, pr_dir=entry, decision=decision_payload)
         claim_time = parse_iso(timestamp)
         if claim_time is None:
             # Last resort: the packet directory's mtime.  This is a fallback for
@@ -917,6 +1778,8 @@ def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | Non
             stale.append(f"{entry.name}: {age_rounded}m {pid_label}")
 
     facts = f"open_claims={open_claims}"
+    if escalated_claims:
+        facts += f" escalated={escalated_claims}"
     if open_claims:
         oldest = max(claims, key=lambda c: c[1])
         facts += f" oldest_min={oldest[1]} oldest={oldest[2]}"
@@ -1177,40 +2040,51 @@ def check_warning_events(report: Report, repo: RepoInfo, baseline: datetime) -> 
     """Surface warning-level events that fire but have no consumer (issue #946).
 
     Mirrors `check_error_events` above one level down the `level` column:
-    every member of `instrumentation._WARNING_KINDS` -- including issue
-    #946's own `dispatch_stale`, plus roughly six pre-existing kinds such as
-    `dispatch_skip_blocked`, `session_exited`, `runner_capacity_starved`, and
-    `draft_pr_ready_held` -- is emitted, classified, documented, and unit
-    tested, but before this check nothing in the codebase ever read a
-    warning-level row. This gives all of them their first reader at once,
-    the same detection-to-delivery gap `check_error_events` closed for
-    `level = 'error'`.
+    every member of `instrumentation._WARNING_KINDS` -- issue #946's
+    motivating kind plus roughly a dozen other pre-existing ones -- is
+    emitted, classified, documented, and unit tested, but before this check
+    nothing in the codebase ever read a warning-level row. This gives all of
+    them their first reader at once, the same detection-to-delivery gap
+    `check_error_events` closed for `level = 'error'`.
 
     Coverage is DERIVED, never a hardcoded `kind` list, for the identical
     reason as `check_error_events`: `level` is computed once and persisted
     per-row at write time by `instrumentation._classify_level` (checked
     against `_WARNING_KINDS` there), so filtering on the persisted
     `level = 'warning'` column here picks up every current and future
-    warning kind without this script importing `charlie_work` or restating
-    its kind list.
+    warning kind without restating the kind list. This one check does import
+    `charlie_work.event_kinds` (see the module-level import's own comment,
+    and NOT `charlie_work.instrumentation` -- that module reaches `ci_fleet`
+    at import time, which this stdlib-only script must never depend on) --
+    but only for `EXPECTED_OPERATIONAL_KINDS`, the presentation bucketing
+    below, which is a distinct question from coverage.
 
     Deliberately different from `check_error_events` in exactly one place:
     a new warning-level event is reported via `report.warn`, not
-    `report.anom`. Several `_WARNING_KINDS` members
-    (`runner_capacity_starved`, `session_exited`, `draft_pr_ready_held`) are
-    normal-operation events, not faults -- and a deliberately paused fleet
-    with a non-empty backlog (the `dispatch_stale` case this check exists
-    to surface) is not a crash either. Flipping the heartbeat to failure on
-    every one of those would make this check permanently red and get
-    ignored within a day; visibility is the goal, not a new alarm. The
-    db-availability guards below stay `report.anom`, matching
-    `check_error_events`: an unreadable events.db means this check cannot
-    vouch for the repo at all, which is a genuine anomaly independent of
-    whether any warning fired.
+    `report.anom`. Several `_WARNING_KINDS` members are normal-operation
+    events, not faults -- and a deliberately paused fleet with a non-empty
+    backlog is not a crash either (see `EXPECTED_OPERATIONAL_KINDS` for
+    exactly which kinds). Flipping the heartbeat to failure on every one of
+    those would make this check permanently red and get ignored within a
+    day; visibility is the goal, not a new alarm. The db-availability guards
+    below stay `report.anom`, matching `check_error_events`: an unreadable
+    events.db means this check cannot vouch for the repo at all, which is a
+    genuine anomaly independent of whether any warning fired.
 
     See `check_error_events`'s docstring for the missing-db-is-an-anomaly
     rationale and the ISO-vs-SQLite string-comparison trap this avoids by
     comparing `ts` in Python against `baseline`, never in SQL.
+
+    Issue #1271: the kinds in `EXPECTED_OPERATIONAL_KINDS` routinely
+    dominate warning volume (a live 7-day window measured them as the
+    majority of 676 total warnings) and drowned the rare genuine warning
+    kinds in a flat listing. New rows whose `kind` is a member are bucketed
+    into a one-line summarized count instead of the detailed listing; every
+    other kind keeps the original flat `kind@ts` format unchanged. Both are
+    still reported via `report.warn`, never `report.anom` -- bucketing
+    changes presentation, not severity. Kind counts within the summary are
+    ordered by sorted kind name (never dict/insertion order) so two runs
+    over the same fixture produce byte-identical report lines.
     """
     check = f"warning-events {repo.slug}"
     db_path = repo.state_dir / "events.db"
@@ -1239,16 +2113,119 @@ def check_warning_events(report: Report, repo: RepoInfo, baseline: datetime) -> 
     finally:
         conn.close()
 
-    new_warnings: list[str] = []
+    new_warnings_detail: list[str] = []
+    expected_operational_counts: dict[str, int] = {}
     for ts, kind in rows:
         ts_dt = parse_iso(ts)
         # An unparseable ts fails toward visibility (reported), not silence.
         if ts_dt is None or ts_dt > baseline:
-            new_warnings.append(f"{kind}@{ts}")
+            if kind in EXPECTED_OPERATIONAL_KINDS:
+                expected_operational_counts[kind] = expected_operational_counts.get(kind, 0) + 1
+            else:
+                new_warnings_detail.append(f"{kind}@{ts}")
 
-    facts = f"warning_rows={len(rows)} new_since_last_beat={len(new_warnings)}"
-    if new_warnings:
-        report.warn(check, f"new warning-level event(s) since last beat: {new_warnings} ({facts})")
+    total_new = len(new_warnings_detail) + sum(expected_operational_counts.values())
+    facts = f"warning_rows={len(rows)} new_since_last_beat={total_new}"
+
+    if new_warnings_detail:
+        report.warn(
+            check, f"new warning-level event(s) since last beat: {new_warnings_detail} ({facts})"
+        )
+    if expected_operational_counts:
+        # Sorted by kind name -- never dict/insertion order -- for
+        # deterministic, byte-identical output across repeated runs.
+        counts_str = ", ".join(
+            f"{kind}={expected_operational_counts[kind]}"
+            for kind in sorted(expected_operational_counts)
+        )
+        report.warn(
+            check,
+            f"{sum(expected_operational_counts.values())} routine operational warnings "
+            f"({counts_str}) ({facts})",
+        )
+    if not new_warnings_detail and not expected_operational_counts:
+        report.ok(check, facts)
+
+
+def check_infra_blocked_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
+    """Surface ``check_infra_blocked`` events and their persisted escalation
+    (issue #1383, AC4).
+
+    ``check_infra_blocked`` is a warning-level event emitted per affected PR
+    when a required check fails due to a fleet-wide infrastructure condition
+    (Actions budget/runner outage) rather than the PR's code. The
+    operator-facing ``infra_blocked_escalated`` error event is emitted at
+    most once per configured window when the condition persists across N
+    passes. Both kinds already appear in the generic
+    ``check_warning_events`` / ``check_error_events`` listings, but those
+    are flat ``kind@ts`` lines with no correlation to the affected PRs or
+    the persistence state. This dedicated check gives the operator a
+    structured view: how many PRs are currently infra-blocked, which
+    checks, and whether the persistence escalation has fired.
+
+    Same db-availability posture as ``check_error_events``: a missing or
+    unreadable events.db is an anomaly (this check cannot vouch for a repo
+    it cannot read), not a silent OK. Timestamps are compared in Python
+    against ``baseline`` for the same ISO-vs-SQLite reason documented on
+    ``check_loop_pass_freshness``.
+    """
+    check = f"infra-blocked-events {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.anom(check, f"cannot check: no events.db at {db_path}")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"cannot check: events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.anom(check, "cannot check: events.db has no events table")
+                return
+            blocked_rows = conn.execute(
+                "SELECT ts, kind FROM events WHERE kind = ?",
+                ("check_infra_blocked",),
+            ).fetchall()
+            escalated_rows = conn.execute(
+                "SELECT ts FROM events WHERE kind = ?",
+                ("infra_blocked_escalated",),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            report.anom(check, f"cannot check: events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    new_blocked: list[str] = []
+    for ts, _kind in blocked_rows:
+        ts_dt = parse_iso(ts)
+        if ts_dt is None or ts_dt > baseline:
+            new_blocked.append(ts)
+
+    new_escalated: list[str] = []
+    for (ts,) in escalated_rows:
+        ts_dt = parse_iso(ts)
+        if ts_dt is None or ts_dt > baseline:
+            new_escalated.append(ts)
+
+    facts = f"blocked_rows={len(blocked_rows)} escalated_rows={len(escalated_rows)}"
+    if new_escalated:
+        report.anom(
+            check,
+            f"infra_blocked_escalated since last beat: {new_escalated} ({facts})",
+        )
+    elif new_blocked:
+        report.warn(
+            check,
+            f"check_infra_blocked since last beat: {len(new_blocked)} event(s) ({facts})",
+        )
     else:
         report.ok(check, facts)
 
@@ -1514,6 +2491,98 @@ def check_github_rate(report: Report, any_repo_root: Path) -> None:
         report.ok(check, facts)
 
 
+def _volume_label(anchor: str) -> str:
+    """Compact display label for a volume anchor (e.g. ``C:\\`` -> ``C:``).
+
+    Strips trailing path separators so the per-volume line reads
+    ``OK disk-space C: free=...`` rather than ``... C:\\ ...``. A root-only
+    anchor (POSIX ``/``) is returned unchanged so it does not collapse to an
+    empty label.
+    """
+    stripped = anchor.rstrip("\\/")
+    return stripped if stripped else anchor
+
+
+def check_disk_space(report: Report, repos: list[RepoInfo]) -> None:
+    """Flag low free disk space on any volume hosting a monitored state root.
+
+    Issue #1359: the 2026-08-19 disk-full outage drained the host volume to 0
+    bytes free while every fleet pass failed with
+    ``OSError: [Errno 28] No space left on device`` and state.json went stale
+    in both lanes. The first heartbeat signal was error-events firing AFTER
+    writes were already failing fleet-wide; free space had been draining for
+    ~3.5 days with zero early warning. This check surfaces the drain at a
+    coarse threshold days before impact.
+
+    The volume set is DERIVED from configuration the script already knows --
+    each registered repo's ``state_dir`` (which holds ``state.json`` and
+    ``events.db`` -- the same paths the rest of this script monitors) plus the
+    fleet dir (which holds ``heartbeat-state.json`` and
+    ``supervisor-heartbeat.json``) -- never a hardcoded drive letter. Volumes
+    are deduplicated by drive anchor (``Path.anchor``: ``C:\\`` on Windows,
+    the mount-root ``/`` on POSIX), so a single volume hosting several repos'
+    state dirs -- the common one-drive-host case -- reports once, not N times.
+    ``events.db`` lives at ``state_dir / "events.db"`` and therefore shares
+    ``state_dir``'s volume, so it needs no separate entry.
+
+    Uses ``shutil.disk_usage`` (stdlib, no new deps, consistent with this
+    script's stdlib-only invariant in ``scripts/README.md``). Below the hard
+    threshold (``DISK_FREE_ANOMALY_BYTES`` or ``DISK_FREE_ANOMALY_RATIO``) ->
+    ``report.anom`` (flips the exit code, exactly like other anomalies);
+    between soft and hard -> ``report.warn`` (routine-operational, never flips
+    the exit code, matching ``check_warning_events``'s treatment of
+    normal-operation warnings); otherwise ``report.ok``.
+    """
+    # Collect candidate paths whose hosting volumes matter, then deduplicate
+    # by drive anchor so each volume reports exactly once.
+    candidates: list[Path] = [repo.state_dir for repo in repos]
+    candidates.append(fleet_dir())
+    volumes: dict[str, Path] = {}
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            # An unresolvable path (e.g. a registered state_dir on a drive
+            # that no longer exists) still has an anchor worth probing; fall
+            # back to the literal path so disk_usage can surface the failure
+            # rather than silently dropping the volume from the report.
+            resolved = path
+        anchor = resolved.anchor or str(resolved)
+        volumes.setdefault(anchor, resolved)
+
+    for anchor, sample_path in volumes.items():
+        check = f"disk-space {_volume_label(anchor)}"
+        try:
+            usage = shutil.disk_usage(str(sample_path))
+        except OSError as exc:
+            report.anom(check, f"cannot stat volume {anchor}: {exc}")
+            continue
+        free = usage.free
+        total = usage.total
+        ratio = free / total if total > 0 else 0.0
+        free_gb = free / 1024**3
+        total_gb = total / 1024**3
+        facts = f"free={free_gb:.1f}GB ({ratio * 100:.1f}%) total={total_gb:.1f}GB"
+        if free < DISK_FREE_ANOMALY_BYTES or ratio < DISK_FREE_ANOMALY_RATIO:
+            report.anom(
+                check,
+                f"free space below hard threshold (free={free_gb:.1f}GB/"
+                f"{ratio * 100:.1f}%, anomaly below "
+                f"{DISK_FREE_ANOMALY_BYTES / 1024**3:.0f}GB or "
+                f"{DISK_FREE_ANOMALY_RATIO * 100:.0f}%) ({facts})",
+            )
+        elif free < DISK_FREE_WARN_BYTES or ratio < DISK_FREE_WARN_RATIO:
+            report.warn(
+                check,
+                f"free space below soft threshold (free={free_gb:.1f}GB/"
+                f"{ratio * 100:.1f}%, warn below "
+                f"{DISK_FREE_WARN_BYTES / 1024**3:.0f}GB or "
+                f"{DISK_FREE_WARN_RATIO * 100:.0f}%) ({facts})",
+            )
+        else:
+            report.ok(check, facts)
+
+
 def check_runners(report: Report) -> None:
     check = "runners"
     if sys.platform != "win32":
@@ -1659,7 +2728,22 @@ def check_supervisor_heartbeat(report: Report) -> None:
 
 
 def main() -> int:
-    report = Report()
+    # Sampled once for this entire beat (issue #828) and threaded into every
+    # sub-check below instead of each one independently racing the wall
+    # clock -- keeps all checks in one run reporting against a single
+    # consistent instant, and makes the run's own last_beat_at exact. Issue
+    # #1361 reuses this same instant for suppression-registry expiry checks
+    # rather than sampling the clock a second time.
+    now = datetime.now(timezone.utc)
+
+    suppressions, suppression_err = load_suppression_registry(suppression_registry_path())
+    report = Report(suppressions=suppressions, now=now)
+    if suppression_err:
+        # Fail closed (issue #1361): the registry loaded as empty, so no
+        # suppression applies this run -- this ANOMALY is additive, not a
+        # replacement for whatever previously-suppressed conditions now
+        # resurface as raw ANOMALY lines below.
+        report.anom("suppression-registry", suppression_err)
 
     repos, load_err = load_repos()
     if load_err:
@@ -1669,11 +2753,6 @@ def main() -> int:
 
     prev_state = load_state()
     prev_last_beat_at = parse_iso(prev_state.get("last_beat_at"))
-    # Sampled once for this entire beat (issue #828) and threaded into every
-    # sub-check below instead of each one independently racing the wall
-    # clock -- keeps all checks in one run reporting against a single
-    # consistent instant, and makes the run's own last_beat_at exact.
-    now = datetime.now(timezone.utc)
     baseline = prev_last_beat_at or (now - timedelta(minutes=LOG_FRESHNESS_STALE_MINUTES))
     skip_delta = prev_last_beat_at is not None and (now - prev_last_beat_at) < timedelta(
         minutes=MIN_BEAT_INTERVAL_MINUTES
@@ -1703,10 +2782,12 @@ def main() -> int:
             blocked_err,
             now=now,
         )
+        check_armable_backlog(report, repo, blocked_by_repo.get(repo.slug), blocked_err)
         check_review_liveness(report, repo, now=now)
         check_dispatch_failures(report, repo, baseline)
         check_error_events(report, repo, baseline)
         check_warning_events(report, repo, baseline)
+        check_infra_blocked_events(report, repo, baseline)
         check_log_freshness(report, repo, now=now)
         check_loop_pass_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)
@@ -1718,10 +2799,15 @@ def main() -> int:
     else:
         report.anom("github-rate", "no repos registered, cannot resolve a cwd for gh")
 
+    check_disk_space(report, repos)
     check_runners(report)
     check_supervisor_heartbeat(report)
 
     save_state(new_state)
+
+    summary = report.suppression_summary()
+    if summary is not None:
+        report.ok("suppressions", summary)
 
     print("\n".join(report.lines))
     return 1 if report.anomaly else 0

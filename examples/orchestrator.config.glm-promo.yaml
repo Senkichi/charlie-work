@@ -29,6 +29,13 @@ review_dispatch:
   enabled: false
   reviews_dir: .var/charlie-work/dispatches/reviews
   max_local_review_processes: 0
+  # Issue #1445: repo file-size cap (lines). A diff that adds code to a file
+  # whose post-diff line count exceeds this cap is a REPORTABLE FINDING in the
+  # review packet. 0 (default) disables the over-cap finding probe; the
+  # rubric prose stays present. Once issue #1442's high-water-mark line-count
+  # ratchet (or its successor structural signal) lands, that source should
+  # rebind this value.
+  # file_size_cap_lines: 0
 
 auto_merge:
   enabled: true
@@ -47,6 +54,8 @@ runtime:
   # prompts_dir: orchestrator-prompts
   # gh_max_retries: 3
   # gh_retry_base_seconds: 1.0
+  # pr_create_retry_max_attempts: 3
+  # pr_create_retry_base_seconds: 10.0
   # graphql_rate_limit_threshold: 1500
 
 devin:

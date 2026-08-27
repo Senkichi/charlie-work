@@ -62,6 +62,39 @@ against the diff, not a fact to accept — a reason that doesn't hold up
 (e.g. "n/a" on a diff with real product logic) should draw
 `request_changes`.
 
+## Static probe
+
+Two mechanical, advisory pre-checks below flag candidates for you to verify
+by reading the diff — a flag is a lead, not a verdict, and a clean run is
+not proof either heuristic is sound for this PR. Regardless of what the
+checks below find:
+
+- **Name the production caller.** For every new public function, method, or
+  class this diff adds, name the specific `src/` call site that invokes it.
+  "Tested but never called" is a blocking (Important-or-higher) finding, not
+  a Minor one, even when the probe below stayed silent.
+- **Classify test strength.** For every new test this diff adds, name its
+  strongest assertion on this scale: existence < type < status < value <
+  behavioral. Flag any test whose expected value is derived by calling the
+  code under test — that is a self-consistency check, not a regression test.
+
+$static_probe_section
+
+## File-size cap
+
+New code added to a file that is over the repo size cap is a REPORTABLE FINDING
+(tag it Important). The cap is whatever the repo's size-cap signal source
+defines -- today the `review_dispatch.file_size_cap_lines` config knob, and once issue
+#1442's high-water-mark line-count ratchet (or its successor structural signal)
+lands, that threshold. Do not duplicate or hardcode a number here; read the cap
+from that source. The suggested remedy is extraction of the new code to a
+domain module per the established facade pattern (re-export block in the
+monolith, implementation in the module), matching the #1283-era extractions.
+
+$over_cap_section
+
+$attachment_budget_section
+
 ## Approval criteria
 
 Approve only if all of these are true:

@@ -50,6 +50,23 @@ review_dispatch:
   # recorded verdict). Prevents a dead provider from being probed with a
   # real reviewer launch every pass, forever.
   # quota_probe_max_interval_minutes: 240
+  # Issue #1439: structure-aware reviewer turn cap. The flat review_max_turns
+  # budget is multiplied when a diff touches a large file (a monolith the
+  # reviewer must navigate in many Read windows), and escalated one step per
+  # consecutive turn-limit miss on the same PR. After
+  # max_consecutive_turn_limit_misses consecutive misses the PR escalates to
+  # agent:human-needed instead of a further identical session.
+  # turn_cap_large_file_threshold: 5000
+  # turn_cap_large_file_multiplier: 2
+  # turn_cap_max_multiplier: 3
+  # max_consecutive_turn_limit_misses: 3
+  # Issue #1445: repo file-size cap (lines). A diff that adds code to a file
+  # whose post-diff line count exceeds this cap is a REPORTABLE FINDING in the
+  # review packet (the rubric references this cap, not a hardcoded number).
+  # 0 (default) disables the over-cap finding probe; the rubric prose stays
+  # present. Once issue #1442's high-water-mark line-count ratchet (or its
+  # successor structural signal) lands, that source should rebind this value.
+  # file_size_cap_lines: 0
 
 auto_merge:
   enabled: true
@@ -88,6 +105,12 @@ runtime:
   # retried on provable pre-connection errors to preserve at-most-once semantics.
   # gh_max_retries: 3
   # gh_retry_base_seconds: 1.0
+  # Bounded outer retry for `gh pr create` specifically (cw#1273), layered on
+  # top of the inner retry above. The inner retry only covers pre-connection
+  # failures for mutations; this one spans longer TLS blips (~45s observed)
+  # and includes a duplicate-PR guard before each retry.
+  # pr_create_retry_max_attempts: 3
+  # pr_create_retry_base_seconds: 10.0
   # Pre-emptive GraphQL rate-limit guard for quota-heavy phases (mop-up sweeps,
   # merged-PR listings). Quota-heavy phases are deferred when remaining points
   # fall below this threshold. Set to 0 to disable the guard.

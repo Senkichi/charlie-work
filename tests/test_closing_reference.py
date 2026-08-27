@@ -354,6 +354,30 @@ def _has_pr_create_call_site(tree: ast.AST) -> bool:
     return False
 
 
+def _has_create_pr_with_retry_call_site(tree: ast.AST) -> bool:
+    """True if ``tree`` calls ``create_pr_with_retry`` (cw#1273) anywhere.
+
+    cw#1273 interposed ``pr_create_retry.create_pr_with_retry`` between every
+    caller and the raw ``gh.pr_create`` -- after that change, the raw
+    ``.pr_create(`` attribute call lives *only* inside ``pr_create_retry.py``
+    itself (see ``test_every_pr_create_call_site_routes_through_the_retry_wrapper``
+    below), so it is no longer where a PR actually gets created from the
+    perspective of "did this caller build/validate a body first". This
+    helper follows that indirection the same way
+    ``_has_pr_create_call_site`` follows the ``getattr(gh, "pr_create",
+    None)`` alias indirection: both track *the point closest to the caller*
+    where a PR creation is actually requested.
+    """
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "create_pr_with_retry"
+        ):
+            return True
+    return False
+
+
 def _imports_and_uses_validator(tree: ast.AST) -> bool:
     imported = False
     for node in ast.walk(tree):
@@ -381,9 +405,20 @@ def test_every_pr_create_call_site_routes_through_the_validator() -> None:
 
     # rglob, not glob: a call site added under a subpackage in the future
     # must not be silently exempted by scanning only the top-level directory.
+    #
+    # cw#1273 interposed create_pr_with_retry() between every caller and the
+    # raw gh.pr_create -- the raw attribute call now lives only inside
+    # pr_create_retry.py (see the AC6 retry-wrapper scan below), so
+    # "where does a caller request a PR creation" is now
+    # _has_create_pr_with_retry_call_site, not _has_pr_create_call_site.
+    # Using the pre-#1273 raw-attribute detector here would find zero call
+    # sites in workflow.py/reconcile.py (both now call the wrapper, not
+    # gh.pr_create directly) and instead flag pr_create_retry.py itself --
+    # a module that forwards an already-built body and has no closing-ref
+    # concern of its own.
     for path in sorted(_SRC_ROOT.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        if not _has_pr_create_call_site(tree):
+        if not _has_create_pr_with_retry_call_site(tree):
             continue
         scanned_with_call_site.append(path.name)
         if not _imports_and_uses_validator(tree):
@@ -396,8 +431,45 @@ def test_every_pr_create_call_site_routes_through_the_validator() -> None:
     assert "reconcile.py" in scanned_with_call_site
 
     assert offenders == [], (
-        f"Module(s) call gh.pr_create without routing through "
-        f"validate_closing_reference: {offenders}"
+        f"Module(s) call create_pr_with_retry without routing through "
+        f"validate_closing_reference first: {offenders}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# cw#1273 AC6: no `gh.pr_create` call site may bypass the bounded outer
+# retry + duplicate-PR guard (`create_pr_with_retry`). Derived from the same
+# AST scan as the validator check above, not a hardcoded file list, so a
+# future third call site is caught automatically.
+# ---------------------------------------------------------------------------
+
+
+def test_every_pr_create_call_site_routes_through_the_retry_wrapper() -> None:
+    bypass_offenders: list[str] = []
+    wrapper_consumers: list[str] = []
+
+    for path in sorted(_SRC_ROOT.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        # pr_create_retry.py's own body is the one legitimate place a raw
+        # `.pr_create(` call may live -- it *is* the routing target every
+        # other module must call instead, the same way the definition of
+        # `pr_create` itself (inside github.py) is excluded by
+        # `_nodes_outside_pr_create_definitions` rather than flagged as a
+        # call site of itself.
+        if path.name != "pr_create_retry.py" and _has_pr_create_call_site(tree):
+            bypass_offenders.append(path.name)
+        if _has_create_pr_with_retry_call_site(tree):
+            wrapper_consumers.append(path.name)
+
+    # Positive control: the scan must actually find real wrapper usage, or
+    # an empty `bypass_offenders` below would be indistinguishable from
+    # "the scan never matched anything".
+    assert "workflow.py" in wrapper_consumers
+    assert "reconcile.py" in wrapper_consumers
+
+    assert bypass_offenders == [], (
+        f"Module(s) call gh.pr_create directly, bypassing the bounded outer "
+        f"retry + duplicate-PR guard (cw#1273): {bypass_offenders}"
     )
 
 
@@ -423,7 +495,7 @@ def _salvage_labels(config: OrchestratorConfig) -> tuple[set[str], set[str]]:
 
 
 def test_open_salvage_pr_logs_unlinked_event_on_mismatch(tmp_path: Path) -> None:
-    from test_issue_956 import _SalvageTestGitHub
+    from _salvage_fixtures import _SalvageTestGitHub
 
     from charlie_work.workflow import _open_salvage_pr
 
@@ -461,7 +533,7 @@ def test_open_salvage_pr_logs_unlinked_event_on_mismatch(tmp_path: Path) -> None
 
 def test_open_salvage_pr_no_unlinked_event_when_matched(tmp_path: Path) -> None:
     """The discriminating case: GitHub's resolution DOES match. No event."""
-    from test_issue_956 import _SalvageTestGitHub
+    from _salvage_fixtures import _SalvageTestGitHub
 
     from charlie_work.workflow import _open_salvage_pr
 
@@ -495,7 +567,7 @@ def test_open_salvage_pr_no_unlinked_event_when_probe_fails(tmp_path: Path) -> N
     reference -- it is indistinguishable from a real miss only in its return
     shape, not in what it means. Logging it anyway would make the warning
     untrustworthy (see advisor review, cw#1263)."""
-    from test_issue_956 import _SalvageTestGitHub
+    from _salvage_fixtures import _SalvageTestGitHub
 
     from charlie_work.workflow import _open_salvage_pr
 
@@ -527,7 +599,7 @@ def test_open_salvage_pr_no_unlinked_event_when_probe_fails(tmp_path: Path) -> N
 def test_open_salvage_pr_skips_probe_under_dry_run(tmp_path: Path) -> None:
     """``pr_create`` returning ``0`` (dry-run sentinel) must not trigger a
     live ``gh pr view 0`` call."""
-    from test_issue_956 import _SalvageTestGitHub
+    from _salvage_fixtures import _SalvageTestGitHub
 
     from charlie_work.workflow import _open_salvage_pr
 
@@ -561,7 +633,7 @@ def test_open_salvage_pr_logs_rewritten_event_when_validator_changes_body(
     itself, so the rewrite branch is defensive in production -- exercise it
     by forcing ``validate_closing_reference`` to report a change, the same
     way a future defect in the body-builder would surface it."""
-    from test_issue_956 import _SalvageTestGitHub
+    from _salvage_fixtures import _SalvageTestGitHub
 
     from charlie_work.workflow import _open_salvage_pr
 
@@ -610,7 +682,7 @@ def test_apply_fixes_salvage_logs_unlinked_event_on_mismatch(tmp_path: Path) -> 
     through the same post-create probe as ``workflow.py``'s -- this exercises
     that side, which the earlier version of this test file never reached at
     all (every existing reconcile salvage test omits ``state_path``)."""
-    from test_reconcile import (
+    from _reconcile_fixtures import (
         FakeGitHub,
         _init_bare_remote_and_clone,
         _issue,
@@ -667,7 +739,7 @@ def test_apply_fixes_salvage_logs_unlinked_event_on_mismatch(tmp_path: Path) -> 
 
 def test_apply_fixes_salvage_no_unlinked_event_when_matched(tmp_path: Path) -> None:
     """Discriminating negative case for the reconcile-side probe."""
-    from test_reconcile import (
+    from _reconcile_fixtures import (
         FakeGitHub,
         _init_bare_remote_and_clone,
         _issue,
@@ -732,7 +804,7 @@ def test_apply_fixes_salvage_passes_corrected_body_to_pr_create(
     pass every other test in this suite (they only check for the presence
     of the *correct* issue number, which reconcile.py's own body-builder
     already writes in the untouched case) but fail this one."""
-    from test_reconcile import (
+    from _reconcile_fixtures import (
         FakeGitHub,
         _init_bare_remote_and_clone,
         _issue,

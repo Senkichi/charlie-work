@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -273,12 +274,15 @@ def is_pid_alive(pid: int, expected_start_time: float | None = None) -> bool:
     current process start time is also fetched and compared against the stored
     fingerprint, returning False if the PID has been recycled.
 
-    Indeterminate probes (e.g. a transient ``OpenProcess`` failure or a
-    start-time query that returns ``None`` while the PID still appears to exist)
-    are treated as ``True``.  Reaping a live worker on a false-negative liveness
-    signal is far worse than delaying a reap by one pass, so this function only
-    returns ``False`` when it can prove the process is dead or has been
-    recycled.
+    Indeterminate probes (e.g. a transient start-time query that returns
+    ``None`` while the PID still appears to exist) are treated as ``True``.
+    Reaping a live worker on a false-negative liveness signal is far worse than
+    delaying a reap by one pass, so this function only returns ``False`` when it
+    can prove the process is dead or has been recycled.
+
+    The one exception is Windows ``ERROR_ACCESS_DENIED`` from ``OpenProcess``:
+    that is fail-closed (``False``), not fail-open.  See the inline comment at
+    the access-denied branch for the same-user invariant that justifies this.
     """
     if pid <= 0:
         return False
@@ -289,23 +293,38 @@ def is_pid_alive(pid: int, expected_start_time: float | None = None) -> bool:
 
         _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         _WIN_STILL_ACTIVE = 259
-        _ERROR_ACCESS_DENIED = 5
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
-            # ``OpenProcess`` can fail because the PID does not exist (definitive
-            # dead signal) or because the process exists but we are denied access
-            # (indeterminate).  Treat access-denied as alive; all other open
-            # failures are treated as not running.
-            return kernel32.GetLastError() == _ERROR_ACCESS_DENIED
+            # ``OpenProcess`` can fail because the PID does not exist (e.g.
+            # ``ERROR_INVALID_PARAMETER`` -- definitive dead signal) or because
+            # the process exists but we are denied access
+            # (``ERROR_ACCESS_DENIED``).
+            #
+            # ACCESS_DENIED is fail-closed for worker liveness, not fail-open.
+            # Every process the orchestrator launches is same-user and openable
+            # with ``PROCESS_QUERY_LIMITED_INFORMATION`` -- that is the
+            # load-bearing invariant.  A PID that returns ACCESS_DENIED is by
+            # construction NOT one of our workers: it is a recycled PID that
+            # landed on a protected/system process.  Treating it as alive would
+            # pin the issue live-dispatched forever (dispatch counts it in
+            # ``_issues_with_live_workers``), starve the salvage lane (issue
+            # #1122), and prevent the dead-session reaper from ever classifying
+            # the sidecar.  Returning ``False`` collapses the recycled-pid case
+            # to dead, which is the correct answer for every caller (dispatch
+            # slot counting, phantom classification, reviewer liveness via
+            # ``_reviewer_pid_alive``, reaper lanes).  (issue #1371)
+            return False
         try:
             exit_code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                # Could not read the exit code; we cannot prove the process is
-                # dead, so treat it as indeterminate rather than failing open.
-                return True
-            if exit_code.value != _WIN_STILL_ACTIVE:
-                return False
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                if exit_code.value != _WIN_STILL_ACTIVE:
+                    return False
+                # Process is still active; fall through to the start-time
+                # identity check below.
+            # ``GetExitCodeProcess`` failed.  Fall through to the start-time
+            # identity check below rather than declaring alive without
+            # verifying identity (issue #1371 audit of indeterminate branches).
         finally:
             kernel32.CloseHandle(handle)
     else:
@@ -314,8 +333,11 @@ def is_pid_alive(pid: int, expected_start_time: float | None = None) -> bool:
         except ProcessLookupError:
             return False
         except PermissionError:
-            # Process exists but we cannot signal it; treat as indeterminate.
-            return True
+            # Process exists but we cannot signal it.  Fall through to the
+            # start-time identity check below rather than declaring alive
+            # without verifying identity (issue #1371 audit of indeterminate
+            # branches).
+            pass
         except (OSError, ValueError):
             return False
 
@@ -717,3 +739,30 @@ def popen_worker(
     popen_kwargs.update(hidden_console_kwargs(extra_flags | process_group_flag))
 
     return subprocess.Popen(args, **popen_kwargs)
+
+
+def kill_orphan_pid(pid: int) -> None:
+    """Best-effort kill of a single orphan PID, cross-platform.
+
+    Mirrors the OS branch used by ``kill_process_tree``: ``taskkill`` on
+    Windows, ``os.kill(SIGKILL)`` on POSIX. Never raises - callers treat this
+    as best-effort and always record the PID as killed regardless of outcome.
+
+    Hoisted here from ``workflow.py`` (issue #1264, W6 PR3, R6a) so that
+    ``write_gate.py`` can wrap it as ``WriteGate.kill_process`` without
+    importing ``workflow.py`` (that would create an import cycle, since
+    ``workflow.py`` is ``write_gate.py``'s only production importer).
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True,
+                text=True,
+                **no_console_window_kwargs(),
+            )
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError, FileNotFoundError):
+        # Best-effort kill - don't fail if the kill attempt fails
+        pass

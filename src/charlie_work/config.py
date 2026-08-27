@@ -46,6 +46,17 @@ WRITER_MARKER_FILENAME = ".charlie-writer.json"
 # this module) -- the same arrangement as ``WRITER_MARKER_FILENAME`` above.
 WORKER_OUTCOME_FILENAME = ".worker-outcome.json"
 
+# Launcher-owned directories written into each worktree by the worker launch
+# shim (the Devin CLI's ``.devin`` config directory and the
+# ``.git_worktree_dir`` marker). These are NOT worker output — the shim
+# materializes them and re-materializes them on every dispatch. Shared by
+# ``worktree._worker_authored_dirty`` (excluded from the dirty check) and
+# ``cross_repo_gate.extract_referenced_paths`` (excluded from path candidates)
+# so the two modules share one definition of "launcher-owned, not evidence"
+# (issue #1391). Like ``.venv``, these are structural single-directory
+# constants, not a hand-maintained list of elements.
+LAUNCHER_OWNED_DIRS: tuple[str, ...] = (".devin", ".git_worktree_dir")
+
 
 def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     """Return path strings with Windows backslash separators normalized to '/'.
@@ -59,13 +70,60 @@ def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, 
 
 
 DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"worker_blocked", "worktree_unsafe", "rework_branch_conflict"}
+    {
+        "worker_blocked",
+        "worktree_unsafe",
+        "rework_branch_conflict",
+        "cross_repo_hop",
+        "provider_suspended",
+    }
 )
 # Deliberately excluded: "worktree_probe_failed" (see worktree.WorktreeProbeFailedError).
 # A failed safety probe (e.g. git status --porcelain hitting an index lock) is
 # transient contention, not a confirmed-dirty worktree — it must take the
 # ordinary redispatch-cap path instead of escalating on first occurrence
 # (issue #288 follow-up, PR #314).
+#
+# "cross_repo_hop" (issue #1244): a dead worker whose issue scope targets
+# another managed repo.  Redispatching repeats the same hop forever — the
+# worker notices the content targets a sibling repo, hops to its worktree,
+# and exits with zero artifacts in the dispatching repo.  Escalate on the
+# first occurrence so a human can file/transfer a mirror into the target
+# repo's tracker, exactly as was done by hand for #709.
+#
+# "provider_suspended" (issue #1342): a provider account suspension /
+# insufficient-balance response (e.g. Moonshot "suspended due to insufficient
+# balance").  The Claude Code CLI retries it as a transient rate-limit, so
+# without this classification the orchestrator burns the full auto-redispatch
+# cap (~35 min, 4 sessions) on a deterministic external billing failure before
+# the operator hears about it.  Escalate on the first occurrence so the
+# operator learns about a billing problem in minutes, and the issue's own
+# dispatch history is not polluted by a provider outage.
+
+# Issue #1393: pre-launch environment blocks — failure kinds that happen
+# BEFORE a worker session PID exists (the worker process never started).
+# These are deterministic, zero-cost, and guaranteed to repeat until the
+# environment conflict is resolved (e.g. a stale foreign worktree is
+# removed).  Counting them against the redispatch cap converts an operator
+# hygiene problem into a fake "worker quality" escalation
+# (redispatch_cap_exceeded / no_op_rework_cap_exceeded) whose text gives
+# the operator no hint that the fix is "remove the stale worktree."
+#
+# Instead of incrementing redispatch_at, the dispatch layer records these
+# in a separate blocked_environment_at list and escalates with reason
+# "dispatch_blocked_environment" (including the blocking path) after the
+# same max_auto_redispatch cap — so the operator sees "remove C:\...\wt",
+# not "worker quality cap exceeded."
+#
+# Deliberately disjoint from DETERMINISTIC_ESCALATION_FAILURE_KINDS: those
+# escalate on the *first* occurrence (the environment is unrecoverable
+# without a human).  A blocked-environment refusal is recoverable by
+# operator hygiene (remove the stale checkout), so it gets the same retry
+# budget as an ordinary redispatch before escalating — just with the
+# correct reason and the blocking path in the message.
+PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS: frozenset[str] = frozenset(
+    {"worktree_foreign_writer"}
+)
 
 
 class ConfigError(ValueError):
@@ -120,6 +178,17 @@ class LabelConfig:
     human_needed: str = "agent:human-needed"
     prose_only_deps: str = "agent:prose-only-deps"
     merge_hold: str = "agent:merge-hold"
+    # Issue #1266: mechanical escalations (reason_class == "mechanical") land
+    # here instead of ``human_needed``, so human attention is reserved for
+    # judgment calls. Unlike ``prose_only_deps`` -- the only other
+    # terminal-but-not-workflow_labels label -- this one IS actively
+    # added/removed by automated ``labels.py`` transitions (the
+    # "operator_queued"/"redispatch_operator_queued" edges and the
+    # de-escalation cap-exhaustion path), so it must be a member of
+    # ``workflow_labels`` (so a transition away from it correctly strips it
+    # via ``_compute_remove``) and of ``all`` (so ``bootstrap_labels``
+    # creates it on GitHub).
+    operator_queue: str = "agent:operator-queue"
     # Routing hint, NOT a workflow state (issue #481). Never a member of
     # ``active``/``terminal``/``workflow_labels`` — it must not affect issue
     # selection or exclusion. Included in ``all`` so ``bootstrap_labels``
@@ -130,7 +199,13 @@ class LabelConfig:
 
     @property
     def terminal(self) -> set[str]:
-        return {self.blocked, self.done, self.human_needed, self.prose_only_deps}
+        return {
+            self.blocked,
+            self.done,
+            self.human_needed,
+            self.prose_only_deps,
+            self.operator_queue,
+        }
 
     @property
     def active(self) -> set[str]:
@@ -151,6 +226,7 @@ class LabelConfig:
             self.prose_only_deps,
             self.merge_hold,
             self.complexity_high,
+            self.operator_queue,
         ]
 
     @property
@@ -173,6 +249,7 @@ class LabelConfig:
             self.blocked,
             self.done,
             self.human_needed,
+            self.operator_queue,
         }
 
 
@@ -345,6 +422,42 @@ class ReviewConfig:
     # mode to hours instead of the unbounded, indefinite spin this issue was
     # filed over.
     rework_stall_minutes: int = 240
+    # Issue #1268 (W11), item 3: record_review's PR-comment gate used to
+    # fire only for request_changes and only when a caller passed
+    # comment=True (the CLI's `charlie verdict --comment`). Every other
+    # terminal decision (approved, blocked) and every automated caller
+    # (dispatch_reviews' reap path, rescue's approved exit, etc.) recorded a
+    # verdict with no corresponding PR-visible trace -- a human or peer
+    # agent reading the PR thread saw nothing. True posts a
+    # "## Fleet review - round K - <decision>" comment for every terminal
+    # decision (still excluding an in-call escalation, which the rescue
+    # tier and the rework-cap path already comment on themselves -- see
+    # record_review's gate). False restores the old silent default; the
+    # CLI's `--comment` flag remains a force-on override on top of this,
+    # not replaced by it.
+    post_verdict_comment: bool = True
+    # Issue #1274 (W17): follow-up policy for `_detect_ci_run_never_created`'s
+    # existing "zero check suites" signal (workflow.py) -- close/reopen (or an
+    # empty-commit fallback) the PR to try to force GitHub Actions to create
+    # the missing check-suite run. This field governs ONLY the wait between
+    # successive retrigger attempts on the SAME still-missing head; it is
+    # never consulted by the detector itself, which has its own independent
+    # grace window (auto_merge.ci_run_never_created_grace_minutes) before it
+    # will even report a head as never-created. Two grace periods gating the
+    # same underlying condition would be the invalid-state smell this
+    # codebase's design explicitly avoids -- keep them separate by contract,
+    # not just by accident. 15 minutes gives a retriggered run enough time to
+    # actually appear before another attempt is considered.
+    stale_checks_grace_minutes: int = 15
+    # Same issue: bounds how many retrigger attempts (close/reopen or
+    # empty-commit, combined -- one shared counter, not two) a single PR gets
+    # before this codebase escalates it to a human via `_escalate_issue`
+    # instead of retrying forever. Mirrors max_conflict_rework_attempts /
+    # max_no_op_rework_attempts's role for their respective failure modes: a
+    # small bound that absorbs transient GitHub-side propagation lag without
+    # spinning indefinitely on a PR where retriggering mechanically cannot
+    # help (e.g. a workflow file itself is broken).
+    stale_checks_max_retriggers: int = 3
 
 
 @dataclass(frozen=True)
@@ -468,6 +581,23 @@ class DeescalationConfig:
     # a distinct one-time event (deescalation_cap_exhausted) makes the
     # terminal state diagnosable rather than a silently renamed one-way door.
     max_auto_deescalations: int = 2
+    # Issue #1314 item 2: dedicated cadence knob for the operator-queue
+    # depth gauge (item 3). The gauge currently rides the loop pass cadence
+    # (every pass); this knob lets operators slow it to a dedicated interval
+    # if the per-pass emission volume is too high for their fleet. 0 means
+    # "check every pass" (preserves the pre-knob behavior); > 0 means
+    # "check every N minutes", gated by a ``next_operator_queue_review_at``
+    # timestamp in ``state.json``'s ``deescalation_pass`` section.
+    operator_queue_review_interval_minutes: int = 0
+    # Issue #1314 item 3: alert threshold for the ``operator_queue_depth``
+    # gauge event. When the number of issues parked on
+    # ``agent:operator-queue`` (state entries with ``status == "escalated"``
+    # and ``reason_class == "mechanical"``) exceeds this threshold, a
+    # warning-level ``operator_queue_depth`` event is emitted to
+    # ``events.db`` so a silently growing queue is visible to
+    # ``heartbeat_check.py`` rather than only via label queries. 0 disables
+    # the alert (no event emitted regardless of depth).
+    operator_queue_depth_threshold: int = 5
 
 
 @dataclass(frozen=True)
@@ -573,6 +703,105 @@ class ReviewDispatchConfig:
     # after a config change invalidates the current cohort) without needing
     # to rename or remove the fraction field.
     review_effort_experiment_salt: str = ""
+    # Issue #1439: structure-aware reviewer turn cap. The flat
+    # ``review_max_turns`` budget ignores the size of the files a diff touches,
+    # so a PR threading a monolith (e.g. workflow.py at ~25k lines) burns the
+    # whole turn budget on grep -> Read-window navigation without ever reaching
+    # a verdict, then retries the identical flat budget on the next dispatch.
+    # These knobs make the cap structure-aware and self-escalating:
+    #
+    #   effective_multiplier = min(structure_multiplier + turn_limit_miss_streak,
+    #                              turn_cap_max_multiplier)
+    #   final_cap = review_max_turns * effective_multiplier
+    #
+    # where ``structure_multiplier`` is ``turn_cap_large_file_multiplier`` when
+    # any touched file exceeds ``turn_cap_large_file_threshold`` lines, else 1.
+    # The miss streak increments on each ``review_verdict_missed`` with reason
+    # ``turn_limit_summary_posted`` and resets on a recorded verdict or a fresh
+    # packet (new head). After ``max_consecutive_turn_limit_misses`` consecutive
+    # turn-limit misses the PR escalates to ``agent:human-needed`` instead of a
+    # further identical session. 0 disables the backstop (preserves the
+    # pre-fix unbounded retry -- not recommended).
+    # Line count above which a touched file triggers the structure multiplier.
+    # 0 disables the structure bonus (every diff uses the base cap).
+    turn_cap_large_file_threshold: int = 5000
+    # Multiplier applied to ``review_max_turns`` when any touched file exceeds
+    # ``turn_cap_large_file_threshold``. Clamped to ``turn_cap_max_multiplier``.
+    turn_cap_large_file_multiplier: int = 2
+    # Absolute cap on the effective multiplier (structure bonus + miss
+    # escalation combined). Prevents unbounded cap growth on a PR that keeps
+    # hitting the turn limit.
+    turn_cap_max_multiplier: int = 3
+    # After this many CONSECUTIVE turn-limit misses on one PR, escalate to a
+    # human instead of redispatching with a further-raised (but already-maxed)
+    # cap. 0 disables the backstop.
+    max_consecutive_turn_limit_misses: int = 3
+    # Issue #1445: repo file-size cap (lines). A diff that adds code to a file
+    # whose post-diff line count exceeds this cap is a REPORTABLE FINDING in the
+    # review packet (the review rubric references this cap generically rather
+    # than hardcoding a number). 0 disables the over-cap finding probe -- the
+    # rubric prose stays present but no dynamic finding section is rendered.
+    # This knob is the cap source the rubric line points at; once issue #1442's
+    # high-water-mark line-count ratchet (or its successor structural signal)
+    # lands, that source should rebind/replace this value rather than the
+    # rubric or probe hardcoding a constant of their own.
+    file_size_cap_lines: int = 0
+
+
+@dataclass(frozen=True)
+class InfraBlockedConfig:
+    """Classification + escalation knobs for required checks that fail
+    because of a fleet-wide infrastructure condition (Actions budget
+    exhaustion, runner outage, quota) rather than the PR's code -- issue
+    #1383.
+
+    A check matching the structural or annotation signal is classified
+    ``infra_blocked`` (see ``checks.is_infra_blocked_check``), excluded from
+    the "required checks failed -> dispatch rework" path, and held without
+    burning rework attempts. Persistence across ``persistence_passes`` loop
+    passes emits exactly ONE operator-facing ``infra_blocked_escalated``
+    event per ``escalation_window_minutes`` window -- not one per PR per
+    pass -- so a billing outage escalates the infra, not every healthy PR
+    on it.
+
+    The annotation substring list lives in config, not code: an operator
+    can retune it for a new infra-outage annotation without a deploy. The
+    structural signal (zero non-setup steps / instant-fail) is code-based
+    and preferred where the Actions API exposes step/timing data.
+    """
+
+    #: Master switch. When False, no infra_blocked classification happens
+    #: and budget-failed checks fall back to ordinary ``failed`` routing
+    #: (the pre-#1383 behavior).
+    enabled: bool = True
+    #: Reserved timing threshold. Originally a separate "instant-fail"
+    #: signal for jobs whose ``steps`` array the Actions API omitted (a
+    #: FAILURE concluding within this many seconds of starting). The
+    #: round-2 #1383 review found that gating the missing-``steps`` case
+    #: on this threshold was not behavior-preserving vs. the pre-#1383
+    #: ``is_infrastructure_failure`` (which returned True for a missing
+    #: ``steps`` key unconditionally), so the missing/empty/setup-only
+    #: steps case is now classified by ``is_infra_blocked_check``'s
+    #: zero-step signal regardless of this value. The field is kept (and
+    #: still validated) as a reserved knob so a future timing signal for
+    #: a distinct shape can reuse it without a config migration; it
+    #: currently has no behavioral effect.
+    instant_fail_seconds: int = 10
+    #: Case-insensitive annotation substrings (matched against each
+    #: annotation's ``message``) that indicate an infrastructure/billing
+    #: block rather than a code failure. Kept in config per issue #1383.
+    annotation_patterns: tuple[str, ...] = (
+        "the job was not started",
+        "actions budget is preventing further use",
+        "no runner matching",
+        "usage limit",
+    )
+    #: Number of loop passes the infra_blocked condition must persist
+    #: across before a single operator-facing escalation is emitted (AC3).
+    persistence_passes: int = 3
+    #: Window (minutes) during which only one ``infra_blocked_escalated``
+    #: event is emitted, regardless of how many PRs are affected (AC3).
+    escalation_window_minutes: int = 60
 
 
 @dataclass(frozen=True)
@@ -602,6 +831,10 @@ class AutoMergeConfig:
     # run id for a check has been retried this many times on the current
     # head, the PR escalates to a human instead of retrying forever.
     infra_rerun_attempt_cap: int = 2
+    # Issue #1383: classification + escalation knobs for required checks
+    # that fail because of a fleet-wide infra condition (Actions budget /
+    # runner outage) rather than the PR's code. See InfraBlockedConfig.
+    infra_blocked: InfraBlockedConfig = field(default_factory=InfraBlockedConfig)
     # Maximum minutes after the PR's last update (updatedAt) to wait for any
     # required check run to appear before routing an approved PR to readiness
     # rework. This catches invisible CI-never-started stalls (mergeStateStatus
@@ -656,6 +889,20 @@ class AutoMergeConfig:
     # firing exactly as before, so the control's failure mode is unchanged
     # until an operator names the bot.
     queue_bot_login: str | None = None
+    # Issue #1401: time-in-mergequeue watchdog. When a PR has carried the
+    # Aviator ``mergequeue`` label for more than this many hours with no head
+    # movement (Aviator never rebased it) and no merge, reconcile escalates it
+    # to a human instead of re-evaluating it forever. The per-pass
+    # ``consecutive_failed_merge_attempts`` counter is a one-shot alarm that
+    # resets on any can_merge pass, so a PR alternating can_merge true/false --
+    # or one Aviator itself keeps failing -- is invisible after its first
+    # alarm. This knob is the independent time-in-queue bound. 0 disables the
+    # time-based trigger (the Aviator-failure trigger below is independent of
+    # it). The companion Aviator-failure trigger (mergequeue + Aviator
+    # ``blocked`` + aviator/checks completed-failure) is unconditional when
+    # ``mergequeue_label`` is set -- it is a definitive "Aviator will not merge
+    # this" signal, not a heuristic, so it does not need a time floor.
+    mergequeue_wedge_hours: float = 24.0
 
     def __post_init__(self) -> None:
         legacy_to_strategy = {
@@ -720,8 +967,35 @@ class AutoMergeConfig:
 
 
 @dataclass(frozen=True)
+class PreflightConfig:
+    """Thresholds and fatal/non-fatal classification for ``preflight.py``'s
+    four host-precondition checks (issue #1363). Defaults match the issue's
+    explicit design: disk_floor and venv_identity are fatal (refuse the
+    pass); clock_sanity and config_freshness are non-fatal tripwires (emit
+    an event, pass proceeds). Never hardcode these values at a call site --
+    read them from here so an operator can retune per host without a code
+    change.
+    """
+
+    #: Minimum free disk space, in GB, on each volume hosting state_dir/repo
+    #: root. Below this, disk_floor fails. 2026-08-19 outage: C: hit 0 bytes
+    #: free; a refusal here replaces 8 noisy aborted passes with one.
+    disk_floor_gb: int = 10
+    disk_floor_fatal: bool = True
+    #: Bound (hours) on state.json's age before clock_sanity flags it as
+    #: stale/skewed. A negative age (state.json mtime in the future) always
+    #: flags regardless of this bound.
+    clock_max_skew_hours: float = 48.0
+    clock_sanity_fatal: bool = False
+    venv_identity_fatal: bool = True
+    config_freshness_fatal: bool = False
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     state_dir: str = layout.DEFAULT_STATE_DIR
+    # Preflight gate thresholds (issue #1363) -- see PreflightConfig.
+    preflight: PreflightConfig = field(default_factory=PreflightConfig)
     # Repo-local template dir searched before the package defaults. Relative
     # paths resolve against the consumer repo root.
     prompts_dir: str | None = None
@@ -784,6 +1058,18 @@ class RuntimeConfig:
     # help a call that never returns — only a timeout converts the hang into a
     # failure the existing retry/next-pass machinery can absorb.
     gh_timeout_seconds: float = 120.0
+    # cw#1273: outer retry for `gh pr create` specifically, layered on top of
+    # GitHub.run()'s inner pre-connection-only retry above. The inner retry's
+    # ~7s default span is far shorter than the ~45s TLS blips observed on
+    # this host, and mutations are deliberately excluded from the inner
+    # retry's post-send-failure case (at-most-once semantics) -- see
+    # pr_create_retry.py's module docstring for the composition rationale.
+    # `pr_create_retry_max_attempts` additional attempts follow the first on
+    # failure (mirrors `gh_max_retries`'s "N retries, N+1 total tries"
+    # naming); backoff before retry n is `pr_create_retry_base_seconds *
+    # (3 ** (n - 1))` -- 10s/30s/90s with the defaults.
+    pr_create_retry_max_attempts: int = 3
+    pr_create_retry_base_seconds: float = 10.0
     # Pre-emptive GraphQL rate-limit guard. Before starting quota-heavy phases
     # (mop-up sweeps, merged-PR listings), GitHub.check_graphql_rate_limit()
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
@@ -810,6 +1096,14 @@ class RuntimeConfig:
     # ``label_error`` is None, which costs a dict lookup and no API call). Set
     # to 0 for unlimited.
     escalated_label_repair_max_per_pass: int = 10
+    # Issue #1372: grace period (in days) after which a stale fleet registry
+    # entry (repo_root no longer exists) is pruned from fleet.json. A stale
+    # entry is skipped every pass and reported separately so one corpse cannot
+    # degrade fleet-wide tooling; after this many days without a successful
+    # touch_repo (last_seen older than the grace period), it is pruned under
+    # state_lock. Set to 0 to disable pruning (stale entries are skipped but
+    # never removed).
+    fleet_registry_stale_grace_days: int = 7
 
 
 @dataclass(frozen=True)
@@ -1189,6 +1483,20 @@ class WatchdogConfig:
     # in the issue title, which is trivially distinguishable from a
     # legitimately long worker session.
     dead_dispatched_reap_minutes: int = 60
+    # Issue #1423: upper bound on how many times a ``worktree_foreign_writer``
+    # block can be auto-reaped for the same issue before falling back to
+    # escalation. Each successful reap resets ``blocked_environment_at`` to
+    # ``[]``, so without a separate cross-pass cap a persistently-blocked
+    # worktree (a foreign writer that keeps coming back, or a new one
+    # appearing each pass) would loop forever between reap and redispatch
+    # instead of ever escalating. The counter is a windowed list of reap
+    # timestamps (``foreign_writer_reaps`` on the issue entry, same window as
+    # ``redispatch_window_minutes``) so it eventually clears once the
+    # underlying cause is gone. 0 disables auto-reaping entirely (always
+    # escalate at cap exhaustion), consistent with ``max_auto_redispatch``
+    # where 0 means "never redispatch." The default of 2 provides the bound
+    # the reviewer requested.
+    max_foreign_writer_reaps: int = 2
 
 
 @dataclass(frozen=True)
@@ -1269,6 +1577,64 @@ class TestAdequacyConfig:
     coverage_enabled: bool = False
     coverage_command: tuple[str, ...] = ()
     min_diff_coverage: float = 0.0
+
+
+@dataclass(frozen=True)
+class CoverageProbeConfig:
+    """Config for the advisory-only static diff-coverage / unwired-symbol
+    probes (``diff_coverage_probe.run_static_probe``, issues #1260/#1261).
+
+    ``enabled`` defaults False so an absent config block is a no-op --
+    mirrors ``CrossFamilyConfig``/``TestAdequacyConfig``. This is a new,
+    independent config section: it does NOT read, gate on, or repurpose any
+    field of ``TestAdequacyConfig``, including that class's reserved Tier-3
+    ``coverage_enabled``/``coverage_command``/``min_diff_coverage`` fields
+    above, which describe an unrelated, deferred, subprocess-based
+    numeric-coverage design.
+
+    Both probe halves are advisory-only in v1 -- they only add text to the
+    review packet and never block dispatch, review, or merge. Promotion to a
+    hard gate is explicitly deferred past a 2-week false-positive
+    measurement window (see the #1260/#1261 scoping comment); this config
+    intentionally has no auto-reject knob.
+    """
+
+    enabled: bool = False
+
+    # -- W3: branch-token-vs-test-add heuristic ------------------------------
+    # Path-classification defaults mirror TestAdequacyConfig's own, kept as
+    # an independent copy (not a shared reference) so the two gates can be
+    # configured separately without coupling.
+    test_path_globs: tuple[str, ...] = ("tests/**", "test_*.py", "*_test.py", "conftest.py")
+    exempt_path_globs: tuple[str, ...] = (
+        "*.md",
+        "docs/**",
+        "examples/**",
+        ".github/workflows/**",
+        "*.lock",
+        "*.toml",
+        "*.cfg",
+        "*.ini",
+    )
+    comment_prefixes: tuple[str, ...] = ("#",)
+    branch_tokens: tuple[str, ...] = ("if ", "elif ", "except ", " and ", " or ", " else ")
+    assertion_markers: tuple[str, ...] = (
+        "assert ",
+        "pytest.raises",
+        "raises(",
+        "assert_called",
+        "self.assert",
+    )
+    test_function_prefix: str = "def test_"
+    # branch_adds:test_adds ratio above this threshold flags even when
+    # test_adds > 0.
+    branch_to_assert_ratio_threshold: float = 4.0
+
+    # -- W20 item 1: unwired-symbol AST probe --------------------------------
+    check_unwired_symbols: bool = True
+    # Leading-underscore names are excluded -- the probe only flags *public*
+    # new symbols.
+    private_name_prefix: str = "_"
 
 
 @dataclass(frozen=True)
@@ -1503,6 +1869,7 @@ class OrchestratorConfig:
         default_factory=WorktreeReclamationConfig
     )
     test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
+    coverage_probe: CoverageProbeConfig = field(default_factory=CoverageProbeConfig)
     fleet: FleetConfig = field(default_factory=FleetConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     runners: RunnersConfig = field(default_factory=RunnersConfig)
@@ -1751,7 +2118,34 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 f"config section 'dispatch' key 'max_open_agent_prs' must be >= 0, got {_mop}"
             )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
-    review = _build_section(ReviewConfig, "review", _section(data, "review"))
+    review_data = _section(data, "review")
+    stale_checks_grace_minutes = review_data.get("stale_checks_grace_minutes")
+    if stale_checks_grace_minutes is not None:
+        if isinstance(stale_checks_grace_minutes, bool) or not isinstance(
+            stale_checks_grace_minutes, int
+        ):
+            raise ConfigError(
+                "config section 'review' key 'stale_checks_grace_minutes' must be an "
+                f"int, got {type(stale_checks_grace_minutes).__name__}"
+            )
+        if stale_checks_grace_minutes < 0:
+            raise ConfigError(
+                "config section 'review' key 'stale_checks_grace_minutes' must not be negative"
+            )
+    stale_checks_max_retriggers = review_data.get("stale_checks_max_retriggers")
+    if stale_checks_max_retriggers is not None:
+        if isinstance(stale_checks_max_retriggers, bool) or not isinstance(
+            stale_checks_max_retriggers, int
+        ):
+            raise ConfigError(
+                "config section 'review' key 'stale_checks_max_retriggers' must be an "
+                f"int, got {type(stale_checks_max_retriggers).__name__}"
+            )
+        if stale_checks_max_retriggers < 0:
+            raise ConfigError(
+                "config section 'review' key 'stale_checks_max_retriggers' must not be negative"
+            )
+    review = _build_section(ReviewConfig, "review", review_data)
     review_dispatch_data = _section(data, "review_dispatch")
     for rd_bool_key in ("enabled",):
         rd_bool_value = review_dispatch_data.get(rd_bool_key)
@@ -1842,6 +2236,25 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'review_dispatch' key 'diff_line_threshold' must be >= 0, "
             f"got {rd_diff_threshold}"
         )
+    # Issue #1439: structure-aware turn-cap knobs.
+    _RD_INT_KEYS = (
+        "turn_cap_large_file_threshold",
+        "turn_cap_large_file_multiplier",
+        "turn_cap_max_multiplier",
+        "max_consecutive_turn_limit_misses",
+        "file_size_cap_lines",
+    )
+    for _rd_key in _RD_INT_KEYS:
+        _rd_val = review_dispatch_data.get(_rd_key)
+        if _rd_val is not None and (isinstance(_rd_val, bool) or not isinstance(_rd_val, int)):
+            raise ConfigError(
+                f"config section 'review_dispatch' key '{_rd_key}' must be an int, "
+                f"got {type(_rd_val).__name__}"
+            )
+        if _rd_val is not None and _rd_val < 0:
+            raise ConfigError(
+                f"config section 'review_dispatch' key '{_rd_key}' must be >= 0, got {_rd_val}"
+            )
     rd_effort = review_dispatch_data.get("review_effort")
     if rd_effort is not None and not isinstance(rd_effort, str):
         raise ConfigError(
@@ -1963,6 +2376,52 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             f"got {rp_alert_days}"
         )
     reconcile_pass = _build_section(ReconcilePassConfig, "reconcile_pass", reconcile_pass_data)
+    # Issue #1314: extract ONLY the two new operator-queue follow-up knobs
+    # from the ``deescalation`` section. The section as a whole was
+    # previously 100% inert (never passed into OrchestratorConfig — always
+    # defaulted), and activating full-section parsing here would silently
+    # (a) hard-reject unknown keys via ``_build_section`` for any live config
+    # that already has a ``deescalation:`` block with extra/typo'd keys
+    # (self-deploy-brick risk) and (b) flip ``enabled`` / ``interval_minutes``
+    # defaults for configs that set those keys expecting them to be ignored.
+    # Full-section activation is a separate, explicitly-reviewed change with
+    # operator notification; this PR scopes to the two fields the issue
+    # actually asks for. Unknown keys and pre-existing
+    # ``enabled``/``interval_minutes`` overrides are silently ignored, same
+    # as before this PR.
+    deescalation_data = _section(data, "deescalation")
+    oqr_interval = deescalation_data.get("operator_queue_review_interval_minutes")
+    if oqr_interval is not None and (
+        isinstance(oqr_interval, bool) or not isinstance(oqr_interval, int)
+    ):
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_review_interval_minutes' "
+            f"must be an int, got {type(oqr_interval).__name__}"
+        )
+    if oqr_interval is not None and oqr_interval < 0:
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_review_interval_minutes' "
+            f"must be >= 0, got {oqr_interval}"
+        )
+    oq_threshold = deescalation_data.get("operator_queue_depth_threshold")
+    if oq_threshold is not None and (
+        isinstance(oq_threshold, bool) or not isinstance(oq_threshold, int)
+    ):
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_depth_threshold' "
+            f"must be an int, got {type(oq_threshold).__name__}"
+        )
+    if oq_threshold is not None and oq_threshold < 0:
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_depth_threshold' "
+            f"must be >= 0, got {oq_threshold}"
+        )
+    deescalation_overrides: dict[str, Any] = {}
+    if oqr_interval is not None:
+        deescalation_overrides["operator_queue_review_interval_minutes"] = oqr_interval
+    if oq_threshold is not None:
+        deescalation_overrides["operator_queue_depth_threshold"] = oq_threshold
+    deescalation = DeescalationConfig(**deescalation_overrides)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
@@ -2059,6 +2518,79 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         # Store the stripped value: it is compared against the GitHub commit
         # author login, where surrounding whitespace can never match.
         auto_merge_data["queue_bot_login"] = stripped_queue_bot_login
+    mergequeue_wedge_hours = auto_merge_data.get("mergequeue_wedge_hours")
+    if mergequeue_wedge_hours is not None:
+        if isinstance(mergequeue_wedge_hours, bool) or not isinstance(
+            mergequeue_wedge_hours, (int, float)
+        ):
+            raise ConfigError(
+                "config section 'auto_merge' key 'mergequeue_wedge_hours' must be a "
+                f"number, got {type(mergequeue_wedge_hours).__name__}"
+            )
+        if mergequeue_wedge_hours < 0:
+            raise ConfigError(
+                "config section 'auto_merge' key 'mergequeue_wedge_hours' "
+                f"must not be negative, got {mergequeue_wedge_hours}"
+            )
+        auto_merge_data["mergequeue_wedge_hours"] = float(mergequeue_wedge_hours)
+    # Issue #1383: nested infra_blocked section under auto_merge.
+    infra_blocked_data = auto_merge_data.get("infra_blocked")
+    if infra_blocked_data is not None:
+        if not isinstance(infra_blocked_data, dict):
+            raise ConfigError(
+                "config section 'auto_merge' key 'infra_blocked' must be a mapping, "
+                f"got {type(infra_blocked_data).__name__}"
+            )
+        infra_blocked_fields = {f.name for f in fields(InfraBlockedConfig)}
+        unknown_ib_keys = sorted(set(infra_blocked_data) - infra_blocked_fields)
+        if unknown_ib_keys:
+            raise ConfigError(
+                "config section 'auto_merge' key 'infra_blocked' has unknown key(s): "
+                f"{', '.join(unknown_ib_keys)} "
+                f"(valid: {', '.join(sorted(infra_blocked_fields))})"
+            )
+        annotation_patterns = infra_blocked_data.get("annotation_patterns")
+        if annotation_patterns is not None:
+            if not isinstance(annotation_patterns, list):
+                raise ConfigError(
+                    "config section 'auto_merge' key 'infra_blocked.annotation_patterns' "
+                    f"must be a list of strings, got {type(annotation_patterns).__name__}"
+                )
+            infra_blocked_data["annotation_patterns"] = tuple(
+                str(item) for item in annotation_patterns
+            )
+        for int_key in ("instant_fail_seconds", "persistence_passes"):
+            int_value = infra_blocked_data.get(int_key)
+            if int_value is not None:
+                if isinstance(int_value, bool) or not isinstance(int_value, int):
+                    raise ConfigError(
+                        f"config section 'auto_merge' key 'infra_blocked.{int_key}' must be an "
+                        f"int, got {type(int_value).__name__}"
+                    )
+                if int_value < 0:
+                    raise ConfigError(
+                        f"config section 'auto_merge' key 'infra_blocked.{int_key}' must be >= 0, "
+                        f"got {int_value}"
+                    )
+        esc_minutes = infra_blocked_data.get("escalation_window_minutes")
+        if esc_minutes is not None:
+            if isinstance(esc_minutes, bool) or not isinstance(esc_minutes, int):
+                raise ConfigError(
+                    "config section 'auto_merge' key 'infra_blocked.escalation_window_minutes' "
+                    f"must be an int, got {type(esc_minutes).__name__}"
+                )
+            if esc_minutes < 0:
+                raise ConfigError(
+                    "config section 'auto_merge' key 'infra_blocked.escalation_window_minutes' "
+                    f"must be >= 0, got {esc_minutes}"
+                )
+        enabled_value = infra_blocked_data.get("enabled")
+        if enabled_value is not None and not isinstance(enabled_value, bool):
+            raise ConfigError(
+                "config section 'auto_merge' key 'infra_blocked.enabled' must be a bool, "
+                f"got {type(enabled_value).__name__}"
+            )
+        auto_merge_data["infra_blocked"] = InfraBlockedConfig(**infra_blocked_data)
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
     runtime_data = _section(data, "runtime")
     throttle_error_markers = runtime_data.get("throttle_error_markers")
@@ -2118,6 +2650,22 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 "config section 'runtime' key 'gh_timeout_seconds' must be > 0, "
                 f"got {gh_timeout_seconds}"
             )
+    pr_create_retry_max_attempts = runtime_data.get("pr_create_retry_max_attempts")
+    if pr_create_retry_max_attempts is not None and not isinstance(
+        pr_create_retry_max_attempts, int
+    ):
+        raise ConfigError(
+            "config section 'runtime' key 'pr_create_retry_max_attempts' must be an int, "
+            f"got {type(pr_create_retry_max_attempts).__name__}"
+        )
+    pr_create_retry_base_seconds = runtime_data.get("pr_create_retry_base_seconds")
+    if pr_create_retry_base_seconds is not None and not isinstance(
+        pr_create_retry_base_seconds, (int, float)
+    ):
+        raise ConfigError(
+            "config section 'runtime' key 'pr_create_retry_base_seconds' must be a number, "
+            f"got {type(pr_create_retry_base_seconds).__name__}"
+        )
     graphql_rate_limit_threshold = runtime_data.get("graphql_rate_limit_threshold")
     if graphql_rate_limit_threshold is not None:
         if not isinstance(graphql_rate_limit_threshold, int):
@@ -2177,6 +2725,73 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 "config section 'runtime' key 'escalated_label_repair_max_per_pass' "
                 f"must be >= 0, got {repair_cap}"
             )
+    stale_grace_days = runtime_data.get("fleet_registry_stale_grace_days")
+    if stale_grace_days is not None:
+        if not isinstance(stale_grace_days, int) or isinstance(stale_grace_days, bool):
+            raise ConfigError(
+                "config section 'runtime' key 'fleet_registry_stale_grace_days' "
+                f"must be an int, got {type(stale_grace_days).__name__}"
+            )
+        if stale_grace_days < 0:
+            raise ConfigError(
+                "config section 'runtime' key 'fleet_registry_stale_grace_days' "
+                f"must be >= 0, got {stale_grace_days}"
+            )
+    # Parse preflight sub-section (issue #1363).
+    preflight_data = runtime_data.get("preflight")
+    if preflight_data is not None:
+        if not isinstance(preflight_data, dict):
+            raise ConfigError(
+                "config section 'runtime' key 'preflight' must be a mapping, "
+                f"got {type(preflight_data).__name__}"
+            )
+        preflight_fields = {f.name for f in fields(PreflightConfig)}
+        unknown_preflight_keys = sorted(set(preflight_data) - preflight_fields)
+        if unknown_preflight_keys:
+            raise ConfigError(
+                "config section 'runtime' key 'preflight' has unknown key(s): "
+                f"{', '.join(unknown_preflight_keys)} "
+                f"(valid: {', '.join(sorted(preflight_fields))})"
+            )
+        disk_floor_gb = preflight_data.get("disk_floor_gb")
+        if disk_floor_gb is not None:
+            if not isinstance(disk_floor_gb, int) or isinstance(disk_floor_gb, bool):
+                raise ConfigError(
+                    "config section 'runtime' key 'preflight.disk_floor_gb' must be an int, "
+                    f"got {type(disk_floor_gb).__name__}"
+                )
+            if disk_floor_gb < 0:
+                raise ConfigError(
+                    "config section 'runtime' key 'preflight.disk_floor_gb' must be >= 0, "
+                    f"got {disk_floor_gb}"
+                )
+        clock_max_skew_hours = preflight_data.get("clock_max_skew_hours")
+        if clock_max_skew_hours is not None:
+            if not isinstance(clock_max_skew_hours, (int, float)) or isinstance(
+                clock_max_skew_hours, bool
+            ):
+                raise ConfigError(
+                    "config section 'runtime' key 'preflight.clock_max_skew_hours' must be a "
+                    f"number, got {type(clock_max_skew_hours).__name__}"
+                )
+            if clock_max_skew_hours < 0:
+                raise ConfigError(
+                    "config section 'runtime' key 'preflight.clock_max_skew_hours' must be >= 0, "
+                    f"got {clock_max_skew_hours}"
+                )
+        for bool_key in (
+            "disk_floor_fatal",
+            "clock_sanity_fatal",
+            "venv_identity_fatal",
+            "config_freshness_fatal",
+        ):
+            bool_value = preflight_data.get(bool_key)
+            if bool_value is not None and not isinstance(bool_value, bool):
+                raise ConfigError(
+                    f"config section 'runtime' key 'preflight.{bool_key}' must be a bool, "
+                    f"got {type(bool_value).__name__}"
+                )
+        runtime_data["preflight"] = PreflightConfig(**preflight_data)
     runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
     devin_data = _section(data, "devin")
     for command_key in ("dispatch_command", "shell_command"):
@@ -2606,6 +3221,55 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             )
 
     test_adequacy = _build_section(TestAdequacyConfig, "test_adequacy", test_adequacy_data)
+    coverage_probe_data = _section(data, "coverage_probe")
+
+    # Five tuple-of-str fields: reject non-list, coerce elements to str.
+    _COVERAGE_PROBE_TUPLE_FIELDS = (
+        "test_path_globs",
+        "exempt_path_globs",
+        "comment_prefixes",
+        "branch_tokens",
+        "assertion_markers",
+    )
+    for key in _COVERAGE_PROBE_TUPLE_FIELDS:
+        value = coverage_probe_data.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, list):
+            raise ConfigError(
+                f"config section 'coverage_probe' key '{key}' must be a list of "
+                f"strings, got {type(value).__name__}"
+            )
+        for item in value:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    f"config section 'coverage_probe' key '{key}' must be a list of "
+                    f"strings, got element of type {type(item).__name__}"
+                )
+        coverage_probe_data[key] = tuple(value)
+
+    branch_ratio = coverage_probe_data.get("branch_to_assert_ratio_threshold")
+    if branch_ratio is not None and not isinstance(branch_ratio, (int, float)):
+        raise ConfigError(
+            "config section 'coverage_probe' key 'branch_to_assert_ratio_threshold' must be "
+            f"a float, got {type(branch_ratio).__name__}"
+        )
+    for str_key in ("test_function_prefix", "private_name_prefix"):
+        str_value = coverage_probe_data.get(str_key)
+        if str_value is not None and not isinstance(str_value, str):
+            raise ConfigError(
+                f"config section 'coverage_probe' key '{str_key}' must be a string, "
+                f"got {type(str_value).__name__}"
+            )
+    for bool_key in ("enabled", "check_unwired_symbols"):
+        bool_value = coverage_probe_data.get(bool_key)
+        if bool_value is not None and not isinstance(bool_value, bool):
+            raise ConfigError(
+                f"config section 'coverage_probe' key '{bool_key}' must be a bool, "
+                f"got {type(bool_value).__name__}"
+            )
+
+    coverage_probe = _build_section(CoverageProbeConfig, "coverage_probe", coverage_probe_data)
     fleet_data = _section(data, "fleet")
     global_max = fleet_data.get("global_max_concurrent_sessions")
     if global_max is not None and not isinstance(global_max, int):
@@ -2842,6 +3506,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         review_dispatch=review_dispatch,
         quota_probe=quota_probe,
         reconcile_pass=reconcile_pass,
+        deescalation=deescalation,
         auto_merge=auto_merge,
         runtime=runtime,
         devin=devin,
@@ -2852,6 +3517,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         watchdog=watchdog,
         worktree_reclamation=worktree_reclamation,
         test_adequacy=test_adequacy,
+        coverage_probe=coverage_probe,
         fleet=fleet,
         notify=notify,
         runners=runners,

@@ -40,11 +40,8 @@ from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
 from charlie_work.workflow import OrchestratorApp, UNAUTHORIZED_MERGE_BASELINE_KEY
 
-from test_charlie_work import (
-    FakeGitHub,
-    _arm_unauthorized_merge_tripwire,
-    _merged_worker_pr,
-)
+from _fakes_github import FakeGitHub
+from _merge_tripwire_fixtures import _arm_unauthorized_merge_tripwire, _merged_worker_pr
 
 # Fixed by ``_arm_unauthorized_merge_tripwire``'s default -- pinned here as a
 # named constant so the before/boundary/after timestamps in the window test

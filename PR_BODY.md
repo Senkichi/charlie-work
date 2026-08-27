@@ -1,104 +1,93 @@
 ## Linked issue
 
-Closes #735
+Closes #1444
 
 ## What changed
 
-`migrate-state-dir` relocated the state tree correctly but left every **embedded absolute path** inside `state.json` pointing at the old root. Those paths (`prompt_path`, `decision_path`, `cross_family_report`, `verdict_source`, ...) were only rewritten opportunistically at dispatch/render sites, so a record that got no fresh render never converged. Immediately after a migration the state file was internally inconsistent: the tree at the new root, the pointers naming the old one. On the 2026-07-30 job-cannon migration the compat junction was never created and the source dir was `rmdir`'d, leaving 441 dangling pointers with no reader to notice.
+Worker dispatch prompts now carry a **module map** section derived at packet build time from the live `src/charlie_work/` tree. For every `.py` module under the package, the section lists the dotted module name, the first line of its docstring, and its public-surface size (`__all__` length if defined, else the count of top-level names not starting with `_`).
 
-This PR makes the path rewrite part of the migration itself, so the inconsistent state is never representable:
+This is the generation-time half of the god-file dynamic tracked in #1317 (extraction) and #1442 (CI ratchet stopgap): extraction removes lines, but nothing steered new lines away from the monolith, so it regrew. The map gives a worker a picture of what modules exist and what belongs where, so the largest file no longer wins by default gravity.
 
-- **`state_migration.py`** — after `apply_state_dir_migration` moves every child, it now walks the parsed `state.json` structurally (not `str.replace` on the file text — that cannot distinguish a path value from a branch name or issue title that happens to contain the token) and rewrites every string leaf under the old root to the new one, verifying each rewritten target exists before committing. The rewrite runs under `state_lock` and saves atomically via `save_state` (temp-file + `replace`).
-  - New `StateRewriteResult` frozen dataclass (ok/rewritten/error).
-  - New `MigrationOutcome.rewritten_paths` field reports the count so it is observable rather than assumed.
-  - New injectable `state_rewriter` seam on `apply_state_dir_migration` (mirrors the existing `mover` seam) for testability.
-  - `_try_rewrite_path_string` uses the existing pure `_is_lexically_contained` / `_relative_parts` helpers (exact-prefix containment, separator- and case-folded) — a string that merely *contains* the old-root token (issue title) or a sibling prefix (`<src>-backup`) is not a hit.
-  - A missing `state.json` is not an error (fresh tree, nothing to rewrite): `ok=True, rewritten=0`.
-  - A rewrite failure (a hit whose rewritten target does not exist, a lock timeout, an `OSError`) returns `ok=False` with `moved` listing what was moved — the children have already moved, so this is an incomplete migration needing manual attention, not a rollback point. `StateLockBusy` and `OSError` are caught and returned as values, never raised (CLAUDE.md invariant). The `except StateLockBusy` and `except OSError` branches in `_rewrite_state_json_paths` are covered by `test_rewrite_state_json_paths_returns_ok_false_on_state_lock_busy` and `test_rewrite_state_json_paths_returns_ok_false_on_oserror` (added in rework), which force each branch via monkeypatching and assert the `ok=False`/error-set contract.
-- **`cli.py`** — `run_migrate_state_dir_command` now reports `rewritten_paths` in both the message (`"moved N children, rewrote M embedded paths"`) and the result `data` dict.
+### Files
 
-This removes the need for both the compat junction and the manual E2 gate, making "migrated" mean the same thing on disk and in state.
+- **`src/charlie_work/module_map.py`** (new) — `build_module_map(package_dir, src_root)` walks the package directory with `pathlib` and parses each `.py` file with `ast` (zero imports — avoids side effects and heavy deps at packet build time). Returns the full markdown section, or an empty string when the package dir is absent/empty. Raises `OSError`/`SyntaxError`/`ValueError` on parse failures so the caller can record the event and degrade; it does not swallow exceptions itself, keeping the single point of enforcement for "dispatch never fails on a map error" at the call site.
+- **`src/charlie_work/workflow.py`** — `_build_module_map_value(issue_number)` is the fail-soft wrapper: it calls `build_module_map` and, on a parse failure, logs a `worker_module_map_failed` warning event to `events.db` and returns `""` (omitted section). `_write_worker_prompt` passes the result as the `module_map` value. `module_map` is added to `WORKER_PROMPT_KEYS` so the drift check (`check_prompt_template_drift`) stays honest. `log_event` (not `self._record_event`) is used because `_write_worker_prompt` runs outside a state-lock context.
+- **`src/charlie_work/instrumentation.py`** — registers `worker_module_map_failed` at `warning` level in `_LEVEL_BY_KIND`.
+- **`src/charlie_work/prompts/worker.md`** and **`worker_claude_code.md`** — reference `$module_map` between the issue body and the scope contract, so the worker sees the module layout before deciding where to place code.
+- **Tests** — `tests/test_module_map.py` (new, 12 tests); updated `ISSUE_VALUES` in `tests/test_prompt_sections.py` and two render tests in `tests/test_charlie_work.py` to supply the new `module_map` placeholder.
 
-### Invariant enumeration — every exit path of `apply_state_dir_migration`
+### Hard constraints (from the issue)
 
-The new invariant is *"after a successful `apply_state_dir_migration`, embedded paths in state.json name the new root"*. Every `return`/`raise` between the rewrite and the end of the function:
+1. **The map is NEVER a hand-maintained list.** `build_module_map` walks the tree with `pathlib.rglob("*.py")` and parses with `ast`. There are zero hardcoded module names in `module_map.py` — verified by `test_newly_added_module_appears_with_no_config_change` (a module added to the tree after the first build appears in the second build with no config change) and `test_build_module_map_lists_modules_with_docstring_and_public_surface`.
+2. **Map generation fails soft.** `_build_module_map_value` catches `OSError`/`SyntaxError`/`ValueError`, logs `worker_module_map_failed`, and returns `""`. Verified by `test_unparseable_file_omits_section_and_logs_warning_event` (a `SyntaxError` file → empty `module_map` + one warning event in `events.db`) and `test_missing_package_dir_omits_section_without_event` (a missing package dir → empty string, no failure event).
 
-1. **Pre-flight refusal (`plan.ok is False`)** — returns before any move or rewrite. No rewrite needed; nothing moved. ✓
-2. **Pre-flight refusal (`plan.blocked` non-empty)** — returns before any move or rewrite. No rewrite needed; nothing moved. ✓
-3. **`dst_root.mkdir` `OSError`** — returns before any move or rewrite. No rewrite needed; nothing moved. ✓
-4. **Containment re-check failure** — returns `ok=False` with `moved` prefix; rewrite not reached. Children may have moved, but the outcome is `ok=False` so the caller knows the migration is incomplete. The rewrite is only run on the all-children-moved path. ✓
-5. **Source-vanished TOCTOU** — same as #4. ✓
-6. **Destination-appeared TOCTOU** — same as #4. ✓
-7. **`mover` `OSError`** — same as #4. ✓
-8. **Rewrite failure (`rewrite_result.ok is False`)** — returns `ok=False` with `moved` listing what moved and `rewritten_paths=0`. The caller knows the migration is incomplete. ✓
-9. **Full success** — returns `ok=True` with `rewritten_paths` set; the rewrite ran under `state_lock` and saved atomically. ✓
+### Acceptance criteria
 
-The rewrite is only attempted after the move loop completes without aborting, so it never runs against a partially-moved tree. A failed rewrite does not roll back the moves (the children are already on the new root); it reports `ok=False` so the operator knows manual attention is needed.
+1. **Zero hardcoded module names.** ✅ — derivation is `rglob("*.py")` + `ast.parse`; no module name appears as a literal in `module_map.py`.
+2. **A newly added module appears with no config change.** ✅ — `test_newly_added_module_appears_with_no_config_change`.
+3. **Prompt-size cost measured and reported.** The map for this repo (76 modules) is **7,201 chars / 82 lines**. The base `worker.md` prompt (no map) is 12,710 chars; with the map it is 19,911 chars — a **~56.7% overhead** on the base prompt. The cost is bounded by the module count (one table row per `.py` file) and grows only as the tree grows.
+4. **Event kind + consumer.** ✅ — `worker_module_map_failed` is registered at `warning` in `_LEVEL_BY_KIND`. The consumer is `scripts/heartbeat_check.py::check_warning_events`, which reads every `level='warning'` row from `events.db` (derived from the persisted `level` column, never a hardcoded kind list — see its docstring). Verified by `test_worker_module_map_failed_registered_as_warning`.
 
 ## Verification
 
 ```
-uv run --extra dev pytest tests/test_state_dir_migration.py tests/test_cli.py -q --tb=short
-........................................................................ [ 48%]
-........................................................................ [ 96%]
-......                                                                   [100%]
-150 passed
+uv run --extra dev pytest tests/test_module_map.py tests/test_prompt_sections.py tests/test_prompt_template_drift_check.py tests/test_prompt_render_contract.py tests/test_fix_prompt_template_drift.py tests/test_instrumentation.py tests/test_markdown_fence.py tests/test_issue_comments.py tests/test_doctor.py tests/test_janitor.py --tb=short
+455 passed in 249.03s (0:04:09)
 ```
 
 ```
 uv run ruff check .
 All checks passed!
 
-uv run ruff format --check .
-191 files already formatted
+uv run ruff format .
+282 files left unchanged
 ```
 
 ### Mutation check
 
-#### Round 1 — rewrite call block
+Reverted each fixed artifact to its merge-base version (`git checkout 87df489 -- <path>`) and confirmed the regression tests fail, then restored the fix and confirmed they pass.
 
-Reverted ONLY the fix — the rewrite call block at the end of `apply_state_dir_migration` in `src/charlie_work/state_migration.py` (the `state_path = plan.dst_root / layout.STATE_FILENAME` block through the final `return`) — to its merge-base version (`return MigrationOutcome(ok=True, moved=tuple(moved))`), keeping the new dataclasses and helpers in place.
+**1. `src/charlie_work/instrumentation.py`** (removed `worker_module_map_failed` from `_LEVEL_BY_KIND`):
+```
+uv run --extra dev pytest tests/test_module_map.py::test_worker_module_map_failed_registered_as_warning --tb=short
+FAILED tests/test_module_map.py::test_worker_module_map_failed_registered_as_warning
+E   AssertionError: assert 'worker_module_map_failed' in mappingproxy({...})
+1 failed
+```
+After restore: `1 passed`.
 
-Run against the reverted code:
+**2. `src/charlie_work/workflow.py`** (removed `module_map` from `WORKER_PROMPT_KEYS`, `_build_module_map_value`, and the values dict):
 ```
-uv run --extra dev pytest tests/test_state_dir_migration.py -q --tb=short -k "test_apply_rewrites_embedded_paths_in_state_json or test_apply_rewrite_failure_returns_ok_false_with_moved or test_apply_uses_injected_state_rewriter_seam or test_apply_injected_state_rewriter_failure_propagates"
-F..FFF                                                                   [100%]
-FAILED tests/test_state_dir_migration.py::test_apply_rewrites_embedded_paths_in_state_json - assert 0 == 8
-FAILED tests/test_state_dir_migration.py::test_apply_rewrite_failure_returns_ok_false_with_moved - assert True is False
-FAILED tests/test_state_dir_migration.py::test_apply_uses_injected_state_rewriter_seam - assert 0 == 5
-FAILED tests/test_state_dir_migration.py::test_apply_injected_state_rewriter_failure_propagates - assert True is False
+uv run --extra dev pytest tests/test_module_map.py::test_module_map_is_a_worker_prompt_key tests/test_module_map.py::test_unparseable_file_omits_section_and_logs_warning_event tests/test_module_map.py::test_write_worker_prompt_includes_module_map_from_live_tree --tb=short
+FAILED tests/test_module_map.py::test_module_map_is_a_worker_prompt_key - Ass...
+FAILED tests/test_module_map.py::test_unparseable_file_omits_section_and_logs_warning_event
+FAILED tests/test_module_map.py::test_write_worker_prompt_includes_module_map_from_live_tree
+3 failed
 ```
+(The `OrchestratorApp` constructor raised `PromptOverrideDriftError` because the templates reference `$module_map` but the writer no longer supplies it — the drift guard catching the regression at the single point of enforcement.) After restore: `12 passed`.
 
-Restored the fix and re-ran:
+**3. `src/charlie_work/prompts/worker.md` + `worker_claude_code.md`** (removed `$module_map`):
 ```
-uv run --extra dev pytest tests/test_state_dir_migration.py -q --tb=short
-........................................................                 [100%]
-56 passed
+uv run --extra dev pytest tests/test_module_map.py::test_write_worker_prompt_includes_module_map_from_live_tree --tb=short
+FAILED tests/test_module_map.py::test_write_worker_prompt_includes_module_map_from_live_tree
+E   AssertionError: assert '## Module map' in '# Devin Worker Task: Issue #1\n...'
+1 failed
 ```
+After restore: `12 passed`.
 
-The 2 tests that pass against the reverted code (`test_apply_no_state_json_reports_zero_rewrites`, `test_apply_state_json_with_no_embedded_paths_reports_zero`) test the "0 rewrites" case, which is identical with or without the fix — they are not claimed as mutation-check coverage.
+### Invariant enumeration (fail-soft paths in `_build_module_map_value`)
 
-#### Round 2 — exception-handling branches in `_rewrite_state_json_paths` (rework)
+The fail-soft contract ("dispatch never fails on a map error; omitted section + warning event") has exactly these exit paths in `_build_module_map_value`:
+1. `build_module_map` returns a non-empty string → returned directly (success, no event). ✅
+2. `build_module_map` returns `""` (missing/empty package dir) → returned directly (omitted section, no event — the map is absent, not broken). ✅
+3. `build_module_map` raises `OSError`/`SyntaxError`/`ValueError` → caught, `worker_module_map_failed` logged at `warning`, `""` returned (omitted section + event). ✅
 
-Reverted ONLY the `except StateLockBusy` / `except OSError` handlers in `_rewrite_state_json_paths` (`src/charlie_work/state_migration.py`, lines 689-692) — replaced the `try`/`except` block with a bare `with state_lock(...):` body so exceptions propagate instead of being caught and returned as `ok=False` values. The two new tests force each branch via monkeypatching `state_lock` (raises `StateLockBusy`) and `load_state` (raises `OSError`).
-
-Run against the reverted code:
-```
-uv run --extra dev pytest tests/test_state_dir_migration.py::test_rewrite_state_json_paths_returns_ok_false_on_state_lock_busy tests/test_state_dir_migration.py::test_rewrite_state_json_paths_returns_ok_false_on_oserror -q --tb=short
-FF                                                                       [100%]
-FAILED tests/test_state_dir_migration.py::test_rewrite_state_json_paths_returns_ok_false_on_state_lock_busy - charlie_work.state.StateLockBusy: lock held by another process
-FAILED tests/test_state_dir_migration.py::test_rewrite_state_json_paths_returns_ok_false_on_oserror - OSError: disk I/O error
-```
-
-Restored the fix and re-ran:
-```
-uv run --extra dev pytest tests/test_state_dir_migration.py -q --tb=short
-............................................................             [100%]
-60 passed
-```
+There are no other `return` or `raise` statements between the `try` and the method's end.
 
 ## Risks / uncertain areas
 
-- **Rewrite failure leaves an incomplete migration.** If the rewrite fails (a non-path hit, a missing target, a lock timeout), the children have already moved but `state.json` still points at the old root. The outcome is `ok=False` with `moved` listing what moved, so the operator knows manual attention is needed. This is deliberate — rolling back the moves would be more dangerous (re-introducing the partial-migration hazard the all-or-nothing design exists to prevent). The remediation script run against job-cannon on 2026-07-30 is the natural basis for a manual fix.
-- **Existence check is filesystem-bound.** `_try_rewrite_path_string` verifies the rewritten target exists on disk. This is correct after a successful all-or-nothing migration (every file that was under the old root is now under the new one), but it means the rewrite cannot run against a tree where some files were not moved. That is by design — a hit whose target does not exist is either a non-path or an unmoved path, both of which must be refused rather than silently skipped.
-- **No change to the compat junction behavior.** The issue body's "Also worth fixing" note about the quiesce gate runbook is a documentation fix, not a code fix, and is out of scope for this PR (the issue's "Proposed fix" section is the code change; the runbook note is filed separately). The embedded-path rewrite removes the *need* for the junction, but the junction itself remains a separate operator concern, as documented in the `apply_state_dir_migration` docstring.
+- **Prompt-size overhead (~57%).** The map adds 7,201 chars to a ~12,710-char base prompt. This is a meaningful per-packet cost. It is bounded by the module count and is the explicit trade-off the issue asks for (placement steering vs. prompt budget). If this becomes a problem for very large repos, a future change could cap the map to the largest N modules or elide modules with a public surface of 0 — but that is out of scope for this issue, which asks for the full map.
+- **`ast.parse` on every packet build.** For this repo (76 modules), `build_module_map` runs in well under a second. It is called once per `_write_worker_prompt` (once per issue at intake/dispatch), not per loop pass. No caching is added; the tree can change between packets by design (a newly added module must appear in the next packet).
+- **Public-surface size is a proxy.** `__all__` length (when defined) or the top-level non-underscore name count is a rough measure of a module's public surface. It does not distinguish re-exports from genuine definitions. This matches the issue's specification exactly.
+
+Generated with [Devin](https://devin.ai)

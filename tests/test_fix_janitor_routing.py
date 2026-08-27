@@ -19,34 +19,22 @@ and CLEAN checks) rather than duplicating that fixture.
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from _janitor_routing_fixtures import _conflicting_app, _set_decision
 from charlie_work.config import DevinConfig, OrchestratorConfig, ReviewConfig, WatchdogConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
 from charlie_work.workflow import OrchestratorApp
+from charlie_work.write_gate import WriteGate
 
-from test_charlie_work import FakeGitHub
-
-
-def _set_decision(app: OrchestratorApp, pr_number: int, decision: str) -> None:
-    pr_dir = app.paths.prs / f"pr-{pr_number}"
-    pr_dir.mkdir(parents=True, exist_ok=True)
-    (pr_dir / "review-decision.json").write_text(
-        json.dumps({"decision": decision}), encoding="utf-8"
-    )
+from _fakes_github import FakeGitHub
 
 
-def _conflicting_app(tmp_path: Path, **config_kwargs) -> OrchestratorApp:
-    config = OrchestratorConfig(**config_kwargs)
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    fake_gh.prs[0]["mergeable"] = "CONFLICTING"
-    fake_gh.prs[0]["mergeStateStatus"] = "DIRTY"
-    return OrchestratorApp(tmp_path, paths, config, fake_gh)
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def test_janitor_conflict_routes_to_rework_when_request_changes(tmp_path: Path) -> None:
@@ -103,8 +91,10 @@ def test_janitor_conflict_attempts_count_cycles_not_passes(tmp_path: Path) -> No
     failed cycle and consumes one attempt (bounding the
     push-conflicted-heads-forever loop); past ``max_conflict_rework_
     attempts`` escalate via the same ``transition()`` helper the other
-    escalation call sites use so ``agent:human-needed`` actually lands
-    (pr-lifecycle.md Finding 3).
+    escalation call sites use so the escalation label actually lands
+    (pr-lifecycle.md Finding 3). Issue #1266: this is a mechanical
+    reason (an attempt-cap limit, not a judgment call), so it lands
+    agent:operator-queue, not agent:human-needed.
     """
     app = _conflicting_app(tmp_path, review=ReviewConfig(max_conflict_rework_attempts=2))
     _set_decision(app, 456, "request_changes")
@@ -146,7 +136,7 @@ def test_janitor_conflict_attempts_count_cycles_not_passes(tmp_path: Path) -> No
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["prs"]["456"]["status"] == "escalated"
     assert state["prs"]["456"]["conflict_rework_attempts"] == 3
-    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+    assert (123, app.config.labels.operator_queue) in app.gh.labels_added
 
     escalated_events = [e for e in state["events"] if e["kind"] == "janitor_rework_escalated"]
     assert len(escalated_events) == 1
@@ -294,7 +284,9 @@ def test_janitor_no_op_rework_routes_to_rework(tmp_path: Path) -> None:
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     _force_issue_status(app, 123, "reviewing")
 
     # Same head, same diff as the recorded verdict: no actual content change.
@@ -324,7 +316,9 @@ def test_janitor_no_op_rework_waits_while_rework_pending(tmp_path: Path) -> None
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     for _ in range(4):
         result = app.review(456)
@@ -343,7 +337,10 @@ def test_janitor_no_op_rework_cap_exceeded_escalates_with_label(tmp_path: Path) 
     ``max_no_op_rework_attempts`` the issue escalates with the label
     actually applied. Re-entry requires the pending status to be lost again
     (simulated here); in normal operation the pending-guard makes this
-    unreachable and dispatch-side caps bound the pending cycles.
+    unreachable and dispatch-side caps bound the pending cycles. Issue
+    #1266: this is a mechanical reason (an attempt-cap limit, not a
+    judgment call), so it lands agent:operator-queue, not
+    agent:human-needed.
     """
     config = OrchestratorConfig(review=ReviewConfig(max_no_op_rework_attempts=2))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -352,7 +349,9 @@ def test_janitor_no_op_rework_cap_exceeded_escalates_with_label(tmp_path: Path) 
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     _force_issue_status(app, 123, "reviewing")
     result1 = app.review(456)
@@ -369,7 +368,7 @@ def test_janitor_no_op_rework_cap_exceeded_escalates_with_label(tmp_path: Path) 
     state = load_state(app.paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["prs"]["456"]["status"] == "escalated"
-    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+    assert (123, app.config.labels.operator_queue) in app.gh.labels_added
 
 
 def test_janitor_conflict_with_failed_required_check_still_routes_to_conflict_rework(
@@ -621,7 +620,16 @@ class _RaceClosedGitHub(FakeGitHub):
     earlier in the pass) still sees the PR as OPEN, but ``pr_view`` (called
     inside ``review()``) observes it as CLOSED. This is exactly the window
     the rework finding describes.
+
+    Issue #1131: ``record_review`` now refuses on a terminal-state PR, so
+    ``pr_view`` returns OPEN until ``close_pr_view`` is set -- the test
+    flips it after ``record_review`` (setup) and before ``dispatch_rework``
+    (where the race actually occurs).
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.close_pr_view = False
 
     def pr_list(self):
         out = []
@@ -639,7 +647,7 @@ class _RaceClosedGitHub(FakeGitHub):
         for pr in self.prs:
             if pr["number"] == number:
                 pr_copy = dict(pr)
-                pr_copy["state"] = "CLOSED"
+                pr_copy["state"] = "CLOSED" if self.close_pr_view else "OPEN"
                 if number in self.pr_head_shas:
                     pr_copy["headRefOid"] = self.pr_head_shas[number]
                 return pr_copy
@@ -679,7 +687,9 @@ def test_route_rework_candidate_to_review_does_not_flip_when_pr_closes_mid_pass(
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Head advances AND the diff content genuinely changes (so dispatch_rework
     # routes to _route_rework_candidate_to_review). pr_list still reports OPEN.
@@ -692,6 +702,10 @@ def test_route_rework_candidate_to_review_does_not_flip_when_pr_closes_mid_pass(
 
     fake_gh.labels_added.clear()
     fake_gh.labels_removed.clear()
+
+    # Issue #1131: flip pr_view to CLOSED -- the race occurs during
+    # dispatch_rework/review(), not during record_review above.
+    fake_gh.close_pr_view = True
 
     result = app.dispatch_rework()
 
@@ -739,7 +753,9 @@ def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     state = load_state(paths.state_file)
     state["issues"]["123"] = {
@@ -754,6 +770,10 @@ def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
     # report CLOSED when review() runs.
     fake_gh.pr_head_shas[456] = "sha-new-head"
 
+    # Issue #1131: flip pr_view to CLOSED -- the race occurs during the
+    # orphan sweep's review() callback, not during record_review above.
+    fake_gh.close_pr_view = True
+
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
@@ -765,6 +785,7 @@ def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
             paths.state_file,
             config,
             fake_gh,
+            write_gate=_wg(paths.state_file),
             review_callback=app.review,
         )
 
@@ -845,7 +866,8 @@ def test_janitor_conflict_stalled_rework_requested_escalates(tmp_path: Path) -> 
     # The stall path never burns an attempt -- it is a distinct escalation
     # reason from the cap, not a disguised extra cap check.
     assert state["prs"]["456"]["conflict_rework_attempts"] == 1
-    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+    # Issue #1266: a stall is a mechanical reason -- lands agent:operator-queue.
+    assert (123, app.config.labels.operator_queue) in app.gh.labels_added
 
     stalled_events = [e for e in state["events"] if e["kind"] == "janitor_rework_stalled"]
     assert len(stalled_events) == 1
@@ -962,7 +984,9 @@ def test_janitor_no_op_rework_stalled_escalates(tmp_path: Path) -> None:
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     # record_review leaves the issue in rework_requested directly -- the
     # common real-world shape: no_op_rework's own "fresh route" baseline
     # write is never reached because the issue is already pending by the
@@ -992,7 +1016,8 @@ def test_janitor_no_op_rework_stalled_escalates(tmp_path: Path) -> None:
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["prs"]["456"]["status"] == "escalated"
     assert state["prs"]["456"].get("no_op_rework_attempts", 0) == 0
-    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+    # Issue #1266: a stall is a mechanical reason -- lands agent:operator-queue.
+    assert (123, app.config.labels.operator_queue) in app.gh.labels_added
 
     stalled_events = [e for e in state["events"] if e["kind"] == "janitor_rework_stalled"]
     assert len(stalled_events) == 1
@@ -1342,7 +1367,9 @@ def test_janitor_no_op_rework_reconcile_status_oscillation_does_not_reset_stall_
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Clock starts on the first passive wait (issue already rework_requested).
     result_wait = app.review(456)

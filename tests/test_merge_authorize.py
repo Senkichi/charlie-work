@@ -37,8 +37,8 @@ from charlie_work.instrumentation import _LEVEL_BY_KIND, close_db, query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
 
-from test_charlie_work import (
-    FakeGitHub,
+from _fakes_github import FakeGitHub
+from _merge_tripwire_fixtures import (
     _arm_unauthorized_merge_tripwire,
     _merge_check_app,
     _merged_worker_pr,
@@ -140,7 +140,9 @@ def test_authorized_override_survives_subsequent_record_review(tmp_path: Path) -
     # 2. A reviewer subsequently records a verdict for the same PR. This is the
     #    sequential (not racy) scenario: the operator authorized, then a review
     #    round completes and record_review overwrites the decision file.
-    review_result = app.record_review(456, "approved", summary="lgtm after rebase")
+    review_result = app.record_review(
+        456, "approved", summary="lgtm after rebase", verdict_provenance="fresh_llm_review"
+    )
     assert review_result.ok is True
 
     # 3. The override must survive the full-file overwrite.

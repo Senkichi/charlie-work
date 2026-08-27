@@ -25,8 +25,16 @@ from pathlib import Path
 from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import _detect_and_handle_stalled_reviews
+from charlie_work.write_gate import WriteGate
 
-from test_charlie_work import _init_git_repo
+from _helpers import _init_git_repo
+
+
+# Issue #1264 (W6 PR2): the WriteGate must carry THIS test's own state_file
+# as state_path -- WriteGate.save_state() writes to self.state_path, not to
+# whatever path the converted function was also given.
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def _seed(tmp_path: Path, pr_number: int = 100, attempt_count: int = 1):
@@ -89,7 +97,9 @@ def test_unreadable_log_rolls_back_without_backoff(tmp_path: Path) -> None:
     sidecar_path = _write_sidecar(reviews_dir, 100, tmp_path, log_path)
     assert not log_path.exists()  # confirms the read will fail
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     # Distinct reason so the condition is diagnosable in events.db.
     assert any(
@@ -135,7 +145,9 @@ def test_empty_log_rolls_back_without_backoff(tmp_path: Path) -> None:
     log_path.write_text("", encoding="utf-8")  # 0-byte log
     sidecar_path = _write_sidecar(reviews_dir, 100, tmp_path, log_path)
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert any(
         entry.get("pr") == 100 and entry.get("reason") == "review_log_unreadable"
@@ -166,7 +178,9 @@ def test_readable_log_without_marker_still_fails(tmp_path: Path) -> None:
     log_path.write_text("some ordinary crash output, no throttle marker here\n", encoding="utf-8")
     _write_sidecar(reviews_dir, 100, tmp_path, log_path)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
     pr_state = state["prs"]["100"]
@@ -214,7 +228,9 @@ def test_undetermined_does_not_block_throttle_backoff_in_same_wave(tmp_path: Pat
     )
     _write_sidecar(reviews_dir, 200, tmp_path, log_200)
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     reasons = {entry.get("pr"): entry.get("reason") for entry in stalled}
     assert reasons.get(100) == "review_log_unreadable"
@@ -312,7 +328,9 @@ def test_persistent_unreadable_log_terminates_via_streak_bound(tmp_path: Path) -
         _write_sidecar(reviews_dir, pr_number, tmp_path, log_path)
         assert not log_path.exists()  # confirms the read will fail
 
-        _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+        _detect_and_handle_stalled_reviews(
+            reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+        )
 
         state = load_state(state_file)
         pr_state = state["prs"][str(pr_number)]
@@ -388,7 +406,9 @@ def test_streak_resets_on_definitive_not_throttled_outcome(tmp_path: Path) -> No
     log_path.write_text("ordinary crash output, no throttle marker\n", encoding="utf-8")
     _write_sidecar(reviews_dir, 100, tmp_path, log_path)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
     pr_state = state["prs"]["100"]

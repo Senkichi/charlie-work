@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _claude_adapter_fixtures import _fake_worktree, _install_fake_create_worktree
 from _worker_marker_wait import read_worker_marker
 
 from charlie_work import claude_code
@@ -40,69 +41,6 @@ from charlie_work.claude_code import (
 from charlie_work.env_sanitize import sanitize_env
 from charlie_work.subprocess_runner import RunResult
 from charlie_work.worktree import WorktreeForeignWriterError, WorktreeInfo
-
-
-def _fake_worktree(tmp_path: Path, branch: str) -> WorktreeInfo:
-    worktree_path = tmp_path / "worktrees" / branch.replace("/", "-")
-    worktree_path.mkdir(parents=True, exist_ok=True)
-    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
-
-
-def _fake_worktree_with_venv(tmp_path: Path, branch: str) -> WorktreeInfo:
-    """Create a fake worktree with a .venv directory.
-
-    This makes sanitize_env actively SET VIRTUAL_ENV (instead of POP-ing it),
-    which makes the merge order testable: if worker_env is merged first,
-    sanitize_env will clobber the override.
-    """
-    worktree_path = tmp_path / "worktrees" / branch.replace("/", "-")
-    worktree_path.mkdir(parents=True, exist_ok=True)
-    (worktree_path / ".venv").mkdir()
-    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
-
-
-def _install_fake_create_worktree(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    *,
-    calls: list[dict] | None = None,
-    with_venv: bool = False,
-) -> None:
-    def fake_create_worktree(
-        repo_root,
-        branch,
-        *,
-        base_ref="HEAD",
-        worktrees_dir=None,
-        venv_source=None,
-        materialize_dirs=(),
-        rework=False,
-        recovery=None,
-        issue_number=None,
-        config=None,
-        sessions_dir=None,
-    ):
-        if calls is not None:
-            calls.append(
-                {
-                    "repo_root": repo_root,
-                    "branch": branch,
-                    "base_ref": base_ref,
-                    "worktrees_dir": worktrees_dir,
-                    "venv_source": venv_source,
-                    "materialize_dirs": materialize_dirs,
-                    "rework": rework,
-                    "recovery": recovery,
-                    "issue_number": issue_number,
-                    "config": config,
-                    "sessions_dir": sessions_dir,
-                }
-            )
-        if with_venv:
-            return _fake_worktree_with_venv(tmp_path, branch)
-        return _fake_worktree(tmp_path, branch)
-
-    monkeypatch.setattr(claude_code, "create_worktree", fake_create_worktree)
 
 
 def _fake_claude_script(tmp_path: Path) -> tuple[str, ...]:
@@ -3219,6 +3157,90 @@ def test_launch_claude_worker_review_pins_configured_model_by_default(
     assert record.command[idx + 1] == ClaudeCodeConfig().model
 
 
+def test_launch_claude_worker_review_pins_max_turns_override(tmp_path: Path) -> None:
+    """Issue #1439 round-2 review: ``launch_claude_worker(review=True,
+    max_turns_override=N)`` must construct a command that hard-pins
+    ``--max-turns`` to N — not the flat ``review_max_turns`` config default.
+
+    The #1439 dispatch-path tests monkeypatch ``launch_claude_worker`` itself
+    and only assert on the ``max_turns_override`` kwarg passed through, so they
+    never exercise the actual command-construction mechanism
+    (``_apply_max_turns_pin``). This test drives the REAL
+    ``launch_claude_worker`` (real ``create_review_checkout``, real
+    ``subprocess.Popen`` of a fake claude script) and asserts on
+    ``record.command`` — the fully-rendered argv handed to ``popen_worker`` —
+    so a regression that drops, ignores, or mis-wires the override is caught.
+
+    Uses 120 (distinct from the default 40) so a mutation that accepts the
+    parameter but silently falls back to the config default also fails this
+    test, not just one that removes the parameter.
+    """
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+
+    record = launch_claude_worker(
+        1439,
+        "agent/issue-1439-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        review=True,
+        head_sha=head_sha,
+        max_turns_override=120,
+    )
+
+    assert record.ok, record.error
+    assert record.command.count("--max-turns") == 1
+    idx = record.command.index("--max-turns")
+    assert record.command[idx + 1] == "120"
+    # Distinct from the flat config default — proves the override won, not a
+    # coincidental match.
+    assert record.command[idx + 1] != str(ReviewDispatchConfig().review_max_turns)
+
+
+def test_launch_claude_worker_review_max_turns_override_none_uses_config_default(
+    tmp_path: Path,
+) -> None:
+    """Issue #1439 round-2 review: ``launch_claude_worker(review=True,
+    max_turns_override=None)`` must use
+    ``resolved_config.review_dispatch.review_max_turns`` exactly as before —
+    regression protection for every direct caller and unit test that does not
+    opt into the structure-aware cap.
+
+    Uses a non-default ``review_max_turns`` (25) so the assertion is
+    meaningful: it confirms the value is read from config, not from a
+    hardcoded constant that happens to match the default.
+    """
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(review_max_turns=25),
+    )
+
+    record = launch_claude_worker(
+        1440,
+        "agent/issue-1440-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        review=True,
+        head_sha=head_sha,
+        config=config,
+        max_turns_override=None,
+    )
+
+    assert record.ok, record.error
+    assert record.command.count("--max-turns") == 1
+    idx = record.command.index("--max-turns")
+    assert record.command[idx + 1] == "25"
+
+
 def test_launch_claude_worker_review_uses_review_effort_when_set(tmp_path: Path) -> None:
     """A reviewer session must pin review_dispatch.review_effort over
     claude_code.effort when review_effort is explicitly set."""
@@ -3768,6 +3790,67 @@ def test_launch_claude_worker_review_prompt_write_failure_tears_down_checkout(
     assert str(checkout_path) not in result.stdout
 
 
+def test_launch_claude_worker_review_writes_terminal_status_record(
+    tmp_path: Path,
+) -> None:
+    """A review=True launch must start the terminal-status watcher so a
+    ``terminal.json`` appears at
+    ``worker_terminal_status_path(reviews_dir, pr_number, 'claude')`` once the
+    reviewer process exits (issue #1354, PR #1356 round-2 review).
+
+    Before the fix, ``launch_claude_worker`` guarded the
+    ``start_terminal_status_watcher`` call with ``if not review:``, so review
+    launches never wrote a terminal-status record and the review-verdict
+    reaper's exit-code fallback had nothing to read. This test exercises the
+    real launch path end-to-end (real ``create_review_checkout``, real
+    ``subprocess.Popen`` of the fake claude script, real watcher thread) and
+    asserts the durable record materializes at the path the reaper reads from.
+    """
+    from charlie_work.process_utils import (
+        find_worker_terminal_status,
+        worker_terminal_status_path,
+    )
+
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+
+    record = launch_claude_worker(
+        1354,
+        "agent/issue-1354-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        review=True,
+        head_sha=head_sha,
+    )
+
+    assert record.ok, record.error
+    assert record.pid is not None
+
+    expected_path = worker_terminal_status_path(sessions_dir, 1354, "claude")
+    # The watcher polls every _TERMINAL_STATUS_POLL_INTERVAL_SECONDS (2s); the
+    # fake script exits near-instantly, so the record should appear within a
+    # few poll intervals. Poll rather than sleep a fixed duration so the test
+    # is fast on a healthy path and only waits as long as needed.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and not expected_path.exists():
+        time.sleep(0.1)
+    assert expected_path.exists(), (
+        f"review=True launch did not write a terminal-status record at "
+        f"{expected_path} -- the start_terminal_status_watcher guard "
+        f"(`if not review:`) may have been reintroduced"
+    )
+
+    payload = find_worker_terminal_status(sessions_dir, 1354)
+    assert payload is not None, "terminal-status record vanished after appearing"
+    assert payload["pid"] == record.pid
+    # The fake claude script exits 0.
+    assert payload["exit_code"] == 0
+
+
 def test_launch_claude_worker_api_kind_sidecar_naming(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4112,3 +4195,165 @@ def test_classify_session_failure_provider_auth_word_boundary_still_matches(
             f"real auth tail no longer matched for tail: {tail!r}"
         )
         assert throttled_until is not None
+
+
+def test_classify_session_failure_provider_suspended_insufficient_balance(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342: a provider account-suspension / insufficient-balance response
+    classifies as ``provider_suspended`` (terminal) for api sessions, not as a
+    transient rate-limit."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    # Verbatim Moonshot suspension message observed 2026-08-18 (issue #1342).
+    log_path.write_text(
+        "Working...\n"
+        "Error: suspended due to insufficient balance, please recharge your "
+        "account or check your plan and billing details.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_suspended"
+    # Terminal failure: no cooldown window (it will not self-heal).
+    assert throttled_until is None
+
+
+def test_classify_session_failure_provider_suspended_account_suspended(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342: a generic ``account suspended`` billing message also
+    classifies as ``provider_suspended`` (matched by semantics, not full-string)."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Error: Your account is suspended. Please update your billing details.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_suspended"
+    assert throttled_until is None
+
+
+def test_classify_session_failure_provider_suspended_not_for_claude_code(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342: suspension classification is api-only (mirrors provider_auth)
+    — a claude-code session with the same message is not classified."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Error: suspended due to insufficient balance, please recharge.\n",
+        encoding="utf-8",
+    )
+
+    # Default adapter_kind="claude-code" — suspension patterns are not checked.
+    failure_kind, throttled_until = _classify_session_failure(log_path)
+
+    assert failure_kind is None
+    assert throttled_until is None
+
+
+def test_classify_session_failure_provider_suspended_takes_precedence_over_throttle(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342: a suspension signature must win over a coincidental
+    rate-limit phrase in the same tail, so the session is not retried as a
+    transient throttle."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Error: rate limit exceeded.\n"
+        "Error: suspended due to insufficient balance, please recharge your account.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_suspended"
+    assert throttled_until is None
+
+
+def test_classify_session_failure_genuine_429_keeps_rate_limited(tmp_path: Path) -> None:
+    """Issue #1342 acceptance criterion 4: a genuine transient 429 rate-limit
+    keeps the existing ``rate_limited`` backoff behavior (no suspension match)."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Working...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
+
+
+def test_classify_session_failure_provider_suspended_quoted_prose_not_matched(
+    tmp_path: Path,
+) -> None:
+    """PR #1426 round-2 review: the suspension phrase appearing only as
+    quoted/reviewed prose (not the session's actual terminal error) must NOT
+    classify as ``provider_suspended``. The structural anchor requires the
+    billing phrase to co-occur on the same log line with an HTTP 402 status or
+    a CLI ``Error:``/``API Error:`` line prefix; prose/code that merely quotes
+    the trigger phrase does not start with ``Error:`` and so is not treated as
+    a real API error. This is the self-inflicted-misclassification guard: a
+    worker reviewing this very fix must not be classified as suspended."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    # The session's actual terminal error is a normal test failure; the
+    # suspension trigger appears only inside a code-string quote and a prose
+    # sentence — neither line starts with ``Error:`` nor carries a 402.
+    log_path.write_text(
+        "Reviewing PR #1426...\n"
+        '    log_path.write_text("Error: suspended due to insufficient '
+        'balance, please recharge your account")\n'
+        "The regex matches `suspended due to insufficient balance` and "
+        "`recharge your account` phrases.\n"
+        "Ran tests.\n"
+        "Error: test failed: assertion error in test_worker.py\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    # Not provider_suspended — the quoted/prose lines have no structural
+    # anchor on the same line, and the real terminal error is a test failure
+    # (no billing phrase on that line either).
+    assert failure_kind is None
+    assert throttled_until is None
+
+
+def test_classify_session_failure_provider_suspended_402_status_anchor(
+    tmp_path: Path,
+) -> None:
+    """PR #1426 round-2 review: an HTTP 402 (Payment Required) status on the
+    same line as a billing phrase is a valid structural anchor — the canonical
+    billing-suspension status code, distinct from any prose phrase."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Working...\n"
+        "Request failed: 402 Payment Required - insufficient balance, please "
+        "recharge your account.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_suspended"
+    assert throttled_until is None

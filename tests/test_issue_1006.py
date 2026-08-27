@@ -21,8 +21,13 @@ from charlie_work.config import (
 )
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state
 from charlie_work.workflow import _detect_and_handle_orphaned_workers
+from charlie_work.write_gate import WriteGate
 
-from test_charlie_work import FakeGitHub
+from _fakes_github import FakeGitHub
+
+
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def test_none_not_in_deterministic_escalation_failure_kinds() -> None:
@@ -141,15 +146,20 @@ def test_orphan_salvage_repo_root_guard(
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
         patch("charlie_work.workflow._open_pr_for_orphaned_branch", side_effect=fake_open_pr),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, state_file, config, fake_gh, write_gate=_wg(state_file)
+        )
 
     state = load_state(state_file)
     issue_state = state["issues"][str(issue_number)]
 
+    # cw#1273: this specific reason now emits its own kind
+    # (pr_create_failed_branch_stranded) instead of the generic
+    # orphaned_worker_drift, after the bounded outer retry exhausted.
     drift_events = [
         e
         for e in state.get("events", [])
-        if e.get("kind") == "orphaned_worker_drift"
+        if e.get("kind") == "pr_create_failed_branch_stranded"
         and e.get("payload", {}).get("reason") == "dead_worker_branch_pushed_pr_create_failed"
     ]
     opened_events = [
@@ -174,6 +184,7 @@ def test_orphan_salvage_repo_root_guard(
         assert len(relabel_events) == 0
         assert len(drift_events) == 1
         assert drift_events[0]["payload"]["issue_number"] == issue_number
+        assert drift_events[0]["payload"]["branch_name"] == branch
         # The issue is held as drift, not silently relabeled/reopened.
         assert issue_state["status"] == "dispatched"
         assert issue_state.get("orphan_drift_fingerprint") is not None

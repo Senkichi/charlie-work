@@ -38,7 +38,7 @@ from charlie_work.state import load_state
 from charlie_work.workflow import OrchestratorApp
 
 # Reuse the shared FakeGitHub rather than redefining it.
-from test_charlie_work import FakeGitHub
+from _fakes_github import FakeGitHub
 
 # A report body with a real MINOR finding and a real Verdict line -- parses to
 # an "approved" CrossFamilyVerdict -- but with NO

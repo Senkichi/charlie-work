@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .config import InfraBlockedConfig
 
 
 @dataclass(frozen=True)
@@ -14,6 +18,16 @@ class CheckSummary:
     failed: tuple[str, ...]
     missing: tuple[str, ...]
     infra_failed: tuple[str, ...]
+    # Issue #1383: required checks that failed because of a fleet-wide
+    # infrastructure condition (Actions budget/runner outage) rather than
+    # the PR's code. Distinct from ``infra_failed`` (per-PR
+    # CANCELLED/INFRA_FAILURE/TIMED_OUT, issue #841): infra_blocked is a
+    # fleet-wide condition escalated once per window, not per-PR, and never
+    # routed to rework. Populated by the data-boundary enrichment
+    # (``_enrich_checks_infra_blocked`` in ``workflow.py``) which rewrites a
+    # FAILURE check's state to the ``INFRA_BLOCKED`` marker before
+    # ``summarize_checks`` ever sees it.
+    infra_blocked: tuple[str, ...] = ()
     unavailable: tuple[str, ...] = ()
 
     @property
@@ -23,6 +37,7 @@ class CheckSummary:
             and not self.failed
             and not self.missing
             and not self.infra_failed
+            and not self.infra_blocked
             and not self.unavailable
         )
 
@@ -44,6 +59,10 @@ class _CheckClassification(Enum):
     SKIPPED = "skipped"  # SKIPPED/NEUTRAL — legitimate non-outcomes
     CANCELLED = "cancelled"  # CANCELLED (infra hiccup, reported distinctly)
     INFRA = "infra"  # INFRA_FAILURE or TIMED_OUT
+    # Issue #1383: a FAILURE conclusion reclassified at the data boundary as
+    # a fleet-wide infrastructure block (billing/runner outage). Routed to
+    # ``CheckSummary.infra_blocked``, never to rework.
+    INFRA_BLOCKED = "infra_blocked"
     FAIL = "fail"  # FAILURE or any other unrecognized terminal state
 
 
@@ -55,6 +74,13 @@ def _classify_check_run(check: dict[str, Any]) -> _CheckClassification:
     ``bucket`` is used only as the pass/pending alternatives it is documented
     to provide (see ``PR_CHECKS_FIELDS`` in ``github.py``), never as an
     independent requirement.
+
+    The ``INFRA_BLOCKED`` marker state is set by the data-boundary enrichment
+    in ``workflow.py`` (``_enrich_checks_infra_blocked``) when a FAILURE
+    check's job shows structural evidence of a non-started job (zero steps /
+    instant-fail) or a config-listed billing annotation -- issue #1383. It is
+    never produced by GitHub's API directly, so an unenriched check list
+    (e.g. from a unit test) cannot land here by accident.
     """
     state = str(check.get("state") or "").upper()
     bucket = str(check.get("bucket") or "").lower()
@@ -71,6 +97,8 @@ def _classify_check_run(check: dict[str, Any]) -> _CheckClassification:
         return _CheckClassification.SKIPPED
     if state == "CANCELLED":
         return _CheckClassification.CANCELLED
+    if state == "INFRA_BLOCKED":
+        return _CheckClassification.INFRA_BLOCKED
     if state in {"INFRA_FAILURE", "TIMED_OUT"}:
         return _CheckClassification.INFRA
     return _CheckClassification.FAIL
@@ -90,6 +118,7 @@ def summarize_checks(
             failed=(),
             missing=(),
             infra_failed=(),
+            infra_blocked=(),
             unavailable=required,
         )
 
@@ -106,6 +135,7 @@ def summarize_checks(
     failed: list[str] = []
     missing: list[str] = []
     infra_failed: list[str] = []
+    infra_blocked: list[str] = []
 
     for name in required:
         runs = by_name.get(name)
@@ -120,6 +150,7 @@ def summarize_checks(
         name_failed = False
         name_pending = False
         name_infra_failed = False
+        name_infra_blocked = False
 
         for check in runs:
             classification = _classify_check_run(check)
@@ -134,6 +165,8 @@ def summarize_checks(
                 # Legitimate non-outcomes (path-filtered/matrix-conditional
                 # jobs) — never a failure.
                 continue
+            elif classification == _CheckClassification.INFRA_BLOCKED:
+                name_infra_blocked = True
             elif classification in {_CheckClassification.CANCELLED, _CheckClassification.INFRA}:
                 name_infra_failed = True
             elif classification == _CheckClassification.FAIL:
@@ -141,6 +174,8 @@ def summarize_checks(
 
         if name_failed:
             failed.append(name)
+        elif name_infra_blocked:
+            infra_blocked.append(name)
         elif name_infra_failed:
             infra_failed.append(name)
         elif name_pending:
@@ -155,6 +190,7 @@ def summarize_checks(
         failed=tuple(failed),
         missing=tuple(missing),
         infra_failed=tuple(infra_failed),
+        infra_blocked=tuple(infra_blocked),
         unavailable=(),
     )
 
@@ -325,6 +361,119 @@ def _is_infra_run(check: dict[str, Any]) -> bool:
         _CheckClassification.CANCELLED,
         _CheckClassification.INFRA,
     }
+
+
+# Setup/bootstrap step names that do not count as "the job ran real work".
+# Structural definition (the meaning of "zero non-setup steps"), not the
+# config-listed infra-annotation set issue #1383 keeps in config -- so this
+# stays a code constant, not an operator-tunable list.
+_SETUP_STEP_NAMES: frozenset[str] = frozenset(
+    {"set up job", "checkout", "initialize", "complete job"}
+)
+
+
+def _parse_actions_ts(value: Any) -> datetime | None:
+    """Parse a GitHub Actions ISO-8601 timestamp (``Z`` or offset) to aware datetime."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _job_duration_seconds(job: dict[str, Any]) -> float | None:
+    """Seconds between a job's ``started_at`` and ``completed_at``, or None."""
+    started = _parse_actions_ts(job.get("started_at"))
+    completed = _parse_actions_ts(job.get("completed_at"))
+    if started is None or completed is None:
+        return None
+    delta = (completed - started).total_seconds()
+    if delta < 0:
+        return None
+    return delta
+
+
+def is_infra_blocked_check(
+    job: dict[str, Any],
+    annotations: list[dict[str, Any]] | None,
+    config: InfraBlockedConfig,
+) -> bool:
+    """Classify a FAILED job as ``infra_blocked`` (fleet-wide infra), not code.
+
+    Issue #1383: a required check that failed because the Actions budget
+    exhausted / no runner was available carries zero signal about the PR's
+    code. Routing it to rework burns caps on no-op cycles and escalates a
+    healthy PR. This classifier is the single source of truth for the
+    structural + annotation signals that distinguish such a failure from a
+    genuine code FAILURE, applied at the check-ingestion data boundary
+    (``_enrich_checks_infra_blocked`` in ``workflow.py``) BEFORE the
+    rework-routing decision.
+
+    Signals (preferred order -- structural over string where the API exposes
+    it, per the issue):
+      1. Annotation match: any annotation whose ``message`` contains a
+         case-insensitive substring from ``config.annotation_patterns``. A
+         billing annotation is authoritative infrastructure evidence even
+         when step data is present, so this wins independently.
+      2. Zero non-setup steps: the job has no ``steps`` key at all, an
+         empty steps list, or only setup bootstrap steps -- the runner
+         never started the actual work (billing lapse / runner never
+         picked up the job). A missing ``steps`` key is treated as zero
+         steps, restoring the pre-#1383 ``is_infrastructure_failure``
+         behavior for the absent-key shape (round-2 #1383 review).
+
+    ``config.instant_fail_seconds`` is a reserved knob with no current
+    behavioral effect (see its config docstring).
+
+    Returns ``False`` for any non-FAILURE conclusion (the function is only
+    meaningful for checks already known to have failed). Never raises: a
+    malformed job (missing/typed-wrong fields) degrades to ``False``, so an
+    unenrichable check falls back to ordinary ``failed`` routing rather than
+    crashing the ingestion path.
+    """
+    if not isinstance(job, dict):
+        return False
+    if not config.enabled:
+        return False
+    if str(job.get("conclusion") or "").upper() != "FAILURE":
+        return False
+
+    # Signal 1: config-listed annotation substring (case-insensitive).
+    patterns = config.annotation_patterns
+    if patterns:
+        raw_annotations = annotations if isinstance(annotations, list) else []
+        for annotation in raw_annotations:
+            if not isinstance(annotation, dict):
+                continue
+            message = str(annotation.get("message") or "").lower()
+            if any(pattern.lower() in message for pattern in patterns if pattern):
+                return True
+
+    # Signal 2: zero non-setup steps (runner never started the work). A
+    # missing ``steps`` key is treated as zero steps -- the Actions API
+    # omits the array for some check-run shapes, and the pre-#1383
+    # ``is_infrastructure_failure`` returned True for that case (a FAILURE
+    # job with no step data never started the work). Restoring that
+    # behavior keeps this classifier behavior-preserving for the
+    # absent-key shape that the prior Signal 3 duration gate alone missed
+    # when timestamps were also absent (issue #1383 round-2 review). The
+    # config docstring's "0 disables the timing signal; zero-step-alone
+    # still classifies" contract is honored: a missing/empty steps array
+    # classifies regardless of ``instant_fail_seconds``.
+    steps = job.get("steps")
+    if steps is None:
+        return True
+    if isinstance(steps, list):
+        non_setup = [
+            s
+            for s in steps
+            if isinstance(s, dict) and str(s.get("name") or "").lower() not in _SETUP_STEP_NAMES
+        ]
+        if len(steps) == 0 or len(non_setup) == 0:
+            return True
+
+    return False
 
 
 @dataclass(frozen=True)
