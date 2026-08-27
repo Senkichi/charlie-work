@@ -89,9 +89,15 @@ def _stale_checks_config(
 
 class FakeGitHubMissingChecksAndConflict(FakeGitHubWithMissingRequiredAndRuns):
     """Models #1186/#1192/#1214's real shape: required checks were never
-    created for the head AND the PR independently has a merge conflict --
-    the co-occurring-failure population issue #1274's binding comment item 5
-    says the retrigger must still fire against.
+    created for the head AND the PR independently has a merge conflict.
+
+    Retained for the issue #1451 CONFLICTING-skip test, which needs a PR
+    whose ``mergeable`` is ``CONFLICTING`` to exercise the remediation
+    chooser's discrimination. The retrigger-mechanism tests (AC5/AC6/AC7)
+    now use a MERGEABLE fixture instead -- issue #1451 reversed #1274's
+    binding comment item 5 for the CONFLICTING case (close/reopen can never
+    create a CI run on a conflicted branch), so those tests can no longer
+    use a CONFLICTING fixture to exercise the close/reopen path.
     """
 
     def __init__(self, runs: list[dict[str, Any]] | None) -> None:
@@ -113,14 +119,22 @@ def _app_with_conflict_and_missing_checks(
     runs: list[dict[str, Any]] | None = None,
     issue_status: str = "dispatched",
     head_sha: str = _STALE_HEAD,
+    mergeable: str = "MERGEABLE",
     **config_kwargs: Any,
 ) -> OrchestratorApp:
     """A PR shaped like #1186/#1192/#1214: missing required checks (so
-    ``_detect_ci_run_never_created`` can fire) AND a merge conflict (so
-    ``_route_janitor_gate_failure_to_rework`` runs first). Verified against
-    all three PRs on 2026-08-16: each has ``mergeable=CONFLICTING`` and an
-    empty ``statusCheckRollup`` -- confirming the missing-checks-AND-conflict
-    co-occurrence this fixture models is real, not hypothetical.
+    ``_detect_ci_run_never_created`` can fire). Verified against all three
+    PRs on 2026-08-16: each has an empty ``statusCheckRollup`` -- confirming
+    the missing-checks condition this fixture models is real, not
+    hypothetical.
+
+    ``mergeable`` defaults to ``"MERGEABLE"`` so the retrigger-mechanism
+    tests (AC5/AC6/AC7/AC11) exercise the close/reopen path. Issue #1451
+    reversed #1274's binding comment item 5 for the CONFLICTING case: a
+    conflicted branch can never get a ``pull_request`` workflow run, so
+    close/reopen is now skipped and the PR is routed to merge-conflict
+    rework instead. The CONFLICTING-skip test passes
+    ``mergeable="CONFLICTING"`` to exercise that discrimination.
 
     ``issue_status`` defaults to "dispatched" purely as a reachability
     choice for the fixture: it is the status value that makes
@@ -142,9 +156,10 @@ def _app_with_conflict_and_missing_checks(
     """
     config = _stale_checks_config(**config_kwargs)
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHubMissingChecksAndConflict(runs=[] if runs is None else runs)
+    fake_gh = FakeGitHubWithMissingRequiredAndRuns(runs=[] if runs is None else runs)
     fake_gh.prs[0]["headRefOid"] = head_sha
     fake_gh.prs[0]["updatedAt"] = _stale_updated_at()
+    fake_gh.prs[0]["mergeable"] = mergeable
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     with state_lock(app.paths.state_file):
         state = load_state(app.paths.state_file)
@@ -162,14 +177,87 @@ def _stale_checks_events(state: dict[str, Any]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def test_retrigger_fires_despite_co_occurring_merge_conflict_failure(tmp_path: Path) -> None:
-    """The gate that matters is "is the check-suite run missing", not "is it
-    the ONLY janitor failure" (binding comment item 5 on issue #1274 --
-    deliberately reverses a strict ``is_missing_checks_only_block`` gate).
-    A fixture whose PR ALSO has a merge conflict (mergeable=CONFLICTING)
-    still gets a retrigger attempt.
+def test_retrigger_skipped_for_conflicting_pr_routes_to_conflict_rework(
+    tmp_path: Path,
+) -> None:
+    """Issue #1451: a CONFLICTING PR with missing checks must NOT get a
+    close/reopen retrigger -- GitHub cannot build ``refs/pull/N/merge`` while
+    the branch conflicts, so no ``pull_request`` workflow run can be created
+    for ANY event (opened, reopened, synchronize) until the conflict is
+    resolved. The remediation chooser (``_attempt_stale_checks_retrigger``)
+    checks ``mergeable`` BEFORE choosing a remedy (single point of
+    enforcement) and routes to the existing merge-conflict rework path
+    instead, recording a ``ci_retrigger_skipped_conflicting`` event for
+    diagnosability.
+
+    This reverses #1274's binding comment item 5 for the CONFLICTING case:
+    that comment assumed the retrigger was "harmless" alongside a
+    co-occurring conflict, but it burns a ``stale_checks_retrigger_attempts``
+    slot and a close/reopen notification cycle with zero possible effect.
+
+    The fixture uses ``issue_status="dispatched"`` (rework already pending)
+    so the janitor gate's own merge-conflict routing returns None and
+    execution reaches ``_attempt_stale_checks_retrigger`` -- the same
+    reachability choice the retrigger-mechanism tests below rely on. The
+    conflict rework wrapper returns None here too (rework still pending),
+    so the pass falls through to the passive janitor_blocked bookkeeping.
+    The routing DECISION is observable through the skip event and the
+    absence of any close/reopen call.
     """
-    app = _app_with_conflict_and_missing_checks(tmp_path)
+    app = _app_with_conflict_and_missing_checks(tmp_path, mergeable="CONFLICTING")
+
+    result = app.review(456)
+
+    assert result.ok is False
+    # No close/reopen or empty-commit attempt was made.
+    assert app.gh.pr_close_calls == []
+    assert app.gh.pr_reopen_calls == []
+    assert app.gh.push_empty_commit_calls == []
+    # No stale_checks attempt was consumed.
+    state = load_state(app.paths.state_file)
+    assert "stale_checks_retrigger_attempts" not in state["prs"]["456"]
+    assert len(_stale_checks_events(state)) == 0
+    # The skip event was emitted with the right payload.
+    skip_events = _events(state, "ci_retrigger_skipped_conflicting")
+    assert len(skip_events) == 1
+    assert skip_events[0]["payload"]["pr_number"] == 456
+    assert skip_events[0]["payload"]["issue_number"] == 123
+    assert skip_events[0]["payload"]["head_sha"] == _STALE_HEAD
+    # The per-head dedup marker was persisted.
+    assert state["prs"]["456"]["ci_retrigger_skipped_conflicting_head"] == _STALE_HEAD
+    # Reachability control: execution reached the terminal janitor-gate-
+    # blocked return AFTER passing through the chooser, not an earlier
+    # short-circuit.
+    assert result.message.startswith("janitor gate blocked PR #456")
+
+
+def test_conflicting_skip_event_deduped_per_head(tmp_path: Path) -> None:
+    """Issue #1451: the ``ci_retrigger_skipped_conflicting`` event is deduped
+    per head -- a CONFLICTING PR that sits for many passes while the rework
+    worker resolves the conflict emits the skip event only once per head,
+    not every pass (mirrors the ``ci_run_never_created`` per-head dedup).
+    """
+    app = _app_with_conflict_and_missing_checks(tmp_path, mergeable="CONFLICTING")
+
+    # Pass 1: emits the skip event for the first time.
+    app.review(456)
+    state = load_state(app.paths.state_file)
+    assert len(_events(state, "ci_retrigger_skipped_conflicting")) == 1
+
+    # Pass 2: same head, still CONFLICTING -> no duplicate skip event.
+    app.review(456)
+    state = load_state(app.paths.state_file)
+    assert len(_events(state, "ci_retrigger_skipped_conflicting")) == 1
+
+
+def test_retrigger_fires_for_mergeable_pr_regression_guard(tmp_path: Path) -> None:
+    """Issue #1451 regression guard: a MERGEABLE PR with missing checks
+    still gets the close/reopen retrigger (the working case the fix must
+    not break). This is the counterpart to the CONFLICTING-skip test above
+    -- the chooser discriminates on ``mergeable``, and MERGEABLE proceeds
+    with the current behavior.
+    """
+    app = _app_with_conflict_and_missing_checks(tmp_path, mergeable="MERGEABLE")
 
     result = app.review(456)
 
@@ -179,11 +267,37 @@ def test_retrigger_fires_despite_co_occurring_merge_conflict_failure(tmp_path: P
     assert app.gh.pr_reopen_calls == [456]
     state = load_state(app.paths.state_file)
     assert state["prs"]["456"]["stale_checks_retrigger_attempts"] == 1
-    assert state["prs"]["456"]["is_missing_checks_only_block"] is False
     events = _stale_checks_events(state)
     assert len(events) == 1
     assert events[0]["payload"]["method"] == "close_reopen"
     assert events[0]["payload"]["attempt"] == 1
+    # No skip event for a MERGEABLE PR.
+    assert _events(state, "ci_retrigger_skipped_conflicting") == []
+
+
+def test_retrigger_deferred_for_unknown_mergeable(tmp_path: Path) -> None:
+    """Issue #1451: a PR whose ``mergeable`` is ``UNKNOWN`` (GitHub still
+    computing) defers to the next pass rather than retriggering blind -- a
+    close/reopen on a PR whose mergeable state is not yet settled could
+    either waste the attempt (if it resolves to CONFLICTING) or fire
+    prematurely (if it resolves to MERGEABLE but GitHub has not yet created
+    the run). No close/reopen, no skip event, no attempt consumed.
+    """
+    app = _app_with_conflict_and_missing_checks(tmp_path, mergeable="UNKNOWN")
+
+    result = app.review(456)
+
+    assert result.ok is False
+    assert result.data.get("stale_checks_retriggered") is None
+    assert app.gh.pr_close_calls == []
+    assert app.gh.pr_reopen_calls == []
+    assert app.gh.push_empty_commit_calls == []
+    state = load_state(app.paths.state_file)
+    assert "stale_checks_retrigger_attempts" not in state["prs"]["456"]
+    assert _events(state, "ci_retrigger_skipped_conflicting") == []
+    assert len(_stale_checks_events(state)) == 0
+    # Reachability control: fell through to the janitor_blocked return.
+    assert result.message.startswith("janitor gate blocked PR #456")
 
 
 def test_retrigger_not_triggered_without_ci_run_never_created_head(tmp_path: Path) -> None:
@@ -509,15 +623,16 @@ def test_exhausted_bound_escalates_to_operator_queue(tmp_path: Path) -> None:
 
 def test_exhaustion_guard_skips_when_already_escalated_for_this_reason(tmp_path: Path) -> None:
     """Direct unit coverage for ``_escalate_stale_checks_exhaustion``'s own
-    dedup guard (``existing_pr_state.get("escalation_reason") ==
-    exhaustion_reason``), calling the method directly rather than through
-    ``review()``. The method's own docstring calls this guard
-    belt-and-suspenders relative to ``review()``'s structural
-    escalated-visibility early return (``test_exhausted_escalation_does_not_refire_on_a_later_pass``
-    below proves that structural path); this test proves the guard clause
-    itself trips independent of that early return -- the one case the
-    docstring names as the reason it exists (something resets ``status``
-    while ``escalation_reason`` survives). No ``state_lock`` should even be
+    dedup guard (``existing_pr_state.get("escalation_reasons_seen")``
+    membership, issue #1461: was ``escalation_reason`` equality), calling the
+    method directly rather than through ``review()``. The method's own
+    docstring calls this guard belt-and-suspenders relative to ``review()``'s
+    structural escalated-visibility early return
+    (``test_exhausted_escalation_does_not_refire_on_a_later_pass`` below
+    proves that structural path); this test proves the guard clause itself
+    trips independent of that early return -- the one case the docstring
+    names as the reason it exists (something resets ``status`` while
+    ``escalation_reason`` survives). No ``state_lock`` should even be
     entered: zero label calls, zero events, and the pre-existing issue state
     left untouched.
     """
@@ -532,6 +647,7 @@ def test_exhaustion_guard_skips_when_already_escalated_for_this_reason(tmp_path:
             "status": "escalated",
             "escalation_reason": "stale_checks_retrigger_exhausted",
             "reason_class": "mechanical",
+            "escalation_reasons_seen": ["stale_checks_retrigger_exhausted"],
         }
         save_state(app.paths.state_file, state)
 
@@ -541,7 +657,10 @@ def test_exhaustion_guard_skips_when_already_escalated_for_this_reason(tmp_path:
         head_sha=_STALE_HEAD,
         attempts=3,
         max_retriggers=3,
-        existing_pr_state={"escalation_reason": "stale_checks_retrigger_exhausted"},
+        existing_pr_state={
+            "escalation_reason": "stale_checks_retrigger_exhausted",
+            "escalation_reasons_seen": ["stale_checks_retrigger_exhausted"],
+        },
     )
 
     assert result is None
@@ -635,7 +754,9 @@ def test_full_chain_detection_through_retrigger_to_exhaustion_escalation(
     tmp_path: Path,
 ) -> None:
     """Fixture shaped like the real #1186/#1192/#1214 population: required
-    checks never created for the head AND an independent merge conflict.
+    checks never created for the head. Uses a MERGEABLE PR (issue #1451:
+    a CONFLICTING PR now routes to conflict rework instead of retriggers,
+    so the close/reopen chain this test exercises requires MERGEABLE).
     Drives three simulated passes (grace window elapsed via backdating the
     persisted timestamp between passes, never a real sleep) over the SAME
     PR/head and asserts the full chain -- detection, two retrigger attempts,
@@ -658,7 +779,7 @@ def test_full_chain_detection_through_retrigger_to_exhaustion_escalation(
 
     state = load_state(app.paths.state_file)
     assert state["prs"]["456"]["ci_run_never_created_head"] == _STALE_HEAD
-    assert state["prs"]["456"]["is_missing_checks_only_block"] is False
+    assert state["prs"]["456"]["is_missing_checks_only_block"] is True
     assert state["prs"]["456"]["stale_checks_retrigger_attempts"] == 1
     assert len(_events(state, "ci_run_never_created")) == 1
     assert len(_stale_checks_events(state)) == 1
@@ -724,13 +845,9 @@ def test_full_chain_detection_through_retrigger_to_exhaustion_escalation(
     # re-fires (zero additional close/reopen/empty-commit calls, no
     # duplicate exhaustion event -- see AC7's dedicated dedup test,
     # ``test_exhausted_escalation_does_not_refire_on_a_later_pass``, for the
-    # structural "escalated-visibility early return" proof on a fixture
-    # without a co-occurring conflict). This fixture's own independent
-    # merge-conflict rework lane is a separate, unrelated escape hatch
-    # (issue #776) that may still route pass 4 to conflict rework -- that is
-    # correct, intentional behavior for this population, not a claim this
-    # test makes about THIS lane's chain, so only the stale-checks-specific
-    # counters are asserted here.
+    # structural "escalated-visibility early return" proof). This fixture
+    # has no co-occurring merge conflict (MERGEABLE), so no unrelated escape
+    # hatch re-enters remediation on pass 4 either.
     result4 = app.review(456)
     assert result4.data.get("stale_checks_retrigger_exhausted") is not True
     state = load_state(app.paths.state_file)

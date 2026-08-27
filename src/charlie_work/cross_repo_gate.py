@@ -32,6 +32,40 @@ The gate is conservative by design:
 Escalating to ``human-needed`` is a safe failure mode: a human can re-label
 the issue after confirming the target repo, so a false positive costs one
 manual triage action rather than a contaminated sibling checkout.
+
+Issues #1452 and #1460: a referenced path is not automatically evidence of a
+cross-repo target. Two shapes of "expected absent" candidate showed up in
+production:
+
+- **Evidence/authority citations** — a path cited as the source of the bug
+  report or the design rationale (``Authority: <path> section 4 rows 5-6``),
+  not as code the worker is meant to touch. #1452's original body cited
+  ``job_finder/*`` paths this way to document where a false-alarm report
+  came from; #1460 cited an ``llibrary`` decision doc as the design
+  authority for the feature. The marker vocabulary is deliberately narrow
+  (``authority``, ``evidence``, ``cited in``, ``rationale``, and the
+  ``section N`` / ``rows N-M`` suffixes) — it excludes ``see``, ``per``, and
+  ``line N``, which are also the ordinary way a bug report cites the file
+  the worker must *edit* (``See `job_finder/matcher.py` line 42 — the loop
+  never breaks``). Treating those as evidence markers would make a genuine
+  wrong-repo issue cited that way go all-neutral and abstain into dispatch —
+  the more expensive false-negative direction described above.
+- **Runtime-artifact write destinations** — a path the issue's *own*
+  deliverable will create at runtime (``advisories are logged to
+  .var/attachment-contracts/advisories.jsonl``), which by definition cannot
+  exist yet. A gitignored path (derived from the target repo's own
+  ``.gitignore`` via ``git check-ignore``, never a hardcoded name list) is
+  the same signal by construction — nothing under a gitignored path is a
+  dispatch target in the first place.
+
+Both shapes are classified **neutral**: excluded from the pass/escalate
+decision and reported separately (``CrossRepoGateResult.neutral_paths``)
+rather than folded into ``referenced_paths``/``missing_paths``. When every
+extracted candidate is neutral, the gate abstains (``passed=True``) — the
+same outcome as an issue that references no paths at all, since neutral
+candidates carry no evidence either way about where the issue's subject code
+lives. When at least one non-neutral ("surviving") candidate remains, the
+existing pass/escalate rule above applies to the survivors unchanged.
 """
 
 from __future__ import annotations
@@ -40,7 +74,14 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .config import LAUNCHER_OWNED_DIRS
 from .safe_path import contains
+from .subprocess_runner import run_captured
+
+#: Timeout for the ``git check-ignore`` invocation used to classify a
+#: candidate as a gitignored runtime artifact. A single-path lookup is
+#: sub-second in practice; this is a backstop against a wedged index lock.
+_CHECK_IGNORE_TIMEOUT_SECONDS = 5
 
 # A file extension: 1-10 word characters after a dot.  Bounds the length so
 # the regex does not match version strings like ``1.2.3.4.5.6.7.8.9.0``.
@@ -96,6 +137,96 @@ _DOMAIN_PATH = r"\b(?:[\w-]+\.)+[a-zA-Z]{2,24}/[^\s|`)\]]*"
 #     unknown number.
 _PLACEHOLDER_SEGMENT = re.compile(r"^(?:[A-Za-z]+-N|.*[<>].*)$")
 
+# Glob metacharacters: ``*``, ``?``, ``[``, ``]``. A candidate containing any
+# of these is a glob pattern, not a literal file path — no file literally
+# named ``*.py`` exists, so a glob candidate is always "missing" and would
+# false-positive the gate. The backtick-quoted path regex (``_TICK_PATH``)
+# captures globs because it matches anything inside backticks that contains a
+# separator and ends with an extension; the non-tick regexes exclude ``*``
+# from their character classes, so only backtick-quoted globs reach this
+# filter (issue #1391).
+_GLOB_METACHAR = re.compile(r"[*?\[\]]")
+
+# Evidence/authority-citation markers (issues #1452, #1460): a candidate
+# preceded by one of these words in its own clause is being cited as a
+# reference that explains or backs the issue, not as a file the worker is
+# expected to touch.
+#
+# Deliberately narrow. "see" and "per" were dropped: they are also the
+# ordinary way a bug report cites the file the worker must EDIT ("See
+# `job_finder/matcher.py` line 42 -- the loop never breaks"), so keeping
+# them made a genuine wrong-repo issue whose only candidates are cited that
+# way go all-neutral and abstain -- a false negative, which is the more
+# expensive failure mode per the module docstring (it costs a contaminated
+# sibling checkout, not just one manual triage action). Only markers that
+# are unambiguously about *authority/rationale for the issue*, never about
+# *where the bug lives*, stay in this list.
+_EVIDENCE_MARKER_RE = re.compile(
+    r"\b(?:authority|evidence|cited\s+in|rationale)\b",
+    re.IGNORECASE,
+)
+
+# Evidence/authority citation SUFFIX markers: "section 4", "rows 5-6"
+# following a candidate in the same paragraph is the same citation signal,
+# just placed after the path instead of before it (issue #1460's
+# "Authority: <path> section 4 rows 5-6").
+#
+# "line N" was dropped: it is the ordinary way a bug report pinpoints the
+# file the worker must edit ("`job_finder/matcher.py` line 42 -- the loop
+# never breaks"), not an evidence-citation signal -- keeping it risked the
+# same false-negative direction as "see"/"per" above.
+_EVIDENCE_SUFFIX_RE = re.compile(
+    r"\b(?:section|rows?)\s+\d+",
+    re.IGNORECASE,
+)
+
+# Runtime-artifact write-destination markers (issue #1460): a candidate
+# preceded by one of these verbs in its own paragraph is something the
+# issue's *own* future work will create or write, not evidence that already
+# exists -- it cannot exist yet by definition, so its absence is not
+# evidence of a cross-repo target.
+_WRITE_DESTINATION_MARKER_RE = re.compile(
+    r"\b(?:logged\s+to|writes?\s+to|written\s+to|will\s+create|"
+    r"creates?|emits?\s+to|appends?\s+to)\b",
+    re.IGNORECASE,
+)
+
+# A blank line (one or more) delimiting markdown paragraphs. Used to bound
+# the context window for the evidence/write-destination checks to "this
+# paragraph" -- wide enough that a marker word introducing a path on the
+# very next line (a markdown soft-wrap, e.g. "Authority:\n<path>") is still
+# caught, narrow enough that an unrelated marker word in a different
+# paragraph of a long issue body cannot neutralize a candidate it has
+# nothing to do with.
+_PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t]*\n")
+
+# Clause-boundary punctuation *within* a paragraph. A preceding marker word
+# must appear in the candidate's own clause, not merely somewhere earlier in
+# the same paragraph -- "Authority: docs/decisions/x.md section 2; the
+# actual bug is in `src/real.py`" must NOT neutralize ``src/real.py`` just
+# because "Authority" opened an unrelated earlier clause in the same
+# sentence.
+#
+# Deliberately excludes ``:`` and bare newlines: a label like "Authority:"
+# or "Evidence:" is a single semantic unit with what follows it (including
+# across a markdown soft-wrap onto the next line), not two separate
+# clauses -- severing at the colon would make the label word unreachable
+# from the clause search, defeating the exact pattern it exists to catch.
+_CLAUSE_BOUNDARY_RE = re.compile(r"[.;,()]")
+
+
+def _current_clause(text_before_in_paragraph: str) -> str:
+    """Return the text since the last clause-boundary punctuation mark in
+    *text_before_in_paragraph* (or the whole string, if none) -- the
+    "current clause" a preceding marker word must appear in to describe the
+    candidate that follows it, rather than an unrelated earlier clause in
+    the same paragraph.
+    """
+    boundaries = list(_CLAUSE_BOUNDARY_RE.finditer(text_before_in_paragraph))
+    if not boundaries:
+        return text_before_in_paragraph
+    return text_before_in_paragraph[boundaries[-1].end() :]
+
 
 @dataclass(frozen=True)
 class CrossRepoGateResult:
@@ -104,20 +235,28 @@ class CrossRepoGateResult:
     Attributes:
         passed: ``True`` when the issue should be dispatched, ``False`` when
             it should be escalated to ``agent:human-needed``.
-        referenced_paths: every candidate file path extracted from the issue
-            body, as raw strings (may include paths that do not exist
-            anywhere).
+        referenced_paths: candidate file paths extracted from the issue body
+            that were *not* classified neutral (see ``neutral_paths``), as
+            raw strings (may include paths that do not exist anywhere).
         missing_paths: the subset of ``referenced_paths`` that do not exist
             in the target repo.  When ``passed`` is ``False``, this equals
             ``referenced_paths`` (every referenced path was missing).
         reason: human-readable explanation for the gate's decision, suitable
             for an event payload.
+        neutral_paths: candidate file paths extracted from the issue body
+            that were classified as evidence/authority citations or
+            gitignored runtime-artifact write destinations (issues #1452,
+            #1460) -- excluded from ``referenced_paths``/``missing_paths``
+            and from the pass/escalate decision entirely. Reported
+            separately for observability, not because it drives any
+            downstream behavior today.
     """
 
     passed: bool
     referenced_paths: tuple[str, ...]
     missing_paths: tuple[str, ...]
     reason: str
+    neutral_paths: tuple[str, ...] = ()
 
 
 def extract_referenced_paths(issue_body: str) -> list[str]:
@@ -137,14 +276,46 @@ def extract_referenced_paths(issue_body: str) -> list[str]:
     ``pr-N``, ``issue-N``, ``<...>``) are dropped — a template stand-in can
     never name a real file, so a templated documentation path in an issue
     body cannot fire the gate (issue #1343).
+
+    Candidates containing glob metacharacters (``*``, ``?``, ``[``, ``]``)
+    are dropped — a glob pattern is not a literal file path, and no file
+    literally named ``*.py`` exists, so a glob candidate is always "missing"
+    and would false-positive the gate (issue #1391).
+
+    Candidates whose first path segment is a launcher-owned worktree
+    directory (``.devin``, ``.git_worktree_dir``) are dropped — these paths
+    live only inside agent worktrees, not in the repo tree, so they are not
+    evidence of a cross-repo target (issue #1391).
+    """
+    return [raw for raw, _start, _end in _iter_candidate_matches(issue_body)[0]]
+
+
+def _strip_non_path_prose(issue_body: str) -> str:
+    """Strip URLs and scheme-less domain-shaped tokens before path matching.
+
+    Shared by :func:`_iter_candidate_matches` so the offsets it returns are
+    relative to the same stripped text a caller uses for context lookups
+    (see :func:`_paragraph_span`).
     """
     # Strip URLs before matching so the POSIX absolute-path alternation does
     # not capture the path portion of ``https://example.com/foo.py``.
     stripped = re.sub(r"https?://\S+", "", issue_body)
     # Strip scheme-less domain-shaped tokens the same way — a "path" whose
     # leading segment is actually a hostname is not a file-path reference.
-    stripped = re.sub(_DOMAIN_PATH, "", stripped)
-    candidates: list[str] = []
+    return re.sub(_DOMAIN_PATH, "", stripped)
+
+
+def _iter_candidate_matches(issue_body: str) -> tuple[list[tuple[str, int, int]], str]:
+    """Return ``(candidates, stripped_body)`` for every surviving candidate.
+
+    ``candidates`` is a de-duplicated, first-seen-order list of
+    ``(raw_path, start, end)`` where ``start``/``end`` are offsets into
+    ``stripped_body`` — kept so callers can inspect the text surrounding a
+    match (see :func:`_paragraph_span`) without re-deriving the stripped
+    body themselves and risking an offset mismatch.
+    """
+    stripped = _strip_non_path_prose(issue_body)
+    candidates: list[tuple[str, int, int]] = []
     seen: set[str] = set()
     for match in _PATH_RE.finditer(stripped):
         # The regex has four alternation groups; pick the one that matched.
@@ -156,10 +327,20 @@ def extract_referenced_paths(issue_body: str) -> list[str]:
         # reference, and can never be a genuine cross-repo target.
         if _has_placeholder_segment(raw):
             continue
+        # Drop glob patterns: a candidate containing ``*``, ``?``, ``[``, or
+        # ``]`` is a glob, not a literal path. No file named ``*.py`` exists,
+        # so a glob is always "missing" and would false-positive the gate.
+        if _GLOB_METACHAR.search(raw):
+            continue
+        # Drop launcher-owned worktree paths: paths under ``.devin/`` or
+        # ``.git_worktree_dir/`` live only inside agent worktrees, not in the
+        # repo tree, so they are not evidence of a cross-repo target.
+        if _is_launcher_owned_path(raw):
+            continue
         if raw not in seen:
             seen.add(raw)
-            candidates.append(raw)
-    return candidates
+            candidates.append((raw, match.start(), match.end()))
+    return candidates, stripped
 
 
 def _has_placeholder_segment(candidate: str) -> bool:
@@ -172,6 +353,24 @@ def _has_placeholder_segment(candidate: str) -> bool:
     (issue #1343).
     """
     return any(_PLACEHOLDER_SEGMENT.match(seg) for seg in re.split(r"[\\/]+", candidate))
+
+
+def _is_launcher_owned_path(candidate: str) -> bool:
+    """Return ``True`` when ``candidate`` is under a launcher-owned worktree dir.
+
+    Paths under ``.devin/`` or ``.git_worktree_dir/`` live only inside agent
+    worktrees — the shim materializes them on every dispatch — not in the
+    repo tree. A candidate whose first path segment names one of these
+    directories is not evidence of a cross-repo target: it will always be
+    "missing" from the repo and would false-positive the gate (issue #1391).
+
+    The launcher-owned directory set is sourced from
+    :data:`charlie_work.config.LAUNCHER_OWNED_DIRS`, shared with
+    :mod:`charlie_work.worktree`'s dirty check so the two modules share one
+    definition of "launcher-owned, not evidence."
+    """
+    segments = re.split(r"[\\/]+", candidate, maxsplit=1)
+    return bool(segments) and segments[0] in LAUNCHER_OWNED_DIRS
 
 
 def _path_exists_in_repo(path_str: str, repo_root: Path) -> bool:
@@ -298,6 +497,85 @@ def _is_repo_shaped_relative_candidate(candidate: str, repo_root: Path) -> bool:
     return True
 
 
+def _paragraph_span(text: str, start: int, end: int) -> tuple[str, str]:
+    """Return ``(text_before, text_after)`` within the paragraph containing ``[start, end)``.
+
+    A paragraph is a blank-line-delimited block (see ``_PARAGRAPH_BREAK_RE``)
+    rather than a single ``\\n``-delimited line — a markdown soft-wrap (one
+    newline, no blank line) does not split a marker word from the path it
+    introduces on the next line, which is exactly issue #1460's shape
+    (``"Authority:\\nllibrary/docs/...\\n"``).
+    """
+    before_text = text[:start]
+    after_text = text[end:]
+    para_start = 0
+    for m in _PARAGRAPH_BREAK_RE.finditer(before_text):
+        para_start = m.end()
+    after_match = _PARAGRAPH_BREAK_RE.search(after_text)
+    para_end = after_match.start() if after_match else len(after_text)
+    return before_text[para_start:], after_text[:para_end]
+
+
+def _is_context_neutral(before: str, after: str) -> bool:
+    """Return ``True`` when the candidate's own clause marks it as an
+    evidence/authority citation or a runtime-artifact write destination
+    rather than a dispatch target (issues #1452, #1460).
+
+    The preceding-marker checks are scoped to :func:`_current_clause` of
+    ``before`` (not the whole paragraph) so a marker word that opened an
+    unrelated earlier clause in the same paragraph/sentence cannot
+    neutralize a candidate it has nothing to do with. The suffix check
+    (``section N`` / ``rows N-M``) stays paragraph-scoped: it only ever
+    matches immediately after the candidate, so there is no equivalent
+    "unrelated earlier clause" to guard against.
+    """
+    clause_before = _current_clause(before)
+    if _EVIDENCE_MARKER_RE.search(clause_before) or _EVIDENCE_SUFFIX_RE.search(after):
+        return True
+    return bool(_WRITE_DESTINATION_MARKER_RE.search(clause_before))
+
+
+def _is_gitignored(candidate: str, repo_root: Path) -> bool:
+    """Return ``True`` when ``git check-ignore`` reports ``candidate`` as
+    ignored by ``repo_root``'s gitignore rules.
+
+    Works on non-existent paths — ``check-ignore`` matches by pathname
+    pattern only, with no filesystem existence check. Any failure
+    (``repo_root`` is not a git repository, the candidate resolves outside
+    the repository, the git binary is missing, a timeout) falls back to
+    ``False`` — "not ignored" — so a broken git invocation degrades to the
+    *narrower* neutral set, not a wider one: a candidate that should
+    escalate keeps escalating rather than being silently suppressed.
+    """
+    result = run_captured(
+        ["git", "check-ignore", "-q", "--", candidate],
+        cwd=repo_root,
+        timeout_seconds=_CHECK_IGNORE_TIMEOUT_SECONDS,
+    )
+    return result.returncode == 0
+
+
+def _split_survivors_and_neutral(issue_body: str, repo_root: Path) -> tuple[list[str], list[str]]:
+    """Partition extracted candidates into survivors and neutral candidates.
+
+    Survivors are the candidates that still count toward the pass/escalate
+    decision. Neutral candidates (gitignored runtime artifacts or
+    evidence/authority citations — see the module docstring) are excluded
+    entirely; :func:`cross_repo_gate` reports them separately via
+    ``CrossRepoGateResult.neutral_paths``.
+    """
+    candidates, stripped = _iter_candidate_matches(issue_body)
+    survivors: list[str] = []
+    neutral: list[str] = []
+    for raw, start, end in candidates:
+        before, after = _paragraph_span(stripped, start, end)
+        if _is_context_neutral(before, after) or _is_gitignored(raw, repo_root):
+            neutral.append(raw)
+        else:
+            survivors.append(raw)
+    return survivors, neutral
+
+
 def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
     """Decide whether an issue should be dispatched or escalated as cross-repo.
 
@@ -307,10 +585,18 @@ def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
     referenced path is missing from ``repo_root`` — the signal that the
     issue's subject code lives in a different repo.
 
-    A single-candidate exception applies: when extraction found exactly one
-    candidate and it is missing, the gate abstains (``passed=True``) unless
-    that candidate is a relative path whose first segment names a directory
-    that actually exists in ``repo_root`` (see
+    Before the pass/escalate decision runs, extracted candidates are split
+    into survivors and neutral candidates (see the module docstring and
+    :func:`_split_survivors_and_neutral`) — a gitignored runtime artifact or
+    an evidence/authority citation is excluded entirely rather than counted
+    as a missing dispatch target. When every candidate is neutral, the gate
+    abstains the same way it would for an issue with no candidates at all.
+    The rules below then apply to the survivors.
+
+    A single-candidate exception applies: when exactly one survivor remains
+    and it is missing, the gate abstains (``passed=True``) unless that
+    candidate is a relative path whose first segment names a directory that
+    actually exists in ``repo_root`` (see
     :func:`_is_repo_shaped_relative_candidate`). One ambiguous fragment
     pulled out of prose (a venv-relative path, a config key, anything that
     merely *looks* path-shaped) is weak evidence of a cross-repo target on
@@ -325,17 +611,36 @@ def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
             referenced_paths=(),
             missing_paths=(),
             reason="no file paths referenced in issue body",
+            neutral_paths=(),
         )
-    missing = tuple(p for p in referenced if not _path_exists_in_repo(p, repo_root))
-    # Block only when EVERY referenced path is absent — the issue's subject
-    # code is not in this repo at all.  If even one referenced path exists,
-    # the worker has something to work on here and the gate passes.
-    if len(missing) < len(referenced):
+    survivors, neutral = _split_survivors_and_neutral(issue_body, repo_root)
+    if not survivors:
+        # Every candidate was neutral (a gitignored runtime artifact or an
+        # evidence/authority citation, see the module docstring) — the same
+        # outcome as no candidates at all, since none of them are evidence
+        # of where the issue's subject code lives.
         return CrossRepoGateResult(
             passed=True,
-            referenced_paths=tuple(referenced),
+            referenced_paths=(),
+            missing_paths=(),
+            reason=(
+                "abstaining: every referenced path was an evidence/authority "
+                "citation or a gitignored runtime artifact, not a dispatch "
+                "target"
+            ),
+            neutral_paths=tuple(neutral),
+        )
+    missing = tuple(p for p in survivors if not _path_exists_in_repo(p, repo_root))
+    # Block only when EVERY surviving path is absent — the issue's subject
+    # code is not in this repo at all.  If even one survivor exists, the
+    # worker has something to work on here and the gate passes.
+    if len(missing) < len(survivors):
+        return CrossRepoGateResult(
+            passed=True,
+            referenced_paths=tuple(survivors),
             missing_paths=missing,
             reason="at least one referenced path exists in the target repo",
+            neutral_paths=tuple(neutral),
         )
     # NOTE: absoluteness is checked via ``_is_absolute_path``, not a bare
     # ``Path(...).is_absolute()`` — the latter is platform-dependent (a
@@ -344,30 +649,32 @@ def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
     # slip through as "relative" and incorrectly abstain. See
     # ``_is_absolute_path`` for the full rationale.
     if (
-        len(referenced) == 1
-        and not _is_absolute_path(referenced[0])
-        and not _is_repo_shaped_relative_candidate(referenced[0], repo_root)
+        len(survivors) == 1
+        and not _is_absolute_path(survivors[0])
+        and not _is_repo_shaped_relative_candidate(survivors[0], repo_root)
     ):
         return CrossRepoGateResult(
             passed=True,
-            referenced_paths=tuple(referenced),
+            referenced_paths=tuple(survivors),
             missing_paths=missing,
             reason=(
                 "single ambiguous candidate "
-                f"({referenced[0]!r}) is not a repo-shaped relative path — "
+                f"({survivors[0]!r}) is not a repo-shaped relative path — "
                 "abstaining rather than escalating on weak evidence"
             ),
+            neutral_paths=tuple(neutral),
         )
-    # Every referenced path is missing — the issue's subject code is not in
+    # Every surviving path is missing — the issue's subject code is not in
     # this repo.  Escalate instead of dispatching a worker that will wander.
     return CrossRepoGateResult(
         passed=False,
-        referenced_paths=tuple(referenced),
+        referenced_paths=tuple(survivors),
         missing_paths=missing,
         reason=(
             f"cross_repo_target: all {len(missing)} referenced file path(s) "
             f"are absent from the target repo ({repo_root})"
         ),
+        neutral_paths=tuple(neutral),
     )
 
 

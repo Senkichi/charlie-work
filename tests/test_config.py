@@ -251,6 +251,38 @@ def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
     assert config.review_dispatch.max_local_review_processes == 4
 
 
+def test_load_config_review_dispatch_file_size_cap_lines_override(tmp_path: Path) -> None:
+    """Issue #1445: ``review_dispatch.file_size_cap_lines`` is read from YAML
+    via the ``_RD_INT_KEYS`` wiring in ``build_config_from_data`` -- the
+    ``review_dispatch:`` section (``ReviewDispatchConfig``), not the unrelated
+    ``review:`` section (``ReviewConfig``)."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  file_size_cap_lines: 1234
+""",
+    )
+    config = load_config(config_file)
+    assert config.review_dispatch.file_size_cap_lines == 1234
+
+
+def test_load_config_review_dispatch_file_size_cap_lines_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    """Issue #1445: ``_RD_INT_KEYS`` validation rejects a non-int
+    ``file_size_cap_lines`` in the ``review_dispatch:`` section."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  file_size_cap_lines: "not-an-int"
+""",
+    )
+    with pytest.raises(ConfigError, match="review_dispatch.*file_size_cap_lines.*must be an int"):
+        load_config(config_file)
+
+
 def test_load_config_quota_probe_defaults() -> None:
     """QuotaProbeConfig defaults: enabled, flat 15-minute interval, Haiku."""
     config = load_config(Path("nonexistent.yaml"))
@@ -1825,3 +1857,202 @@ def test_build_config_from_data_require_worker_github_token_rejects_non_bool() -
     """Issue #1001: dispatch.require_worker_github_token must be a bool."""
     with pytest.raises(ConfigError, match="require_worker_github_token.*must be a bool"):
         build_config_from_data({"dispatch": {"require_worker_github_token": "true"}})
+
+
+# ---------------------------------------------------------------------------
+# Issue #1383: auto_merge.infra_blocked validation error paths.
+#
+# Mirrors the per-field rejection convention established for every other
+# auto_merge / review sub-section (e.g. stale_checks_*): unknown key,
+# wrong type per field, bool-for-int rejection, and negative-value
+# rejection. The happy path (YAML parse + round-trip) is covered in
+# test_charlie_work.py::test_infra_blocked_config_parses_from_yaml.
+# ---------------------------------------------------------------------------
+
+
+_IB_HEADER = "auto_merge:\n  required_checks: [Tests passed]\n  infra_blocked:\n"
+
+
+def test_load_config_infra_blocked_defaults_when_absent(tmp_path: Path) -> None:
+    """An absent infra_blocked section yields InfraBlockedConfig's documented
+    defaults -- no silent zero/None, matching the sibling
+    stale_checks default-fallback shape."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        "auto_merge:\n  required_checks: [Tests passed]\n",
+    )
+    config = load_config(config_file)
+    cfg = config.auto_merge.infra_blocked
+    assert cfg.enabled is True
+    assert cfg.instant_fail_seconds == 10
+    assert cfg.persistence_passes == 3
+    assert cfg.escalation_window_minutes == 60
+    assert cfg.annotation_patterns == (
+        "the job was not started",
+        "actions budget is preventing further use",
+        "no runner matching",
+        "usage limit",
+    )
+
+
+def test_load_config_infra_blocked_rejects_non_mapping(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        "auto_merge:\n  required_checks: [Tests passed]\n  infra_blocked: not-a-map\n",
+    )
+    with pytest.raises(ConfigError, match="infra_blocked.*must be a mapping"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_rejects_unknown_key(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    bogus_key: 1\n",
+    )
+    with pytest.raises(ConfigError, match="infra_blocked.*has unknown key"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_annotation_patterns_rejects_non_list(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    annotation_patterns: billing-exhausted\n",
+    )
+    with pytest.raises(ConfigError, match="annotation_patterns.*must be a list of strings"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_instant_fail_seconds_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    instant_fail_seconds: ten\n",
+    )
+    with pytest.raises(ConfigError, match="instant_fail_seconds.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_instant_fail_seconds_rejects_bool(
+    tmp_path: Path,
+) -> None:
+    """YAML boolean true is not a valid integer count (matches the
+    stale_checks_max_retriggers bool-rejection convention)."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    instant_fail_seconds: true\n",
+    )
+    with pytest.raises(ConfigError, match="instant_fail_seconds.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_instant_fail_seconds_rejects_negative(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    instant_fail_seconds: -1\n",
+    )
+    with pytest.raises(ConfigError, match="instant_fail_seconds.*must be >= 0"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_persistence_passes_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    persistence_passes: three\n",
+    )
+    with pytest.raises(ConfigError, match="persistence_passes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_persistence_passes_rejects_bool(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    persistence_passes: false\n",
+    )
+    with pytest.raises(ConfigError, match="persistence_passes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_persistence_passes_rejects_negative(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    persistence_passes: -2\n",
+    )
+    with pytest.raises(ConfigError, match="persistence_passes.*must be >= 0"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_escalation_window_minutes_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    escalation_window_minutes: 1h\n",
+    )
+    with pytest.raises(ConfigError, match="escalation_window_minutes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_escalation_window_minutes_rejects_bool(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    escalation_window_minutes: true\n",
+    )
+    with pytest.raises(ConfigError, match="escalation_window_minutes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_escalation_window_minutes_rejects_negative(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    escalation_window_minutes: -5\n",
+    )
+    with pytest.raises(ConfigError, match="escalation_window_minutes.*must be >= 0"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_enabled_rejects_non_bool(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    enabled: yes-please\n",
+    )
+    with pytest.raises(ConfigError, match="infra_blocked.enabled.*must be a bool"):
+        load_config(config_file)
+
+
+def test_provider_suspended_is_deterministic_escalation_failure_kind() -> None:
+    """Issue #1342: ``provider_suspended`` must sit in
+    DETERMINISTIC_ESCALATION_FAILURE_KINDS so a suspended provider account
+    escalates to an operator on the first occurrence instead of burning the
+    auto-redispatch cap on a deterministic external billing failure."""
+    from charlie_work.config import DETERMINISTIC_ESCALATION_FAILURE_KINDS
+
+    assert "provider_suspended" in DETERMINISTIC_ESCALATION_FAILURE_KINDS

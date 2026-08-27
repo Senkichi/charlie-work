@@ -103,6 +103,73 @@ _PROVIDER_AUTH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Provider account suspension / insufficient-balance responses (issue #1342).
+# Matched against the log tail of api-kind sessions only — a suspended provider
+# account (e.g. Moonshot "Error: suspended due to insufficient balance, please
+# recharge your account") is a TERMINAL billing failure that will not self-heal
+# in minutes, so it must NOT enter the rate-limit backoff loop. It is classified
+# as ``provider_suspended`` with NO cooldown (terminal), and
+# ``provider_suspended`` sits in ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS``
+# so the issue escalates to an operator on the first occurrence instead of
+# burning the redispatch cap.
+#
+# Structural anchor (PR #1426 round-2 review): the billing phrase alone is NOT
+# enough — it must co-occur on the SAME log line with a structural API-error
+# signal, enforced by ``_provider_suspension_in_tail``. The anchor is either an
+# HTTP 402 (Payment Required) status code (word-boundary, like the 401/403 auth
+# pattern) or a CLI error-rendering line prefix (``Error:`` / ``API Error:``).
+# Without this anchor the phrase regex matches the suspension trigger when it
+# appears only as quoted or reviewed prose — e.g. a worker reviewing this very
+# fix whose log contains the trigger phrase inside a code string or prose
+# sentence — and Signal 2.5 in ``classify_worker_health`` then kills that live
+# worker as DEAD (self-inflicted). The anchor cannot be a bare prose phrase:
+# 402 is a numeric token that does not appear in prose about the suspension, and
+# ``Error:``/``API Error:`` is the CLI's structured error-rendering marker, not a
+# mid-sentence quote. This is distinct from the provider-auth pattern
+# (401/403/invalid-key — a credential problem) and the quota-exhaustion pattern
+# ("usage limit" — a usage-ceiling problem).
+_PROVIDER_SUSPENDED_PHRASE = re.compile(
+    r"insufficient\s+(?:balance|funds|credit)"
+    r"|account\s+(?:is\s+)?suspended"
+    r"|suspended\s+due\s+to\s+(?:insufficient\s+balance|billing|payment|unpaid)"
+    r"|recharge\s+your\s+account"
+    r"|please\s+recharge",
+    re.IGNORECASE,
+)
+# The structural API-error signal that must co-occur on the same log line as a
+# billing phrase (see ``_provider_suspension_in_tail``). The ``Error:`` /
+# ``API Error:`` prefix is anchored to the START of the line (after optional
+# whitespace) because that is the CLI's error-rendering marker — a code string
+# or prose sentence that merely quotes ``Error: suspended ...`` (e.g. a worker
+# catting this PR's own test fixtures) does not start with ``Error:`` and so is
+# not treated as a real API error. HTTP 402 (Payment Required) is matched
+# word-boundary anywhere on the line, mirroring the 401/403 auth pattern.
+_PROVIDER_SUSPENDED_ANCHOR = re.compile(
+    r"^\s*(?:api\s+)?error\s*:|\b402\b",
+    re.IGNORECASE,
+)
+
+
+def _provider_suspension_in_tail(tail: str) -> bool:
+    """Return True if the log tail contains a structurally-anchored provider
+    account-suspension signature (issue #1342).
+
+    The billing phrase (``_PROVIDER_SUSPENDED_PHRASE``) must co-occur on the
+    SAME log line with a structural API-error signal
+    (``_PROVIDER_SUSPENDED_ANCHOR`` — HTTP 402 or a CLI ``Error:``/``API
+    Error:`` prefix). The phrase alone is not enough: a worker that merely
+    quotes or reviews the suspension trigger (e.g. a session reviewing this
+    very fix) would otherwise be misclassified — and, in
+    ``classify_worker_health``'s Signal 2.5, killed as DEAD mid-session.
+    Requiring the anchor on the same line makes the phrase's surrounding
+    prose/code context a non-match.
+    """
+    for line in tail.splitlines():
+        if _PROVIDER_SUSPENDED_PHRASE.search(line) and _PROVIDER_SUSPENDED_ANCHOR.search(line):
+            return True
+    return False
+
+
 # Default cooldown durations when we can't parse a specific reset time
 _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
 _DEFAULT_QUOTA_COOLDOWN_HOURS = 24
@@ -528,8 +595,10 @@ def _classify_session_failure(
     """Classify a session failure by matching the log tail against provider throttle signatures.
 
     Returns a tuple of (failure_kind, throttled_until_iso):
-    - failure_kind: "rate_limited" | "quota_exhausted" | "provider_auth" | None
-    - throttled_until_iso: ISO timestamp when the cooldown ends, or None if not applicable
+    - failure_kind: "provider_suspended" | "rate_limited" | "quota_exhausted" |
+      "provider_auth" | None
+    - throttled_until_iso: ISO timestamp when the cooldown ends, or None if not
+      applicable (None for ``provider_suspended`` — terminal, no cooldown)
 
     This is called after a session exits to detect provider throttling and set a cool-down window.
 
@@ -562,6 +631,15 @@ def _classify_session_failure(
 
     # Check the last 2KB of the log (where error messages appear)
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+
+    # Provider account-suspension classification (api only, issue #1342).
+    # Checked BEFORE auth/quota/throttle so a suspended account is never
+    # retried as a transient rate-limit. A suspended account is a terminal
+    # billing failure: it returns ``provider_suspended`` with NO cooldown
+    # (the account will not self-heal) and escalates to an operator on the
+    # first occurrence via ``DETERMINISTIC_ESCALATION_FAILURE_KINDS``.
+    if adapter_kind == "api" and _provider_suspension_in_tail(tail):
+        return "provider_suspended", None
 
     # Provider-auth classification (api only, issue #484). Checked before
     # quota/throttle so an auth failure is never relabeled as a generic
@@ -922,6 +1000,7 @@ def launch_claude_worker(
     provider: str = "",
     resolved_review_effort: str | None = None,
     model_override: str | None = None,
+    max_turns_override: int | None = None,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree/checkout and launch a headless Claude Code
     worker (or reviewer) in it.
@@ -983,6 +1062,16 @@ def launch_claude_worker(
     claude_code section's. When omitted (the default), the claude_code
     section's model is pinned exactly as before — the single enforcement
     point stays ``_apply_model_pin``, never an ``adapter_kind`` branch.
+
+    ``max_turns_override``, when provided on a ``review=True`` launch, is
+    pinned as the ``--max-turns`` value instead of
+    ``resolved_config.review_dispatch.review_max_turns``. Issue #1439: the
+    dispatch path resolves a structure-aware cap (raised for diffs touching
+    large files, escalated one step per consecutive turn-limit miss) and
+    passes it here so the reviewer runs with that budget rather than the flat
+    config default. When omitted (``None``), the flat config default is used
+    exactly as before -- preserving every direct caller and unit test that
+    does not opt into the structure-aware cap.
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
@@ -1046,9 +1135,17 @@ def launch_claude_worker(
     if review:
         # Cap agentic turns for reviewer sessions to prevent unbounded
         # codebase exploration and runaway token spend. 0 = unlimited.
-        command_template = _apply_max_turns_pin(
-            command_template, resolved_config.review_dispatch.review_max_turns
+        # Issue #1439: ``max_turns_override`` (resolved by the dispatch path
+        # from the packet's structure multiplier + the per-PR turn-limit miss
+        # streak) takes precedence over the flat config default so a PR
+        # threading a monolith gets a raised budget. ``None`` preserves the
+        # pre-#1439 flat ``review_max_turns`` behaviour for direct callers.
+        _review_max_turns = (
+            max_turns_override
+            if max_turns_override is not None
+            else resolved_config.review_dispatch.review_max_turns
         )
+        command_template = _apply_max_turns_pin(command_template, _review_max_turns)
 
     try:
         if review:
@@ -1379,7 +1476,9 @@ def launch_claude_worker(
     )
 
     try:
-        write_worktree_marker(worktree.path, process.pid, session_id)
+        write_worktree_marker(
+            worktree.path, process.pid, session_id, process_start_time=process_start_time
+        )
     except OSError:
         # Best-effort marker write must not derail a successful launch.
         pass

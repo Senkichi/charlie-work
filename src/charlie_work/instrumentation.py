@@ -149,6 +149,10 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # -----------------------------------------------------------------
         # error-level kinds: conditions that ended a lane or lost work
         # -----------------------------------------------------------------
+        # Issue #1342: a provider account suspension is a terminal billing
+        # failure — the operator must learn about it in minutes, not after the
+        # redispatch cap drains. Error, like the other *_escalated kinds.
+        "api_worker_provider_suspended": "error",
         "cross_family_verdict_abandoned": "error",
         # The head-SHA guard could not adjudicate, so no verdict is recorded on
         # this pass. Since #1081 an unusable report is regenerated (bounded per
@@ -170,6 +174,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "fleet_pass_config_error": "error",
         "github_error": "error",
         "github_not_found_error": "error",
+        # Issue #1383: fleet-wide infra block (Actions budget/runner outage)
+        # has persisted across the configured pass threshold -- one
+        # operator-facing escalation per window, not per PR. Terminal for
+        # the affected PRs' lane this pass -> error, parallel to
+        # infra_rerun_escalated.
+        "infra_blocked_escalated": "error",
         "infra_rerun_escalated": "error",
         "intake_failed": "error",
         "janitor_rework_cycle_failed": "error",
@@ -208,6 +218,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "session_salvaged": "error",
         "session_stalled": "error",
         "spec_review_failed": "error",
+        # Issue #1453: a worker deliberately concluded the task is structurally
+        # impossible and declared a ``blocked`` outcome. Terminal for the issue
+        # -- escalated to the operator queue with zero redispatches -> error,
+        # parallel to session_failed_escalated / orphan_sweep_redispatch_escalated.
+        "worker_declared_blocked": "error",
         # Issue #1274 (W17): stale_checks_retrigger_attempts reached
         # stale_checks_max_retriggers and the check suite is still missing --
         # no code-fix rework path exists for a run GitHub never created, so
@@ -260,6 +275,15 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "cross_family_regen_not_reached": "warning",
         "dead_dispatched_worker_reaped": "warning",
         "deescalation_cap_exhausted": "warning",
+        # Issue #1383: a required check failed due to a fleet-wide infra
+        # condition (Actions budget/runner outage) rather than the PR's
+        # code. Warning, not error: the PR is held without rework (not
+        # escalated), and the operator-facing escalation is the separate
+        # ``infra_blocked_escalated`` error kind, emitted once per window
+        # only when the condition persists. Consumed by heartbeat_check.py's
+        # ``check_infra_blocked_events`` (AC4) and by the cross-pass
+        # escalation tracker in ``_loop_impl``.
+        "check_infra_blocked": "warning",
         # Issue #1000: a path:line citation in a dispatch-ready issue no longer
         # matches the working tree (file renamed/deleted, line out of range, or
         # blank). Warning, not error: dispatch is not gated on drift -- the flag
@@ -286,6 +310,16 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "infra_rerun_failed": "warning",
         "janitor_rework_stalled": "warning",
         "main_ci_reclaim_failed": "warning",
+        # Issue #1314 item 3: the operator-queue depth gauge. Warning, not
+        # error: a deep queue is a growing backlog of mechanical escalations
+        # the de-escalation sweep has not yet cleared, not a fault that ended
+        # a lane or lost work. The event fires when depth exceeds the
+        # configured ``operator_queue_depth_threshold``; a chronically deep
+        # queue fires every pass the gauge is due, which is why the kind is
+        # also in ``EXPECTED_OPERATIONAL_KINDS`` -- ``heartbeat_check.py``
+        # buckets it into a summarized count instead of interleaving it with
+        # flat detailed listings of genuinely rare warnings.
+        "operator_queue_depth": "warning",
         # cw#1263: the orchestrator's own salvage-PR-body builders had to
         # rewrite the ``Closes #N`` line before handing the body to
         # ``gh pr create``. Warning, not error: the rewrite happens before
@@ -349,6 +383,15 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # emitted from the same call site with an explicit ``level="warning"``.
         "review_verdict_reconcile_failed": "warning",
         "rework_issue_fetch_skipped": "warning",
+        # Issue #1239: a dead rework worker's stranded commits were
+        # salvage-pushed (the worker completed the rework but died before
+        # ``git push``), so the death is NOT counted toward the death-loop
+        # cap and the issue is routed to review instead of escalated.
+        # Warning, not error: no work was lost -- the push recovered the
+        # completed commit and the issue continues to review. Sibling to
+        # ``dead_dispatched_worker_reaped`` (a reaped death) but with the
+        # recovery made explicit.
+        "rework_stranded_commits_salvaged": "warning",
         "runner_allocation_refused": "warning",
         "runner_allocation_skipped": "warning",
         "runner_capacity_starved": "warning",
@@ -371,6 +414,41 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "venv_pth_mismatch": "warning",
         "venv_pth_repaired": "warning",
         "worktree_foreign_writer": "warning",
+        # Issue #1444: the module-map section could not be derived from the
+        # live tree at packet build time (unparseable file, missing package
+        # dir, I/O error). Warning, not error: the dispatch proceeds with an
+        # omitted section -- the worker loses placement steering for this one
+        # packet, but no work is lost and the next packet rebuilds the map
+        # against the then-current tree. The consumer is heartbeat_check.py's
+        # check_warning_events, which reads every level='warning' row from
+        # events.db (derived from the level column, never a hardcoded kind
+        # list), so this kind is visible to the operator the moment it fires.
+        "worker_module_map_failed": "warning",
+        # Issue #1460: the attachment-budget dispatch clause could not be
+        # built (`.attachment-budgets.json` present but fails structural
+        # validation via `baseline.load`). Warning, not error: fail-soft
+        # mirrors `worker_module_map_failed` -- the dispatch proceeds with an
+        # omitted clause, never a dispatch failure.
+        "worker_attachment_budget_failed": "warning",
+        # Issue #1393: a pre-launch environment block (e.g.
+        # worktree_foreign_writer) prevented a dispatch from starting. Warning,
+        # not error: the issue is not terminal — the cap may not yet be
+        # exhausted, and the operator can resolve the conflict (e.g. remove a
+        # stale checkout) to unblock the next pass. The escalation when the
+        # cap IS exhausted goes through session_failed_escalated (error).
+        "dispatch_blocked_environment": "warning",
+        "rework_dispatch_blocked_environment": "warning",
+        # Issue #1423: a foreign writer that was alive but idle past the stall
+        # threshold was reaped (killed + marker cleaned) instead of blocking
+        # dispatch or escalating to a human. Warning, not error: the reap is a
+        # recovery, not a fault — the zombie is gone and dispatch proceeds. The
+        # sibling ``dispatch_blocked_environment_reaped`` /
+        # ``rework_dispatch_blocked_environment_reaped`` record the same reap at
+        # the blocked-environment cap exhaustion point (counter reset + retry
+        # instead of escalation).
+        "foreign_writer_reaped": "warning",
+        "dispatch_blocked_environment_reaped": "warning",
+        "rework_dispatch_blocked_environment_reaped": "warning",
         # Issue #849: rescue capture preserves work before a reset. Warning
         # level because it means a worktree had uncommitted work that was
         # about to be lost — the capture succeeded, but the condition that
@@ -387,6 +465,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # the intended follow-up mechanism working as designed, mirroring
         # flake_rerun_triggered / infra_rerun_triggered below.
         "ci_retriggered_stale_checks": "info",
+        # Issue #1451: the ci_run_never_created remediation declined to
+        # close/reopen a CONFLICTING PR (GitHub cannot build refs/pull/N/merge
+        # while conflicted, so no pull_request workflow run can be created for
+        # ANY event) and routed to the existing merge-conflict rework path
+        # instead. Info, not warning: this is the chooser correctly
+        # discriminating, mirroring ci_retriggered_stale_checks' level.
+        "ci_retrigger_skipped_conflicting": "info",
         "ci_run_never_created": "info",
         "closed_unmerged_pr_state_converged": "info",
         "containment_check": "info",

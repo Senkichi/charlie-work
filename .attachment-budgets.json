@@ -1,0 +1,232 @@
+{
+ "entries": [
+  {
+   "boundary": 6.0,
+   "bumps": [],
+   "file": "src/charlie_work/github.py",
+   "identity": "GitHub",
+   "kind": "class",
+   "member_count": 53
+  },
+  {
+   "boundary": 6.0,
+   "bumps": [],
+   "file": "src/charlie_work/wedge_watchdog.py",
+   "identity": "WedgeWatchdog",
+   "kind": "class",
+   "member_count": 9
+  },
+  {
+   "boundary": 6.0,
+   "bumps": [],
+   "file": "src/charlie_work/workflow.py",
+   "identity": "OrchestratorApp",
+   "kind": "class",
+   "member_count": 134
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_api_budget.py",
+   "identity": "tests/test_api_budget.py::module",
+   "kind": "test_module",
+   "member_count": 55
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_charlie_work.py",
+   "identity": "tests/test_charlie_work.py::module",
+   "kind": "test_module",
+   "member_count": 1059
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_checks.py",
+   "identity": "tests/test_checks.py::module",
+   "kind": "test_module",
+   "member_count": 47
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_claude_code_adapter.py",
+   "identity": "tests/test_claude_code_adapter.py::module",
+   "kind": "test_module",
+   "member_count": 130
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_cli.py",
+   "identity": "tests/test_cli.py::module",
+   "kind": "test_module",
+   "member_count": 105
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_config.py",
+   "identity": "tests/test_config.py::module",
+   "kind": "test_module",
+   "member_count": 118
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_devin_shell.py",
+   "identity": "tests/test_devin_shell.py::module",
+   "kind": "test_module",
+   "member_count": 75
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_doctor.py",
+   "identity": "tests/test_doctor.py::module",
+   "kind": "test_module",
+   "member_count": 82
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_fleet_dispatch.py",
+   "identity": "tests/test_fleet_dispatch.py::module",
+   "kind": "test_module",
+   "member_count": 166
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_github.py",
+   "identity": "tests/test_github.py::module",
+   "kind": "test_module",
+   "member_count": 55
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_heartbeat_check.py",
+   "identity": "tests/test_heartbeat_check.py::module",
+   "kind": "test_module",
+   "member_count": 152
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_instrumentation.py",
+   "identity": "tests/test_instrumentation.py::module",
+   "kind": "test_module",
+   "member_count": 58
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_janitor.py",
+   "identity": "tests/test_janitor.py::module",
+   "kind": "test_module",
+   "member_count": 159
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_merge_preflight_hook.py",
+   "identity": "tests/test_merge_preflight_hook.py::module",
+   "kind": "test_module",
+   "member_count": 54
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_post_mortem.py",
+   "identity": "tests/test_post_mortem.py::module",
+   "kind": "test_module",
+   "member_count": 59
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_process_utils.py",
+   "identity": "tests/test_process_utils.py::module",
+   "kind": "test_module",
+   "member_count": 47
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_prompt_sections.py",
+   "identity": "tests/test_prompt_sections.py::module",
+   "kind": "test_module",
+   "member_count": 59
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_reconcile.py",
+   "identity": "tests/test_reconcile.py::module",
+   "kind": "test_module",
+   "member_count": 135
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_routing.py",
+   "identity": "tests/test_routing.py::module",
+   "kind": "test_module",
+   "member_count": 42
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_state_dir_migration.py",
+   "identity": "tests/test_state_dir_migration.py::module",
+   "kind": "test_module",
+   "member_count": 60
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_supervise.py",
+   "identity": "tests/test_supervise.py::module",
+   "kind": "test_module",
+   "member_count": 99
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_worker.py",
+   "identity": "tests/test_worker.py::module",
+   "kind": "test_module",
+   "member_count": 48
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_worker_health.py",
+   "identity": "tests/test_worker_health.py::module",
+   "kind": "test_module",
+   "member_count": 55
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_worker_stop_gate.py",
+   "identity": "tests/test_worker_stop_gate.py::module",
+   "kind": "test_module",
+   "member_count": 49
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_worktree.py",
+   "identity": "tests/test_worktree.py::module",
+   "kind": "test_module",
+   "member_count": 222
+  }
+ ],
+ "floor": 4,
+ "generated_at": "2026-08-25T06:12:35.790112+00:00",
+ "generated_by": "charlie_work.attachment_contracts 0.1.0",
+ "version": 1
+}

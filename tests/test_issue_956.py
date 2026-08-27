@@ -6,6 +6,7 @@ that call it (``_attempt_salvage`` and ``_open_pr_for_orphaned_branch``).
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -274,3 +275,50 @@ def test_attempt_salvage_records_label_write_failure(
     events = [e for e in state["events"] if e["kind"] == "session_salvaged"]
     assert events[0]["payload"]["label_write_ok"] is False
     assert events[0]["payload"]["label_error"] is not None
+
+
+def test_attempt_salvage_dry_run_threads_to_push_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1326: a dry-run WriteGate threads ``dry_run=True`` into
+    ``push_branch``, so no real ``git push`` is issued. The push_branch mock
+    captures the kwarg and asserts it was passed.
+    """
+    from charlie_work.workflow import _attempt_salvage
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"events": []}), encoding="utf-8")
+    config = OrchestratorConfig()
+    active_labels, issue_labels = _salvage_labels(config)
+    gh = _SalvageTestGitHub(repo_root=tmp_path)
+
+    push_calls: list[dict[str, Any]] = []
+
+    def fake_push_branch(*args, **kwargs):
+        push_calls.append({"args": args, "kwargs": kwargs})
+        return (True, None)
+
+    monkeypatch.setattr("charlie_work.workflow.push_branch", fake_push_branch)
+
+    salvaged, error = _attempt_salvage(
+        gh=gh,
+        config=config,
+        repo_root=tmp_path,
+        worktree_path=tmp_path,
+        branch="agent/issue-1326",
+        base_ref="main",
+        issue_number=1326,
+        active_labels=active_labels,
+        issue_labels=issue_labels,
+        state_file=state_file,
+        failure_kind="unpublished_work",
+        issue_title="Salvage push dry-run gate",
+        write_gate=_wg(state_file, dry_run=True),
+    )
+
+    assert len(push_calls) == 1
+    assert push_calls[0]["kwargs"].get("dry_run") is True
+    # Under dry-run, push_branch returns (True, None) and _attempt_salvage
+    # proceeds to _open_salvage_pr, whose gh.pr_create is gated at the
+    # GitHub client sink level (returns 0). The salvage itself is "ok".
+    assert salvaged is True
