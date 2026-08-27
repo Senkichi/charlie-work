@@ -483,6 +483,40 @@ def _windowed_blocked_environment_at(
     return result
 
 
+def _windowed_foreign_writer_reaps(
+    entry: dict[str, Any],
+    *,
+    window_minutes: int,
+) -> list[str]:
+    """Return foreign-writer reap timestamps within the window.
+
+    Issue #1423: parallel to ``_windowed_blocked_environment_at`` but reads
+    ``entry["foreign_writer_reaps"]`` -- the list of timestamps recorded each
+    time a ``worktree_foreign_writer`` block was auto-reaped at the
+    blocked-environment cap exhaustion point (instead of escalating). Each
+    successful reap resets ``blocked_environment_at`` to ``[]``, so without
+    this separate cross-pass counter a persistently-blocked worktree would
+    loop forever between reap and redispatch. The cap is enforced by the
+    caller against ``watchdog.max_foreign_writer_reaps``; when the windowed
+    count is at/over the cap, the caller escalates instead of reaping.
+    """
+    raw = entry.get("foreign_writer_reaps")
+    if not isinstance(raw, list):
+        return []
+    now = datetime.now(UTC)
+    window_start = now - timedelta(minutes=window_minutes)
+    result: list[str] = []
+    for t in raw:
+        if not isinstance(t, str):
+            continue
+        try:
+            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start:
+                result.append(t)
+        except (ValueError, AttributeError):
+            continue
+    return result
+
+
 def _is_review_dispatchable(
     state: dict[str, Any],
     pr_number: int,
@@ -490,6 +524,7 @@ def _is_review_dispatchable(
     *,
     max_attempts: int = 3,
     now: datetime | None = None,
+    max_consecutive_turn_limit_misses: int = 0,
 ) -> bool:
     """Return True if ``pr_number`` is free to receive a new reviewer dispatch.
 
@@ -499,6 +534,9 @@ def _is_review_dispatchable(
       has elapsed, allowing retry.
     - A dispatched reviewer is no longer alive and its claim has gone stale.
     - The per-PR dispatch attempt count has not reached ``max_attempts``.
+    - The per-PR consecutive turn-limit miss streak has not reached
+      ``max_consecutive_turn_limit_misses`` (issue #1439). 0 disables this
+      backstop.
 
     This reuses ``is_claim_stale`` for the timeout and ``_reviewer_pid_alive``
     for liveness, avoiding a parallel mechanism.
@@ -520,6 +558,16 @@ def _is_review_dispatchable(
     attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
     if attempt_count >= max_attempts:
         return False
+
+    # Issue #1439: turn-limit miss backstop. A PR that has hit the turn limit
+    # ``max_consecutive_turn_limit_misses`` times in a row (with the cap
+    # already maxed at ``turn_cap_max_multiplier``) is not going to converge
+    # on another identical session -- escalate instead of redispatching. The
+    # caller escalates; here we just block further dispatch. 0 disables.
+    if max_consecutive_turn_limit_misses > 0:
+        miss_streak = int(pr_state.get("review_turn_limit_miss_streak", 0))
+        if miss_streak >= max_consecutive_turn_limit_misses:
+            return False
 
     if status is None or status == "review_dispatch_completed":
         return True
@@ -590,6 +638,7 @@ def _select_review_dispatch_candidates(
     ``_partition_rescue_candidates`` before calling this helper.
     """
     max_attempts = review_dispatch_config.max_review_dispatch_attempts
+    max_turn_limit_misses = review_dispatch_config.max_consecutive_turn_limit_misses
     escalated_skipped: list[int] = []
     merge_conflict_routed: list[dict[str, Any]] = []
     for c in candidates:
@@ -622,7 +671,14 @@ def _select_review_dispatch_candidates(
         for c in candidates
         if c["pr"] not in escalated_skipped_set
         and c["pr"] not in merge_conflict_pr_set
-        and _is_review_dispatchable(state, c["pr"], c, max_attempts=max_attempts, now=resolved_now)
+        and _is_review_dispatchable(
+            state,
+            c["pr"],
+            c,
+            max_attempts=max_attempts,
+            now=resolved_now,
+            max_consecutive_turn_limit_misses=max_turn_limit_misses,
+        )
     ]
     max_local = review_dispatch_config.max_local_review_processes
     max_concurrent = review_dispatch_config.max_concurrent_reviews

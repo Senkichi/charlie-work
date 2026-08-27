@@ -180,9 +180,7 @@ LABEL_LIST_FIELDS = "name"
 # like statusCheckRollup (see the PR_CHECKS_FIELDS note above and issue #361);
 # safe to include unconditionally. Needed by detect_aviator_stale_blocked's
 # commit_check_runs(sha) lookup.
-RECONCILE_PR_FIELDS = (
-    "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository,headRefOid"
-)
+RECONCILE_PR_FIELDS = "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository,headRefOid,closedAt"
 RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels,state"
 RUN_LIST_FIELDS = "databaseId,status,createdAt,headBranch"
 
@@ -2557,15 +2555,108 @@ _BLOCKER_PATTERNS = [
 _CLAUSE_BOUNDARY_CHARS = ".!?\n"
 _ISSUE_REF = re.compile(r"#\d+")
 
+# Markdown backtick code span: an opening run of backticks, content, and a
+# closing run of the SAME length. Capturing group 2 is the span content.
+_CODE_SPAN_RE = re.compile(r"(`+)(.+?)(\1)", flags=re.DOTALL)
+# Balanced straight-double-quote span. Group 1 is the quoted content.
+_DOUBLE_QUOTE_SPAN_RE = re.compile(r'"([^"]*)"')
+# Opening fence of a fenced code block: a line beginning with a run of 3+
+# backticks or tildes (optionally followed by an info string). CommonMark
+# allows up to 3 leading spaces; we tolerate any leading whitespace.
+_FENCE_OPEN_RE = re.compile(r"^[ \t]*([`~]{3,})")
 
-def _clause_preceding(text: str, match_start: int) -> str:
-    """Return the text of the sentence/line leading up to a match.
 
-    Bounded by the closest preceding sentence terminator (".", "!", "?") or
-    line break, so each bullet/sentence is judged independently.
+def _inside_code_span(text: str, start: int, end: int) -> bool:
+    """True if the [start, end) range falls inside a Markdown backtick code span."""
+    for m in _CODE_SPAN_RE.finditer(text):
+        if m.start(2) <= start and end <= m.end(2):
+            return True
+    return False
+
+
+def _inside_quoted_span(text: str, start: int, end: int) -> bool:
+    """True if the [start, end) range falls inside a straight-double-quote span."""
+    for m in _DOUBLE_QUOTE_SPAN_RE.finditer(text):
+        if m.start(1) <= start and end <= m.end(1):
+            return True
+    return False
+
+
+def _fenced_block_ranges(text: str) -> list[tuple[int, int]]:
+    """Return the ``(start, end)`` char-offset ranges of fenced code blocks.
+
+    A fenced block starts with a line beginning with a run of 3+ backticks or
+    tildes (optionally followed by an info string, e.g. ```` ```python ````)
+    and ends at the next line beginning with a closing fence of the same
+    character and at least the same length. An unclosed fence runs to the end
+    of the text. Each returned range spans from the start of the opening fence
+    line up to (excluding) the closing fence line, so any content line between
+    the fences is contained in the range.
     """
-    boundary = max(text.rfind(ch, 0, match_start) for ch in _CLAUSE_BOUNDARY_CHARS)
-    return text[boundary + 1 : match_start]
+    ranges: list[tuple[int, int]] = []
+    pos = 0
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    block_start = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip(" \t")
+        if not in_fence:
+            m = _FENCE_OPEN_RE.match(stripped)
+            if m:
+                fence_char = m.group(1)[0]
+                fence_len = len(m.group(1))
+                block_start = pos
+                in_fence = True
+        else:
+            close_m = re.match(
+                rf"{re.escape(fence_char)}{{{fence_len},}}[ \t]*$",
+                stripped.rstrip("\r\n"),
+            )
+            if close_m:
+                # Range covers opening fence line through last content line;
+                # the closing fence line itself is excluded.
+                ranges.append((block_start, pos))
+                in_fence = False
+                fence_char = ""
+                fence_len = 0
+        pos += len(line)
+    if in_fence:
+        # Unclosed fence runs to end of text.
+        ranges.append((block_start, len(text)))
+    return ranges
+
+
+def _inside_fenced_block(text: str, start: int, end: int) -> bool:
+    """True if the ``[start, end)`` range falls inside a fenced code block.
+
+    Unlike inline code spans, fenced blocks are multi-line Markdown constructs
+    whose opening and closing fence markers sit on separate lines from the
+    content. Clause bounds (which break on newlines) therefore cannot detect
+    them -- the content line is its own clause with no fence markers in it --
+    so this check runs against the full document with absolute offsets, not
+    the clause substring.
+    """
+    for r_start, r_end in _fenced_block_ranges(text):
+        if r_start <= start and end <= r_end:
+            return True
+    return False
+
+
+def _clause_bounds(text: str, match_start: int, match_end: int) -> tuple[int, int]:
+    """Return the (start, end) offsets of the sentence/line containing a match.
+
+    Bounded by the closest preceding AND following sentence terminator
+    (".", "!", "?") or line break, so each bullet/sentence is judged
+    independently. The boundary characters themselves are excluded from the
+    returned range.
+    """
+    start_boundary = max(text.rfind(ch, 0, match_start) for ch in _CLAUSE_BOUNDARY_CHARS)
+    start = start_boundary + 1 if start_boundary != -1 else 0
+    end_candidates = [text.find(ch, match_end) for ch in _CLAUSE_BOUNDARY_CHARS]
+    end_candidates = [p for p in end_candidates if p != -1]
+    end = min(end_candidates) if end_candidates else len(text)
+    return start, end
 
 
 def is_infrastructure_failure(job: dict[str, Any], annotations: list[dict[str, Any]]) -> bool:
@@ -2578,6 +2669,15 @@ def is_infrastructure_failure(job: dict[str, Any], annotations: list[dict[str, A
     This is used to reclassify FAILURE-state checks as infra_failed instead of
     code failures, preventing rework worker dispatch against untested code.
 
+    Issue #1383: the detection logic now lives in
+    :func:`charlie_work.checks.is_infra_blocked_check`, which is config-driven
+    (annotation patterns and the instant-fail threshold live in
+    :class:`InfraBlockedConfig`, not hardcoded here). This function remains as
+    a thin backward-compatible wrapper that delegates to the canonical
+    classifier with a default config, so existing callers and tests keep
+    working unchanged. New call sites should call
+    ``is_infra_blocked_check`` directly with the active config.
+
     Args:
         job: A single job object with steps[] from the GitHub Actions API
         annotations: A flat list of annotation objects from the check-runs API
@@ -2585,51 +2685,10 @@ def is_infrastructure_failure(job: dict[str, Any], annotations: list[dict[str, A
     Returns:
         True if any infrastructure failure signal is detected, False otherwise.
     """
-    conclusion = str(job.get("conclusion") or "").upper()
-    if conclusion != "FAILURE":
-        # Only check jobs that actually failed
-        return False
+    from .checks import is_infra_blocked_check
+    from .config import InfraBlockedConfig
 
-    steps = job.get("steps", [])
-    if not isinstance(steps, list):
-        steps = []
-
-    # Signal 1: zero-step job (never started)
-    # Primary signal: job with no steps at all (runner never started)
-    if len(steps) == 0:
-        return True
-
-    # Fallback: filter out setup steps to detect jobs that completed
-    # without running any actual test/work steps
-    non_setup_steps = [
-        s
-        for s in steps
-        if isinstance(s, dict)
-        and str(s.get("name") or "").lower()
-        not in {
-            "set up job",
-            "checkout",
-            "initialize",
-            "complete job",
-        }
-    ]
-
-    if len(non_setup_steps) == 0:
-        # Job completed with zero non-setup steps - infrastructure failure
-        return True
-
-    # Signal 2: check for "was not started" annotations
-    # Billing lapse annotation: "The job was not started because recent account payments have failed or your spending limit needs to be increased."
-    if not isinstance(annotations, list):
-        annotations = []
-
-    for annotation in annotations:
-        if isinstance(annotation, dict):
-            message = str(annotation.get("message") or "").lower()
-            if "was not started" in message:
-                return True
-
-    return False
+    return is_infra_blocked_check(job, annotations, InfraBlockedConfig())
 
 
 def parse_blockers(text: str) -> list[int]:
@@ -2643,10 +2702,30 @@ def parse_blockers(text: str) -> list[int]:
     Handles comma-separated lists (e.g., "Blocked by #743, #744").
 
     A match is only treated as the CURRENT issue declaring its own blocker
-    if no other issue reference appears earlier in the same sentence/line.
-    This excludes prose like "#168, #169, and #170 all build on this and are
-    blocked by #159" — which describes those OTHER issues as blocked, not
-    a self-declaration by whichever issue contains that text.
+    when it reads as a first-person declaration about THIS issue. Three guards
+    enforce that, in order of structural strength:
+
+    1. **Quoted/code exclusion** — a match falling inside a Markdown backtick
+       code span, a triple-backtick (or ``~~~``) fenced code block, or a
+       straight-double-quote span is prose quoting another issue's blocker
+       declaration, not a self-declaration. This is the fix for issue #1454:
+       an issue describing another issue's blocker phrase (backticked, quoted,
+       or parenthetically annotated) must not self-gate. The inline span
+       search is scoped to the containing clause (see guard 2) so an unrelated
+       stray backtick or quote ELSEWHERE in the body cannot pair with a later
+       one to envelope a genuine declaration and silently drop it -- a real
+       false-negative risk in this backtick-heavy codebase. Fenced code blocks
+       are multi-line constructs whose fence markers sit on separate lines
+       from the content, so clause bounds (which break on newlines) cannot
+       detect them; the fenced-block check therefore runs against the full
+       document with absolute offsets, not the clause substring.
+    2. **Foreign-issue-ref exclusion** — a match whose containing
+       sentence/line carries ANY other ``#NNN`` reference (before OR after
+       the match, and not part of the match itself) describes those OTHER
+       issues, not this one. This generalizes the original backward-only
+       ``_clause_preceding`` guard (issue #159) to also look forward, so
+       issue-referencing parentheticals after the match are excluded too.
+    3. The remaining matches are honored as genuine self-declarations.
 
     Returns an empty list if no blockers are found.
     """
@@ -2657,7 +2736,46 @@ def parse_blockers(text: str) -> list[int]:
     # Check if they appear in blocker context
     for pattern in _BLOCKER_PATTERNS:
         for match in pattern.finditer(text):
-            if _ISSUE_REF.search(_clause_preceding(text, match.start())):
+            match_start, match_end = match.start(), match.end()
+
+            # Guard 1a: a match inside a fenced code block (triple-backtick or
+            # ~~~) is quoted prose, not a self-declaration. Fenced blocks are
+            # multi-line constructs whose fence markers sit on separate lines
+            # from the content, so the clause-scoped inline span checks below
+            # cannot detect them (the content line is its own clause with no
+            # fence markers). This check therefore runs against the full
+            # document with absolute offsets (issue #1454 rework round 2).
+            if _inside_fenced_block(text, match_start, match_end):
+                continue
+
+            # Both remaining guards judge the match against its containing
+            # clause, so compute the clause window once and reuse it. Scoping
+            # the inline span check to the clause is what prevents an unrelated
+            # stray backtick/quote elsewhere in the body from swallowing a
+            # genuine declaration (issue #1454 rework).
+            clause_start, clause_end = _clause_bounds(text, match_start, match_end)
+            clause = text[clause_start:clause_end]
+            match_rel_start = match_start - clause_start
+            match_rel_end = match_end - clause_start
+
+            # Guard 1b: a match inside an inline code span or quoted span
+            # WITHIN the clause is quoted prose describing another issue, not
+            # a self-declaration. Searched on the clause substring so a span
+            # opening outside this clause cannot envelope the match.
+            if _inside_code_span(clause, match_rel_start, match_rel_end):
+                continue
+            if _inside_quoted_span(clause, match_rel_start, match_rel_end):
+                continue
+
+            # Guard 2: any OTHER #NNN in the containing clause (not part of
+            # this match) means the clause is about a different issue.
+            has_foreign_ref = False
+            for ref in _ISSUE_REF.finditer(clause):
+                if ref.start() >= match_rel_start and ref.end() <= match_rel_end:
+                    continue  # part of the match itself
+                has_foreign_ref = True
+                break
+            if has_foreign_ref:
                 continue
 
             # Extract the full match and find all #N references within it
