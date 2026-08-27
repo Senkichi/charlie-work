@@ -49,6 +49,7 @@ from .rescue_capture_exclusions import (  # noqa: F401  (deliberate re-export)
     _filter_redundant_add_exclusions,
     _is_glob_pathspec,
 )
+from .base_branch import resolve_base_branch_name  # noqa: F401  (deliberate re-export)
 
 _DEFAULT_TIMEOUT_SECONDS = 60
 # Shorter timeout for network-touching git commands (ls-remote, fetch) so a
@@ -4145,30 +4146,6 @@ def push_branch(
     if local_sha_result.stdout.strip() == remote_sha:
         return True, None
     return False, f"remote branch {branch} does not match local tip after push"
-
-
-def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
-    """Convert a base ref (e.g. ``origin/main`` or ``HEAD``) into a branch name.
-
-    ``gh pr create --base`` expects a simple branch name. Remote-tracking refs
-    are stripped to their local branch name; ``HEAD`` falls back to the current
-    branch or ``main``.
-    """
-    if base_ref.startswith("refs/remotes/origin/"):
-        return base_ref[len("refs/remotes/origin/") :]
-    if base_ref.startswith("refs/heads/"):
-        return base_ref[len("refs/heads/") :]
-    if base_ref.startswith("origin/"):
-        return base_ref[len("origin/") :]
-    if base_ref == "HEAD":
-        current_branch = run_captured(
-            ["git", "branch", "--show-current"],
-            cwd=repo_root,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-        )
-        if current_branch.ok and current_branch.stdout.strip():
-            return current_branch.stdout.strip()
-    return "main"
 
 
 def salvage_branch_empty_diff(repo_root: Path, branch: str, base_ref: str) -> bool:
