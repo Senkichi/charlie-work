@@ -84,15 +84,81 @@ OPERATOR_MARKER_SESSION_ID = "operator-claim"
 OPERATOR_MARKER_KIND = "operator"
 
 
+# Issue #807: ``worktree_unsafe`` is split at detection time into two
+# discriminable kinds, because the two triggers do not share a correct
+# response. Launch-shim dirt / adapter shim materialization (uncommitted
+# modifications) is genuinely mechanical — auto-clear and redispatch is the
+# right move. Genuine unpushed local commits on the worktree branch are a
+# judgment call — returning the issue to dispatch actively fights the safety
+# system that raised the escalation and risks a second writer on a branch
+# that already has divergent local work. The discriminator is the
+# ``dirty_reason`` string already computed at the raise site; classifying at
+# detection (rather than after the fact) makes the invalid state
+# unrepresentable.
+WORKTREE_UNSAFE_KIND_SHIM_DIRT = "worktree_unsafe_shim_dirt"
+WORKTREE_UNSAFE_KIND_LOCAL_COMMITS = "worktree_unsafe_local_commits"
+WORKTREE_UNSAFE_KINDS: frozenset[str] = frozenset(
+    {WORKTREE_UNSAFE_KIND_SHIM_DIRT, WORKTREE_UNSAFE_KIND_LOCAL_COMMITS}
+)
+
+
+def _worktree_unsafe_kind_from_reason(reason: str) -> str:
+    """Map a ``dirty_reason`` string to its ``worktree_unsafe`` sub-kind.
+
+    The reason strings are produced by ``_worktree_refuse_to_reset_reason``
+    and ``_worktree_dirty_reason``. "uncommitted modifications" denotes
+    shim/adapter dirt (mechanical); "local commit(s)" denotes genuine
+    divergence (judgment). A reason that matches neither known pattern
+    defaults to ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`` — the fail-closed
+    classification toward judgment/human-needed — so a future reason
+    string that doesn't match either pattern escalates as a judgment
+    call rather than being silently treated as mechanical and
+    auto-cleared (which would reproduce the #807 bug the split exists to
+    prevent). This mirrors the fail-closed convention already enforced
+    for an unrecognized explicit ``kind`` in ``WorktreeUnsafeError.__init__``
+    and for an unrecognized ``reason_class`` in
+    ``state.escalation_reason_class``.
+    """
+    if "local commit" in reason:
+        return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+    if "uncommitted modifications" in reason:
+        return WORKTREE_UNSAFE_KIND_SHIM_DIRT
+    return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+
+
 class WorktreeUnsafeError(RuntimeError):
     """Raised when ``create_worktree`` is about to reset a worktree that is
     CONFIRMED to contain local work (uncommitted modifications, or local
     commits not on the remote branch). This is a deterministic finding — the
-    launch shim surfaces it as ``failure_kind="worktree_unsafe"``, which sits
-    in ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` and escalates to a
-    human on first occurrence. Do not raise this for a probe that merely
-    *failed to determine* dirtiness — see ``WorktreeProbeFailedError``.
+    launch shim surfaces it as a ``failure_kind`` equal to ``kind``, which
+    sits in ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` (shim dirt) or
+    ``config.DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS`` (local commits)
+    and escalates to a human on first occurrence. Do not raise this for a
+    probe that merely *failed to determine* dirtiness — see
+    ``WorktreeProbeFailedError``.
+
+    ``kind`` carries the discriminator (issue #807) so the launch shim can
+    emit a distinct ``failure_kind`` at detection time rather than
+    classifying after the fact. It is derived from the ``dirty_reason``
+    string by ``_worktree_unsafe_kind_from_reason`` unless the caller
+    supplies it explicitly, in which case it must be one of
+    ``WORKTREE_UNSAFE_KINDS`` — an unrecognized explicit ``kind`` would
+    silently fail to match either
+    ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` or
+    ``config.DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS``, degrading to
+    the ordinary redispatch-cap path instead of escalating, so this fails
+    closed with a ``ValueError`` rather than allowing that silently.
     """
+
+    def __init__(self, reason: str, *, kind: str | None = None) -> None:
+        if kind is not None and kind not in WORKTREE_UNSAFE_KINDS:
+            raise ValueError(
+                f"invalid WorktreeUnsafeError kind {kind!r}; expected one of "
+                f"{sorted(WORKTREE_UNSAFE_KINDS)}"
+            )
+        self.reason = reason
+        self.kind = kind or _worktree_unsafe_kind_from_reason(reason)
+        super().__init__(reason)
 
 
 class WorktreeProbeFailedError(RuntimeError):
