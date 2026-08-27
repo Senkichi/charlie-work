@@ -18543,6 +18543,187 @@ def test_merge_ready_mergequeue_mode_unapproved_pr_not_labeled(tmp_path: Path) -
     assert result.data.get("mergequeue_label_applied") is None
 
 
+def test_merge_ready_event_persists_gate_inputs_distinguishing_false_causes(
+    tmp_path: Path,
+) -> None:
+    """Issue #1060: the ``merge_ready`` event must persist the three gate
+    inputs (``summary_ready``, ``approved``, ``require_approved_review``,
+    ``sync_failed``) alongside ``can_merge``, plus ``mergequeue_label_applied``,
+    so a ``can_merge=False`` can be diagnosed from events.db alone.
+
+    The three distinct false-causes -- CI not green, no recorded approval, base
+    sync failed -- must produce three *different* payloads, not three identical
+    ones. Mutating any single input must change the recorded event; if it does
+    not, the record is not load-bearing.
+    """
+
+    def _last_merge_ready_payload(state_file: Path) -> dict[str, Any]:
+        state = load_state(state_file)
+        events = [e for e in state["events"] if e["kind"] == "merge_ready"]
+        assert events, "no merge_ready event was recorded"
+        return events[-1]["payload"]
+
+    gate_keys = {"summary_ready", "approved", "require_approved_review", "sync_failed"}
+
+    # --- Scenario 1: CI not green (summary_ready=False) -------------------
+    # require_current_base=False keeps the base-freshness deferral gate off so
+    # the pass reaches the merge_ready event instead of short-circuiting on a
+    # stale-base deferral (which records a different event kind).
+    config_ci = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed",),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_ci = runtime_paths(tmp_path / "ci", config_ci.runtime.state_dir)
+    fake_gh_ci = FakeGitHubWithChecks(checks=[{"name": "Tests passed", "state": "FAILURE"}])
+    app_ci = OrchestratorApp(tmp_path / "ci", paths_ci, config_ci, fake_gh_ci)
+    app_ci.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    app_ci.merge_ready(456, merge=False)
+    payload_ci = _last_merge_ready_payload(paths_ci.state_file)
+
+    # --- Scenario 2: no recorded approval (approved=False) ----------------
+    config_noappr = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_noappr = runtime_paths(tmp_path / "noappr", config_noappr.runtime.state_dir)
+    fake_gh_noappr = FakeGitHub()
+    app_noappr = OrchestratorApp(tmp_path / "noappr", paths_noappr, config_noappr, fake_gh_noappr)
+    # Deliberately do NOT record a review -> approved=False.
+    app_noappr.merge_ready(456, merge=False)
+    payload_noappr = _last_merge_ready_payload(paths_noappr.state_file)
+
+    # --- Scenario 3: base sync failed (sync_failed=True) ------------------
+    # A genuine merge conflict (mergeable=CONFLICTING) sets sync_failed=True
+    # before the gate, while the default passing checks keep summary_ready=True.
+    config_sync = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            require_approved_review=True,
+        )
+    )
+    paths_sync = runtime_paths(tmp_path / "sync", config_sync.runtime.state_dir)
+    fake_gh_sync = FakeGitHub()
+    fake_gh_sync.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BEHIND",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app_sync = OrchestratorApp(tmp_path / "sync", paths_sync, config_sync, fake_gh_sync)
+    app_sync.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    app_sync.merge_ready(456, merge=False)
+    payload_sync = _last_merge_ready_payload(paths_sync.state_file)
+
+    # All three are can_merge=False but for three distinct reasons, and every
+    # payload carries the gate inputs plus the persisted handoff outcome.
+    for payload in (payload_ci, payload_noappr, payload_sync):
+        assert payload["can_merge"] is False
+        assert gate_keys <= set(payload)
+        assert "mergequeue_label_applied" in payload
+
+    # Scenario 1: CI not green.
+    assert payload_ci["summary_ready"] is False
+    assert payload_ci["approved"] is True
+    assert payload_ci["require_approved_review"] is True
+    assert payload_ci["sync_failed"] is False
+
+    # Scenario 2: no recorded approval.
+    assert payload_noappr["summary_ready"] is True
+    assert payload_noappr["approved"] is False
+    assert payload_noappr["require_approved_review"] is True
+    assert payload_noappr["sync_failed"] is False
+
+    # Scenario 3: base sync failed (merge conflict).
+    assert payload_sync["summary_ready"] is True
+    assert payload_sync["approved"] is True
+    assert payload_sync["require_approved_review"] is True
+    assert payload_sync["sync_failed"] is True
+
+    # The three payloads are distinguishable on the gate-input sub-dict: no two
+    # share the same (summary_ready, approved, sync_failed) triple. Mutating any
+    # single input changes the recorded event -- the record is load-bearing.
+    triples = {
+        (p["summary_ready"], p["approved"], p["sync_failed"])
+        for p in (payload_ci, payload_noappr, payload_sync)
+    }
+    assert len(triples) == 3
+
+
+def test_merge_ready_real_path_return_data_includes_gate_inputs(
+    tmp_path: Path,
+) -> None:
+    """Issue #1060: the real (non-dry-run) ``merge_ready()`` call's returned
+    ``.data`` dict must include the four gate inputs
+    (``summary_ready``, ``approved``, ``require_approved_review``,
+    ``sync_failed``) alongside ``can_merge``, for diagnostic parity with the
+    persisted ``merge_ready`` event. The review found that only the persisted
+    event and the dry-run return were covered -- the real-path in-memory
+    verdict's gate-input spread had no regression test.
+
+    Two scenarios exercise both the ``can_merge=True`` and ``can_merge=False``
+    branches so the assertion is not vacuously satisfied by a missing key
+    defaulting to a falsy value.
+    """
+    gate_keys = {"summary_ready", "approved", "require_approved_review", "sync_failed"}
+
+    # --- Scenario 1: approved + green -> can_merge=True -------------------
+    config_ok = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_ok = runtime_paths(tmp_path / "ok", config_ok.runtime.state_dir)
+    fake_gh_ok = FakeGitHub()
+    app_ok = OrchestratorApp(tmp_path / "ok", paths_ok, config_ok, fake_gh_ok)
+    app_ok.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    result_ok = app_ok.merge_ready(456, merge=False)
+
+    assert result_ok.data["can_merge"] is True
+    assert gate_keys <= set(result_ok.data)
+    assert result_ok.data["summary_ready"] is True
+    assert result_ok.data["approved"] is True
+    assert result_ok.data["require_approved_review"] is True
+    assert result_ok.data["sync_failed"] is False
+
+    # --- Scenario 2: no recorded approval -> can_merge=False --------------
+    config_noappr = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_noappr = runtime_paths(tmp_path / "noappr", config_noappr.runtime.state_dir)
+    fake_gh_noappr = FakeGitHub()
+    app_noappr = OrchestratorApp(tmp_path / "noappr", paths_noappr, config_noappr, fake_gh_noappr)
+    # Deliberately do NOT record a review -> approved=False.
+    result_noappr = app_noappr.merge_ready(456, merge=False)
+
+    assert result_noappr.data["can_merge"] is False
+    assert gate_keys <= set(result_noappr.data)
+    assert result_noappr.data["summary_ready"] is True
+    assert result_noappr.data["approved"] is False
+    assert result_noappr.data["require_approved_review"] is True
+    assert result_noappr.data["sync_failed"] is False
+
+
 def test_merge_ready_mergequeue_parked_pr_excluded_from_merge_train_head(
     tmp_path: Path,
 ) -> None:
@@ -20519,7 +20700,15 @@ def test_merge_ready_dry_run_already_merged_is_noop(tmp_path: Path) -> None:
 
 def test_merge_ready_dry_run_unapproved_reports_can_merge_false(tmp_path: Path) -> None:
     """Issue #614: under --dry-run, an unapproved PR reports can_merge=False
-    without persisting any state."""
+    without persisting any state.
+
+    Issue #1060: the dry-run return payload must also surface the four gate
+    inputs (``summary_ready``, ``approved``, ``require_approved_review``,
+    ``sync_failed``) so the preview has diagnostic parity with the persisted
+    ``merge_ready`` event.  This scenario — checks green but no recorded
+    approval — exercises the ``approved=False`` / ``require_approved_review=True``
+    branch that makes ``can_merge`` False.
+    """
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -20530,6 +20719,13 @@ def test_merge_ready_dry_run_unapproved_reports_can_merge_false(tmp_path: Path) 
     assert result.data["can_merge"] is False
     assert result.data["merged"] is False
     assert result.data["dry_run"] is True
+    # Issue #1060: the four gate inputs are spread into the dry-run payload
+    # from the same dict the gate reads, so the preview explains *why*
+    # can_merge is False without needing events.db.
+    assert result.data["summary_ready"] is True
+    assert result.data["approved"] is False
+    assert result.data["require_approved_review"] is True
+    assert result.data["sync_failed"] is False
     # No state was written for this PR.
     assert "456" not in load_state(paths.state_file)["prs"]
 
