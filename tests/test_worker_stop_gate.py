@@ -732,11 +732,17 @@ def test_evaluate_still_targets_untracked_test_files(gate, repo, monkeypatch):
     coverage -- the gate must still run pytest on it even though ruff skips
     it. (If ruff ran on it, a format issue in the new test file would block
     before pytest even gets to run it -- the #1306 trade-off.)
+
+    The pytest command list is captured and asserted to contain
+    ``tests/test_new.py`` so the test fails if untracked test-file
+    targeting regresses -- not just if pytest happens to not be invoked
+    at all (which would leave ``result.block is False`` true regardless).
     """
     (repo / "tests").mkdir()
     (repo / "tests" / "test_new.py").write_text(
         "def test_x():\n    assert True\n", encoding="utf-8"
     )
+    captured_pytest: list[list[str]] = []
 
     def _fake_run(cmd, *, cwd, timeout):
         del cwd, timeout
@@ -747,6 +753,7 @@ def test_evaluate_still_targets_untracked_test_files(gate, repo, monkeypatch):
         if "ruff" in cmd:
             raise AssertionError("ruff must not run on untracked test file (#1306)")
         if "pytest" in cmd:
+            captured_pytest.append(cmd)
             return subprocess.CompletedProcess(cmd, 0, stdout="1 passed\n", stderr="")
         raise AssertionError(f"unexpected command {cmd}")
 
@@ -755,6 +762,13 @@ def test_evaluate_still_targets_untracked_test_files(gate, repo, monkeypatch):
     result = gate._evaluate(repo)
 
     assert result.block is False
+    assert captured_pytest, (
+        "pytest must be invoked on the untracked test file -- a passing "
+        "result with no pytest call means targeting silently regressed"
+    )
+    assert any("tests/test_new.py" in cmd for cmd in captured_pytest), (
+        f"pytest must target tests/test_new.py; got {captured_pytest}"
+    )
 
 
 def test_evaluate_untracked_src_with_emit_site_still_triggers_w4(gate, repo, monkeypatch):
