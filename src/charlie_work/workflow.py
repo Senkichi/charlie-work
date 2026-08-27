@@ -15912,10 +15912,25 @@ class OrchestratorApp:
                         },
                     )
 
+        # Issue #1060: derive ``can_merge`` from a single dict of gate inputs
+        # and persist that same dict in the ``merge_ready`` event below. The
+        # gate and the record now read from one source, so a future added
+        # condition cannot silently fall out of the persisted payload the way
+        # ``mergequeue_label_applied`` did (it existed only in the in-memory
+        # return dict, never in events.db, so a query for it was vacuously 0
+        # for every PR that has ever existed). A hand-maintained list of keys
+        # drifts from the expression it describes; this dict *is* the
+        # expression.
+        merge_gate_inputs = {
+            "summary_ready": summary.ready,
+            "approved": approved,
+            "require_approved_review": self.config.auto_merge.require_approved_review,
+            "sync_failed": sync_failed,
+        }
         can_merge = (
-            summary.ready
-            and (approved or not self.config.auto_merge.require_approved_review)
-            and not sync_failed
+            merge_gate_inputs["summary_ready"]
+            and (merge_gate_inputs["approved"] or not merge_gate_inputs["require_approved_review"])
+            and not merge_gate_inputs["sync_failed"]
         )
         # Issue #840: escalation gate on the merge-execution block. An
         # approved, green, conflict-free PR whose linked issue (or the PR
@@ -16478,6 +16493,17 @@ class OrchestratorApp:
                     "merge_hold": merge_hold,
                     "merge_hold_check_unavailable": merge_hold_check_unavailable,
                     "cancel_superseded_runs_results": cancel_results,
+                    # Issue #1060: persist the Aviator handoff outcome so a
+                    # query for it is no longer vacuously 0 for every PR. This
+                    # key previously existed only in the in-memory return dict
+                    # below, never in events.db.
+                    "mergequeue_label_applied": mergequeue_label_applied,
+                    # Issue #1060: persist the three gate inputs alongside the
+                    # conclusion so a ``can_merge=False`` can be diagnosed from
+                    # events.db alone. Spread from the same dict the gate reads
+                    # (``merge_gate_inputs`` above) so a future added condition
+                    # cannot silently fall out of the record.
+                    **merge_gate_inputs,
                 },
             )
             # Issue #747: emit a dedicated terminal success event on the
@@ -16530,6 +16556,9 @@ class OrchestratorApp:
             "merge_hold": merge_hold,
             "merge_hold_check_unavailable": merge_hold_check_unavailable,
             "escalated_merge_hold": escalated_merge_hold,
+            # Issue #1060: surface the gate inputs in the in-memory verdict
+            # too, for diagnostic parity with the persisted event.
+            **merge_gate_inputs,
         }
         message = "merge readiness evaluated"
         if cross_pr_revert_detected:
@@ -16750,10 +16779,20 @@ class OrchestratorApp:
         diff = self.gh.pr_diff(pr_number)
         containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)
 
+        # Issue #1060: mirror the real path's dict-based gate so the two
+        # duplicated gates cannot drift -- a future condition added to one but
+        # not the other would silently diverge the dry-run preview from the
+        # real verdict.
+        merge_gate_inputs = {
+            "summary_ready": summary.ready,
+            "approved": approved,
+            "require_approved_review": self.config.auto_merge.require_approved_review,
+            "sync_failed": sync_failed,
+        }
         can_merge = (
-            summary.ready
-            and (approved or not self.config.auto_merge.require_approved_review)
-            and not sync_failed
+            merge_gate_inputs["summary_ready"]
+            and (merge_gate_inputs["approved"] or not merge_gate_inputs["require_approved_review"])
+            and not merge_gate_inputs["sync_failed"]
         )
         # Issue #840: mirror the real path's escalation gate so the dry-run
         # preview accurately reports "would be held" instead of "would merge"
@@ -16847,6 +16886,9 @@ class OrchestratorApp:
                 "merge_hold": merge_hold,
                 "merge_hold_check_unavailable": merge_hold_check_unavailable,
                 "escalated_merge_hold": escalated_merge_hold,
+                # Issue #1060: surface the gate inputs in the dry-run preview
+                # too, for diagnostic parity with the persisted event.
+                **merge_gate_inputs,
                 "dry_run": True,
             },
         )
