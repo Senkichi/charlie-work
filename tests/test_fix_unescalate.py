@@ -133,6 +133,57 @@ def test_unescalate_escalated_open_pr_resets_and_relabels(tmp_path: Path) -> Non
     assert len(_events(state, "unescalate")) == 1
 
 
+def test_unescalate_reset_covers_every_rework_lane_companion() -> None:
+    """Every companion field a lane's auto de-escalation resets must also be
+    reset by the operator door. Derived from the map, not hand-listed, so a
+    new lane (or a new companion) that lands in one place and not the other
+    fails here instead of re-escalating in production (PR #1449)."""
+    from charlie_work.workflow import OrchestratorApp
+
+    reset = set(OrchestratorApp._UNESCALATE_PR_RESET_FIELDS)
+    missing: set[str] = set()
+    for counter, companions in OrchestratorApp._REWORK_BUDGET_RESET_BY_ESCALATION_REASON.values():
+        missing |= ({counter} | set(companions)) - reset
+    assert not missing, sorted(missing)
+
+
+def test_unescalate_clears_rework_stall_clock_for_both_lanes(tmp_path: Path) -> None:
+    """A stall clock started during the exhausted episode must not survive the
+    re-arm: _check_janitor_rework_stall restarts from utc_now() only when the
+    key is unset, and a cap escalation never clears it, so a stale start makes
+    the very next janitor pass fire ``*_stall_exceeded`` at attempt 1."""
+    app = _app(tmp_path)
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+            "conflict_rework_attempts": 3,
+            "conflict_rework_attempts_last_head": "sha-old",
+            "conflict_rework_attempts_stall_since": "2026-08-25T16:30:18Z",
+            "conflict_rework_attempts_stall_head": "sha-old",
+            "no_op_rework_attempts": 1,
+            "no_op_rework_attempts_stall_since": "2026-08-25T16:30:18Z",
+            "no_op_rework_attempts_stall_head": "sha-old",
+        }
+        state["issues"]["123"] = {"number": 123, "status": "escalated"}
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(pr_number=456)
+
+    assert result.ok is True and result.data["changed"] is True
+    pr_entry = load_state(app.paths.state_file)["prs"]["456"]
+    for stale_field in (
+        "conflict_rework_attempts_stall_since",
+        "conflict_rework_attempts_stall_head",
+        "no_op_rework_attempts_stall_since",
+        "no_op_rework_attempts_stall_head",
+    ):
+        assert stale_field not in pr_entry, stale_field
+
+
 def test_unescalate_janitor_blocked_pr_uses_same_rearm_path(tmp_path: Path) -> None:
     app = _app(tmp_path)
     with state_lock(app.paths.state_file):
