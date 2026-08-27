@@ -192,6 +192,11 @@ from .worktree import (
     write_worktree_marker,
 )
 from . import state as _state
+from .unescalate_reset_fields import (
+    REWORK_BUDGET_RESET_BY_ESCALATION_REASON,
+    UNESCALATE_ISSUE_RESET_FIELDS,
+    UNESCALATE_PR_RESET_FIELDS,
+)
 from .state import (
     PASSIVE_OPEN_STATUS,
     StateLockBusy,
@@ -14770,159 +14775,11 @@ class OrchestratorApp:
             },
         )
 
-    # PR-record bookkeeping that must not survive an operator re-arm: attempt
-    # counters and caches that would otherwise instantly re-escalate the PR
-    # (counters at cap) or feed the pipeline frozen pre-escalation data
-    # (janitor/CI caches — pr-lifecycle.md: escalated PRs freeze their cached
-    # janitor state forever, e.g. #548 showing "Tests pending" 12h after the
-    # checks passed).
-    _UNESCALATE_PR_RESET_FIELDS = (
-        "review_dispatch_attempt_count",
-        # Issue #1351: companion baseline to review_dispatch_attempt_count.
-        # Cleared on re-arm alongside the counter so the next review() for the
-        # same head starts a fresh dispatch cycle (counter is 0 either way, but
-        # this keeps the pair consistent with the other _last_head baselines).
-        "review_dispatch_attempt_last_head",
-        "review_log_unreadable_streak",
-        # Issue #1439: turn-limit miss streak must not survive a re-arm, or
-        # the cap-aware backstop would re-escalate instantly on the next
-        # turn-limit death.
-        "review_turn_limit_miss_streak",
-        "request_changes_count",
-        "conflict_rework_attempts",
-        "conflict_rework_attempts_last_head",
-        "no_op_rework_attempts",
-        "no_op_rework_attempts_last_head",
-        "review_dispatch_status",
-        "review_dispatch_failed_at",
-        "review_dispatch_pending_at",
-        "review_dispatched_at",
-        "reviewer_pid",
-        "reviewer_process_start_time",
-        "review_turn_limit_summary_posted",
-        "review_miss_summary_posted",
-        "janitor_ok",
-        "janitor_failures",
-        "janitor_warnings",
-        # Same frozen-cache hazard as janitor_ok/janitor_failures above: once
-        # a head is flagged never-created, the dedup marker would otherwise
-        # silently suppress a fresh event even after an operator re-arms the
-        # PR and the same head is still stuck.
-        "ci_run_never_created_head",
-        "escalation_reason",
-        # Issue #1461: clear the append-only escalation history so a re-arm
-        # gives every lane a genuinely fresh dedup slate.
-        "escalation_reasons_seen",
-        "label_error",
-        # Issue #1099: the per-head cross-family regeneration record holds both
-        # budgets. Leaving it behind makes the re-arm inert -- loop() reads the
-        # spent counters and parks the PR again on the very next pass, so the
-        # operator's unescalate accomplishes nothing without also hand-editing
-        # state.json. That is the same "re-arm does not stick" shape this
-        # command exists to fix.
-        "cross_family_regen",
-        # Rescue tier (issue #555): rescue_attempted is the durable "used my
-        # one shot" marker. Only charlie unescalate clears it (this tuple) —
-        # every other code path treats a present marker as permanent.
-        "rescue_attempted",
-        "rescue_cause",
-        "rescue_dispatched_at",
-    )
-    # Issue-record equivalents (dispatch-side caps and stale worker bookkeeping).
-    _UNESCALATE_ISSUE_RESET_FIELDS = (
-        "dispatch_failed_at",
-        "redispatch_at",
-        "worker_death_at",
-        # Issue #1243: the orphan-sweep no-open-PR redispatch cap tracking
-        # fields must reset on human un-escalate so the cap starts fresh
-        # after the operator re-arms the issue.
-        "orphan_redispatch_head_sha",
-        "orphan_redispatch_at",
-        "orphan_redispatch_counted_dispatch",
-        "escalation_reason",
-        # Issue #1461: clear the append-only escalation history so a re-arm
-        # gives every lane a genuinely fresh dedup slate.
-        "escalation_reasons_seen",
-        # Issue #783: a human-authorized manual unescalate clears the reason
-        # class (the escalation itself is gone) and resets the auto
-        # de-escalation counter -- unlike the automated sweep, which never
-        # resets its own counter (that is the oscillation guard; see
-        # _maybe_deescalate_mechanical). The one-time cap-notification marker
-        # must reset alongside the counter it gates: without this, a human
-        # unescalate -> re-escalate -> re-hit-the-cap cycle would silently
-        # suppress the second `deescalation_cap_exhausted` event because the
-        # stale marker from the first cap-hit survived the reset, leaving
-        # the oscillation guard's terminal state undiagnosable the second
-        # time around.
-        "reason_class",
-        "auto_deescalation_count",
-        "deescalation_cap_notified_at",
-        # Issue #1093: the per-escalation-episode marker for the rework
-        # budget reset must clear alongside the escalation it tracks, so a
-        # manual re-arm gives the next sweep clear a clean slate.
-        "rework_budget_reset_for_terminal_since",
-        "label_error",
-        "worker_pid",
-        "worker_process_start_time",
-        "dispatched_at",
-    )
-    # Issue #1093: the de-escalation sweep's once-per-episode rework-budget
-    # reset must zero the per-mechanism PR counter that ACTUALLY gates the
-    # cleared ``escalation_reason``, not a counter belonging to a different
-    # lane.  ``_route_janitor_gate_failure_to_rework`` escalates with reason
-    # ``f"{attempts_key}_cap_exceeded"`` (or ``_stall_exceeded``) and reads
-    # ``attempts_key`` itself on the next pass; ``record_review`` escalates
-    # with ``max_rework_cycles_exceeded`` and reads ``request_changes_count``.
-    # Resetting ``request_changes_count`` for a ``no_op_rework_attempts_*``
-    # clear (the PR's own reproduction scenario) left the real gating counter
-    # untouched, so the router re-escalated on the very next detection -- the
-    # promised "fresh rework budget" never applied to the lane it serves.
-    #
-    # Each lane's counter is reset together with its head-baseline
-    # (``_last_head``) and stall-clock (``_stall_since`` / ``_stall_head``)
-    # companions so the next detection re-baselines instead of inheriting a
-    # stale head/stall snapshot from the exhausted episode.  Escalation
-    # reasons with no per-mechanism rework counter (e.g.
-    # ``session_failed_escalated``, ``worktree_unsafe``) are absent from the
-    # map: there is no rework budget to reset for them, so the clear resets
-    # nothing extra.  ``auto_deescalation_count`` still independently bounds
-    # total clears (Issue #783 hazard (b)), so the per-episode reset cannot
-    # unbound the paid-session loop.
-    _REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[str, tuple[str, ...]]] = {
-        "max_rework_cycles_exceeded": ("request_changes_count", ()),
-        "no_op_rework_attempts_cap_exceeded": (
-            "no_op_rework_attempts",
-            (
-                "no_op_rework_attempts_last_head",
-                "no_op_rework_attempts_stall_since",
-                "no_op_rework_attempts_stall_head",
-            ),
-        ),
-        "no_op_rework_attempts_stall_exceeded": (
-            "no_op_rework_attempts",
-            (
-                "no_op_rework_attempts_last_head",
-                "no_op_rework_attempts_stall_since",
-                "no_op_rework_attempts_stall_head",
-            ),
-        ),
-        "conflict_rework_attempts_cap_exceeded": (
-            "conflict_rework_attempts",
-            (
-                "conflict_rework_attempts_last_head",
-                "conflict_rework_attempts_stall_since",
-                "conflict_rework_attempts_stall_head",
-            ),
-        ),
-        "conflict_rework_attempts_stall_exceeded": (
-            "conflict_rework_attempts",
-            (
-                "conflict_rework_attempts_last_head",
-                "conflict_rework_attempts_stall_since",
-                "conflict_rework_attempts_stall_head",
-            ),
-        ),
-    }
+    # Re-arm field sets live in unescalate_reset_fields.py (extracted under the
+    # #1442 ratchet); the aliases keep ``self._...`` call sites and tests intact.
+    _UNESCALATE_PR_RESET_FIELDS = UNESCALATE_PR_RESET_FIELDS
+    _UNESCALATE_ISSUE_RESET_FIELDS = UNESCALATE_ISSUE_RESET_FIELDS
+    _REWORK_BUDGET_RESET_BY_ESCALATION_REASON = REWORK_BUDGET_RESET_BY_ESCALATION_REASON
 
     def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> str | None:
         """Re-run the worktree safety check for an issue (issue #849).
@@ -16111,10 +15968,25 @@ class OrchestratorApp:
                         },
                     )
 
+        # Issue #1060: derive ``can_merge`` from a single dict of gate inputs
+        # and persist that same dict in the ``merge_ready`` event below. The
+        # gate and the record now read from one source, so a future added
+        # condition cannot silently fall out of the persisted payload the way
+        # ``mergequeue_label_applied`` did (it existed only in the in-memory
+        # return dict, never in events.db, so a query for it was vacuously 0
+        # for every PR that has ever existed). A hand-maintained list of keys
+        # drifts from the expression it describes; this dict *is* the
+        # expression.
+        merge_gate_inputs = {
+            "summary_ready": summary.ready,
+            "approved": approved,
+            "require_approved_review": self.config.auto_merge.require_approved_review,
+            "sync_failed": sync_failed,
+        }
         can_merge = (
-            summary.ready
-            and (approved or not self.config.auto_merge.require_approved_review)
-            and not sync_failed
+            merge_gate_inputs["summary_ready"]
+            and (merge_gate_inputs["approved"] or not merge_gate_inputs["require_approved_review"])
+            and not merge_gate_inputs["sync_failed"]
         )
         # Issue #840: escalation gate on the merge-execution block. An
         # approved, green, conflict-free PR whose linked issue (or the PR
@@ -16677,6 +16549,17 @@ class OrchestratorApp:
                     "merge_hold": merge_hold,
                     "merge_hold_check_unavailable": merge_hold_check_unavailable,
                     "cancel_superseded_runs_results": cancel_results,
+                    # Issue #1060: persist the Aviator handoff outcome so a
+                    # query for it is no longer vacuously 0 for every PR. This
+                    # key previously existed only in the in-memory return dict
+                    # below, never in events.db.
+                    "mergequeue_label_applied": mergequeue_label_applied,
+                    # Issue #1060: persist the three gate inputs alongside the
+                    # conclusion so a ``can_merge=False`` can be diagnosed from
+                    # events.db alone. Spread from the same dict the gate reads
+                    # (``merge_gate_inputs`` above) so a future added condition
+                    # cannot silently fall out of the record.
+                    **merge_gate_inputs,
                 },
             )
             # Issue #747: emit a dedicated terminal success event on the
@@ -16729,6 +16612,9 @@ class OrchestratorApp:
             "merge_hold": merge_hold,
             "merge_hold_check_unavailable": merge_hold_check_unavailable,
             "escalated_merge_hold": escalated_merge_hold,
+            # Issue #1060: surface the gate inputs in the in-memory verdict
+            # too, for diagnostic parity with the persisted event.
+            **merge_gate_inputs,
         }
         message = "merge readiness evaluated"
         if cross_pr_revert_detected:
@@ -16949,10 +16835,20 @@ class OrchestratorApp:
         diff = self.gh.pr_diff(pr_number)
         containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)
 
+        # Issue #1060: mirror the real path's dict-based gate so the two
+        # duplicated gates cannot drift -- a future condition added to one but
+        # not the other would silently diverge the dry-run preview from the
+        # real verdict.
+        merge_gate_inputs = {
+            "summary_ready": summary.ready,
+            "approved": approved,
+            "require_approved_review": self.config.auto_merge.require_approved_review,
+            "sync_failed": sync_failed,
+        }
         can_merge = (
-            summary.ready
-            and (approved or not self.config.auto_merge.require_approved_review)
-            and not sync_failed
+            merge_gate_inputs["summary_ready"]
+            and (merge_gate_inputs["approved"] or not merge_gate_inputs["require_approved_review"])
+            and not merge_gate_inputs["sync_failed"]
         )
         # Issue #840: mirror the real path's escalation gate so the dry-run
         # preview accurately reports "would be held" instead of "would merge"
@@ -17046,6 +16942,9 @@ class OrchestratorApp:
                 "merge_hold": merge_hold,
                 "merge_hold_check_unavailable": merge_hold_check_unavailable,
                 "escalated_merge_hold": escalated_merge_hold,
+                # Issue #1060: surface the gate inputs in the dry-run preview
+                # too, for diagnostic parity with the persisted event.
+                **merge_gate_inputs,
                 "dry_run": True,
             },
         )
