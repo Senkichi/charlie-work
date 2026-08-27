@@ -4279,8 +4279,13 @@ def _reap_restore_rework_requested(
     # Transition labels: escalate (operator_queue for mechanical reasons,
     # human_needed reserved for judgment), or rework_requested (needs_rework),
     # removing the stale in_progress label from the failed launch.
+    # Issue #807: the edge must follow reason_class so a deterministic judgment
+    # failure (genuine local commits) lands agent:human-needed, not
+    # agent:operator-queue. reason_class is only assigned inside the
+    # should_escalate branch above, and this ternary only reads it when
+    # should_escalate is true, so it is always bound on this access.
     edge = (
-        _escalation_edge("redispatch_escalated", "mechanical")
+        _escalation_edge("redispatch_escalated", reason_class)
         if should_escalate
         else "rework_requested"
     )

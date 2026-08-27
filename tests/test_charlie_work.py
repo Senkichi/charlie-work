@@ -20080,6 +20080,105 @@ def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> No
     assert (123, config.labels.needs_rework) in fake_gh.labels_removed
 
 
+def test_dispatch_rework_worktree_unsafe_local_commits_escalates_as_judgment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #807: a rework-dispatch attempt whose failure_kind is
+    ``worktree_unsafe_local_commits`` (genuine unpushed local commits on the
+    worktree branch) must escalate immediately on the FIRST attempt — like a
+    deterministic mechanical failure — but with ``reason_class="judgment"`` so
+    the label lands ``agent:human-needed`` (not ``agent:operator-queue``) and
+    the de-escalation sweep never auto-clears it.
+
+    Mirrors ``test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment``
+    (the fresh-dispatch site) but covers ``_dispatch_rework_impl``'s escalation
+    branch — the rework-dispatch counterpart, which carries the same
+    reason_class-derivation logic.
+
+    Mutation gate: dropping the ``deterministic_judgment`` half of
+    ``immediate_escalation`` in ``_dispatch_rework_impl``'s escalation branch
+    makes this test fail (the issue takes the redispatch-cap path and stays
+    ``rework_requested`` instead of escalating). Reverting the
+    ``_escalation_edge("redispatch_escalated", reason_class)`` to the hardcoded
+    ``"mechanical"`` also fails it (the label lands ``agent:operator-queue``
+    while state carries ``reason_class="judgment"``).
+    """
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; sys.exit(1)",
+            ),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="launch failed: worktree contains local commits",
+                failure_kind="worktree_unsafe_local_commits",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    # A deterministic judgment failure escalates on the FIRST attempt, not
+    # after burning max_auto_redispatch.
+    result = app.dispatch_rework()
+    assert result.ok is False
+    assert result.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe_local_commits"
+    assert state["issues"]["123"]["reason_class"] == "judgment"
+    # Escalated on the FIRST failure — not after burning max_auto_redispatch.
+    assert len(state["issues"]["123"]["redispatch_at"]) == 1
+    # Issue #807: judgment -> agent:human-needed, not agent:operator-queue.
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) in fake_gh.labels_removed
+
+
 def test_dry_run_dispatch_rework_leaves_state_unchanged(tmp_path: Path) -> None:
     """Issue #616: --dry-run rework dispatch must not advance the state machine
     off fabricated adapter results.
@@ -27037,6 +27136,120 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
     # (same _escalate_issue site as worker_death_loop/redispatch_cap_exceeded
     # in _reap_restore_rework_requested), so this lands agent:operator-queue.
     assert (123, config.labels.operator_queue) in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+    event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
+    assert "session_failed_escalated" in event_kinds
+    assert "rework_requeued" not in event_kinds
+
+
+def test_classify_dead_rework_session_worktree_unsafe_local_commits_escalates_as_judgment(
+    tmp_path: Path,
+) -> None:
+    """Issue #807: a dead rework worker whose failure_kind is
+    ``worktree_unsafe_local_commits`` (genuine unpushed local commits on the
+    worktree branch) must escalate immediately on the first occurrence — like
+    the mechanical deterministic kinds — but with ``reason_class="judgment"`` so
+    the de-escalation sweep never auto-clears it and the label lands
+    ``agent:human-needed`` (not ``agent:operator-queue``).
+
+    Mirrors ``test_classify_dead_rework_session_deterministic_failure_kind_escalates_immediately``
+    (the mechanical sibling) and
+    ``test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment`` (the
+    fresh-dispatch site), but covers the dead-rework-worker path in
+    ``_reap_restore_rework_requested`` — the call site most relevant to the
+    original #807 scenario.
+
+    Mutation gate: reverting ``_reap_restore_rework_requested``'s label edge at
+    the function tail from ``_escalation_edge("redispatch_escalated",
+    reason_class)`` back to the hardcoded ``"mechanical"`` makes this test fail
+    — the issue escalates with ``reason_class="judgment"`` in state but the
+    label transition still lands ``agent:operator-queue``. Dropping the
+    ``deterministic_judgment`` half of ``immediate_escalation`` also fails it
+    (the issue is restored to ``rework_requested`` instead of escalating).
+    """
+    import json
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+    # fake_gh.prs[0]["headRefOid"] defaults to "sha-abc123".
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-fix-search",
+            "redispatch_at": [],  # nowhere near the cap
+        }
+        # Live request_changes decision matching the current head, so this
+        # test isolates the judgment-kind guard rather than finding 1's gate.
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("worktree contains local commits, cannot reset\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(paths.prs / "pr-456" / "rework-prompt.md"),
+        command=("devin", "--prompt-file", "rework-prompt.md"),
+        pid=None,  # Launch failure -- process never started
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="worktree creation failed: worktree contains local commits",
+        failure_kind="worktree_unsafe_local_commits",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
+    )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "worktree_unsafe_local_commits"
+    # Issue #807: a deterministic judgment failure escalates as judgment, so
+    # the label lands agent:human-needed, not agent:operator-queue.
+    assert entry["reason_class"] == "judgment"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
