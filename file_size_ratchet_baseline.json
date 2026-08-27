@@ -59,7 +59,7 @@
   "tests/test_wedge_watchdog.py": 1442,
   "tests/test_worker.py": 2582,
   "tests/test_worker_health.py": 2215,
-  "tests/test_worker_stop_gate.py": 885,
+  "tests/test_worker_stop_gate.py": 1056,
   "tests/test_worktree.py": 8494,
   "tests/test_write_gate_enforcement.py": 1702
 }
