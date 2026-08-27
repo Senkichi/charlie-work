@@ -27,23 +27,44 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, runtime_checkable
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
-from .config import OrchestratorConfig, WORKER_OUTCOME_FILENAME, WRITER_MARKER_FILENAME
+from .config import (
+    LAUNCHER_OWNED_DIRS,
+    OrchestratorConfig,
+    WORKER_OUTCOME_FILENAME,
+    WRITER_MARKER_FILENAME,
+)
 from . import git_pull_blockers
 from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
 from .janitor import _calculate_patch_id
 from . import layout
 from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
-from .process_utils import is_pid_alive
+from .process_utils import is_pid_alive, kill_orphan_pid, kill_process_tree, sweep_orphan_processes
 from .safe_path import contains
 from .safe_ref import require_valid_ref_name, require_valid_rev, require_valid_sha
 from .subprocess_runner import RunResult, run_captured
 from . import state as _state
+from .rescue_capture_exclusions import (  # noqa: F401  (deliberate re-export)
+    _build_rescue_capture_exclusions,
+    _filter_redundant_add_exclusions,
+    _is_glob_pathspec,
+)
+from .base_branch import resolve_base_branch_name  # noqa: F401  (deliberate re-export)
 
 _DEFAULT_TIMEOUT_SECONDS = 60
 # Shorter timeout for network-touching git commands (ls-remote, fetch) so a
 # stalled remote call cannot consume the entire local dispatch budget.
 _REMOTE_TIMEOUT_SECONDS = 20
+
+# PR body scratch files: workers ad-hoc draft PR bodies into root-level .md
+# files with varying naming conventions (``PR_BODY.md``, ``PR_BODY_<issue>.md``,
+# ``.worker-pr-body.md``, ``_pr_body.md``, ``.pr_body_<issue>.md``). All are
+# launcher/protocol residue, not worker output (issue #1391). The regex
+# matches any root-level filename in this family so a new ad-hoc variant does
+# not re-trip the unsafe check.
+_LAUNCHER_OWNED_PR_BODY_RE = re.compile(
+    r"^(?:PR_BODY.*|\.worker-pr-body|_pr_body|\.pr_body.*)\.md$", re.IGNORECASE
+)
 
 
 def _run_remote_captured(command: list[str], cwd: Path) -> RunResult:
@@ -63,15 +84,81 @@ OPERATOR_MARKER_SESSION_ID = "operator-claim"
 OPERATOR_MARKER_KIND = "operator"
 
 
+# Issue #807: ``worktree_unsafe`` is split at detection time into two
+# discriminable kinds, because the two triggers do not share a correct
+# response. Launch-shim dirt / adapter shim materialization (uncommitted
+# modifications) is genuinely mechanical — auto-clear and redispatch is the
+# right move. Genuine unpushed local commits on the worktree branch are a
+# judgment call — returning the issue to dispatch actively fights the safety
+# system that raised the escalation and risks a second writer on a branch
+# that already has divergent local work. The discriminator is the
+# ``dirty_reason`` string already computed at the raise site; classifying at
+# detection (rather than after the fact) makes the invalid state
+# unrepresentable.
+WORKTREE_UNSAFE_KIND_SHIM_DIRT = "worktree_unsafe_shim_dirt"
+WORKTREE_UNSAFE_KIND_LOCAL_COMMITS = "worktree_unsafe_local_commits"
+WORKTREE_UNSAFE_KINDS: frozenset[str] = frozenset(
+    {WORKTREE_UNSAFE_KIND_SHIM_DIRT, WORKTREE_UNSAFE_KIND_LOCAL_COMMITS}
+)
+
+
+def _worktree_unsafe_kind_from_reason(reason: str) -> str:
+    """Map a ``dirty_reason`` string to its ``worktree_unsafe`` sub-kind.
+
+    The reason strings are produced by ``_worktree_refuse_to_reset_reason``
+    and ``_worktree_dirty_reason``. "uncommitted modifications" denotes
+    shim/adapter dirt (mechanical); "local commit(s)" denotes genuine
+    divergence (judgment). A reason that matches neither known pattern
+    defaults to ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`` — the fail-closed
+    classification toward judgment/human-needed — so a future reason
+    string that doesn't match either pattern escalates as a judgment
+    call rather than being silently treated as mechanical and
+    auto-cleared (which would reproduce the #807 bug the split exists to
+    prevent). This mirrors the fail-closed convention already enforced
+    for an unrecognized explicit ``kind`` in ``WorktreeUnsafeError.__init__``
+    and for an unrecognized ``reason_class`` in
+    ``state.escalation_reason_class``.
+    """
+    if "local commit" in reason:
+        return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+    if "uncommitted modifications" in reason:
+        return WORKTREE_UNSAFE_KIND_SHIM_DIRT
+    return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+
+
 class WorktreeUnsafeError(RuntimeError):
     """Raised when ``create_worktree`` is about to reset a worktree that is
     CONFIRMED to contain local work (uncommitted modifications, or local
     commits not on the remote branch). This is a deterministic finding — the
-    launch shim surfaces it as ``failure_kind="worktree_unsafe"``, which sits
-    in ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` and escalates to a
-    human on first occurrence. Do not raise this for a probe that merely
-    *failed to determine* dirtiness — see ``WorktreeProbeFailedError``.
+    launch shim surfaces it as a ``failure_kind`` equal to ``kind``, which
+    sits in ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` (shim dirt) or
+    ``config.DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS`` (local commits)
+    and escalates to a human on first occurrence. Do not raise this for a
+    probe that merely *failed to determine* dirtiness — see
+    ``WorktreeProbeFailedError``.
+
+    ``kind`` carries the discriminator (issue #807) so the launch shim can
+    emit a distinct ``failure_kind`` at detection time rather than
+    classifying after the fact. It is derived from the ``dirty_reason``
+    string by ``_worktree_unsafe_kind_from_reason`` unless the caller
+    supplies it explicitly, in which case it must be one of
+    ``WORKTREE_UNSAFE_KINDS`` — an unrecognized explicit ``kind`` would
+    silently fail to match either
+    ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` or
+    ``config.DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS``, degrading to
+    the ordinary redispatch-cap path instead of escalating, so this fails
+    closed with a ``ValueError`` rather than allowing that silently.
     """
+
+    def __init__(self, reason: str, *, kind: str | None = None) -> None:
+        if kind is not None and kind not in WORKTREE_UNSAFE_KINDS:
+            raise ValueError(
+                f"invalid WorktreeUnsafeError kind {kind!r}; expected one of "
+                f"{sorted(WORKTREE_UNSAFE_KINDS)}"
+            )
+        self.reason = reason
+        self.kind = kind or _worktree_unsafe_kind_from_reason(reason)
+        super().__init__(reason)
 
 
 class WorktreeProbeFailedError(RuntimeError):
@@ -394,7 +481,12 @@ def read_worker_outcome(worktree_path: Path) -> dict[str, Any] | None:
 
 
 def write_worktree_marker(
-    worktree_path: Path, pid: int, session_id: str, kind: str = "worker"
+    worktree_path: Path,
+    pid: int,
+    session_id: str,
+    kind: str = "worker",
+    *,
+    process_start_time: float | None = None,
 ) -> None:
     """Write a ``.charlie-writer.json`` marker into the worktree root.
 
@@ -402,14 +494,26 @@ def write_worktree_marker(
     detect a live foreign writer before dispatching a second one into the
     same worktree. ``kind`` distinguishes long-lived operator claim markers
     (``pid`` is a sentinel) from ordinary worker session markers.
+
+    Issue #1423: ``process_start_time`` is the OS process creation timestamp
+    captured immediately after spawn (same fingerprint the session sidecars
+    store). It is read back by ``_reap_idle_foreign_writer`` and passed to
+    ``kill_process_tree`` so the kill path re-verifies process identity
+    immediately before terminating — the same PID-recycling defense every
+    other ``kill_process_tree`` call site in this codebase uses. A marker
+    without it (legacy marker written before this field existed, or an
+    operator sentinel marker with ``pid == 0``) cannot be safely reaped and
+    falls back to the block/escalate path instead.
     """
     marker_path = worktree_path / WRITER_MARKER_FILENAME
-    marker = {
+    marker: dict[str, Any] = {
         "pid": pid,
         "session_id": session_id,
         "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "kind": kind,
     }
+    if process_start_time is not None:
+        marker["process_start_time"] = process_start_time
     _write_json_atomic(marker_path, marker)
 
 
@@ -495,6 +599,7 @@ def _check_worktree_writer_marker(
     sessions_dir: Path,
     issue_number: int | None = None,
     state_file: Path | None = None,
+    config: OrchestratorConfig | None = None,
 ) -> None:
     """Refuse to enter a worktree that is currently occupied by a foreign writer.
 
@@ -506,6 +611,12 @@ def _check_worktree_writer_marker(
     Operator claim markers (``kind == "operator"`` or legacy ``operator-*``
     session ids) are live while state.json says the issue is operator-claimed,
     independent of PID.
+
+    Issue #1423: when ``config`` is provided, a foreign writer with a live pid
+    is also evaluated against the same inactivity threshold the stall detector
+    uses before blocking dispatch. A writer that is alive but idle past the
+    threshold is reaped and its marker cleaned, so the dispatch proceeds
+    instead of escalating a zombie the fleet itself launched and forgot.
     """
     marker = read_worktree_marker(worktree_path)
     if marker is None:
@@ -536,7 +647,141 @@ def _check_worktree_writer_marker(
     if session_id and own.get(session_id) == pid:
         # Marker belongs to a live session we already know about.
         return
+    # Issue #1423: a foreign writer with a live pid is only ever checked for
+    # "is it alive", never "is it doing anything". A writer the orchestrator
+    # lost the handle to (e.g. via #1398's relabel) is "foreign" in name only
+    # — it is ours, but we forgot. Before blocking dispatch (and eventually
+    # escalating to a human), evaluate it against the same inactivity threshold
+    # the stall detector uses. A foreign writer that is alive but idle past the
+    # threshold is reaped (same kill path as ``session_stalled``) and its marker
+    # cleaned, so the dispatch proceeds instead of escalating a zombie.
+    if config is not None and _reap_idle_foreign_writer(
+        worktree_path,
+        pid,
+        session_id,
+        marker,
+        config,
+        state_file=state_file,
+        issue_number=issue_number,
+    ):
+        return
     raise WorktreeForeignWriterError(worktree_path=worktree_path, pid=pid, session_id=session_id)
+
+
+def _reap_idle_foreign_writer(
+    worktree_path: Path,
+    pid: int,
+    session_id: str | None,
+    marker: dict[str, Any],
+    config: OrchestratorConfig,
+    *,
+    state_file: Path | None = None,
+    issue_number: int | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Reap a foreign writer that is alive but idle past the stall threshold.
+
+    Issue #1423: a writer the orchestrator classifies as *foreign* (live pid,
+    session id not in our sidecars) is exempt from every liveness bound the
+    orchestrator applies to its *own* sessions. Liveness-without-activity is
+    exactly the state the stall detector exists to terminate, and it is
+    reachable from inside the fleet via #1398's relabel, so "foreign" here
+    means "ours, but we lost the handle".
+
+    This helper evaluates the writer against the same real-activity probe the
+    stall detector uses (``real_activity_for_worker``: sessions.db, per-PID
+    Devin log, worktree file mtimes — whichever apply). When the probe is not
+    fresh (every source is quiet past its threshold), the writer is reaped via
+    the same kill path as ``session_stalled`` (``kill_process_tree`` +
+    ``sweep_orphan_processes``), the marker is cleaned, and a
+    ``foreign_writer_reaped`` event is logged. When the probe is fresh, the
+    writer is genuinely active and must remain blocked — escalation is reserved
+    for a writer that is alive *and* active (genuinely someone else's).
+
+    PID-recycling defense (issue #1423 review): the marker's
+    ``process_start_time`` fingerprint is passed to ``kill_process_tree`` so
+    the kill path re-verifies process identity immediately before terminating
+    — the same defense every other ``kill_process_tree`` call site in this
+    codebase uses. A marker without ``process_start_time`` (legacy marker
+    written before the field existed, or an operator sentinel with ``pid 0``)
+    cannot be safely reaped: an idle window can be hours long, and without the
+    fingerprint ``kill_process_tree`` would terminate whatever process now
+    holds the PID, which may be unrelated. Such a marker returns ``False`` so
+    the caller falls back to the block/escalate path instead.
+
+    Returns ``True`` when the writer was reaped (caller should proceed with
+    dispatch), ``False`` when it is still active or cannot be safely reaped
+    (caller should block/raise).
+    """
+    if now is None:
+        now = datetime.now(UTC)
+
+    # PID-recycling defense: refuse to reap a marker that carries no
+    # process-start-time fingerprint. Without it, ``kill_process_tree`` cannot
+    # re-verify identity, and an hours-long idle window is exactly the window
+    # in which the OS recycles PIDs. Fall back to block/escalate instead.
+    process_start_time = marker.get("process_start_time")
+    if not isinstance(process_start_time, (int, float)):
+        return False
+
+    started_at = marker.get("started_at")
+    if not isinstance(started_at, str):
+        started_at = now.isoformat().replace("+00:00", "Z")
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        str(worktree_path),
+        started_at,
+        pid,
+        now,
+        log_path=None,
+        watchdog_config=config.watchdog,
+        worker_kind=None,
+    )
+
+    if probe.is_fresh(config.watchdog.stall_minutes):
+        return False
+
+    # Writer is alive but idle past the threshold — reap it (same kill path
+    # as ``session_stalled`` in ``_detect_and_handle_stalled_sessions``). The
+    # marker's ``process_start_time`` is passed so ``kill_process_tree``
+    # re-verifies identity immediately before terminating, closing the
+    # PID-recycling gap every other kill call site in this codebase closes.
+    killed_pids = kill_process_tree(pid, process_start_time)
+    orphan_pids: list[int] = []
+    orphan_processes = sweep_orphan_processes(str(worktree_path))
+    if orphan_processes:
+        for orphan in orphan_processes:
+            kill_orphan_pid(orphan["pid"])
+            killed_pids.append(orphan["pid"])
+        orphan_pids = [o["pid"] for o in orphan_processes]
+
+    remove_worktree_marker(worktree_path)
+
+    if state_file is not None:
+        try:
+            from .instrumentation import log_event
+
+            log_event(
+                state_file,
+                "foreign_writer_reaped",
+                {
+                    "issue_number": issue_number,
+                    "pid": pid,
+                    "session_id": session_id,
+                    "worktree_path": str(worktree_path),
+                    "killed_pids": killed_pids,
+                    "orphan_pids": orphan_pids if orphan_pids else None,
+                    "latest_real_activity_at": probe.latest_timestamp.isoformat()
+                    if probe.latest_timestamp is not None
+                    else None,
+                    "latest_real_activity_source": probe.latest_source,
+                },
+            )
+        except Exception:  # noqa: BLE001 — instrumentation is best-effort
+            pass
+
+    return True
 
 
 def _read_origin_head_symref(repo_root: Path) -> str | None:
@@ -833,6 +1078,7 @@ def salvage_push_stranded_commits(
     worktree_path: Path,
     *,
     base_ref: str = "",
+    dry_run: bool = False,
 ) -> SalvagePushResult:
     """Fast-forward-push committed-but-unpushed work from a dead worker's worktree.
 
@@ -857,6 +1103,12 @@ def salvage_push_stranded_commits(
       has never seen means someone else pushed -- diverged, skip.
 
     Never raises; every failure comes back as a value.
+
+    Issue #1326: ``dry_run=True`` threads through to ``push_branch``, which
+    short-circuits before the ``git push`` subprocess call. The read-only
+    probing above (rev-parse, ls-remote, merge-base, rev-list) still runs --
+    those are the same read-only git/network calls the orchestrator makes
+    under dry-run elsewhere -- but no real push reaches ``origin``.
     """
     try:
         branch = require_valid_ref_name(branch, context="salvage_push branch")
@@ -960,7 +1212,7 @@ def salvage_push_stranded_commits(
         if commit_count == 0:
             return SalvagePushResult(pushed=False, skip_reason="no_commits_beyond_base")
 
-    ok, push_error = push_branch(repo_root, branch, worktree_path)
+    ok, push_error = push_branch(repo_root, branch, worktree_path, dry_run=dry_run)
     if not ok:
         return SalvagePushResult(
             pushed=False,
@@ -1412,6 +1664,40 @@ def _parse_status_v2_paths(stdout: str) -> list[str]:
     return paths
 
 
+def _launcher_owned_matcher() -> Callable[[str], bool]:
+    """Build a predicate matching worktree-relative paths owned by the
+    worker launch shim (not worker output).
+
+    The shim materializes ``.devin/`` (the Devin CLI config directory) and
+    ``.git_worktree_dir/`` into each worktree on every dispatch; workers
+    also ad-hoc draft PR bodies into root-level ``.md`` scratch files.
+    None of this is worker product — it is launcher/protocol residue that
+    the shim re-materializes on the next dispatch — so it is excluded from
+    the dirty check alongside declared scaffolding (issue #1391).
+
+    Semantically distinct from :func:`_declared_scaffolding_matcher`:
+    declared scaffolding is what the *orchestrator* itself writes
+    (``injected_paths`` + ``materialize_dirs``); launcher-owned paths are
+    what the *shim* writes. Both are "not worker product", but they have
+    different sources and different re-materialization guarantees, so they
+    are kept as separate predicates.
+    """
+    excluded_dirs = [PurePosixPath(d) for d in LAUNCHER_OWNED_DIRS]
+
+    def _is_launcher_owned(raw_path: str) -> bool:
+        path = PurePosixPath(str(raw_path).replace("\\", "/"))
+        # Directory match: path is at or under a launcher-owned directory.
+        if any(path == d or d in path.parents for d in excluded_dirs):
+            return True
+        # PR body scratch file match: root-level file (no path separator)
+        # whose name matches the PR body family pattern.
+        if len(path.parts) == 1 and _LAUNCHER_OWNED_PR_BODY_RE.match(path.name):
+            return True
+        return False
+
+    return _is_launcher_owned
+
+
 def _declared_scaffolding_matcher(
     injected_paths: tuple[str, ...] = (),
     materialize_dirs: tuple[str, ...] = (),
@@ -1660,8 +1946,9 @@ def _worker_authored_dirty(
         )
 
     is_declared = _declared_scaffolding_matcher(injected_paths, materialize_dirs)
+    is_launcher_owned = _launcher_owned_matcher()
     for raw_path in _parse_status_v2_paths(status_result.stdout):
-        if is_declared(raw_path):
+        if is_declared(raw_path) or is_launcher_owned(raw_path):
             continue
         return True
     return False
@@ -1689,14 +1976,12 @@ def _capture_worktree_work_to_rescue_ref(
     as values). A capture failure returns a ``RescueCapture`` with ``error``
     set — the caller must refuse the reset in that case, exactly as today.
     """
-    # Build exclusion pathspecs. ``.venv`` is always excluded: it is either a
-    # junction into the shared virtualenv (following it would add every other
-    # worktree's venv contents) or a local venv that is not worker content.
-    exclusions: list[str] = [":(exclude).venv"]
-    for p in (*injected_paths, *materialize_dirs):
-        normalized = str(p).replace("\\", "/").strip("/")
-        if normalized:
-            exclusions.append(f":(exclude){normalized}")
+    # Build exclusion pathspecs (see _build_rescue_capture_exclusions):
+    # ``.venv``, launcher-owned directories, PR-body scratch files, and
+    # declared scaffolding paths — pruned of any literal exclusion that
+    # would trip git's ignored-file advice/error (see
+    # _filter_redundant_add_exclusions).
+    exclusions = _build_rescue_capture_exclusions(worktree_path, injected_paths, materialize_dirs)
 
     add_result = run_captured(
         ["git", "add", "-A", "--", ".", *exclusions],
@@ -1927,7 +2212,11 @@ def _worktree_refuse_to_reset_reason(
             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )
         if not merge_base_result.ok:
-            return "worktree has local commits not on remote branch"
+            return (
+                f"worktree has local commits not on remote branch "
+                f"(refs/heads/{branch} @ {local_sha[:12]}); push to a "
+                f"salvage ref with: git push origin {local_sha}:refs/heads/salvage/{branch}"
+            )
         merge_base = merge_base_result.stdout.strip()
         rev_list_result = run_captured(
             ["git", "rev-list", "--count", f"{merge_base}..{local_sha}"],
@@ -1939,7 +2228,12 @@ def _worktree_refuse_to_reset_reason(
             and rev_list_result.stdout.strip().isdigit()
             and int(rev_list_result.stdout.strip()) > 0
         ):
-            return f"worktree has {rev_list_result.stdout.strip()} local commit(s) not on remote branch"
+            count = rev_list_result.stdout.strip()
+            return (
+                f"worktree has {count} local commit(s) not on remote branch "
+                f"(refs/heads/{branch} @ {local_sha[:12]}); push to a "
+                f"salvage ref with: git push origin {local_sha}:refs/heads/salvage/{branch}"
+            )
         return None
 
     # Remote branch exists. If local tip matches the remote tip, there are no
@@ -1958,7 +2252,12 @@ def _worktree_refuse_to_reset_reason(
     if ancestor_result.ok:
         return None
 
-    return "worktree has local commits not on remote branch"
+    return (
+        f"worktree has local commits not on remote branch "
+        f"(refs/heads/{branch} @ {local_sha[:12]} diverged from origin/{branch} "
+        f"@ {remote_sha[:12]}); push to a salvage ref with: "
+        f"git push origin {local_sha}:refs/heads/salvage/{branch}"
+    )
 
 
 def _worktree_dirty_reason(
@@ -2761,7 +3060,11 @@ def create_worktree(
         state_file = runtime_paths(repo_root, config.runtime.state_dir).state_file
     if sessions_dir is not None:
         _check_worktree_writer_marker(
-            worktree_path, sessions_dir, issue_number=issue_number, state_file=state_file
+            worktree_path,
+            sessions_dir,
+            issue_number=issue_number,
+            state_file=state_file,
+            config=config,
         )
 
     # Recovery mode: dead-worker re-dispatch with leftover worktree/branch
@@ -2821,7 +3124,10 @@ def create_worktree(
         into a new work session, and returns — the reset is permitted because
         the work is now durable on a ref. If capture fails, raises
         ``WorktreeUnsafeError`` exactly as today — capture failure must never
-        downgrade the safety property.
+        downgrade the safety property. The capture's own error detail is
+        appended to the raised message so a capture-stage failure (e.g. a
+        ``git add`` or ``write-tree`` error) is distinguishable from a bare
+        dirty-worktree refusal in logs and escalation payloads.
 
         The working-tree clean is the single enforcement point for the "never
         commit tracked modifications the shim did not itself produce"
@@ -2843,6 +3149,8 @@ def create_worktree(
             _emit_rescue_event(capture, unsafe_reason, check_path)
             _clean_captured_worktree(check_path, capture_injected)
             return
+        if capture.error:
+            raise WorktreeUnsafeError(f"{unsafe_reason}; rescue capture failed: {capture.error}")
         raise WorktreeUnsafeError(unsafe_reason)
 
     def _clean_captured_worktree(wt_path: Path, clean_injected: tuple[str, ...]) -> None:
@@ -3842,17 +4150,35 @@ def inspect_worktree_state(
 
 
 def push_branch(
-    repo_root: Path, branch: str, worktree_path: Path | None = None
+    repo_root: Path,
+    branch: str,
+    worktree_path: Path | None = None,
+    *,
+    dry_run: bool = False,
 ) -> tuple[bool, str | None]:
     """Push ``branch`` to origin and verify via ``git ls-remote``.
 
     Returns ``(ok, error)``. Pushes can fail silently on some transports, so the
     remote branch tip is explicitly checked and compared to the local branch tip.
+
+    Issue #1326: ``dry_run=True`` short-circuits before the ``git push``
+    subprocess call, returning ``(True, None)`` -- the natural "nothing
+    happened" result shape (the push neither failed nor produced a remote tip
+    to verify). This mirrors ``_reconcile_locked``'s explicit-threading
+    convention: the orchestrator's ``dry_run`` flag is threaded directly,
+    rather than going through ``WriteGate`` (which covers state.json /
+    events.db / label-transition / process-kill primitives, not git-level
+    mutations). Downstream callers' own state writes and label transitions
+    remain gated by ``WriteGate``; the ``gh pr create`` that follows in
+    ``_attempt_salvage`` is gated at the ``GitHub`` client sink level.
     """
     try:
         branch = require_valid_ref_name(branch, context="push_branch branch")
     except ValueError as exc:
         return False, str(exc)
+
+    if dry_run:
+        return True, None
 
     cwd = worktree_path if worktree_path else repo_root
     push_result = run_captured(
@@ -3886,30 +4212,6 @@ def push_branch(
     if local_sha_result.stdout.strip() == remote_sha:
         return True, None
     return False, f"remote branch {branch} does not match local tip after push"
-
-
-def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
-    """Convert a base ref (e.g. ``origin/main`` or ``HEAD``) into a branch name.
-
-    ``gh pr create --base`` expects a simple branch name. Remote-tracking refs
-    are stripped to their local branch name; ``HEAD`` falls back to the current
-    branch or ``main``.
-    """
-    if base_ref.startswith("refs/remotes/origin/"):
-        return base_ref[len("refs/remotes/origin/") :]
-    if base_ref.startswith("refs/heads/"):
-        return base_ref[len("refs/heads/") :]
-    if base_ref.startswith("origin/"):
-        return base_ref[len("origin/") :]
-    if base_ref == "HEAD":
-        current_branch = run_captured(
-            ["git", "branch", "--show-current"],
-            cwd=repo_root,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-        )
-        if current_branch.ok and current_branch.stdout.strip():
-            return current_branch.stdout.strip()
-    return "main"
 
 
 def salvage_branch_empty_diff(repo_root: Path, branch: str, base_ref: str) -> bool:

@@ -46,6 +46,17 @@ WRITER_MARKER_FILENAME = ".charlie-writer.json"
 # this module) -- the same arrangement as ``WRITER_MARKER_FILENAME`` above.
 WORKER_OUTCOME_FILENAME = ".worker-outcome.json"
 
+# Launcher-owned directories written into each worktree by the worker launch
+# shim (the Devin CLI's ``.devin`` config directory and the
+# ``.git_worktree_dir`` marker). These are NOT worker output — the shim
+# materializes them and re-materializes them on every dispatch. Shared by
+# ``worktree._worker_authored_dirty`` (excluded from the dirty check) and
+# ``cross_repo_gate.extract_referenced_paths`` (excluded from path candidates)
+# so the two modules share one definition of "launcher-owned, not evidence"
+# (issue #1391). Like ``.venv``, these are structural single-directory
+# constants, not a hand-maintained list of elements.
+LAUNCHER_OWNED_DIRS: tuple[str, ...] = (".devin", ".git_worktree_dir")
+
 
 def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     """Return path strings with Windows backslash separators normalized to '/'.
@@ -59,7 +70,23 @@ def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, 
 
 
 DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"worker_blocked", "worktree_unsafe", "rework_branch_conflict", "cross_repo_hop"}
+    {
+        "worker_blocked",
+        "worktree_unsafe_shim_dirt",
+        "rework_branch_conflict",
+        "cross_repo_hop",
+        "provider_suspended",
+    }
+)
+# Issue #807: failure kinds that escalate immediately (like
+# DETERMINISTIC_ESCALATION_FAILURE_KINDS) but as ``reason_class="judgment"``
+# rather than ``"mechanical"``, so the de-escalation sweep never auto-clears
+# them. ``worktree_unsafe_local_commits`` — genuine unpushed local commits on
+# the worktree branch — is a judgment call: returning the issue to dispatch
+# actively fights the safety system that raised the escalation and risks a
+# second writer on a branch that already has divergent local work.
+DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
+    {"worktree_unsafe_local_commits"}
 )
 # Deliberately excluded: "worktree_probe_failed" (see worktree.WorktreeProbeFailedError).
 # A failed safety probe (e.g. git status --porcelain hitting an index lock) is
@@ -73,6 +100,40 @@ DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
 # and exits with zero artifacts in the dispatching repo.  Escalate on the
 # first occurrence so a human can file/transfer a mirror into the target
 # repo's tracker, exactly as was done by hand for #709.
+#
+# "provider_suspended" (issue #1342): a provider account suspension /
+# insufficient-balance response (e.g. Moonshot "suspended due to insufficient
+# balance").  The Claude Code CLI retries it as a transient rate-limit, so
+# without this classification the orchestrator burns the full auto-redispatch
+# cap (~35 min, 4 sessions) on a deterministic external billing failure before
+# the operator hears about it.  Escalate on the first occurrence so the
+# operator learns about a billing problem in minutes, and the issue's own
+# dispatch history is not polluted by a provider outage.
+
+# Issue #1393: pre-launch environment blocks — failure kinds that happen
+# BEFORE a worker session PID exists (the worker process never started).
+# These are deterministic, zero-cost, and guaranteed to repeat until the
+# environment conflict is resolved (e.g. a stale foreign worktree is
+# removed).  Counting them against the redispatch cap converts an operator
+# hygiene problem into a fake "worker quality" escalation
+# (redispatch_cap_exceeded / no_op_rework_cap_exceeded) whose text gives
+# the operator no hint that the fix is "remove the stale worktree."
+#
+# Instead of incrementing redispatch_at, the dispatch layer records these
+# in a separate blocked_environment_at list and escalates with reason
+# "dispatch_blocked_environment" (including the blocking path) after the
+# same max_auto_redispatch cap — so the operator sees "remove C:\...\wt",
+# not "worker quality cap exceeded."
+#
+# Deliberately disjoint from DETERMINISTIC_ESCALATION_FAILURE_KINDS: those
+# escalate on the *first* occurrence (the environment is unrecoverable
+# without a human).  A blocked-environment refusal is recoverable by
+# operator hygiene (remove the stale checkout), so it gets the same retry
+# budget as an ordinary redispatch before escalating — just with the
+# correct reason and the blocking path in the message.
+PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS: frozenset[str] = frozenset(
+    {"worktree_foreign_writer"}
+)
 
 
 class ConfigError(ValueError):
@@ -530,6 +591,23 @@ class DeescalationConfig:
     # a distinct one-time event (deescalation_cap_exhausted) makes the
     # terminal state diagnosable rather than a silently renamed one-way door.
     max_auto_deescalations: int = 2
+    # Issue #1314 item 2: dedicated cadence knob for the operator-queue
+    # depth gauge (item 3). The gauge currently rides the loop pass cadence
+    # (every pass); this knob lets operators slow it to a dedicated interval
+    # if the per-pass emission volume is too high for their fleet. 0 means
+    # "check every pass" (preserves the pre-knob behavior); > 0 means
+    # "check every N minutes", gated by a ``next_operator_queue_review_at``
+    # timestamp in ``state.json``'s ``deescalation_pass`` section.
+    operator_queue_review_interval_minutes: int = 0
+    # Issue #1314 item 3: alert threshold for the ``operator_queue_depth``
+    # gauge event. When the number of issues parked on
+    # ``agent:operator-queue`` (state entries with ``status == "escalated"``
+    # and ``reason_class == "mechanical"``) exceeds this threshold, a
+    # warning-level ``operator_queue_depth`` event is emitted to
+    # ``events.db`` so a silently growing queue is visible to
+    # ``heartbeat_check.py`` rather than only via label queries. 0 disables
+    # the alert (no event emitted regardless of depth).
+    operator_queue_depth_threshold: int = 5
 
 
 @dataclass(frozen=True)
@@ -635,6 +713,105 @@ class ReviewDispatchConfig:
     # after a config change invalidates the current cohort) without needing
     # to rename or remove the fraction field.
     review_effort_experiment_salt: str = ""
+    # Issue #1439: structure-aware reviewer turn cap. The flat
+    # ``review_max_turns`` budget ignores the size of the files a diff touches,
+    # so a PR threading a monolith (e.g. workflow.py at ~25k lines) burns the
+    # whole turn budget on grep -> Read-window navigation without ever reaching
+    # a verdict, then retries the identical flat budget on the next dispatch.
+    # These knobs make the cap structure-aware and self-escalating:
+    #
+    #   effective_multiplier = min(structure_multiplier + turn_limit_miss_streak,
+    #                              turn_cap_max_multiplier)
+    #   final_cap = review_max_turns * effective_multiplier
+    #
+    # where ``structure_multiplier`` is ``turn_cap_large_file_multiplier`` when
+    # any touched file exceeds ``turn_cap_large_file_threshold`` lines, else 1.
+    # The miss streak increments on each ``review_verdict_missed`` with reason
+    # ``turn_limit_summary_posted`` and resets on a recorded verdict or a fresh
+    # packet (new head). After ``max_consecutive_turn_limit_misses`` consecutive
+    # turn-limit misses the PR escalates to ``agent:human-needed`` instead of a
+    # further identical session. 0 disables the backstop (preserves the
+    # pre-fix unbounded retry -- not recommended).
+    # Line count above which a touched file triggers the structure multiplier.
+    # 0 disables the structure bonus (every diff uses the base cap).
+    turn_cap_large_file_threshold: int = 5000
+    # Multiplier applied to ``review_max_turns`` when any touched file exceeds
+    # ``turn_cap_large_file_threshold``. Clamped to ``turn_cap_max_multiplier``.
+    turn_cap_large_file_multiplier: int = 2
+    # Absolute cap on the effective multiplier (structure bonus + miss
+    # escalation combined). Prevents unbounded cap growth on a PR that keeps
+    # hitting the turn limit.
+    turn_cap_max_multiplier: int = 3
+    # After this many CONSECUTIVE turn-limit misses on one PR, escalate to a
+    # human instead of redispatching with a further-raised (but already-maxed)
+    # cap. 0 disables the backstop.
+    max_consecutive_turn_limit_misses: int = 3
+    # Issue #1445: repo file-size cap (lines). A diff that adds code to a file
+    # whose post-diff line count exceeds this cap is a REPORTABLE FINDING in the
+    # review packet (the review rubric references this cap generically rather
+    # than hardcoding a number). 0 disables the over-cap finding probe -- the
+    # rubric prose stays present but no dynamic finding section is rendered.
+    # This knob is the cap source the rubric line points at; once issue #1442's
+    # high-water-mark line-count ratchet (or its successor structural signal)
+    # lands, that source should rebind/replace this value rather than the
+    # rubric or probe hardcoding a constant of their own.
+    file_size_cap_lines: int = 0
+
+
+@dataclass(frozen=True)
+class InfraBlockedConfig:
+    """Classification + escalation knobs for required checks that fail
+    because of a fleet-wide infrastructure condition (Actions budget
+    exhaustion, runner outage, quota) rather than the PR's code -- issue
+    #1383.
+
+    A check matching the structural or annotation signal is classified
+    ``infra_blocked`` (see ``checks.is_infra_blocked_check``), excluded from
+    the "required checks failed -> dispatch rework" path, and held without
+    burning rework attempts. Persistence across ``persistence_passes`` loop
+    passes emits exactly ONE operator-facing ``infra_blocked_escalated``
+    event per ``escalation_window_minutes`` window -- not one per PR per
+    pass -- so a billing outage escalates the infra, not every healthy PR
+    on it.
+
+    The annotation substring list lives in config, not code: an operator
+    can retune it for a new infra-outage annotation without a deploy. The
+    structural signal (zero non-setup steps / instant-fail) is code-based
+    and preferred where the Actions API exposes step/timing data.
+    """
+
+    #: Master switch. When False, no infra_blocked classification happens
+    #: and budget-failed checks fall back to ordinary ``failed`` routing
+    #: (the pre-#1383 behavior).
+    enabled: bool = True
+    #: Reserved timing threshold. Originally a separate "instant-fail"
+    #: signal for jobs whose ``steps`` array the Actions API omitted (a
+    #: FAILURE concluding within this many seconds of starting). The
+    #: round-2 #1383 review found that gating the missing-``steps`` case
+    #: on this threshold was not behavior-preserving vs. the pre-#1383
+    #: ``is_infrastructure_failure`` (which returned True for a missing
+    #: ``steps`` key unconditionally), so the missing/empty/setup-only
+    #: steps case is now classified by ``is_infra_blocked_check``'s
+    #: zero-step signal regardless of this value. The field is kept (and
+    #: still validated) as a reserved knob so a future timing signal for
+    #: a distinct shape can reuse it without a config migration; it
+    #: currently has no behavioral effect.
+    instant_fail_seconds: int = 10
+    #: Case-insensitive annotation substrings (matched against each
+    #: annotation's ``message``) that indicate an infrastructure/billing
+    #: block rather than a code failure. Kept in config per issue #1383.
+    annotation_patterns: tuple[str, ...] = (
+        "the job was not started",
+        "actions budget is preventing further use",
+        "no runner matching",
+        "usage limit",
+    )
+    #: Number of loop passes the infra_blocked condition must persist
+    #: across before a single operator-facing escalation is emitted (AC3).
+    persistence_passes: int = 3
+    #: Window (minutes) during which only one ``infra_blocked_escalated``
+    #: event is emitted, regardless of how many PRs are affected (AC3).
+    escalation_window_minutes: int = 60
 
 
 @dataclass(frozen=True)
@@ -664,6 +841,10 @@ class AutoMergeConfig:
     # run id for a check has been retried this many times on the current
     # head, the PR escalates to a human instead of retrying forever.
     infra_rerun_attempt_cap: int = 2
+    # Issue #1383: classification + escalation knobs for required checks
+    # that fail because of a fleet-wide infra condition (Actions budget /
+    # runner outage) rather than the PR's code. See InfraBlockedConfig.
+    infra_blocked: InfraBlockedConfig = field(default_factory=InfraBlockedConfig)
     # Maximum minutes after the PR's last update (updatedAt) to wait for any
     # required check run to appear before routing an approved PR to readiness
     # rework. This catches invisible CI-never-started stalls (mergeStateStatus
@@ -718,6 +899,20 @@ class AutoMergeConfig:
     # firing exactly as before, so the control's failure mode is unchanged
     # until an operator names the bot.
     queue_bot_login: str | None = None
+    # Issue #1401: time-in-mergequeue watchdog. When a PR has carried the
+    # Aviator ``mergequeue`` label for more than this many hours with no head
+    # movement (Aviator never rebased it) and no merge, reconcile escalates it
+    # to a human instead of re-evaluating it forever. The per-pass
+    # ``consecutive_failed_merge_attempts`` counter is a one-shot alarm that
+    # resets on any can_merge pass, so a PR alternating can_merge true/false --
+    # or one Aviator itself keeps failing -- is invisible after its first
+    # alarm. This knob is the independent time-in-queue bound. 0 disables the
+    # time-based trigger (the Aviator-failure trigger below is independent of
+    # it). The companion Aviator-failure trigger (mergequeue + Aviator
+    # ``blocked`` + aviator/checks completed-failure) is unconditional when
+    # ``mergequeue_label`` is set -- it is a definitive "Aviator will not merge
+    # this" signal, not a heuristic, so it does not need a time floor.
+    mergequeue_wedge_hours: float = 24.0
 
     def __post_init__(self) -> None:
         legacy_to_strategy = {
@@ -1298,6 +1493,20 @@ class WatchdogConfig:
     # in the issue title, which is trivially distinguishable from a
     # legitimately long worker session.
     dead_dispatched_reap_minutes: int = 60
+    # Issue #1423: upper bound on how many times a ``worktree_foreign_writer``
+    # block can be auto-reaped for the same issue before falling back to
+    # escalation. Each successful reap resets ``blocked_environment_at`` to
+    # ``[]``, so without a separate cross-pass cap a persistently-blocked
+    # worktree (a foreign writer that keeps coming back, or a new one
+    # appearing each pass) would loop forever between reap and redispatch
+    # instead of ever escalating. The counter is a windowed list of reap
+    # timestamps (``foreign_writer_reaps`` on the issue entry, same window as
+    # ``redispatch_window_minutes``) so it eventually clears once the
+    # underlying cause is gone. 0 disables auto-reaping entirely (always
+    # escalate at cap exhaustion), consistent with ``max_auto_redispatch``
+    # where 0 means "never redispatch." The default of 2 provides the bound
+    # the reviewer requested.
+    max_foreign_writer_reaps: int = 2
 
 
 @dataclass(frozen=True)
@@ -2037,6 +2246,25 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'review_dispatch' key 'diff_line_threshold' must be >= 0, "
             f"got {rd_diff_threshold}"
         )
+    # Issue #1439: structure-aware turn-cap knobs.
+    _RD_INT_KEYS = (
+        "turn_cap_large_file_threshold",
+        "turn_cap_large_file_multiplier",
+        "turn_cap_max_multiplier",
+        "max_consecutive_turn_limit_misses",
+        "file_size_cap_lines",
+    )
+    for _rd_key in _RD_INT_KEYS:
+        _rd_val = review_dispatch_data.get(_rd_key)
+        if _rd_val is not None and (isinstance(_rd_val, bool) or not isinstance(_rd_val, int)):
+            raise ConfigError(
+                f"config section 'review_dispatch' key '{_rd_key}' must be an int, "
+                f"got {type(_rd_val).__name__}"
+            )
+        if _rd_val is not None and _rd_val < 0:
+            raise ConfigError(
+                f"config section 'review_dispatch' key '{_rd_key}' must be >= 0, got {_rd_val}"
+            )
     rd_effort = review_dispatch_data.get("review_effort")
     if rd_effort is not None and not isinstance(rd_effort, str):
         raise ConfigError(
@@ -2158,6 +2386,52 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             f"got {rp_alert_days}"
         )
     reconcile_pass = _build_section(ReconcilePassConfig, "reconcile_pass", reconcile_pass_data)
+    # Issue #1314: extract ONLY the two new operator-queue follow-up knobs
+    # from the ``deescalation`` section. The section as a whole was
+    # previously 100% inert (never passed into OrchestratorConfig — always
+    # defaulted), and activating full-section parsing here would silently
+    # (a) hard-reject unknown keys via ``_build_section`` for any live config
+    # that already has a ``deescalation:`` block with extra/typo'd keys
+    # (self-deploy-brick risk) and (b) flip ``enabled`` / ``interval_minutes``
+    # defaults for configs that set those keys expecting them to be ignored.
+    # Full-section activation is a separate, explicitly-reviewed change with
+    # operator notification; this PR scopes to the two fields the issue
+    # actually asks for. Unknown keys and pre-existing
+    # ``enabled``/``interval_minutes`` overrides are silently ignored, same
+    # as before this PR.
+    deescalation_data = _section(data, "deescalation")
+    oqr_interval = deescalation_data.get("operator_queue_review_interval_minutes")
+    if oqr_interval is not None and (
+        isinstance(oqr_interval, bool) or not isinstance(oqr_interval, int)
+    ):
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_review_interval_minutes' "
+            f"must be an int, got {type(oqr_interval).__name__}"
+        )
+    if oqr_interval is not None and oqr_interval < 0:
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_review_interval_minutes' "
+            f"must be >= 0, got {oqr_interval}"
+        )
+    oq_threshold = deescalation_data.get("operator_queue_depth_threshold")
+    if oq_threshold is not None and (
+        isinstance(oq_threshold, bool) or not isinstance(oq_threshold, int)
+    ):
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_depth_threshold' "
+            f"must be an int, got {type(oq_threshold).__name__}"
+        )
+    if oq_threshold is not None and oq_threshold < 0:
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_depth_threshold' "
+            f"must be >= 0, got {oq_threshold}"
+        )
+    deescalation_overrides: dict[str, Any] = {}
+    if oqr_interval is not None:
+        deescalation_overrides["operator_queue_review_interval_minutes"] = oqr_interval
+    if oq_threshold is not None:
+        deescalation_overrides["operator_queue_depth_threshold"] = oq_threshold
+    deescalation = DeescalationConfig(**deescalation_overrides)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
@@ -2254,6 +2528,79 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         # Store the stripped value: it is compared against the GitHub commit
         # author login, where surrounding whitespace can never match.
         auto_merge_data["queue_bot_login"] = stripped_queue_bot_login
+    mergequeue_wedge_hours = auto_merge_data.get("mergequeue_wedge_hours")
+    if mergequeue_wedge_hours is not None:
+        if isinstance(mergequeue_wedge_hours, bool) or not isinstance(
+            mergequeue_wedge_hours, (int, float)
+        ):
+            raise ConfigError(
+                "config section 'auto_merge' key 'mergequeue_wedge_hours' must be a "
+                f"number, got {type(mergequeue_wedge_hours).__name__}"
+            )
+        if mergequeue_wedge_hours < 0:
+            raise ConfigError(
+                "config section 'auto_merge' key 'mergequeue_wedge_hours' "
+                f"must not be negative, got {mergequeue_wedge_hours}"
+            )
+        auto_merge_data["mergequeue_wedge_hours"] = float(mergequeue_wedge_hours)
+    # Issue #1383: nested infra_blocked section under auto_merge.
+    infra_blocked_data = auto_merge_data.get("infra_blocked")
+    if infra_blocked_data is not None:
+        if not isinstance(infra_blocked_data, dict):
+            raise ConfigError(
+                "config section 'auto_merge' key 'infra_blocked' must be a mapping, "
+                f"got {type(infra_blocked_data).__name__}"
+            )
+        infra_blocked_fields = {f.name for f in fields(InfraBlockedConfig)}
+        unknown_ib_keys = sorted(set(infra_blocked_data) - infra_blocked_fields)
+        if unknown_ib_keys:
+            raise ConfigError(
+                "config section 'auto_merge' key 'infra_blocked' has unknown key(s): "
+                f"{', '.join(unknown_ib_keys)} "
+                f"(valid: {', '.join(sorted(infra_blocked_fields))})"
+            )
+        annotation_patterns = infra_blocked_data.get("annotation_patterns")
+        if annotation_patterns is not None:
+            if not isinstance(annotation_patterns, list):
+                raise ConfigError(
+                    "config section 'auto_merge' key 'infra_blocked.annotation_patterns' "
+                    f"must be a list of strings, got {type(annotation_patterns).__name__}"
+                )
+            infra_blocked_data["annotation_patterns"] = tuple(
+                str(item) for item in annotation_patterns
+            )
+        for int_key in ("instant_fail_seconds", "persistence_passes"):
+            int_value = infra_blocked_data.get(int_key)
+            if int_value is not None:
+                if isinstance(int_value, bool) or not isinstance(int_value, int):
+                    raise ConfigError(
+                        f"config section 'auto_merge' key 'infra_blocked.{int_key}' must be an "
+                        f"int, got {type(int_value).__name__}"
+                    )
+                if int_value < 0:
+                    raise ConfigError(
+                        f"config section 'auto_merge' key 'infra_blocked.{int_key}' must be >= 0, "
+                        f"got {int_value}"
+                    )
+        esc_minutes = infra_blocked_data.get("escalation_window_minutes")
+        if esc_minutes is not None:
+            if isinstance(esc_minutes, bool) or not isinstance(esc_minutes, int):
+                raise ConfigError(
+                    "config section 'auto_merge' key 'infra_blocked.escalation_window_minutes' "
+                    f"must be an int, got {type(esc_minutes).__name__}"
+                )
+            if esc_minutes < 0:
+                raise ConfigError(
+                    "config section 'auto_merge' key 'infra_blocked.escalation_window_minutes' "
+                    f"must be >= 0, got {esc_minutes}"
+                )
+        enabled_value = infra_blocked_data.get("enabled")
+        if enabled_value is not None and not isinstance(enabled_value, bool):
+            raise ConfigError(
+                "config section 'auto_merge' key 'infra_blocked.enabled' must be a bool, "
+                f"got {type(enabled_value).__name__}"
+            )
+        auto_merge_data["infra_blocked"] = InfraBlockedConfig(**infra_blocked_data)
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
     runtime_data = _section(data, "runtime")
     throttle_error_markers = runtime_data.get("throttle_error_markers")
@@ -3169,6 +3516,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         review_dispatch=review_dispatch,
         quota_probe=quota_probe,
         reconcile_pass=reconcile_pass,
+        deescalation=deescalation,
         auto_merge=auto_merge,
         runtime=runtime,
         devin=devin,

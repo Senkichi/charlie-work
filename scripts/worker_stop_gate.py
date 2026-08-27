@@ -478,7 +478,7 @@ def _run_ruff(repo_root: Path, py_files: tuple[str, ...]) -> GateResult:
     if not py_files:
         return GateResult(block=False)
     check = _run(
-        ["uv", "run", "--no-sync", "ruff", "check", *py_files],
+        ["uv", "run", "--no-sync", "ruff", "check", "--force-exclude", *py_files],
         cwd=repo_root,
         timeout=RUFF_TIMEOUT_SECONDS,
     )
@@ -487,7 +487,7 @@ def _run_ruff(repo_root: Path, py_files: tuple[str, ...]) -> GateResult:
             block=True, reason="ruff check failed:\n" + (check.stdout + check.stderr).strip()
         )
     fmt = _run(
-        ["uv", "run", "--no-sync", "ruff", "format", "--check", *py_files],
+        ["uv", "run", "--no-sync", "ruff", "format", "--check", "--force-exclude", *py_files],
         cwd=repo_root,
         timeout=RUFF_TIMEOUT_SECONDS,
     )

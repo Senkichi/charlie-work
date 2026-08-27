@@ -438,6 +438,8 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "static_probe_section",
     "diff_size_section",
     "ci_status_section",
+    "over_cap_section",
+    "attachment_budget_section",
     "prior_review_section",
 }
 
@@ -534,6 +536,8 @@ def test_review_md_renders_with_production_paths_and_no_state_dir_literal(
         "static_probe_section": "",
         "diff_size_section": "",
         "ci_status_section": "",
+        "over_cap_section": "",
+        "attachment_budget_section": "",
         "prior_review_section": "",
     }
     assert set(values) == REVIEW_MD_SUPPLIED_KEYS
@@ -589,6 +593,8 @@ def test_review_md_repo_local_override_render_with_no_state_dir_literal(
         "static_probe_section": "",
         "diff_size_section": "",
         "ci_status_section": "",
+        "over_cap_section": "",
+        "attachment_budget_section": "",
         "prior_review_section": "",
     }
     assert set(values) == REVIEW_MD_SUPPLIED_KEYS
