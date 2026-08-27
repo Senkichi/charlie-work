@@ -3434,6 +3434,34 @@ def test_resolve_base_branch_name_heals_missing_origin_head(tmp_path: Path) -> N
     assert symref.stdout.strip() == "refs/remotes/origin/trunk"
 
 
+def test_resolve_base_branch_name_returns_main_when_origin_unhealable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #1250 regression for the ``except RuntimeError`` branch in
+    ``resolve_base_branch_name``: when an origin remote is present but its
+    default branch cannot be healed (``_resolve_default_branch_ref`` raises),
+    the function must return ``"main"`` without raising and log a warning
+    carrying the underlying exception detail.
+
+    Mirrors ``test_resolve_default_branch_ref_raises_when_unhealable``'s fixture
+    (origin pointed at a nonexistent local path so ``set-head --auto`` fails
+    fast without network), but exercises the public caller's contract that the
+    RuntimeError is converted into a value plus a visible warning rather than
+    propagated. Against an unfixed ``resolve_base_branch_name`` that did not
+    catch the RuntimeError, this test would raise instead of returning ``main``.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    _git(repo_root, "remote", "add", "origin", str(tmp_path / "does-not-exist"))
+
+    with caplog.at_level("WARNING", logger="charlie_work.worktree"):
+        assert resolve_base_branch_name(repo_root, "") == "main"
+    assert any(
+        "falling back to hardcoded 'main'" in record.message and "issue #239" in record.message
+        for record in caplog.records
+    )
+
+
 def test_fresh_dispatch_autoresolve_ignores_stale_local_head(tmp_path: Path) -> None:
     """base_ref='' must base on the fetched origin tip even when origin/HEAD is
     unset and local HEAD is stale AND carries operator-only work (issue #239)."""
