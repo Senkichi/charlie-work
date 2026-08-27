@@ -18664,6 +18664,66 @@ def test_merge_ready_event_persists_gate_inputs_distinguishing_false_causes(
     assert len(triples) == 3
 
 
+def test_merge_ready_real_path_return_data_includes_gate_inputs(
+    tmp_path: Path,
+) -> None:
+    """Issue #1060: the real (non-dry-run) ``merge_ready()`` call's returned
+    ``.data`` dict must include the four gate inputs
+    (``summary_ready``, ``approved``, ``require_approved_review``,
+    ``sync_failed``) alongside ``can_merge``, for diagnostic parity with the
+    persisted ``merge_ready`` event. The review found that only the persisted
+    event and the dry-run return were covered -- the real-path in-memory
+    verdict's gate-input spread had no regression test.
+
+    Two scenarios exercise both the ``can_merge=True`` and ``can_merge=False``
+    branches so the assertion is not vacuously satisfied by a missing key
+    defaulting to a falsy value.
+    """
+    gate_keys = {"summary_ready", "approved", "require_approved_review", "sync_failed"}
+
+    # --- Scenario 1: approved + green -> can_merge=True -------------------
+    config_ok = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_ok = runtime_paths(tmp_path / "ok", config_ok.runtime.state_dir)
+    fake_gh_ok = FakeGitHub()
+    app_ok = OrchestratorApp(tmp_path / "ok", paths_ok, config_ok, fake_gh_ok)
+    app_ok.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    result_ok = app_ok.merge_ready(456, merge=False)
+
+    assert result_ok.data["can_merge"] is True
+    assert gate_keys <= set(result_ok.data)
+    assert result_ok.data["summary_ready"] is True
+    assert result_ok.data["approved"] is True
+    assert result_ok.data["require_approved_review"] is True
+    assert result_ok.data["sync_failed"] is False
+
+    # --- Scenario 2: no recorded approval -> can_merge=False --------------
+    config_noappr = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_noappr = runtime_paths(tmp_path / "noappr", config_noappr.runtime.state_dir)
+    fake_gh_noappr = FakeGitHub()
+    app_noappr = OrchestratorApp(tmp_path / "noappr", paths_noappr, config_noappr, fake_gh_noappr)
+    # Deliberately do NOT record a review -> approved=False.
+    result_noappr = app_noappr.merge_ready(456, merge=False)
+
+    assert result_noappr.data["can_merge"] is False
+    assert gate_keys <= set(result_noappr.data)
+    assert result_noappr.data["summary_ready"] is True
+    assert result_noappr.data["approved"] is False
+    assert result_noappr.data["require_approved_review"] is True
+    assert result_noappr.data["sync_failed"] is False
+
+
 def test_merge_ready_mergequeue_parked_pr_excluded_from_merge_train_head(
     tmp_path: Path,
 ) -> None:
