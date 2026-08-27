@@ -262,6 +262,41 @@ def test_required_check_infra_failed_is_not_check_failure_block() -> None:
     assert any("infrastructure" in f.lower() for f in verdict.failures)
 
 
+def test_infra_blocked_block_holds_when_non_required_check_also_fails() -> None:
+    """Round-2 #1383 guard: a fleet-wide outage typically fails non-required
+    jobs too (e.g. an optional docs/lint job that also never started). The
+    janitor gate must still classify the PR as ``is_infra_blocked_block`` so
+    the protection is not silently disqualified.
+
+    This locks in the structural reason the disqualification does NOT happen:
+    ``summarize_checks`` only iterates the ``required`` tuple, so a
+    non-required check's FAILURE never enters the janitor ``failures`` list
+    and therefore never inflates ``non_required_checks_failures`` (which
+    counts failures NOT contributed by ``_check_required_checks`` -- draft,
+    state, mergeable, linked-issue, body, no-op-rework -- not literally
+    "non-required check failures"). The required check is shown here in its
+    post-enrichment ``INFRA_BLOCKED`` marker state, exactly as
+    ``_enrich_checks_infra_blocked`` would rewrite it before ``run_janitor``
+    sees it.
+    """
+    checks = [
+        {"name": "Tests passed", "state": "INFRA_BLOCKED"},
+        {"name": "Lint & Format", "bucket": "pass"},
+        # A non-required job that also failed with a zero-step / infra
+        # signature during the same fleet-wide outage.
+        {"name": "Optional Docs Build", "state": "FAILURE"},
+    ]
+
+    verdict = run_janitor(_green_pr(), checks, _config(), repo_root=Path.cwd())
+
+    assert verdict.is_infra_blocked_block is True
+    assert verdict.failed_required_checks == ()
+    # The only recorded failure is the infra-blocked required check -- the
+    # non-required FAILURE contributed nothing to ``failures``.
+    assert len(verdict.failures) == 1
+    assert "infra-blocked" in verdict.failures[0].lower()
+
+
 def test_no_required_checks_configured_skips_check_gate() -> None:
     verdict = run_janitor(_green_pr(), [], _config(required_checks=()))
 
@@ -700,6 +735,7 @@ index aaaaaaa..bbbbbbb 100644
         pr_state=pr_state,
         repo_root=tmp_path,
         pr_diff=diff_after_base_update,
+        review_decision=pr_state,
     )
 
     assert verdict.ok is False, (
@@ -734,7 +770,13 @@ index 1234567..abcdef0 100644
     pr_state["reviewed_patch_id"] = current_patch_id
 
     verdict = run_janitor(
-        pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd(), pr_diff=diff
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        pr_diff=diff,
+        review_decision=pr_state,
     )
 
     assert verdict.ok is False
@@ -795,7 +837,13 @@ index 1234567..abcdef0 100644
 """
 
     verdict = run_janitor(
-        pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd(), pr_diff=diff
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        pr_diff=diff,
+        review_decision=pr_state,
     )
 
     # Should FAIL because SHA matches (fallback behavior)
@@ -813,7 +861,13 @@ def test_no_op_rework_skips_patch_id_check_without_diff() -> None:
     }
 
     verdict = run_janitor(
-        pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd(), pr_diff=None
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        pr_diff=None,
+        review_decision=pr_state,
     )
 
     # Should FAIL because SHA matches (fallback behavior when diff is None)
@@ -1522,7 +1576,14 @@ def test_no_op_rework_detects_unchanged_head() -> None:
         "reviewed_head_sha": "abc123",
     }
 
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        review_decision=pr_state,
+    )
 
     assert verdict.ok is False
     assert any("PR head unchanged since request_changes verdict" in f for f in verdict.failures)
@@ -1835,7 +1896,14 @@ def test_no_op_rework_merge_only_fails_gate(tmp_path: Path) -> None:
         "reviewed_head_sha": initial_sha,
     }
 
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=local_repo)
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=local_repo,
+        review_decision=pr_state,
+    )
 
     # Should FAIL (merge-only advance is a no-op rework)
     assert verdict.ok is False
@@ -1993,7 +2061,14 @@ def test_no_op_rework_git_failure_degrades_to_warning(tmp_path: Path) -> None:
         "reviewed_head_sha": initial_sha,
     }
 
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=tmp_path)
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=tmp_path,
+        review_decision=pr_state,
+    )
 
     # Should PASS (git failure degrades to warning, not failure)
     assert verdict.ok is True
@@ -2050,7 +2125,14 @@ def test_no_op_rework_unpushed_commit_enrichment(tmp_path: Path) -> None:
         "reviewed_head_sha": initial_sha,
     }
 
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=tmp_path)
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=tmp_path,
+        review_decision=pr_state,
+    )
 
     # Should fail (no-op rework)
     assert verdict.ok is False, (
@@ -2339,7 +2421,14 @@ def test_no_op_rework_merge_only_ignores_unpushed_base_merge_noise(tmp_path: Pat
         "reviewed_head_sha": initial_sha,
     }
 
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=local_repo)
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=local_repo,
+        review_decision=pr_state,
+    )
 
     # Should still FAIL as a merge-only no-op rework
     assert verdict.ok is False
@@ -3174,7 +3263,14 @@ def test_no_op_rework_warns_on_flag_like_reviewed_head_sha() -> None:
         "reviewed_head_sha": "--exec=foo",
     }
 
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        review_decision=pr_state,
+    )
 
     assert isinstance(verdict, JanitorVerdict)
     assert not verdict.is_no_op_rework
@@ -3189,7 +3285,14 @@ def test_no_op_rework_warns_on_non_hex_reviewed_head_sha() -> None:
         "reviewed_head_sha": "not-a-sha!",
     }
 
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        review_decision=pr_state,
+    )
 
     assert isinstance(verdict, JanitorVerdict)
     assert not verdict.is_no_op_rework
@@ -3204,7 +3307,14 @@ def test_no_op_rework_warns_on_flag_like_current_head_sha() -> None:
         "reviewed_head_sha": "abc123",
     }
 
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        review_decision=pr_state,
+    )
 
     assert isinstance(verdict, JanitorVerdict)
     assert not verdict.is_no_op_rework
@@ -3219,7 +3329,14 @@ def test_no_op_rework_warns_on_flag_like_head_ref() -> None:
         "reviewed_head_sha": "abc123",
     }
 
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        review_decision=pr_state,
+    )
 
     assert isinstance(verdict, JanitorVerdict)
     assert not verdict.is_no_op_rework
@@ -3234,7 +3351,14 @@ def test_no_op_rework_warns_on_flag_like_base_ref() -> None:
         "reviewed_head_sha": "abc123",
     }
 
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        review_decision=pr_state,
+    )
 
     assert isinstance(verdict, JanitorVerdict)
     assert not verdict.is_no_op_rework
@@ -3251,7 +3375,14 @@ def test_no_op_rework_accepts_valid_sha_and_ref_values(tmp_path: Path) -> None:
 
     # Heads differ and no real git repo at tmp_path — the merge-only check will
     # fail gracefully (subprocess error → warning), but validation must pass.
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=tmp_path)
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=tmp_path,
+        review_decision=pr_state,
+    )
 
     assert isinstance(verdict, JanitorVerdict)
     assert not verdict.is_no_op_rework
@@ -3295,7 +3426,13 @@ index 1234567..abcdef0 100644
     monkeypatch.setattr(janitor_module, "_get_unpushed_commit_info", _fail_if_called)
 
     verdict = run_janitor(
-        pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd(), pr_diff=diff
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        pr_diff=diff,
+        review_decision=pr_state,
     )
 
     assert verdict.ok is False
@@ -3333,7 +3470,13 @@ index 1234567..abcdef0 100644
     monkeypatch.setattr(janitor_module, "_get_unpushed_commit_info", _fail_if_called)
 
     verdict = run_janitor(
-        pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd(), pr_diff=diff
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        pr_diff=diff,
+        review_decision=pr_state,
     )
 
     assert verdict.ok is False
@@ -3361,7 +3504,14 @@ def test_no_op_rework_warns_on_flag_like_head_ref_sha_match(
 
     monkeypatch.setattr(janitor_module, "_get_unpushed_commit_info", _fail_if_called)
 
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        review_decision=pr_state,
+    )
 
     assert verdict.ok is False
     assert any("_check_no_op_rework head_ref (sha-match)" in w for w in verdict.warnings)
@@ -3389,7 +3539,14 @@ def test_no_op_rework_warns_on_flag_like_base_ref_sha_match(
 
     monkeypatch.setattr(janitor_module, "_get_unpushed_commit_info", _fail_if_called)
 
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        review_decision=pr_state,
+    )
 
     assert verdict.ok is False
     assert any("_check_no_op_rework base_ref (sha-match)" in w for w in verdict.warnings)
@@ -3661,10 +3818,43 @@ def test_run_janitor_stale_ci_skips_no_op_rework_check() -> None:
 
 
 def test_run_janitor_no_review_decision_preserves_no_op_check() -> None:
-    """Positive control: review_decision=None must leave today's behavior
-    unchanged -- the no-op check runs, ``no_op_check_skipped_stale_ci`` stays
-    False, and the SHA-fallback no-op failure fires exactly as it did before
-    issue #1116."""
+    """Positive control: a review_decision mapping matching the recorded
+    verdict (the normal shape every real caller passes -- run_janitor's own
+    ``review_decision`` param, resolved via ``self._review_decision(pr_number)``
+    at every production call site) leaves the no-op check active --
+    ``no_op_check_skipped_stale_ci`` stays False, and the SHA-fallback no-op
+    failure fires exactly as it did before issue #1116."""
+    pr = _green_pr(headRefOid="abc123")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        review_decision=pr_state,
+    )
+
+    assert verdict.ok is False
+    assert verdict.no_op_check_skipped_stale_ci is False
+    assert verdict.is_no_op_rework is True
+    assert any("PR head unchanged since request_changes verdict" in f for f in verdict.failures)
+    assert not any("No-op rework check skipped" in w for w in verdict.warnings)
+
+
+def test_run_janitor_no_review_decision_skips_no_op_check() -> None:
+    """Issue #1362 Stage 1: without a resolved review_decision mapping (the
+    file-first reader's payload), the no-op-rework gate must NOT fall back to
+    reading ``pr_state["decision"]`` directly -- that is exactly the stale
+    state.json divergence AC1 exists to eliminate (a crash between the file
+    write and the state write leaves state.json holding a stale verdict).
+    ``review_decision=None`` must therefore leave the gate inactive even
+    though ``pr_state`` alone would have triggered it under the pre-#1362
+    behavior."""
     pr = _green_pr(headRefOid="abc123")
     pr_state = {
         "decision": "request_changes",
@@ -3680,11 +3870,11 @@ def test_run_janitor_no_review_decision_preserves_no_op_check() -> None:
         review_decision=None,
     )
 
-    assert verdict.ok is False
-    assert verdict.no_op_check_skipped_stale_ci is False
-    assert verdict.is_no_op_rework is True
-    assert any("PR head unchanged since request_changes verdict" in f for f in verdict.failures)
-    assert not any("No-op rework check skipped" in w for w in verdict.warnings)
+    assert verdict.ok is True
+    assert verdict.is_no_op_rework is False
+    assert not any(
+        "PR head unchanged since request_changes verdict" in f for f in verdict.failures
+    )
 
 
 def test_run_janitor_stale_ci_skip_fails_closed_on_red_required_check() -> None:

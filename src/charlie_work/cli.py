@@ -23,7 +23,11 @@ from .fleet_dispatch import (
     run_fleet_supervise,
     run_fleet_supervise_loop,
 )
-from .supervise_loop import DEFAULT_MAX_RELAUNCHES, EXIT_RESTART_REQUESTED
+from .supervise_loop import (
+    DEFAULT_MAX_RELAUNCHES,
+    EXIT_RESTART_REQUESTED,
+    PREFLIGHT_REFUSAL_EXIT_CODE,
+)
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
@@ -160,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("review-queue")
+    subparsers.add_parser("operator-queue")
 
     dispatch = subparsers.add_parser("work")
     dispatch.add_argument("--limit", type=int, default=None)
@@ -288,6 +293,7 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_sub = fleet.add_subparsers(dest="fleet_command", required=True)
     fleet_sub.add_parser("status")
     fleet_sub.add_parser("review-queue")
+    fleet_sub.add_parser("operator-queue")
 
     fleet_work = fleet_sub.add_parser("work")
     fleet_work.add_argument("--limit", type=int, default=None)
@@ -599,6 +605,97 @@ def _assert_config_repo_matches(config_arg: Path | None, repo_root: Path) -> Non
     )
 
 
+#: Commands that mutate orchestrator state and are rare, operator-driven, and
+#: high-cost-of-misroute.  ``_assert_not_sibling_clone`` is called for these
+#: only (issue #1376): a wrong-cwd invocation silently writes a valid record
+#: into a sibling clone's phantom ``.var`` tree, invisible to the canonical
+#: repo — and if the target is a transient dispatch/agent worktree, the reap
+#: lanes later delete the whole checkout, destroying the record permanently.
+#: Read-only commands are deliberately exempt: their cwd-defaulted resolution
+#: is harmless and changing it would break operator workflows that routinely
+#: run ``charlie status`` from worktree cwds.
+_STATE_AFFECTING_COMMANDS = frozenset({"verdict", "merge-authorize", "unescalate"})
+
+
+def _assert_not_sibling_clone(ctx: CommandContext, args: argparse.Namespace) -> None:
+    """Refuse to write state from a sibling clone of the canonical fleet repo.
+
+    The DEFAULT-case sibling of the documented ``--config`` trap
+    (``_assert_config_repo_matches``, issue #895): there, an explicit flag
+    misleads; here, no flag at all plus an unexpected cwd silently selects a
+    different state root.  ``find_repo_root`` already resolves linked
+    worktrees to the shared main checkout (issue #648), so a verdict run from
+    a ``.claude/worktrees/*`` or agent worktree correctly targets the
+    canonical ``.var/charlie-work``.  The remaining hazard is a **sibling
+    clone** — a separate git repo (e.g. ``repos/cw-*``) that shares the same
+    GitHub remote but has its own ``.git`` and therefore its own phantom
+    ``.var/charlie-work``.  ``find_repo_root`` returns the clone's own root
+    (it is the main worktree of its own repo), and state silently lands there.
+
+    Detection uses the fleet registry: the canonical repo is registered under
+    its ``nameWithOwner`` with a ``repo_root`` pointing at the main checkout.
+    If the current ``repo_root`` differs from the registered one (after
+    normalizing both through ``find_repo_root`` so an old entry pointing at a
+    linked worktree resolves to the same shared root), the current cwd is a
+    sibling clone and the command is refused.
+
+    Fails open (allows the command) when:
+    - ``nameWithOwner`` cannot be resolved from ``git remote get-url origin``
+      (non-GitHub repo, no origin remote) — the guard is for GitHub-fleet
+      repos, not arbitrary git checkouts.
+    - The repo is not yet in the fleet registry (fresh install) — there is no
+      canonical root to compare against.
+    - The registered ``repo_root`` no longer exists or is not a git worktree
+      — a stale entry is not evidence of a sibling clone.
+
+    Explicit ``--repo`` skips this guard entirely (acceptance criterion #4):
+    the operator named the repo, so the resolution is intentional.
+    """
+    # Resolve the repo's GitHub identity from the local git remote — no
+    # network round-trip, works under --dry-run and in tests with real repos.
+    try:
+        owner, name = ctx.gh._repo_owner_name()
+    except GitHubError:
+        return
+    name_with_owner = f"{owner}/{name}"
+
+    fleet_json_path = layout.fleet_registry_path(override=args.fleet_dir)
+    registry = _load_registry(fleet_json_path)
+    entry = registry.get("repos", {}).get(name_with_owner)
+    if not entry:
+        return
+
+    registered_root_str = entry.get("repo_root")
+    if not registered_root_str:
+        return
+    registered_root = Path(registered_root_str)
+    if not registered_root.exists():
+        return
+
+    # Normalize the registered root through find_repo_root so an old entry
+    # pointing at a linked worktree resolves to the shared main checkout —
+    # the same normalization find_repo_root applies to cwd.  Without this,
+    # a pre-#692 registry entry would false-positive as a sibling clone.
+    try:
+        normalized_registered = find_repo_root(registered_root, explicit=True)
+    except RepoNotFoundError:
+        return
+
+    if ctx.repo_root == normalized_registered:
+        return
+
+    cwd = Path.cwd()
+    raise ConfigError(
+        f"cwd {cwd} resolves to repo root {ctx.repo_root}, whose state root "
+        f"is {ctx.paths.root}. The fleet registry has {name_with_owner} "
+        f"registered at {normalized_registered} — the canonical root. "
+        f"State would silently land in the sibling clone's tree, invisible "
+        f"to the canonical repo. "
+        f"Pass --repo {normalized_registered} to operate on the canonical repo, "
+        f"or cd to {normalized_registered}."
+    )
+
+
 @dataclass(frozen=True)
 class CommandContext:
     """The four bootstrap artifacts every command handler needs (issue #705).
@@ -643,6 +740,20 @@ def bootstrap_command(args: argparse.Namespace) -> CommandContext:
 
 def build_app(args: argparse.Namespace) -> OrchestratorApp:
     ctx = bootstrap_command(args)
+    # Issue #1376: for state-affecting commands, refuse before touch_repo
+    # mutates the fleet registry — a sibling-clone cwd would otherwise
+    # overwrite the canonical entry and the guard would never fire.  Explicit
+    # --repo skips the guard (the operator named the repo intentionally).
+    # `args.repo is None` is checked first, and `command` is read defensively
+    # via getattr: build_app is also called directly (outside the full
+    # argparse pipeline) by tests and other callers that hand-build a
+    # Namespace without a `command` attribute. Ordering the cheap, always-
+    # present `repo` check first avoids an AttributeError on `args.command`
+    # for those callers when --repo is explicit (AC#4 already skips the
+    # guard in that case), and getattr keeps the check inert rather than
+    # crashing if `command` is absent entirely.
+    if args.repo is None and getattr(args, "command", None) in _STATE_AFFECTING_COMMANDS:
+        _assert_not_sibling_clone(ctx, args)
     touch_repo(args.fleet_dir, ctx.repo_root, ctx.paths, ctx.gh, dry_run=args.dry_run)
     return OrchestratorApp(
         ctx.repo_root,
@@ -1283,12 +1394,20 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
+    # Issue #1372: stale entries (repo_root no longer exists) are reported in a
+    # separate "stale" list that does NOT flip ok/exit-code, so one corpse
+    # cannot degrade fleet-wide tooling (e.g. the heartbeat's blocked-issue
+    # enrichment that treats any nonzero exit as degraded).
+    stale: list[dict[str, str]] = []
 
     for repo_key, entry in sorted(registry.get("repos", {}).items()):
         try:
-            repo_root = Path(entry.get("repo_root"))
+            repo_root = Path(entry.get("repo_root") or "")
             if not repo_root.exists():
-                raise RepoNotFoundError(f"Repo root does not exist: {repo_root}")
+                # Issue #1372: a stale entry is not a live failing lane —
+                # report it separately so it does not affect the exit code.
+                stale.append({"repo_key": repo_key, "repo_root": str(repo_root)})
+                continue
 
             config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
@@ -1304,10 +1423,11 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
 
     return CommandResult(
         ok=not errors,
-        message=f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s)",
+        message=f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s), {len(stale)} stale(s)",
         data={
             "repos": per_repo,
             "errors": errors,
+            "stale": stale,
             "api_worker_report": api_worker_report.to_dict()
             if api_worker_report is not None
             else None,
@@ -1347,6 +1467,42 @@ def run_fleet_review_queue(args: argparse.Namespace) -> CommandResult:
     return CommandResult(
         ok=not errors,
         message=f"fleet review queue: {len(per_repo)} repo(s), {len(errors)} error(s)",
+        data={"repos": per_repo, "errors": errors},
+    )
+
+
+def run_fleet_operator_queue(args: argparse.Namespace) -> CommandResult:
+    """Run fleet operator-queue aggregation across all registered repos.
+
+    Issue #1314 item 1. This is a read-only command that mirrors
+    ``run_fleet_review_queue``: for each registered repo, calls
+    ``OrchestratorApp.operator_queue()`` with ``dry_run=True``, aggregates
+    per-repo queue entries keyed by repo_key (nameWithOwner), and isolates
+    per-repo errors without aborting aggregation.
+    """
+    fleet_json_path = layout.fleet_registry_path()
+    registry = _load_registry(fleet_json_path)
+    per_repo: dict[str, Any] = {}
+    errors: list[dict[str, str]] = []
+
+    for repo_key, entry in sorted(registry.get("repos", {}).items()):
+        try:
+            repo_root = Path(entry.get("repo_root"))
+            if not repo_root.exists():
+                raise RepoNotFoundError(f"Repo root does not exist: {repo_root}")
+
+            config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
+            paths = runtime_paths(repo_root, config.runtime.state_dir)
+            gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=True)
+            app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
+            result = app.operator_queue()
+            per_repo[repo_key] = result.data
+        except (RepoNotFoundError, ConfigError, GitHubError, OSError) as exc:
+            errors.append({"repo_key": repo_key, "error": str(exc)})
+
+    return CommandResult(
+        ok=not errors,
+        message=f"fleet operator queue: {len(per_repo)} repo(s), {len(errors)} error(s)",
         data={"repos": per_repo, "errors": errors},
     )
 
@@ -2241,6 +2397,8 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
         return app.dispatch(args.limit, only_issues=args.issues)
     if args.command == "review-queue":
         return app.review_queue()
+    if args.command == "operator-queue":
+        return app.operator_queue()
     if args.command == "why-charlie-hate":
         # The operator's manual re-run is deliberately exempt from the per-head
         # cross-family regeneration budget (issue #1099): a human typing a
@@ -2261,6 +2419,11 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
                 summary_file=args.summary_file,
                 comment=args.comment,
                 reviewed_head=args.reviewed_head,
+                # Issue #1265: a human running this command is, by
+                # definition, the operator-manual provenance -- no flag to
+                # thread through, this is the one caller for which the value
+                # is always the same.
+                verdict_provenance="operator_manual",
                 # Issue #1072: the operator CLI is the one caller that may
                 # legitimately pin a verdict to a superseded head (issue #467's
                 # explicit-choice design). Automated callers use the default
@@ -2408,6 +2571,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = run_fleet_status(args)
             elif args.fleet_command == "review-queue":
                 result = run_fleet_review_queue(args)
+            elif args.fleet_command == "operator-queue":
+                result = run_fleet_operator_queue(args)
             elif args.fleet_command == "work":
                 result = run_fleet_work(args)
             elif args.fleet_command == "bash-rats":
@@ -2496,6 +2661,14 @@ def main(argv: list[str] | None = None) -> int:
                 print("Errors:")
                 for error in errors:
                     print(f"  {error['repo_key']}: {error['error']}")
+            # Issue #1372: stale entries are reported separately and do not
+            # affect the exit code; surface them so an operator can see and
+            # clean up corpses without mistaking them for live failing lanes.
+            stale = result.data.get("stale", [])
+            if stale:
+                print("Stale:")
+                for entry in stale:
+                    print(f"  {entry['repo_key']}: {entry['repo_root']}")
             _render_api_worker_report(result.data)
         elif args.fleet_command in ("work", "bash-rats"):
             repos = result.data.get("repos", {})
@@ -2656,6 +2829,16 @@ def main(argv: list[str] | None = None) -> int:
     # out the interval exactly as in #862.
     if isinstance(result.data, dict) and result.data.get("restart_requested"):
         return EXIT_RESTART_REQUESTED
+
+    # Issue #1363: a fatal preflight failure at supervisor startup (disk
+    # floor, wrong venv/checkout) exits PREFLIGHT_REFUSAL_EXIT_CODE (4), not
+    # the generic 1 -- so the fleet pass log and the supervise-loop wrapper
+    # can both distinguish "refused to start, named reason" from an ordinary
+    # crash. Read out of result.data the same way restart_requested is,
+    # above: main() is generic across every command, and this keeps the
+    # signal out of the command-name dispatch.
+    if isinstance(result.data, dict) and result.data.get("preflight_refused"):
+        return PREFLIGHT_REFUSAL_EXIT_CODE
 
     return 0 if result.ok else 1
 

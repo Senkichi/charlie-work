@@ -54,6 +54,36 @@ def test_githublike_protocol_declares_pr_ready() -> None:
     assert sig.return_annotation == "GitHubRunResult"
 
 
+def test_githublike_protocol_declares_pr_close() -> None:
+    """GitHubLike must declare ``pr_close`` (issue #1274, W17) so
+    ``GitHubLike``-typed ``self.gh`` can call it unguardedly without a
+    pyright error. Same structural-omission class as ``pr_ready``.
+    """
+    assert "pr_close" in GitHubLike.__dict__, "GitHubLike is missing pr_close"
+    sig = inspect.signature(GitHubLike.pr_close)
+    assert list(sig.parameters) == ["self", "number"]
+    assert sig.return_annotation == "GitHubRunResult"
+
+
+def test_githublike_protocol_declares_pr_reopen() -> None:
+    """GitHubLike must declare ``pr_reopen`` (issue #1274, W17)."""
+    assert "pr_reopen" in GitHubLike.__dict__, "GitHubLike is missing pr_reopen"
+    sig = inspect.signature(GitHubLike.pr_reopen)
+    assert list(sig.parameters) == ["self", "number"]
+    assert sig.return_annotation == "GitHubRunResult"
+
+
+def test_githublike_protocol_declares_push_empty_commit() -> None:
+    """GitHubLike must declare ``push_empty_commit`` (issue #1274, W17) --
+    the empty-commit-push fallback used when ``pr_close``/``pr_reopen``
+    does not mechanically succeed.
+    """
+    assert "push_empty_commit" in GitHubLike.__dict__, "GitHubLike is missing push_empty_commit"
+    sig = inspect.signature(GitHubLike.push_empty_commit)
+    assert list(sig.parameters) == ["self", "branch"]
+    assert sig.return_annotation == "GitHubRunResult"
+
+
 def _compatible_signature(proto_sig: inspect.Signature, concrete_sig: inspect.Signature) -> None:
     proto_params = [p for n, p in proto_sig.parameters.items() if n != "self"]
     concrete_params = [p for n, p in concrete_sig.parameters.items() if n != "self"]

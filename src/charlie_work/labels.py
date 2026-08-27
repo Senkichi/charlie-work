@@ -66,6 +66,16 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
         # rework cap exhausted or reviewer blocked — a human decision is needed
         "escalated": ((labels.human_needed,), _compute_remove((labels.human_needed,))),
         "blocked": ((labels.human_needed,), _compute_remove((labels.human_needed,))),
+        # Issue #1266: mechanical-escalation counterparts of "escalated" /
+        # "redispatch_escalated" — same shape, different label, so a
+        # mechanical escalation lands here instead of human_needed and
+        # reserves that label for judgment calls. escalation.py's
+        # _escalation_edge() is the single place that decides which of the
+        # two edges a call site should use; nothing else picks between them.
+        "operator_queued": (
+            (labels.operator_queue,),
+            _compute_remove((labels.operator_queue,)),
+        ),
         # Issue #427: finalization must also drop the ready marker; a closed
         # issue with a stale automated-ready label pollutes roll-call/metrics.
         # Issue #496: merge-hold is a transient operator signal, not a workflow
@@ -86,6 +96,13 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
         ),
         # redispatch cap exhausted — a human decision is needed
         "redispatch_escalated": ((labels.human_needed,), _compute_remove((labels.human_needed,))),
+        # Issue #1266: mechanical counterpart of "redispatch_escalated" — see
+        # "operator_queued" above for why this is a distinct named edge
+        # rather than reusing that one.
+        "redispatch_operator_queued": (
+            (labels.operator_queue,),
+            _compute_remove((labels.operator_queue,)),
+        ),
         # Operator re-arm (`charlie unescalate`) for an issue whose PR is
         # still open: drop human-needed (and any other stale workflow state)
         # and return to the passive pr-open state pending a fresh review.

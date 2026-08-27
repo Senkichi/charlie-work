@@ -50,7 +50,14 @@ stdlib-only; see the notes below before "fixing" one.
 - **`heartbeat_check.py`** — deterministic fleet-heartbeat check (see its
   module docstring). Deliberately **stdlib-only** (plus `psutil`/`yaml`,
   already project dependencies) so a broken package install can never break
-  the check that would detect it. Do not add a `charlie_work` import here.
+  the check that would detect it. Do not add a `charlie_work` import here —
+  with one narrow, deliberate exception (#1271): `charlie_work.event_kinds`,
+  which exists solely to be a genuine leaf (no imports beyond stdlib, and
+  never `ci_fleet`) that both this script and `charlie_work.instrumentation`
+  can import from without either pulling in the other. That module is the
+  only permitted import; anything else needing sharing from inside the
+  package still needs the reimplement-locally treatment `fleet_dir` and the
+  stale-open-issue-mention primitives already get, not a new exception here.
 - **`backfill_stale_rework_briefs.py`** — one-shot operator tool (F6 of
   `docs/plans/rework-findings-channel.md`) that bumps a `review-decision.json`
   verdict's mtime (`os.utime` only — never rewrites its contents) for PRs

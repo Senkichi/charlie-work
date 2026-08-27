@@ -7,6 +7,10 @@
           {
             "type": "command",
             "command": ".venv/Scripts/python.exe -m charlie_work.merge_preflight_hook || true"
+          },
+          {
+            "type": "command",
+            "command": ".venv/Scripts/python.exe scripts/git_push_lint_hook.py || true"
           }
         ]
       },
@@ -16,6 +20,16 @@
           {
             "type": "command",
             "command": ".venv/Scripts/python.exe -m charlie_work.merge_preflight_hook || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".venv/Scripts/python.exe scripts/worker_stop_gate.py"
           }
         ]
       }

@@ -6,7 +6,6 @@ import errno
 import json
 import logging
 import os
-import re
 import sqlite3
 import subprocess
 import sys
@@ -20,11 +19,40 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from _fakes_github import (
+    FakeGitHub,
+    FakeGitHubWithChecks,
+    FakeGitHubWithChecksAndAnnotations,
+    FakeGitHubWithMissingRequired,
+)
+from _helpers import (
+    EXAMPLES_DIR,
+    _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+    _STALE_CI_GREEN_CHECKS,
+    _STALE_CI_RED_CHECKS,
+    _STALE_CI_REQUIRED,
+    _init_git_repo,
+    _second_mergequeue_pr,
+)
+from _merge_tripwire_fixtures import (
+    _ack_unauthorized_merge,
+    _arm_unauthorized_merge_tripwire,
+    _merged_worker_pr,
+)
+from _review_fixtures import (
+    _approved_automerge,
+    _dispatch_reviews_app,
+    _fake_claude_worker_record,
+    _make_dead_review_sidecar,
+    _make_loop_app,
+    _required_checks_config,
+    _set_review_dispatched_state,
+    _write_review_events,
+    _write_review_packet,
+)
 from _sessions_db_fixtures import make_sessions_db
 from charlie_work import cli
 from charlie_work import github as github_module
-from charlie_work.checks import _run_id_from_link, summarize_checks
-from charlie_work.github import _job_id_from_link, is_infrastructure_failure
 from charlie_work.config import (
     AutoMergeConfig,
     ClaudeCodeConfig,
@@ -53,18 +81,18 @@ from charlie_work.cross_family import (
     CrossFamilyResult,
     CrossFamilyVerdict,
     LEGACY_VACUOUS_SUMMARY,
-    MalformedCrossFamilyVerdict,
     extract_report_body,
     parse_cross_family_verdict,
     render_command,
     report_body_is_valid,
     run_cross_family_review,
 )
-from charlie_work.github import issue_numbers_mentioned_by_pr, label_names, linked_issue_number
+from charlie_work.github import issue_numbers_mentioned_by_pr, label_names
 from charlie_work.instrumentation import log_event, query_events
 from charlie_work.markdown_fence import fenced_block
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.prompts import render_prompt
+from charlie_work.review_decision import ReviewDecision
 from charlie_work.state import (
     PASSIVE_OPEN_STATUS,
     append_event,
@@ -76,19 +104,19 @@ from charlie_work.state import (
     state_lock,
 )
 import charlie_work.state as state_module
+from charlie_work.verdict_parsing import (
+    REVIEW_SESSION_FAILED_HEADING,
+    REVIEW_SESSION_SUMMARY_HEADING,
+)
 from charlie_work.workflow import (
     ORCHESTRATOR_COMMENT_MARKER,
     CommandResult,
     ConcurrencyGovernorResult,
     OrchestratorApp,
-    _annotation_to_required_change,
     _append_sweep_events,
     _detect_and_handle_stalled_reviews,
-    _is_carry_forward_eligible,
     _parse_review_verdict_from_log,
-    _reap_orphaned_review_checkouts,
     _render_required_changes_section,
-    _required_changes_from_checks,
     _summary_is_vacuous,
     sink_census,
     slugify,
@@ -96,8 +124,35 @@ from charlie_work.workflow import (
 from charlie_work.worktree import create_worktree
 from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.devin_shell import SessionRecord
+from charlie_work.write_gate import WriteGate
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
+
+# Issue #1264 (W6 PR2): the WriteGate must carry THIS test's own state_file
+# as state_path -- WriteGate.save_state() writes to self.state_path, not to
+# whatever path the converted function was also given.
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
+
+
+def _write_flat_review_decision(
+    paths: Any, pr_number: int, decision: str, reviewed_head_sha: str | None
+) -> None:
+    """Write a flat ``prs/pr-N/review-decision.json`` matching a test's
+    ``state["prs"][...]`` fixture.
+
+    Issue #1362 Stage 1: control-flow reads of a PR's review decision go
+    through the file-first ``review_decision`` reader now, not
+    ``state.json``'s ``decision``/``reviewed_head_sha`` fields. A fixture
+    that only writes those fields into ``state.json`` no longer drives the
+    behavior it used to -- the flat file must exist and agree, or the
+    reader reports ``missing``.
+    """
+    pr_dir = paths.prs / f"pr-{pr_number}"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {"decision": decision}
+    if reviewed_head_sha is not None:
+        payload["reviewed_head_sha"] = reviewed_head_sha
+    (pr_dir / "review-decision.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _load_external_fixture(name: str) -> list[dict[str, Any]]:
@@ -592,6 +647,8 @@ def test_worker_prompt_renders_issue_values() -> None:
             "branch_name": "agent/issue-123-fix-search",
             "worker_model_tier": "capable",
             "issue_comments": "",
+            "module_map": "",
+            "attachment_budget": "",
         },
     )
 
@@ -612,6 +669,8 @@ def test_claude_code_worker_prompt_renders_issue_values() -> None:
             "branch_name": "agent/issue-123-fix-search",
             "worker_model_tier": "capable",
             "issue_comments": "",
+            "module_map": "",
+            "attachment_budget": "",
         },
     )
 
@@ -668,46 +727,6 @@ def test_label_names_accepts_gh_shape() -> None:
     assert label_names(issue) == {"automated-ready", "agent:in-progress"}
 
 
-def test_linked_issue_number_from_branch_body_or_title() -> None:
-    assert (
-        linked_issue_number(
-            {"headRefName": "agent/issue-456-fix"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        == 456
-    )
-    assert (
-        linked_issue_number(
-            {"body": "Closes #789"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        == 789
-    )
-    assert (
-        linked_issue_number(
-            {"title": "Fix #321: thing"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        == 321
-    )
-
-
-def test_linked_issue_number_ignores_unqualified_body_references() -> None:
-    body = "Bumps actions/checkout. See dependabot/dependabot-core#2454 for details."
-
-    assert (
-        linked_issue_number(
-            {"body": body},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        is None
-    )
-
-
 def test_issue_numbers_mentioned_by_pr_matches_issue_reference() -> None:
     pr = {
         "title": "fix(scope): reap sidecar files on session exit (issue #113)",
@@ -737,357 +756,6 @@ def test_issue_numbers_mentioned_by_pr_ignores_blockquoted_lines() -> None:
     }
 
     assert issue_numbers_mentioned_by_pr(pr) == set()
-
-
-def test_summarize_checks_requires_all_configured_checks() -> None:
-    checks = [
-        {"name": "Tests passed", "state": "SUCCESS"},
-        {"name": "Lint & Format", "bucket": "pass"},
-        {"name": "Pre-commit", "state": "FAILURE"},
-    ]
-
-    summary = summarize_checks(checks, ("Tests passed", "Lint & Format", "Pre-commit"))
-
-    assert summary.ready is False
-    assert summary.passed == ("Tests passed", "Lint & Format")
-    assert summary.failed == ("Pre-commit",)
-    assert summary.infra_failed == ()
-
-
-def test_summarize_checks_duplicate_runs_failure_then_success() -> None:
-    """Regression test for issue #1: duplicate runs with FAILURE then SUCCESS should classify as failed."""
-    checks = [
-        {"name": "test", "state": "FAILURE"},
-        {"name": "test", "state": "SUCCESS"},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.failed == ("test",)
-    assert summary.passed == ()
-    assert summary.infra_failed == ()
-
-
-def test_summarize_checks_duplicate_runs_success_then_failure() -> None:
-    """Regression test for issue #1: duplicate runs with SUCCESS then FAILURE should classify as failed."""
-    checks = [
-        {"name": "test", "state": "SUCCESS"},
-        {"name": "test", "state": "FAILURE"},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.failed == ("test",)
-    assert summary.passed == ()
-    assert summary.infra_failed == ()
-
-
-def test_summarize_checks_duplicate_runs_all_success() -> None:
-    """Duplicate runs with all SUCCESS should classify as passed."""
-    checks = [
-        {"name": "test", "state": "SUCCESS"},
-        {"name": "test", "state": "SUCCESS"},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is True
-    assert summary.passed == ("test",)
-    assert summary.failed == ()
-    assert summary.infra_failed == ()
-
-
-def test_summarize_checks_duplicate_runs_pending_then_success() -> None:
-    """Duplicate runs with PENDING then SUCCESS should classify as pending."""
-    checks = [
-        {"name": "test", "state": "PENDING"},
-        {"name": "test", "state": "SUCCESS"},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.pending == ("test",)
-    assert summary.passed == ()
-    assert summary.failed == ()
-    assert summary.infra_failed == ()
-
-
-def test_summarize_checks_duplicate_runs_failure_then_pending() -> None:
-    """Duplicate runs with FAILURE then PENDING should classify as failed (worst-of)."""
-    checks = [
-        {"name": "test", "state": "FAILURE"},
-        {"name": "test", "state": "PENDING"},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.failed == ("test",)
-    assert summary.pending == ()
-    assert summary.infra_failed == ()
-
-
-def test_summarize_checks_empty_state_and_bucket_classifies_as_pending() -> None:
-    """Regression test for issue #95: null/empty state+bucket should classify as pending."""
-    checks = [
-        {"name": "test", "state": None, "bucket": None},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.pending == ("test",)
-    assert summary.failed == ()
-    assert summary.infra_failed == ()
-
-
-def test_summarize_checks_empty_string_state_and_bucket_classifies_as_pending() -> None:
-    """Regression test for issue #95: empty string state+bucket should classify as pending."""
-    checks = [
-        {"name": "test", "state": "", "bucket": ""},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.pending == ("test",)
-    assert summary.failed == ()
-
-
-def test_summarize_checks_cancelled_classifies_as_infra_failed() -> None:
-    """Regression test for issue #210: CANCELLED state should classify as infrastructure failure."""
-    checks = [
-        {"name": "test", "state": "CANCELLED"},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.infra_failed == ("test",)
-    assert summary.failed == ()
-    assert summary.pending == ()
-
-
-def test_summarize_checks_timed_out_classifies_as_infra_failed() -> None:
-    """Issue #841: TIMED_OUT is a documented GitHub Actions conclusion value
-    distinct from this repo's observed CANCELLED-on-timeout behavior, but it
-    must not fall through the catch-all into a code failure -- there is no
-    code fix for a job that ran out of time."""
-    checks = [
-        {"name": "test", "state": "TIMED_OUT"},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.infra_failed == ("test",)
-    assert summary.failed == ()
-
-
-def test_summarize_checks_cancelled_case_insensitive() -> None:
-    """CANCELLED state classification should be case-insensitive."""
-    checks = [
-        {"name": "test", "state": "cancelled"},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.infra_failed == ("test",)
-    assert summary.failed == ()
-
-
-def test_summarize_checks_mixed_cancelled_and_failure() -> None:
-    """Mixed CANCELLED and FAILURE states should classify each separately."""
-    checks = [
-        {"name": "test1", "state": "CANCELLED"},
-        {"name": "test2", "state": "FAILURE"},
-    ]
-
-    summary = summarize_checks(checks, ("test1", "test2"))
-
-    assert summary.ready is False
-    assert summary.infra_failed == ("test1",)
-    assert summary.failed == ("test2",)
-    assert summary.pending == ()
-
-
-def test_summarize_checks_duplicate_runs_cancelled_then_success() -> None:
-    """Duplicate runs with CANCELLED then SUCCESS should classify as infra_failed (worst-of)."""
-    checks = [
-        {"name": "test", "state": "CANCELLED"},
-        {"name": "test", "state": "SUCCESS"},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.infra_failed == ("test",)
-    assert summary.failed == ()
-    assert summary.pending == ()
-
-
-def test_summarize_checks_failure_takes_priority_over_cancelled() -> None:
-    """FAILURE should take priority over CANCELLED in worst-of semantics."""
-    checks = [
-        {"name": "test", "state": "CANCELLED"},
-        {"name": "test", "state": "FAILURE"},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.failed == ("test",)
-    assert summary.infra_failed == ()
-    assert summary.pending == ()
-
-
-def test_summarize_checks_infra_failure_marker_classifies_as_infra_failed() -> None:
-    """INFRA_FAILURE marker state should classify as infrastructure failure."""
-    checks = [
-        {"name": "test", "state": "INFRA_FAILURE"},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.infra_failed == ("test",)
-    assert summary.failed == ()
-    assert summary.pending == ()
-
-
-def test_summarize_checks_infra_failure_case_insensitive() -> None:
-    """INFRA_FAILURE state classification should be case-insensitive."""
-    checks = [
-        {"name": "test", "state": "infra_failure"},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.infra_failed == ("test",)
-    assert summary.failed == ()
-
-
-def test_summarize_checks_failure_takes_priority_over_infra_failure() -> None:
-    """FAILURE should take priority over INFRA_FAILURE in worst-of semantics."""
-    checks = [
-        {"name": "test", "state": "INFRA_FAILURE"},
-        {"name": "test", "state": "FAILURE"},
-    ]
-
-    summary = summarize_checks(checks, ("test",))
-
-    assert summary.ready is False
-    assert summary.failed == ("test",)
-    assert summary.infra_failed == ()
-
-
-def test_summarize_checks_none_returns_unavailable_required_checks() -> None:
-    """Command-level gh failure (checks=None) marks every required check unavailable."""
-    summary = summarize_checks(None, ("Tests",))
-
-    assert summary.ready is False
-    assert summary.unavailable == ("Tests",)
-    assert summary.passed == ()
-    assert summary.pending == ()
-    assert summary.failed == ()
-    assert summary.missing == ()
-
-
-def test_is_infrastructure_failure_zero_step_job() -> None:
-    """Jobs with zero non-setup steps should be classified as infrastructure failure."""
-    job = {
-        "conclusion": "FAILURE",
-        "steps": [
-            {"name": "Set up job"},
-            {"name": "Checkout"},
-        ],
-    }
-    annotations = []
-
-    assert is_infrastructure_failure(job, annotations) is True
-
-
-def test_is_infrastructure_failure_with_test_steps() -> None:
-    """Jobs with actual test steps should not be classified as infrastructure failure."""
-    job = {
-        "conclusion": "FAILURE",
-        "steps": [
-            {"name": "Set up job"},
-            {"name": "Checkout"},
-            {"name": "Run tests"},
-        ],
-    }
-    annotations = []
-
-    assert is_infrastructure_failure(job, annotations) is False
-
-
-def test_is_infrastructure_failure_billing_annotation() -> None:
-    """Jobs with billing annotation should be classified as infrastructure failure."""
-    job = {
-        "conclusion": "FAILURE",
-        "steps": [{"name": "Run tests"}],
-    }
-    annotations = [
-        {
-            "message": "The job was not started because recent account payments have failed or your spending limit needs to be increased."
-        }
-    ]
-
-    assert is_infrastructure_failure(job, annotations) is True
-
-
-def test_is_infrastructure_failure_mixed_billing_annotation_text() -> None:
-    """Billing annotation detection should be case-insensitive and match partial text."""
-    job = {
-        "conclusion": "FAILURE",
-        "steps": [{"name": "Run tests"}],
-    }
-    annotations = [{"message": "The job WAS NOT STARTED due to billing issues"}]
-
-    assert is_infrastructure_failure(job, annotations) is True
-
-
-def test_is_infrastructure_failure_no_infrastructure_signals() -> None:
-    """Jobs without infrastructure failure signals should not be classified as such."""
-    job = {
-        "conclusion": "FAILURE",
-        "steps": [
-            {"name": "Set up job"},
-            {"name": "Checkout"},
-            {"name": "Run tests"},
-        ],
-    }
-    annotations = [{"message": "Test failed: assertion error"}]
-
-    assert is_infrastructure_failure(job, annotations) is False
-
-
-def test_is_infrastructure_failure_empty_steps() -> None:
-    """Job with no steps at all should be classified as infrastructure failure (primary signal)."""
-    job = {
-        "conclusion": "FAILURE",
-        "steps": [],
-    }
-    annotations = []
-
-    assert is_infrastructure_failure(job, annotations) is True
-
-
-def test_is_infrastructure_failure_non_failed_job() -> None:
-    """Jobs that didn't fail should not trigger infrastructure failure detection."""
-    job = {
-        "conclusion": "SUCCESS",
-        "steps": [],
-    }
-    annotations = []
-
-    assert is_infrastructure_failure(job, annotations) is False
 
 
 def test_state_json_is_valid_after_save(tmp_path: Path) -> None:
@@ -1743,6 +1411,213 @@ def test_config_accepts_full_test_adequacy_override(tmp_path: Path) -> None:
     assert config.test_adequacy.coverage_enabled is True
     assert config.test_adequacy.coverage_command == ("custom", "cov")
     assert config.test_adequacy.min_diff_coverage == 0.5
+
+
+def test_default_config_disables_coverage_probe() -> None:
+    """CoverageProbeConfig defaults to disabled with all default values
+    (issues #1260/#1261) -- an absent config block is a no-op."""
+    from charlie_work.config import CoverageProbeConfig
+
+    config = load_config()
+
+    assert config.coverage_probe == CoverageProbeConfig()
+    assert config.coverage_probe.enabled is False
+
+
+def test_coverage_probe_config_is_frozen() -> None:
+    from charlie_work.config import CoverageProbeConfig
+    from dataclasses import FrozenInstanceError
+
+    config = CoverageProbeConfig()
+    try:
+        config.enabled = True  # type: ignore[misc]
+        raise AssertionError("expected FrozenInstanceError")
+    except FrozenInstanceError:
+        pass
+
+
+def test_orchestrator_config_ctor_wires_coverage_probe_field() -> None:
+    """OrchestratorConfig() carries a coverage_probe field with defaults."""
+    from charlie_work.config import CoverageProbeConfig
+
+    config = OrchestratorConfig()
+
+    assert config.coverage_probe == CoverageProbeConfig()
+
+
+def test_config_coverage_probe_coerces_tuple_fields_to_tuple(tmp_path: Path) -> None:
+    """YAML lists in coverage_probe tuple fields round-trip to tuples."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """coverage_probe:
+  enabled: true
+  test_path_globs:
+    - "tests/**"
+    - "test_*.py"
+  exempt_path_globs:
+    - "*.md"
+  comment_prefixes:
+    - "#"
+    - "//"
+  branch_tokens:
+    - "if "
+    - "elif "
+  assertion_markers:
+    - "assert "
+    - "pytest.raises"
+  branch_to_assert_ratio_threshold: 3.5
+  check_unwired_symbols: false
+  test_function_prefix: "def check_"
+  private_name_prefix: "__"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.coverage_probe.enabled is True
+    assert isinstance(config.coverage_probe.test_path_globs, tuple)
+    assert config.coverage_probe.test_path_globs == ("tests/**", "test_*.py")
+    assert config.coverage_probe.exempt_path_globs == ("*.md",)
+    assert config.coverage_probe.comment_prefixes == ("#", "//")
+    assert config.coverage_probe.branch_tokens == ("if ", "elif ")
+    assert config.coverage_probe.assertion_markers == ("assert ", "pytest.raises")
+    assert config.coverage_probe.branch_to_assert_ratio_threshold == 3.5
+    assert config.coverage_probe.check_unwired_symbols is False
+    assert config.coverage_probe.test_function_prefix == "def check_"
+    assert config.coverage_probe.private_name_prefix == "__"
+
+
+def test_config_rejects_non_list_coverage_probe_tuple_field(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "coverage_probe:\n  branch_tokens: 'if '\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for non-list tuple field")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for non-list tuple field")
+
+    assert "coverage_probe" in message
+    assert "branch_tokens" in message
+    assert "must be a list" in message
+
+
+def test_config_rejects_bad_type_branch_to_assert_ratio_threshold(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "coverage_probe:\n  branch_to_assert_ratio_threshold: high\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for bad type")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for bad type")
+
+    assert "coverage_probe" in message
+    assert "branch_to_assert_ratio_threshold" in message
+    assert "must be a float" in message
+
+
+def test_config_rejects_non_bool_coverage_probe_flags(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    for bool_key in ("enabled", "check_unwired_symbols"):
+        config_path = tmp_path / "orchestrator.config.yaml"
+        config_path.write_text(
+            f'coverage_probe:\n  {bool_key}: "true"\n',
+            encoding="utf-8",
+        )
+
+        try:
+            load_config(config_path)
+            raise AssertionError(f"expected ConfigError for non-bool {bool_key}")
+        except ConfigError as exc:
+            message = str(exc)
+        else:  # pragma: no cover
+            raise AssertionError(f"expected ConfigError for non-bool {bool_key}")
+
+        assert "coverage_probe" in message
+        assert bool_key in message
+        assert "must be a bool" in message
+
+
+def test_load_config_rejects_unknown_coverage_probe_key(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "coverage_probe:\n  enabled: true\n  bad_key: value\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for unknown coverage_probe key")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for unknown coverage_probe key")
+
+    assert "section 'coverage_probe'" in message
+    assert "bad_key" in message
+    assert "enabled" in message
+
+
+def test_config_accepts_full_coverage_probe_override(tmp_path: Path) -> None:
+    """A YAML block overriding every field loads correctly and does NOT
+    disturb TestAdequacyConfig's reserved Tier-3 fields (independent
+    sections -- issues #1260/#1261 design item 2)."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """coverage_probe:
+  enabled: true
+  test_path_globs:
+    - "custom_tests/**"
+  exempt_path_globs:
+    - "*.txt"
+  comment_prefixes:
+    - "//"
+  branch_tokens:
+    - "if "
+  assertion_markers:
+    - "custom_assert"
+  branch_to_assert_ratio_threshold: 2.0
+  check_unwired_symbols: false
+  test_function_prefix: "def scenario_"
+  private_name_prefix: "__"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.coverage_probe.enabled is True
+    assert config.coverage_probe.test_path_globs == ("custom_tests/**",)
+    assert config.coverage_probe.exempt_path_globs == ("*.txt",)
+    assert config.coverage_probe.comment_prefixes == ("//",)
+    assert config.coverage_probe.branch_tokens == ("if ",)
+    assert config.coverage_probe.assertion_markers == ("custom_assert",)
+    assert config.coverage_probe.branch_to_assert_ratio_threshold == 2.0
+    assert config.coverage_probe.check_unwired_symbols is False
+    assert config.coverage_probe.test_function_prefix == "def scenario_"
+    assert config.coverage_probe.private_name_prefix == "__"
+    # TestAdequacyConfig's reserved Tier-3 fields are untouched defaults.
+    assert config.test_adequacy.coverage_enabled is False
+    assert config.test_adequacy.min_diff_coverage == 0.0
 
 
 def test_config_accepts_watchdog_terminal_error_markers(tmp_path: Path) -> None:
@@ -2682,6 +2557,7 @@ def test_validate_field_lists_passes_when_gh_lists_all_fields(monkeypatch, tmp_p
             "isCrossRepository",
             "mergeable",
             "headRefOid",
+            "closedAt",
             "databaseId",
             "status",
             "createdAt",
@@ -3060,602 +2936,6 @@ def test_pr_list_raises_limit_to_500_and_warns_on_truncation(
     assert any("truncated" in record.message for record in caplog.records)
 
 
-def _required_checks_config(**kwargs) -> OrchestratorConfig:
-    from charlie_work.config import AutoMergeConfig
-
-    auto_merge = AutoMergeConfig(
-        required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
-        enabled=True,  # Ensure auto_merge is enabled for merge tests
-        **kwargs,
-    )
-    return OrchestratorConfig(auto_merge=auto_merge)
-
-
-class FakeGitHub:
-    def __init__(self, repo_root: Any = None, dry_run: bool = False) -> None:
-        self.repo_root = repo_root
-        self.dry_run = dry_run
-        self.issues = [
-            {
-                "number": 123,
-                "title": "Fix search",
-                "url": "https://example.test/issues/123",
-                "body": "Search is broken",
-                "labels": [{"name": "automated-ready"}],
-                "state": "OPEN",
-            }
-        ]
-        # A janitor-green PR: open, non-draft, linked issue, tests mentioned.
-        self.prs = [
-            {
-                "number": 456,
-                "title": "Fix #123: search",
-                "url": "https://example.test/pull/456",
-                "headRefName": "agent/issue-123-fix-search",
-                "baseRefName": "main",
-                "headRefOid": "sha-abc123",
-                "mergeStateStatus": "CLEAN",
-                "body": "Closes #123\n\nTests: regression coverage added.",
-                "labels": [],
-                "isCrossRepository": False,
-                "state": "OPEN",
-            }
-        ]
-        self.labels_added: list[tuple[int, str]] = []
-        self.labels_removed: list[tuple[int, str]] = []
-        self.labels_created: list[tuple[str, str, str]] = []
-        self.pr_labels_added: list[tuple[int, str]] = []
-        self.add_pr_label_ok = True
-        self.prs_created: list[dict[str, Any]] = []
-        self.pr_create_return: int | None = None
-        self.merged: list[tuple[int, str]] = []
-        self.merged_admin_flags: list[bool] = []
-        self.merged_merge_flags: list[tuple[str, ...]] = []
-        self.deleted_branches: list[str] = []
-        self.delete_branch_ok = True
-        self.update_branch_ok = True
-        self.pr_update_branch_calls: list[int] = []
-        self.pr_ready_calls: list[int] = []
-        self.pr_ready_ok = True
-        self.pr_ready_error: str | None = None
-        self.pr_head_shas: dict[int, str] = {}
-        self.diffs: dict[int, str] = {}
-        self.pr_external_issue_comments: dict[int, list[dict[str, Any]]] = {}
-        self.pr_external_reviews: dict[int, list[dict[str, Any]]] = {}
-        self.pr_external_review_comments: dict[int, list[dict[str, Any]]] = {}
-        self.closed_issues: list[int] = []
-        self.commits: dict[str, dict[str, Any]] = {}
-        # Default base head and per-(base,head) compare overrides for testing
-        # the merge-base freshness gate.
-        self.base_head_sha = "base-sha"
-        self.compare_overrides: dict[tuple[str, str], dict[str, Any] | None] = {}
-        self.compare_diff_overrides: dict[tuple[str, str], str | None] = {}
-        # Per-base branch protection overrides for testing issue #812's
-        # freshness-policy derivation. Default (no override) is None, matching
-        # the real GitHub.branch_protection()'s fail-closed return on any read
-        # failure -- so every pre-existing test keeps exercising the
-        # require_current_base fallback unchanged unless it opts in.
-        self.branch_protection_overrides: dict[str, dict[str, Any] | None] = {}
-        self.branch_protection_calls: list[str] = []
-        self._record_pr_heads(self.prs)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        object.__setattr__(self, name, value)
-        if name == "base_head_sha" and hasattr(self, "commits"):
-            if value not in self.commits:
-                self.commits[value] = {"parents": []}
-        elif name == "prs" and hasattr(self, "commits") and hasattr(self, "base_head_sha"):
-            self._record_pr_heads(value)
-
-    def _record_pr_heads(self, prs: list[dict[str, Any]]) -> None:
-        """Index PR head SHAs as commits rooted at the current base tip."""
-        base = self.base_head_sha
-        for pr in prs:
-            head = pr.get("headRefOid")
-            if head and head not in self.commits:
-                self.commits[head] = {"parents": [{"sha": base}]}
-
-    def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
-        return (True, 10000, 0)
-
-    def invalidate_list_cache(self) -> None:
-        # The real GitHub clears its per-pass list cache here (called at the
-        # start of every loop pass); the fake has no cache, so this is a no-op.
-        self.list_cache_invalidations = getattr(self, "list_cache_invalidations", 0) + 1
-
-    def issue_list(self, labels=None, state=None):
-        # Honor the label filter: return only issues with the ready label
-        # Support both old signature (ready_label: str) and new (labels=None, state=None)
-        if isinstance(labels, str):
-            ready_label = labels
-            return [
-                issue
-                for issue in self.issues
-                if ready_label in [label["name"] for label in issue.get("labels", [])]
-            ]
-        elif labels:
-            return [
-                issue
-                for issue in self.issues
-                if any(
-                    label in [label_obj["name"] for label_obj in issue.get("labels", [])]
-                    for label in labels
-                )
-            ]
-        return self.issues
-
-    def issue_view(self, number: int):
-        # Return the issue matching the requested number
-        for issue in self.issues:
-            if issue["number"] == number:
-                return issue
-        raise ValueError(f"Issue {number} not found")
-
-    def pr_list(self):
-        return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "OPEN"]
-
-    def merged_pr_list(self):
-        return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "MERGED"]
-
-    def merged_prs_for_issue(self, issue_number: int, branch_prefix: str):
-        # Issue #882: match the production shape. GitHubCLI.merged_prs_for_issue
-        # always returns a MergedPRSearchResult carrying ``.ok``; the base fake
-        # used to return a plain list, which only worked because the sole
-        # consumer reads defensively via ``getattr(merged_prs, "ok", True)``.
-        # Returning the typed wrapper here keeps the fake and the real thing
-        # agreeing, so a future caller that reads ``.ok`` directly does not pass
-        # tests here and AttributeError in production.
-        matched = []
-        for pr in self.prs:
-            if pr.get("state", "OPEN").upper() != "MERGED":
-                continue
-            bound = linked_issue_number(
-                pr,
-                is_cross_repository=pr.get("isCrossRepository"),
-                branch_prefix=branch_prefix,
-            )
-            if bound == issue_number:
-                matched.append(pr)
-        return github_module._MergedPRSearchResult(matched, ok=True)
-
-    def pr_view(self, number: int):
-        # Return the PR matching the requested number
-        for pr in self.prs:
-            if pr["number"] == number:
-                # Return a copy with the current head SHA (if overridden)
-                pr_copy = dict(pr)
-                if number in self.pr_head_shas:
-                    pr_copy["headRefOid"] = self.pr_head_shas[number]
-                return pr_copy
-        raise ValueError(f"PR {number} not found")
-
-    def pr_create(self, head: str, base: str, title: str, body: str) -> int | None:
-        self.prs_created.append({"head": head, "base": base, "title": title, "body": body})
-        return self.pr_create_return
-
-    def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
-        # No fixture data configured means an empty list, matching the real
-        # GitHub.pr_commits's "no failure, nothing found" shape rather than
-        # raising. Not exercised by any GitHubLike-typed call site as of the
-        # PR that added this method (only the concrete GitHub-typed
-        # closing-keyword-check CLI path calls it), but kept here so
-        # FakeGitHub stays a complete stand-in for the GitHubLike protocol.
-        return []
-
-    def pr_checks(self, number: int):
-        return [
-            {"name": "Tests passed", "state": "SUCCESS"},
-            {"name": "Lint & Format", "bucket": "pass"},
-            {"name": "Pre-commit", "state": "SUCCESS"},
-        ]
-
-    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
-        # Mirrors the real GitHub.check_run_annotations default: no
-        # annotations configured means an empty list, never a raise.
-        return []
-
-    def pr_diff(self, number: int):
-        # Return custom diff if set, otherwise default
-        if number in self.diffs:
-            return self.diffs[number]
-        return "diff --git a/file b/file"
-
-    def add_issue_label(self, number: int, label: str) -> bool:
-        self.labels_added.append((number, label))
-        return True
-
-    def remove_issue_label(self, number: int, label: str) -> bool:
-        self.labels_removed.append((number, label))
-        return True
-
-    def add_pr_label(self, number: int, label: str) -> bool:
-        self.pr_labels_added.append((number, label))
-        return self.add_pr_label_ok
-
-    def close_issue(self, number: int) -> bool:
-        """Track issue closure for testing. Idempotent — returns True even if already closed."""
-        # Track the closure
-        self.closed_issues.append(number)
-        # Update the issue state in the issues list
-        for issue in self.issues:
-            if issue["number"] == number:
-                issue["state"] = "CLOSED"
-                break
-        return True
-
-    def name_with_owner(self) -> str:
-        return "test-owner/test-repo"
-
-    def merge_pr(
-        self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()
-    ) -> str:
-        self.merged.append((number, strategy))
-        # merge_flags takes precedence over admin
-        if merge_flags:
-            self.merged_admin_flags.append("--admin" in merge_flags)
-        else:
-            self.merged_admin_flags.append(admin)
-        self.merged_merge_flags.append(merge_flags)
-
-        # Model the real effect of a merge: the base branch tip advances to a
-        # merge commit whose parents are the previous base tip and the merged PR
-        # head. This lets stale-base tests derive base movement organically from
-        # recorded merges instead of hand-feeding compare_overrides.
-        pr: dict[str, Any] | None = None
-        for candidate in self.prs:
-            if candidate.get("number") == number:
-                pr = candidate
-                break
-        if pr is not None:
-            base_ref = pr.get("baseRefName") or "main"
-            head_sha = pr.get("headRefOid")
-            old_base = self.base_head_sha
-            merge_sha = f"{base_ref}-merged-{head_sha}"
-            self.commits[merge_sha] = {
-                "parents": [{"sha": old_base}, {"sha": head_sha}],
-                "committer": {"login": "web-flow"},
-                "commit": {"committer": {"name": "GitHub"}},
-            }
-            self.base_head_sha = merge_sha
-
-        return "merged"
-
-    def delete_branch(self, branch: str) -> bool:
-        self.deleted_branches.append(branch)
-        return self.delete_branch_ok
-
-    def pr_ready(self, number: int) -> github_module.GitHubRunResult:
-        self.pr_ready_calls.append(number)
-        if self.pr_ready_ok:
-            for pr in self.prs:
-                if pr["number"] == number:
-                    # Simulate GitHub's real effect: the PR is no longer a
-                    # draft, so the next janitor pass sees isDraft=False.
-                    pr["isDraft"] = False
-                    break
-            return github_module.GitHubRunResult(
-                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
-            )
-        error = self.pr_ready_error or "gh: pull request #%d is not ready for review" % number
-        return github_module.GitHubRunResult(
-            ok=False, returncode=1, stdout="", stderr=error, value=None, error=error
-        )
-
-    def pr_update_branch(self, pr_number: int) -> bool:
-        self.pr_update_branch_calls.append(pr_number)
-        # Simulate a base update by moving the PR's head to a new SHA
-        # This reproduces the churn that the fix prevents
-        for pr in self.prs:
-            if pr["number"] == pr_number:
-                # Append a merge-SHA marker to simulate the head moving
-                old_head = pr.get("headRefOid", "")
-                new_head = f"{old_head}-updated"
-                pr["headRefOid"] = new_head
-                # A real update-branch makes the PR current with its base. Future
-                # compare calls for the new head should see the current base tip.
-                pr["mergeStateStatus"] = "CLEAN"
-                base_ref = pr.get("baseRefName") or "main"
-                base_head = self.base_head_sha
-                self.compare_overrides[(base_ref, new_head)] = {
-                    "base_commit": {"sha": base_head},
-                    "merge_base_commit": {"sha": base_head},
-                }
-                # Record the fake commit metadata so the post-sync verification
-                # helper sees a valid GitHub web-flow merge commit.
-                self.commits[new_head] = {
-                    "parents": [
-                        {"sha": old_head},
-                        {"sha": base_head},
-                    ],
-                    "committer": {"login": "web-flow"},
-                    "commit": {"committer": {"name": "GitHub"}},
-                }
-                return self.update_branch_ok
-        return False
-
-    def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
-        """Default implementation: check the actual state field in issues."""
-        open_issues: set[int] = set()
-        for number in issue_numbers:
-            for issue in self.issues:
-                if issue["number"] == number and str(issue.get("state") or "").upper() == "OPEN":
-                    open_issues.add(number)
-                    break
-        return open_issues
-
-    def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
-        """Fake run method for GitHub API calls. Returns empty list for dependencies by default."""
-        # Handle dependency API calls
-        if "dependencies" in " ".join(args):
-            # Default: return empty list (feature not available)
-            # Tests can override this by setting dependencies_response
-            if hasattr(self, "dependencies_response"):
-                return self.dependencies_response
-            return [] if json_output else ""
-        # Handle run list API calls
-        if "run" in args and "list" in args:
-            # Default: return empty list
-            # Tests can override this by setting runs_response
-            if hasattr(self, "runs_response"):
-                return self.runs_response
-            return [] if json_output else ""
-        # Handle run cancel API calls
-        if "run" in args and "cancel" in args:
-            # Default: return success string
-            return "Cancelled"
-        # Handle external findings API calls (issue #950).
-        joined = " ".join(args)
-        m = re.search(r"/issues/(\d+)/comments", joined)
-        if m and "/pulls/" not in joined:
-            return self.pr_external_issue_comments.get(int(m.group(1)), [])
-        m = re.search(r"/pulls/(\d+)/reviews", joined)
-        if m and "/comments" not in joined:
-            return self.pr_external_reviews.get(int(m.group(1)), [])
-        m = re.search(r"/pulls/(\d+)/comments", joined)
-        if m and "/reviews/" not in joined:
-            return self.pr_external_review_comments.get(int(m.group(1)), [])
-        # Handle paginated PR list REST API calls from reconcile.py.
-        if args[0] == "api" and "pulls?state=all" in args[1]:
-            url = args[1]
-            page_match = re.search(r"[?&]page=(\d+)", url)
-            page = int(page_match.group(1)) if page_match else 1
-            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
-            per_page = int(per_page_match.group(1)) if per_page_match else 100
-            start = (page - 1) * per_page
-            return self.prs[start : start + per_page]
-        # Handle paginated issue list REST API calls from reconcile.py.
-        if args[0] == "api" and "issues?state=all" in args[1]:
-            url = args[1]
-            page_match = re.search(r"[?&]page=(\d+)", url)
-            page = int(page_match.group(1)) if page_match else 1
-            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
-            per_page = int(per_page_match.group(1)) if per_page_match else 100
-            start = (page - 1) * per_page
-            return self.issues[start : start + per_page]
-        # Handle other API calls (for reconcile tests)
-        if json_output:
-            return []
-        return ""
-
-    def commit(self, sha: str) -> github_module.GitHubRunResult:
-        commit = self.commits.get(sha)
-        if not isinstance(commit, dict):
-            return github_module.GitHubRunResult(
-                ok=False,
-                returncode=1,
-                stdout="",
-                stderr="",
-                value=None,
-                error=f"commit {sha} not found",
-            )
-        return github_module.GitHubRunResult(
-            ok=True, returncode=0, stdout="", stderr="", value=commit
-        )
-
-    def _ancestors(self, sha: str) -> set[str]:
-        """Return all ancestors of ``sha`` (including ``sha`` itself)."""
-        seen: set[str] = set()
-        stack = [sha]
-        while stack:
-            current = stack.pop()
-            if current in seen or not current:
-                continue
-            seen.add(current)
-            commit = self.commits.get(current)
-            if not isinstance(commit, dict):
-                continue
-            for parent in commit.get("parents", []):
-                if isinstance(parent, dict):
-                    parent_sha = parent.get("sha")
-                else:
-                    parent_sha = parent
-                if parent_sha:
-                    stack.append(parent_sha)
-        return seen
-
-    def _merge_base(self, base_sha: str, head_sha: str) -> str | None:
-        """Return the best common ancestor of ``base_sha`` and ``head_sha``.
-
-        The best common ancestor is a common ancestor that is not itself an
-        ancestor of another common ancestor. For linear DAGs this is the usual
-        merge-base; the simple filter works for the small graphs in these tests.
-        """
-        base_ancestors = self._ancestors(base_sha)
-        head_ancestors = self._ancestors(head_sha)
-        common = base_ancestors & head_ancestors
-        if not common:
-            return None
-        best = [
-            sha
-            for sha in common
-            if not any(sha in self._ancestors(other) and sha != other for other in common)
-        ]
-        if not best:
-            best = list(common)
-
-        # Deterministic tie-break: prefer the ancestor closest to the base tip.
-        def _distance(source: str, target: str) -> int:
-            if source == target:
-                return 0
-            visited: set[str] = {source}
-            queue: list[tuple[str, int]] = [(source, 0)]
-            while queue:
-                current, dist = queue.pop(0)
-                commit = self.commits.get(current)
-                if not isinstance(commit, dict):
-                    continue
-                for parent in commit.get("parents", []):
-                    if isinstance(parent, dict):
-                        parent_sha = parent.get("sha")
-                    else:
-                        parent_sha = parent
-                    if parent_sha == target:
-                        return dist + 1
-                    if parent_sha and parent_sha not in visited:
-                        visited.add(parent_sha)
-                        queue.append((parent_sha, dist + 1))
-            return len(self.commits)
-
-        best.sort(key=lambda sha: (_distance(base_sha, sha), _distance(head_sha, sha), sha))
-        return best[0]
-
-    def compare(self, base: str, head: str) -> dict[str, Any] | None:
-        override = self.compare_overrides.get((base, head))
-        if override is not None:
-            return override
-        base_head = self.base_head_sha
-
-        # Find the matching PR so we can honor mergeStateStatus hints when the
-        # graph is not enough or contradicts a BEHIND signal.
-        matching_pr = None
-        for pr in self.prs:
-            if pr.get("headRefOid") == head:
-                matching_pr = pr
-                break
-        if matching_pr is None:
-            for pr_number, pr_head in self.pr_head_shas.items():
-                if pr_head == head:
-                    for pr in self.prs:
-                        if pr.get("number") == pr_number:
-                            matching_pr = pr
-                            break
-                    break
-
-        # If we have a commit graph for both the current base tip and the head,
-        # derive the merge base from recorded merges. This is the path that lets
-        # merge tests prove ``merge advances main`` organically.
-        if base_head in self.commits and head in self.commits:
-            merge_base = self._merge_base(base_head, head)
-            base_current = merge_base == base_head
-            if base_current and str(matching_pr.get("mergeStateStatus") or "").upper() == "BEHIND":
-                # A BEHIND mergeStateStatus is a stronger stale signal than the
-                # current graph, so tests can still simulate a stale branch by
-                # setting mergeStateStatus to BEHIND.
-                return {
-                    "base_commit": {"sha": base_head},
-                    "merge_base_commit": {"sha": f"{base_head}-stale"},
-                }
-            return {
-                "base_commit": {"sha": base_head},
-                "merge_base_commit": {"sha": merge_base if merge_base else ""},
-            }
-
-        # If no graph is available, fall back to the PR's mergeStateStatus when
-        # it is known. Tests can still use compare_overrides to model exceptional
-        # cases (e.g. CLEAN-but-stale where mergeStateStatus lags).
-        if (
-            matching_pr is not None
-            and str(matching_pr.get("mergeStateStatus") or "").upper() == "BEHIND"
-        ):
-            return {
-                "base_commit": {"sha": base_head},
-                "merge_base_commit": {"sha": f"{base_head}-stale"},
-            }
-        # Default: the PR's merge-base is the current base tip.
-        return {
-            "base_commit": {"sha": base_head},
-            "merge_base_commit": {"sha": base_head},
-        }
-
-    def compare_diff(self, base: str, head: str) -> str | None:
-        override = self.compare_diff_overrides.get((base, head), "_unset")
-        if override != "_unset":
-            return override
-        return f"diff --git a/interdiff b/interdiff\n--- a/interdiff\n+++ b/interdiff\n@@ -1 +1 @@\n-{base}\n+{head}\n"
-
-    def branch_protection(self, base: str) -> dict[str, Any] | None:
-        self.branch_protection_calls.append(base)
-        return self.branch_protection_overrides.get(base)
-
-    def label_create(self, label: str, color: str, description: str) -> None:
-        self.labels_created.append((label, color, description))
-
-    def label_list(self) -> list[dict[str, object]]:
-        # Return all labels that have been created — simulates creation success.
-        return [{"name": name} for name, _color, _desc in self.labels_created]
-
-    def pr_comment(self, number: int, body_file: Path) -> None:
-        pass
-
-    def remove_pr_label(self, number: int, label: str) -> bool:
-        return True
-
-    def actions_job(self, job_id: int) -> dict[str, Any] | None:
-        return None
-
-    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
-        return None
-
-    def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None:
-        return None
-
-    def validate_field_lists(self) -> None:
-        pass
-
-
-class FakeGitHubWithChecks(FakeGitHub):
-    """FakeGitHub whose pr_checks returns a configurable list."""
-
-    def __init__(self, checks: list[dict[str, Any]] | None = None) -> None:
-        super().__init__()
-        self.checks = checks if checks is not None else []
-
-    def pr_checks(self, number: int) -> list[dict[str, Any]]:
-        # Mirror production GitHub.pr_checks: inject databaseId/runId from the
-        # check link, but only when not already provided by the test.
-        return [
-            {
-                **check,
-                "databaseId": check.get("databaseId", _job_id_from_link(check.get("link"))),
-                "runId": check.get("runId", _run_id_from_link(check.get("link"))),
-            }
-            for check in self.checks
-        ]
-
-
-class FakeGitHubWithChecksAndAnnotations(FakeGitHubWithChecks):
-    """FakeGitHubWithChecks whose check_run_annotations returns a configurable
-    per-check-run-id mapping (issue #771 tests)."""
-
-    def __init__(
-        self,
-        checks: list[dict[str, Any]] | None = None,
-        annotations_by_check_run_id: dict[int, list[dict[str, Any]]] | None = None,
-    ) -> None:
-        super().__init__(checks=checks)
-        self.annotations_by_check_run_id = annotations_by_check_run_id or {}
-
-    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
-        return self.annotations_by_check_run_id.get(check_run_id, [])
-
-
-class FakeGitHubWithMissingRequired(FakeGitHubWithChecks):
-    """No required checks present at all, so every required check is missing."""
-
-    def __init__(self) -> None:
-        super().__init__(checks=[])
-
-
 def test_fake_github_default_pr_head_is_indexed() -> None:
     """Issue #347: the default FakeGitHub fixture must index the PR head in commits.
 
@@ -3679,6 +2959,16 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
     In a criss-cross graph, the two best common ancestors are both minimal.
     A correct BFS distance and a deterministic tie-break must produce the same
     merge base regardless of hash randomization.
+
+    Issue #1292: the harness was previously flaky because (a) it imported
+    ``FakeGitHub`` via ``test_charlie_work`` -- dragging the entire 50k-line
+    test module (pytest, yaml, every helper fixture) into a subprocess whose
+    import can fail transiently under full-suite parallel-run contention --
+    and (b) it collected results into a ``set``, discarding the seed-to-result
+    mapping so a failure was unactionable. The harness now imports
+    ``FakeGitHub`` directly from ``_fakes_github`` (the lightweight module that
+    defines it) and records the seed that produced each result so any future
+    non-determinism is immediately attributable.
     """
     tests_dir = Path(__file__).parent
     repo_root = tests_dir.parent
@@ -3686,7 +2976,7 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
         [
             "import os, sys",
             "sys.path.insert(0, sys.argv[1])",
-            "from test_charlie_work import FakeGitHub",
+            "from _fakes_github import FakeGitHub",
             "gh = FakeGitHub()",
             "gh.commits = {",
             '    "R": {"parents": []},',
@@ -3699,7 +2989,8 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
             'print(gh._merge_base("A2", "B2"))',
         ]
     )
-    results: set[str] = set()
+    # Record the seed that produced each result so a failure is actionable.
+    results: dict[str, str] = {}
     for seed in range(5):
         env = os.environ.copy()
         env["PYTHONHASHSEED"] = str(seed)
@@ -3709,10 +3000,15 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
             cwd=str(repo_root),
             capture_output=True,
             text=True,
-            check=True,
         )
-        results.add(proc.stdout.strip())
-    assert len(results) == 1, f"merge_base varied across hash seeds: {results}"
+        if proc.returncode != 0:
+            raise AssertionError(
+                f"subprocess for PYTHONHASHSEED={seed} exited {proc.returncode}.\n"
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            )
+        results[str(seed)] = proc.stdout.strip()
+    distinct = set(results.values())
+    assert len(distinct) == 1, f"merge_base varied across hash seeds (seed -> result): {results}"
 
 
 def test_base_fake_github_merged_prs_for_issue_returns_typed_result() -> None:
@@ -3832,6 +3128,58 @@ def test_dispatch_excludes_issue_with_open_tracked_pr(tmp_path: Path) -> None:
     # The default FakeGitHub fixture is exactly the hazard case: issue 123 is
     # labeled ready and has NO state entry, while open PR 456 tracks it.
     assert app.gh.prs[0]["state"] == "OPEN"
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    prompt_path = tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
+    assert not prompt_path.exists()
+    assert (123, "agent:queued") not in fake_gh.labels_added
+    assert (123, "agent:in-progress") not in fake_gh.labels_added
+
+
+def test_dispatch_selects_ready_issue_without_operator_queue_label(tmp_path: Path) -> None:
+    """Positive control for the operator_queue dispatch-exclusion test below:
+    the exact same fixture (ready label, no open tracked PR) but with no
+    ``operator_queue`` label present must dispatch normally. Without this
+    control, a dispatch-exclusion assertion of ``selected_count == 0`` would
+    be equally consistent with "the terminal check works" and with "this
+    fixture never dispatches for an unrelated reason" (see issue #257 above --
+    the default fixture's open tracked PR is exactly that trap)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Clear the default fixture's open tracked PR so it cannot mask the
+    # terminal-label check under test.
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert (123, "agent:queued") in fake_gh.labels_added
+
+
+def test_dispatch_excludes_issue_with_operator_queue_label(tmp_path: Path) -> None:
+    """Issue #1266: an issue carrying ``agent:operator-queue`` (a mechanical
+    escalation awaiting operator triage) must never be selected for dispatch,
+    even though it still carries ``automated-ready`` -- exactly the same
+    invariant ``human_needed`` already has via ``LabelConfig.terminal``.
+    Drives the real ``OrchestratorApp.dispatch`` -> ``_is_dispatchable`` path,
+    not the label-set membership in isolation (that is
+    ``test_label_config_operator_queue_in_terminal_set`` in test_config.py).
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    fake_gh.issues[0]["labels"] = [
+        {"name": config.labels.ready},
+        {"name": config.labels.operator_queue},
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
     result = app.dispatch(limit=1)
 
     assert result.ok is True
@@ -4990,6 +4338,228 @@ def test_dispatch_merged_pr_mention_flag_skips_dedup_marker_on_partial_failure(
     assert flagged_events_2[0]["payload"]["issue_numbers"] == [123]
 
 
+def test_dispatch_merged_pr_mention_rearmed_re_enters_dispatch(tmp_path: Path) -> None:
+    """Issue #1336: an operator who reviews a mention-only flag and
+    deliberately re-arms the issue (removes agent:human-needed) must get it
+    dispatched again on the next pass. Before the fix, the mention-only
+    dispatch exclusion keyed off the raw mention scan, which recomputed
+    from the merged PR's immutable text on every pass and blocked the issue
+    forever -- the #564 point-2 limitation.
+
+    This pins acceptance criterion 1 (re-arm re-enters dispatch) and the
+    one-shot flag preservation (no re-flag on the re-arm pass). Uses a
+    label-mutating fake so the issue's labels genuinely reflect the
+    operator's removal, exercising the re-arm detection path that reads
+    the already-loaded issue labels.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),  # avoid real worker launch
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    human_needed = config.labels.human_needed
+
+    class LabelMutatingFakeGitHub(FakeGitHub):
+        def add_issue_label(self, number: int, label: str) -> bool:
+            super().add_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] != number:
+                    continue
+                names = {item.get("name") for item in issue["labels"]}
+                if label not in names:
+                    issue["labels"].append({"name": label})
+                break
+            return True
+
+        def remove_issue_label(self, number: int, label: str) -> bool:
+            super().remove_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] == number:
+                    issue["labels"] = [
+                        item for item in issue["labels"] if item.get("name") != label
+                    ]
+                    break
+            return True
+
+    fake_gh = LabelMutatingFakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Merged PR #456 only *mentions* issue #123 in free text -- no
+    # branch-prefix binding, no closing keyword -- so only the loose
+    # mention scan finds it.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+    assert fake_gh.prs[0]["isCrossRepository"] is False
+
+    # --- Pass 1: never-flagged mention-only -> flagged, excluded, not dispatched
+    result1 = app.dispatch(limit=1)
+    assert result1.ok is True
+    assert result1.data["merged_pr_flagged_issue_numbers"] == [123]
+    assert result1.data["merged_pr_mention_rearmed_issue_numbers"] == []
+    assert result1.data["selected_count"] == 0  # mention-only exclusion applies
+    assert (123, human_needed) in fake_gh.labels_added
+    state1 = load_state(paths.state_file)
+    assert state1["issues"]["123"].get("merged_pr_mention_flagged_at") is not None
+    assert state1["issues"]["123"].get("mention_rearmed_at") is None
+
+    # --- Operator re-arm: remove agent:human-needed (deliberate ruling).
+    assert fake_gh.remove_issue_label(123, human_needed)
+
+    # --- Pass 2: re-arm detected -> exclusion lifts, issue dispatched, no re-flag
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is True
+    assert result2.data["merged_pr_flagged_issue_numbers"] == []  # one-shot preserved
+    assert result2.data["merged_pr_mention_rearmed_issue_numbers"] == [123]
+    assert result2.data["selected_count"] == 1  # re-entered dispatch candidates
+    assert 123 in [s["issue_number"] for s in result2.data["sessions"]]
+    state2 = load_state(paths.state_file)
+    assert state2["issues"]["123"].get("mention_rearmed_at") is not None
+    # The durable re-arm marker is recorded as an event.
+    rearmed_events = [
+        e
+        for e in state2.get("events", [])
+        if e.get("kind") == "dispatch_merged_pr_mention_rearmed"
+    ]
+    assert len(rearmed_events) == 1
+    assert rearmed_events[0]["payload"]["issue_numbers"] == [123]
+
+    # --- Pass 3: durable marker persists -> exclusion stays lifted. The issue
+    # is now dispatched (active labels), so it is not re-selected; the point is
+    # that the mention-only exclusion does NOT re-assert and block recovery.
+    result3 = app.dispatch(limit=1)
+    assert result3.ok is True
+    state3 = load_state(paths.state_file)
+    assert state3["issues"]["123"].get("mention_rearmed_at") is not None
+    # No second re-arm event -- the durable marker suppresses re-detection.
+    rearmed_events_3 = [
+        e
+        for e in state3.get("events", [])
+        if e.get("kind") == "dispatch_merged_pr_mention_rearmed"
+    ]
+    assert len(rearmed_events_3) == 1
+
+
+def test_dispatch_merged_pr_mention_still_carries_human_needed_stays_excluded(
+    tmp_path: Path,
+) -> None:
+    """Issue #1336 acceptance criterion 2: a mention-only issue that was flagged
+    and still carries agent:human-needed must remain excluded -- the operator
+    has not re-armed, so the safe default from #564 is preserved. A regression
+    that lifts the exclusion purely on the flag timestamp (without checking the
+    label / durable re-arm marker) makes this test fail.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class LabelMutatingFakeGitHub(FakeGitHub):
+        def add_issue_label(self, number: int, label: str) -> bool:
+            super().add_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] != number:
+                    continue
+                names = {item.get("name") for item in issue["labels"]}
+                if label not in names:
+                    issue["labels"].append({"name": label})
+                break
+            return True
+
+    fake_gh = LabelMutatingFakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+
+    # Pass 1: flagged, human_needed applied (and retained on the issue).
+    result1 = app.dispatch(limit=1)
+    assert result1.data["merged_pr_flagged_issue_numbers"] == [123]
+    assert result1.data["selected_count"] == 0
+
+    # Pass 2: operator did NOT remove human_needed -> still excluded.
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is True
+    assert result2.data["merged_pr_flagged_issue_numbers"] == []  # one-shot
+    assert result2.data["merged_pr_mention_rearmed_issue_numbers"] == []
+    assert result2.data["selected_count"] == 0  # still excluded
+    state2 = load_state(paths.state_file)
+    assert state2["issues"]["123"].get("mention_rearmed_at") is None
+
+
+def test_dispatch_merged_pr_mention_never_flagged_stays_excluded(tmp_path: Path) -> None:
+    """Issue #1336 acceptance criterion 2 (never-reviewed half): a
+    mention-only issue that has never been flagged must remain excluded this
+    pass while it is being flagged for the first time -- the re-arm lift only
+    applies to issues flagged in a PRIOR pass. A regression that lifts the
+    exclusion for any issue with the flag timestamp set this pass (before the
+    operator has had a chance to rule) makes this test fail.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+
+    result = app.dispatch(limit=1)
+    assert result.ok is True
+    # First-time flag: excluded this pass (flagged, not dispatched), no re-arm.
+    assert result.data["merged_pr_flagged_issue_numbers"] == [123]
+    assert result.data["merged_pr_mention_rearmed_issue_numbers"] == []
+    assert result.data["selected_count"] == 0
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"].get("mention_rearmed_at") is None
+
+
+def test_dispatch_merged_pr_bound_exclusion_unaffected_by_rearm(tmp_path: Path) -> None:
+    """Issue #1336 acceptance criterion 3: ``bound`` exclusions (branch-prefix
+    / closing-verb linkage) stay scan-based and are never lifted by a re-arm.
+    A bound PR genuinely addressed the issue, so even an issue carrying the
+    durable ``mention_rearmed_at`` marker must remain excluded and be closed.
+    A regression that subtracts rearmed issues from the bound set (instead of
+    only the mention-only set) makes this test fail.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # PR #456 binds to issue #123 via the branch prefix -> bound, not mention.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "agent/issue-123-fix-search"
+    fake_gh.prs[0]["title"] = "Fix #123: search"
+    fake_gh.prs[0]["body"] = "Closes #123\n\nTests: regression coverage added."
+
+    # Pre-seed state with both a mention flag timestamp AND a re-arm marker to
+    # prove the bound exclusion ignores re-arm entirely.
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "merged_pr_mention_flagged_at": "2026-01-01T00:00:00Z",
+        "mention_rearmed_at": "2026-01-02T00:00:00Z",
+    }
+    save_state(paths.state_file, seed)
+
+    result = app.dispatch(limit=1)
+    assert result.ok is True
+    # Bound issue stays excluded and is closed -- re-arm does not lift bound.
+    assert 123 in result.data["merged_pr_referenced_issue_numbers"]
+    assert 123 in fake_gh.closed_issues
+    assert result.data["selected_count"] == 0
+
+
 def test_dispatch_ignores_cross_repo_pr_mentioning_ready_issue(tmp_path: Path) -> None:
     """Regression for the isCrossRepository guard (workflow.py,
     _merged_pr_referenced_issue_numbers): a merged PR whose provenance is
@@ -5878,155 +5448,6 @@ def test_merge_ready_requires_approved_decision_then_merges(tmp_path: Path) -> N
     assert ready.data["branch_deleted"] is True
 
 
-def _merge_check_app(tmp_path: Path):
-    config = _required_checks_config()
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    return OrchestratorApp(tmp_path, paths, config, fake_gh), paths, fake_gh
-
-
-def _write_decision(tmp_path: Path, pr: int, payload: dict) -> None:
-    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / f"pr-{pr}"
-    decision_dir.mkdir(parents=True, exist_ok=True)
-    (decision_dir / "review-decision.json").write_text(json.dumps(payload), encoding="utf-8")
-
-
-def test_merge_check_fails_closed_with_no_decision(tmp_path: Path) -> None:
-    """Issue #894. No recorded decision must never read as authorization."""
-    app, _, fake_gh = _merge_check_app(tmp_path)
-
-    result = app.merge_check(456)
-
-    assert result.ok is False
-    assert result.data["authorized"] is False
-    assert result.data["reason"] == "no_decision"
-    # A preflight is a pure question: it must not merge as a side effect.
-    assert fake_gh.merged == []
-
-
-def test_merge_check_rejects_request_changes(tmp_path: Path) -> None:
-    """The PR #759 shape: a recorded `request_changes` at the live head."""
-    app, _, _ = _merge_check_app(tmp_path)
-    _write_decision(
-        tmp_path, 456, {"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}
-    )
-
-    result = app.merge_check(456)
-
-    assert result.ok is False
-    assert result.data["reason"] == "not_approved"
-    assert result.data["decision"] == "request_changes"
-
-
-def test_merge_check_rejects_approval_at_stale_head(tmp_path: Path) -> None:
-    """Approved-but-moved is a distinct outcome from never-approved: it routes to
-    re-review, not to review. Collapsing them would make the preflight
-    unactionable."""
-    app, _, _ = _merge_check_app(tmp_path)
-    _write_decision(tmp_path, 456, {"decision": "approved", "reviewed_head_sha": "sha-old"})
-
-    result = app.merge_check(456)
-
-    assert result.ok is False
-    assert result.data["reason"] == "head_moved"
-    assert result.data["reviewed_head_sha"] == "sha-old"
-    assert result.data["live_head_sha"] == "sha-abc123"
-
-
-def test_merge_check_rejects_malformed_decision(tmp_path: Path) -> None:
-    """Unparseable state fails closed rather than laundering uncertainty."""
-    app, _, _ = _merge_check_app(tmp_path)
-    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
-    decision_dir.mkdir(parents=True)
-    (decision_dir / "review-decision.json").write_text("{not json", encoding="utf-8")
-
-    result = app.merge_check(456)
-
-    assert result.ok is False
-    assert result.data["reason"] == "invalid_decision"
-
-
-def test_merge_check_authorizes_approved_at_current_head(tmp_path: Path) -> None:
-    """The positive control: without this, every assertion above would also pass
-    against a merge_check that returned False unconditionally."""
-    app, _, fake_gh = _merge_check_app(tmp_path)
-    _write_decision(tmp_path, 456, {"decision": "approved", "reviewed_head_sha": "sha-abc123"})
-
-    result = app.merge_check(456)
-
-    assert result.ok is True
-    assert result.data["authorized"] is True
-    assert result.data["reason"] == "approved_at_head"
-    assert fake_gh.merged == []
-
-
-def test_merge_check_rejects_already_merged_pr(tmp_path: Path) -> None:
-    app, _, fake_gh = _merge_check_app(tmp_path)
-    _write_decision(tmp_path, 456, {"decision": "approved", "reviewed_head_sha": "sha-abc123"})
-    for pr in fake_gh.prs:
-        if pr.get("number") == 456:
-            pr["state"] = "MERGED"
-
-    result = app.merge_check(456)
-
-    assert result.ok is False
-    assert result.data["reason"] == "already_merged"
-
-
-def test_merge_check_is_reachable_through_the_cli(tmp_path: Path) -> None:
-    """Wiring check (L3). Every other test here calls merge_check directly and
-    would still pass if the subcommand were never registered or dispatched —
-    which is exactly the failure mode that makes a control inert. A hook shelling
-    out to `charlie merge-check` reaches it through this path only."""
-    app, _, _ = _merge_check_app(tmp_path)
-    _write_decision(tmp_path, 456, {"decision": "approved", "reviewed_head_sha": "sha-abc123"})
-
-    args = cli.build_parser().parse_args(["merge-check", "456"])
-    assert args.command == "merge-check"
-    assert args.pr == 456
-
-    result = cli.run_command(app, args)
-    assert result.ok is True
-    assert result.data["reason"] == "approved_at_head"
-
-
-def test_merge_check_does_not_fail_open_when_state_lock_is_held(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """merge_check must not carry @_guard_state_lock.
-
-    That guard's contract (issue #398) is to return a *successful* skip
-    (ok=True, reason='state_lock_busy') so a contended pass is a no-op rather
-    than a crash. Correct for state-writing commands; catastrophic here, because
-    a caller gating a merge on exit status would read "lock was busy" as
-    "authorized". An authorization preflight must answer the question or fail
-    closed — never succeed vacuously.
-
-    This is not hypothetical: adding merge_check directly above merge_ready
-    silently transferred merge_ready's decorator onto it, and only merge_ready's
-    own lock-guard test noticed. Nothing asserted the property from this side.
-    """
-    monkeypatch.setattr(state_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
-    app, paths, _ = _merge_check_app(tmp_path)
-    _write_decision(
-        tmp_path, 456, {"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}
-    )
-
-    state_path = paths.state_file
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(
-        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
-    )
-    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
-
-    with _hold_state_lock(lock_path):
-        result = app.merge_check(456)
-
-    assert result.ok is False
-    assert result.data["reason"] == "not_approved"
-    assert result.data.get("pass_skipped") is not True
-
-
 def test_merge_ready_branch_delete_failure_never_blocks_labels(tmp_path: Path) -> None:
     """The empericus failure mode: a branch checked out in a local worktree made
     `gh pr merge --delete-branch` abort the post-merge label update. Deletion is
@@ -6186,31 +5607,6 @@ def _review_queue_app(
     if prs is not None:
         fake_gh.prs = prs
     return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
-
-
-def _write_review_packet(
-    tmp_path: Path,
-    pr_number: int,
-    packet_head_sha: str,
-    decision: dict[str, Any] | None = None,
-) -> Path:
-    """Create a review packet fixture for a PR."""
-    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / f"pr-{pr_number}"
-    pr_dir.mkdir(parents=True, exist_ok=True)
-    (pr_dir / "pr.json").write_text(
-        json.dumps({"number": pr_number, "headRefOid": packet_head_sha}),
-        encoding="utf-8",
-    )
-    (pr_dir / "review-prompt.md").write_text(
-        f"review prompt for PR #{pr_number}",
-        encoding="utf-8",
-    )
-    if decision is not None:
-        (pr_dir / "review-decision.json").write_text(
-            json.dumps(decision),
-            encoding="utf-8",
-        )
-    return pr_dir
 
 
 def test_review_queue_includes_missing_pending_and_stale_decisions(
@@ -7639,19 +7035,21 @@ def test_review_queue_stays_stale_with_empty_patch_id_from_rename(
 def test_check_carry_forward_tier1_whitespace_collision_bypasses_tier2(
     tmp_path: Path,
 ) -> None:
-    """Issue #634 audit rework: ``git patch-id --stable`` strips leading
-    whitespace from ``+``/``-`` content lines, so two diffs that differ ONLY
-    in indentation depth produce the identical patch-id.  The tier-1 fast
-    path in ``_check_carry_forward`` (workflow.py:17333-17334) matches on
-    that hash and returns ``"patch-id"`` immediately — it never falls through
-    to the tier-2 line-content signature, which DOES preserve whitespace and
-    WOULD distinguish the two diffs.
+    """Issue #1187 (audit #634 rework): ``git patch-id --stable`` strips
+    leading whitespace from ``+``/``-`` content lines, so two diffs that
+    differ ONLY in indentation depth produce the identical patch-id.  The
+    tier-1 fast path in ``_check_carry_forward`` previously matched on that
+    hash and returned ``"patch-id"`` immediately — it never consulted the
+    tier-2 line-content signature, which DOES preserve whitespace and WOULD
+    distinguish the two diffs.
 
     In Python, an indentation-only change can alter control flow (e.g. moving
     a ``return`` into or out of an ``if`` block).  Carrying forward an
     approved verdict across such a change without review is a review-gate
-    bypass.  This test documents the vulnerability; the fix is tracked as a
-    follow-up (see audit doc and PR body).
+    bypass.  After the fix, the tier-1 patch-id match is no longer
+    sufficient: the tier-2 line-content signature is also validated, and
+    when it differs (a whitespace-only change that patch-id collapsed) the
+    carry-forward is REFUSED — the verdict is reported stale.
     """
     from charlie_work.janitor import _calculate_patch_id, _diff_content_signature
 
@@ -7739,22 +7137,23 @@ def test_check_carry_forward_tier1_whitespace_collision_bypasses_tier2(
     result = app.review_queue()
 
     assert result.ok is True
-    assert result.data["queue"] == [], (
-        "the verdict was carried forward (not reported stale) — this is "
-        "the vulnerability: tier-1 patch-id match short-circuits before "
-        "tier-2 can reject the whitespace-only change"
+    assert result.data["queue"] != [], (
+        "the verdict must NOT be carried forward across an "
+        "indentation-only change — tier-2 signature differs, so the "
+        "verdict is reported stale for re-review"
     )
 
     decision = json.loads(
         (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
     )
-    assert decision["reviewed_head_sha"] == new_head, (
-        "the approved verdict was carried forward to the reindented head "
-        "without review — the review-gate bypass"
+    assert decision["reviewed_head_sha"] == old_head, (
+        "the approved verdict must NOT be carried forward to the "
+        "reindented head — the review-gate bypass is closed"
     )
-    assert decision["carry_forward_tier"] == "patch-id", (
-        "carry-forward was via tier-1 (patch-id), NOT tier-2 (line-content) "
-        "— tier-2 was never consulted because tier-1 short-circuited"
+    assert decision.get("carry_forward_tier") != "patch-id", (
+        "carry-forward must not be via tier-1 (patch-id) when the tier-2 "
+        "line-content signature differs — the whitespace collision is "
+        "detected and the verdict is refused"
     )
 
 
@@ -7887,22 +7286,6 @@ def test_review_queue_carry_forward_records_event(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 # Issue #1111: stale-CI request_changes verdict suppression in review_queue()
 # --------------------------------------------------------------------------
-
-_STALE_CI_REQUIRED = ("Tests passed", "Pre-commit")
-
-_STALE_CI_GREEN_CHECKS = [
-    {"name": "Tests passed", "state": "SUCCESS"},
-    {"name": "Pre-commit", "state": "SUCCESS"},
-]
-
-_STALE_CI_RED_CHECKS = [
-    {"name": "Tests passed", "state": "FAILURE"},
-    {"name": "Pre-commit", "state": "SUCCESS"},
-]
-
-_STALE_CI_CONTAMINATED_REQUIRED_CHANGES = [
-    "Tests passed: .github:18 — Process completed with exit code 1."
-]
 
 
 def _stale_ci_review_queue_app(
@@ -8306,6 +7689,7 @@ def test_review_no_op_rework_suppressed_when_stale_ci_verdict(tmp_path: Path) ->
         "request_changes",
         summary="Tests passed: .github:18 — Process completed with exit code 1.",
         required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        verdict_provenance="ci_gate_auto_reject",
     )
     state = load_state(app.paths.state_file)
     record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
@@ -8346,6 +7730,7 @@ def test_review_stale_ci_skip_emits_gate_pass_event(tmp_path: Path) -> None:
         "request_changes",
         summary="Tests passed: .github:18 — Process completed with exit code 1.",
         required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        verdict_provenance="ci_gate_auto_reject",
     )
     state = load_state(app.paths.state_file)
     record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
@@ -8382,6 +7767,7 @@ def test_review_stale_ci_skip_no_gate_pass_event_in_dry_run(tmp_path: Path) -> N
         "request_changes",
         summary="Tests passed: .github:18 — Process completed with exit code 1.",
         required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        verdict_provenance="ci_gate_auto_reject",
     )
     state = load_state(app.paths.state_file)
     record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
@@ -8414,6 +7800,7 @@ def test_review_stale_ci_gate_pass_event_deduped_per_head(tmp_path: Path) -> Non
         "request_changes",
         summary="Tests passed: .github:18 — Process completed with exit code 1.",
         required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        verdict_provenance="ci_gate_auto_reject",
     )
     state = load_state(app.paths.state_file)
     record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
@@ -8451,6 +7838,7 @@ def test_review_no_op_rework_routes_when_prose_finding(tmp_path: Path) -> None:
         "request_changes",
         summary="fix A",
         required_changes=["src/foo.py:42 — off-by-one error in the loop bound."],
+        verdict_provenance="fresh_llm_review",
     )
     state = load_state(app.paths.state_file)
     record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
@@ -8505,7 +7893,7 @@ def test_merge_ready_post_update_branch_records_verified_sync_event(
         }
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(pr_number, "approved", summary="lgtm")
+    app.record_review(pr_number, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Advance the base tip so the PR is stale and triggers pr_update_branch.
     post_merge_base = "main-merged-sha"
@@ -8600,7 +7988,7 @@ def test_merge_ready_head_sync_verification_none_sets_sync_failed(
     fake_gh.diffs[pr_number] = original_diff
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(pr_number, "approved", summary="lgtm")
+    app.record_review(pr_number, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Simulate the branch moving (e.g. a rebase) with unchanged cumulative
     # content, so the patch-id carry-forward tier fires naturally and the
@@ -8682,8 +8070,8 @@ def test_update_open_agent_prs_front_of_train_records_verified_sync_event(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     for idx, pr_number in enumerate((456, 789)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -8709,47 +8097,6 @@ def test_update_open_agent_prs_front_of_train_records_verified_sync_event(
     assert payload["pr_number"] == 789
     assert payload["issue_number"] == 124
     assert payload["carry_forward_tier"] == "verified-sync"
-
-
-def _dispatch_reviews_app(
-    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None, enabled: bool = True
-) -> OrchestratorApp:
-    """Build an OrchestratorApp with review_dispatch enabled (by default) and an empty state file.
-
-    Issue #868: ``enabled`` is overridable so tests can exercise
-    ``dispatch_reviews()``'s disabled-gate path with the same PR/state seeding
-    helpers used by the enabled-path tests.
-    """
-    config = OrchestratorConfig(
-        review_dispatch=ReviewDispatchConfig(enabled=enabled),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    (paths.root).mkdir(parents=True, exist_ok=True)
-    (paths.root / "state.json").write_text(
-        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
-        encoding="utf-8",
-    )
-    fake_gh = FakeGitHub()
-    fake_gh.issues = []
-    if prs is not None:
-        fake_gh.prs = prs
-    return OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-
-def _fake_claude_worker_record(pr_number: int, branch: str) -> ClaudeWorkerRecord:
-    """Return a successful Claude worker record for monkeypatched launches."""
-    return ClaudeWorkerRecord(
-        issue_number=pr_number,
-        branch=branch,
-        worktree_path="/fake/worktree",
-        prompt_path="/fake/prompt.md",
-        command=("claude", "-p"),
-        pid=12345,
-        started_at="2026-07-06T12:00:00Z",
-        log_path="/fake/log.log",
-        error=None,
-        process_start_time=1.0,
-    )
 
 
 def test_dispatch_reviews_launches_for_all_queued_prs(monkeypatch, tmp_path: Path) -> None:
@@ -8812,6 +8159,268 @@ def test_dispatch_reviews_launches_for_all_queued_prs(monkeypatch, tmp_path: Pat
     assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
     assert state["prs"]["100"]["reviewer_pid"] == 12345
     assert state["prs"]["200"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+
+def test_dispatch_reviews_skips_empty_diff_pr(monkeypatch, tmp_path: Path) -> None:
+    """Issue #1251: a PR whose diff.patch is empty (zero-file diff vs base)
+    must not burn a paid reviewer session. The pre-flight gate skips dispatch,
+    emits review_dispatch_skipped_empty_diff, and does NOT increment
+    review_dispatch_attempt_count (an empty diff is not a review attempt)."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    # Write an EMPTY diff.patch — the signal for a zero-file PR.
+    pr_dir = app.paths.prs / "pr-100"
+    (pr_dir / "diff.patch").write_text("", encoding="utf-8")
+
+    launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append((args, kwargs))
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # No reviewer must have been launched.
+    assert len(launched) == 0
+    assert result.data["launched_count"] == 0
+    # The PR must appear in the skipped_empty_diff payload.
+    assert 100 in result.data["skipped_empty_diff"]
+    # review_dispatch_skipped_empty_diff event must have been emitted.
+    skip_events = query_events(app.paths.state_file, kind="review_dispatch_skipped_empty_diff")
+    assert len(skip_events) == 1
+    assert skip_events[0]["pr_number"] == 100
+    # review_dispatch_attempt_count must NOT have been incremented.
+    state = load_state(app.paths.state_file)
+    pr_state = state["prs"].get("100", {})
+    assert int(pr_state.get("review_dispatch_attempt_count", 0)) == 0
+    # No dispatch claim must have been written.
+    assert pr_state.get("review_dispatch_status") != "review_dispatch_pending"
+
+
+def test_dispatch_reviews_proceeds_with_nonempty_diff(monkeypatch, tmp_path: Path) -> None:
+    """Issue #1251: a PR with a non-empty diff.patch must proceed through
+    normal dispatch unchanged — the empty-diff gate only stops zero-file PRs."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    # Write a NON-EMPTY diff.patch.
+    pr_dir = app.paths.prs / "pr-100"
+    (pr_dir / "diff.patch").write_text(
+        "diff --git a/foo.py b/foo.py\n+print('hello')\n", encoding="utf-8"
+    )
+
+    launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append((args, kwargs))
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # The reviewer must have been launched.
+    assert len(launched) == 1
+    assert result.data["launched_count"] == 1
+    # No empty-diff skip.
+    assert result.data["skipped_empty_diff"] == []
+    # No review_dispatch_skipped_empty_diff event.
+    skip_events = query_events(app.paths.state_file, kind="review_dispatch_skipped_empty_diff")
+    assert len(skip_events) == 0
+    # Dispatch must have proceeded — claim upgraded to dispatched.
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+
+def test_dispatch_reviews_empty_diff_mixed_with_nonempty(monkeypatch, tmp_path: Path) -> None:
+    """Issue #1251: when both an empty-diff PR and a non-empty-diff PR are
+    queued, only the non-empty PR is dispatched; the empty one is skipped
+    without affecting the other's dispatch."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 200,
+            "title": "Fix #20",
+            "url": "https://example.test/pull/200",
+            "headRefName": "agent/issue-20-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #20",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    _write_review_packet(tmp_path, 200, "sha-200")
+    # PR 100: empty diff. PR 200: non-empty diff.
+    (app.paths.prs / "pr-100" / "diff.patch").write_text("", encoding="utf-8")
+    (app.paths.prs / "pr-200" / "diff.patch").write_text(
+        "diff --git a/bar.py b/bar.py\n+pass\n", encoding="utf-8"
+    )
+
+    launched: list[int] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # Only PR 200 must have been launched.
+    assert launched == [200]
+    assert result.data["launched_count"] == 1
+    # PR 100 must be in the skipped list.
+    assert 100 in result.data["skipped_empty_diff"]
+    assert 200 not in result.data["skipped_empty_diff"]
+    # PR 100's attempt count must not have been incremented.
+    state = load_state(app.paths.state_file)
+    assert int(state["prs"].get("100", {}).get("review_dispatch_attempt_count", 0)) == 0
+    # PR 200's attempt count must have been incremented (claimed).
+    assert int(state["prs"]["200"].get("review_dispatch_attempt_count", 0)) == 1
+
+
+def test_dispatch_reviews_dry_run_empty_diff_preview_is_read_only(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #1251: the dry-run preview branch of dispatch_reviews mirrors the
+    real path's empty-diff pre-flight gate (added at the dry-run branch's
+    dry_selected/dry_skipped_empty_diff loop) but must stay strictly read-only:
+    no review_dispatch_skipped_empty_diff event emitted, no state.json mutation, no
+    attempt_count change. This is the only test covering that loop -- no other
+    dispatch_reviews dry-run test exists in the file."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 200,
+            "title": "Fix #20",
+            "url": "https://example.test/pull/200",
+            "headRefName": "agent/issue-20-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #20",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs, dry_run=True)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    _write_review_packet(tmp_path, 200, "sha-200")
+    # PR 100: empty diff. PR 200: non-empty diff.
+    (app.paths.prs / "pr-100" / "diff.patch").write_text("", encoding="utf-8")
+    (app.paths.prs / "pr-200" / "diff.patch").write_text(
+        "diff --git a/bar.py b/bar.py\n+pass\n", encoding="utf-8"
+    )
+
+    # A dry-run pass must never launch a worker. Guard against the launch
+    # helper being invoked at all -- if it is, the dry-run gate failed.
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        raise AssertionError("dry-run dispatch_reviews must not launch a worker")
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    # Snapshot state.json's raw bytes so a no-op dry-run can be proven by
+    # byte-equality, not just by re-reading parsed fields.
+    state_path = app.paths.state_file
+    state_before = state_path.read_bytes()
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # The empty-diff PR is excluded from the would-dispatch count; the
+    # non-empty PR is the only one that would be dispatched.
+    assert result.data["selected_count"] == 1
+    assert result.data["attempted_count"] == 1
+    assert result.data["launched_count"] == 0
+    # deferred_count = all_candidates - dry_selected = 2 - 1 = 1 (the empty
+    # PR is counted as deferred in the dry-run preview, mirroring how the
+    # real path's deferred_count = candidates - dispatchable treats a
+    # pre-flight-skipped PR as not-selected).
+    assert result.data["deferred_count"] == 1
+    # The empty-diff PR is reported in skipped_empty_diff; the non-empty is not.
+    assert result.data["skipped_empty_diff"] == [100]
+    # Read-only contract: no review_dispatch_skipped_empty_diff event emitted.
+    skip_events = query_events(app.paths.state_file, kind="review_dispatch_skipped_empty_diff")
+    assert skip_events == []
+    # Read-only contract: state.json bytes unchanged.
+    assert state_path.read_bytes() == state_before
+    # Read-only contract: no attempt_count mutation for either PR.
+    state = load_state(state_path)
+    assert "100" not in state["prs"]
+    assert "200" not in state["prs"]
 
 
 def test_dispatch_reviews_forwards_orchestrator_config_to_launch(
@@ -8916,8 +8525,15 @@ def test_dispatch_reviews_records_review_effort_arm_on_state_and_event(
     claim_events = [e for e in state["events"] if e.get("kind") == "review_dispatch_claim"]
     assert len(claim_events) == 1
     assignments = claim_events[0]["payload"]["review_effort_assignments"]
+    # Issue #1439: the structure-aware turn cap is resolved alongside the
+    # review_effort arm and mirrored into the same assignment record.
     assert assignments == [
-        {"pr_number": 100, "review_effort_arm": "treatment", "review_effort_used": "high"}
+        {
+            "pr_number": 100,
+            "review_effort_arm": "treatment",
+            "review_effort_used": "high",
+            "review_turn_cap": config.review_dispatch.review_max_turns,
+        }
     ]
 
 
@@ -9261,6 +8877,14 @@ def test_dispatch_reviews_reaps_stalled_claim_when_disabled(monkeypatch, tmp_pat
         "process_start_time": 1.0,
     }
     (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    # Give the reviewer a readable log with no throttle marker so it
+    # classifies as NOT_THROTTLED (the counted-failure path this test
+    # exercises). Without this the log read would fail (the sidecar's
+    # log_path names a file that was never created) and classify as
+    # UNDETERMINED (issue #1069), whose first-few-deaths handling rolls the
+    # claim back to re-dispatchable instead of reaping it to
+    # review_dispatch_failed.
+    Path(sidecar["log_path"]).write_text("ordinary crash output\n", encoding="utf-8")
     with state_lock(app.paths.state_file):
         state = load_state(app.paths.state_file)
         state["prs"]["100"] = {
@@ -9606,7 +9230,13 @@ def test_dispatch_reviews_recorded_verdict_suppresses_later_stalled_throttle(
         }
         save_state(app.paths.state_file, state)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, app.paths.state_file, app.config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir,
+        app.paths.state_file,
+        app.config,
+        repo_root,
+        write_gate=_wg(app.paths.state_file),
+    )
 
     state = load_state(app.paths.state_file)
     assert not is_reviewer_quota_exhausted(state)
@@ -9924,21 +9554,6 @@ def test_dispatch_reviews_respects_max_concurrent_reviews(monkeypatch, tmp_path:
     assert result.data["launched_count"] == 2
 
 
-def _init_git_repo(repo_root: Path) -> None:
-    import subprocess
-
-    repo_root.mkdir(parents=True, exist_ok=True)
-    run = lambda args: subprocess.run(  # noqa: E731
-        args, cwd=repo_root, check=True, capture_output=True, text=True
-    )
-    run(["git", "init", "--initial-branch=main"])
-    run(["git", "config", "user.email", "test@example.test"])
-    run(["git", "config", "user.name", "Test User"])
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    run(["git", "add", "README.md"])
-    run(["git", "commit", "-m", "initial commit"])
-
-
 def test_detect_and_handle_stalled_reviews_removes_review_checkout(tmp_path: Path) -> None:
     """Issue #397: a reaped stale-claim review must tear down that PR's
     isolated review checkout, not just free the state.json claim."""
@@ -9974,7 +9589,9 @@ def test_detect_and_handle_stalled_reviews_removes_review_checkout(tmp_path: Pat
         }
         save_state(state_file, state)
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert any(entry.get("pr") == 100 for entry in stalled)
     assert not checkout.path.exists()
@@ -10043,7 +9660,9 @@ def test_detect_and_handle_stalled_reviews_backs_off_on_provider_throttle_in_log
         }
         save_state(state_file, state)
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert any(
         entry.get("pr") == 100 and entry.get("reason") == "provider_throttled" for entry in stalled
@@ -10136,7 +9755,9 @@ def test_detect_and_handle_stalled_reviews_suppresses_backoff_after_probe_recove
         }
         save_state(state_file, state)
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert any(
         entry.get("pr") == 100 and entry.get("reason") == "provider_throttled" for entry in stalled
@@ -10230,7 +9851,9 @@ def test_detect_and_handle_stalled_reviews_applies_backoff_when_probe_predates_d
         }
         save_state(state_file, state)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = _load_state(state_file)
     quota = state.get("reviewer_quota", {})
@@ -10479,7 +10102,9 @@ def test_stale_claim_recovery_skipped_logs_when_decision_already_recorded(
         }
         save_state(state_file, state)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
     # The PR was not reaped -- recovery declined because a verdict exists.
@@ -10535,7 +10160,9 @@ def test_stale_claim_recovery_skipped_logs_when_packet_not_stale(
         }
         save_state(state_file, state)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
     assert state["prs"]["100"].get("review_dispatch_status") is None
@@ -10547,303 +10174,6 @@ def test_stale_claim_recovery_skipped_logs_when_packet_not_stale(
     assert payload["reason"] == "packet_not_stale"
     assert "packet_age" in payload
     assert skip_events[0]["level"] == "info"
-
-
-def test_reap_completed_review_checkouts_removes_checkout_once_reviewer_exited(
-    tmp_path: Path,
-) -> None:
-    """Issue #397: once record_review has recorded a verdict
-    (review_dispatch_completed) and the reviewer's own sidecar process is no
-    longer alive, the isolated review checkout is reaped. Liveness must be
-    checked via the sidecar in reviews_dir (iter_workers), since record_review
-    already cleared state.json's reviewer_pid by this point."""
-    from datetime import timedelta
-
-    from charlie_work.workflow import _reap_completed_review_checkouts
-    from charlie_work.worktree import create_review_checkout
-
-    repo_root = tmp_path / "repo"
-    _init_git_repo(repo_root)
-    reviews_dir = tmp_path / "reviews"
-
-    head_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True, capture_output=True, text=True
-    ).stdout.strip()
-    checkout = create_review_checkout(repo_root, 200, head_sha, reviews_dir=reviews_dir)
-    assert checkout.path.exists()
-
-    # A sidecar recording a definitely-dead pid (record_review does not
-    # delete the sidecar itself, only clears state.json's own pid fields).
-    reviews_dir.mkdir(parents=True, exist_ok=True)
-    sidecar = {
-        "issue_number": 200,
-        "branch": "agent/issue-20-fix",
-        "worktree_path": str(checkout.path),
-        "prompt_path": str(checkout.path / ".orchestrator-prompt.md"),
-        "command": ["claude", "-p"],
-        "pid": 999999999,
-        "started_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
-        "log_path": str(reviews_dir / "issue-200.claude.log"),
-        "error": None,
-        "process_start_time": 1.0,
-    }
-    (reviews_dir / "issue-200.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
-
-    state_file = tmp_path / "state.json"
-    state_file.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "issues": {},
-                "prs": {
-                    "200": {
-                        "number": 200,
-                        "review_dispatch_status": "review_dispatch_completed",
-                        "reviewer_pid": None,
-                        "reviewer_process_start_time": None,
-                    }
-                },
-                "events": [],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    reaped = _reap_completed_review_checkouts(repo_root, reviews_dir, state_file)
-
-    assert reaped == [200]
-    assert not checkout.path.exists()
-
-
-def test_reap_completed_review_checkouts_skips_while_reviewer_still_alive(
-    tmp_path: Path,
-) -> None:
-    """A completed-verdict PR whose reviewer sidecar is still alive must NOT
-    have its checkout removed out from under the exiting process.
-
-    Uses this test process's own PID/start-time as the sidecar's recorded
-    identity, so the real (non-monkeypatched) claude_code.is_worker_alive
-    liveness+identity check reports it genuinely alive — matching how
-    test_count_live_sessions_ghost_worker_pid_corroborated_by_state (same
-    file) proves a "ghost" liveness case elsewhere in this suite.
-    """
-    from charlie_work.claude_code import _get_process_start_time
-    from charlie_work.workflow import _reap_completed_review_checkouts
-    from charlie_work.worktree import create_review_checkout
-
-    repo_root = tmp_path / "repo"
-    _init_git_repo(repo_root)
-    reviews_dir = tmp_path / "reviews"
-
-    head_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True, capture_output=True, text=True
-    ).stdout.strip()
-    checkout = create_review_checkout(repo_root, 201, head_sha, reviews_dir=reviews_dir)
-
-    reviews_dir.mkdir(parents=True, exist_ok=True)
-    current_pid = os.getpid()
-    sidecar = {
-        "issue_number": 201,
-        "branch": "agent/issue-21-fix",
-        "worktree_path": str(checkout.path),
-        "prompt_path": str(checkout.path / ".orchestrator-prompt.md"),
-        "command": ["claude", "-p"],
-        "pid": current_pid,
-        "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        "log_path": str(reviews_dir / "issue-201.claude.log"),
-        "error": None,
-        "process_start_time": _get_process_start_time(current_pid),
-    }
-    (reviews_dir / "issue-201.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
-
-    state_file = tmp_path / "state.json"
-    state_file.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "issues": {},
-                "prs": {
-                    "201": {
-                        "number": 201,
-                        "review_dispatch_status": "review_dispatch_completed",
-                        "reviewer_pid": None,
-                        "reviewer_process_start_time": None,
-                    }
-                },
-                "events": [],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    reaped = _reap_completed_review_checkouts(repo_root, reviews_dir, state_file)
-
-    assert reaped == []
-    assert checkout.path.exists()
-
-
-def test_reap_orphaned_review_checkouts_clears_merged_pr_dispatch_state(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """Issue #494: the review-dispatch pass must reap checkouts and clear
-    review-dispatch state for PRs that GitHub already reports as MERGED
-    or CLOSED, regardless of the local claim status.
-    """
-    from charlie_work.state import empty_state
-    from charlie_work.workflow import _reap_orphaned_review_checkouts
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    reviews_dir = tmp_path / "reviews"
-    reviews_dir.mkdir()
-    state_file = tmp_path / "state.json"
-
-    config = OrchestratorConfig()
-    state = empty_state()
-    state["prs"]["100"] = {
-        "number": 100,
-        "review_dispatch_status": "review_dispatch_dispatched",
-        "review_dispatched_at": "2026-07-20T00:00:00Z",
-        "reviewer_pid": 12345,
-        "reviewer_process_start_time": 1.0,
-    }
-    save_state(state_file, state)
-
-    fake_gh = FakeGitHub()
-    fake_gh.prs = [
-        {
-            "number": 100,
-            "title": "Fix #1",
-            "url": "https://example.test/pull/100",
-            "headRefName": "agent/issue-1-fix",
-            "baseRefName": "main",
-            "headRefOid": "sha-100",
-            "body": "Closes #1",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "MERGED",
-        }
-    ]
-
-    removed_calls: list[tuple[Path, int, Path | None]] = []
-
-    def fake_remove_review_checkout(
-        repo_root_arg: Path, pr_number: int, *, reviews_dir: Path | None = None
-    ) -> bool:
-        removed_calls.append((repo_root_arg, pr_number, reviews_dir))
-        return True
-
-    monkeypatch.setattr(
-        "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
-    )
-
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
-
-    assert reaped == [100]
-    assert len(removed_calls) == 1
-    assert removed_calls[0][0] == repo_root
-    assert removed_calls[0][1] == 100
-    assert removed_calls[0][2] == reviews_dir
-
-    new_state = load_state(state_file)
-    assert new_state["prs"]["100"]["review_dispatch_status"] is None
-    assert new_state["prs"]["100"]["review_dispatched_at"] is None
-    assert new_state["prs"]["100"]["reviewer_pid"] is None
-    assert new_state["prs"]["100"]["reviewer_process_start_time"] is None
-    assert new_state["prs"]["100"]["status"] == "merged"
-
-
-def test_reap_orphaned_review_checkouts_defers_while_reviewer_alive(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """Issue #504: a PR merged/closed externally while its reviewer is still
-    alive must not have its review checkout removed or its dispatch claim
-    cleared until the reviewer exits.
-
-    Uses a sidecar in reviews_dir and monkeypatches WorkerView.is_alive to
-    True/False so the test exercises the liveness gate without a real process.
-    """
-    from charlie_work.state import empty_state, load_state, save_state
-    from charlie_work.workflow import _reap_orphaned_review_checkouts
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    reviews_dir = tmp_path / "reviews"
-    reviews_dir.mkdir()
-    state_file = tmp_path / "state.json"
-
-    config = OrchestratorConfig()
-    state = empty_state()
-    state["prs"]["100"] = {
-        "number": 100,
-        "review_dispatch_status": "review_dispatch_dispatched",
-        "review_dispatched_at": "2026-07-20T00:00:00Z",
-        "reviewer_pid": 12345,
-        "reviewer_process_start_time": 1.0,
-    }
-    save_state(state_file, state)
-
-    sidecar = {
-        "issue_number": 100,
-        "branch": "agent/issue-100-fix",
-        "worktree_path": str(reviews_dir / "pr-100"),
-        "prompt_path": str(reviews_dir / "pr-100" / ".orchestrator-prompt.md"),
-        "command": ["claude", "-p"],
-        "pid": 12345,
-        "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        "log_path": str(reviews_dir / "issue-100.claude.log"),
-        "error": None,
-        "process_start_time": 1.0,
-        "adapter_kind": "claude-code",
-    }
-    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
-
-    fake_gh = FakeGitHub()
-    fake_gh.prs = [
-        {
-            "number": 100,
-            "title": "Fix #1",
-            "url": "https://example.test/pull/100",
-            "headRefName": "agent/issue-100-fix",
-            "baseRefName": "main",
-            "headRefOid": "sha-100",
-            "body": "Closes #1",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "MERGED",
-        }
-    ]
-
-    removed_calls: list[tuple[Path, int, Path | None]] = []
-
-    def fake_remove_review_checkout(
-        repo_root_arg: Path, pr_number: int, *, reviews_dir: Path | None = None
-    ) -> bool:
-        removed_calls.append((repo_root_arg, pr_number, reviews_dir))
-        return True
-
-    monkeypatch.setattr(
-        "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
-    )
-
-    # Live reviewer: defer the reap.
-    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: True)
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
-    assert reaped == []
-    assert removed_calls == []
-    new_state = load_state(state_file)
-    assert new_state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
-
-    # Dead reviewer: proceed with the reap.
-    removed_calls.clear()
-    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
-    assert reaped == [100]
-    assert len(removed_calls) == 1
-    assert removed_calls[0][1] == 100
-    new_state = load_state(state_file)
-    assert new_state["prs"]["100"]["review_dispatch_status"] is None
-    assert new_state["prs"]["100"]["status"] == "merged"
 
 
 def test_loop_dispatches_reviews_and_evaluates_merge(monkeypatch, tmp_path: Path) -> None:
@@ -10992,28 +10322,6 @@ def test_loop_zero_checks_pr_does_not_land_in_errors_bucket(tmp_path: Path) -> N
     assert result.data["merges"] == []
     assert len(result.data["reviews"]) == 1
     assert result.data["reviews"][0]["pr"] == 456
-
-
-def _arm_unauthorized_merge_tripwire(paths, pre_existing: tuple[int, ...] = ()) -> None:
-    """Declare the #502 tripwire already armed, so a test sees its steady state.
-
-    The tripwire's first pass over a fresh state records a baseline of the merges
-    that predate it and reports nothing (see
-    ``OrchestratorApp._apply_unauthorized_merge_baseline``). Any test asserting on
-    findings must therefore say whether it is exercising the arming pass or the
-    steady state. Calling this with no arguments means "armed, and there was no
-    pre-existing backlog", which is the condition every pre-baseline tripwire test
-    was implicitly written against.
-    """
-    from charlie_work.state import load_state, save_state
-    from charlie_work.workflow import UNAUTHORIZED_MERGE_BASELINE_KEY
-
-    state = load_state(paths.state_file)
-    state[UNAUTHORIZED_MERGE_BASELINE_KEY] = {
-        "armed_at": "2026-07-26T00:00:00Z",
-        "pre_existing_prs": list(pre_existing),
-    }
-    save_state(paths.state_file, state)
 
 
 def test_detect_unauthorized_merges_flags_worker_self_merge(tmp_path: Path) -> None:
@@ -11812,6 +11120,49 @@ auto_merge:
     assert config.auto_merge.queue_bot_login == "aviator-app[bot]"
 
 
+def test_auto_merge_config_mergequeue_wedge_hours_defaults_to_24() -> None:
+    """Issue #1401: default AutoMergeConfig() enables the time-in-mergequeue
+    watchdog at 24h -- the live #1751 case ran 28h+ undetected, so the default
+    must be on, not opt-in."""
+    assert AutoMergeConfig().mergequeue_wedge_hours == 24.0
+
+
+def test_load_config_parses_mergequeue_wedge_hours(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_wedge_hours: 6
+"""
+    )
+    config = load_config(config_file)
+    assert config.auto_merge.mergequeue_wedge_hours == 6.0
+
+
+def test_load_config_rejects_negative_mergequeue_wedge_hours(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_wedge_hours: -1
+"""
+    )
+    with pytest.raises(ConfigError, match="must not be negative"):
+        load_config(config_file)
+
+
+def test_load_config_rejects_non_number_mergequeue_wedge_hours(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_wedge_hours: "soon"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be a number"):
+        load_config(config_file)
+
+
 def test_loop_surfaces_unauthorized_merge_in_errors_bucket(tmp_path: Path) -> None:
     """loop() must wire the post-merge tripwire into the errors bucket even when dispatch() had no ready issues and returned an empty merged_prs list (issue #502)."""
     from charlie_work.config import OrchestratorConfig
@@ -11913,22 +11264,6 @@ def test_loop_tripwire_silent_for_approved_matching_head(tmp_path: Path) -> None
     assert tripwire_errors == [], (
         f"approved matching-head merge must not be flagged, got {tripwire_errors}"
     )
-
-
-def _merged_worker_pr(number: int, issue: int, sha: str) -> dict[str, Any]:
-    """A merged worker-branch PR shaped like merged_pr_list() output."""
-    return {
-        "number": number,
-        "title": f"fix: work for #{issue}",
-        "url": f"https://example.test/pull/{number}",
-        "headRefName": f"agent/issue-{issue}-fix",
-        "baseRefName": "main",
-        "headRefOid": sha,
-        "state": "MERGED",
-        "isCrossRepository": False,
-        "body": f"Closes #{issue}",
-        "labels": [],
-    }
 
 
 def test_unauthorized_merge_tripwire_arms_instead_of_flagging_history(tmp_path: Path) -> None:
@@ -12079,29 +11414,6 @@ def test_unauthorized_merge_baseline_arming_writes_nothing_in_dry_run(tmp_path: 
     assert UNAUTHORIZED_MERGE_BASELINE_KEY not in load_state(paths.state_file), (
         "dry-run must leave no baseline behind"
     )
-
-
-def _ack_unauthorized_merge(paths, pr_number: int, reason: str = "triaged") -> None:
-    """Mark a post-arming unauthorized-merge finding as acknowledged in state.json.
-
-    Mirrors ``_arm_unauthorized_merge_tripwire`` for the ack half of the
-    tripwire: tests asserting on post-arming findings use this to declare the
-    steady state where a finding has already been triaged and must no longer
-    pin ``ok=False`` (issue #673).
-    """
-    from charlie_work.state import load_state, save_state
-    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
-
-    state = load_state(paths.state_file)
-    acks = state.get(UNAUTHORIZED_MERGE_ACK_KEY)
-    if not isinstance(acks, dict):
-        acks = {}
-    acks[str(pr_number)] = {
-        "acknowledged_at": "2026-07-27T00:00:00Z",
-        "reason": reason,
-    }
-    state[UNAUTHORIZED_MERGE_ACK_KEY] = acks
-    save_state(paths.state_file, state)
 
 
 def test_unauthorized_merge_ack_suppresses_acknowledged_finding(tmp_path: Path) -> None:
@@ -12383,116 +11695,12 @@ def test_github_remove_issue_label_returns_true_on_success(monkeypatch, tmp_path
 # --- Cross-family adversarial review ------------------------------------------
 
 
-def _fake_completed(
-    returncode: int = 0, stdout: str = "**MAJOR**\nx\n\nVerdict: safe", stderr: str = ""
-):
-    def _runner(command, **kwargs):
-        return subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr=stderr)
-
-    return _runner
-
-
-def _cross_family_app(tmp_path: Path, *, enabled: bool) -> OrchestratorApp:
-    config = OrchestratorConfig(cross_family=CrossFamilyConfig(enabled=enabled))
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    return OrchestratorApp(tmp_path, paths, config, FakeGitHub())
-
-
 def test_render_command_templates_list_and_string() -> None:
     values = {"model": "codex", "prompt_path": "/tmp/p.md"}
     assert render_command(
         ("devin", "--model", "{model}", "-p", "--prompt-file", "{prompt_path}"), values
     ) == ["devin", "--model", "codex", "-p", "--prompt-file", "/tmp/p.md"]
     assert render_command("devin --model {model}", values) == "devin --model codex"
-
-
-def test_run_cross_family_writes_report_with_caveat(tmp_path: Path) -> None:
-    report = tmp_path / "report.md"
-    prompt = tmp_path / "prompt.md"
-
-    result = run_cross_family_review(
-        model="codex",
-        command=("devin",),
-        repo_root=tmp_path,
-        prompt_text="attack this",
-        prompt_path=prompt,
-        report_path=report,
-        timeout_seconds=5,
-        runner=_fake_completed(0, "**BLOCKER**\nboom\n\nVerdict: safe"),
-    )
-
-    assert result.ok is True
-    assert result.returncode == 0
-    assert prompt.read_text(encoding="utf-8") == "attack this"
-    body = report.read_text(encoding="utf-8")
-    assert "leads, not verdicts" in body
-    assert "**BLOCKER**" in body
-    assert "Verdict: safe" in body
-    assert "codex" in body
-
-
-def test_run_cross_family_timeout_is_captured_not_raised(tmp_path: Path) -> None:
-    report = tmp_path / "report.md"
-
-    def _runner(command, **kwargs):
-        raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
-
-    result = run_cross_family_review(
-        model="codex",
-        command=("devin",),
-        repo_root=tmp_path,
-        prompt_text="x",
-        prompt_path=tmp_path / "p.md",
-        report_path=report,
-        timeout_seconds=3,
-        runner=_runner,
-    )
-
-    assert result.ok is False
-    assert "timed out" in (result.error or "")
-    assert "UNAVAILABLE" in report.read_text(encoding="utf-8")
-
-
-def test_run_cross_family_nonzero_exit_is_captured(tmp_path: Path) -> None:
-    report = tmp_path / "report.md"
-
-    result = run_cross_family_review(
-        model="codex",
-        command=("devin",),
-        repo_root=tmp_path,
-        prompt_text="x",
-        prompt_path=tmp_path / "p.md",
-        report_path=report,
-        timeout_seconds=5,
-        runner=_fake_completed(2, "partial output", "stderr boom"),
-    )
-
-    assert result.ok is False
-    assert result.returncode == 2
-    text = report.read_text(encoding="utf-8")
-    assert "exited 2" in text
-    assert "partial output" in text
-
-
-def test_run_cross_family_missing_binary_is_captured(tmp_path: Path) -> None:
-    report = tmp_path / "report.md"
-
-    def _runner(command, **kwargs):
-        raise FileNotFoundError("devin not on PATH")
-
-    result = run_cross_family_review(
-        model="codex",
-        command=("devin",),
-        repo_root=tmp_path,
-        prompt_text="x",
-        prompt_path=tmp_path / "p.md",
-        report_path=report,
-        timeout_seconds=5,
-        runner=_runner,
-    )
-
-    assert result.ok is False
-    assert "failed to start" in (result.error or "")
 
 
 def test_devin_example_config_enables_cross_family() -> None:
@@ -12725,100 +11933,6 @@ def test_config_accepts_string_review_effort(tmp_path: Path) -> None:
     assert config.review_dispatch.review_effort == "high"
 
 
-def test_review_injects_cross_family_section_when_enabled(tmp_path: Path, monkeypatch) -> None:
-    app = _cross_family_app(tmp_path, enabled=True)
-    calls = {"n": 0}
-
-    VALID_REPORT = "**MAJOR**\nissue\n\nVerdict: safe"
-
-    def _fake_run(**kwargs):
-        calls["n"] += 1
-        Path(kwargs["report_path"]).write_text(VALID_REPORT, encoding="utf-8")
-        return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
-
-    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
-
-    result = app.review(456)
-
-    assert calls["n"] == 1
-    assert result.data["cross_family_ok"] is True
-    prs_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
-    prompt_text = (prs_dir / "review-prompt.md").read_text(encoding="utf-8")
-    assert "Cross-family adversarial pass" in prompt_text
-    assert "leads, not verdicts" in prompt_text
-    assert (prs_dir / "cross-family-review.md").exists()
-
-
-def test_review_reuses_existing_cross_family_report(tmp_path: Path, monkeypatch) -> None:
-    app = _cross_family_app(tmp_path, enabled=True)
-    calls = {"n": 0}
-    VALID_REPORT = "**MAJOR**\nissue\n\nVerdict: safe"
-
-    # Set a consistent head SHA for the PR
-    app.gh.pr_head_shas[456] = "sha-abc123"
-
-    def _fake_run(**kwargs):
-        calls["n"] += 1
-        # Write a report with the current head SHA so it can be reused
-        head_sha = kwargs.get("head_ref_oid", "sha-abc123")
-        report_content = (
-            f"# Cross-family adversarial review — `codex`\n\n"
-            f"<!-- PR head SHA: {head_sha} -->\n\n"
-            f"> Findings below are **leads, not verdicts**\n\n"
-            f"---\n\n"
-            f"{VALID_REPORT}\n"
-        )
-        Path(kwargs["report_path"]).write_text(report_content, encoding="utf-8")
-        return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
-
-    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
-
-    app.review(456)
-    app.review(456)
-
-    assert calls["n"] == 1  # the second pass reused the report; codex did not re-run
-
-
-def test_review_no_cross_family_override_skips(tmp_path: Path, monkeypatch) -> None:
-    app = _cross_family_app(tmp_path, enabled=True)
-
-    def _boom(**kwargs):
-        raise AssertionError("cross-family must not run when disabled per call")
-
-    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _boom)
-
-    result = app.review(456, cross_family=False)
-
-    assert result.data["cross_family_ok"] is None
-    prompt_text = (
-        tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
-    ).read_text(encoding="utf-8")
-    assert "Cross-family adversarial pass" not in prompt_text
-
-
-def test_review_skips_cross_family_for_draft_pr(tmp_path: Path, monkeypatch) -> None:
-    app = _cross_family_app(tmp_path, enabled=True)
-    app.gh.prs[0] = {**app.gh.prs[0], "isDraft": True}
-
-    def _boom(**kwargs):
-        raise AssertionError("cross-family must not run for a draft PR")
-
-    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _boom)
-
-    result = app.review(456)
-
-    # Issue #818: the default fixture PR is otherwise fully janitor-green
-    # (linked issue, tests mentioned, CLEAN merge state), so draft is the
-    # ONLY failure -- the janitor gate now auto-readies it via `gh pr ready`
-    # instead of parking it, deferring the actual review to the next poll
-    # pass (the pass that never comes in this test, since _boom would raise
-    # if cross-family review ran). The pre-fix pin (janitor_ok False,
-    # "draft" in janitor_failures) no longer holds for a pure-draft block.
-    assert result.ok is False
-    assert result.data["draft_readied"] is True
-    assert app.gh.pr_ready_calls == [456]
-
-
 def test_spec_review_runs_and_writes_report(tmp_path: Path, monkeypatch) -> None:
     spec = tmp_path / "SPEC.md"
     spec.write_text("# My spec\nclaims", encoding="utf-8")
@@ -12851,129 +11965,6 @@ def test_spec_review_missing_file_propagates_os_error(tmp_path: Path) -> None:
         app.spec_review(tmp_path / "nope.md")
 
     assert not (tmp_path / ".var" / "charlie-work" / "cross-family").exists()
-
-
-# --- Issue #38 regression: transient retry + empty/blocked report guard --------
-
-
-VALID_CROSS_FAMILY_REPORT = "**MAJOR**\nissue\n\nVerdict: safe"
-
-
-def test_run_cross_family_retries_once_on_transient_rate_limit_then_success(
-    tmp_path: Path,
-) -> None:
-    report = tmp_path / "report.md"
-    prompt = tmp_path / "prompt.md"
-    calls: list[str] = []
-    rate_msg = (
-        "Reached overall message rate limit. Please try again later. "
-        "Your limit will reset in 1 minute."
-    )
-
-    def _runner(command, **kwargs):
-        if not calls:
-            calls.append("fail")
-            return subprocess.CompletedProcess(command, 1, stdout="", stderr=rate_msg)
-        calls.append("success")
-        return subprocess.CompletedProcess(command, 0, stdout=VALID_CROSS_FAMILY_REPORT, stderr="")
-
-    sleep_calls: list[float] = []
-    result = run_cross_family_review(
-        model="codex",
-        command=("devin",),
-        repo_root=tmp_path,
-        prompt_text="attack this",
-        prompt_path=prompt,
-        report_path=report,
-        timeout_seconds=5,
-        runner=_runner,
-        sleep=lambda s: sleep_calls.append(s),
-    )
-
-    assert result.ok is True
-    assert result.returncode == 0
-    assert calls == ["fail", "success"]
-    assert sleep_calls == [90.0]
-    assert "**MAJOR**" in report.read_text(encoding="utf-8")
-
-
-def test_run_cross_family_rate_limit_retry_exhausted_then_fails(tmp_path: Path) -> None:
-    report = tmp_path / "report.md"
-    prompt = tmp_path / "prompt.md"
-    rate_msg = "Rate limit exceeded. Try again later."
-    calls: list[str] = []
-
-    def _runner(command, **kwargs):
-        calls.append("fail")
-        return subprocess.CompletedProcess(command, 1, stdout="", stderr=rate_msg)
-
-    result = run_cross_family_review(
-        model="codex",
-        command=("devin",),
-        repo_root=tmp_path,
-        prompt_text="x",
-        prompt_path=prompt,
-        report_path=report,
-        timeout_seconds=5,
-        runner=_runner,
-        sleep=lambda s: None,
-    )
-
-    assert result.ok is False
-    assert result.returncode == 1
-    assert calls == ["fail", "fail"]
-    assert "UNAVAILABLE" in report.read_text(encoding="utf-8")
-
-
-def test_run_cross_family_exit_zero_blocked_output_is_stubbed(tmp_path: Path) -> None:
-    report = tmp_path / "report.md"
-    prompt = tmp_path / "prompt.md"
-    blocked = (
-        "I'm blocked from performing the review. All tool calls are being rejected. Please re-run."
-    )
-
-    result = run_cross_family_review(
-        model="codex",
-        command=("devin",),
-        repo_root=tmp_path,
-        prompt_text="x",
-        prompt_path=prompt,
-        report_path=report,
-        timeout_seconds=5,
-        runner=_fake_completed(0, blocked),
-    )
-
-    assert result.ok is False
-    assert result.returncode == 0
-    assert "UNAVAILABLE" in report.read_text(encoding="utf-8")
-    assert "empty or blocked report" in (result.error or "")
-
-
-def test_review_does_not_reuse_semantically_empty_cross_family_report(
-    tmp_path: Path, monkeypatch
-) -> None:
-    app = _cross_family_app(tmp_path, enabled=True)
-    calls = {"n": 0}
-
-    def _fake_run(**kwargs):
-        calls["n"] += 1
-        Path(kwargs["report_path"]).write_text(VALID_CROSS_FAMILY_REPORT, encoding="utf-8")
-        return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
-
-    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
-
-    prs_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
-    report_path = prs_dir / "cross-family-review.md"
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(
-        "I'm blocked from performing the review. Tool calls rejected. Please re-run.",
-        encoding="utf-8",
-    )
-
-    app.review(456)
-
-    assert calls["n"] == 1
-    assert report_path.read_text(encoding="utf-8") == VALID_CROSS_FAMILY_REPORT
 
 
 def test_run_cross_family_sanitizes_environment(
@@ -13020,86 +12011,6 @@ def test_run_cross_family_sanitizes_environment_with_repo_venv(
     )
 
 
-def test_run_cross_family_sanitizes_environment_at_spawn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """run_cross_family_review must pass sanitized env to the actual subprocess runner."""
-    import subprocess
-    from charlie_work.cross_family import run_cross_family_review
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    report_path = tmp_path / "report.md"
-    prompt_path = tmp_path / "prompt.md"
-    prompt_path.write_text("test prompt", encoding="utf-8")
-
-    # Set parent env variables (simulating orchestrator leak)
-    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
-    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
-
-    captured_env: dict[str, str] | None = None
-
-    def _fake_runner(command, **kwargs):
-        nonlocal captured_env
-        captured_env = kwargs.get("env")
-        # Return a valid report
-        return subprocess.CompletedProcess(
-            args=command,
-            returncode=0,
-            stdout="**MINOR**\nissue\n\nVerdict: safe",
-            stderr="",
-        )
-
-    result = run_cross_family_review(
-        model="codex",
-        command=("echo", "test"),
-        repo_root=repo_root,
-        prompt_text="test prompt",
-        prompt_path=prompt_path,
-        report_path=report_path,
-        timeout_seconds=30,
-        runner=_fake_runner,
-    )
-
-    assert result.ok is True
-    assert captured_env is not None, "Runner should have received env kwarg"
-    assert "VIRTUAL_ENV" not in captured_env, (
-        "VIRTUAL_ENV must be sanitized in the actual subprocess env"
-    )
-    assert "UV_PROJECT_ENVIRONMENT" not in captured_env, (
-        "UV_PROJECT_ENVIRONMENT must be sanitized in the actual subprocess env"
-    )
-
-
-def test_review_does_not_reuse_legacy_wrapped_blocked_report(tmp_path: Path, monkeypatch) -> None:
-    """Regression for issue #38: a legacy wrapped report whose body is a blocked
-    refusal must not be reused as a success report on subsequent passes.
-    """
-    app = _cross_family_app(tmp_path, enabled=True)
-    calls = {"n": 0}
-
-    def _fake_run(**kwargs):
-        calls["n"] += 1
-        Path(kwargs["report_path"]).write_text(VALID_CROSS_FAMILY_REPORT, encoding="utf-8")
-        return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
-
-    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
-
-    prs_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
-    report_path = prs_dir / "cross-family-review.md"
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    blocked = "I'm blocked from performing the review. Tool calls rejected. Please re-run."
-    report_path.write_text(
-        f"# Cross-family adversarial review — `codex`\n\n{_CAVEAT}\n\n---\n\n{blocked}\n",
-        encoding="utf-8",
-    )
-
-    app.review(456)
-
-    assert calls["n"] == 1
-    assert report_path.read_text(encoding="utf-8") == VALID_CROSS_FAMILY_REPORT
-
-
 def test_report_body_is_valid_detects_real_review_vs_blocked() -> None:
     assert report_body_is_valid("**MAJOR**\nissue\n\nVerdict: safe") is True
     assert report_body_is_valid("Verdict: safe") is True
@@ -13141,438 +12052,6 @@ def test_extract_report_body_strips_wrapper_but_preserves_model_output() -> None
     wrapped = f"# Cross-family adversarial review — `codex`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     assert extract_report_body(wrapped) == body
     assert extract_report_body(body) == body
-
-
-def test_parse_cross_family_verdict_approved_no_blockers() -> None:
-    """A report with only MINOR/NIT findings parses to approved."""
-    body = "**MINOR**\nsmall issue\n\nVerdict: No BLOCKERs or MAJORs — fix is correct"
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    result = parse_cross_family_verdict(wrapped)
-    assert result is not None
-    assert result.decision == "approved"
-    assert "No BLOCKERs" in result.summary
-    assert result.required_changes == ()
-
-
-def test_parse_cross_family_verdict_request_changes_with_blocker() -> None:
-    """A report with a BLOCKER finding parses to request_changes."""
-    body = "**BLOCKER**\ncritical bug\n\nVerdict: BLOCKER — does not fix the issue"
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    result = parse_cross_family_verdict(wrapped)
-    assert result is not None
-    assert result.decision == "request_changes"
-    assert "BLOCKER" in result.summary
-    assert result.required_changes == ()
-
-
-def test_parse_cross_family_verdict_request_changes_with_major() -> None:
-    """A report with a MAJOR finding parses to request_changes."""
-    body = "**MAJOR**\nreal bug\n\nVerdict: MAJOR issues block merge"
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    result = parse_cross_family_verdict(wrapped)
-    assert result is not None
-    assert result.decision == "request_changes"
-
-
-def test_parse_cross_family_verdict_heading_style_major() -> None:
-    """Heading-style ``### MAJOR`` markers are detected as request_changes."""
-    body = "### MAJOR — bug.py:10: off-by-one\n\nfix it\n\n## Verdict\n\nMAJOR should be fixed"
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    result = parse_cross_family_verdict(wrapped)
-    assert result is not None
-    assert result.decision == "request_changes"
-
-
-def test_parse_cross_family_verdict_unavailable_returns_none() -> None:
-    """An UNAVAILABLE stub report returns None (skip, don't record a wrong verdict)."""
-    stub = "# Cross-family adversarial review — `glm-5.2` (UNAVAILABLE)\n\n> timed out\n"
-    assert parse_cross_family_verdict(stub) is None
-
-
-def test_parse_cross_family_verdict_empty_returns_none() -> None:
-    """Empty/blank report text returns None."""
-    assert parse_cross_family_verdict("") is None
-    assert parse_cross_family_verdict("   ") is None
-
-
-def test_parse_cross_family_verdict_invalid_body_returns_none() -> None:
-    """A report body that fails report_body_is_valid returns None."""
-    body = "some random text with no severity or verdict"
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    assert parse_cross_family_verdict(wrapped) is None
-
-
-def test_parse_cross_family_verdict_json_block_populates_required_changes() -> None:
-    """The defect this covers: a new-format report's JSON verdict block carries
-    itemized findings into ``required_changes`` instead of leaving it empty."""
-    body = (
-        "**MAJOR**\nfile.py:10 does the wrong thing\n\n"
-        "Verdict: MAJOR issue blocks merge\n\n"
-        "```json\n"
-        '{"decision": "request_changes", '
-        '"summary": "file.py:10 has a real bug that breaks X", '
-        '"required_changes": ["Fix the off-by-one in file.py:10", '
-        '"Add a regression test for the empty-list case"]}\n'
-        "```\n"
-    )
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    result = parse_cross_family_verdict(wrapped)
-    assert result is not None
-    assert result == CrossFamilyVerdict(
-        decision="request_changes",
-        summary="file.py:10 has a real bug that breaks X",
-        required_changes=(
-            "Fix the off-by-one in file.py:10",
-            "Add a regression test for the empty-list case",
-        ),
-    )
-
-
-def test_parse_cross_family_verdict_json_approved_no_markdown_severity() -> None:
-    """A JSON-only body (no ``**SEVERITY**``/``Verdict:`` markers) still parses --
-    exercises report_body_is_valid's JSON-block fallback."""
-    body = (
-        '```json\n{"decision": "approved", "summary": "clean PR, only a style nit", '
-        '"required_changes": []}\n```\n'
-    )
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    assert report_body_is_valid(body) is True
-    result = parse_cross_family_verdict(wrapped)
-    assert result == CrossFamilyVerdict(decision="approved", summary="clean PR, only a style nit")
-
-
-def test_parse_cross_family_verdict_json_approved_overridden_by_body_severity() -> None:
-    """Fail-safe: a **MAJOR** marker in the Markdown findings always overrides a
-    JSON block that claims "approved" -- this verdict auto-records and can
-    unblock the merge lane, so a self-contradicting downgrade is never trusted."""
-    body = (
-        "**MAJOR**\nfile.py:20 real bug\n\nVerdict: MAJOR should block\n\n"
-        '```json\n{"decision": "approved", "summary": "looks fine overall", '
-        '"required_changes": []}\n```\n'
-    )
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    result = parse_cross_family_verdict(wrapped)
-    assert result is not None
-    assert result.decision == "request_changes"
-
-
-def test_parse_cross_family_verdict_json_request_changes_empty_list_is_malformed() -> None:
-    """Issue #784 (AC-2): a JSON verdict block that declares request_changes
-    with an empty/missing required_changes list is a contract violation and
-    must NOT silently fall back to the legacy Markdown parse -- even though
-    the legacy parse would find a perfectly usable ``Verdict:`` line here.
-    Pre-#784, this test asserted exactly that fall-through as correct
-    behavior; that assertion encoded the defect itself (issue #784's root
-    cause: "a JSON verdict saying request_changes with empty
-    required_changes falls through to the weaker legacy path"), so it is
-    replaced rather than preserved. The contract is: once a reviewer elects
-    the structured JSON format, empty required_changes is untrusted on its
-    own, full stop -- regardless of what the Markdown body also says."""
-    body = (
-        "**MAJOR**\nfile.py:30 bug\n\nVerdict: MAJOR should block\n\n"
-        '```json\n{"decision": "request_changes", "summary": "bad but no list", '
-        '"required_changes": []}\n```\n'
-    )
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    result = parse_cross_family_verdict(wrapped)
-    assert isinstance(result, MalformedCrossFamilyVerdict)
-    assert result.reason == "json_verdict_request_changes_missing_required_changes"
-
-
-def test_parse_cross_family_verdict_json_block_drives_decision_legacy_would_not_reach() -> None:
-    """The JSON block is the decision authority, not a passenger on a legacy
-    verdict that happens to agree: a body with only a **MINOR** marker and no
-    ``Verdict:`` line -- which the legacy parser alone would call "approved"
-    (no BLOCKER/MAJOR marker present) -- must come back as request_changes
-    when the JSON block says so with a populated required_changes list. This
-    would fail if the JSON check were ever reordered below the legacy path."""
-    body = (
-        "**MINOR**\nfile.py:5 minor style issue, not a real bug\n\n"
-        "```json\n"
-        '{"decision": "request_changes", '
-        '"summary": "actually needs a behavioral fix despite the minor framing", '
-        '"required_changes": ["Handle the None case in file.py:5"]}\n'
-        "```\n"
-    )
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    result = parse_cross_family_verdict(wrapped)
-    assert result == CrossFamilyVerdict(
-        decision="request_changes",
-        summary="actually needs a behavioral fix despite the minor framing",
-        required_changes=("Handle the None case in file.py:5",),
-    )
-
-
-def test_parse_cross_family_verdict_legacy_report_unchanged_by_json_support() -> None:
-    """Backward-compatibility regression guard: a historical report with no
-    JSON verdict block at all parses to the exact same decision/summary the
-    pre-JSON-support parser produced, with an empty required_changes."""
-    body = "**BLOCKER**\ncritical bug\n\nVerdict: BLOCKER — does not fix the issue"
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    result = parse_cross_family_verdict(wrapped)
-    assert result == CrossFamilyVerdict(
-        decision="request_changes",
-        summary="BLOCKER — does not fix the issue",
-        required_changes=(),
-    )
-
-
-def test_parse_cross_family_verdict_legacy_blocker_with_no_summary_is_malformed() -> None:
-    """Issue #784 AC-1: a BLOCKER/MAJOR marker with no ``Verdict:`` line to
-    extract a summary from is genuinely content-free -- it must return
-    MalformedCrossFamilyVerdict, never a request_changes verdict asserting
-    blockers exist while naming none. No hardcoded placeholder summary is
-    substituted (the pre-#784 behavior this fix replaces)."""
-    body = "**BLOCKER**\ncritical bug, but no Verdict: line anywhere in this report"
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    result = parse_cross_family_verdict(wrapped)
-    assert isinstance(result, MalformedCrossFamilyVerdict)
-    assert result.reason == "blocker_or_major_with_no_extractable_summary"
-    assert "BLOCKER" in result.raw_body
-
-
-def test_parse_cross_family_verdict_bold_inline_verdict_marker() -> None:
-    """Regression: some cross-family models (e.g. glm-5.2) emit the verdict as
-    a bold-inline ``**Verdict:**`` marker within a paragraph, rather than a
-    bare ``Verdict:`` line or a ``## Verdict`` heading. The pre-fix
-    ``_VERDICT_RE`` matched neither the bare-colon nor the heading form, so
-    every such report (PRs #680, #690, #692, #699, #700 in production, all
-    with real BLOCKER/MAJOR findings and a readable verdict) fell through to
-    the "no extractable summary" branch and was misclassified as
-    ``MalformedCrossFamilyVerdict`` despite the verdict being right there."""
-    body = (
-        "**MAJOR**\nfile.py:10 real bug\n\n"
-        "**Verdict:** Approve with a required follow-up — MAJOR 1 is a real "
-        "correctness bug that must be fixed before this claim can be trusted."
-    )
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    result = parse_cross_family_verdict(wrapped)
-    assert result == CrossFamilyVerdict(
-        decision="request_changes",
-        summary=(
-            "Approve with a required follow-up — MAJOR 1 is a real "
-            "correctness bug that must be fixed before this claim can be trusted."
-        ),
-        required_changes=(),
-    )
-
-
-def test_parse_cross_family_verdict_json_block_after_language_tagged_code_fences() -> None:
-    """Regression for PR #802's real failure shape: a report that cites code
-    in ```python fences before its final ```json verdict fence. The pre-fix
-    ``_VERDICT_FENCE_RE`` (``` ```(?:json)?\\s*\\n `` ``) only recognized an
-    opening fence tagged bare or ``json`` -- a ```python fence's own opening
-    backtick never matched, so ``finditer`` instead paired that block's
-    *closing* bare ``` with the *next* fence's opening as a bogus "match",
-    permanently desynchronizing every fence pair after it and hiding the
-    genuinely well-formed trailing JSON verdict entirely (confirmed
-    byte-for-byte against PR #802's on-disk report)."""
-    body = (
-        "**MAJOR**\nfile.py:10 real bug\n\n"
-        "```python\n"
-        "total_running = sum(t.running for t in plan.targets)\n"
-        "```\n\n"
-        "some prose explaining the first citation\n\n"
-        "```python\n"
-        "planned_running = sum(t.target for t in plan.targets)\n"
-        "```\n\n"
-        "some prose explaining the second citation\n\n"
-        "```json\n"
-        '{"decision": "request_changes", "summary": "real bug in the spare-budget gate", '
-        '"required_changes": ["Fix the gate to use planned running, not actual running"]}\n'
-        "```\n"
-    )
-    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    result = parse_cross_family_verdict(wrapped)
-    assert result == CrossFamilyVerdict(
-        decision="request_changes",
-        summary="real bug in the spare-budget gate",
-        required_changes=("Fix the gate to use planned running, not actual running",),
-    )
-
-
-def test_cross_family_verdict_post_init_rejects_content_free_request_changes() -> None:
-    """Issue #784 AC-6: the invalid state -- request_changes with neither
-    itemized required_changes nor a real summary -- must be unrepresentable
-    at construction, not just avoided by callers that remember to check."""
-    with pytest.raises(ValueError, match="content-free"):
-        CrossFamilyVerdict(decision="request_changes", summary="", required_changes=())
-
-
-def test_cross_family_verdict_post_init_rejects_whitespace_only_summary() -> None:
-    """Whitespace-only is not a real summary either -- ``.strip()`` is
-    applied before the emptiness check, so padding cannot smuggle a
-    content-free verdict past the guard."""
-    with pytest.raises(ValueError, match="content-free"):
-        CrossFamilyVerdict(decision="request_changes", summary="   \n  ", required_changes=())
-
-
-def test_cross_family_verdict_post_init_allows_request_changes_with_only_summary() -> None:
-    """Narrower than "always require required_changes": the legacy Markdown
-    parse path never itemizes findings, so a request_changes verdict with a
-    real extracted summary and empty required_changes remains legitimate
-    and constructible -- this is exactly what the legacy-path tests above
-    rely on."""
-    verdict = CrossFamilyVerdict(
-        decision="request_changes", summary="a real extracted summary", required_changes=()
-    )
-    assert verdict.summary == "a real extracted summary"
-
-
-def test_cross_family_verdict_post_init_allows_request_changes_with_only_required_changes() -> (
-    None
-):
-    """A JSON-block verdict with itemized required_changes but an empty
-    summary is also legitimate -- required_changes alone is something a
-    rework brief can act on."""
-    verdict = CrossFamilyVerdict(
-        decision="request_changes", summary="", required_changes=("fix the null check",)
-    )
-    assert verdict.required_changes == ("fix the null check",)
-
-
-def test_cross_family_verdict_post_init_allows_approved_with_empty_summary() -> None:
-    """The guard is scoped to ``request_changes`` only -- an approved
-    verdict never needs anything for a rework brief to act on, so an empty
-    summary there is unaffected."""
-    verdict = CrossFamilyVerdict(decision="approved", summary="")
-    assert verdict.decision == "approved"
-
-
-# --------------------------------------------------------------------------
-# Issue #784 AC-8: _is_carry_forward_eligible -- the single-point-of-
-# enforcement predicate that rejects carry-forward for a content-free
-# recorded verdict. Operates on plain dicts (never reconstructs a
-# CrossFamilyVerdict), which is the load-bearing fact resolving the
-# deserialization hazard: it must never raise on any of the 8 pre-#784
-# on-disk broken records, however malformed their shape.
-# --------------------------------------------------------------------------
-
-
-def test_is_carry_forward_eligible_true_for_approved() -> None:
-    assert _is_carry_forward_eligible({"decision": "approved", "summary": ""}) is True
-
-
-def test_is_carry_forward_eligible_true_for_blocked() -> None:
-    assert _is_carry_forward_eligible({"decision": "blocked", "summary": "why"}) is True
-
-
-def test_is_carry_forward_eligible_true_for_request_changes_with_required_changes() -> None:
-    assert (
-        _is_carry_forward_eligible(
-            {"decision": "request_changes", "required_changes": ["fix x"], "summary": ""}
-        )
-        is True
-    )
-
-
-def test_is_carry_forward_eligible_true_for_request_changes_with_real_summary() -> None:
-    assert (
-        _is_carry_forward_eligible(
-            {"decision": "request_changes", "required_changes": [], "summary": "Real prose."}
-        )
-        is True
-    )
-
-
-def test_is_carry_forward_eligible_false_for_empty_summary_and_required_changes() -> None:
-    assert (
-        _is_carry_forward_eligible(
-            {"decision": "request_changes", "required_changes": [], "summary": ""}
-        )
-        is False
-    )
-
-
-def test_is_carry_forward_eligible_false_for_missing_keys() -> None:
-    """A pre-#784 broken on-disk record may not even carry a
-    ``required_changes`` or ``summary`` key at all -- must classify as
-    ineligible via ``.get()`` defaults, never raise (KeyError or otherwise),
-    on a plain dict this predicate was built specifically to tolerate."""
-    assert _is_carry_forward_eligible({"decision": "request_changes"}) is False
-
-
-def test_is_carry_forward_eligible_false_for_legacy_placeholder_summary() -> None:
-    """The historical hardcoded placeholder is content-free by definition
-    even though ``summary`` is technically non-empty -- one of the 8
-    pre-#784 on-disk records has exactly this shape."""
-    assert (
-        _is_carry_forward_eligible(
-            {
-                "decision": "request_changes",
-                "required_changes": [],
-                "summary": LEGACY_VACUOUS_SUMMARY,
-            }
-        )
-        is False
-    )
-
-
-def test_is_carry_forward_eligible_false_for_whitespace_padded_placeholder() -> None:
-    """``summary`` is ``.strip()``-normalized before the comparison, so
-    whitespace padding around the exact placeholder cannot smuggle it past
-    the guard as if it were a distinct, real summary."""
-    assert (
-        _is_carry_forward_eligible(
-            {
-                "decision": "request_changes",
-                "required_changes": [],
-                "summary": f"  {LEGACY_VACUOUS_SUMMARY}  ",
-            }
-        )
-        is False
-    )
-
-
-# --------------------------------------------------------------------------
-# Issue #792: _summary_is_vacuous is the single shared discriminator between
-# "nothing to derive" (record_review's write-time marker) and "not eligible
-# for carry-forward" (_is_carry_forward_eligible's read-time check above).
-# It must classify real, specific reviewer prose as non-vacuous even when
-# that prose is terse or lacks a file/line reference -- only a blank string
-# or the one known historical placeholder is vacuous.
-# --------------------------------------------------------------------------
-
-
-def test_summary_is_vacuous_true_for_blank_string() -> None:
-    assert _summary_is_vacuous("") is True
-
-
-def test_summary_is_vacuous_true_for_whitespace_only() -> None:
-    assert _summary_is_vacuous("   \n\t  ") is True
-
-
-def test_summary_is_vacuous_true_for_legacy_placeholder() -> None:
-    assert _summary_is_vacuous(LEGACY_VACUOUS_SUMMARY) is True
-
-
-def test_summary_is_vacuous_true_for_whitespace_padded_placeholder() -> None:
-    assert _summary_is_vacuous(f"  {LEGACY_VACUOUS_SUMMARY}  ") is True
-
-
-def test_summary_is_vacuous_false_for_substantive_architectural_prose() -> None:
-    """A real, specific finding with no file/line reference (pr-774's shape)
-    must not be misclassified as vacuous just because it lacks structure."""
-    prose = (
-        "The retry wrapper swallows the underlying exception type, so a "
-        "caller cannot distinguish a transient network failure from a "
-        "permanent 4xx and will retry requests that can never succeed."
-    )
-    assert _summary_is_vacuous(prose) is False
-
-
-def test_summary_is_vacuous_false_for_terse_but_real_ci_summary() -> None:
-    """The CI-failure producer's own summary shape (pr-529/683's pattern)
-    is short but names a specific, real cause -- not content-free."""
-    assert _summary_is_vacuous("CI failed on Lint; push a fix") is False
-
-
-def test_summary_is_vacuous_false_for_prefix_or_suffix_of_placeholder() -> None:
-    """Only an exact match on the known placeholder is vacuous -- a summary
-    that merely contains it as a substring (e.g. a reviewer quoting the old
-    bug) is real, distinguishing text and must not be swept in by a loose
-    substring check."""
-    assert _summary_is_vacuous(f"{LEGACY_VACUOUS_SUMMARY} but I also checked X") is False
 
 
 # --------------------------------------------------------------------------
@@ -14273,7 +12752,7 @@ def test_record_review_resets_cross_family_parse_failure_count(tmp_path: Path) -
         state["prs"]["456"] = {"number": 456, "cross_family_parse_failure_count": 5}
         save_state(paths.state_file, state)
 
-    app.record_review(456, "approved", summary="all clear")
+    app.record_review(456, "approved", summary="all clear", verdict_provenance="fresh_llm_review")
 
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["cross_family_parse_failure_count"] == 0
@@ -14333,7 +12812,7 @@ def test_string_dispatch_command_rejects_issue_title(tmp_path: Path) -> None:
     assert (123, "agent:in-progress") not in fake_gh.labels_added
 
 
-def test_rework_cap_escalates_to_human(tmp_path: Path) -> None:
+def test_rework_cap_escalates_to_operator_queue(tmp_path: Path) -> None:
     config = OrchestratorConfig()  # max_rework_cycles = 2
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -14341,122 +12820,29 @@ def test_rework_cap_escalates_to_human(tmp_path: Path) -> None:
 
     # First request_changes (count = 1, head = "sha-1")
     fake_gh.pr_head_shas[456] = "sha-1"
-    first = app.record_review(456, "request_changes", summary="fix A")
+    first = app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Second request_changes (count = 2, head = "sha-2")
     fake_gh.pr_head_shas[456] = "sha-2"
-    second = app.record_review(456, "request_changes", summary="fix B")
+    second = app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
 
     # Third request_changes (count stays at 2, escalated, head = "sha-3")
     fake_gh.pr_head_shas[456] = "sha-3"
-    third = app.record_review(456, "request_changes", summary="fix C")
+    third = app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
 
     assert first.data["escalated"] is False and first.data["rework_path"]
     assert second.data["escalated"] is False and second.data["rework_path"]
     assert third.data["escalated"] is True
     assert third.data["rework_path"] is None  # no third rework prompt
     assert fake_gh.labels_added.count((123, "agent:needs-rework")) == 2
-    assert (123, "agent:human-needed") in fake_gh.labels_added
-
-
-def test_cross_family_failure_stub_is_not_reused(tmp_path: Path, monkeypatch) -> None:
-    app = _cross_family_app(tmp_path, enabled=True)
-    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
-    pr_dir.mkdir(parents=True)
-    (pr_dir / "cross-family-review.md").write_text(
-        "# Cross-family adversarial review — `codex` (UNAVAILABLE)\n\n> timed out\n",
-        encoding="utf-8",
-    )
-    calls = {"n": 0}
-
-    def _fake_run(**kwargs):
-        calls["n"] += 1
-        Path(kwargs["report_path"]).write_text("# real findings", encoding="utf-8")
-        return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
-
-    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
-
-    result = app.review(456)
-
-    assert calls["n"] == 1  # the stub did NOT satisfy the reuse check
-    assert result.data["cross_family_ok"] is True
-
-
-def test_cross_family_report_invalidated_on_head_sha_change(tmp_path: Path, monkeypatch) -> None:
-    """Regression test for issue #156: cross-family reports must be invalidated
-    when the PR head SHA changes to prevent reviewing stale code."""
-    app = _cross_family_app(tmp_path, enabled=True)
-    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
-    pr_dir.mkdir(parents=True)
-
-    # Create a report with an old head SHA
-    old_head_sha = "abc123def456"
-    report_content = (
-        f"# Cross-family adversarial review — `codex`\n\n"
-        f"<!-- PR head SHA: {old_head_sha} -->\n\n"
-        f"> Findings below are **leads, not verdicts**\n\n"
-        f"---\n\n"
-        f"**MAJOR**\nfile:line: old bug\n\nVerdict: needs work\n"
-    )
-    (pr_dir / "cross-family-review.md").write_text(report_content, encoding="utf-8")
-
-    calls = {"n": 0}
-
-    def _fake_run(**kwargs):
-        calls["n"] += 1
-        # Verify that the new head SHA is passed to run_cross_family_review
-        assert kwargs.get("head_ref_oid") == "newheadsha789"
-        Path(kwargs["report_path"]).write_text("# new findings", encoding="utf-8")
-        return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
-
-    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
-
-    # Update the PR to have a new head SHA
-    app.gh.pr_head_shas[456] = "newheadsha789"
-
-    result = app.review(456)
-
-    # The old report should NOT be reused because the head SHA changed
-    assert calls["n"] == 1
-    assert result.data["cross_family_ok"] is True
-
-
-def test_cross_family_report_reused_when_head_sha_unchanged(tmp_path: Path, monkeypatch) -> None:
-    """Regression test for issue #156: cross-family reports should be reused
-    when the PR head SHA has not changed."""
-    app = _cross_family_app(tmp_path, enabled=True)
-    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
-    pr_dir.mkdir(parents=True)
-
-    # Create a report with a head SHA
-    head_sha = "abc123def456"
-    report_content = (
-        f"# Cross-family adversarial review — `codex`\n\n"
-        f"<!-- PR head SHA: {head_sha} -->\n\n"
-        f"> Findings below are **leads, not verdicts**\n\n"
-        f"---\n\n"
-        f"**MAJOR**\nfile:line: bug\n\nVerdict: needs work\n"
-    )
-    (pr_dir / "cross-family-review.md").write_text(report_content, encoding="utf-8")
-
-    calls = {"n": 0}
-
-    def _fake_run(**kwargs):
-        calls["n"] += 1
-        Path(kwargs["report_path"]).write_text("# new findings", encoding="utf-8")
-        return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
-
-    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
-
-    # The PR still has the same head SHA
-    app.gh.pr_head_shas[456] = head_sha
-
-    result = app.review(456)
-
-    # The report should be reused because the head SHA has not changed
-    assert calls["n"] == 0
-    assert result.data["cross_family_ok"] is True
-    assert result.data["cross_family_reused"] is True
+    # Issue #1266: max_rework_cycles_exceeded is a mechanical escalation.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 def test_loop_isolates_per_pr_errors(tmp_path: Path) -> None:
@@ -15130,11 +13516,21 @@ def test_detect_and_handle_stalled_reviews_skips_terminal_pr_reaps_sidecar(
     sidecar_100.write_text(json.dumps(_sidecar(100, old_started)), encoding="utf-8")
     sidecar_200 = reviews_dir / "issue-200.claude.json"
     sidecar_200.write_text(json.dumps(_sidecar(200, old_started)), encoding="utf-8")
+    # PR 200 is the non-terminal PR that should get the normal reap-to-failed
+    # treatment. Give it a readable log with no throttle marker so it
+    # classifies as NOT_THROTTLED (the counted-failure path). Without this the
+    # log read would fail and classify as UNDETERMINED (issue #1069), which
+    # rolls back instead of failing — not the path this test exercises.
+    (reviews_dir / "issue-200.claude.log").write_text("ordinary crash output\n", encoding="utf-8")
 
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
-    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    monkeypatch.setattr(
+        "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
+    )
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert not sidecar_100.exists()
     assert not sidecar_200.exists()
@@ -15150,86 +13546,6 @@ def test_detect_and_handle_stalled_reviews_skips_terminal_pr_reaps_sidecar(
     ]
     assert len(stalled_events) == 1
     assert stalled_events[0]["payload"]["pr_number"] == 200
-
-
-def test_reap_orphaned_review_checkouts_reaps_sidecar_stops_stalled_ping_pong(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """Issue observed 07-22: reaping a merged PR's checkout without reaping
-    its dead reviewer sidecar left the sidecar to resurrect as a phantom
-    failed claim on every subsequent stalled sweep, which re-reaped it --
-    an infinite ping-pong. The orphan sweep must delete the sidecar, and a
-    following stalled-sweep pass must then see nothing to reap."""
-    from charlie_work.state import empty_state
-    from charlie_work.workflow import _reap_orphaned_review_checkouts
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    reviews_dir = tmp_path / "reviews"
-    reviews_dir.mkdir()
-    state_file = tmp_path / "state.json"
-
-    config = OrchestratorConfig()
-    state = empty_state()
-    state["prs"]["100"] = {
-        "number": 100,
-        "review_dispatch_status": "review_dispatch_dispatched",
-        "review_dispatched_at": "2026-07-20T00:00:00Z",
-        "reviewer_pid": 12345,
-        "reviewer_process_start_time": 1.0,
-    }
-    save_state(state_file, state)
-
-    sidecar = {
-        "issue_number": 100,
-        "branch": "agent/issue-100-fix",
-        "worktree_path": str(reviews_dir / "pr-100"),
-        "prompt_path": str(reviews_dir / "pr-100" / ".orchestrator-prompt.md"),
-        "command": ["claude", "-p"],
-        "pid": 999999999,
-        "started_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
-        "log_path": str(reviews_dir / "issue-100.claude.log"),
-        "error": None,
-        "process_start_time": 1.0,
-        "adapter_kind": "claude-code",
-    }
-    sidecar_path = reviews_dir / "issue-100.claude.json"
-    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
-
-    fake_gh = FakeGitHub()
-    fake_gh.prs = [
-        {
-            "number": 100,
-            "title": "Fix #1",
-            "url": "https://example.test/pull/100",
-            "headRefName": "agent/issue-100-fix",
-            "baseRefName": "main",
-            "headRefOid": "sha-100",
-            "body": "Closes #1",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "MERGED",
-        }
-    ]
-
-    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
-    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
-
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
-
-    assert reaped == [100]
-    assert not sidecar_path.exists()
-
-    # A following stalled-sweep pass sees nothing left to reap: the sidecar
-    # is gone (iter_workers yields no worker for PR 100) and the state's
-    # review_dispatch_status is already None -- the ping-pong is dead.
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
-
-    assert stalled == []
-    state_after = load_state(state_file)
-    assert not any(
-        e.get("kind") == "review_dispatch_stalled" for e in state_after.get("events", [])
-    )
 
 
 def test_detect_and_handle_stalled_reviews_warns_on_checkout_removal_failure(
@@ -15275,11 +13591,21 @@ def test_detect_and_handle_stalled_reviews_warns_on_checkout_removal_failure(
         "adapter_kind": "claude-code",
     }
     (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    # Give the reviewer a readable log with no throttle marker so it
+    # classifies as NOT_THROTTLED (the counted-failure path that calls
+    # _remove_review_checkout_with_warning). Without this the log read would
+    # fail and classify as UNDETERMINED (issue #1069), which uses a different
+    # checkout-removal path — not the warning path this test exercises.
+    (reviews_dir / "issue-100.claude.log").write_text("ordinary crash output\n", encoding="utf-8")
 
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
-    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: False)
+    monkeypatch.setattr(
+        "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: False
+    )
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert [entry["pr"] for entry in stalled] == [100]
     state_after = load_state(state_file)
@@ -15292,171 +13618,6 @@ def test_detect_and_handle_stalled_reviews_warns_on_checkout_removal_failure(
     ]
     assert len(warning_events) == 1
     assert warning_events[0]["payload"]["pr_number"] == 100
-
-
-def test_reap_orphaned_review_checkouts_warns_once_and_retries_on_checkout_failure(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """Issue #526: when a merged PR's review checkout cannot be removed, the
-    orphan sweep must not silently discard the failure, must not append a
-    lifecycle-reaped event or claim the PR as reaped, and must emit only one
-    warning per failure episode. A later successful retry clears the marker
-    and records the reap."""
-    from charlie_work.state import empty_state
-    from charlie_work.workflow import _reap_orphaned_review_checkouts
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    reviews_dir = tmp_path / "reviews"
-    reviews_dir.mkdir()
-    checkout_dir = reviews_dir / "pr-100"
-    checkout_dir.mkdir()
-    state_file = tmp_path / "state.json"
-
-    config = OrchestratorConfig()
-    state = empty_state()
-    state["prs"]["100"] = {
-        "number": 100,
-        "review_dispatch_status": "review_dispatch_dispatched",
-        "review_dispatched_at": "2026-07-20T00:00:00Z",
-        "reviewer_pid": 12345,
-        "review_process_start_time": 1.0,
-    }
-    save_state(state_file, state)
-
-    fake_gh = FakeGitHub()
-    fake_gh.prs = [
-        {
-            "number": 100,
-            "title": "Fix #1",
-            "url": "https://example.test/pull/100",
-            "headRefName": "agent/issue-100-fix",
-            "baseRefName": "main",
-            "headRefOid": "sha-100",
-            "body": "Closes #1",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "MERGED",
-        }
-    ]
-
-    call_count = 0
-
-    def fake_remove_review_checkout(
-        repo_root_arg: Path, pr_number: int, *, reviews_dir: Path | None = None
-    ) -> bool:
-        nonlocal call_count
-        call_count += 1
-        return False
-
-    monkeypatch.setattr(
-        "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
-    )
-    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
-
-    # First pass: failure is reported once, PR is not claimed as reaped.
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
-    assert reaped == []
-    assert call_count == 1
-    state_after = load_state(state_file)
-    assert state_after["prs"]["100"]["status"] == "merged"
-    assert state_after["prs"]["100"]["review_dispatch_status"] is None
-    assert state_after["prs"]["100"]["review_checkout_removal_warned"] is True
-    assert not any(
-        e.get("kind") == "review_dispatch_lifecycle_reaped" for e in state_after.get("events", [])
-    )
-    warning_events = [
-        e
-        for e in state_after.get("events", [])
-        if e.get("kind") == "review_checkout_removal_failed"
-    ]
-    assert len(warning_events) == 1
-
-    # Second pass: retry without re-emitting the warning.
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
-    assert reaped == []
-    assert call_count == 2
-    state_after = load_state(state_file)
-    warning_events = [
-        e
-        for e in state_after.get("events", [])
-        if e.get("kind") == "review_checkout_removal_failed"
-    ]
-    assert len(warning_events) == 1
-
-    # Third pass succeeds: the marker is cleared and the reap is recorded.
-    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
-    assert reaped == [100]
-    assert call_count == 2  # the lambda does not increment the nested counter
-    state_after = load_state(state_file)
-    assert state_after["prs"]["100"].get("review_checkout_removal_warned") is None
-    assert any(
-        e.get("kind") == "review_dispatch_lifecycle_reaped" for e in state_after.get("events", [])
-    )
-
-
-# --- Issue #526: error-isolation hardening --------------------------------------
-
-
-def test_reap_orphaned_review_checkouts_overwrites_stale_reviewing_status(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """A closed PR whose status was left as "reviewing" by the review pipeline
-    must have its status overwritten to "closed" by the lifecycle reaper.
-
-    Without this, the unclaimed-stalled sweep re-triggers every pass because
-    it matches ``status is None and pr_state.get("status") == "reviewing"``,
-    causing an infinite ping-pong with the lifecycle reaper.
-    """
-    from charlie_work.state import empty_state
-    from charlie_work.workflow import _reap_orphaned_review_checkouts
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    reviews_dir = tmp_path / "reviews"
-    reviews_dir.mkdir()
-    state_file = tmp_path / "state.json"
-
-    config = OrchestratorConfig()
-    state = empty_state()
-    state["prs"]["200"] = {
-        "number": 200,
-        "issue_number": 199,
-        "status": "reviewing",
-        "review_dispatch_status": "review_dispatch_dispatched",
-        "review_dispatched_at": "2026-07-01T00:00:00Z",
-        "reviewer_pid": 99999,
-        "reviewer_process_start_time": 1.0,
-        "prompt_path": str(tmp_path / "prompt.md"),
-        "decision_path": str(tmp_path / "decision.json"),
-    }
-    save_state(state_file, state)
-
-    fake_gh = FakeGitHub()
-    fake_gh.prs = [
-        {
-            "number": 200,
-            "title": "Fix #199",
-            "url": "https://example.test/pull/200",
-            "headRefName": "agent/issue-199-fix",
-            "baseRefName": "main",
-            "headRefOid": "sha-200",
-            "body": "Closes #199",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "CLOSED",
-        }
-    ]
-
-    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
-    monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
-
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
-    assert reaped == [200]
-    state_after = load_state(state_file)
-    assert state_after["prs"]["200"]["status"] == "closed"
-    assert state_after["prs"]["200"]["review_dispatch_status"] is None
 
 
 # --- Issue #14: error-isolation hardening --------------------------------------
@@ -15475,7 +13636,11 @@ def test_corrupt_review_decision_treated_as_not_approved(tmp_path: Path) -> None
 
     result = app.merge_ready(456)
 
-    assert result.data["review_decision"] == {"decision": "invalid"}
+    # Issue #1362 Stage 1: a corrupt flat file with no round-archive fallback
+    # now resolves to {"decision": "missing"} rather than the old "invalid"
+    # sentinel (review_decision.resolve_decision_payload) -- both are
+    # equally non-terminal, so the fail-safe outcome below is unchanged.
+    assert result.data["review_decision"] == {"decision": "missing"}
     assert result.data["can_merge"] is False
     assert fake_gh.merged == []
 
@@ -15969,6 +14134,14 @@ def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
     # live worker slot. This also makes _worker_pid_alive return False so the
     # issue is selectable despite state.json recording a worker_pid.
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    # The sidecar-driven live-worker census (_issues_with_live_workers ->
+    # worker.iter_workers().is_alive() -> claude_code.is_worker_alive) reads a
+    # SEPARATE claude_code.is_pid_alive reference. Patch it too: whether the
+    # fixture's PID reads as alive there depends on the host's current PID
+    # table (process_utils.is_pid_alive treats OpenProcess/ERROR_ACCESS_DENIED
+    # as indeterminate-so-alive by design), so leaving it unpatched makes the
+    # test's outcome depend on host state, not the code under test.
+    monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -16085,6 +14258,14 @@ def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    # The sidecar-driven live-worker census (_issues_with_live_workers ->
+    # worker.iter_workers().is_alive() -> claude_code.is_worker_alive) reads a
+    # SEPARATE claude_code.is_pid_alive reference. Patch it too: whether the
+    # fixture's PID reads as alive there depends on the host's current PID
+    # table (process_utils.is_pid_alive treats OpenProcess/ERROR_ACCESS_DENIED
+    # as indeterminate-so-alive by design), so leaving it unpatched makes the
+    # test's outcome depend on host state, not the code under test.
+    monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -16189,6 +14370,13 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
     worktree_path, branch = _setup_completed_worktree(repo_root, 1122)
 
+    # Derived, not hardcoded: this removes a latent stale-date hazard in the
+    # fixture. It is NOT what fixes this test -- the phantom-live routing
+    # under test does not gate on started_at at all. The actual gate that
+    # made this test flip green/red across days is PID-liveness, not a time
+    # window (see the claude_code.is_pid_alive patch below).
+    recent_started_at = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     def _fake_launch(issue_number, branch, prompt_text, **kwargs):
         return ClaudeWorkerRecord(
             issue_number=issue_number,
@@ -16197,7 +14385,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
             prompt_path=str(worktree_path / ".orchestrator-prompt.md"),
             command=("claude", "-p"),
             pid=6262,
-            started_at="2026-08-10T11:15:39Z",
+            started_at=recent_started_at,
             log_path=str(tmp_path / "log"),
             error="probe_error",
             failure_kind="live_worker_redispatch_averted",
@@ -16206,6 +14394,23 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    # Issue #1122 fixture note: the sidecar's PID must also read as dead via
+    # ``_issues_with_live_workers`` -> ``worker.iter_workers().is_alive()`` ->
+    # ``claude_code.is_worker_alive`` -> ``claude_code.is_pid_alive`` -- a
+    # SEPARATE module-level reference from ``charlie_work.workflow.is_pid_alive``
+    # patched above. Without this, this fixture's specific PID (6262) can
+    # spuriously read as "alive": ``process_utils.is_pid_alive`` treats
+    # ``OpenProcess`` failing with ``ERROR_ACCESS_DENIED`` as indeterminate-so-
+    # alive by design (process_utils.py:293-301), and on this host PID 6262
+    # currently returns that error while sibling fixture PIDs (4242, 5353,
+    # 7373) return ``ERROR_INVALID_PARAMETER`` (correctly read as dead) --
+    # confirmed by direct ``OpenProcess`` probe, not assumed. That makes the
+    # unpatched read host-PID-table-state dependent rather than deterministic,
+    # which is what made this test pass on 2026-08-19 and fail on 2026-08-21
+    # with no code change: it marks the issue live-dispatched and drops it out
+    # of the dispatch candidate set before the phantom-live-worker routing
+    # under test ever runs.
+    monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -16238,7 +14443,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
                 "prompt_path": "",
                 "command": ["claude", "-p"],
                 "pid": 6262,
-                "started_at": "2026-08-10T11:15:39Z",
+                "started_at": recent_started_at,
                 "log_path": str(tmp_path / "log"),
                 "error": "probe_error",
                 "failure_kind": "live_worker_redispatch_averted",
@@ -16265,7 +14470,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
     result = app.dispatch(limit=1)
 
     # The phantom live worker is detected but the sidecar is PRESERVED.
-    assert result.data["phantom_live_worker_count"] == 1
+    assert result.data["phantom_live_worker_count"] == 1, repr(result.data)
     assert sidecar_path.exists(), "Sidecar must not be reaped so the reaper lane can salvage"
 
     # Labels are NOT stripped: the issue stays in-progress until salvage moves
@@ -16326,6 +14531,13 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    # See the sibling completed-worktree test above: the sidecar's PID must
+    # also read as dead through claude_code.is_worker_alive's own
+    # claude_code.is_pid_alive reference, not just workflow's, or the test's
+    # outcome depends on the host's current PID table (ERROR_ACCESS_DENIED
+    # from OpenProcess is treated as indeterminate-so-alive by design) instead
+    # of the code under test.
+    monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -16383,7 +14595,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     result = app.dispatch(limit=1)
 
-    assert result.data["phantom_live_worker_count"] == 1
+    assert result.data["phantom_live_worker_count"] == 1, repr(result.data)
     assert sidecar_path.exists(), "Sidecar must not be reaped so the reaper lane can salvage"
 
     # Labels are NOT stripped.
@@ -16528,7 +14740,9 @@ def test_orphaned_worker_sweep_runs_with_watchdog_disabled(tmp_path: Path) -> No
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # The #935 salvage backstop fired despite watchdog being disabled: a PR was
     # opened for the pushed branch and the issue moved to open_passive.
@@ -17194,6 +15408,110 @@ def test_review_corrupted_decision_file_has_no_prior_review_section(tmp_path: Pa
     assert "## Prior review" not in packet
 
 
+def test_review_round3_surfaces_findings_from_every_prior_round(tmp_path: Path) -> None:
+    """Issue #1270 (W13): a round-3 review must surface findings from EVERY
+    prior round, not only the most recent one -- a finding raised in round 1
+    and not repeated in round 2 must still reach the round-3 reviewer.
+    Reads exclusively from the rounds/round-K archive W11 built (#1268),
+    mirroring what record_review actually writes to disk (the flat mirror
+    review-decision.json always equals the latest archived round)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    round1_decision = {
+        "decision": "request_changes",
+        "summary": "round-1 summary text",
+        "required_changes": ["round-1 finding: add null check"],
+        "reviewed_head_sha": "sha-r1",
+    }
+    round2_decision = {
+        "decision": "request_changes",
+        "summary": "round-2 summary text",
+        "required_changes": ["round-2 finding: handle empty list"],
+        "reviewed_head_sha": "sha-r2",
+    }
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round2_dir = decision_dir / "rounds" / "round-2"
+    round1_dir.mkdir(parents=True)
+    round2_dir.mkdir(parents=True)
+    (round1_dir / "review-decision.json").write_text(json.dumps(round1_decision), encoding="utf-8")
+    (round2_dir / "review-decision.json").write_text(json.dumps(round2_decision), encoding="utf-8")
+    # The flat mirror _review_decision reads always equals the latest
+    # archived round -- record_review writes both together, same call.
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(round2_decision), encoding="utf-8"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "### Round 1" in packet
+    assert "### Round 2" in packet
+    assert packet.index("### Round 1") < packet.index("### Round 2")
+    assert "round-1 finding: add null check" in packet
+    assert "round-2 finding: handle empty list" in packet
+    # #1270 follow-up: a round whose required_changes list is non-empty now
+    # ALSO carries its own summary (appended after the itemized list) --
+    # the pre-#792 tier-1/tier-2 exclusivity is a worker-brief-only
+    # tradeoff; the reviewer's round-history entry shows both.
+    assert "round-1 summary text" in packet
+    assert "round-2 summary text" in packet
+
+    # The interdiff compares the LATEST round's head to the live head, not
+    # round 1's -- round 1's head must not leak into the interdiff.
+    interdiff_path = decision_dir / "interdiff.patch"
+    assert interdiff_path.exists()
+    interdiff_text = interdiff_path.read_text(encoding="utf-8")
+    assert "sha-r2" in interdiff_text
+    assert "sha-abc123" in interdiff_text
+    assert "sha-r1" not in interdiff_text
+
+
+def test_review_round_history_strips_crash_signature_findings(tmp_path: Path) -> None:
+    """Issue #1270 (W13) composes with the #1269 (W12) crash-signature
+    guard: a prior round whose required_changes still carries a
+    pre-collector-fix crash comment (old-shape findings_channel ==
+    "external") must render with the crash text absent from the
+    round-history section -- the same guarantee
+    _render_required_changes_section already gives the worker's rework
+    brief, now also true for the reviewer's aggregated prior-review
+    section. Without this, aggregating every prior round (instead of only
+    the latest decision) would widen a poisoned old round's exposure
+    instead of narrowing it."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    round1_decision = {
+        "decision": "request_changes",
+        "summary": "",
+        "required_changes": ["fix the off-by-one", crash_body],
+        "findings_channel": "external",
+        "reviewed_head_sha": "sha-r1",
+    }
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round1_dir.mkdir(parents=True)
+    (round1_dir / "review-decision.json").write_text(json.dumps(round1_decision), encoding="utf-8")
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(round1_decision), encoding="utf-8"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "fix the off-by-one" in packet
+    assert crash_body not in packet
+    assert REVIEW_SESSION_SUMMARY_HEADING not in packet
+
+
 def test_review_same_head_terminal_verdict_surfaces_findings(tmp_path: Path) -> None:
     """Issue #632 defect 3: a terminal verdict on disk for the SAME head (a
     PR parked on agent:human-needed whose head has not advanced, or an
@@ -17235,310 +15553,189 @@ def test_review_same_head_terminal_verdict_surfaces_findings(tmp_path: Path) -> 
     assert "No interdiff is needed" in packet
 
 
-def test_annotation_to_required_change_full_annotation() -> None:
-    """Issue #771: a well-formed GitHub annotation renders check/path/line/message."""
-    entry = _annotation_to_required_change(
-        "Lint",
-        {
-            "path": "src/charlie_work/workflow.py",
-            "start_line": 42,
-            "message": "line too long (100 > 99)",
-            "annotation_level": "failure",
-        },
-    )
-    assert entry == "Lint: src/charlie_work/workflow.py:42 — line too long (100 > 99)"
-
-
-def test_annotation_to_required_change_no_message_returns_none() -> None:
-    """Never fabricate a placeholder when GitHub gives no explanatory message."""
-    assert (
-        _annotation_to_required_change(
-            "Lint", {"path": "src/foo.py", "start_line": 1, "annotation_level": "failure"}
-        )
-        is None
-    )
-    assert (
-        _annotation_to_required_change(
-            "Lint", {"path": "src/foo.py", "message": "", "annotation_level": "failure"}
-        )
-        is None
-    )
-
-
-def test_annotation_to_required_change_non_failure_level_returns_none() -> None:
-    """Issue #993: warning/notice annotations are not required changes -- they
-    are emitted on green runs too (e.g. the actions/checkout Node.js 20
-    deprecation advisory), so surfacing them as rework items sends the worker
-    after unrelated noise. Only ``annotation_level == "failure"`` renders."""
-    warning = {
-        "path": ".github",
-        "start_line": 2,
-        "message": "Node.js 20 is deprecated. ... actions/checkout@v4",
-        "annotation_level": "warning",
+def test_review_round_history_shows_approved_round_required_changes_with_summary(
+    tmp_path: Path,
+) -> None:
+    """Issue #1270 review round 1 (blocker): an approved archived round can
+    legitimately carry a non-empty required_changes left over from an
+    earlier round (rework_prompts.py's own docstring names this population
+    explicitly). _render_required_changes_section returns "" for `approved`
+    by design -- that verdict is out of its scope, since its findings
+    belong in $prior_review_section (i.e. exactly this round-history
+    section) rather than the worker's brief. Before the fix,
+    _render_round_findings inherited that "" unconditionally and the caller
+    printed the affirmatively false "_No findings recorded for this
+    round._" even though the round's archive held a real finding."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    round1_decision = {
+        "decision": "approved",
+        "summary": "looks good overall, one leftover item",
+        "required_changes": ["leftover from earlier: tighten the input regex"],
+        "reviewed_head_sha": "sha-r1",
     }
-    notice = {
-        "path": "src/foo.py",
-        "start_line": 1,
-        "message": "consider using X",
-        "annotation_level": "notice",
-    }
-    missing_level = {"path": "src/foo.py", "start_line": 1, "message": "boom"}
-    null_level = {
-        "path": "src/foo.py",
-        "start_line": 1,
-        "message": "boom",
-        "annotation_level": None,
-    }
-    assert _annotation_to_required_change("Lint", warning) is None
-    assert _annotation_to_required_change("Lint", notice) is None
-    assert _annotation_to_required_change("Lint", missing_level) is None
-    assert _annotation_to_required_change("Lint", null_level) is None
-
-
-def test_annotation_to_required_change_missing_path_falls_back_to_message_only() -> None:
-    """No path/line data (e.g. a process-level crash) still surfaces the real
-    message rather than being dropped -- but with no fabricated location."""
-    entry = _annotation_to_required_change(
-        "Tests", {"message": "process exited with code 1", "annotation_level": "failure"}
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round1_dir.mkdir(parents=True)
+    (round1_dir / "review-decision.json").write_text(json.dumps(round1_decision), encoding="utf-8")
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(round1_decision), encoding="utf-8"
     )
-    assert entry == "Tests: process exited with code 1"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "leftover from earlier: tighten the input regex" in packet
+    assert "looks good overall, one leftover item" in packet
+    assert "_No findings recorded for this round._" not in packet
 
 
-def test_annotation_to_required_change_path_without_line() -> None:
-    entry = _annotation_to_required_change(
-        "Lint",
-        {"path": "src/foo.py", "message": "file-level issue", "annotation_level": "failure"},
-    )
-    assert entry == "Lint: src/foo.py — file-level issue"
-
-
-def test_annotation_to_required_change_non_dict_returns_none() -> None:
-    assert _annotation_to_required_change("Lint", "not a dict") is None  # type: ignore[arg-type]
-
-
-def test_required_changes_from_checks_aggregates_annotations_for_failing_check() -> None:
-    checks = [
-        {"name": "Lint", "state": "FAILURE", "databaseId": 111},
-        {"name": "Tests", "state": "SUCCESS", "databaseId": 222},
-    ]
-    annotations_by_id = {
-        111: [
-            {
-                "path": "src/foo.py",
-                "start_line": 10,
-                "message": "E501 line too long",
-                "annotation_level": "failure",
-            },
-            {
-                "path": "src/bar.py",
-                "start_line": 20,
-                "message": "F401 unused import",
-                "annotation_level": "failure",
-            },
-        ],
+def test_review_round_history_shows_approved_round_required_changes_without_summary(
+    tmp_path: Path,
+) -> None:
+    """Same population as the sibling test above (an approved round with
+    leftover required_changes), but with an empty summary -- the bullets
+    must render on their own, not only when a summary happens to also be
+    present."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    round1_decision = {
+        "decision": "approved",
+        "summary": "",
+        "required_changes": ["leftover finding: add a test for the empty-input case"],
+        "reviewed_head_sha": "sha-r1",
     }
-    required_changes = _required_changes_from_checks(
-        checks, ("Lint",), lambda check_run_id: annotations_by_id.get(check_run_id, [])
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round1_dir.mkdir(parents=True)
+    (round1_dir / "review-decision.json").write_text(json.dumps(round1_decision), encoding="utf-8")
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(round1_decision), encoding="utf-8"
     )
-    assert required_changes == [
-        "Lint: src/foo.py:10 — E501 line too long",
-        "Lint: src/bar.py:20 — F401 unused import",
-    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "leftover finding: add a test for the empty-input case" in packet
+    assert "_No findings recorded for this round._" not in packet
 
 
-def test_required_changes_from_checks_skips_passing_run_of_failed_name() -> None:
-    """A name with two runs (matrix legs) under worst-of semantics: only the
-    FAILURE run's annotations should be fetched, not the passing sibling's."""
-    fetched_ids: list[int] = []
+def test_review_round_history_shows_blocked_round_required_changes_with_summary(
+    tmp_path: Path,
+) -> None:
+    """Issue #1270 review round 1 (blocker): a blocked archived round's
+    tiers 1-2 are intentionally suppressed by
+    _render_required_changes_section for the WORKER's rework brief (the
+    "what must change before this PR can be approved" framing is wrong for
+    the decision-agnostic routes that produce a blocked verdict). That
+    suppression is specific to the worker's brief -- it must not also
+    delete the finding from the REVIEWER's round-history entry, which is a
+    different audience with a different, legitimate use for the same
+    content."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    round1_decision = {
+        "decision": "blocked",
+        "summary": "blocked pending an external dependency update",
+        "required_changes": ["blocked-round finding: pin the vendored SDK version"],
+        "reviewed_head_sha": "sha-r1",
+    }
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round1_dir.mkdir(parents=True)
+    (round1_dir / "review-decision.json").write_text(json.dumps(round1_decision), encoding="utf-8")
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(round1_decision), encoding="utf-8"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    def fetch(check_run_id: int) -> list[dict[str, Any]]:
-        fetched_ids.append(check_run_id)
-        return (
-            [{"path": "x.py", "start_line": 1, "message": "boom", "annotation_level": "failure"}]
-            if check_run_id == 2
-            else []
-        )
+    result = app.review(456)
 
-    checks = [
-        {"name": "Tests", "state": "SUCCESS", "databaseId": 1},
-        {"name": "Tests", "state": "FAILURE", "databaseId": 2},
-    ]
-    required_changes = _required_changes_from_checks(checks, ("Tests",), fetch)
-    assert fetched_ids == [2]
-    assert required_changes == ["Tests: x.py:1 — boom"]
-
-
-def test_required_changes_from_checks_no_databaseid_degrades_to_empty() -> None:
-    """No resolvable check-run id AND no link (e.g. a bare status check with
-    neither) -- degrade to [] without ever calling the annotations fetcher."""
-    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": None}]
-    called = False
-
-    def fetch(check_run_id: int) -> list[dict[str, Any]]:
-        nonlocal called
-        called = True
-        return []
-
-    assert _required_changes_from_checks(checks, ("Lint",), fetch) == []
-    assert called is False
-
-
-def test_required_changes_from_checks_no_databaseid_falls_back_to_link() -> None:
-    """No resolvable check-run id (e.g. an external status check) but a real
-    ``link`` from GitHub -- fall back to pointing at the link rather than
-    silently dropping the failure, and never call the annotations fetcher
-    (there is no check-run id to fetch with)."""
-    checks = [
-        {
-            "name": "Lint",
-            "state": "FAILURE",
-            "databaseId": None,
-            "link": "https://example.com/status/lint",
-        }
-    ]
-    called = False
-
-    def fetch(check_run_id: int) -> list[dict[str, Any]]:
-        nonlocal called
-        called = True
-        return []
-
-    result = _required_changes_from_checks(checks, ("Lint",), fetch)
-    assert result == [
-        "Lint: no per-line annotations available from GitHub; "
-        "inspect the failing run at https://example.com/status/lint",
-    ]
-    assert called is False
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "blocked-round finding: pin the vendored SDK version" in packet
+    assert "blocked pending an external dependency update" in packet
+    assert "_No findings recorded for this round._" not in packet
 
 
-def test_required_changes_from_checks_zero_annotations_degrades_to_empty() -> None:
-    """A resolvable check run with zero annotations and no link (common for a
-    process-level crash) degrades to [] -- never a fabricated file/line."""
-    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": 5}]
-    assert _required_changes_from_checks(checks, ("Lint",), lambda _id: []) == []
+def test_review_round_history_shows_blocked_round_required_changes_without_summary(
+    tmp_path: Path,
+) -> None:
+    """Same population as the sibling test above (a blocked round with
+    required_changes), but with an empty summary -- the bullets must render
+    on their own."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    round1_decision = {
+        "decision": "blocked",
+        "summary": "",
+        "required_changes": ["blocked-round finding: rotate the leaked credential"],
+        "reviewed_head_sha": "sha-r1",
+    }
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round1_dir.mkdir(parents=True)
+    (round1_dir / "review-decision.json").write_text(json.dumps(round1_decision), encoding="utf-8")
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(round1_decision), encoding="utf-8"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "blocked-round finding: rotate the leaked credential" in packet
+    assert "_No findings recorded for this round._" not in packet
 
 
-def test_required_changes_from_checks_zero_annotations_falls_back_to_link() -> None:
-    """A resolvable check run with zero annotations but a real ``link`` falls
-    back to the link -- more useful than silence, still not fabricated."""
-    checks = [
-        {
-            "name": "Lint",
-            "state": "FAILURE",
-            "databaseId": 5,
-            "link": "https://github.com/o/r/actions/runs/1/jobs/5",
-        }
-    ]
-    result = _required_changes_from_checks(checks, ("Lint",), lambda _id: [])
-    assert result == [
-        "Lint: no per-line annotations available from GitHub; "
-        "inspect the failing run at https://github.com/o/r/actions/runs/1/jobs/5",
-    ]
+def test_review_round_history_falls_back_when_round_dir_unreadable(tmp_path: Path) -> None:
+    """Issue #1270 review round 1 (fix 2): _round_history_entries used to
+    gate its fallback-to-the-flat-mirror on `not numbers` (whether any
+    round-K directory existed at all) rather than `not entries` (whether
+    any round-K directory's decision file was actually readable).
+    workflow.py's OrchestratorApp._write_json creates the round directory
+    via mkdir strictly before its atomic tmp_path.replace(), so a crash in
+    that window leaves an empty round-K/ with no review-decision.json
+    inside -- exactly what this test simulates by mkdir-ing round-1/
+    without writing anything into it. Before the fix, that left `numbers`
+    non-empty (the directory exists) but `entries` empty (nothing readable
+    inside it), so the fallback never fired and the whole prior-review
+    section silently vanished even though the flat mirror
+    (review-decision.json) held a perfectly valid verdict."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    flat_decision = {
+        "decision": "request_changes",
+        "summary": "fallback summary text",
+        "required_changes": ["fallback finding: fix the retry loop"],
+        "reviewed_head_sha": "sha-r1",
+    }
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round1_dir.mkdir(parents=True)  # directory exists, decision file does not
+    (decision_dir / "review-decision.json").write_text(json.dumps(flat_decision), encoding="utf-8")
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
+    result = app.review(456)
 
-def test_required_changes_from_checks_no_checks_available_degrades_to_empty() -> None:
-    assert _required_changes_from_checks(None, ("Lint",), lambda _id: []) == []
-
-
-def test_required_changes_from_checks_no_failed_names_degrades_to_empty() -> None:
-    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": 5}]
-    assert _required_changes_from_checks(checks, (), lambda _id: [{"message": "x"}]) == []
-
-
-def test_required_changes_from_checks_filters_warning_level_annotations() -> None:
-    """Issue #993: warning/notice annotations are present on green runs too
-    (e.g. the actions/checkout Node.js 20 deprecation advisory), so they are
-    not required changes. Only failure-level annotations render as entries;
-    the warning is dropped entirely rather than crowding the rework brief
-    with unrelated noise."""
-    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": 111}]
-    annotations = [
-        {
-            "path": ".github",
-            "start_line": 2,
-            "message": "Node.js 20 is deprecated. ... actions/checkout@v4",
-            "annotation_level": "warning",
-        },
-        {
-            "path": "src/foo.py",
-            "start_line": 10,
-            "message": "E501 line too long",
-            "annotation_level": "failure",
-        },
-    ]
-    required_changes = _required_changes_from_checks(checks, ("Lint",), lambda _id: annotations)
-    assert required_changes == ["Lint: src/foo.py:10 — E501 line too long"]
-
-
-def test_required_changes_from_checks_appends_link_alongside_failure_annotations() -> None:
-    """Issue #993: the failing run's ``link`` is always appended alongside
-    whatever failure-level annotations rendered -- not only when *zero*
-    annotations rendered. A process-level crash emits a contentless
-    ``"Process completed with exit code 1."`` failure annotation that names
-    no cause; the real cause (e.g. a TLS handshake timeout) lives only in
-    the step log the link reaches. The old ``if entries:`` guard suppressed
-    the link whenever any annotation rendered, so the fallback never fired
-    in the scenario its own docstring named as common."""
-    checks = [
-        {
-            "name": "Lint",
-            "state": "FAILURE",
-            "databaseId": 111,
-            "link": "https://github.com/o/r/actions/runs/92297706625",
-        }
-    ]
-    annotations = [
-        {
-            "path": ".github",
-            "start_line": 2,
-            "message": "Node.js 20 is deprecated. ... actions/checkout@v4",
-            "annotation_level": "warning",
-        },
-        {
-            "path": ".github",
-            "start_line": 14,
-            "message": "Process completed with exit code 1.",
-            "annotation_level": "failure",
-        },
-    ]
-    required_changes = _required_changes_from_checks(checks, ("Lint",), lambda _id: annotations)
-    # The warning is filtered out; the contentless failure annotation still
-    # renders (it is failure-level and carries a message), and the link is
-    # appended alongside it so the worker can reach the run log where the
-    # real cause lives.
-    assert required_changes == [
-        "Lint: .github:14 — Process completed with exit code 1.",
-        "Lint: failing run — https://github.com/o/r/actions/runs/92297706625",
-    ]
-
-
-def test_required_changes_from_checks_link_fallback_fires_for_contentless_failure_only() -> None:
-    """Issue #993: when the only annotations are non-failure-level (so
-    ``entries`` is empty after filtering), the link fallback still fires
-    with the "no per-line annotations available" wording -- the fallback is
-    not deleted, only its guard is fixed so it no longer requires *zero*
-    annotations of any level."""
-    checks = [
-        {
-            "name": "Lint",
-            "state": "FAILURE",
-            "databaseId": 111,
-            "link": "https://github.com/o/r/actions/runs/1",
-        }
-    ]
-    annotations = [
-        {
-            "path": ".github",
-            "start_line": 2,
-            "message": "Node.js 20 is deprecated. ... actions/checkout@v4",
-            "annotation_level": "warning",
-        },
-    ]
-    required_changes = _required_changes_from_checks(checks, ("Lint",), lambda _id: annotations)
-    assert required_changes == [
-        "Lint: no per-line annotations available from GitHub; "
-        "inspect the failing run at https://github.com/o/r/actions/runs/1",
-    ]
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "fallback finding: fix the retry loop" in packet
 
 
 def test_review_ci_failure_with_annotations_populates_required_changes(tmp_path: Path) -> None:
@@ -17812,6 +16009,10 @@ def test_janitor_required_check_infra_failure_stays_blocked(tmp_path: Path) -> N
     issue #841 fixes). A check that DOES carry a run id instead gets one
     auto-rerun first -- see
     test_janitor_infra_failed_first_cancel_triggers_rerun_without_failed_flag.
+
+    Issue #1266: this escalates through the same infra_rerun_cap_exceeded
+    site as the cap-exhaustion case, which is a mechanical reason, so it
+    lands agent:operator-queue, not agent:human-needed.
     """
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -17835,11 +16036,533 @@ def test_janitor_required_check_infra_failure_stays_blocked(tmp_path: Path) -> N
     # Issue #841: escalated to a human instead of blocking silently forever.
     assert state["prs"]["456"]["status"] == "escalated"
     assert state["issues"]["123"]["status"] == "escalated"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
+
+
+# ---------------------------------------------------------------------------
+# Issue #1383: infra_blocked routing -- AC1 through AC4
+# ---------------------------------------------------------------------------
+
+
+class _FakeGitHubWithInfraBlockedJob(FakeGitHubWithChecksAndAnnotations):
+    """FakeGitHub whose ``actions_job`` returns a configurable per-job-id mapping.
+
+    Simulates the Actions API response for a budget-exhausted / runner-outage
+    job: zero steps, FAILURE conclusion, optionally a billing annotation.
+    """
+
+    def __init__(
+        self,
+        checks: list[dict[str, Any]] | None = None,
+        annotations_by_check_run_id: dict[int, list[dict[str, Any]]] | None = None,
+        jobs_by_check_run_id: dict[int, dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(checks, annotations_by_check_run_id)
+        self._jobs = jobs_by_check_run_id or {}
+
+    def actions_job(self, job_id: int) -> dict[str, Any] | None:
+        return self._jobs.get(job_id)
+
+
+def test_infra_blocked_budget_failure_no_rework(tmp_path: Path) -> None:
+    """AC1: a simulated check run failing in under 10 seconds with zero steps
+    and a budget annotation is classified ``infra_blocked`` and dispatches no
+    rework."""
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _FakeGitHubWithInfraBlockedJob(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        annotations_by_check_run_id={
+            9001: [
+                {
+                    "message": "The job was not started because your spending limit needs to be increased."
+                }
+            ],
+        },
+        jobs_by_check_run_id={
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    # AC1: no rework dispatched
+    assert result.ok is False
+    assert result.data.get("infra_blocked") is True
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+    # The issue is NOT transitioned to in_progress (no rework)
+    assert (123, config.labels.in_progress) not in fake_gh.labels_added
+
+
+def test_infra_blocked_no_rework_counter_incremented(tmp_path: Path) -> None:
+    """AC2: attempt counters remain unchanged after an infra_blocked pass."""
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _FakeGitHubWithInfraBlockedJob(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.review(456)
+
+    state = load_state(paths.state_file)
+    pr_state = state.get("prs", {}).get("456", {})
+    # No rework attempts recorded for the infra_blocked PR
+    assert pr_state.get("no_op_rework_attempts", 0) == 0
+    assert pr_state.get("check_rerun_attempts", {}).get("Tests passed", 0) == 0
+
+
+def test_infra_blocked_then_genuine_failure_routes_to_rework(tmp_path: Path) -> None:
+    """AC2: a later genuine test failure on the same PR still routes to rework normally."""
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Pass 1: infra_blocked (zero-step FAILURE)
+    fake_gh_infra = _FakeGitHubWithInfraBlockedJob(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh_infra)
+    result1 = app.review(456)
+    assert result1.data.get("infra_blocked") is True
+
+    # Pass 2: genuine test failure (real test step failed)
+    fake_gh_real = _FakeGitHubWithInfraBlockedJob(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9002},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            9002: {
+                "conclusion": "FAILURE",
+                "steps": [
+                    {"name": "Set up job", "conclusion": "SUCCESS"},
+                    {"name": "Run tests", "conclusion": "FAILURE"},
+                ],
+            },
+        },
+    )
+    fake_gh_real.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app2 = OrchestratorApp(tmp_path, paths, config, fake_gh_real)
+    result2 = app2.review(456)
+
+    # AC2: genuine failure routes to rework normally
+    assert result2.ok is True  # review packet generated (rework dispatched)
+    assert result2.data.get("infra_blocked") is not True
+
+
+def test_infra_blocked_persistence_one_escalation_per_window(tmp_path: Path) -> None:
+    """AC3: persistence across N passes emits exactly one operator escalation
+    event per window, not one event per PR per pass."""
+    from charlie_work.config import InfraBlockedConfig
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()  # reset cross-pass state from other tests
+
+    config = _required_checks_config(
+        infra_blocked=InfraBlockedConfig(persistence_passes=2, escalation_window_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    def make_infra_blocked_fake() -> _FakeGitHubWithInfraBlockedJob:
+        return _FakeGitHubWithInfraBlockedJob(
+            checks=[
+                {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+                {"name": "Lint & Format", "bucket": "pass"},
+                {"name": "Pre-commit", "state": "SUCCESS"},
+            ],
+            jobs_by_check_run_id={
+                9001: {"conclusion": "FAILURE", "steps": []},
+            },
+        )
+
+    # Pass 1: infra_blocked, but persistence_passes=2 so no escalation yet
+    app1 = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    app1.review(456)
+    escalated_1 = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated_1) == 0
+
+    # Pass 2: persistence threshold reached -> one escalation
+    app2 = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    app2.review(456)
+    escalated_2 = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated_2) == 1
+
+    # Pass 3: same window -> no additional escalation
+    app3 = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    app3.review(456)
+    escalated_3 = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated_3) == 1  # still exactly one
+
+
+def test_infra_blocked_multiple_prs_one_pass_no_premature_escalation(
+    tmp_path: Path,
+) -> None:
+    """AC3 (rework finding): multiple infra-blocked PRs encountered within a
+    single loop pass must increment ``consecutive_passes`` at most ONCE for
+    that pass, not once per PR. Without the correlation_id gate on the
+    increment, N concurrent infra-blocked PRs in one pass reach
+    ``persistence_passes=N`` and fire ``infra_blocked_escalated`` within
+    that single pass -- contradicting the documented "persistence across N
+    passes, not per PR per pass" design.
+
+    This test simulates a single pass (one ``correlation_context``) that
+    encounters three infra-blocked PRs by calling ``review()`` three times
+    within that context. With ``persistence_passes=3``, the bug would fire
+    escalation on the third call within the same pass; the fix holds the
+    counter at 1 for the whole pass, so no escalation fires until two more
+    passes observe infra-blocked PRs.
+    """
+    from charlie_work.config import InfraBlockedConfig
+    from charlie_work.instrumentation import correlation_context
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+
+    config = _required_checks_config(
+        infra_blocked=InfraBlockedConfig(persistence_passes=3, escalation_window_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    def make_infra_blocked_fake() -> _FakeGitHubWithInfraBlockedJob:
+        return _FakeGitHubWithInfraBlockedJob(
+            checks=[
+                {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+                {"name": "Lint & Format", "bucket": "pass"},
+                {"name": "Pre-commit", "state": "SUCCESS"},
+            ],
+            jobs_by_check_run_id={
+                9001: {"conclusion": "FAILURE", "steps": []},
+            },
+        )
+
+    # A single pass: one correlation_context, three infra-blocked review()
+    # calls (simulating three PRs encountered in the same pass). The
+    # infra_blocked branch is idempotent (no state/label mutation, early
+    # return), so repeated calls for the same PR exercise the same counter
+    # path as distinct PRs would.
+    app = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    with correlation_context() as cid:
+        app.review(456)
+        app.review(456)
+        app.review(456)
+
+    # The counter incremented exactly once for this pass, not three times.
+    repo_key = str(tmp_path)
+    assert _infra_blocked_window[repo_key]["consecutive_passes"] == 1, (
+        f"expected one increment for pass {cid!r}, got "
+        f"{_infra_blocked_window[repo_key]['consecutive_passes']!r}"
+    )
+    # persistence_passes=3 not reached within a single pass -> no escalation.
+    escalated = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated) == 0, escalated
+
+    # A second pass (new correlation_context) increments again -> counter=2,
+    # still below threshold -> no escalation.
+    app2 = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    with correlation_context():
+        app2.review(456)
+    assert _infra_blocked_window[repo_key]["consecutive_passes"] == 2
+    escalated_2 = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated_2) == 0
+
+    # A third pass reaches persistence_passes=3 -> exactly one escalation.
+    app3 = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    with correlation_context():
+        app3.review(456)
+    assert _infra_blocked_window[repo_key]["consecutive_passes"] == 3
+    escalated_3 = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated_3) == 1
+
+
+def test_infra_blocked_window_resets_when_pass_reviews_clear_prs(tmp_path: Path) -> None:
+    """Rework finding: the ``_loop_impl`` branch that resets
+    ``_infra_blocked_window`` when a pass reviews PRs and finds none
+    infra-blocked (the fleet-wide infra condition has cleared). A pass
+    that reviews at least one clear PR must zero the consecutive-pass
+    counter so the next outage starts fresh, rather than carrying stale
+    persistence forward.
+
+    ``FakeGitHub()`` ships a janitor-green PR 456 with passing required
+    checks, so ``loop(limit=0)`` runs a full pass (intake, dispatch, the
+    review lane, the post-pass reset sweep) that actually reviews PR 456
+    and emits no ``check_infra_blocked`` events for this pass's
+    correlation_id -- exactly the "we looked and the coast was clear"
+    condition that triggers the reset.
+    """
+    from charlie_work.workflow import _infra_blocked_window
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pre-populate the window as if prior passes observed infra-blocked PRs.
+    repo_key = str(tmp_path)
+    _infra_blocked_window[repo_key] = {
+        "consecutive_passes": 2,
+        "last_escalation": datetime.now(UTC),
+        "last_pass_cid": "stale-cid-from-prior-pass",
+    }
+
+    result = app.loop(limit=0)
+
+    # The pass reviewed PR 456 (green) and found no infra-blocked PRs -> the
+    # window was reset.
+    assert len(result.data["reviews"]) >= 1
+    window = _infra_blocked_window[repo_key]
+    assert window["consecutive_passes"] == 0
+    assert window["last_escalation"] is None
+    assert window["last_pass_cid"] is None
+
+
+def test_infra_blocked_window_not_reset_when_pass_reviews_zero_prs(tmp_path: Path) -> None:
+    """Round-2 #1383 regression: a pass that reviews ZERO PRs during a live
+    outage must NOT reset ``_infra_blocked_window``. The prior reset logic
+    conflated "zero ``check_infra_blocked`` events emitted" with "we looked
+    and the coast was clear" -- but a pass that reviews nothing also emits
+    zero such events, so an idle pass during a live outage silently cleared
+    ``consecutive_passes``/``last_escalation`` and could prevent the AC3
+    persistence escalation from ever firing.
+
+    Distinct from ``test_infra_blocked_window_resets_when_pass_reviews_clear_prs``
+    (which reviews a green PR and DOES reset): here the PR/issue queue is
+    empty so the review lane runs over zero PRs.
+    """
+    from charlie_work.workflow import _infra_blocked_window
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Empty queue: no PRs and no issues, so the review lane reviews nothing.
+    fake_gh.prs = []
+    fake_gh.issues = []
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pre-populate the window as if prior passes observed infra-blocked PRs
+    # (a live outage is in progress).
+    repo_key = str(tmp_path)
+    prior_last_esc = datetime.now(UTC)
+    _infra_blocked_window[repo_key] = {
+        "consecutive_passes": 2,
+        "last_escalation": prior_last_esc,
+        "last_pass_cid": "stale-cid-from-prior-pass",
+    }
+
+    result = app.loop(limit=0)
+
+    # The pass reviewed zero PRs -> the window must be preserved, not reset.
+    assert len(result.data["reviews"]) == 0
+    window = _infra_blocked_window[repo_key]
+    assert window["consecutive_passes"] == 2
+    assert window["last_escalation"] == prior_last_esc
+    assert window["last_pass_cid"] == "stale-cid-from-prior-pass"
+
+
+def test_infra_blocked_check_infra_blocked_event_emitted(tmp_path: Path) -> None:
+    """AC4: the ``check_infra_blocked`` event is emitted and has a consumer
+    (heartbeat_check.py's ``check_infra_blocked_events``)."""
+    from charlie_work.instrumentation import _LEVEL_BY_KIND
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _FakeGitHubWithInfraBlockedJob(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.review(456)
+
+    blocked_events = query_events(paths.state_file, kind="check_infra_blocked")
+    assert len(blocked_events) == 1
+    assert blocked_events[0]["payload"]["pr_number"] == 456
+    assert "Tests passed" in blocked_events[0]["payload"]["checks"]
+    # The event kind is registered at warning level
+    assert _LEVEL_BY_KIND["check_infra_blocked"] == "warning"
+    # The escalation kind is registered at error level
+    assert _LEVEL_BY_KIND["infra_blocked_escalated"] == "error"
+
+
+def test_infra_blocked_config_parses_from_yaml(tmp_path: Path) -> None:
+    """The infra_blocked config section is parsed from YAML correctly."""
+    from charlie_work.config import load_config
+
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "auto_merge:\n"
+        "  required_checks: [Tests passed]\n"
+        "  infra_blocked:\n"
+        "    enabled: true\n"
+        "    instant_fail_seconds: 15\n"
+        "    annotation_patterns: [billing exhausted, quota exceeded]\n"
+        "    persistence_passes: 5\n"
+        "    escalation_window_minutes: 120\n",
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    cfg = config.auto_merge.infra_blocked
+    assert cfg.enabled is True
+    assert cfg.instant_fail_seconds == 15
+    assert cfg.annotation_patterns == ("billing exhausted", "quota exceeded")
+    assert cfg.persistence_passes == 5
+    assert cfg.escalation_window_minutes == 120
+
+
+def test_infra_blocked_does_not_shadow_cancelled_auto_rerun_path(tmp_path: Path) -> None:
+    """Round-3 review finding: the #1383 ``_enrich_checks_infra_blocked``
+    helper gates on ``state == "FAILURE"``, so it must NOT reclassify a
+    ``CANCELLED`` (or ``INFRA_FAILURE``/``TIMED_OUT``) required check. The
+    pre-existing #841 ``is_infra_failure_block`` auto-rerun+escalate path is
+    fed by ``run_janitor`` over those conclusions and must still fire
+    post-#1383. This test confirms a ``CANCELLED`` required check -- carrying
+    a ``databaseId`` and a zero-step job that WOULD match
+    ``is_infra_blocked_check`` if the gate admitted it -- still routes to
+    ``infra_rerun`` (not ``infra_blocked``) with the #1383 classifier enabled
+    (its default). The ``databaseId`` + zero-step job exercise the gate so a
+    mutation that broadens it to ``CANCELLED`` is caught."""
+
+    class _FakeGitHubWithInfraJobAndRerun(_FakeGitHubWithInfraBlockedJob):
+        """Combines actions_job (for the enrichment gate) with rerun capture
+        (for the #841 auto-rerun assertion)."""
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.rerun_calls: list[list[str]] = []
+
+        def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):  # noqa: ANN202
+            if len(args) >= 2 and args[0] == "run" and args[1] == "rerun":
+                self.rerun_calls.append(list(args))
+                return "DRY-RUN: gh run rerun " + " ".join(args[2:])
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+    config = _required_checks_config()  # InfraBlockedConfig.enabled defaults to True
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
+    fake_gh = _FakeGitHubWithInfraJobAndRerun(
+        checks=[
+            {"name": "Tests passed", "state": "CANCELLED", "link": link, "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            # Zero-step FAILURE job that is_infra_blocked_check WOULD classify
+            # -- but the outer gate excludes CANCELLED check-state, so this
+            # job is never consulted and the check stays CANCELLED.
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    # The #841 auto-rerun path fired for the CANCELLED check.
+    assert result.ok is False
+    assert result.data.get("infra_rerun_run_ids") == [12345]
+    assert len(fake_gh.rerun_calls) == 1
+    # The #1383 infra_blocked hold path did NOT fire.
+    assert result.data.get("infra_blocked") is not True
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+    # No check_infra_blocked event was emitted -- the CANCELLED check is not
+    # in the infra_blocked population.
+    blocked_events = query_events(paths.state_file, kind="check_infra_blocked")
+    assert len(blocked_events) == 0
+
+
+def test_merge_ready_infra_blocked_failure_blocks_merge_in_blocked_bucket(
+    tmp_path: Path,
+) -> None:
+    """Round-3 review finding: ``merge_ready()`` uses the shared
+    ``_enrich_checks_infra_blocked`` helper, which rewrites a zero-step
+    FAILURE required check to ``INFRA_BLOCKED`` (not ``INFRA_FAILURE`` as the
+    old inline enrichment did). The check must land in
+    ``CheckSummary.infra_blocked`` (not ``infra_failed``) and block the merge
+    (``can_merge=False``, ``merged=False``). Both buckets block merge via
+    ``CheckSummary.ready``, so the merge gate is unchanged -- only the bucket
+    differs. This is the merge_ready()-path coverage the round-1/2 tests
+    lacked (only review()'s new path was covered)."""
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _FakeGitHubWithInfraBlockedJob(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    # Plant an approved review decision so merge_ready reaches the check gate.
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    result = app.merge_ready(456, merge=True)
+
+    # The zero-step FAILURE check blocks merge via the infra_blocked bucket.
+    assert result.data["can_merge"] is False
+    assert result.data["merged"] is False
+    assert fake_gh.merged == []
+    checks = result.data["checks"]
+    assert checks["infra_blocked"] == ("Tests passed",)
+    assert checks["infra_failed"] == ()
+    assert checks["failed"] == ()
 
 
 def test_janitor_required_check_repeated_failure_escalates(tmp_path: Path) -> None:
-    """Issue #376: repeated check-failure reworks escalate to human_needed via the request_changes cap."""
+    """Issue #376: repeated check-failure reworks escalate via the
+    request_changes cap. Issue #1266: max_rework_cycles_exceeded is
+    mechanical, so this lands agent:operator-queue, not agent:human-needed."""
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     checks = [
@@ -17880,7 +16603,7 @@ def test_janitor_required_check_repeated_failure_escalates(tmp_path: Path) -> No
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["prs"]["456"]["status"] == "escalated"
     assert state["prs"]["456"]["request_changes_count"] == 2
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 def test_janitor_required_check_failure_noop_does_not_reroute(tmp_path: Path) -> None:
@@ -17972,7 +16695,18 @@ def test_janitor_required_check_first_failure_triggers_rerun(tmp_path: Path) -> 
 
 
 def test_janitor_required_check_second_failure_routes_to_rework(tmp_path: Path) -> None:
-    """Issue #391: the same check failing again on the same head is definitive and routes to rework."""
+    """Issue #391: the same check failing again on the same head is definitive and routes to rework.
+
+    Issue #1258 extends this test (rather than adding a parallel one) to also
+    cover: (a) AC2 -- the pre-existing sole-failure short-circuit and its
+    one-time flake-debounce rerun are unchanged by the new co-occurring-
+    failure branch (the rerun fires exactly once, on pass 1, never again on
+    pass 2's definitive failure); (b) AC4 -- the new
+    ``review_dispatch_skipped_ci_red`` provenance kind is emitted exactly
+    once, alongside (additive to) this short-circuit's pre-existing
+    ``record_review``-driven routing, tagged ``co_occurring: False`` because
+    the required-check failure is this PR's sole janitor failure.
+    """
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
@@ -17992,6 +16726,9 @@ def test_janitor_required_check_second_failure_routes_to_rework(tmp_path: Path) 
     assert result1.ok is False
     assert result1.data.get("rerun_run_ids") == [12345]
     assert len(fake_gh.rerun_calls) == 1
+    # Pass 1 is the one-time flake-debounce rerun itself, not the definitive
+    # short-circuit -- no provenance event yet.
+    assert query_events(paths.state_file, kind="review_dispatch_skipped_ci_red") == []
 
     result2 = app.review(456)
     assert result2.ok is True
@@ -18000,8 +16737,605 @@ def test_janitor_required_check_second_failure_routes_to_rework(tmp_path: Path) 
     assert state["prs"]["456"]["decision"] == "request_changes"
     assert state["prs"]["456"]["request_changes_count"] == 1
     assert (123, config.labels.needs_rework) in fake_gh.labels_added
-    # No additional rerun was triggered on the second pass.
+    # No additional rerun was triggered on the second pass: AC2's "exactly
+    # one rerun, not zero, not twice" across both passes.
     assert len(fake_gh.rerun_calls) == 1
+
+    ci_red_events = query_events(paths.state_file, kind="review_dispatch_skipped_ci_red")
+    assert len(ci_red_events) == 1
+    payload = ci_red_events[0]["payload"]
+    assert payload["pr_number"] == 456
+    assert payload["issue_number"] == 123
+    assert payload["failed_required_checks"] == ["Tests passed"]
+    assert payload["co_occurring"] is False
+    assert payload["co_occurring_failures"] == []
+
+
+def _fail_if_launched(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Fail the test loudly if a reviewer is launched -- reused for every
+    fixture below that must never reach a paid reviewer session (issue
+    #1258's co-occurring-failure gate). Mirrors the identical pattern in
+    ``test_fix_escalated_dispatch_gate.py`` for the analogous escalated-PR
+    gate."""
+    launched: list[Any] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> Any:
+        launched.append((args, kwargs))
+        raise AssertionError("launch_claude_worker must not be called on red CI")
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+    return launched
+
+
+def test_janitor_required_check_failure_with_co_occurring_body_failure_routes_to_rework(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1258 (AC3): a required-check failure that is NOT the PR's sole
+    janitor failure -- here, co-occurring with an empty PR body
+    (``_check_body``) -- used to fall straight through
+    ``is_check_failure_block`` (which requires the check failure be the SOLE
+    blocker) into the passive ``janitor_blocked`` dead end: neither reviewed
+    nor routed to rework, silently re-logging the same failure set forever.
+    This must now route to rework via the same ``record_review(request_
+    changes)`` machinery the sole-failure short-circuit uses, naming BOTH the
+    failing check and the co-occurring janitor failure, and it must never
+    launch a reviewer.
+
+    The launch-avoidance assertion drives the real, end-to-end pipeline
+    (``review()`` then ``dispatch_reviews()``), not just ``review()`` in
+    isolation: launch happens in ``dispatch_reviews`` (workflow.py), which a
+    ``review()``-only test never reaches, so a bare ``assert launched == []``
+    against a monkeypatch that method can't trigger would pass for ANY
+    mutation -- an inert control (see the AC1 sibling test immediately below,
+    which drives the identical seam and gets ``launched_count == 1``; that is
+    the positive-control proof this guard is live and this zero is real).
+    """
+    config = dataclasses.replace(
+        _required_checks_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    # Trip _check_body's "PR body is empty" failure alongside the red check.
+    # This co-occurring failure is independent of issue_number binding
+    # (unlike a missing-linked-issue fixture, which review() itself requires
+    # non-None before reaching ANY routing branch -- see the janitor.py
+    # cross-reference in _check_linked_issue) and is not a merge conflict or
+    # a no-op-rework, so it exercises exactly the new branch, not the
+    # existing sole-failure short-circuit or the merge-conflict/no-op-rework
+    # routing block.
+    fake_gh.prs[0]["body"] = ""
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    launched = _fail_if_launched(monkeypatch)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert launched == []
+
+    # Drive the real launch seam: no packet was written (the PR never left
+    # the janitor-blocked/rework path), so dispatch_reviews must select and
+    # launch nothing. This is what makes ``launched == []`` above meaningful
+    # rather than vacuous.
+    dispatch_result = app.dispatch_reviews()
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["launched_count"] == 0
+    assert dispatch_result.data["selected_count"] == 0
+    assert launched == []
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["decision"] == "request_changes"
+    assert state["prs"]["456"]["request_changes_count"] == 1
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    assert rework_prompt.exists()
+    prompt_text = rework_prompt.read_text(encoding="utf-8")
+    assert "CI failed on Tests passed" in prompt_text
+    assert "PR body is empty" in prompt_text
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert "Tests passed" in decision["summary"]
+    assert "PR body is empty" in decision["summary"]
+    assert decision["required_changes"] == ["PR body is empty"]
+
+    ci_red_events = query_events(paths.state_file, kind="review_dispatch_skipped_ci_red")
+    assert len(ci_red_events) == 1
+    payload = ci_red_events[0]["payload"]
+    assert payload["pr_number"] == 456
+    assert payload["issue_number"] == 123
+    assert payload["failed_required_checks"] == ["Tests passed"]
+    assert payload["co_occurring"] is True
+    assert payload["co_occurring_failures"] == ["PR body is empty"]
+
+
+def test_janitor_required_check_failure_with_co_occurring_infra_failure_stays_blocked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1258 (AC3 carve-out): unlike AC3's ``_check_body`` co-occurring
+    failure immediately above, a genuine required-check FAILURE co-occurring
+    with an INFRA-failed required check (CANCELLED/TIMED_OUT, issue #841/#847)
+    must NOT route through the new ``is_co_occurring_check_failure_block``
+    branch -- it has its own dedicated infra-rerun/escalation remediation
+    that this fix must not shadow or double-dispatch against. This is the
+    same combination the pre-existing
+    ``test_janitor_mixed_genuine_failure_and_infra_failure_routes_to_rework_not_infra_rerun``
+    (issue #847) pins from the infra side; this sibling pins it from #1258's
+    side -- through the real ``review()`` + ``dispatch_reviews()`` pipeline,
+    with the new provenance kind explicitly asserted ABSENT -- so the
+    boundary is owned by this issue's own tests, not inferred from an
+    unrelated suite.
+    """
+    config = dataclasses.replace(
+        _required_checks_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE"},
+            {"name": "Lint & Format", "state": "CANCELLED"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    launched = _fail_if_launched(monkeypatch)
+
+    result = app.review(456)
+
+    # Falls through to the passive janitor_blocked path, unchanged by this
+    # diff -- this combination is an accepted carve-out (infra remediation
+    # owns it), not a new rework route.
+    assert result.ok is False
+    assert launched == []
+
+    dispatch_result = app.dispatch_reviews()
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["launched_count"] == 0
+    assert dispatch_result.data["selected_count"] == 0
+    assert launched == []
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    assert state["prs"]["456"].get("decision") is None
+    failures = state["prs"]["456"]["janitor_failures"]
+    assert any("Tests passed" in f for f in failures)
+    assert any("infrastructure" in f.lower() and "Lint & Format" in f for f in failures)
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    assert not rework_prompt.exists()
+
+    # The new co-occurring-failure provenance kind must NOT fire for this
+    # carve-out -- it is reserved for the code-fixable branch above.
+    assert query_events(paths.state_file, kind="review_dispatch_skipped_ci_red") == []
+
+
+def test_co_occurring_ci_red_branch_stays_inside_janitor_ok_gate() -> None:
+    """Issue #1258 (AC8): a mutation-testing gap found in review that AC8's
+    literal construction (disable the co-occurring branch's own boolean
+    guard, expect a launch) cannot be satisfied against this architecture,
+    and explains why, before pinning the mutation that CAN be.
+
+    Why the local mutation is structurally inert: ``janitor.run_janitor``
+    (janitor.py) always appends "Required check(s) failed: ..." to
+    ``failures`` whenever ``failed_required_checks`` is truthy, and
+    ``JanitorVerdict.ok = not failures`` -- so ``verdict.ok`` is NEVER True
+    while CI is red, sole or co-occurring. ``review()``'s
+    ``if not verdict.ok:`` gate (workflow.py) is therefore always entered on
+    red CI, and every branch inside it is an early ``return`` ending in an
+    UNCONDITIONAL default that overwrites ``status`` to ``"janitor_blocked"``
+    and returns ``CommandResult(False, ...)`` before the packet-write/
+    dispatch code textually after (i.e. outside) the gate is ever reached.
+    Disabling ``is_co_occurring_check_failure_block``'s own guard therefore
+    cannot produce a ``launch_claude_worker`` call -- it can only fall
+    through to the pre-existing ``janitor_blocked`` stall, which
+    ``test_janitor_required_check_failure_with_co_occurring_body_failure_routes_to_rework``'s
+    ``launched == []`` assertion cannot distinguish from the branch actually
+    firing.
+
+    The mutation that DOES reach a launch is hoisting a red-CI exclusion out
+    to the outer gate itself, e.g. rewriting
+    ``if not verdict.ok:`` as
+    ``if not verdict.ok and not bool(verdict.failed_required_checks):`` --
+    that skips the fail-safe default entirely for every red-CI PR (sole or
+    co-occurring) and falls through to the packet-write/dispatch path.
+    Applied by hand against this diff and reverted immediately (not part of
+    this suite's harness -- AST source-mutation isn't a fixture here), it
+    made
+    ``test_janitor_required_check_failure_with_co_occurring_body_failure_routes_to_rework``
+    fail exactly at the ``_fail_if_launched`` fake's
+    ``launch_claude_worker`` call:
+    ``AssertionError: launch_claude_worker must not be called on red CI``,
+    raised from ``dispatch_reviews`` -- a real, reachable launch-on-red-CI,
+    not a hypothetical one.
+
+    This test is the permanent guard against that specific hoist: it
+    AST-scans ``review()`` and asserts (a) the outer gate's test is exactly
+    ``not verdict.ok`` with no additional ``and``/``or`` operand, and (b) the
+    ``is_co_occurring_check_failure_block`` branch stays lexically nested
+    inside that outer gate's body rather than becoming a sibling of it (or
+    being folded into its condition). Either change is exactly the refactor
+    mistake that would reopen this gap; this test fails CI the moment either
+    lands, rather than relying on a mutation that this architecture makes
+    unreachable at the branch's own guard.
+
+    Both assertions were verified live (positive control), applied by hand
+    against this diff and reverted immediately (confirmed byte-identical via
+    diff against a pre-mutation backup) -- neither is a mutation this suite
+    runs automatically:
+    - Rewriting the outer gate as
+      ``if not verdict.ok and not bool(verdict.failed_required_checks):``
+      makes the AST node a ``BoolOp``, not the ``UnaryOp``-wrapping-
+      ``Attribute`` shape ``is_outer_gate`` matches, so ``outer_gates``
+      drops to 0 and assertion (a) (``len(outer_gates) == 1``) fires:
+      "found 0 -- a rewrite changed the outer janitor-blocked gate's shape".
+    - Dedenting the ``is_co_occurring_check_failure_block`` ``if``-statement
+      (and its body) by one level so it becomes a sibling statement
+      immediately after the outer gate's closing ``)`` -- textually after,
+      not inside, ``if not verdict.ok:`` -- still parses (this is valid
+      Python) and still yields exactly one ``co_occurring_ifs`` match, so
+      assertion (a) and the count check in (b) both stay green; it is
+      specifically the ``nested_inside_outer_gate`` assertion that fires:
+      "must stay lexically nested inside `if not verdict.ok:` ... or moved
+      to be a sibling of it". This is the assertion that actually guards
+      the sibling-hoist shape, distinct from the one guarding the
+      condition-hoist shape above.
+    """
+    import ast
+
+    src_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
+    source = src_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(src_path))
+
+    review_fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "review":
+            review_fn = node
+            break
+    assert review_fn is not None, "could not find review() -- a rename invalidated this probe"
+
+    def is_outer_gate(stmt: ast.AST) -> bool:
+        if not isinstance(stmt, ast.If):
+            return False
+        test = stmt.test
+        return (
+            isinstance(test, ast.UnaryOp)
+            and isinstance(test.op, ast.Not)
+            and isinstance(test.operand, ast.Attribute)
+            and test.operand.attr == "ok"
+            and isinstance(test.operand.value, ast.Name)
+            and test.operand.value.id == "verdict"
+        )
+
+    outer_gates = [stmt for stmt in ast.walk(review_fn) if is_outer_gate(stmt)]
+    assert len(outer_gates) == 1, (
+        "expected exactly one `if not verdict.ok:` gate (no additional and/or "
+        f"operand) in review(), found {len(outer_gates)} -- a rewrite changed "
+        "the outer janitor-blocked gate's shape"
+    )
+    outer_gate = outer_gates[0]
+
+    def has_co_occurring_guard(stmt: ast.AST) -> bool:
+        if not isinstance(stmt, ast.If):
+            return False
+        names = {n.id for n in ast.walk(stmt.test) if isinstance(n, ast.Name)}
+        return "is_co_occurring_check_failure_block" in names
+
+    co_occurring_ifs = [stmt for stmt in ast.walk(review_fn) if has_co_occurring_guard(stmt)]
+    assert len(co_occurring_ifs) == 1, (
+        "expected exactly one `is_co_occurring_check_failure_block` guard in "
+        f"review(), found {len(co_occurring_ifs)} -- a rename/duplication invalidated this probe"
+    )
+    co_occurring_if = co_occurring_ifs[0]
+
+    nested_inside_outer_gate = any(
+        stmt is co_occurring_if for stmt in ast.walk(outer_gate) if stmt is not outer_gate
+    )
+    assert nested_inside_outer_gate, (
+        "the co-occurring CI-red branch must stay lexically nested inside "
+        "`if not verdict.ok:`, not hoisted into the outer gate's own condition "
+        "(e.g. `if not verdict.ok and not is_co_occurring_check_failure_block:`) "
+        "or moved to be a sibling of it -- either change skips the fail-safe "
+        "janitor_blocked default and is the one refactor mistake that makes "
+        "launch_claude_worker reachable on red CI (confirmed by hand-mutation, "
+        "see this test's docstring)"
+    )
+
+
+def test_janitor_all_checks_green_dispatches_reviewer_ci_red_kind_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1258 (AC1): the green-checks path is unaffected by the new
+    co-occurring-failure branch and the new provenance kind -- both guards
+    require ``verdict.failed_required_checks`` to be truthy, which an
+    all-green PR never has, so neither new branch's body executes at all.
+    Exercises the real, end-to-end pipeline (``review()`` packet-build then
+    ``dispatch_reviews()`` launch), not just ``review()`` in isolation, so
+    "the reviewer is launched with the same command as pre-diff" is an
+    actual launch-call assertion, not merely an absence-of-packet inference.
+    """
+    config = dataclasses.replace(
+        _required_checks_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "SUCCESS"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = paths.prs / "pr-456" / "review-prompt.md"
+    assert packet.exists()
+    # The janitor gate never blocked this PR, so none of its routing kinds
+    # (old or new) fired.
+    assert query_events(paths.state_file, kind="review_dispatch_skipped_ci_red") == []
+    assert not any(
+        e["kind"] == "janitor_gate" for e in load_state(paths.state_file).get("events", [])
+    )
+
+    launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append((args, kwargs))
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    dispatch_result = app.dispatch_reviews()
+
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["launched_count"] == 1
+    assert len(launched) == 1
+    _launch_args, launch_kwargs = launched[0]
+    assert launch_kwargs.get("review") is True
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["review_dispatch_status"] == "review_dispatch_dispatched"
+    # Pre-existing dispatch-lane kinds still fire (additive, not replaced).
+    assert query_events(paths.state_file, kind="review_dispatch_claim") != []
+    # The new CI-red kind is scoped to the janitor gate and never fires on
+    # the dispatch-claim/launch path itself (also AC6's redundant-gate claim,
+    # from the launch side).
+    assert query_events(paths.state_file, kind="review_dispatch_skipped_ci_red") == []
+
+
+def test_dispatch_claim_site_has_no_redundant_ci_status_check() -> None:
+    """Issue #1258 (AC6): the janitor gate in ``review()`` must stay the SOLE
+    source of truth for "is CI red" -- a second, independent CI-status check
+    anywhere near the dispatch-claim/launch site would be the exact
+    redundant-gate hazard the issue's binding comment warns against (two
+    disagreeing sources of truth for the same question).
+
+    AST-scans the three dispatch-claim-site functions/methods (not a plain
+    text grep over the whole file, which would also match unrelated code
+    elsewhere) for any of the tokens a CI-status read would need to use:
+    ``pr_checks``/``summarize_checks``/``failed_required_checks``/
+    ``required_checks``/``is_check_failure``/``checkSuite``/
+    ``statusCheckRollup``. Zero hits confirmed by recon before this item's
+    branch was added; this pins that finding down so a future PR that adds a
+    second check here fails CI instead of silently duplicating the gate.
+
+    issue #1283 Phase A: ``_is_review_dispatchable`` and
+    ``_select_review_dispatch_candidates`` moved to
+    ``charlie_work/dispatch_selection.py``; only ``dispatch_reviews`` (an
+    ``OrchestratorApp`` method) stays in workflow.py. Both files are
+    AST-parsed and their ``FunctionDef``/``AsyncFunctionDef`` tables unioned
+    before the target check below, so the probe keeps covering the same
+    three call sites across the split instead of silently losing two of
+    them the moment they became import lines in workflow.py.
+    """
+    import ast
+
+    workflow_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
+    dispatch_selection_path = (
+        Path(__file__).parents[1] / "src" / "charlie_work" / "dispatch_selection.py"
+    )
+
+    targets = {
+        "dispatch_reviews",
+        "_is_review_dispatchable",
+        "_select_review_dispatch_candidates",
+    }
+    forbidden = (
+        "pr_checks",
+        "summarize_checks",
+        "failed_required_checks",
+        "required_checks",
+        "is_check_failure",
+        "checkSuite",
+        "statusCheckRollup",
+    )
+
+    found: dict[str, str] = {}
+    for src_path in (workflow_path, dispatch_selection_path):
+        source = src_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(src_path))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in targets:
+                segment = ast.get_source_segment(source, node)
+                assert segment is not None, f"could not extract source for {node.name}"
+                found[node.name] = segment
+
+    assert found.keys() == targets, (
+        f"expected to find {sorted(targets)}, found {sorted(found)} -- "
+        "a rename/move at the dispatch-claim site invalidated this probe's anchors"
+    )
+
+    violations = {
+        name: [token for token in forbidden if token in segment] for name, segment in found.items()
+    }
+    violations = {name: tokens for name, tokens in violations.items() if tokens}
+    assert not violations, (
+        "a CI-status token was found at the dispatch-claim site -- this is the "
+        "redundant-gate hazard: the janitor gate in review() must remain the "
+        f"sole source of truth for 'is CI red': {violations}"
+    )
+
+
+def test_scope_fence_no_verdict_source_added() -> None:
+    """Issue #1258 (AC7, structural half): this item's diff must add NO
+    ``verdict_source`` field/enum anywhere in the new CI-red gate (W8's
+    "ci_gate_auto_reject provenance enum" -- W8 lands after W1).
+
+    Originally this test also pinned ``ReviewConfig.stale_checks_grace_minutes``
+    / ``max_retriggers`` absent, guarding against W1 (or #1258 itself)
+    re-adding W17's fields prematurely. W17 (issue #1274, this same lane) has
+    now landed those two fields on ``ReviewConfig`` on purpose -- see
+    ``ReviewConfig.stale_checks_grace_minutes``/``stale_checks_max_retriggers``
+    and their loader validation block in config.py. That half of this test is
+    therefore retired; the ``verdict_source`` guard below is unrelated
+    (W8/#1258 concern) and still applies.
+
+    ``verdict_source`` already exists elsewhere in this codebase
+    (``_reap_review_verdicts`` provenance, an unrelated pre-existing
+    mechanism -- see workflow.py's own field of that name) -- this test does
+    not (and must not) assert the string is absent from the whole repo, only
+    that ``JanitorVerdict`` (the structure this item actually touches) never
+    gained the field.
+    """
+    from charlie_work.janitor import JanitorVerdict
+
+    janitor_verdict_fields = {f.name for f in dataclasses.fields(JanitorVerdict)}
+    assert "verdict_source" not in janitor_verdict_fields
+
+
+def test_missing_checks_only_pr_falls_through_to_janitor_blocked_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1258 (AC7, behavioral half): a PR whose required checks are
+    entirely MISSING (never reported), as opposed to FAILED, is the
+    pre-existing "absent checks" code path this item must leave untouched
+    -- it is classification-only (``is_missing_checks_only_block``, issue
+    #1133) with no retrigger, and W17's not-yet-built
+    stale-checks-grace/retrigger policy is what would eventually act on it.
+
+    Both of this item's new/extended gates require
+    ``verdict.failed_required_checks`` to be truthy
+    (``is_check_failure_block`` and the new co-occurring branch alike) --
+    a purely-missing check leaves that tuple empty, so neither can fire by
+    construction. This PR must fall straight through to the passive
+    ``janitor_blocked`` bookkeeping exactly as it did before this item's
+    diff: no ``record_review`` decision, no ``review_dispatch_skipped_ci_red``
+    event, no reviewer launch.
+
+    ``review_dispatch`` is explicitly enabled here (``_required_checks_config()``
+    alone leaves it at its ``enabled=False`` default) and the launch seam is
+    driven for real via ``_fail_if_launched`` -- with dispatch left disabled,
+    ``dispatch_reviews()`` returns ``launched_count == 0`` on its very first
+    line for every fixture, sole-failure and co-occurring alike, which would
+    make that assertion pass for any mutation of the gate. The positive
+    control proving this zero is real, not vacuous, is the AC1 sibling
+    ``test_janitor_all_checks_green_dispatches_reviewer_ci_red_kind_absent``,
+    which drives the identical enabled seam and gets ``launched_count == 1``.
+    """
+    config = dataclasses.replace(
+        _required_checks_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithMissingRequired()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    launched = _fail_if_launched(monkeypatch)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    pr_state = state["prs"]["456"]
+    assert pr_state["status"] == "janitor_blocked"
+    assert pr_state["is_missing_checks_only_block"] is True
+    # Neither the pre-existing sole-failure short-circuit nor the new
+    # co-occurring branch fired -- no request_changes decision was recorded.
+    assert "decision" not in pr_state
+    assert query_events(paths.state_file, kind="review_dispatch_skipped_ci_red") == []
+
+    # No packet was written (the janitor gate blocked before packet-build),
+    # so dispatch_reviews has structurally nothing to launch for this PR --
+    # driven for real, with dispatch enabled and the launch seam wired to
+    # fail loudly, not inferred from a disabled-dispatch early return.
+    dispatch_result = app.dispatch_reviews()
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["launched_count"] == 0
+    assert dispatch_result.data["selected_count"] == 0
+    assert launched == []
+
+
+def test_dispatch_reviews_empty_diff_skip_is_registered_and_never_launches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1258 (AC5): the #1251 empty-diff pre-flight guard already
+    landed on this clone's main (commit 7de2fa9, PR #1278) before this item
+    started -- per the task's "integrate with it instead of duplicating"
+    instruction, this item does not reimplement it. This test pins the two
+    concrete AC5 guarantees against the ALREADY-MERGED gate as an explicit
+    W1 regression (not just #1251's own suite): zero reviewer-launch calls
+    for a zero-file PR, and its dedicated event kind is genuinely registered
+    in instrumentation.py's exhaustive registry (not just a bare string).
+
+    Naming note: the event kind was originally ``review_skipped_empty_diff``
+    (#1251, PR #1278) and has been renamed to ``review_dispatch_skipped_empty_diff``
+    for issue #1258 (AC5) so it shares the ``review_dispatch_*`` family AC4
+    pins for the new CI-red kind. The rename touches only the
+    ``_LEVEL_BY_KIND`` registry key, its single emitter call site, and this
+    suite's assertions -- the emission site, payload shape, and warning
+    level are unchanged, so this is not a behavior change.
+
+    ``_dispatch_reviews_app`` defaults ``review_dispatch.enabled=True``, so
+    ``launched == []`` here is a real launch-avoidance assertion, not a
+    disabled-dispatch early return. The positive control proving this fixture
+    would otherwise launch is the pre-existing sibling
+    ``test_dispatch_reviews_proceeds_with_nonempty_diff`` (same app/packet
+    helpers, non-empty ``diff.patch``), which gets exactly one launch.
+    """
+    from charlie_work.instrumentation import _LEVEL_BY_KIND
+
+    assert "review_dispatch_skipped_empty_diff" in _LEVEL_BY_KIND
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    (app.paths.prs / "pr-100" / "diff.patch").write_text("", encoding="utf-8")
+
+    launched = _fail_if_launched(monkeypatch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert launched == []
+    assert result.data["launched_count"] == 0
+    skip_events = query_events(app.paths.state_file, kind="review_dispatch_skipped_empty_diff")
+    assert len(skip_events) == 1
+    assert skip_events[0]["pr_number"] == 100
 
 
 def test_janitor_required_check_rerun_api_error_falls_through_to_rework(tmp_path: Path) -> None:
@@ -18121,10 +17455,12 @@ def test_janitor_infra_failed_first_cancel_triggers_rerun_without_failed_flag(
     assert "123" not in state.get("issues", {})
 
 
-def test_janitor_infra_failed_cap_exhausted_escalates_to_human_needed(tmp_path: Path) -> None:
+def test_janitor_infra_failed_cap_exhausted_escalates_to_operator_queue(tmp_path: Path) -> None:
     """Criterion 2: once the infra rerun attempt cap (default 2) is exhausted,
-    there is no code-fix rework path -- the PR must escalate to
-    agent:human-needed instead of looping forever."""
+    there is no code-fix rework path -- the PR must escalate instead of
+    looping forever. Issue #1266: infra_rerun_cap_exceeded is a mechanical
+    reason (a process-attempt-cap limit, not a judgment call), so it lands
+    agent:operator-queue, not agent:human-needed."""
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
@@ -18160,7 +17496,7 @@ def test_janitor_infra_failed_cap_exhausted_escalates_to_human_needed(tmp_path: 
     assert state["issues"]["123"]["escalation_reason"] == "infra_rerun_cap_exceeded"
     assert state["issues"]["123"]["reason_class"] == "mechanical"
     assert state["prs"]["456"]["status"] == "escalated"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     assert any(event["kind"] == "infra_rerun_escalated" for event in state.get("events", []))
 
 
@@ -18346,6 +17682,231 @@ def test_test_adequacy_section_not_in_review_packet_when_disabled(tmp_path: Path
     assert "## Test-adequacy facts (Tier 1, deterministic)" not in packet_text
     # Verify no unresolved placeholder
     assert "$test_adequacy_section" not in packet_text
+
+
+def test_render_static_probe_section_unit() -> None:
+    """Unit test for render_static_probe_section (issues #1260/#1261)."""
+    from charlie_work.diff_coverage_probe import (
+        BranchCoverageFinding,
+        StaticProbeVerdict,
+        UnwiredSymbolFinding,
+    )
+    from charlie_work.workflow import render_static_probe_section
+
+    # Disabled (probe never ran) -> "".
+    assert render_static_probe_section(None) == ""
+
+    # Enabled, zero findings, zero warnings -> explicit visible "no findings"
+    # line, never a bare "" -- an advisory probe that goes silent on a clean
+    # run must not read as "never ran".
+    clean_section = render_static_probe_section(StaticProbeVerdict())
+    assert clean_section == "Static probe: no findings.\n"
+
+    # Enabled, internal error -> visible degradation warning, not silent-empty.
+    degraded = StaticProbeVerdict(
+        warnings=("static probe degraded: branch-coverage heuristic failed: boom",)
+    )
+    degraded_section = render_static_probe_section(degraded)
+    assert "static probe degraded" in degraded_section
+
+    # Enabled, findings present -> both W3 and W20 findings concatenated
+    # into the one section.
+    verdict = StaticProbeVerdict(
+        branch_findings=(BranchCoverageFinding("src/foo.py", 3, 0, "no_test_adds"),),
+        unwired_findings=(UnwiredSymbolFinding("helper", "src/bar.py", "function"),),
+    )
+    section = render_static_probe_section(verdict)
+    assert "Branch-coverage heuristic (W3)" in section
+    assert "src/foo.py" in section
+    assert "Unwired-symbol probe (W20)" in section
+    assert "helper" in section
+    assert "src/bar.py" in section
+
+
+def test_static_probe_section_not_in_review_packet_when_disabled(tmp_path: Path) -> None:
+    """When coverage_probe.enabled=False (default), the computed section is
+    empty and no dynamic probe content leaks into the packet. The STATIC
+    '## Static probe' heading + rubric prose (W20 item 2) are permanent
+    template text and remain present regardless -- mirrors the always-
+    present '## Test adequacy' template heading precedent."""
+    from charlie_work.config import CoverageProbeConfig
+
+    config = OrchestratorConfig(coverage_probe=CoverageProbeConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[456] = (
+        "diff --git a/src/feature.py b/src/feature.py\n"
+        "index 123..456 100644\n"
+        "--- a/src/feature.py\n"
+        "+++ b/src/feature.py\n"
+        "@@ -1,2 +1,4 @@\n"
+        " def feature():\n"
+        "     pass\n"
+        "+def new_feature(x):\n"
+        "+    if x:\n"
+        "+        return 1\n"
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+
+    # Static template heading + rubric prose (W20 item 2) always present.
+    assert "## Static probe" in packet_text
+    assert "Name the production caller." in packet_text
+    assert "Classify test strength." in packet_text
+    assert "existence < type < status < value <" in packet_text
+    # No dynamic probe content and no unresolved placeholder.
+    assert "Branch-coverage heuristic (W3)" not in packet_text
+    assert "Static probe: no findings." not in packet_text
+    assert "$static_probe_section" not in packet_text
+
+
+def test_static_probe_section_in_review_packet_when_enabled_with_findings(
+    tmp_path: Path,
+) -> None:
+    """Integration test: findings from both probe halves land in
+    $static_probe_section, adjacent to (not folded into) ## Test adequacy.
+
+    ``repo_root`` (``tmp_path``) is given a real ``src/`` tree containing a
+    file that does NOT reference the flagged symbol, so
+    ``_collect_repo_referenced_names`` actually walks it and the line-295
+    collision filter runs live (issue #1260/#1261 review finding A5) instead
+    of short-circuiting on a missing ``src/`` directory. The flagged symbol
+    uses a distinctive name (not ``helper``) precisely so it cannot
+    accidentally collide with anything incidental in that tree.
+    """
+    from charlie_work.config import CoverageProbeConfig
+
+    config = OrchestratorConfig(coverage_probe=CoverageProbeConfig(enabled=True))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Real src/ tree under repo_root, unrelated to the diffed symbol below --
+    # exercises the collision filter live rather than short-circuiting it.
+    unrelated_src = tmp_path / "src" / "unrelated_module.py"
+    unrelated_src.parent.mkdir(parents=True, exist_ok=True)
+    unrelated_src.write_text(
+        "def totally_unrelated_function(value):\n    return value * 2\n",
+        encoding="utf-8",
+    )
+
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[456] = (
+        "diff --git a/src/feature.py b/src/feature.py\n"
+        "index 123..456 100644\n"
+        "--- a/src/feature.py\n"
+        "+++ b/src/feature.py\n"
+        "@@ -1,2 +1,5 @@\n"
+        " def feature():\n"
+        "     pass\n"
+        "+def compute_shard_checksum(x):\n"
+        "+    if x:\n"
+        "+        return 1\n"
+        "diff --git a/tests/test_feature.py b/tests/test_feature.py\n"
+        "index 123..456 100644\n"
+        "--- a/tests/test_feature.py\n"
+        "+++ b/tests/test_feature.py\n"
+        "@@ -1,2 +1,4 @@\n"
+        " def test_existing():\n"
+        "     pass\n"
+        "+def test_compute_shard_checksum():\n"
+        "+    assert compute_shard_checksum(True) == 1\n"
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+
+    assert "## Static probe" in packet_text
+    # compute_shard_checksum() is defined in src/feature.py, referenced only
+    # from the test, and absent from the real (live-walked) src/ tree -- the
+    # collision filter runs and correctly does not suppress it.
+    assert "Unwired-symbol probe (W20)" in packet_text
+    assert "compute_shard_checksum" in packet_text
+    assert "$static_probe_section" not in packet_text
+    assert packet_text.index("## Test adequacy") < packet_text.index("## Static probe")
+
+
+def test_static_probe_section_no_findings_renders_visible_clean_line(tmp_path: Path) -> None:
+    """Enabled + zero findings still renders visible text, not "" (mirrors
+    render_test_adequacy_section's own always-visible-when-enabled shape)."""
+    from charlie_work.config import CoverageProbeConfig
+
+    config = OrchestratorConfig(coverage_probe=CoverageProbeConfig(enabled=True))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[456] = (
+        "diff --git a/README.md b/README.md\n"
+        "index 123..456 100644\n"
+        "--- a/README.md\n"
+        "+++ b/README.md\n"
+        "@@ -1 +1,2 @@\n"
+        " Hello\n"
+        "+World\n"
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+    assert "Static probe: no findings." in packet_text
+
+
+def test_static_probe_section_shows_visible_degradation_on_internal_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An internal exception in the probe must render a visible warning
+    line in the packet, never a silently empty section (design item 7)."""
+    from charlie_work.config import CoverageProbeConfig
+
+    def _boom(diff, config):
+        raise ValueError("synthetic failure")
+
+    monkeypatch.setattr("charlie_work.diff_coverage_probe.check_branch_coverage", _boom)
+
+    config = OrchestratorConfig(coverage_probe=CoverageProbeConfig(enabled=True))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+    assert "static probe degraded" in packet_text
+    assert "branch-coverage heuristic failed" in packet_text
+
+
+def test_coverage_probe_never_called_when_disabled(tmp_path: Path, monkeypatch) -> None:
+    """When coverage_probe.enabled=False (default), run_static_probe is
+    never invoked -- mirrors test_review_test_adequacy_disabled_is_noop."""
+    from charlie_work.config import CoverageProbeConfig
+
+    calls = {"n": 0}
+
+    def _fake_run_static_probe(diff, repo_root, config):
+        calls["n"] += 1
+        raise AssertionError("run_static_probe should not be called when disabled")
+
+    monkeypatch.setattr("charlie_work.workflow.run_static_probe", _fake_run_static_probe)
+
+    config = OrchestratorConfig(coverage_probe=CoverageProbeConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    result = app.review(456)
+
+    assert calls["n"] == 0
+    assert result.ok is True
 
 
 def test_review_prompt_uses_fenced_json_verdict(tmp_path: Path) -> None:
@@ -18650,187 +18211,6 @@ def test_cli_repo_nonexistent_path_errors(tmp_path: Path, capsys) -> None:
     assert not ghost.exists()
 
 
-def test_find_repo_root_explicit_raises_on_missing_path(tmp_path: Path) -> None:
-    from charlie_work.paths import RepoNotFoundError, find_repo_root
-
-    missing = tmp_path / "no-such-dir"
-
-    try:
-        find_repo_root(missing, explicit=True)
-    except RepoNotFoundError as exc:
-        assert "does not exist" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("expected RepoNotFoundError")
-
-
-def test_find_repo_root_explicit_raises_when_not_git_repo(tmp_path: Path) -> None:
-    from charlie_work.paths import RepoNotFoundError, find_repo_root
-
-    non_git = tmp_path / "plain-dir"
-    non_git.mkdir()
-
-    try:
-        find_repo_root(non_git, explicit=True)
-    except RepoNotFoundError as exc:
-        assert "git work tree" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("expected RepoNotFoundError")
-
-
-def _init_git_repo(repo_root: Path) -> None:
-    """Create a real non-bare git repo with one commit on ``main``."""
-    repo_root.mkdir(parents=True, exist_ok=True)
-    run = lambda args: subprocess.run(  # noqa: E731
-        args, cwd=repo_root, check=True, capture_output=True, text=True
-    )
-    run(["git", "init", "--initial-branch=main"])
-    run(["git", "config", "user.email", "test@example.test"])
-    run(["git", "config", "user.name", "Test User"])
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    run(["git", "add", "README.md"])
-    run(["git", "commit", "-m", "initial commit"])
-
-
-def test_find_repo_root_resolves_shared_root_from_linked_worktree(tmp_path: Path) -> None:
-    """Issue #648: with no --repo, find_repo_root() invoked from inside a
-    linked git worktree must resolve the *shared* (main) worktree root, not
-    the worktree's own toplevel — otherwise runtime state silently targets a
-    phantom, never-populated ``.var/charlie-work/`` directory."""
-    from charlie_work.paths import find_repo_root, runtime_paths
-
-    repo_root = tmp_path / "repo"
-    _init_git_repo(repo_root)
-    # Seed a real state dir under the main root so we can distinguish it.
-    main_state_dir = repo_root / ".var" / "charlie-work"
-    main_state_dir.mkdir(parents=True)
-    (main_state_dir / "state.json").write_text("{}", encoding="utf-8")
-
-    branch = "agent/issue-648-linked"
-    subprocess.run(
-        ["git", "worktree", "add", "-b", branch, str(tmp_path / "wt"), "HEAD"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    try:
-        resolved = find_repo_root(tmp_path / "wt")
-        # Must resolve to the main worktree root, not the linked worktree.
-        assert resolved == repo_root.resolve()
-        paths = runtime_paths(resolved, ".var/charlie-work")
-        assert paths.state_file.exists()
-        assert paths.state_file == (repo_root / ".var" / "charlie-work" / "state.json").resolve()
-    finally:
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(tmp_path / "wt")],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-
-def test_find_repo_root_explicit_main_worktree_returns_main_root(tmp_path: Path) -> None:
-    """An explicit --repo pointing at the main checkout returns the main root.
-    The shared-root resolution returns None in the main worktree (where
-    --git-dir == --git-common-dir), so --show-toplevel is used and is correct."""
-    from charlie_work.paths import find_repo_root
-
-    repo_root = tmp_path / "repo"
-    _init_git_repo(repo_root)
-    resolved = find_repo_root(repo_root, explicit=True)
-    assert resolved == repo_root.resolve()
-
-
-def test_find_repo_root_explicit_linked_worktree_resolves_main_root(tmp_path: Path) -> None:
-    """Issue #648 review: an explicit --repo pointing at a linked worktree must
-    also resolve to the shared main root, not the linked worktree's own
-    toplevel.  The orchestrator's state is shared — there is no per-worktree
-    state directory — so --repo <linked-worktree> would silently target a
-    phantom state dir without this."""
-    from charlie_work.paths import find_repo_root
-
-    repo_root = tmp_path / "repo"
-    _init_git_repo(repo_root)
-    branch = "agent/issue-648-explicit"
-    linked_wt = tmp_path / "wt-explicit"
-    subprocess.run(
-        ["git", "worktree", "add", "-b", branch, str(linked_wt), "HEAD"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    try:
-        resolved = find_repo_root(linked_wt, explicit=True)
-        assert resolved == repo_root.resolve()
-    finally:
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(linked_wt)],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-
-def test_find_repo_root_from_subdirectory_of_linked_worktree(tmp_path: Path) -> None:
-    """Issue #648 review: find_repo_root from a *subdirectory* of a linked
-    worktree must still resolve to the shared main root."""
-    from charlie_work.paths import find_repo_root
-
-    repo_root = tmp_path / "repo"
-    _init_git_repo(repo_root)
-    linked_wt = tmp_path / "wt-subdir"
-    subprocess.run(
-        ["git", "worktree", "add", "-b", "agent/issue-648-subdir", str(linked_wt), "HEAD"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subdir = linked_wt / "src" / "deep"
-    subdir.mkdir(parents=True)
-    try:
-        resolved = find_repo_root(subdir)
-        assert resolved == repo_root.resolve()
-    finally:
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(linked_wt)],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-
-def test_find_repo_root_separate_git_dir_main_worktree(tmp_path: Path) -> None:
-    """Issue #648 review MAJOR 1: a --separate-git-dir repo's main worktree
-    must resolve to the *working tree* root (where the code lives), not the
-    external git dir's container.  The shared-root resolution detects the main
-    worktree (--git-dir == --git-common-dir) and returns None, so
-    --show-toplevel is used and returns the working tree root."""
-    from charlie_work.paths import find_repo_root
-
-    repo_root = tmp_path / "repo"
-    external_git = tmp_path / "external" / ".git"
-    repo_root.mkdir(parents=True, exist_ok=True)
-    external_git.parent.mkdir(parents=True, exist_ok=True)
-    run = lambda args: subprocess.run(  # noqa: E731
-        args, cwd=repo_root, check=True, capture_output=True, text=True
-    )
-    run(["git", "init", f"--separate-git-dir={external_git}", "--initial-branch=main"])
-    run(["git", "config", "user.email", "test@example.test"])
-    run(["git", "config", "user.name", "Test User"])
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    run(["git", "add", "README.md"])
-    run(["git", "commit", "-m", "initial commit"])
-    # The external dir's parent must NOT be returned as the repo root.
-    resolved = find_repo_root(repo_root)
-    assert resolved == repo_root.resolve()
-    assert resolved != external_git.parent.resolve()
-
-
 def test_runtime_paths_warns_on_phantom_state_dir(tmp_path: Path, caplog: Any) -> None:
     """Issue #648: a state dir that exists with sibling artifacts but no
     state.json is a phantom signal — runtime_paths must warn (non-blocking)
@@ -18915,14 +18295,6 @@ def test_runtime_paths_silent_when_state_json_exists(tmp_path: Path, caplog: Any
 # --- adversarial-review fixes: regressions + coverage gaps ---------------------
 
 
-def _approved_automerge():
-    from charlie_work.config import AutoMergeConfig
-
-    # No required checks -> the check gate is vacuously satisfied, isolating the
-    # approved-decision path for merge tests.
-    return AutoMergeConfig(required_checks=(), require_approved_review=True)
-
-
 def _mergequeue_automerge(label: str = "mergequeue"):
     from charlie_work.config import AutoMergeConfig
 
@@ -18943,7 +18315,7 @@ def test_merge_ready_mergequeue_mode_labels_instead_of_merging(tmp_path: Path) -
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -18957,6 +18329,65 @@ def test_merge_ready_mergequeue_mode_labels_instead_of_merging(tmp_path: Path) -
     assert persisted["status"] != "merged"
 
 
+def test_merge_ready_mergequeue_stamps_and_preserves_dwell_tracking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1401: merge_ready stamps mergequeue_since/mergequeue_head_sha when
+    a PR enters Aviator's queue, preserves them across passes while the head is
+    frozen (so the wedge watchdog can measure true no-progress dwell), and
+    resets them when the head advances (Aviator rebased -> progress, not a wedge)."""
+    # utc_now() strips microseconds, so two merge_ready calls within the same
+    # wall-clock second produce identical timestamps. Mock it with a per-call
+    # counter so the "head advanced -> fresh dwell window" assertion is
+    # deterministic, not a race against the clock.
+    _utc_call = 0
+
+    def _fake_utc_now() -> str:
+        nonlocal _utc_call
+        _utc_call += 1
+        return f"2026-01-01T00:00:{_utc_call:02d}Z"
+
+    monkeypatch.setattr("charlie_work.workflow.utc_now", _fake_utc_now)
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    app.merge_ready(456, merge=True)
+    first = load_state(paths.state_file)["prs"]["456"]
+    assert first["status"] == "mergequeue"
+    assert first["mergequeue_head_sha"] == "sha-abc123"
+    assert first["mergequeue_since"]
+    first_since = first["mergequeue_since"]
+
+    # Second pass, head unchanged: the queue-enter time is preserved so the
+    # watchdog's dwell measurement is not reset by a no-op re-evaluation pass.
+    app.merge_ready(456, merge=True)
+    second = load_state(paths.state_file)["prs"]["456"]
+    assert second["mergequeue_head_sha"] == "sha-abc123"
+    assert second["mergequeue_since"] == first_since
+
+    # Aviator rebases the PR -> head advances. merge_ready returns early
+    # ("head moved, re-review required") without persisting; a fresh
+    # record_review at the new head re-approves it, and the next merge_ready
+    # stamps a fresh dwell window (progress, not a wedge).
+    fake_gh.pr_head_shas[456] = "sha-abc123-rebased"
+    head_moved = app.merge_ready(456, merge=True)
+    assert head_moved.data["head_moved"] is True
+    app.record_review(
+        456,
+        "approved",
+        summary="ok",
+        verdict_provenance="fresh_llm_review",
+        reviewed_head="sha-abc123-rebased",
+    )
+    app.merge_ready(456, merge=True)
+    third = load_state(paths.state_file)["prs"]["456"]
+    assert third["mergequeue_head_sha"] == "sha-abc123-rebased"
+    assert third["mergequeue_since"] != first_since
+
+
 def test_merge_ready_mergequeue_hold_label_on_pr_prevents_re_add(tmp_path: Path) -> None:
     """Issue #496: an approved PR carrying the configured merge-hold label
     must not be swept back into the mergequeue on subsequent passes."""
@@ -18965,7 +18396,7 @@ def test_merge_ready_mergequeue_hold_label_on_pr_prevents_re_add(tmp_path: Path)
     fake_gh = FakeGitHub()
     fake_gh.prs[0]["labels"] = [{"name": config.labels.merge_hold}]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -18989,7 +18420,7 @@ def test_merge_ready_mergequeue_hold_label_on_issue_prevents_re_add(tmp_path: Pa
         {"name": config.labels.merge_hold},
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -19008,7 +18439,7 @@ def test_merge_ready_mergequeue_hold_label_removed_resumes_re_add(tmp_path: Path
     hold_label = config.labels.merge_hold
     fake_gh.prs[0]["labels"] = [{"name": hold_label}]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     held = app.merge_ready(456, merge=True)
     assert held.data["merge_hold"] is True
@@ -19042,7 +18473,7 @@ def test_merge_ready_mergequeue_hold_issue_check_unavailable_fails_closed(tmp_pa
 
     fake_gh = IssueViewFailGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -19080,7 +18511,7 @@ def test_merge_ready_mergequeue_hold_issue_degraded_payload_fails_closed(
 
     fake_gh = IssueViewDegradedGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -19233,36 +18664,6 @@ def test_merge_ready_event_persists_gate_inputs_distinguishing_false_causes(
     assert len(triples) == 3
 
 
-def _second_mergequeue_pr(fake_gh) -> None:
-    """Add a second approved-candidate issue/PR pair (124/789) to a FakeGitHub
-    fixture, reviewed after the default 123/456 pair."""
-    fake_gh.issues.append(
-        {
-            "number": 124,
-            "title": "Fix parsing",
-            "url": "https://example.test/issues/124",
-            "body": "Parsing is broken",
-            "labels": [{"name": "automated-ready"}],
-            "state": "OPEN",
-        }
-    )
-    fake_gh.prs.append(
-        {
-            "number": 789,
-            "title": "Fix #124: parsing",
-            "url": "https://example.test/pull/789",
-            "headRefName": "agent/issue-124-fix-parsing",
-            "baseRefName": "main",
-            "headRefOid": "sha-def789",
-            "mergeStateStatus": "CLEAN",
-            "body": "Closes #124\n\nTests: regression coverage added.",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "OPEN",
-        }
-    )
-
-
 def test_merge_ready_mergequeue_parked_pr_excluded_from_merge_train_head(
     tmp_path: Path,
 ) -> None:
@@ -19278,8 +18679,8 @@ def test_merge_ready_mergequeue_parked_pr_excluded_from_merge_train_head(
     fake_gh = FakeGitHub()
     _second_mergequeue_pr(fake_gh)
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
-    app.record_review(789, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     # First poll: 456 was reviewed first (and sorts first on a tie), so it
     # wins merge-train head and gets parked into the mergequeue.
@@ -19311,7 +18712,7 @@ def test_merge_train_candidates_no_state_read_when_mergequeue_label_unset(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     def _fail_if_called(*_args, **_kwargs):
         raise AssertionError("load_state_locked called with mergequeue_label unset")
@@ -19337,7 +18738,7 @@ def test_merge_ready_mergequeue_parked_pr_skips_charlie_branch_sync(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     # First poll parks the PR.
     first = app.merge_ready(456, merge=True)
@@ -19373,7 +18774,7 @@ def test_merge_ready_mergequeue_label_add_failure_does_not_advance_status(
     fake_gh = FakeGitHub()
     fake_gh.add_pr_label_ok = False
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -19412,7 +18813,7 @@ def test_merge_ready_mergequeue_label_add_failure_alarm_fires_at_threshold(
     fake_gh = FakeGitHub()
     fake_gh.add_pr_label_ok = False
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     first = app.merge_ready(456, merge=True)
     assert first.data["merge_attempt_alarm"] is False
@@ -19446,7 +18847,7 @@ def test_merge_ready_mergequeue_silent_revert_increments_counter_across_passes(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     # Pass 1: fresh handoff, succeeds. Counter starts/stays at 0.
     first = app.merge_ready(456, merge=True)
@@ -19493,7 +18894,7 @@ def test_merge_ready_mergequeue_silent_revert_escalation_reachable(tmp_path: Pat
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     first = app.merge_ready(456, merge=True)
     assert first.data["merge_attempt_alarm"] is False
@@ -19519,7 +18920,7 @@ def test_merge_ready_mergequeue_label_present_next_pass_not_treated_as_reverted(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     first = app.merge_ready(456, merge=True)
     assert first.data["consecutive_failed_merge_attempts"] == 0
@@ -19551,7 +18952,7 @@ def test_merge_ready_mergequeue_revert_detector_ignores_non_mergequeue_prior_sta
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     seed = load_state(paths.state_file)
     seed["prs"]["456"] = {
@@ -19606,7 +19007,7 @@ def test_merge_ready_mergequeue_check_failure_still_routes_to_rework(tmp_path: P
         checks=[{"name": name, "state": "SUCCESS"} for name in required]
     )
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     # Pass 1: checks green, handoff succeeds, status becomes "mergequeue".
     first = app.merge_ready(456, merge=True)
@@ -19642,268 +19043,106 @@ def test_merge_ready_mergequeue_check_failure_still_routes_to_rework(tmp_path: P
     assert check_failure_events[0]["payload"]["failed_checks"] == ["Tests passed"]
 
 
-def test_linked_issue_number_rejects_bare_hash_in_attacker_title() -> None:
-    # A bare #N substring in an attacker-controlled title must NOT bind the PR
-    # to issue N (label/merge hijack). Only a closing keyword counts.
-    assert (
-        linked_issue_number(
-            {"title": "Refactor everything #1 nicely"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        is None
+def test_merge_ready_self_revoked_stale_head_no_false_alarm(tmp_path: Path) -> None:
+    """Issue #1402: when reconcile's own ``detect_mergequeue_not_approved``
+    (#819 gap fix) revokes ``mergequeue`` because the approval is pinned to a
+    stale head, and ``merge_ready``'s carry-forward then re-validates and
+    re-applies the label in the same pass, the cross-pass
+    ``mergequeue_label_reverted`` signal must NOT be folded into
+    ``mergequeue_handoff_failed``. The label was removed by our own code
+    (cooperative self-revocation), not by Aviator's #823 silent rejection --
+    so the counter must stay at 0 and no alarm must fire.
+
+    Simulates the exact PR #1843 sequence: pass 1 hands off to Aviator
+    (status="mergequeue"), Aviator rebases the branch (head moves), reconcile
+    revokes the label (stale-head, records ``mergequeue_revoked_reason``),
+    pass 2 carry-forwards the approval and re-applies the label."""
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
     )
-    assert (
-        linked_issue_number(
-            {"title": "see #5 for context", "body": "no link"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        is None
-    )
-    # Closing-keyword forms still resolve.
-    assert (
-        linked_issue_number(
-            {"title": "Fix #321: thing"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        == 321
-    )
-    assert (
-        linked_issue_number(
-            {"body": "Resolves #7"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        == 7
-    )
-    # Orchestrator's own branch convention is the trusted head-ref signal.
-    assert (
-        linked_issue_number(
-            {"headRefName": "agent/issue-456-x", "title": "#999"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        == 456
-    )
+    new_head = "sha-rebased-1843"
+    pr_number = 456
+
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[pr_number] = diff_text
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(pr_number, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    # Pass 1: fresh handoff, succeeds. Status becomes "mergequeue".
+    first = app.merge_ready(pr_number, merge=True)
+    assert first.data["mergequeue_label_applied"] is True
+    assert first.data["consecutive_failed_merge_attempts"] == 0
+    assert load_state(paths.state_file)["prs"][str(pr_number)]["status"] == "mergequeue"
+
+    # Simulate reconcile's cooperative self-revocation: Aviator rebased the
+    # branch (head moves), the approval is now at a stale head, reconcile
+    # revokes the label and records the reason in state.
+    state = load_state(paths.state_file)
+    state["prs"][str(pr_number)]["mergequeue_revoked_reason"] = "stale_head_pending_carry_forward"
+    save_state(paths.state_file, state)
+    fake_gh.prs[0]["headRefOid"] = new_head
+    fake_gh.diffs[pr_number] = diff_text  # same diff -> patch-id matches -> carry-forward
+
+    # Pass 2: carry-forward re-validates the approval at the new head and
+    # re-applies the mergequeue label. The label was absent (reconcile removed
+    # it) and prior status was "mergequeue", so mergequeue_label_reverted is
+    # True -- but mergequeue_self_revoked_stale_head is also True, so
+    # mergequeue_handoff_failed must be False. No counter increment, no alarm.
+    second = app.merge_ready(pr_number, merge=True)
+    assert second.data["mergequeue_label_applied"] is True
+    assert second.data["consecutive_failed_merge_attempts"] == 0
+    assert second.data["merge_attempt_alarm"] is False
+
+    # The self-revocation reason must be cleared so a subsequent Aviator #823
+    # rejection is not misread as a stale self-revocation.
+    state = load_state(paths.state_file)
+    assert state["prs"][str(pr_number)].get("mergequeue_revoked_reason") is None
 
 
-def test_linked_issue_number_fork_pr_branch_name_does_not_bind() -> None:
-    # Issue #9: Fork PRs must not bind via branch name (attacker-controlled).
-    # A fork PR with branch name "issue-42" should NOT bind to issue 42.
-    assert (
-        linked_issue_number(
-            {"headRefName": "issue-42-fix"},
-            is_cross_repository=True,
-            branch_prefix="agent/issue",
-        )
-        is None
-    )
-    # Even with the orchestrator's prefix, fork PRs must not bind via branch.
-    assert (
-        linked_issue_number(
-            {"headRefName": "agent/issue-42-fix"},
-            is_cross_repository=True,
-            branch_prefix="agent/issue",
-        )
-        is None
-    )
+def test_merge_ready_aviator_revert_without_self_revocation_reason_still_counts(
+    tmp_path: Path,
+) -> None:
+    """Issue #1402 regression guard: a genuine Aviator #823 silent rejection
+    (no ``mergequeue_revoked_reason`` recorded -- the label was stripped by
+    Aviator, not by reconcile) must still increment the counter and eventually
+    fire the alarm. This is the exact same scenario as the pre-#1402
+    ``test_merge_ready_mergequeue_silent_revert_increments_counter_across_passes``
+    test, but explicitly seeds an ABSENT ``mergequeue_revoked_reason`` to prove
+    the self-revocation exclusion does not swallow the #823 path."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
+    # Pass 1: fresh handoff, succeeds.
+    first = app.merge_ready(456, merge=True)
+    assert first.data["consecutive_failed_merge_attempts"] == 0
 
-def test_linked_issue_number_same_repo_branch_with_prefix_binds() -> None:
-    # Issue #9: Same-repo PRs with correct branch prefix should still bind.
+    # Explicitly ensure no self-revocation reason is set (Aviator stripped the
+    # label, not reconcile). The key may be present as None from pass 1's
+    # label re-add write, but it must NOT be "stale_head_pending_carry_forward".
+    state = load_state(paths.state_file)
     assert (
-        linked_issue_number(
-            {"headRefName": "agent/issue-42-fix"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        == 42
-    )
-    # Same-repo PR with wrong prefix should not bind via branch.
-    assert (
-        linked_issue_number(
-            {"headRefName": "issue-42-fix"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        is None
+        state["prs"]["456"].get("mergequeue_revoked_reason") != "stale_head_pending_carry_forward"
     )
 
-
-def test_linked_issue_number_fork_pr_closing_keyword_does_not_bind() -> None:
-    # Issue #9: Fork PRs must NOT bind via closing keywords for lifecycle purposes.
-    # (GitHub's own auto-close on merge is GitHub's policy for issue state;
-    # the orchestrator's label lifecycle is ours.)
-    assert (
-        linked_issue_number(
-            {"body": "Closes #42"},
-            is_cross_repository=True,
-            branch_prefix="agent/issue",
-        )
-        is None
-    )
-    assert (
-        linked_issue_number(
-            {"title": "Fix #42: security issue"},
-            is_cross_repository=True,
-            branch_prefix="agent/issue",
-        )
-        is None
-    )
-
-
-def test_linked_issue_number_same_repo_closing_keyword_binds() -> None:
-    # Same-repo PRs should still bind via closing keywords.
-    assert (
-        linked_issue_number(
-            {"body": "Closes #42"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        == 42
-    )
-    assert (
-        linked_issue_number(
-            {"title": "Fix #42: security issue"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        == 42
-    )
-
-
-def test_linked_issue_number_none_treats_as_cross_repository() -> None:
-    # When is_cross_repository is None (provenance unknown), treat as cross-repo
-    # for trust purposes — bind nothing via branch name or closing keyword
-    # (fail closed). This hardens against future call sites that omit the
-    # parameter or pass a PR dict missing the isCrossRepository field.
-    assert (
-        linked_issue_number(
-            {"headRefName": "agent/issue-42-fix"},
-            is_cross_repository=None,
-            branch_prefix="agent/issue",
-        )
-        is None
-    )
-    assert (
-        linked_issue_number(
-            {"body": "Closes #42"},
-            is_cross_repository=None,
-            branch_prefix="agent/issue",
-        )
-        is None
-    )
-
-
-def test_linked_issue_number_negation_guard_rejects_negated_keyword() -> None:
-    # Issue #781 AC1: a closing keyword preceded by a negation must not
-    # bind -- "does not fix #649" is the real-world PR #766 -> issue #649
-    # text that produced a false LABEL TRANSITION (not a GitHub auto-close;
-    # this guard only affects charlie-work's own binding). The non-negated
-    # form of the identical keyword still binds.
-    assert (
-        linked_issue_number(
-            {"body": "does not fix #649"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        is None
-    )
-    assert (
-        linked_issue_number(
-            {"body": "Fixes #649"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        == 649
-    )
-
-
-def test_linked_issue_number_negation_guard_table() -> None:
-    # Issue #781 AC2: table-driven negation coverage (doesn't / never /
-    # without / cannot / does not), plus non-negated controls proving the
-    # guard doesn't over-trigger on unrelated text.
-    negated_cases = [
-        "doesn't close #1",
-        "never resolves #2",
-        # "without fixing #3" returns None via the BASE regex, not the
-        # negation guard: _CLOSING_KEYWORD_REF only matches fix/fixes/fixed
-        # (fix(?:e[sd])?) -- never the gerund "fixing". Included per the
-        # issue's explicit list, but see the dedicated assertion below for
-        # proof this is NOT evidence the negation guard itself fired.
-        "without fixing #3",
-        "cannot close #4",
-        "does not fix #5",
-    ]
-    for body in negated_cases:
-        assert (
-            linked_issue_number(
-                {"body": body},
-                is_cross_repository=False,
-                branch_prefix="agent/issue",
-            )
-            is None
-        ), f"expected no binding for negated text: {body!r}"
-
-    # Non-negated controls: the same keywords, without a preceding negation,
-    # still bind -- proves the guard isn't simply matching nothing.
-    non_negated_cases = [
-        ("Closes #1", 1),
-        ("This resolves #2", 2),
-        ("Fixes #5", 5),
-    ]
-    for body, expected in non_negated_cases:
-        assert (
-            linked_issue_number(
-                {"body": body},
-                is_cross_repository=False,
-                branch_prefix="agent/issue",
-            )
-            == expected
-        ), f"expected binding to {expected} for non-negated text: {body!r}"
-
-    # "fixing #3" alone (no negation at all) confirms the gerund truly never
-    # matches the base regex -- so the None result above for "without
-    # fixing #3" is not evidence the negation guard fired.
-    assert (
-        linked_issue_number(
-            {"body": "fixing #3"},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        is None
-    )
-
-
-def test_linked_issue_number_negation_does_not_shadow_later_genuine_match() -> None:
-    # A negated match earlier in a text field must not prevent a later,
-    # genuine closing keyword from binding -- finditer-continuation, not
-    # search()-first-match-only. Monotone with respect to pre-#781 behavior:
-    # no input that previously returned a number now returns None because of
-    # this change; the negation guard can only turn a previously-binding
-    # negated match into None, never suppress a separate genuine one.
-    #
-    # The negation lookback window (32 chars, chosen to cover "does not "
-    # plus headroom) is deliberately wide enough to span a short clause, so
-    # a genuine match must sit outside that window to prove continuation
-    # rather than an accidental non-negation coincidence. Verified
-    # empirically: without the padding, "does not fix #649. Fixes #700"
-    # actually returns None (the 32-char window reaches back across the
-    # sentence boundary to "not") -- that cross-sentence over-triggering is
-    # the deliberate, sanctioned safe-direction tradeoff described on
-    # `_NEGATION_LOOKBEHIND_CHARS`, not a bug. This test instead places the
-    # genuine match far enough away to isolate the continuation behavior.
-    padded_body = "does not fix #649. " + ("x" * 50) + " Fixes #700"
-    assert (
-        linked_issue_number(
-            {"body": padded_body},
-            is_cross_repository=False,
-            branch_prefix="agent/issue",
-        )
-        == 700
-    )
+    # Pass 2: label absent (FakeGitHub.add_pr_label doesn't mutate labels),
+    # no self-revocation reason -> genuine #823 path -> counter increments.
+    second = app.merge_ready(456, merge=True)
+    assert second.data["mergequeue_label_applied"] is True
+    assert second.data["consecutive_failed_merge_attempts"] == 1
+    assert second.data["merge_attempt_alarm"] is False
 
 
 def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
@@ -19920,11 +19159,11 @@ def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
 
     # First request_changes (count = 1, head = "sha-1")
     fake_gh.pr_head_shas[456] = "sha-1"
-    app.record_review(456, "request_changes", summary="a")
+    app.record_review(456, "request_changes", summary="a", verdict_provenance="fresh_llm_review")
 
     # Second request_changes (count = 2, head = "sha-2")
     fake_gh.pr_head_shas[456] = "sha-2"
-    app.record_review(456, "request_changes", summary="b")
+    app.record_review(456, "request_changes", summary="b", verdict_provenance="fresh_llm_review")
 
     # Flood the event log so any record_review events for 456 are evicted.
     state = load_state(paths.state_file)
@@ -19937,11 +19176,14 @@ def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
 
     # Third request_changes (count stays at 2, escalated, head = "sha-3")
     fake_gh.pr_head_shas[456] = "sha-3"
-    third = app.record_review(456, "request_changes", summary="c")
+    third = app.record_review(
+        456, "request_changes", summary="c", verdict_provenance="fresh_llm_review"
+    )
 
     assert third.data["escalated"] is True
     assert third.data["rework_path"] is None
-    assert (123, "agent:human-needed") in fake_gh.labels_added
+    # Issue #1266: max_rework_cycles_exceeded is a mechanical escalation.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 def test_record_review_approved_transitions_labels(tmp_path: Path) -> None:
@@ -19950,7 +19192,7 @@ def test_record_review_approved_transitions_labels(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # review_approved clears reviewing/needs-rework so the issue isn't stuck.
     assert (123, "agent:reviewing") in fake_gh.labels_removed
@@ -19972,7 +19214,9 @@ def test_record_review_transition_failure_recorded(tmp_path: Path) -> None:
     fake_gh = LabelFailGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "approved", summary="lgtm")
+    result = app.record_review(
+        456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is True
     label_error = result.data["label_error"]
@@ -19997,7 +19241,9 @@ def test_record_review_request_changes_transition_failure_recorded(tmp_path: Pat
     fake_gh = LabelFailGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "request_changes", summary="fix it")
+    result = app.record_review(
+        456, "request_changes", summary="fix it", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is True
     label_error = result.data["label_error"]
@@ -20005,6 +19251,30 @@ def test_record_review_request_changes_transition_failure_recorded(tmp_path: Pat
     assert label_error["edge"] == "rework_requested"
     assert label_error["outcome"] == TransitionOutcome.PARTIAL_FAILURE.value
     assert len(label_error["add_failures"]) > 0
+
+
+def test_record_review_blocked_transitions_to_human_needed(tmp_path: Path) -> None:
+    """Issue #1266 behavior preservation: "blocked" is judgment-only by
+    construction (a reviewer-flagged security/product concern is never
+    mechanical), so record_review's "blocked" decision must keep routing to
+    agent:human-needed unchanged -- it has no operator-queue counterpart in
+    _MECHANICAL_ESCALATION_EDGES. Representative judgment site #2 (site #1 is
+    test_cross_family_regen_reachability.py's
+    test_the_escalating_pass_does_not_strip_the_human_needed_label)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456, "blocked", summary="security concern", verdict_provenance="fresh_llm_review"
+    )
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["reason_class"] == "judgment"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_added
 
 
 def test_record_review_blocked_transition_failure_recorded(tmp_path: Path) -> None:
@@ -20022,7 +19292,9 @@ def test_record_review_blocked_transition_failure_recorded(tmp_path: Path) -> No
     fake_gh = LabelFailGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "blocked", summary="security issue")
+    result = app.record_review(
+        456, "blocked", summary="security issue", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is True
     label_error = result.data["label_error"]
@@ -20048,7 +19320,7 @@ def test_merge_ready_head_moved_transition_failure_recorded(tmp_path: Path) -> N
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # First approve the PR to set reviewed_head_sha
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Then simulate head moved by updating the PR head SHA
     fake_gh.pr_head_shas[456] = "sha-different"
@@ -20734,7 +20006,9 @@ def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> No
         assert state["issues"]["123"]["status"] == "rework_requested"
         assert len(state["issues"]["123"].get("redispatch_at", [])) == i + 1
 
-    # Third failure exceeds the cap and escalates to human-needed.
+    # Third failure exceeds the cap and escalates. Issue #1266:
+    # redispatch_cap_exceeded is mechanical, so this lands
+    # agent:operator-queue, not agent:human-needed.
     result = app.dispatch_rework()
     assert result.ok is False
     assert result.data["failed_count"] == 1
@@ -20742,7 +20016,7 @@ def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> No
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"
     assert len(state["issues"]["123"]["redispatch_at"]) == 3
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     assert (123, config.labels.needs_rework) in fake_gh.labels_removed
 
 
@@ -21146,7 +20420,7 @@ def test_merge_ready_sets_status_merged(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -21165,7 +20439,7 @@ def test_merge_ready_emits_merge_succeeded_on_fleet_merge(tmp_path: Path) -> Non
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -21226,7 +20500,7 @@ def test_merge_ready_mergequeue_handoff_does_not_emit_merge_succeeded(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -21245,7 +20519,7 @@ def test_merge_ready_dry_run_does_not_merge_or_persist(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -21277,7 +20551,7 @@ def test_merge_ready_dry_run_mergequeue_does_not_label_or_persist(tmp_path: Path
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -21305,7 +20579,7 @@ def test_merge_ready_dry_run_preserves_existing_state(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     # Plant a pre-existing PR state entry with a non-zero counter.
     with state_lock(paths.state_file):
@@ -21434,7 +20708,7 @@ def test_merge_ready_evaluation_only_preserves_recorded_merged_fact(tmp_path: Pa
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     merge_result = app.merge_ready(456, merge=True)
     assert merge_result.data["merged"] is True
@@ -21471,7 +20745,7 @@ def test_merge_ready_failed_attempt_alarm_fires_once_at_threshold(tmp_path: Path
     fake_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # First two failed attempts do not alarm.
     result1 = app.merge_ready(456, merge=False)
@@ -21511,6 +20785,7 @@ def test_merge_ready_failed_attempt_alarm_fires_once_at_threshold(tmp_path: Path
         "failed",
         "missing",
         "infra_failed",
+        "infra_blocked",
         "unavailable",
     }
 
@@ -21557,7 +20832,7 @@ def test_merge_ready_failed_attempt_alarm_reports_merge_state_not_unknown(
     }
     fake_gh.update_branch_ok = False
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=False)
     assert result.data["can_merge"] is False
@@ -21605,7 +20880,7 @@ def test_merge_ready_failed_attempt_alarm_falls_back_when_merge_state_unknown(
     }
     fake_gh.update_branch_ok = False
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=False)
     assert result.data["can_merge"] is False
@@ -21651,7 +20926,7 @@ def test_merge_ready_failed_attempt_alarm_reports_unavailable_not_passed(
 
     fake_gh = FakeGitHubWithChecksUnavailable()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=False)
     assert result.data["checks_unavailable"] is True
@@ -21686,7 +20961,7 @@ def test_merge_ready_failed_attempt_alarm_resets_on_merge(tmp_path: Path) -> Non
     missing_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, missing_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     for _ in range(3):
         app.merge_ready(456, merge=False)
 
@@ -21726,7 +21001,7 @@ def test_merge_ready_failed_attempt_alarm_resets_on_head_move(tmp_path: Path) ->
     fake_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     app.merge_ready(456, merge=False)
     app.merge_ready(456, merge=False)
 
@@ -21770,7 +21045,7 @@ def test_merge_ready_readiness_gate_escalates_no_ci_stall(tmp_path: Path) -> Non
     fake_gh.prs[0]["mergeable"] = "MERGEABLE"
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=False)
 
@@ -21820,7 +21095,7 @@ def test_merge_ready_readiness_gate_escalates_dirty_pr(tmp_path: Path) -> None:
     ]
     fake_gh._record_pr_heads(fake_gh.prs)
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=False)
 
@@ -21852,7 +21127,7 @@ def test_merge_ready_failed_attempt_alarm_resets_on_decision_change(tmp_path: Pa
     fake_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     app.merge_ready(456, merge=False)
     app.merge_ready(456, merge=False)
 
@@ -21860,7 +21135,9 @@ def test_merge_ready_failed_attempt_alarm_resets_on_decision_change(tmp_path: Pa
     assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 2
 
     # Operator changes decision to request_changes.
-    app.record_review(456, "request_changes", summary="needs work")
+    app.record_review(
+        456, "request_changes", summary="needs work", verdict_provenance="fresh_llm_review"
+    )
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 0
     assert state["issues"]["123"]["merge_alert"] == "OK"
@@ -21887,7 +21164,7 @@ def test_merge_ready_failed_attempt_alarm_skips_pending_only_checks(tmp_path: Pa
     fake_gh = FakeGitHubWithChecks(checks=pending_checks)
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     for _ in range(3):
         result = app.merge_ready(456, merge=False)
@@ -21928,7 +21205,7 @@ def test_merge_ready_failed_attempt_alarm_preserves_count_across_pending_only_pa
     fake_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     app.merge_ready(456, merge=False)
     app.merge_ready(456, merge=False)
 
@@ -21987,7 +21264,7 @@ def test_merge_ready_failed_attempt_alarm_pending_passes_do_not_delay_threshold(
     ]
     fail_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fail_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     expected_sequence = [1, 1, 2, 2, 3]
     is_pending_step = [False, True, False, True, False]
@@ -22032,7 +21309,7 @@ def test_merge_ready_failed_attempt_alarm_clamps_at_threshold_plus_one(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     results = [app.merge_ready(456, merge=False) for _ in range(6)]
 
@@ -22074,7 +21351,7 @@ def test_merge_ready_failed_attempt_alarm_resets_when_can_merge_without_merging(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fail_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fail_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     app.merge_ready(456, merge=False)
     app.merge_ready(456, merge=False)
 
@@ -22127,7 +21404,7 @@ def test_merge_ready_stale_base_alarm_fires_after_threshold(
     # Simulate a base-sync that reports success but does not advance the head.
     monkeypatch.setattr(fake_gh, "pr_update_branch", lambda pr_number: True)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     for attempt in range(1, 4):
         result = app.merge_ready(456, merge=False)
@@ -22189,7 +21466,7 @@ def test_merge_ready_merge_alert_refires_after_can_merge_recovery(tmp_path: Path
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     failing_gh = FakeGitHubWithChecks(checks=failing_checks)
     app = OrchestratorApp(tmp_path, paths, config, failing_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # First degradation to threshold.
     for _ in range(3):
@@ -22719,6 +21996,156 @@ def test_bootstrap_labels_fails_when_label_list_raises(tmp_path: Path) -> None:
 
     assert result.ok is False
     assert "verification failed" in result.message
+
+
+# ---------------------------------------------------------------------------
+# Issue #1339: automatic startup label ensure (OrchestratorApp.ensure_labels)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_labels_creates_every_configured_label(tmp_path: Path) -> None:
+    """ensure_labels is the automatic startup counterpart of bootstrap_labels.
+
+    It must create every LabelConfig-derived label and record an ``ok`` event
+    so convergence is observable in events.db without an operator running
+    ``charlie bootstrap-labels``.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.ensure_labels()
+
+    created = {name for name, _color, _desc in fake_gh.labels_created}
+    assert created == set(config.labels.all)
+    assert result.ok is True
+    assert result.data["missing"] == []
+    ok_events = query_events(paths.state_file, kind="label_ensure_ok")
+    assert len(ok_events) == 1, ok_events
+    assert ok_events[0]["level"] == "info"
+
+
+def test_ensure_labels_extra_labelconfig_field_is_ensured(tmp_path: Path) -> None:
+    """AC #3: a LabelConfig with an extra field results in that label being ensured.
+
+    The ensure set must derive from LabelConfig fields, so a new field ships its
+    label with no extra wiring. Verified by subclassing LabelConfig with an
+    extra field included in ``all``.
+    """
+
+    @dataclasses.dataclass(frozen=True)
+    class _ExtraLabelConfig(LabelConfig):
+        extra_label: str = "agent:extra-test-field"
+
+        @property
+        def all(self) -> list[str]:
+            return [*LabelConfig.all.fget(self), self.extra_label]  # type: ignore[misc]
+
+    config = OrchestratorConfig(labels=_ExtraLabelConfig())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.ensure_labels()
+
+    created = {name for name, _color, _desc in fake_gh.labels_created}
+    assert "agent:extra-test-field" in created
+    assert created == set(config.labels.all)
+    assert result.ok is True
+
+
+def test_ensure_labels_removal_of_field_does_not_delete(tmp_path: Path) -> None:
+    """AC #3: removing a field from LabelConfig must not delete the label.
+
+    ensure_labels only creates/updates; it never deletes. A label that exists
+    on the repo but is no longer in ``LabelConfig.all`` must survive the ensure.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Pre-create a label that is NOT in the default LabelConfig.all, simulating
+    # a label left behind after a field was removed from LabelConfig.
+    orphan = "agent:removed-from-config"
+    fake_gh.labels_created.append((orphan, "5319E7", "orphaned label"))
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.ensure_labels()
+
+    assert result.ok is True
+    live = {str(item.get("name") or "") for item in fake_gh.label_list()}
+    # The orphan label survives — ensure never deletes.
+    assert orphan in live
+
+
+def test_ensure_labels_records_incomplete_event_on_missing(tmp_path: Path) -> None:
+    """AC #2: ensure failures surface as events, not exceptions.
+
+    When label_create silently fails (e.g. no auth), the ensure must record a
+    ``label_ensure_incomplete`` warning event and return ok=False rather than
+    raise.
+    """
+
+    class _FailingCreateGitHub(FakeGitHub):
+        def label_create(self, label: str, color: str, description: str) -> None:
+            pass  # silently drop all creates
+
+        def label_list(self) -> list[dict[str, object]]:
+            return []  # nothing was created
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, _FailingCreateGitHub())
+
+    result = app.ensure_labels()
+
+    assert result.ok is False
+    assert result.data["missing"] == config.labels.all
+    incomplete = query_events(paths.state_file, kind="label_ensure_incomplete")
+    assert len(incomplete) == 1, incomplete
+    assert incomplete[0]["level"] == "warning"
+
+
+def test_ensure_labels_records_failed_event_on_list_error(tmp_path: Path) -> None:
+    """AC #2: a verification (label_list) error surfaces as an error event."""
+    from charlie_work.github import GitHubError
+
+    class _ErrorListGitHub(FakeGitHub):
+        def label_list(self) -> list[dict[str, object]]:
+            raise GitHubError("could not list labels: HTTP 401")
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, _ErrorListGitHub())
+
+    result = app.ensure_labels()
+
+    assert result.ok is False
+    assert "verification failed" in result.message
+    failed = query_events(paths.state_file, kind="label_ensure_failed")
+    assert len(failed) == 1, failed
+    assert failed[0]["level"] == "error"
+
+
+def test_ensure_labels_never_raises_on_unexpected_exception(tmp_path: Path) -> None:
+    """AC #2: an unexpected exception from the gh impl is recorded, not raised."""
+
+    class _RaisingCreateGitHub(FakeGitHub):
+        def label_create(self, label: str, color: str, description: str) -> None:
+            raise RuntimeError("boom")
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, _RaisingCreateGitHub())
+
+    # Must not raise.
+    result = app.ensure_labels()
+
+    assert result.ok is False
+    failed = query_events(paths.state_file, kind="label_ensure_failed")
+    assert len(failed) == 1, failed
+    assert failed[0]["level"] == "error"
+    assert "RuntimeError" in failed[0]["payload"]["error"]
 
 
 def test_status_aggregates_counts(tmp_path: Path) -> None:
@@ -23269,73 +22696,6 @@ def test_dry_run_dispatch_preserves_existing_worker_prompt(tmp_path: Path) -> No
     assert forensic_prompt.read_text(encoding="utf-8") == original_content
 
 
-def test_touch_repo_dry_run_does_not_write_fleet_registry(tmp_path: Path) -> None:
-    """Issue #618-B: ``touch_repo`` with ``dry_run=True`` must not create or
-    update the fleet registry. Running a ``--dry-run`` command from a worktree
-    would otherwise repoint the fleet's registry entry at the worktree path.
-    """
-    from charlie_work.fleet_registry import touch_repo
-    from charlie_work.github import GitHub
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir(parents=True, exist_ok=True)
-    paths = runtime_paths(repo_root, ".var/charlie-work")
-
-    class FakeGitHub(GitHub):
-        def name_with_owner(self) -> str:
-            return "owner/repo"
-
-    gh = FakeGitHub(repo_root=repo_root)
-    fleet_dir = tmp_path / "fleet"
-
-    registry = touch_repo(str(fleet_dir), repo_root, paths, gh, dry_run=True)
-
-    # The registry should be empty (no write occurred)
-    assert registry == {"version": 1, "repos": {}}
-    # The fleet.json file must NOT exist
-    assert not (fleet_dir / "fleet.json").exists()
-
-
-def test_touch_repo_dry_run_preserves_existing_registry(tmp_path: Path) -> None:
-    """Issue #618-B: ``touch_repo`` with ``dry_run=True`` must not bump
-    ``last_seen`` or repoint ``repo_root`` for an already-registered repo.
-    """
-    from charlie_work.fleet_registry import touch_repo
-    from charlie_work.github import GitHub
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir(parents=True, exist_ok=True)
-    paths = runtime_paths(repo_root, ".var/charlie-work")
-
-    class FakeGitHub(GitHub):
-        def name_with_owner(self) -> str:
-            return "owner/repo"
-
-    gh = FakeGitHub(repo_root=repo_root)
-    fleet_dir = tmp_path / "fleet"
-
-    # First call (real) registers the repo
-    touch_repo(str(fleet_dir), repo_root, paths, gh)
-    fleet_json = fleet_dir / "fleet.json"
-    assert fleet_json.exists()
-    original = json.loads(fleet_json.read_text(encoding="utf-8"))
-    original_last_seen = original["repos"]["owner/repo"]["last_seen"]
-
-    # Second call from a DIFFERENT path (e.g. a worktree) with dry_run=True
-    worktree_root = tmp_path / "worktree"
-    worktree_root.mkdir(parents=True, exist_ok=True)
-    worktree_paths = runtime_paths(worktree_root, ".var/charlie-work")
-    gh_wt = FakeGitHub(repo_root=worktree_root)
-
-    touch_repo(str(fleet_dir), worktree_root, worktree_paths, gh_wt, dry_run=True)
-
-    # The registry must be unchanged — repo_root not repointed, last_seen not bumped
-    after = json.loads(fleet_json.read_text(encoding="utf-8"))
-    assert after == original
-    assert after["repos"]["owner/repo"]["repo_root"] == str(repo_root)
-    assert after["repos"]["owner/repo"]["last_seen"] == original_last_seen
-
-
 def test_dry_run_intake_does_not_write_files_or_state(tmp_path: Path) -> None:
     """Issue #618-C: ``intake()`` in dry-run must not create issue dirs, write
     issue.json/worker-prompt.md, add labels, or merge state.
@@ -23620,7 +22980,9 @@ def test_record_review_captures_reviewed_head_sha(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "approved", summary="lgtm")
+    result = app.record_review(
+        456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+    )
 
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -23663,7 +23025,9 @@ def test_record_review_requires_explicit_head_when_packet_and_live_differ(
 
     # Without an explicit choice, the verdict must fail loudly and must not
     # overwrite the pending decision file written by review().
-    result = app.record_review(456, "approved", summary="lgtm")
+    result = app.record_review(
+        456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+    )
     assert result.ok is False
     assert "sha-abc123" in result.message
     assert "sha-new789" in result.message
@@ -23676,7 +23040,12 @@ def test_record_review_requires_explicit_head_when_packet_and_live_differ(
     # Automated callers (review() exits, dispatch_reviews) use the default False
     # and are refused by record_review()'s compare-and-swap guard.
     result = app.record_review(
-        456, "approved", summary="lgtm", reviewed_head="sha-abc123", allow_stale_head=True
+        456,
+        "approved",
+        summary="lgtm",
+        reviewed_head="sha-abc123",
+        allow_stale_head=True,
+        verdict_provenance="operator_manual",
     )
     assert result.ok is True
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -23692,7 +23061,13 @@ def test_record_review_requires_explicit_head_when_packet_and_live_differ(
     state["prs"].pop("456", None)
     save_state(paths.state_file, state)
 
-    result = app.record_review(456, "approved", summary="lgtm", reviewed_head="sha-new789")
+    result = app.record_review(
+        456,
+        "approved",
+        summary="lgtm",
+        reviewed_head="sha-new789",
+        verdict_provenance="fresh_llm_review",
+    )
     assert result.ok is True
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["reviewed_head_sha"] == "sha-new789"
@@ -23725,7 +23100,9 @@ def test_record_review_blocked_persists_reviewed_patch_id(tmp_path: Path) -> Non
     assert review_result.ok is True
     packet_patch_id = _calculate_patch_id(fake_gh.diffs[456])
 
-    result = app.record_review(456, "blocked", summary="security concern")
+    result = app.record_review(
+        456, "blocked", summary="security concern", verdict_provenance="fresh_llm_review"
+    )
 
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -23745,7 +23122,9 @@ def test_record_review_request_changes_rejects_empty_summary(tmp_path: Path) -> 
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "request_changes", summary="")
+    result = app.record_review(
+        456, "request_changes", summary="", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is False
     assert "--summary or --summary-file is required" in result.message
@@ -23764,7 +23143,7 @@ def test_record_review_blocked_rejects_empty_summary(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "blocked", summary="")
+    result = app.record_review(456, "blocked", summary="", verdict_provenance="fresh_llm_review")
 
     assert result.ok is False
     assert "--summary or --summary-file is required" in result.message
@@ -23780,7 +23159,9 @@ def test_record_review_request_changes_rejects_whitespace_only_summary(tmp_path:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "request_changes", summary="   \n\t  ")
+    result = app.record_review(
+        456, "request_changes", summary="   \n\t  ", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is False
     assert "--summary or --summary-file is required" in result.message
@@ -23793,7 +23174,7 @@ def test_record_review_approved_allows_empty_summary(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "approved", summary="")
+    result = app.record_review(456, "approved", summary="", verdict_provenance="fresh_llm_review")
 
     assert result.ok is True
     assert result.message == "review recorded (head from live)"
@@ -23817,7 +23198,7 @@ def test_record_review_decision_payload_includes_required_changes(tmp_path: Path
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -23826,7 +23207,9 @@ def test_record_review_decision_payload_includes_required_changes(tmp_path: Path
     # approved is never subject to derivation: no marker at all (issue #792 AC-4).
     assert "findings_channel" not in decision
 
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert "required_changes" in decision
@@ -23854,7 +23237,13 @@ def test_record_review_derives_required_changes_from_summary(tmp_path: Path) -> 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     prose = "The null check in parse() is missing, causing a crash on empty input."
-    result = app.record_review(456, "request_changes", summary=prose, required_changes=None)
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary=prose,
+        required_changes=None,
+        verdict_provenance="fresh_llm_review",
+    )
 
     assert result.ok is True
     decision = json.loads(
@@ -23887,7 +23276,11 @@ def test_record_review_persists_vacuous_marker_when_nothing_derivable(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     result = app.record_review(
-        456, "request_changes", summary=LEGACY_VACUOUS_SUMMARY, required_changes=None
+        456,
+        "request_changes",
+        summary=LEGACY_VACUOUS_SUMMARY,
+        required_changes=None,
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -23921,6 +23314,7 @@ def test_record_review_positive_control_legacy_vacuous_summary(tmp_path: Path) -
         "request_changes",
         summary=LEGACY_VACUOUS_SUMMARY,
         required_changes=None,
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -23942,7 +23336,10 @@ def test_record_review_blocked_also_derives_required_changes(tmp_path: Path) -> 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     result = app.record_review(
-        456, "blocked", summary="Security review flagged an unauthenticated endpoint."
+        456,
+        "blocked",
+        summary="Security review flagged an unauthenticated endpoint.",
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -23975,6 +23372,7 @@ def test_record_review_folds_external_findings_into_required_changes(
         "request_changes",
         summary="The retry wrapper swallows the exception type (Fixes #649).",
         required_changes=["add a regression test"],
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -24010,7 +23408,11 @@ def test_record_review_external_findings_override_vacuous_summary(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     result = app.record_review(
-        456, "request_changes", summary=LEGACY_VACUOUS_SUMMARY, required_changes=None
+        456,
+        "request_changes",
+        summary=LEGACY_VACUOUS_SUMMARY,
+        required_changes=None,
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -24055,6 +23457,7 @@ def test_record_review_external_findings_scoped_to_previous_round(tmp_path: Path
         "request_changes",
         summary="internal summary round 1",
         required_changes=["fix the internal thing"],
+        verdict_provenance="fresh_llm_review",
     )
     assert result1.ok is True
     decision1 = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
@@ -24086,6 +23489,7 @@ def test_record_review_external_findings_scoped_to_previous_round(tmp_path: Path
         "request_changes",
         summary="internal summary round 2",
         required_changes=["fix the internal thing, round 2"],
+        verdict_provenance="fresh_llm_review",
     )
     assert result2.ok is True
     decision2 = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
@@ -24138,7 +23542,11 @@ def test_orchestrator_own_comment_is_not_reingested_as_external_finding(
     ]
 
     result = app.record_review(
-        456, "request_changes", summary="internal summary", required_changes=["keep me"]
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -24196,7 +23604,11 @@ def test_human_quote_reply_to_orchestrator_comment_is_still_ingested(
     ]
 
     result = app.record_review(
-        456, "request_changes", summary="internal summary", required_changes=["keep me"]
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -24249,7 +23661,13 @@ def test_record_review_derived_with_external_findings_preserves_both(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # No itemized required_changes -> record_review derives from summary.
-    result = app.record_review(456, "request_changes", summary=prose, required_changes=None)
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary=prose,
+        required_changes=None,
+        verdict_provenance="fresh_llm_review",
+    )
 
     assert result.ok is True
     decision = json.loads(
@@ -24346,7 +23764,11 @@ def test_worker_rework_reply_is_not_ingested_as_external_finding(
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     result = app.record_review(
-        456, "request_changes", summary="internal summary", required_changes=["keep me"]
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -24439,7 +23861,11 @@ def test_human_comment_in_before_to_reviewed_at_gap_surfaces_next_round(
     # Round 1: request_changes. The gap comment is after the round-1 head
     # commit, so ``before`` excludes it this round -- it must NOT appear yet.
     r1 = app.record_review(
-        456, "request_changes", summary="round 1", required_changes=["internal-1"]
+        456,
+        "request_changes",
+        summary="round 1",
+        required_changes=["internal-1"],
+        verdict_provenance="fresh_llm_review",
     )
     assert r1.ok is True
     d1 = json.loads((paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8"))
@@ -24477,7 +23903,11 @@ def test_human_comment_in_before_to_reviewed_at_gap_surfaces_next_round(
     }
 
     r2 = app.record_review(
-        456, "request_changes", summary="round 2", required_changes=["internal-2"]
+        456,
+        "request_changes",
+        summary="round 2",
+        required_changes=["internal-2"],
+        verdict_provenance="fresh_llm_review",
     )
     assert r2.ok is True
     d2 = json.loads((paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8"))
@@ -24495,6 +23925,238 @@ def test_human_comment_in_before_to_reviewed_at_gap_surfaces_next_round(
     assert "internal-2" in changes2
 
 
+# --------------------------------------------------------------------------
+# Issue #1269 (W12): _collect_external_findings filters out reviewer-session
+# crash summaries -- posted by _extract_review_session_summary when a
+# reviewer dies without a verdict -- so they are never ingested as if they
+# were genuine human/peer-agent findings. This is the collector-side half of
+# the fix; the render-side guard (tested above, near
+# _render_required_changes_section) is what reaches records already
+# persisted before this filter existed.
+# --------------------------------------------------------------------------
+
+
+def test_record_review_does_not_ingest_an_unstamped_crash_summary(tmp_path: Path) -> None:
+    """A reviewer-session crash summary posted before the
+    ORCHESTRATOR_COMMENT_MARKER provenance stamp existed (#1242/55cecd9) --
+    or before this filter itself -- carries no marker for
+    _is_orchestrator_comment to catch, so it used to be ingested as if it
+    were a genuine external finding. It must not be, while a genuine human
+    finding posted alongside it is still ingested."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    crash_body = (
+        f"{REVIEW_SESSION_SUMMARY_HEADING}\n\n"
+        "The automated reviewer ran for 4 turns (2 tool calls) but did not "
+        "produce a structured verdict.\n"
+    )
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": crash_body,
+            "user": {"login": "Senkichi", "type": "User"},
+            "created_at": "2026-08-09T12:00:00Z",
+        },
+        {
+            "body": "The migration script drops the index without a guard.",
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-08-09T12:05:00Z",
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    external = decision.get("external_findings", [])
+    assert not any(REVIEW_SESSION_SUMMARY_HEADING in item for item in external), (
+        "the crash summary must not be ingested as an external finding"
+    )
+    assert any("migration script drops the index" in item for item in external), (
+        "the genuine human finding must still be ingested"
+    )
+
+
+def test_record_review_does_not_ingest_a_synthetic_launch_failed_crash_summary(
+    tmp_path: Path,
+) -> None:
+    """The other crash-summary heading (REVIEW_SESSION_FAILED_HEADING, for a
+    reviewer that died before its first turn) is filtered too. No captured
+    fixture carries this heading (the jc#1394 population happens to be
+    entirely the summary variant), so this specimen is synthetic -- built
+    from the shared constant, never a hardcoded copy."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    crash_body = (
+        f"{REVIEW_SESSION_FAILED_HEADING}\n\n"
+        "The automated reviewer exited before running a single turn, so no "
+        "review was performed.\n"
+    )
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": crash_body,
+            "user": {"login": "Senkichi", "type": "User"},
+            "created_at": "2026-08-09T12:00:00Z",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision.get("external_findings", []) == []
+
+
+def test_human_quote_reply_to_a_crash_summary_is_still_ingested(tmp_path: Path) -> None:
+    """A genuine human reply that GitHub-quotes a crash summary (to discuss
+    or dispute it) is preserved -- mirrors
+    test_human_quote_reply_to_orchestrator_comment_is_still_ingested's
+    rationale for ORCHESTRATOR_COMMENT_MARKER, applied to the crash-heading
+    prefix check instead. A substring match would wrongly discard this
+    reply along with the quoted heading; the prefix check must not."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    quoted_reply = (
+        f"> {REVIEW_SESSION_SUMMARY_HEADING}\n"
+        "> \n"
+        "> The automated reviewer ran for 4 turns...\n"
+        "\n"
+        "This looks like a session crash, not a real review -- can we re-run it?"
+    )
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": quoted_reply,
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-08-09T12:00:00Z",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    external = decision.get("external_findings", [])
+    assert any("can we re-run it" in item for item in external), (
+        "a genuine human reply quoting a crash summary must still be ingested"
+    )
+
+
+def test_record_review_dedups_identical_bodies_within_a_round(tmp_path: Path) -> None:
+    """Issue #1269 part (c): the same finding posted byte-for-byte on two
+    different surfaces within one round (e.g. an issue comment and a review
+    body -- the crash-recovery path reposts across more than one surface)
+    collapses to a single entry, so a rework brief does not present N
+    duplicate copies of the same finding as if they were N distinct ones."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    duplicated_body = "The migration script drops the index without a guard."
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": duplicated_body,
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-08-09T12:00:00Z",
+        }
+    ]
+    fake_gh.pr_external_reviews[456] = [
+        {
+            "body": duplicated_body,
+            "user": {"login": "a-real-human", "type": "User"},
+            "submitted_at": "2026-08-09T12:01:00Z",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    external = decision.get("external_findings", [])
+    assert external.count(duplicated_body) == 1, (
+        f"expected the duplicated body collapsed to one entry, found: {external}"
+    )
+
+
+def test_record_review_dedup_does_not_over_merge_similar_but_distinct_findings(
+    tmp_path: Path,
+) -> None:
+    """Over-aggression guard: two genuinely different findings that happen
+    to share a substring must stay distinct -- the dedup is exact-string
+    equality only (dict.fromkeys), never a whitespace/substring merge."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    finding_a = "The retry wrapper swallows the exception type in the fetch path."
+    finding_b = "The retry wrapper swallows the exception type in the push path."
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": finding_a,
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-08-09T12:00:00Z",
+        },
+        {
+            "body": finding_b,
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-08-09T12:01:00Z",
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    external = decision.get("external_findings", [])
+    assert finding_a in external
+    assert finding_b in external
+    assert len(external) == 2, f"two distinct findings must not be merged into one: {external}"
+
+
 def test_record_review_never_rejects_for_empty_required_changes(tmp_path: Path) -> None:
     """AC-3 regression pin, referenced by name in record_review's derivation
     comment. A reject-on-empty-required_changes gate here would recreate the
@@ -24510,13 +24172,21 @@ def test_record_review_never_rejects_for_empty_required_changes(tmp_path: Path) 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     vacuous_result = app.record_review(
-        456, "request_changes", summary=LEGACY_VACUOUS_SUMMARY, required_changes=None
+        456,
+        "request_changes",
+        summary=LEGACY_VACUOUS_SUMMARY,
+        required_changes=None,
+        verdict_provenance="fresh_llm_review",
     )
     assert vacuous_result.ok is True
 
     fake_gh.pr_head_shas[456] = "sha-2"
     derivable_result = app.record_review(
-        456, "request_changes", summary="Real finding here.", required_changes=None
+        456,
+        "request_changes",
+        summary="Real finding here.",
+        required_changes=None,
+        verdict_provenance="fresh_llm_review",
     )
     assert derivable_result.ok is True
 
@@ -24537,24 +24207,242 @@ def test_record_review_persists_escalated_in_decision_file(tmp_path: Path) -> No
     decision_path = paths.prs / "pr-456" / "review-decision.json"
 
     fake_gh.pr_head_shas[456] = "sha-1"
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert "escalated" in decision
     assert decision["escalated"] is False
     assert app._review_decision(456)["escalated"] is False
 
     fake_gh.pr_head_shas[456] = "sha-2"
-    app.record_review(456, "request_changes", summary="fix B")
+    app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["escalated"] is False
 
     fake_gh.pr_head_shas[456] = "sha-3"
-    app.record_review(456, "request_changes", summary="fix C")
+    app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["escalated"] is True
     # _review_decision is the reader used by merge_ready and merge-train
     # eligibility; it must see the persisted escalated value.
     assert app._review_decision(456)["escalated"] is True
+
+
+def test_refresh_pr_decision_cache_updates_disagreeing_tracked_pr(tmp_path: Path) -> None:
+    """Issue #1362 Stage 3: a tracked PR whose cache disagrees with the
+    file-first decision gets its three cache fields overwritten."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    seed = load_state(paths.state_file)
+    seed["prs"]["456"] = {
+        "status": "reviewing",
+        "issue_number": 123,
+        "decision": "pending",
+        "reviewed_head_sha": "stale-sha",
+        "decision_path": "stale-path",
+    }
+    save_state(paths.state_file, seed)
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = ReviewDecision(
+        decision="approved",
+        reviewed_head_sha="fresh-sha",
+        recorded_at="2026-08-21T00:00:00Z",
+        source_round=None,
+        stale=False,
+        missing=False,
+    )
+    app._refresh_pr_decision_cache(456, decision, decision_path)
+
+    refreshed = load_state(paths.state_file)["prs"]["456"]
+    assert refreshed["decision"] == "approved"
+    assert refreshed["reviewed_head_sha"] == "fresh-sha"
+    assert refreshed["decision_path"] == str(decision_path)
+    # Non-decision fields (status, issue_number) must survive the mirror
+    # write untouched -- the refresh must never clobber the rest of the entry.
+    assert refreshed["status"] == "reviewing"
+    assert refreshed["issue_number"] == 123
+
+
+def test_refresh_pr_decision_cache_no_op_when_cache_already_agrees(tmp_path: Path) -> None:
+    """Issue #1362 Stage 3: when the cache already agrees with the file, the
+    refresh must not write state.json at all -- the docstring's promised
+    short-circuit for the common (no verdict activity) case."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    seed = load_state(paths.state_file)
+    seed["prs"]["456"] = {
+        "status": "reviewing",
+        "decision": "approved",
+        "reviewed_head_sha": "fresh-sha",
+        "decision_path": str(decision_path),
+    }
+    save_state(paths.state_file, seed)
+    mtime_before = paths.state_file.stat().st_mtime_ns
+
+    decision = ReviewDecision(
+        decision="approved",
+        reviewed_head_sha="fresh-sha",
+        recorded_at="2026-08-21T00:00:00Z",
+        source_round=None,
+        stale=False,
+        missing=False,
+    )
+
+    # Positive signal, not just an absence: wrap the gated writer so a call
+    # that happens but happens to leave the mtime unchanged (e.g. a
+    # sub-resolution clock or a write of byte-identical content) cannot
+    # read as "no write occurred". An mtime check alone would pass even if
+    # the short-circuit above it were deleted, as long as the resulting
+    # write raced under the OS's mtime granularity.
+    #
+    # ``write_gate`` is a frozen dataclass (its instances reject attribute
+    # assignment), so the wrap patches the *class* method rather than the
+    # instance attribute.
+    save_state_calls: list[dict] = []
+    write_gate_cls = type(app.write_gate)
+    original_save_state = write_gate_cls.save_state
+
+    def _tracking_save_state(self: object, state: dict) -> None:
+        save_state_calls.append(state)
+        original_save_state(self, state)
+
+    write_gate_cls.save_state = _tracking_save_state  # type: ignore[method-assign]
+    try:
+        app._refresh_pr_decision_cache(456, decision, decision_path)
+    finally:
+        write_gate_cls.save_state = original_save_state  # type: ignore[method-assign]
+
+    assert save_state_calls == []
+    assert paths.state_file.stat().st_mtime_ns == mtime_before
+
+
+def test_refresh_pr_decision_cache_skips_pr_not_yet_in_state(tmp_path: Path) -> None:
+    """Issue #1362 Stage 3 (review finding F3): a PR not yet tracked in
+    state["prs"] must be left untouched by the refresh rather than
+    materializing a decision-only partial entry with no status/counters."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    decision_path = paths.prs / "pr-999" / "review-decision.json"
+    decision = ReviewDecision(
+        decision="approved",
+        reviewed_head_sha="fresh-sha",
+        recorded_at="2026-08-21T00:00:00Z",
+        source_round=None,
+        stale=False,
+        missing=False,
+    )
+    app._refresh_pr_decision_cache(999, decision, decision_path)
+
+    state = load_state(paths.state_file)
+    assert "999" not in state["prs"]
+
+
+def test_loop_pass_refreshes_pr_decision_cache_to_file_value(tmp_path: Path) -> None:
+    """Issue #1386: pin the _refresh_pr_decision_cache CALL SITE in loop()'s
+    per-PR dispatch block.
+
+    The three behavioral tests above cover the method itself (updates a
+    disagreeing tracked PR, no-ops when the cache agrees, skips untracked
+    PRs), but none of them exercise the call site -- deleting the
+    ``self._refresh_pr_decision_cache(...)`` invocation from ``loop()``'s
+    dispatch block would leave the whole suite green. This test closes that
+    gap: it seeds a tracked PR whose state-side decision disagrees with its
+    flat ``review-decision.json`` (the #1340 divergence shape: state lags a
+    concurrent void/record_review), runs one ``loop()`` pass, and asserts
+    ``state["prs"][N]`` was reconciled to the file value.
+
+    The test runs in live (non-dry-run) mode. Dry-run would seem isolating
+    but is not: ``_refresh_pr_decision_cache`` writes through
+    ``self.write_gate.save_state``, which is a no-op under dry-run (the
+    WriteGate's strict "zero writes under dry-run" invariant), so the
+    refresh's disk write is invisible there. In live mode the merge success
+    path (``merge_ready``) DOES write state, but it carries forward the
+    existing decision cache fields via ``**state["prs"].get(...)``
+    (workflow.py merge_success block) -- it does NOT re-derive
+    ``decision``/``reviewed_head_sha``/``decision_path`` from the file. So
+    the final state's cache fields are exactly what the refresh wrote: the
+    file value if the refresh ran, the stale seed value if it did not.
+    Deleting the call site leaves the seeded divergence unreconciled and
+    this test fails.
+    """
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubListingPRs(FakeGitHub):
+        """loop()'s reconcile pass (merge-lane-recovery §6-B) queries
+        gh.run(["pr", "list", ...]); the base fake's generic run() fallback
+        returns [] regardless of self.prs, which misreports PR 456 as
+        missing on GitHub. Reflect self.prs so the reconcile pass sees the
+        same PR the rest of this fake knows about. Same override as
+        test_loop_skips_review_for_approved_unmerged_pr."""
+
+        def run(self, args, *, json_output=False, allow_failure=False):
+            if args[:2] == ["pr", "list"]:
+                return list(self.prs) if json_output else ""
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    fake_gh = FakeGitHubListingPRs()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Seed a tracked PR whose state-side decision DISAGREES with the file
+    # (the #1340 divergence shape: state says "pending" at a stale head while
+    # the file has already been reset to "approved" at the live head).
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {
+        "number": 456,
+        "issue_number": 123,
+        "status": "reviewing",
+        "decision": "pending",
+        "reviewed_head_sha": "stale-sha",
+        "decision_path": "stale-path",
+    }
+    save_state(paths.state_file, state)
+
+    # The flat file is authoritative: it says "approved" at the live head
+    # (sha-abc123, matching FakeGitHub's default PR head). The file's
+    # reviewed_head_sha matches the live head so the already_approved /
+    # head_matches gates fire and merge_ready's merge-success path runs --
+    # which carries forward the existing cache fields rather than
+    # re-deriving them, isolating the refresh as the sole reconciler.
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    decision_path = decision_dir / "review-decision.json"
+    decision_path.write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    result = app.loop(limit=0)
+
+    # The merge must have run (confirms the per-PR dispatch block reached
+    # merge_ready, which is downstream of the refresh call site).
+    assert len(result.data["merges"]) == 1
+    assert result.data["merges"][0]["merged"] is True
+
+    refreshed = load_state(paths.state_file)["prs"]["456"]
+    # The three cache fields must be reconciled to the file value by the
+    # refresh -- merge_ready's carry-forward preserves whatever the refresh
+    # wrote, so these fail if the refresh call site is deleted.
+    assert refreshed["decision"] == "approved"
+    assert refreshed["reviewed_head_sha"] == "sha-abc123"
+    assert refreshed["decision_path"] == str(decision_path)
+    # Non-decision fields survive: issue_number is carried forward by both
+    # the refresh and merge_ready's spread. (status becomes "merged" after
+    # the merge, which is expected and not a cache field.)
+    assert refreshed["issue_number"] == 123
 
 
 def test_merge_ready_reads_escalated_from_persisted_decision(tmp_path: Path) -> None:
@@ -24568,10 +24456,14 @@ def test_merge_ready_reads_escalated_from_persisted_decision(tmp_path: Path) -> 
 
     # First request_changes is not escalated (count 0 -> 1).
     fake_gh.pr_head_shas[456] = "sha-1"
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     # Second request_changes hits the max_rework_cycles cap and escalates.
     fake_gh.pr_head_shas[456] = "sha-2"
-    app.record_review(456, "request_changes", summary="fix B")
+    app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
 
     result = app.merge_ready(456)
     assert result.ok is True
@@ -24601,7 +24493,9 @@ def test_record_review_request_changes_updates_issue_status_to_rework_requested(
     assert issue_number == 123
 
     # Record a non-escalated request_changes decision
-    result = app.record_review(456, "request_changes", summary="fix A")
+    result = app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is True
     assert result.data["escalated"] is False
@@ -24644,7 +24538,14 @@ def test_standard_lifecycle_rework_dispatch_selects_issue(tmp_path: Path) -> Non
     assert state["issues"]["123"]["status"] == "dispatched"
 
     # Step 2: record_review(request_changes) updates issue status to rework_requested
-    review_result = app.record_review(456, "request_changes", summary="fix A")
+    # Issue #1131: record_review now refuses on a terminal-state (CLOSED) PR,
+    # so restore the PR to OPEN before recording the verdict -- the CLOSED
+    # state above was a fixture trick to make dispatch select the issue, not
+    # a real terminal state.
+    app.gh.prs[0]["state"] = "OPEN"
+    review_result = app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     assert review_result.ok is True
     assert review_result.data["escalated"] is False
 
@@ -24703,8 +24604,13 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     assert dispatch_result.data["selected_count"] == 1
 
     # Step 2: Record first request_changes (count = 1, not escalated, head = "sha-1")
+    # Issue #1131: restore PR to OPEN before record_review -- the CLOSED state
+    # was a fixture trick for dispatch, not a real terminal state.
+    app.gh.prs[0]["state"] = "OPEN"
     fake_gh.pr_head_shas[456] = "sha-1"
-    review_result_1 = app.record_review(456, "request_changes", summary="fix A")
+    review_result_1 = app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_1.ok is True
     assert review_result_1.data["escalated"] is False
 
@@ -24719,7 +24625,9 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     rework_prompt.write_text("Fix the issues", encoding="utf-8")
     fake_gh.pr_head_shas[456] = "sha-2"
 
-    review_result_2 = app.record_review(456, "request_changes", summary="fix B")
+    review_result_2 = app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_2.ok is True
     assert review_result_2.data["escalated"] is False
 
@@ -24730,7 +24638,9 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     # Step 4: Record third request_changes (count stays at 2, escalated because max_rework_cycles = 2, head = "sha-3")
     # When escalated, the count is NOT incremented (see workflow.py line 731-734)
     fake_gh.pr_head_shas[456] = "sha-3"
-    review_result_3 = app.record_review(456, "request_changes", summary="fix C")
+    review_result_3 = app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_3.ok is True
     assert review_result_3.data["escalated"] is True  # Should be escalated
 
@@ -24743,10 +24653,13 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     # Issue status should now be escalated (cleared from rework_requested)
     assert state["issues"]["123"]["status"] == "escalated"
 
-    # Step 5: Verify the escalated label transition was fired (adds human_needed, removes reviewing)
-    assert (123, "agent:human-needed") in fake_gh.labels_added
+    # Step 5: Verify the escalated label transition was fired (adds
+    # operator_queue, removes reviewing). Issue #1266: max_rework_cycles_exceeded
+    # is a mechanical escalation, so it now routes to operator_queue instead of
+    # human_needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     # The escalated transition removes reviewing but does NOT remove needs_rework
-    # (this is by design per labels.py: "escalated": ((labels.human_needed,), (labels.reviewing,)))
+    # (this is by design per labels.py's redispatch_escalated/escalated edges)
 
     # Step 6: dispatch_rework should still NOT select the escalated issue
     # because the issue status is "escalated" (not "rework_requested")
@@ -24793,8 +24706,13 @@ def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Pa
     assert dispatch_result.ok is True
 
     # Step 2: Record first request_changes (count = 1, head = "sha-1")
+    # Issue #1131: restore PR to OPEN before record_review -- the CLOSED state
+    # was a fixture trick for dispatch, not a real terminal state.
+    app.gh.prs[0]["state"] = "OPEN"
     fake_gh.pr_head_shas[456] = "sha-1"
-    review_result_1 = app.record_review(456, "request_changes", summary="fix A")
+    review_result_1 = app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_1.ok is True
     assert review_result_1.data["escalated"] is False
 
@@ -24809,7 +24727,9 @@ def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Pa
     rework_prompt = pr_dir / "rework-prompt.md"
     rework_prompt.write_text("Fix the issues", encoding="utf-8")
 
-    review_result_2 = app.record_review(456, "request_changes", summary="fix B")
+    review_result_2 = app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_2.ok is True
     assert review_result_2.data["escalated"] is False
 
@@ -24820,7 +24740,9 @@ def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Pa
 
     # Step 4: Record third request_changes with NEW head (count should increment to 2)
     fake_gh.pr_head_shas[456] = "sha-2"
-    review_result_3 = app.record_review(456, "request_changes", summary="fix C")
+    review_result_3 = app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_3.ok is True
     assert review_result_3.data["escalated"] is False
 
@@ -24864,8 +24786,13 @@ def test_at_cap_request_changes_on_unchanged_head_does_not_escalate(
     assert dispatch_result.ok is True
 
     # Step 2: Drive request_changes_count up to the cap (2) over two advancing heads.
+    # Issue #1131: restore PR to OPEN before record_review -- the CLOSED state
+    # was a fixture trick for dispatch, not a real terminal state.
+    app.gh.prs[0]["state"] = "OPEN"
     fake_gh.pr_head_shas[456] = "sha-1"
-    review_result_1 = app.record_review(456, "request_changes", summary="fix A")
+    review_result_1 = app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_1.ok is True
     assert review_result_1.data["escalated"] is False
 
@@ -24874,7 +24801,9 @@ def test_at_cap_request_changes_on_unchanged_head_does_not_escalate(
     (pr_dir / "rework-prompt.md").write_text("Fix the issues", encoding="utf-8")
 
     fake_gh.pr_head_shas[456] = "sha-2"
-    review_result_2 = app.record_review(456, "request_changes", summary="fix B")
+    review_result_2 = app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_2.ok is True
     assert review_result_2.data["escalated"] is False
 
@@ -24885,7 +24814,9 @@ def test_at_cap_request_changes_on_unchanged_head_does_not_escalate(
     # Step 3: A request_changes verdict on the SAME head (sha-2) — the worker
     # died without pushing anything. request_changes_count is already at the
     # cap. This must NOT escalate and must NOT mutate the counter.
-    review_result_3 = app.record_review(456, "request_changes", summary="fix C")
+    review_result_3 = app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_3.ok is True
     assert review_result_3.data["escalated"] is False
 
@@ -24902,7 +24833,9 @@ def test_at_cap_request_changes_on_unchanged_head_does_not_escalate(
     # Step 4: Sanity — once the head DOES advance, the at-cap verdict escalates
     # as before (existing behavior preserved for advanced heads).
     fake_gh.pr_head_shas[456] = "sha-3"
-    review_result_4 = app.record_review(456, "request_changes", summary="fix D")
+    review_result_4 = app.record_review(
+        456, "request_changes", summary="fix D", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_4.ok is True
     assert review_result_4.data["escalated"] is True
 
@@ -24920,7 +24853,7 @@ def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> N
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     fake_gh.prs[0] = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
     fake_gh.pr_head_shas[456] = "sha-new-head"
 
@@ -24954,7 +24887,7 @@ def test_merge_ready_head_moved_does_not_stamp_reviewing_when_dispatch_disabled(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     fake_gh.prs[0] = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
     fake_gh.pr_head_shas[456] = "sha-new-head"
 
@@ -25003,7 +24936,7 @@ def test_merge_ready_escalated_head_moved_makes_no_label_or_status_mutations(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     fake_gh.prs[0] = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
     fake_gh.pr_head_shas[456] = "sha-new-head"
     # Simulate the fleet state a livelocked issue #602/PR #679 was actually
@@ -25050,7 +24983,7 @@ def test_merge_ready_merges_when_head_unchanged_after_approval(tmp_path: Path) -
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -25083,7 +25016,7 @@ def test_merge_ready_escalated_issue_blocks_merge_of_otherwise_green_pr(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     # Escalate the linked issue for an unrelated reason.
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
@@ -25122,7 +25055,7 @@ def test_merge_ready_escalated_pr_blocks_merge_of_otherwise_green_pr(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["prs"]["456"] = {
@@ -25164,7 +25097,7 @@ def test_merge_ready_escalated_issue_counter_does_not_climb(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["issues"]["123"] = {
@@ -25202,7 +25135,7 @@ def test_merge_ready_escalated_issue_blocks_mergequeue_handoff(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["issues"]["123"] = {
@@ -25241,7 +25174,7 @@ def test_merge_ready_dry_run_escalated_issue_reports_hold(tmp_path: Path) -> Non
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     app.dry_run = True
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["issues"]["123"] = {
@@ -25271,7 +25204,7 @@ def test_merge_ready_passes_admin_flag_when_configured(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -25294,7 +25227,7 @@ def test_merge_ready_passes_merge_flags_when_configured(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -25320,7 +25253,7 @@ def test_merge_ready_merge_flags_takes_precedence_over_admin(tmp_path: Path) -> 
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -25344,7 +25277,7 @@ def test_merge_ready_default_merge_flags_preserves_current_behavior(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -25910,7 +25843,7 @@ def test_classify_dead_sessions_relabel_idempotent(tmp_path: Path) -> None:
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify first pass relabeled the issue
@@ -25939,7 +25872,7 @@ def test_classify_dead_sessions_relabel_idempotent(tmp_path: Path) -> None:
 
     # Second pass: run classification again
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify second pass did NOT emit duplicate event (idempotency)
@@ -26039,7 +25972,7 @@ def test_classify_dead_sessions_preserves_state_record_branch(tmp_path: Path) ->
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify branch and worktree_path are preserved byte-identical
@@ -26137,7 +26070,7 @@ def test_classify_dead_sessions_dispatch_recovery_integration(tmp_path: Path) ->
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify the issue was relabeled to ready
@@ -26267,7 +26200,7 @@ def test_classify_dead_sessions_with_closed_pr_triggers_relabel(tmp_path: Path) 
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify relabel fired despite CLOSED PR (OPEN filter works)
@@ -26359,7 +26292,7 @@ def test_classify_dead_sessions_with_open_pr_suppresses_relabel(tmp_path: Path) 
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify relabel did NOT fire (OPEN PR guard works)
@@ -26442,9 +26375,18 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     # Create the rework prompt on disk (the rework brief).
     pr_dir = paths.prs / "pr-456"
-    pr_dir.mkdir(parents=True)
+    pr_dir.mkdir(parents=True, exist_ok=True)
     rework_prompt = pr_dir / "rework-prompt.md"
     rework_prompt.write_text("Fix the issues", encoding="utf-8")
 
@@ -26473,7 +26415,7 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
 
     # Run the reap pass.
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify state was restored to rework_requested for the owning lane.
@@ -26605,7 +26547,7 @@ def test_classify_dead_rework_session_stale_prompt_does_not_reopen_approved_head
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
@@ -26682,6 +26624,15 @@ def test_classify_dead_rework_session_escalates_at_death_cap(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     # Launch-failure sidecar with a non-deterministic failure signature (rate
     # limit) -- isolates the cap check from finding 2b's deterministic-kind
     # guard (covered by the worktree_unsafe test below).
@@ -26707,7 +26658,7 @@ def test_classify_dead_rework_session_escalates_at_death_cap(
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
@@ -26717,7 +26668,9 @@ def test_classify_dead_rework_session_escalates_at_death_cap(
     assert entry["escalation_reason"] == "worker_death_loop"
     assert len(entry["redispatch_at"]) == 4
     assert len(entry["worker_death_at"]) == 4
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: worker_death_loop is mechanical, so this lands
+    # agent:operator-queue, not agent:human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
@@ -26785,6 +26738,15 @@ def test_classify_dead_rework_session_no_op_cap_with_prior_no_ops(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
@@ -26807,7 +26769,7 @@ def test_classify_dead_rework_session_no_op_cap_with_prior_no_ops(
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
@@ -26873,6 +26835,15 @@ def test_classify_dead_rework_session_deaths_below_cap_not_escalated(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
@@ -26895,7 +26866,7 @@ def test_classify_dead_rework_session_deaths_below_cap_not_escalated(
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
@@ -26965,6 +26936,15 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
@@ -26986,14 +26966,17 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["123"]
     assert entry["status"] == "escalated"
     assert entry["escalation_reason"] == "worktree_unsafe"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: a deterministic failure_kind escalation is mechanical
+    # (same _escalate_issue site as worker_death_loop/redispatch_cap_exceeded
+    # in _reap_restore_rework_requested), so this lands agent:operator-queue.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
@@ -27043,6 +27026,15 @@ def test_classify_dead_rework_session_rework_branch_conflict_escalates_immediate
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
@@ -27068,14 +27060,16 @@ def test_classify_dead_rework_session_rework_branch_conflict_escalates_immediate
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["123"]
     assert entry["status"] == "escalated"
     assert entry["escalation_reason"] == "rework_branch_conflict"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: same mechanical _escalate_issue site as the
+    # worktree_unsafe/worker_death_loop cases above -> operator_queue.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
@@ -27158,7 +27152,9 @@ def test_classify_dead_rework_session_completed_worktree_not_rolled_back(
         }
         save_state(state_file, state)
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
     entry = state["issues"]["315"]
@@ -27254,7 +27250,7 @@ def test_classify_dead_sessions_worker_blocked_escalates_and_suppresses_redispat
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # (a) No hot relabel-to-ready — the escalation path must never grant the
@@ -27265,9 +27261,11 @@ def test_classify_dead_sessions_worker_blocked_escalates_and_suppresses_redispat
     assert (42, config.labels.ready) not in fake_gh.labels_added
 
     # The escalation transition (redispatch_escalated) must have actually run:
-    # human_needed added, in_progress removed — proving escalation took the
-    # GitHub-mutating path rather than silently no-oping.
-    assert (42, config.labels.human_needed) in fake_gh.labels_added
+    # operator_queue added, in_progress removed — proving escalation took the
+    # GitHub-mutating path rather than silently no-oping. Issue #1266:
+    # worker_blocked is mechanical, so it lands agent:operator-queue, not
+    # agent:human-needed.
+    assert (42, config.labels.operator_queue) in fake_gh.labels_added
     assert (42, config.labels.in_progress) in fake_gh.labels_removed
 
     # (b) escalation_reason recorded as worker_blocked, not the generic cap.
@@ -27372,14 +27370,15 @@ def test_classify_dead_sessions_worker_blocked_log_tail_fallback_escalates_and_s
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # No hot relabel-to-ready — same structural proof as the DB-based test.
     assert (42, config.labels.ready) not in fake_gh.labels_added
 
-    # Escalation transition actually ran.
-    assert (42, config.labels.human_needed) in fake_gh.labels_added
+    # Escalation transition actually ran. Issue #1266: worker_blocked is
+    # mechanical, so it lands agent:operator-queue, not agent:human-needed.
+    assert (42, config.labels.operator_queue) in fake_gh.labels_added
     assert (42, config.labels.in_progress) in fake_gh.labels_removed
 
     # escalation_reason recorded as worker_blocked, not the generic cap or
@@ -27457,13 +27456,14 @@ def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # No hot relabel-to-ready.
     assert (42, config.labels.ready) not in fake_gh.labels_added
-    # Escalation transition added human_needed.
-    assert (42, config.labels.human_needed) in fake_gh.labels_added
+    # Escalation transition added operator_queue. Issue #1266: worktree_unsafe
+    # is mechanical, so it lands agent:operator-queue, not agent:human-needed.
+    assert (42, config.labels.operator_queue) in fake_gh.labels_added
     # The launch never succeeded, so the issue should not be marked in_progress.
     assert (42, config.labels.in_progress) not in fake_gh.labels_added
 
@@ -27476,7 +27476,7 @@ def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
     assert "session_failed_relabeled" not in event_kinds
     assert "session_failed_escalated" in event_kinds
 
-    fake_gh.issues[0]["labels"].append({"name": config.labels.human_needed})
+    fake_gh.issues[0]["labels"].append({"name": config.labels.operator_queue})
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     result = app.dispatch(limit=1)
     assert result.data["selected_count"] == 0
@@ -27550,7 +27550,7 @@ def test_worktree_probe_failed_launch_failure_does_not_escalate(
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # No escalation transition — human_needed must NOT be added, and the
@@ -27654,7 +27654,7 @@ def test_classify_dead_sessions_retains_sidecar_on_inconclusive_probe(
 
     with patch("charlie_work.worker.is_session_alive", return_value=False):
         _classify_dead_sessions_and_update_throttle_state(
-            sessions_dir, paths.state_file, fake_gh, config
+            sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
         )
 
     assert sidecar_path.exists(), "sidecar must be RETAINED when the probe is inconclusive"
@@ -27733,7 +27733,7 @@ def test_classify_dead_sessions_reaps_sidecar_when_probe_conclusively_stale(
         patch("charlie_work.worker.real_activity_probe_for", return_value=stale_probe),
     ):
         _classify_dead_sessions_and_update_throttle_state(
-            sessions_dir, paths.state_file, fake_gh, config
+            sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
         )
 
     assert not sidecar_path.exists(), "a conclusively-stale probe must still allow reaping"
@@ -27832,13 +27832,16 @@ def test_stall_and_dead_lane_increment_deferral_counter_at_most_once_per_pass(
     ):
         # loop() order and arguments: stall lane runs before the dead lane,
         # which is told not to persist the counter itself this pass.
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
         _classify_dead_sessions_and_update_throttle_state(
             sessions_dir,
             paths.state_file,
             fake_gh,
             config,
             persist_inconclusive_probe_counter=False,
+            write_gate=_wg(paths.state_file),
         )
 
     assert sidecar_path.exists(), "sidecar must be RETAINED when the probe is inconclusive"
@@ -27953,7 +27956,9 @@ def test_stall_then_dead_lane_composition_survives_phantom_post_mortem_sidecar(
                 return_value=inconclusive_probe,
             ),
         ):
-            _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+            _detect_and_handle_stalled_sessions(
+                sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+            )
 
     def _run_dead_lane() -> None:
         with (
@@ -27969,6 +27974,7 @@ def test_stall_then_dead_lane_composition_survives_phantom_post_mortem_sidecar(
                 fake_gh,
                 config,
                 persist_inconclusive_probe_counter=False,
+                write_gate=_wg(paths.state_file),
             )
 
     def _run_pass() -> None:
@@ -29219,7 +29225,7 @@ def test_merge_ready_next_mode_syncs_head_before_merge(tmp_path: Path) -> None:
     fake_gh.prs[0]["mergeStateStatus"] = "BEHIND"
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.ok is True
@@ -29270,8 +29276,8 @@ def test_merge_ready_next_mode_skips_non_head(tmp_path: Path) -> None:
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     # Ensure 456 is the head of the queue regardless of when approvals occurred.
     for idx, pr_number in enumerate((456, 789)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
@@ -29307,7 +29313,7 @@ def test_merge_ready_clean_stale_base_syncs_and_merges(tmp_path: Path) -> None:
     }
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.ok is True
@@ -29335,7 +29341,7 @@ def test_merge_ready_current_base_no_sync(tmp_path: Path) -> None:
     # mergeStateStatus CLEAN and the compare API agrees the base is current.
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.ok is True
@@ -29380,7 +29386,7 @@ def test_merge_ready_conflict_rework_debounces_and_preserves_approval(tmp_path: 
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     original_decision = json.loads(decision_path.read_text())
 
@@ -29469,7 +29475,7 @@ def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     original_decision = json.loads(decision_path.read_text())
 
@@ -29563,7 +29569,7 @@ def test_merge_ready_check_failure_routes_to_rework(tmp_path: Path) -> None:
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     original_decision = json.loads(decision_path.read_text())
 
@@ -29772,7 +29778,7 @@ def test_merge_ready_silent_cross_pr_revert_blocks_and_routes_to_rework(
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=False)
 
     assert result.ok is True
@@ -29826,7 +29832,7 @@ def test_merge_ready_silent_cross_pr_revert_allows_explicit_marker(
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.ok is True
@@ -29873,7 +29879,7 @@ def test_merge_ready_silent_cross_pr_revert_prompt_echo_does_not_bypass(
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=False)
 
     assert result.ok is True
@@ -29924,7 +29930,7 @@ def test_merge_ready_stale_base_not_routed_to_rework(
     monkeypatch.setattr(fake_gh, "pr_update_branch", lambda pr_number: True)
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=False)
 
     assert result.ok is True
@@ -29969,7 +29975,7 @@ def test_merge_ready_conflict_alarm_message_is_honest(tmp_path: Path) -> None:
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result1 = app.merge_ready(456, merge=False)
     assert result1.data["merge_conflict"] is True
@@ -30035,7 +30041,7 @@ def test_merge_ready_conflict_rework_routes_past_threshold(tmp_path: Path) -> No
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Pre-seed the state with attempt count *past* the threshold (simulates
     # a prior rework dispatch that failed to transition the issue).
@@ -30089,7 +30095,7 @@ def test_merge_ready_conflict_no_linked_issue_alarm_is_honest(tmp_path: Path) ->
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=False)
 
     assert result.ok is True
@@ -30149,7 +30155,7 @@ def test_merge_ready_conflict_label_failure_is_recorded(tmp_path: Path) -> None:
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=False)
 
     assert result.ok is True
@@ -30206,7 +30212,7 @@ def test_merge_ready_conflict_inflight_worker_returns_early(tmp_path: Path) -> N
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["issues"]["123"]["status"] = "dispatched"
@@ -30270,7 +30276,7 @@ def test_merge_ready_conflict_blocked_issue_not_rerouted(tmp_path: Path) -> None
     fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["issues"]["123"]["status"] = "blocked"
@@ -30340,10 +30346,13 @@ def test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework(
             "isCrossRepository": False,
         },
     ]
-    fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
+    # Issue #1266: redispatch_cap_exceeded is mechanical, so a real prior
+    # escalation for this reason would have landed agent:operator-queue, not
+    # agent:human-needed -- seed the fixture to match.
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.operator_queue}]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     unrelated_redispatch_at = ["2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z"]
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
@@ -30351,6 +30360,7 @@ def test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework(
             **state["issues"]["123"],
             "status": "escalated",
             "escalation_reason": "redispatch_cap_exceeded",
+            "reason_class": "mechanical",
             "redispatch_at": unrelated_redispatch_at,
         }
         save_state(paths.state_file, state)
@@ -30374,7 +30384,7 @@ def test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework(
     assert len(conflict_events) == 1
     assert conflict_events[0]["payload"]["issue_number"] == 123
     assert (123, config.labels.needs_rework) in fake_gh.labels_added
-    assert (123, config.labels.human_needed) in fake_gh.labels_removed
+    assert (123, config.labels.operator_queue) in fake_gh.labels_removed
     # Reason X's own budget must survive remediating unrelated Y: the
     # watchdog redispatch timestamps that drove the ORIGINAL escalation are
     # untouched, so a later re-escalation for the same reason X is not
@@ -30428,7 +30438,7 @@ def test_merge_ready_conflict_rework_dispatch_bounded_by_cap_across_repeated_eva
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     def _reset_issue_to_fresh() -> None:
         with state_lock(paths.state_file):
@@ -30547,7 +30557,7 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     dispatch_result = app.merge_ready(456, merge=False)
     assert dispatch_result.ok is True
@@ -30582,7 +30592,9 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: this deterministic-failure-kind escalation is mechanical,
+    # so it lands agent:operator-queue, not agent:human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
     # The attempt counted by the (now-unified) conflict-rework dispatch must
     # survive this SEPARATE escalation lane untouched -- it lives on the PR
@@ -30637,7 +30649,7 @@ def test_startup_death_does_not_consume_conflict_rework_cap(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Seed the PR state with the startup-death flag, simulating a dead
     # rework session that was reaped by _reap_restore_rework_requested.
@@ -30691,7 +30703,9 @@ def test_startup_death_does_not_consume_no_op_rework_cap(
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Force issue status to "reviewing" (the orphaned/stuck shape the
     # no-op route exists for — same as test_janitor_no_op_rework_routes_
@@ -30768,7 +30782,7 @@ def test_non_startup_death_still_consumes_conflict_rework_cap(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Seed the PR state with a NON-startup death (stalled, but the flag
     # is False — the session ran long enough to be a genuine no-op).
@@ -30871,6 +30885,15 @@ def test_reap_restore_sets_startup_death_flag(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
@@ -30890,7 +30913,7 @@ def test_reap_restore_sets_startup_death_flag(
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
@@ -30973,6 +30996,15 @@ def test_reap_restore_startup_death_stalled_real_pid_under_classification_delay(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     # Write the log file with the calibration incident's refusal message and
     # freeze its mtime at the death moment (5s after start).
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -31016,6 +31048,7 @@ def test_reap_restore_startup_death_stalled_real_pid_under_classification_delay(
         open_prs_by_issue,
         worker,
         failure_kind="stalled",
+        write_gate=_wg(paths.state_file),
     )
 
     state = load_state(paths.state_file)
@@ -31082,6 +31115,15 @@ def test_reap_restore_stalled_long_runtime_not_startup_death(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
@@ -31123,6 +31165,7 @@ def test_reap_restore_stalled_long_runtime_not_startup_death(
         open_prs_by_issue,
         worker,
         failure_kind="stalled",
+        write_gate=_wg(paths.state_file),
     )
 
     state = load_state(paths.state_file)
@@ -31331,7 +31374,7 @@ def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Directly construct the "this lane's own cap already exhausted,
     # escalated" state that _route_janitor_gate_failure_to_rework's
@@ -31345,12 +31388,14 @@ def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
             **state["prs"]["456"],
             "status": "escalated",
             "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+            "escalation_reasons_seen": ["conflict_rework_attempts_cap_exceeded"],
             "conflict_rework_attempts": 3,
         }
         state["issues"]["123"] = {
             **state["issues"]["123"],
             "status": "escalated",
             "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+            "escalation_reasons_seen": ["conflict_rework_attempts_cap_exceeded"],
         }
         save_state(paths.state_file, state)
 
@@ -31452,7 +31497,7 @@ def test_merge_ready_conflict_carry_forward_resets_counter_before_dispatch(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(pr_number, "approved", summary="lgtm")
+    app.record_review(pr_number, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Two CONFLICTING passes with the original head bring the counter to 2.
     for _ in range(2):
@@ -31541,7 +31586,7 @@ def test_merge_ready_conflict_dispatch_rechecks_issue_status_under_lock(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=False)
 
@@ -31598,8 +31643,8 @@ def test_update_open_agent_prs_next_mode_syncs_stale_clean_base(tmp_path: Path) 
     # advances the fake base tip, even though mergeStateStatus reports CLEAN.
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     for idx, pr_number in enumerate((456, 789)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -31721,7 +31766,9 @@ def test_update_open_agent_prs_next_mode_syncs_head_of_queue(tmp_path: Path) -> 
 
     # Approve in order: 456 first (head), then 789, then 101.
     for pr_number in (456, 789, 101):
-        app.record_review(pr_number, "approved", summary="lgtm")
+        app.record_review(
+            pr_number, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+        )
     # Override timestamps so fast tests don't all land in the same second.
     for idx, pr_number in enumerate((456, 789, 101)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
@@ -31790,8 +31837,8 @@ def test_update_open_agent_prs_next_mode_skips_up_to_date_head(tmp_path: Path) -
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     # Ensure 456 is the head of the queue.
     for idx, pr_number in enumerate((456, 789)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
@@ -31871,8 +31918,8 @@ def test_update_open_agent_prs_next_mode_reports_compare_unavailable(tmp_path: P
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     for idx, pr_number in enumerate((456, 789)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -32007,7 +32054,9 @@ def test_front_of_train_only_updates_next_candidate(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     for pr_number in (456, 789, 101):
-        app.record_review(pr_number, "approved", summary="lgtm")
+        app.record_review(
+            pr_number, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+        )
     for idx, pr_number in enumerate((456, 789, 101)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -32084,7 +32133,9 @@ def test_front_of_train_carries_forward_approved_verdict_end_to_end(tmp_path: Pa
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     for pr_number in (456, 789, 101):
-        app.record_review(pr_number, "approved", summary="lgtm")
+        app.record_review(
+            pr_number, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+        )
     for idx, pr_number in enumerate((456, 789, 101)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -32164,9 +32215,11 @@ def test_front_of_train_skips_request_changes_and_blocked(tmp_path: Path) -> Non
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "request_changes", summary="needs work")
-    app.record_review(101, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(
+        789, "request_changes", summary="needs work", verdict_provenance="fresh_llm_review"
+    )
+    app.record_review(101, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     for idx, pr_number in enumerate((456, 789, 101)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -32204,7 +32257,7 @@ def test_merge_ready_compare_unavailable_fail_closed(tmp_path: Path) -> None:
     fake_gh = FakeGitHubCompareUnavailable()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.ok is True
@@ -32267,7 +32320,7 @@ def test_merge_ready_merge_train_post_sync_head_race_rejected(tmp_path: Path) ->
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.ok is True
@@ -32341,7 +32394,7 @@ def test_merge_ready_race_with_spoofed_committer_name_rejected(tmp_path: Path) -
         },
     )
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.data["merged"] is False
@@ -32368,7 +32421,7 @@ def test_merge_ready_race_with_spoofed_webflow_login_rejected(tmp_path: Path) ->
         },
     )
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.data["merged"] is False
@@ -32424,8 +32477,8 @@ def test_update_open_agent_prs_merge_train_post_sync_head_race_rejected(
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     for idx, pr_number in enumerate((456, 789)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -33877,373 +33930,6 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
     assert issues_payload["deferred_by_concurrency_count"] == 7
 
 
-def test_count_fleet_live_sessions_skips_vanished_repos(tmp_path: Path, monkeypatch) -> None:
-    """count_fleet_live_sessions should skip repos that no longer exist and report them."""
-    from charlie_work.fleet_registry import count_fleet_live_sessions
-
-    # Create a fake fleet registry with 3 repos
-    fleet_dir = tmp_path / ".fleet"
-    fleet_dir.mkdir(parents=True)
-    fleet_json = fleet_dir / "fleet.json"
-
-    # Create two real repos and one vanished repo
-    repo1 = tmp_path / "repo1"
-    repo2 = tmp_path / "repo2"
-    repo1.mkdir()
-    repo2.mkdir()
-    (repo1 / ".git").mkdir()
-    (repo2 / ".git").mkdir()
-
-    # Create state dirs for the real repos
-    state1 = repo1 / ".var" / "charlie-work"
-    state2 = repo2 / ".var" / "charlie-work"
-    state1.mkdir(parents=True)
-    state2.mkdir(parents=True)
-
-    # Create sessions dirs (empty, so no live sessions)
-    sessions1 = state1 / "dispatches" / "sessions"
-    sessions2 = state2 / "dispatches" / "sessions"
-    sessions1.mkdir(parents=True)
-    sessions2.mkdir(parents=True)
-
-    # Write the registry
-    registry_data = {
-        "version": 1,
-        "repos": {
-            "owner/repo1": {
-                "repo_root": str(repo1),
-                "name_with_owner": "owner/repo1",
-                "config_path": str(repo1 / "orchestrator.config.yaml"),
-                "state_dir": str(state1),
-                "first_seen": "2024-01-01T00:00:00Z",
-                "last_seen": "2024-01-01T00:00:00Z",
-            },
-            "owner/repo2": {
-                "repo_root": str(repo2),
-                "name_with_owner": "owner/repo2",
-                "config_path": str(repo2 / "orchestrator.config.yaml"),
-                "state_dir": str(state2),
-                "first_seen": "2024-01-01T00:00:00Z",
-                "last_seen": "2024-01-01T00:00:00Z",
-            },
-            "owner/vanished": {
-                "repo_root": str(tmp_path / "vanished"),
-                "name_with_owner": "owner/vanished",
-                "config_path": str(tmp_path / "vanished" / "orchestrator.config.yaml"),
-                "state_dir": str(tmp_path / "vanished" / ".var" / "charlie-work"),
-                "first_seen": "2024-01-01T00:00:00Z",
-                "last_seen": "2024-01-01T00:00:00Z",
-            },
-        },
-    }
-    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
-
-    # Redirect fleet_dir resolution to our test fleet dir via the env var
-    # fleet_paths.fleet_dir() itself supports (checked before the platform
-    # default). Patching the module-level name directly no longer works since
-    # fleet_registry composes fleet paths through layout.py, which binds its
-    # own reference to fleet_paths.fleet_dir at import time.
-    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
-
-    # Count fleet live sessions
-    live_count, skipped_repos = count_fleet_live_sessions(None)
-
-    # Should count 0 live sessions (both real repos have empty sessions dirs)
-    assert live_count == 0
-    # Should report the vanished repo
-    assert "owner/vanished" in skipped_repos
-    assert len(skipped_repos) == 1
-
-
-def test_count_fleet_live_sessions_reports_missing_sessions_dir(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """A repo whose state_dir exists but whose sessions_dir is missing is reported."""
-    from charlie_work.fleet_registry import count_fleet_live_sessions
-
-    fleet_dir = tmp_path / ".fleet"
-    fleet_dir.mkdir(parents=True)
-    fleet_json = fleet_dir / "fleet.json"
-
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".git").mkdir()
-
-    # state_dir exists, but the default sessions subdir is deliberately absent.
-    state = repo / ".var" / "charlie-work"
-    state.mkdir(parents=True)
-
-    registry_data = {
-        "version": 1,
-        "repos": {
-            "owner/repo": {
-                "repo_root": str(repo),
-                "name_with_owner": "owner/repo",
-                "config_path": str(repo / "orchestrator.config.yaml"),
-                "state_dir": str(state),
-                "first_seen": "2024-01-01T00:00:00Z",
-                "last_seen": "2024-01-01T00:00:00Z",
-            },
-        },
-    }
-    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
-    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
-
-    live_count, skipped_repos = count_fleet_live_sessions(None)
-
-    assert live_count == 0
-    assert "owner/repo" in skipped_repos
-    assert len(skipped_repos) == 1
-
-
-def test_count_fleet_live_sessions_respects_devin_sessions_dir_override(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """A repo that overrides devin.sessions_dir is counted from that path."""
-    from charlie_work.fleet_registry import count_fleet_live_sessions
-
-    fleet_dir = tmp_path / ".fleet"
-    fleet_dir.mkdir(parents=True)
-    fleet_json = fleet_dir / "fleet.json"
-
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".git").mkdir()
-
-    # Default sessions dir is missing; the override is the live one.
-    state = repo / ".var" / "charlie-work"
-    state.mkdir(parents=True)
-
-    custom_sessions = repo / "custom-sessions"
-    custom_sessions.mkdir(parents=True)
-    (custom_sessions / "issue-1.json").write_text(
-        json.dumps(
-            {
-                "issue_number": 1,
-                "branch": "main",
-                "worktree_path": str(repo / "worktrees" / "issue-1"),
-                "prompt_path": str(repo / "prompt.md"),
-                "command": ["devin"],
-                "pid": 1234,
-                "started_at": "2026-08-05T00:00:00Z",
-                "log_path": str(repo / "log.txt"),
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    (repo / "orchestrator.config.yaml").write_text(
-        "devin:\n  sessions_dir: custom-sessions\n",
-        encoding="utf-8",
-    )
-
-    registry_data = {
-        "version": 1,
-        "repos": {
-            "owner/repo": {
-                "repo_root": str(repo),
-                "name_with_owner": "owner/repo",
-                "config_path": str(repo / "orchestrator.config.yaml"),
-                "state_dir": str(state),
-                "first_seen": "2024-01-01T00:00:00Z",
-                "last_seen": "2024-01-01T00:00:00Z",
-            },
-        },
-    }
-    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
-    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: True)
-
-    live_count, skipped_repos = count_fleet_live_sessions(None)
-
-    assert live_count == 1
-    assert skipped_repos == []
-
-
-def test_count_fleet_live_sessions_respects_global_devin_sessions_dir_override(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """A repo with no per-repo override is still counted when fleet config sets devin.sessions_dir.
-
-    Regression for the review of issue #707: count_fleet_live_sessions loaded the
-    per-repo orchestrator.config.yaml only, so a global <fleet_dir>/config.yaml
-    devin.sessions_dir override was silently ignored.
-    """
-    from charlie_work.fleet_registry import count_fleet_live_sessions
-
-    fleet_dir = tmp_path / ".fleet"
-    fleet_dir.mkdir(parents=True)
-    fleet_json = fleet_dir / "fleet.json"
-
-    # No per-repo config; all config comes from the fleet-wide layer.
-    (fleet_dir / "config.yaml").write_text(
-        "devin:\n  sessions_dir: custom-sessions\n",
-        encoding="utf-8",
-    )
-
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".git").mkdir()
-
-    # Default sessions dir is missing; the global override is the live one.
-    state = repo / ".var" / "charlie-work"
-    state.mkdir(parents=True)
-
-    custom_sessions = repo / "custom-sessions"
-    custom_sessions.mkdir(parents=True)
-    (custom_sessions / "issue-1.json").write_text(
-        json.dumps(
-            {
-                "issue_number": 1,
-                "branch": "main",
-                "worktree_path": str(repo / "worktrees" / "issue-1"),
-                "prompt_path": str(repo / "prompt.md"),
-                "command": ["devin"],
-                "pid": 1234,
-                "started_at": "2026-08-05T00:00:00Z",
-                "log_path": str(repo / "log.txt"),
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    registry_data = {
-        "version": 1,
-        "repos": {
-            "owner/repo": {
-                "repo_root": str(repo),
-                "name_with_owner": "owner/repo",
-                "config_path": str(repo / "orchestrator.config.yaml"),
-                "state_dir": str(state),
-                "first_seen": "2024-01-01T00:00:00Z",
-                "last_seen": "2024-01-01T00:00:00Z",
-            },
-        },
-    }
-    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
-    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: True)
-
-    live_count, skipped_repos = count_fleet_live_sessions(None)
-
-    assert live_count == 1
-    assert skipped_repos == []
-
-
-def test_count_fleet_live_sessions_skips_repo_with_null_state_dir(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """A corrupted registry entry with state_dir: null does not crash count_fleet_live_sessions.
-
-    Regression for the review of issue #707 (rework round 3):
-    ``Path(entry.get("state_dir", ""))`` returns ``Path(None)`` when the key is
-    present with a null value (``.get``'s default only applies when the key is
-    *absent*), raising TypeError. The same bug class was already fixed in this
-    PR for ``repo_root`` across fleet_dispatch.py but missed for ``state_dir``
-    in this exact function. The fix ``entry.get("state_dir") or ""`` makes null
-    behave identically to a missing key (fall back to cwd), and the repo is
-    then reported in skipped_repos because the resolved sessions_dir under cwd
-    does not exist.
-    """
-    from charlie_work.fleet_registry import count_fleet_live_sessions
-
-    fleet_dir = tmp_path / ".fleet"
-    fleet_dir.mkdir(parents=True)
-    fleet_json = fleet_dir / "fleet.json"
-
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".git").mkdir()
-
-    # Pin cwd to tmp_path so the cwd-fallback (Path("") == Path(".")) resolves
-    # deterministically: sessions_dir_default(tmp_path) = tmp_path/dispatches/
-    # sessions, which does not exist, so the repo is skipped + reported.
-    monkeypatch.chdir(tmp_path)
-
-    registry_data = {
-        "version": 1,
-        "repos": {
-            "owner/repo": {
-                "repo_root": str(repo),
-                "name_with_owner": "owner/repo",
-                "config_path": str(repo / "orchestrator.config.yaml"),
-                "state_dir": None,
-                "first_seen": "2024-01-01T00:00:00Z",
-                "last_seen": "2024-01-01T00:00:00Z",
-            },
-        },
-    }
-    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
-    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
-
-    # Must not raise TypeError; the repo is skipped + reported.
-    live_count, skipped_repos = count_fleet_live_sessions(None)
-
-    assert live_count == 0
-    assert "owner/repo" in skipped_repos
-    assert len(skipped_repos) == 1
-
-
-def test_count_fleet_live_sessions_skips_repo_with_malformed_config(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """A repo with an unparseable per-repo config does not crash count_fleet_live_sessions.
-
-    Regression for the review of issue #707 (rework round 3): the
-    ``load_layered_config`` call in ``count_fleet_live_sessions`` is wrapped in
-    a broad ``except Exception`` containment, but no test exercised a malformed
-    ``orchestrator.config.yaml`` (which raises ``yaml.YAMLError``) against it.
-    Mirrors the equivalent malformed-config tests already added for
-    fleet_dispatch.py. The repo must land in skipped_repos instead of crashing.
-    """
-    from charlie_work.fleet_registry import count_fleet_live_sessions
-
-    fleet_dir = tmp_path / ".fleet"
-    fleet_dir.mkdir(parents=True)
-    fleet_json = fleet_dir / "fleet.json"
-
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / ".git").mkdir()
-
-    state = repo / ".var" / "charlie-work"
-    state.mkdir(parents=True)
-
-    # Plant a malformed YAML file that yaml.safe_load cannot parse.
-    (repo / "orchestrator.config.yaml").write_text(
-        "devin:\n  sessions_dir: [unclosed\n",
-        encoding="utf-8",
-    )
-
-    registry_data = {
-        "version": 1,
-        "repos": {
-            "owner/repo": {
-                "repo_root": str(repo),
-                "name_with_owner": "owner/repo",
-                "config_path": str(repo / "orchestrator.config.yaml"),
-                "state_dir": str(state),
-                "first_seen": "2024-01-01T00:00:00Z",
-                "last_seen": "2024-01-01T00:00:00Z",
-            },
-        },
-    }
-    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
-    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
-
-    # Must not raise yaml.YAMLError; the repo is skipped + reported.
-    live_count, skipped_repos = count_fleet_live_sessions(None)
-
-    assert live_count == 0
-    assert "owner/repo" in skipped_repos
-    assert len(skipped_repos) == 1
-
-
 def test_concurrency_governor_result_enabled_property() -> None:
     """ConcurrencyGovernorResult.enabled property correctly reflects governor enabled state."""
     # Disabled (max_concurrent=0)
@@ -35012,6 +34698,7 @@ def test_dispatch_rework_approved_verdict_clears_rework_requested(tmp_path: Path
         decision="approved",
         summary="LGTM",
         comment=None,
+        verdict_provenance="fresh_llm_review",
     )
 
     # Verify the issue status is now "approved", not "rework_requested"
@@ -35068,7 +34755,9 @@ def test_dispatch_rework_routes_to_review_instead_of_relaunch_when_head_moved(
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
@@ -35108,6 +34797,300 @@ def test_dispatch_rework_routes_to_review_instead_of_relaunch_when_head_moved(
     assert any(e["kind"] == "rework_already_pushed" for e in state["events"])
 
 
+def test_dispatch_rework_launches_for_conflicted_pr_with_unknown_mergeable_pr_view(
+    tmp_path: Path,
+) -> None:
+    """Issue #1349 pr_view fallback: pr_list's ``mergeable`` can be UNKNOWN
+    (GitHub computes it asynchronously). When pr_list is indeterminate, the
+    #339 filter must re-check with a fresh pr_view before routing to review,
+    so a persistently-conflicting PR whose conflict only shows on pr_view is
+    still dispatched rather than deadlocked.
+    """
+
+    class PrViewConflictingGitHub(FakeGitHub):
+        def pr_view(self, number: int):
+            pr_copy = dict(super().pr_view(number))
+            # pr_list reports UNKNOWN; the authoritative pr_view reveals
+            # the conflict.
+            pr_copy["mergeable"] = "CONFLICTING"
+            pr_copy["mergeStateStatus"] = "DIRTY"
+            return pr_copy
+
+    config = _dispatch_rework_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = PrViewConflictingGitHub()
+    # pr_list's mergeable is UNKNOWN (not a definite CONFLICTING/MERGEABLE)
+    # and mergeStateStatus is CLEAN, so the pr_view fallback path is taken.
+    fake_gh.prs[0]["mergeable"] = "UNKNOWN"
+    fake_gh.prs[0]["mergeStateStatus"] = "CLEAN"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
+    )
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
+
+    fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+second"
+    )
+
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["routed_to_review"] == []
+    assert result.data["sessions"][0]["issue_number"] == 123
+    state = load_state(paths.state_file)
+    assert not any(e["kind"] == "rework_already_pushed" for e in state["events"])
+
+
+def test_dry_run_dispatch_rework_conflict_bypass_direct_conflicting(
+    tmp_path: Path,
+) -> None:
+    """Issue #1349 dry-run mirror: a rework candidate whose PR head moved with
+    a real content change AND whose PR is directly CONFLICTING/DIRTY in
+    ``pr_list`` must be classified as a launch candidate (not routed_to_review)
+    even under --dry-run. The dry-run path must only *report* the
+    classification without performing the dispatch or the review routing.
+    """
+    from charlie_work.janitor import _calculate_patch_id
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    fake_gh = ReworkGitHub()
+
+    reviewed_diff = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
+    )
+    reviewed_patch_id = _calculate_patch_id(reviewed_diff)
+    assert reviewed_patch_id, "fixture must produce a non-empty reviewed_patch_id"
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "status": "needs_rework",
+            "reviewed_head_sha": "sha-abc123",
+            "reviewed_patch_id": reviewed_patch_id,
+        }
+        save_state(paths.state_file, state)
+
+    live_diff = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+second"
+    live_patch_id = _calculate_patch_id(live_diff)
+    assert live_patch_id != reviewed_patch_id, (
+        "fixture must reproduce a genuine content change (distinct patch-ids)"
+    )
+    # Head advances with a real content change AND the PR is directly
+    # CONFLICTING/DIRTY in pr_list -- the conflict-bypass applies.
+    fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+    fake_gh.prs[0]["mergeable"] = "CONFLICTING"
+    fake_gh.prs[0]["mergeStateStatus"] = "DIRTY"
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = live_diff
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    routing_calls: list[tuple[int, int, str | None]] = []
+
+    def _spy_route_rework_candidate_to_review(
+        issue_number: int, pr_number: int, reviewed_head_sha_before: str | None
+    ):
+        routing_calls.append((issue_number, pr_number, reviewed_head_sha_before))
+        raise AssertionError(
+            "dry-run must not invoke _route_rework_candidate_to_review "
+            f"(called for issue {issue_number}, pr {pr_number})"
+        )
+
+    app._route_rework_candidate_to_review = _spy_route_rework_candidate_to_review  # type: ignore[method-assign]
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert "dry-run" in result.message.lower()
+    # The conflict-bypass keeps the issue as a launch candidate, NOT routed
+    # to the review lane.
+    assert result.data["routed_to_review"] == [], (
+        "dry-run must not report a conflict-bypassed candidate as routed_to_review"
+    )
+    assert result.data["selected_count"] == 1, (
+        "dry-run must report the conflict-bypassed candidate as dispatch-eligible"
+    )
+    assert result.data["sessions"][0]["issue_number"] == 123
+
+    # The routing helper was never invoked.
+    assert routing_calls == [], "dry-run must not invoke _route_rework_candidate_to_review"
+
+    # State must be unchanged.
+    with state_lock(paths.state_file):
+        final_state = load_state(paths.state_file)
+    assert final_state["issues"]["123"]["status"] == "rework_requested"
+    assert final_state["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
+    assert final_state["events"] == []
+
+    assert fake_gh.labels_added == [], "dry-run must not add GitHub labels"
+    assert fake_gh.labels_removed == [], "dry-run must not remove GitHub labels"
+
+
+def test_dry_run_dispatch_rework_conflict_bypass_unknown_mergeable_pr_view_fallback(
+    tmp_path: Path,
+) -> None:
+    """Issue #1349 dry-run mirror: when ``pr_list``'s ``mergeable`` is UNKNOWN
+    (indeterminate) and a fresh ``pr_view`` reveals the conflict, the dry-run
+    path must classify the candidate as a launch candidate (not
+    routed_to_review) via the pr_view fallback. The dry-run path must only
+    *report* the classification without performing the dispatch or the review
+    routing.
+    """
+    from charlie_work.janitor import _calculate_patch_id
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class PrViewConflictingGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+        def pr_view(self, number: int):
+            pr_copy = dict(super().pr_view(number))
+            # pr_list reports UNKNOWN; the authoritative pr_view reveals
+            # the conflict.
+            pr_copy["mergeable"] = "CONFLICTING"
+            pr_copy["mergeStateStatus"] = "DIRTY"
+            return pr_copy
+
+    fake_gh = PrViewConflictingGitHub()
+
+    reviewed_diff = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
+    )
+    reviewed_patch_id = _calculate_patch_id(reviewed_diff)
+    assert reviewed_patch_id, "fixture must produce a non-empty reviewed_patch_id"
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "status": "needs_rework",
+            "reviewed_head_sha": "sha-abc123",
+            "reviewed_patch_id": reviewed_patch_id,
+        }
+        save_state(paths.state_file, state)
+
+    live_diff = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+second"
+    live_patch_id = _calculate_patch_id(live_diff)
+    assert live_patch_id != reviewed_patch_id, (
+        "fixture must reproduce a genuine content change (distinct patch-ids)"
+    )
+    # pr_list's mergeable is UNKNOWN (not a definite CONFLICTING/MERGEABLE)
+    # and mergeStateStatus is CLEAN, so the pr_view fallback path is taken.
+    fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+    fake_gh.prs[0]["mergeable"] = "UNKNOWN"
+    fake_gh.prs[0]["mergeStateStatus"] = "CLEAN"
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = live_diff
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    routing_calls: list[tuple[int, int, str | None]] = []
+
+    def _spy_route_rework_candidate_to_review(
+        issue_number: int, pr_number: int, reviewed_head_sha_before: str | None
+    ):
+        routing_calls.append((issue_number, pr_number, reviewed_head_sha_before))
+        raise AssertionError(
+            "dry-run must not invoke _route_rework_candidate_to_review "
+            f"(called for issue {issue_number}, pr {pr_number})"
+        )
+
+    app._route_rework_candidate_to_review = _spy_route_rework_candidate_to_review  # type: ignore[method-assign]
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert "dry-run" in result.message.lower()
+    # The pr_view fallback detects the conflict, so the issue is kept as a
+    # launch candidate, NOT routed to the review lane.
+    assert result.data["routed_to_review"] == [], (
+        "dry-run must not report a pr_view-fallback conflict-bypassed "
+        "candidate as routed_to_review"
+    )
+    assert result.data["selected_count"] == 1, (
+        "dry-run must report the pr_view-fallback conflict-bypassed candidate as dispatch-eligible"
+    )
+    assert result.data["sessions"][0]["issue_number"] == 123
+
+    assert routing_calls == [], "dry-run must not invoke _route_rework_candidate_to_review"
+
+    with state_lock(paths.state_file):
+        final_state = load_state(paths.state_file)
+    assert final_state["issues"]["123"]["status"] == "rework_requested"
+    assert final_state["prs"]["456"]["reviewed_head_sha"] == "sha-abc123"
+    assert final_state["events"] == []
+
+    assert fake_gh.labels_added == [], "dry-run must not add GitHub labels"
+    assert fake_gh.labels_removed == [], "dry-run must not remove GitHub labels"
+
+
 def test_dispatch_rework_launches_when_head_matches_reviewed_sha(tmp_path: Path) -> None:
     """Regression pin (issue #339 acceptance criterion 2): dispatch_rework
     must still launch exactly as before when the PR head is unchanged since
@@ -35123,7 +35106,9 @@ def test_dispatch_rework_launches_when_head_matches_reviewed_sha(tmp_path: Path)
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Head is unchanged (still the default "sha-abc123") — genuinely outstanding.
     rework_prompt = pr_dir / "rework-prompt.md"
@@ -35157,7 +35142,9 @@ def test_dispatch_rework_skips_without_stranding_when_head_indeterminate(
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Head moves, but the diff fetch now fails — GitHub.pr_diff's real
     # allow_failure=True contract returns "" on failure, so an empty diff is
@@ -35208,7 +35195,9 @@ def test_dispatch_rework_launches_when_head_moved_by_sync_merge_only(tmp_path: P
     pr_dir.mkdir(parents=True, exist_ok=True)
     diff_text = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     fake_gh.diffs[456] = diff_text
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
@@ -35239,20 +35228,25 @@ def test_dispatch_rework_launches_when_head_moved_by_sync_merge_only(tmp_path: P
     assert (123, "agent:in-progress") in fake_gh.labels_added
 
 
-def test_dispatch_rework_head_moved_but_review_blocked_by_janitor_retries_next_pass(
+def test_dispatch_rework_dispatches_conflicted_pr_with_advanced_head_no_deadlock(
     tmp_path: Path,
 ) -> None:
-    """Issue #339 finding 1 (reviewer repro): a candidate whose PR head moved
-    with a real content change gets routed to review() — but if the PR is
-    CONFLICTING, review()'s deterministic janitor gate returns ok=False
-    *before* writing a packet or firing the review_started transition, and
-    without touching reviewed_head_sha. The routing helper must not
-    force-flip the issue's status to "reviewing" in that case: doing so would
-    desync state.json from GitHub reality (labels still say needs-rework, no
-    packet exists) and strand the issue outside dispatch_rework's own
-    candidate pool forever, with no automated recovery path. The issue must
-    stay rework_requested so the next pass retries (the janitor block is
-    often transient, e.g. a merge-train branch sync resolving the conflict).
+    """Issue #1349: a candidate whose PR head moved with a real content
+    change (live_patch_id != reviewed_patch_id) AND whose PR is
+    CONFLICTING/DIRTY must receive a rework worker, not be routed to
+    review(). Previously the #339 "already pushed" filter routed such a PR
+    to review(), whose janitor gate bounced it back to rework_requested
+    without writing a packet or touching reviewed_head_sha -- deadlocking
+    the issue between dispatch_rework and review() forever (the only exit
+    being the #765 stall escalation to a human, not a dispatch). The
+    "already pushed" inference is unsound in exactly this state: whatever
+    was pushed since the last verdict did NOT resolve the conflict the
+    rework was requested for, so the rework is still outstanding.
+
+    The desync guard the original #339 finding 1 test exercised (don't
+    force-flip status to "reviewing" when review() blocks without a packet)
+    is covered for the non-conflict case by
+    test_dispatch_rework_head_moved_but_review_blocked_by_janitor_does_not_flip_to_reviewing.
     """
     config = _dispatch_rework_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -35264,12 +35258,94 @@ def test_dispatch_rework_head_moved_but_review_blocked_by_janitor_retries_next_p
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
-    # Head advances with a real content change (routes to review) AND the PR
-    # is now conflicting (janitor blocks review() before any packet/label write).
+    # Head advances with a real content change (the #339 "already pushed"
+    # condition) AND the PR is now conflicting: the advance did not resolve
+    # the conflict, so the rework is still outstanding.
     fake_gh.prs[0]["headRefOid"] = "sha-new-head"
     fake_gh.prs[0]["mergeable"] = "CONFLICTING"
+    fake_gh.prs[0]["mergeStateStatus"] = "DIRTY"
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+second"
+    )
+
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    fake_gh.labels_added.clear()
+    fake_gh.labels_removed.clear()
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    # A rework worker is dispatched -- the conflicted PR is kept as a
+    # legitimate launch candidate, not routed to the review lane.
+    assert result.data["selected_count"] == 1
+    assert result.data["routed_to_review"] == []
+    assert result.data["review_blocked_retry"] == []
+    assert result.data["sessions"][0]["issue_number"] == 123
+    assert (123, "agent:in-progress") in fake_gh.labels_added
+
+    # The rework_already_pushed -> janitor-blocked -> rework_already_pushed
+    # cycle cannot recur: no rework_already_pushed event fires because the
+    # issue was never misrouted to review().
+    state = load_state(paths.state_file)
+    assert not any(e["kind"] == "rework_already_pushed" for e in state["events"])
+
+
+def test_dispatch_rework_head_moved_but_review_blocked_by_janitor_does_not_flip_to_reviewing(
+    tmp_path: Path,
+) -> None:
+    """Issue #339 finding 1 (non-conflict regression guard): a candidate whose
+    PR head moved with a real content change gets routed to review() — but if
+    review()'s deterministic janitor gate returns ok=False *before* writing a
+    packet or firing the review_started transition (here: a draft PR whose
+    ``gh pr ready`` fails), the routing helper must NOT force-flip the issue's
+    status to "reviewing". Doing so would desync state.json from GitHub
+    reality (labels still say needs-rework, no packet exists) and strand the
+    issue outside dispatch_rework's own candidate pool forever, with no
+    automated recovery path. The issue must stay rework_requested so the next
+    pass retries.
+
+    This is the non-conflict counterpart to
+    test_dispatch_rework_dispatches_conflicted_pr_with_advanced_head_no_deadlock:
+    that test covers the #1349 conflict-bypass (the PR never reaches
+    _route_rework_candidate_to_review); this test covers the #339 finding 1
+    desync guard (the PR DOES reach _route_rework_candidate_to_review, but
+    review() blocks without a packet). A draft PR is used as the non-conflict
+    janitor-block trigger so the #1349 conflict-bypass does not intercept it.
+    """
+    config = _dispatch_rework_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # ``gh pr ready`` must fail so the draft parks as janitor_blocked and
+    # review() returns ok=False without writing a packet. If it succeeded,
+    # the PR would be readied and the block would be transient (deferred to
+    # the next pass), not a durable janitor_blocked state.
+    fake_gh.pr_ready_ok = False
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
+    )
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
+
+    # Head advances with a real content change (routes to review) AND the PR
+    # is now a draft (janitor blocks review() before any packet/label write).
+    # mergeable=MERGEABLE so the #1349 conflict-bypass does not intercept
+    # this candidate — it must reach _route_rework_candidate_to_review.
+    fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+    fake_gh.prs[0]["isDraft"] = True
+    fake_gh.prs[0]["mergeable"] = "MERGEABLE"
+    fake_gh.prs[0]["mergeStateStatus"] = "CLEAN"
     fake_gh.pr_head_shas[456] = "sha-new-head"
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+second"
@@ -35320,7 +35396,9 @@ def test_dispatch_rework_skips_when_live_head_ref_oid_missing(tmp_path: Path) ->
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Live head is unavailable from the PR list response.
     fake_gh.prs[0]["headRefOid"] = None
@@ -35419,7 +35497,9 @@ def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path:
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
 
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Verify the decision was recorded
     with state_lock(paths.state_file):
@@ -35475,7 +35555,9 @@ def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path:
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
 
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Advance the PR head and change the diff (simulating actual content changes)
     fake_gh.prs[0]["headRefOid"] = "sha-new-head"
@@ -35496,10 +35578,11 @@ def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path:
 def test_review_does_not_clobber_escalated_label_on_head_advance(tmp_path: Path) -> None:
     """Issue #384: an escalated issue must stay terminal on re-review.
 
-    After record_review escalates an issue to agent:human-needed, a later
-    review() pass (e.g., from loop()) that sees a newly-advanced head must not
-    regenerate a packet or fire review_started, which would strip the human-needed
-    label and put the PR back into an active-automation state.
+    After record_review escalates an issue to agent:operator-queue (issue
+    #1266: max_rework_cycles_exceeded is mechanical), a later review() pass
+    (e.g., from loop()) that sees a newly-advanced head must not regenerate a
+    packet or fire review_started, which would strip the escalation label
+    and put the PR back into an active-automation state.
     """
     config = OrchestratorConfig()  # max_rework_cycles = 2
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -35509,22 +35592,30 @@ def test_review_does_not_clobber_escalated_label_on_head_advance(tmp_path: Path)
     # First request_changes (count = 1)
     fake_gh.pr_head_shas[456] = "1111111111111111111111111111111111111111"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 1"
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Second request_changes (count = 2)
     fake_gh.pr_head_shas[456] = "2222222222222222222222222222222222222222"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 2"
-    app.record_review(456, "request_changes", summary="fix B")
+    app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
 
     # Third request_changes (escalated)
     fake_gh.pr_head_shas[456] = "3333333333333333333333333333333333333333"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 3"
-    app.record_review(456, "request_changes", summary="fix C")
+    app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
 
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["prs"]["456"]["status"] == "escalated"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: max_rework_cycles_exceeded is mechanical, so it lands
+    # agent:operator-queue, not agent:human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
     # Clear label tracking to isolate the review() call
     fake_gh.labels_added.clear()
@@ -35536,9 +35627,9 @@ def test_review_does_not_clobber_escalated_label_on_head_advance(tmp_path: Path)
 
     result = app.review(456)
 
-    # review() must short-circuit and must not touch the human-needed label
+    # review() must short-circuit and must not touch the escalation label
     assert result.ok is True
-    assert (123, config.labels.human_needed) not in fake_gh.labels_removed
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_removed
     assert (123, config.labels.pr_open) not in fake_gh.labels_added
     assert (123, config.labels.reviewing) not in fake_gh.labels_added
 
@@ -35569,17 +35660,23 @@ def test_review_short_circuits_escalated_issue_less_pr(tmp_path: Path) -> None:
     # First request_changes (count = 1)
     fake_gh.pr_head_shas[456] = "1111111111111111111111111111111111111111"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 1"
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Second request_changes (count = 2)
     fake_gh.pr_head_shas[456] = "2222222222222222222222222222222222222222"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 2"
-    app.record_review(456, "request_changes", summary="fix B")
+    app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
 
     # Third request_changes (escalated)
     fake_gh.pr_head_shas[456] = "3333333333333333333333333333333333333333"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 3"
-    result = app.record_review(456, "request_changes", summary="fix C")
+    result = app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
     assert result.data["escalated"] is True
 
     state = load_state(paths.state_file)
@@ -35895,977 +35992,6 @@ def test_is_throttled_checks_against_current_time(tmp_path: Path) -> None:
     assert is_throttled(state) is False
 
 
-def _quota_probe_app(
-    tmp_path: Path, *, interval_minutes: int = 15, enabled: bool = True
-) -> OrchestratorApp:
-    from charlie_work.config import QuotaProbeConfig
-
-    config = OrchestratorConfig(
-        quota_probe=QuotaProbeConfig(enabled=enabled, interval_minutes=interval_minutes)
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
-    return OrchestratorApp(tmp_path, paths, config, FakeGitHub())
-
-
-def test_maybe_probe_quota_recovery_noop_when_nothing_throttled(tmp_path: Path) -> None:
-    from charlie_work import workflow as workflow_module
-
-    app = _quota_probe_app(tmp_path)
-
-    def _fail_if_called(**_kwargs: object) -> bool:
-        raise AssertionError("run_quota_probe must not be called when nothing is throttled")
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
-    try:
-        app._maybe_probe_quota_recovery()
-    finally:
-        monkeypatch.undo()
-
-    state = load_state(app.paths.state_file)
-    assert state.get("quota_probe", {}).get("next_probe_at") is None
-
-
-def test_maybe_probe_quota_recovery_disarms_stale_schedule_when_throttle_cleared(
-    tmp_path: Path,
-) -> None:
-    """A cooldown can expire naturally (root throttled_until passes) between
-    passes, before the flat-interval probe schedule fires. The next pass
-    must disarm the now-stale schedule rather than probing needlessly."""
-    from charlie_work.state import arm_quota_probe, save_state
-
-    app = _quota_probe_app(tmp_path)
-    state = load_state(app.paths.state_file)
-    state = arm_quota_probe(state, "2026-08-01T00:00:00Z")
-    save_state(app.paths.state_file, state)
-
-    app._maybe_probe_quota_recovery()
-
-    state = load_state(app.paths.state_file)
-    assert state.get("quota_probe", {}).get("next_probe_at") is None
-
-
-def test_maybe_probe_quota_recovery_arms_on_first_pass_without_probing(tmp_path: Path) -> None:
-    from datetime import UTC, datetime
-
-    from charlie_work import workflow as workflow_module
-    from charlie_work.state import save_state, set_throttled_until
-
-    app = _quota_probe_app(tmp_path, interval_minutes=15)
-    future = (
-        (datetime.now(UTC) + timedelta(hours=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
-    save_state(app.paths.state_file, state)
-
-    def _fail_if_called(**_kwargs: object) -> bool:
-        raise AssertionError("first pass after onset must arm, not probe")
-
-    # frozen_now (issue #828) is injected so the schedule assertion below is
-    # exact instead of racing wall-clock time under CI runner contention --
-    # no downstream real-clock-dependent step follows in this test, so no
-    # offset is needed (contrast test_loop_classifies_dead_sessions_...,
-    # which offsets +1h because a later dispatch() reads real wall clock).
-    frozen_now = datetime.now(UTC)
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
-    try:
-        app._maybe_probe_quota_recovery(now=frozen_now)
-    finally:
-        monkeypatch.undo()
-
-    state = load_state(app.paths.state_file)
-    next_probe_at = state["quota_probe"]["next_probe_at"]
-    expected = (
-        (frozen_now + timedelta(minutes=15))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    assert next_probe_at == expected
-
-
-def test_maybe_probe_quota_recovery_waits_until_due(tmp_path: Path) -> None:
-    from datetime import UTC, datetime
-
-    from charlie_work import workflow as workflow_module
-    from charlie_work.state import arm_quota_probe, save_state, set_throttled_until
-
-    app = _quota_probe_app(tmp_path)
-    future = (
-        (datetime.now(UTC) + timedelta(hours=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
-    not_due = (
-        (datetime.now(UTC) + timedelta(minutes=10))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = arm_quota_probe(state, not_due)
-    save_state(app.paths.state_file, state)
-
-    def _fail_if_called(**_kwargs: object) -> bool:
-        raise AssertionError("must not probe before the scheduled time")
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
-    try:
-        app._maybe_probe_quota_recovery()
-    finally:
-        monkeypatch.undo()
-
-    state = load_state(app.paths.state_file)
-    assert state["quota_probe"]["next_probe_at"] == not_due
-
-
-def test_maybe_probe_quota_recovery_green_clears_all_throttles(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    from datetime import UTC, datetime
-
-    from charlie_work import workflow as workflow_module
-    from charlie_work.state import (
-        arm_quota_probe,
-        save_state,
-        set_reviewer_quota_exhausted,
-        set_throttled_until,
-    )
-
-    app = _quota_probe_app(tmp_path)
-    future = (
-        (datetime.now(UTC) + timedelta(hours=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = set_throttled_until(
-        load_state(app.paths.state_file), future, reason="rate_limited", adapter_kind="claude-code"
-    )
-    state = set_reviewer_quota_exhausted(state, throttled_until=future, probe_after=future)
-    state = {
-        **state,
-        "reviewer_quota": {**state["reviewer_quota"], "consecutive_probe_failures": 3},
-    }
-    due = (
-        (datetime.now(UTC) - timedelta(minutes=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = arm_quota_probe(state, due)
-    save_state(app.paths.state_file, state)
-
-    calls: list[dict] = []
-
-    def _fake_probe(**kwargs: object) -> bool:
-        calls.append(kwargs)
-        return True
-
-    monkeypatch.setattr(workflow_module, "run_quota_probe", _fake_probe)
-
-    app._maybe_probe_quota_recovery()
-
-    assert len(calls) == 1
-    assert calls[0]["repo_root"] == tmp_path
-    state = load_state(app.paths.state_file)
-    assert state["throttled_until"] is None
-    assert "throttled_until" not in state.get("reviewer_quota", {})
-    assert state.get("quota_probe", {}).get("next_probe_at") is None
-    assert any(e["kind"] == "quota_probe_succeeded" for e in state["events"])
-    assert state["reviewer_quota"]["consecutive_probe_failures"] == 0
-
-
-def test_maybe_probe_quota_recovery_red_reschedules_flat_interval_and_keeps_throttle(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    from datetime import UTC, datetime
-
-    from charlie_work import workflow as workflow_module
-    from charlie_work.state import arm_quota_probe, save_state, set_throttled_until
-
-    app = _quota_probe_app(tmp_path, interval_minutes=15)
-    future = (
-        (datetime.now(UTC) + timedelta(hours=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
-    due = (
-        (datetime.now(UTC) - timedelta(minutes=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = arm_quota_probe(state, due)
-    save_state(app.paths.state_file, state)
-
-    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
-
-    # frozen_now (issue #828) injected for an exact schedule assertion; no
-    # downstream real-clock dependency follows, so no offset is needed.
-    frozen_now = datetime.now(UTC)
-    app._maybe_probe_quota_recovery(now=frozen_now)
-
-    state = load_state(app.paths.state_file)
-    # Flat interval: rescheduled ~15 minutes out again, not a growing backoff.
-    next_probe_at = state["quota_probe"]["next_probe_at"]
-    expected = (
-        (frozen_now + timedelta(minutes=15))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    assert next_probe_at == expected
-    assert state["throttled_until"] == future
-    assert any(e["kind"] == "quota_probe_failed" for e in state["events"])
-
-
-def test_maybe_probe_quota_recovery_red_also_defers_reviewer_probe(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A red flat probe must also bump reviewer_quota.probe_after so
-    dispatch_reviews's probe_mode gate defers instead of independently
-    launching a real reviewer session into the same still-closed window
-    (issue #663)."""
-    from datetime import UTC, datetime
-
-    from charlie_work import workflow as workflow_module
-    from charlie_work.state import (
-        arm_quota_probe,
-        is_reviewer_probe_ready,
-        save_state,
-        set_reviewer_quota_exhausted,
-        set_throttled_until,
-    )
-
-    app = _quota_probe_app(tmp_path, interval_minutes=15)
-    future = (
-        (datetime.now(UTC) + timedelta(hours=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
-    # Reviewer quota exhausted with probe_after in the past (ready to probe).
-    state = set_reviewer_quota_exhausted(
-        state, throttled_until=future, probe_after="2020-01-01T00:00:00Z"
-    )
-    due = (
-        (datetime.now(UTC) - timedelta(minutes=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = arm_quota_probe(state, due)
-    save_state(app.paths.state_file, state)
-
-    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
-
-    app._maybe_probe_quota_recovery()
-
-    state = load_state(app.paths.state_file)
-    next_probe_at = state["quota_probe"]["next_probe_at"]
-    # probe_after must now be bumped to the flat probe's next attempt, so
-    # dispatch_reviews's is_reviewer_probe_ready returns False.
-    assert state["reviewer_quota"]["probe_after"] == next_probe_at
-    assert is_reviewer_probe_ready(state) is False
-    # consecutive_probe_failures is not touched by the flat probe.
-    assert state["reviewer_quota"].get("consecutive_probe_failures", 0) == 0
-
-
-def test_maybe_probe_quota_recovery_red_does_not_shorten_existing_backoff(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """If the reviewer quota's own exponential backoff already pushed
-    probe_after further out than the flat probe's interval, a red flat
-    probe must not shorten it (issue #663)."""
-    from datetime import UTC, datetime
-
-    from charlie_work import workflow as workflow_module
-    from charlie_work.state import (
-        arm_quota_probe,
-        save_state,
-        set_reviewer_quota_exhausted,
-        set_throttled_until,
-    )
-
-    app = _quota_probe_app(tmp_path, interval_minutes=15)
-    future = (
-        (datetime.now(UTC) + timedelta(hours=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    far_future = (
-        (datetime.now(UTC) + timedelta(hours=4))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
-    state = set_reviewer_quota_exhausted(state, throttled_until=future, probe_after=far_future)
-    due = (
-        (datetime.now(UTC) - timedelta(minutes=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = arm_quota_probe(state, due)
-    save_state(app.paths.state_file, state)
-
-    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
-
-    app._maybe_probe_quota_recovery()
-
-    state = load_state(app.paths.state_file)
-    # probe_after stays at the existing (further-out) backoff target.
-    assert state["reviewer_quota"]["probe_after"] == far_future
-
-
-def test_maybe_probe_quota_recovery_red_skips_reviewer_probe_when_only_root_throttled(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A red flat probe must not write reviewer_quota.probe_after when the
-    reviewer quota is not exhausted -- only the root throttle is active
-    (issue #663)."""
-    from datetime import UTC, datetime
-
-    from charlie_work import workflow as workflow_module
-    from charlie_work.state import arm_quota_probe, save_state, set_throttled_until
-
-    app = _quota_probe_app(tmp_path, interval_minutes=15)
-    future = (
-        (datetime.now(UTC) + timedelta(hours=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = set_throttled_until(
-        load_state(app.paths.state_file), future, reason="rate_limited", adapter_kind="claude-code"
-    )
-    due = (
-        (datetime.now(UTC) - timedelta(minutes=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = arm_quota_probe(state, due)
-    save_state(app.paths.state_file, state)
-
-    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
-
-    app._maybe_probe_quota_recovery()
-
-    state = load_state(app.paths.state_file)
-    # No reviewer_quota.probe_after written -- reviewer quota was not exhausted.
-    assert "probe_after" not in state.get("reviewer_quota", {})
-
-
-def test_maybe_probe_quota_recovery_disabled_config_never_probes(tmp_path: Path) -> None:
-    from datetime import UTC, datetime
-
-    from charlie_work import workflow as workflow_module
-    from charlie_work.state import save_state, set_throttled_until
-
-    app = _quota_probe_app(tmp_path, enabled=False)
-    future = (
-        (datetime.now(UTC) + timedelta(hours=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
-    save_state(app.paths.state_file, state)
-
-    def _fail_if_called(**_kwargs: object) -> bool:
-        raise AssertionError("disabled quota_probe must never call run_quota_probe")
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
-    try:
-        app._maybe_probe_quota_recovery()
-    finally:
-        monkeypatch.undo()
-
-    state = load_state(app.paths.state_file)
-    assert state.get("quota_probe", {}).get("next_probe_at") is None
-
-
-def test_maybe_probe_quota_recovery_never_arms_for_provider_auth_throttle(
-    tmp_path: Path,
-) -> None:
-    """A dead key does not self-heal within minutes, and ``clear_quota_throttles``
-    deliberately leaves a provider_auth-reasoned root throttle untouched even
-    on a green probe. The probe must therefore never arm for one in the first
-    place -- arming/probing a throttle that can never be cleared would just
-    burn a Haiku session every ``interval_minutes`` for the whole cooldown
-    window with no possible benefit."""
-    from datetime import UTC, datetime
-
-    from charlie_work import workflow as workflow_module
-    from charlie_work.state import save_state, set_throttled_until
-
-    app = _quota_probe_app(tmp_path)
-    future = (
-        (datetime.now(UTC) + timedelta(hours=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = set_throttled_until(
-        load_state(app.paths.state_file),
-        future,
-        reason="provider_auth",
-        adapter_kind="claude-code",
-    )
-    save_state(app.paths.state_file, state)
-
-    def _fail_if_called(**_kwargs: object) -> bool:
-        raise AssertionError("provider_auth throttle must never arm the probe")
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
-    try:
-        app._maybe_probe_quota_recovery()
-    finally:
-        monkeypatch.undo()
-
-    state = load_state(app.paths.state_file)
-    assert state.get("quota_probe", {}).get("next_probe_at") is None
-    assert state["throttled_until"] == future
-    assert state["throttle_reason"] == "provider_auth"
-
-
-def test_maybe_probe_quota_recovery_never_arms_for_non_claude_code_adapter_throttle(
-    tmp_path: Path,
-) -> None:
-    """A devin/api-adapter throttle is not cleared by a claude-code ambient
-    probe (different tool/credential entirely -- see
-    ``clear_quota_throttles``), so the probe must never arm for one."""
-    from datetime import UTC, datetime
-
-    from charlie_work import workflow as workflow_module
-    from charlie_work.state import save_state, set_throttled_until
-
-    app = _quota_probe_app(tmp_path)
-    future = (
-        (datetime.now(UTC) + timedelta(hours=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = set_throttled_until(
-        load_state(app.paths.state_file),
-        future,
-        reason="rate_limited",
-        adapter_kind="devin",
-    )
-    save_state(app.paths.state_file, state)
-
-    def _fail_if_called(**_kwargs: object) -> bool:
-        raise AssertionError("devin-adapter throttle must never arm the probe")
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
-    try:
-        app._maybe_probe_quota_recovery()
-    finally:
-        monkeypatch.undo()
-
-    state = load_state(app.paths.state_file)
-    assert state.get("quota_probe", {}).get("next_probe_at") is None
-    assert state["throttled_until"] == future
-    assert state["throttle_adapter_kind"] == "devin"
-
-
-def _reclamation_app(
-    tmp_path: Path,
-    *,
-    enabled: bool = True,
-    interval_minutes: int = 60,
-    dry_run: bool = False,
-) -> OrchestratorApp:
-    from charlie_work.config import WorktreeReclamationConfig
-
-    config = OrchestratorConfig(
-        worktree_reclamation=WorktreeReclamationConfig(
-            enabled=enabled, interval_minutes=interval_minutes
-        )
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
-    return OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=dry_run)
-
-
-def test_worktree_reclamation_config_defaults() -> None:
-    from charlie_work.config import WorktreeReclamationConfig
-
-    wr = WorktreeReclamationConfig()
-    assert wr.enabled is True
-    assert wr.interval_minutes == 60
-
-
-def test_worktree_reclamation_config_absent_block_defaults_enabled(tmp_path: Path) -> None:
-    path = tmp_path / "c.yaml"
-    path.write_text("labels:\n  ready: automated-ready\n", encoding="utf-8")
-
-    config = load_config(path)
-
-    assert config.worktree_reclamation.enabled is True
-    assert config.worktree_reclamation.interval_minutes == 60
-
-
-def test_worktree_reclamation_config_parses(tmp_path: Path) -> None:
-    path = tmp_path / "c.yaml"
-    path.write_text(
-        "worktree_reclamation:\n  enabled: true\n  interval_minutes: 30\n",
-        encoding="utf-8",
-    )
-
-    config = load_config(path)
-
-    assert config.worktree_reclamation.enabled is True
-    assert config.worktree_reclamation.interval_minutes == 30
-
-
-def test_worktree_reclamation_config_rejects_non_int_interval(tmp_path: Path) -> None:
-    path = tmp_path / "c.yaml"
-    path.write_text("worktree_reclamation:\n  interval_minutes: soon\n", encoding="utf-8")
-
-    with pytest.raises(ConfigError, match="interval_minutes"):
-        load_config(path)
-
-
-def test_worktree_reclamation_config_rejects_zero_interval(tmp_path: Path) -> None:
-    path = tmp_path / "c.yaml"
-    path.write_text("worktree_reclamation:\n  interval_minutes: 0\n", encoding="utf-8")
-
-    with pytest.raises(ConfigError, match="interval_minutes"):
-        load_config(path)
-
-
-def test_is_worktree_reclamation_due_when_no_schedule() -> None:
-    from charlie_work.state import is_worktree_reclamation_due
-
-    # An absent schedule means "never run yet" -> due, so the first fleet pass
-    # after startup clears the existing backlog (issue #636).
-    assert is_worktree_reclamation_due({}) is True
-    assert is_worktree_reclamation_due({"worktree_reclamation": {}}) is True
-
-
-def test_is_worktree_reclamation_due_false_for_future_schedule() -> None:
-    from datetime import UTC, datetime
-
-    from charlie_work.state import is_worktree_reclamation_due, schedule_worktree_reclamation
-
-    future = (
-        (datetime.now(UTC) + timedelta(hours=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = schedule_worktree_reclamation({}, future)
-
-    assert is_worktree_reclamation_due(state) is False
-
-
-def test_is_worktree_reclamation_due_true_for_past_schedule() -> None:
-    from datetime import UTC, datetime
-
-    from charlie_work.state import is_worktree_reclamation_due, schedule_worktree_reclamation
-
-    past = (
-        (datetime.now(UTC) - timedelta(minutes=5))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    state = schedule_worktree_reclamation({}, past)
-
-    assert is_worktree_reclamation_due(state) is True
-
-
-def test_is_worktree_reclamation_due_treats_malformed_as_due() -> None:
-    from charlie_work.state import is_worktree_reclamation_due, schedule_worktree_reclamation
-
-    state = schedule_worktree_reclamation({}, "not-a-timestamp")
-
-    # A corrupt value must not wedge reclamation off forever.
-    assert is_worktree_reclamation_due(state) is True
-
-
-def test_maybe_reclaim_worktrees_disabled_returns_none(tmp_path: Path) -> None:
-    from charlie_work import workflow as workflow_module
-
-    app = _reclamation_app(tmp_path, enabled=False)
-
-    def _fail_if_called(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("disabled reclamation must never call clean_worktrees")
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(workflow_module, "clean_worktrees", _fail_if_called)
-    try:
-        assert app._maybe_reclaim_worktrees() is None
-    finally:
-        monkeypatch.undo()
-
-    state = load_state(app.paths.state_file)
-    assert state.get("worktree_reclamation", {}).get("next_run_at") is None
-
-
-def test_maybe_reclaim_worktrees_not_due_does_not_sweep(tmp_path: Path) -> None:
-    from datetime import UTC, datetime
-
-    from charlie_work import workflow as workflow_module
-    from charlie_work.state import save_state, schedule_worktree_reclamation
-
-    app = _reclamation_app(tmp_path, interval_minutes=60)
-    future = (
-        (datetime.now(UTC) + timedelta(hours=1))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    save_state(app.paths.state_file, schedule_worktree_reclamation({}, future))
-
-    def _fail_if_called(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("must not sweep before the scheduled interval elapses")
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(workflow_module, "clean_worktrees", _fail_if_called)
-    try:
-        assert app._maybe_reclaim_worktrees() is None
-    finally:
-        monkeypatch.undo()
-
-    # Schedule is untouched when not due.
-    state = load_state(app.paths.state_file)
-    assert state["worktree_reclamation"]["next_run_at"] == future
-
-
-def test_maybe_reclaim_worktrees_dry_run_threads_and_removes_nothing(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A --dry-run fleet pass must run the sweep in preview mode, which removes
-    nothing (the preview-vs-act class tracked in #614-#619). ``dry_run`` is
-    threaded from the app into ``clean_worktrees``."""
-    from charlie_work import workflow as workflow_module
-    from charlie_work.worktree import WorktreeCleanResult
-
-    app = _reclamation_app(tmp_path, dry_run=True)
-
-    calls: list[dict] = []
-
-    def _fake_clean(*args: object, **kwargs: object) -> WorktreeCleanResult:
-        calls.append({"args": args, "kwargs": kwargs})
-        return WorktreeCleanResult(
-            ok=True,
-            message="worktree-clean (dry-run): 2 eligible, 0 skipped, 0 orphan(s)",
-            data={
-                "planned": [{"worktree": "a"}, {"worktree": "b"}],
-                "removed": [],
-                "skipped": [],
-                "failed": [],
-                "orphans": {"planned": [], "removed": [], "failed": []},
-                "venv_ok": True,
-                "venv_message": "ok",
-                "attention_events": [],
-            },
-        )
-
-    monkeypatch.setattr(workflow_module, "clean_worktrees", _fake_clean)
-
-    summary = app._maybe_reclaim_worktrees()
-
-    assert summary is not None
-    assert len(calls) == 1
-    # dry_run is threaded honestly into the sweep.
-    assert calls[0]["kwargs"]["dry_run"] is True
-    # The canonical resolved worktrees root is passed -- not a manual
-    # re-derivation -- so this call site can never diverge from dispatch's
-    # and `charlie worktree-clean`'s (the create/sweep split documented in
-    # layout.py's module docstring, "74-uncollected-worktrees").
-    assert calls[0]["args"][1] == app.layout.worktrees
-    # A preview removes nothing.
-    assert summary["removed"] == 0
-    assert summary["planned"] == 2
-    assert summary["dry_run"] is True
-    # The schedule is advanced even in dry-run: clean_worktrees makes its
-    # live `gh pr view` fan-out unconditionally (dry_run only gates the final
-    # `git worktree remove`), so the cadence gate's cost is identical in both
-    # modes and must be rate-limited in both.
-    state = load_state(app.paths.state_file)
-    assert state["worktree_reclamation"]["next_run_at"] is not None
-    # An event was emitted so the preview is observable.
-    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
-    assert len(events) == 1
-    assert events[0]["payload"]["dry_run"] is True
-    assert events[0]["payload"]["planned"] == 2
-    assert events[0]["payload"]["removed"] == 0
-
-
-def test_maybe_reclaim_worktrees_runs_and_emits_event(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A live (non-dry-run) pass runs the sweep, records a
-    ``worktrees_reclaimed`` event with the counts, and advances the cadence
-    schedule (issue #636: a maintenance action that leaves no trace is
-    indistinguishable from one that never ran -- lesson from #595/#621)."""
-    from datetime import UTC, datetime
-
-    from charlie_work import workflow as workflow_module
-    from charlie_work.worktree import WorktreeCleanResult
-
-    app = _reclamation_app(tmp_path, interval_minutes=60)
-
-    def _fake_clean(*_args: object, **_kwargs: object) -> WorktreeCleanResult:
-        return WorktreeCleanResult(
-            ok=True,
-            message="worktree-clean: 3 removed, 1 skipped, 0 failed, 0 orphan(s)",
-            data={
-                "planned": [],
-                "removed": [{"issue_number": 1}, {"issue_number": 2}, {"issue_number": 3}],
-                "skipped": [{"issue_number": 4}],
-                "failed": [],
-                "orphans": {"planned": [], "removed": [], "failed": []},
-                "venv_ok": True,
-                "venv_message": "ok",
-                "attention_events": [],
-            },
-        )
-
-    monkeypatch.setattr(workflow_module, "clean_worktrees", _fake_clean)
-
-    # frozen_now (issue #828) injected so the schedule assertion below is
-    # exact instead of racing the sweep's own duration (or a CI stall
-    # between the schedule computation and this assertion). No downstream
-    # real-clock dependency follows in this test, so no offset is needed.
-    frozen_now = datetime.now(UTC)
-    summary = app._maybe_reclaim_worktrees(now=frozen_now)
-
-    assert summary is not None
-    assert summary["dry_run"] is False
-    assert summary["removed"] == 3
-    assert summary["skipped_count"] == 1
-    state = load_state(app.paths.state_file)
-    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
-    assert len(events) == 1
-    assert events[0]["payload"]["removed"] == 3
-    # The schedule was advanced ~interval_minutes into the future, so the very
-    # next pass does not re-fire the per-candidate gh fan-out.
-    next_run_at = state["worktree_reclamation"]["next_run_at"]
-    expected = (
-        (frozen_now + timedelta(minutes=60))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    assert next_run_at == expected
-
-
-def test_maybe_reclaim_worktrees_event_carries_skip_reasons(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Issue #1012: ``clean_worktrees`` computes a distinct ``reason`` string
-    per skipped worktree, but only ``skipped_count`` used to reach the durable
-    ``worktrees_reclaimed`` event. The full reason strings, plus the
-    out-of-scope/registered counts, must now survive into the persisted
-    payload -- an operator reading events.db, not live output, is the actual
-    consumer this event exists for."""
-    from charlie_work import workflow as workflow_module
-    from charlie_work.worktree import WorktreeCleanResult
-
-    app = _reclamation_app(tmp_path, interval_minutes=60)
-
-    skipped_entries = [
-        {
-            "worktree": "C:/wt/agent-issue-4",
-            "branch": "agent/issue-4",
-            "issue_number": 4,
-            "pr_number": 40,
-            "reason": "worktree HEAD (abc12345) is not contained in merged PR "
-            "head (def67890); stray post-merge commit(s)",
-        },
-        {
-            "worktree": "C:/wt/agent-issue-5",
-            "branch": "agent/issue-5",
-            "issue_number": 5,
-            "pr_number": 50,
-            "reason": "live worker detected: recorded PID 1234 is alive",
-        },
-    ]
-
-    def _fake_clean(*_args: object, **_kwargs: object) -> WorktreeCleanResult:
-        return WorktreeCleanResult(
-            ok=True,
-            message="worktree-clean: 0 removed, 2 skipped, 0 failed, 0 orphan(s)",
-            data={
-                "planned": [],
-                "removed": [],
-                "skipped": skipped_entries,
-                "failed": [],
-                "orphans": {"planned": [], "removed": [], "failed": []},
-                "venv_ok": True,
-                "venv_message": "ok",
-                "attention_events": [],
-                "worktrees_registered": 3,
-                "worktrees_out_of_scope": 1,
-            },
-        )
-
-    monkeypatch.setattr(workflow_module, "clean_worktrees", _fake_clean)
-
-    summary = app._maybe_reclaim_worktrees()
-
-    assert summary is not None
-    assert summary["skipped_count"] == 2
-    # The exact reason strings -- not just a count -- reach the summary.
-    assert summary["skipped_examples"] == skipped_entries
-    assert summary["worktrees_registered"] == 3
-    assert summary["worktrees_out_of_scope"] == 1
-
-    state = load_state(app.paths.state_file)
-    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
-    assert len(events) == 1
-    payload = events[0]["payload"]
-    # This is the load-bearing assertion: the durable event -- not just the
-    # in-memory summary -- carries the reasons. Before this fix, `payload`
-    # had no `skipped_examples` key at all.
-    assert payload["skipped_examples"] == skipped_entries
-    assert "stray post-merge commit(s)" in payload["skipped_examples"][0]["reason"]
-    assert "live worker detected" in payload["skipped_examples"][1]["reason"]
-    assert payload["worktrees_out_of_scope"] == 1
-
-    # The issue's actual complaint is that reconstructing "why" from events.db
-    # was impossible -- state.json's 200-entry array is a convenience cache,
-    # not the durable store an operator queries after the fact. Round-trip
-    # through the real SQLite dual-write (append_event -> events.db) via the
-    # same query_events() helper an operator would use, not just state.json.
-    db_events = query_events(app.paths.state_file, kind="worktrees_reclaimed")
-    assert len(db_events) == 1
-    db_payload = db_events[0]["payload"]
-    assert db_payload["skipped_examples"] == skipped_entries
-    assert "stray post-merge commit(s)" in db_payload["skipped_examples"][0]["reason"]
-    assert "live worker detected" in db_payload["skipped_examples"][1]["reason"]
-    assert db_payload["worktrees_out_of_scope"] == 1
-    assert db_payload["worktrees_registered"] == 3
-
-
-def test_maybe_reclaim_worktrees_skip_examples_truncated(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A standing backlog of skipped worktrees must not re-emit every reason
-    string into events.db on every cadence interval -- the same idiom as
-    ``_MAX_DEFERRED_CONCURRENCY_EXAMPLES`` (issue #1005). ``skipped`` stays
-    the exact count; ``skipped_examples`` is capped."""
-    from charlie_work import workflow as workflow_module
-    from charlie_work.workflow import _MAX_SKIPPED_WORKTREE_EXAMPLES
-    from charlie_work.worktree import WorktreeCleanResult
-
-    app = _reclamation_app(tmp_path, interval_minutes=60)
-
-    many_skipped = [
-        {
-            "worktree": f"C:/wt/agent-issue-{i}",
-            "branch": f"agent/issue-{i}",
-            "issue_number": i,
-            "pr_number": i * 10,
-            "reason": "PR not merged",
-        }
-        for i in range(_MAX_SKIPPED_WORKTREE_EXAMPLES + 7)
-    ]
-
-    def _fake_clean(*_args: object, **_kwargs: object) -> WorktreeCleanResult:
-        return WorktreeCleanResult(
-            ok=True,
-            message="worktree-clean: 0 removed, many skipped, 0 failed, 0 orphan(s)",
-            data={
-                "planned": [],
-                "removed": [],
-                "skipped": many_skipped,
-                "failed": [],
-                "orphans": {"planned": [], "removed": [], "failed": []},
-                "venv_ok": True,
-                "venv_message": "ok",
-                "attention_events": [],
-                "worktrees_registered": len(many_skipped) + 1,
-                "worktrees_out_of_scope": 1,
-            },
-        )
-
-    monkeypatch.setattr(workflow_module, "clean_worktrees", _fake_clean)
-
-    summary = app._maybe_reclaim_worktrees()
-
-    assert summary is not None
-    # The exact count is never truncated.
-    assert summary["skipped_count"] == len(many_skipped)
-    # The examples list IS truncated.
-    assert len(summary["skipped_examples"]) == _MAX_SKIPPED_WORKTREE_EXAMPLES
-    assert summary["skipped_examples"] == many_skipped[:_MAX_SKIPPED_WORKTREE_EXAMPLES]
-
-    state = load_state(app.paths.state_file)
-    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
-    assert len(events[0]["payload"]["skipped_examples"]) == _MAX_SKIPPED_WORKTREE_EXAMPLES
-    assert events[0]["payload"]["skipped_count"] == len(many_skipped)
-
-
-def test_maybe_reclaim_worktrees_advances_schedule_before_sweep(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The schedule is advanced BEFORE the sweep runs, so a sweep that errors
-    or takes longer than one poll interval cannot double-fire on the next
-    pass."""
-    from charlie_work import workflow as workflow_module
-    from charlie_work.worktree import WorktreeCleanResult
-
-    app = _reclamation_app(tmp_path, interval_minutes=60)
-
-    def _exploding_clean(*_args: object, **_kwargs: object) -> WorktreeCleanResult:
-        # Simulate a sweep that fails: the schedule must already have been
-        # advanced before this point.
-        state = load_state(app.paths.state_file)
-        assert state["worktree_reclamation"]["next_run_at"] is not None
-        return WorktreeCleanResult(
-            ok=False,
-            message="worktree-clean: 0 removed, 0 skipped, 1 failed",
-            data={
-                "planned": [],
-                "removed": [],
-                "skipped": [],
-                "failed": [{"worktree": "a"}],
-                "orphans": {"planned": [], "removed": [], "failed": []},
-                "venv_ok": True,
-                "venv_message": "ok",
-                "attention_events": [],
-            },
-        )
-
-    monkeypatch.setattr(workflow_module, "clean_worktrees", _exploding_clean)
-
-    summary = app._maybe_reclaim_worktrees()
-
-    assert summary is not None
-    assert summary["ok"] is False
-    assert summary["failed"] == 1
-    # A failed sweep still records an event (observability) and keeps the
-    # advanced schedule (no immediate retry storm).
-    state = load_state(app.paths.state_file)
-    assert state["worktree_reclamation"]["next_run_at"] is not None
-    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
-    assert len(events) == 1
-    assert events[0]["payload"]["failed"] == 1
-
-
 def _reconcile_pass_app(
     tmp_path: Path,
     *,
@@ -36930,6 +36056,7 @@ def test_loop_forwards_shared_now_to_cadence_gated_lanes(
         state_file: Path,
         config: OrchestratorConfig,
         *,
+        write_gate: object,
         now: datetime | None = None,
     ) -> list[dict[str, int]]:
         received["stalled_sessions"] = now
@@ -37730,6 +36857,157 @@ def test_parse_blockers_ignores_downstream_reference_to_self() -> None:
     assert parse_blockers(body) == []
 
 
+def test_parse_blockers_quoted_backtick_phrase_does_not_self_block() -> None:
+    """Issue #1454 regression: an issue whose body quotes ANOTHER issue's
+    blocker declaration inside a Markdown backtick code span must not be
+    classified as blocked by the quoted number.
+
+    Reproduces the #1927 incident shape: a bug report ABOUT the parser
+    flapping on #887/#888 quoted their trigger phrase on its own line, with
+    no preceding issue ref in the clause, so the old backward-only guard
+    could not suppress it and the describing issue self-gated on #886.
+    """
+    from charlie_work.github import parse_blockers
+
+    body = (
+        "## Symptom\n\n"
+        "The parser flaps on #887 and #888.\n\n"
+        "Their bodies contain the trigger phrase:\n\n"
+        "`blocked by #886`\n\n"
+        "which the parser reads as a self-declaration.\n"
+    )
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_quoted_double_quote_phrase_does_not_self_block() -> None:
+    """Issue #1454: a trigger phrase inside straight double quotes is quoted
+    prose, not a self-declaration."""
+    from charlie_work.github import parse_blockers
+
+    body = (
+        "## Symptom\n\n"
+        'The parser sees the literal phrase "blocked by #886" in #887\'s '
+        "body and misreads it as a self-declaration.\n"
+    )
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_forward_foreign_ref_does_not_self_block() -> None:
+    """Issue #1454: a match whose clause carries another #NNN AFTER it (e.g.
+    an issue-referencing parenthetical) describes that other issue, not this
+    one. The old guard only looked backward and missed this."""
+    from charlie_work.github import parse_blockers
+
+    body = (
+        "## Symptom\n\n"
+        "The trigger phrase blocked by #886 (see #887) appears verbatim in "
+        "the upstream body.\n"
+    )
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_genuine_declaration_still_gates() -> None:
+    """Issue #1454 regression: a genuine first-person blocker declaration
+    (the #887/#888 shape) must still gate. The quoted-phrase fix must not
+    suppress real declarations."""
+    from charlie_work.github import parse_blockers
+
+    assert parse_blockers("This issue is blocked by #743") == [743]
+    assert parse_blockers("Blocked by #743, #744") == [743, 744]
+    assert parse_blockers("Depends on #123") == [123]
+    assert parse_blockers("Blocked-by: #456") == [456]
+    # Genuine declaration with surrounding prose but no foreign issue ref.
+    body = "## Summary\n\nFix the parser.\n\nBlocked by #886\n"
+    assert parse_blockers(body) == [886]
+
+
+def test_parse_blockers_stray_backtick_elsewhere_does_not_swallow_declaration() -> None:
+    """Issue #1454 rework: an unrelated/unbalanced backtick ELSEWHERE in the
+    body must not pair with a later backtick to form a code span that
+    envelopes a genuine 'Blocked by #NNN' declaration and silently drop it.
+
+    The body below has a stray opening backtick on the first line and a
+    closing backtick on the last line. Against the whole-document span scan
+    (the pre-rework guard 1) the regex ``(`+)(.+?)(\\1)`` with re.DOTALL
+    matches one span whose content runs from "broken thing." through
+    "Blocked by #159" through "See also ", so the declaration is
+    misclassified as quoted prose and dropped -- a false negative. Scoping
+    the span search to the containing clause (bounded by newlines) leaves
+    the clause "Blocked by #159" with no backticks, so the declaration gates.
+    """
+    from charlie_work.github import parse_blockers
+
+    body = "TODO: fix the `broken thing.\nBlocked by #159\nSee also `foo`.\n"
+    assert parse_blockers(body) == [159]
+
+
+def test_parse_blockers_stray_double_quote_elsewhere_does_not_swallow_declaration() -> None:
+    """Issue #1454 rework: an unrelated/unbalanced straight double quote
+    ELSEWHERE in the body must not pair with a later quote to envelope a
+    genuine declaration. Same false-negative shape as the backtick case:
+    ``"([^"]*)"`` matches from the first quote to the next, swallowing the
+    declaration line in between when scanned over the whole document.
+    Scoping to the clause leaves "Blocked by #743" with no quotes, so it
+    gates.
+    """
+    from charlie_work.github import parse_blockers
+
+    body = 'The error was "connection refused.\nBlocked by #743\nThen it said "done".\n'
+    assert parse_blockers(body) == [743]
+
+
+def test_parse_blockers_fenced_code_block_does_not_self_gate() -> None:
+    """Issue #1454 rework round 2: a 'Blocked by #NNN' line inside a real
+    multi-line triple-backtick fenced code block (fence markers on separate
+    lines from the content) must NOT self-gate.
+
+    The clause-scoped inline span guard (round 1) cannot detect this: clause
+    bounds break on newlines, so the fenced content line ``blocked by #886``
+    is its own clause with no fence markers in it, and the declaration is
+    misclassified as a genuine self-declaration. The fenced-block check runs
+    against the full document with absolute offsets and suppresses it.
+    """
+    from charlie_work.github import parse_blockers
+
+    body = (
+        "## Symptom\n\n"
+        "The upstream issue's body contains:\n\n"
+        "```python\n"
+        "blocked by #886\n"
+        "```\n\n"
+        "which the parser used to misread as a self-declaration.\n"
+    )
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_fenced_code_block_tilde_fence_does_not_self_gate() -> None:
+    """Issue #1454 rework round 2: ``~~~`` fences are equivalent to triple-
+    backtick fences in CommonMark and must be detected the same way."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Example\n\n~~~\nblocked by #886\n~~~\n"
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_fenced_block_with_language_tag_does_not_self_gate() -> None:
+    """Issue #1454 rework round 2: an opening fence carrying an info string
+    (e.g. ```` ```bash ````) must still be recognized as a fence."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Repro\n\n```bash\n$ echo 'blocked by #886'\n```\n"
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_genuine_declaration_outside_fenced_block_still_gates() -> None:
+    """Issue #1454 rework round 2: a genuine declaration on a line OUTSIDE a
+    fenced block must still gate. The fenced-block guard must not over-suppress
+    real declarations that merely share a document with a fenced block."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Summary\n\nFix the parser.\n\n```python\nblocked by #886\n```\n\nBlocked by #743\n"
+    assert parse_blockers(body) == [743]
+
+
 def test_detect_prose_only_dependencies_do_not_dispatch_before() -> None:
     """Test detection of 'do not dispatch before' pattern (issue #225)."""
     from charlie_work.github import detect_prose_only_dependencies
@@ -38203,204 +37481,6 @@ def test_get_github_issue_dependencies_caches_successful_result_per_pass(
     gh.invalidate_list_cache()
     get_github_issue_dependencies(gh, 100)
     assert len(calls) == 3
-
-
-def test_cancel_superseded_runs_no_workflow_name(tmp_path: Path) -> None:
-    """Test that cancel_superseded_runs returns error when workflow_name is empty."""
-    from charlie_work.github import cancel_superseded_runs
-
-    fake_gh = FakeGitHub()
-    result = cancel_superseded_runs(fake_gh, "main", "")
-    assert result["errors"] == ["workflow_name is empty - cannot cancel runs"]
-    assert result["total_queued"] == 0
-    assert result["kept"] == 0
-    assert result["cancelled"] == 0
-
-
-def test_cancel_superseded_runs_no_queued_runs(tmp_path: Path) -> None:
-    """Test that cancel_superseded_runs handles no queued runs correctly."""
-    from charlie_work.github import cancel_superseded_runs
-
-    class FakeGitHubWithEmptyRuns(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.runs_response = []
-
-    fake_gh = FakeGitHubWithEmptyRuns()
-    result = cancel_superseded_runs(fake_gh, "main", "test-workflow")
-    assert result["total_queued"] == 0
-    assert result["kept"] == 0
-    assert result["cancelled"] == 0
-    assert result["cancelled_run_ids"] == []
-    assert result["errors"] == []
-
-
-def test_cancel_superseded_runs_one_queued_run(tmp_path: Path) -> None:
-    """Test that cancel_superseded_runs keeps the single queued run."""
-    from charlie_work.github import cancel_superseded_runs
-
-    class FakeGitHubWithOneRun(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.runs_response = [
-                {
-                    "databaseId": 123,
-                    "status": "queued",
-                    "createdAt": "2026-07-09T00:00:00Z",
-                    "headBranch": "main",
-                }
-            ]
-
-    fake_gh = FakeGitHubWithOneRun()
-    result = cancel_superseded_runs(fake_gh, "main", "test-workflow")
-    assert result["total_queued"] == 1
-    assert result["kept"] == 1
-    assert result["cancelled"] == 0
-    assert result["cancelled_run_ids"] == []
-    assert result["errors"] == []
-
-
-def test_cancel_superseded_runs_multiple_queued_runs(tmp_path: Path) -> None:
-    """Test that cancel_superseded_runs keeps newest and cancels older runs."""
-    from charlie_work.github import cancel_superseded_runs
-
-    class FakeGitHubWithMultipleRuns(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.runs_response = [
-                {
-                    "databaseId": 123,
-                    "status": "queued",
-                    "createdAt": "2026-07-09T00:00:00Z",
-                    "headBranch": "main",
-                },
-                {
-                    "databaseId": 124,
-                    "status": "queued",
-                    "createdAt": "2026-07-09T01:00:00Z",
-                    "headBranch": "main",
-                },
-                {
-                    "databaseId": 125,
-                    "status": "queued",
-                    "createdAt": "2026-07-09T02:00:00Z",
-                    "headBranch": "main",
-                },
-            ]
-            self.cancelled_runs = []
-
-        def run(self, args, *, json_output=False, allow_failure=False):
-            if "cancel" in args:
-                run_id = int(args[-1])
-                self.cancelled_runs.append(run_id)
-                return "Cancelled"
-            return super().run(args, json_output=json_output, allow_failure=allow_failure)
-
-    fake_gh = FakeGitHubWithMultipleRuns()
-    result = cancel_superseded_runs(fake_gh, "main", "test-workflow")
-    assert result["total_queued"] == 3
-    assert result["kept"] == 1
-    assert result["cancelled"] == 2
-    assert result["cancelled_run_ids"] == [124, 123]  # Oldest two cancelled
-    assert result["errors"] == []
-    # Verify the newest (125) was kept, older ones cancelled
-    assert 123 in fake_gh.cancelled_runs  # Oldest cancelled
-    assert 124 in fake_gh.cancelled_runs  # Middle cancelled
-    assert 125 not in fake_gh.cancelled_runs  # Newest kept
-
-
-def test_cancel_superseded_runs_ignores_in_progress(tmp_path: Path) -> None:
-    """Test that cancel_superseded_runs ignores in_progress runs."""
-    from charlie_work.github import cancel_superseded_runs
-
-    class FakeGitHubWithInProgress(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.runs_response = [
-                {
-                    "databaseId": 123,
-                    "status": "queued",
-                    "createdAt": "2026-07-09T00:00:00Z",
-                    "headBranch": "main",
-                },
-                {
-                    "databaseId": 124,
-                    "status": "in_progress",
-                    "createdAt": "2026-07-09T01:00:00Z",
-                    "headBranch": "main",
-                },
-            ]
-
-    fake_gh = FakeGitHubWithInProgress()
-    result = cancel_superseded_runs(fake_gh, "main", "test-workflow")
-    assert result["total_queued"] == 1  # Only queued runs counted
-    assert result["kept"] == 1
-    assert result["cancelled"] == 0
-    assert result["cancelled_run_ids"] == []
-    assert result["errors"] == []
-
-
-def test_cancel_superseded_runs_handles_cancel_error(tmp_path: Path) -> None:
-    """Test that cancel_superseded_runs handles individual cancel failures gracefully."""
-    from charlie_work.github import cancel_superseded_runs
-
-    class FakeGitHubWithCancelError(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.runs_response = [
-                {
-                    "databaseId": 123,
-                    "status": "queued",
-                    "createdAt": "2026-07-09T00:00:00Z",
-                    "headBranch": "main",
-                },
-                {
-                    "databaseId": 124,
-                    "status": "queued",
-                    "createdAt": "2026-07-09T01:00:00Z",
-                    "headBranch": "main",
-                },
-            ]
-
-        def run(self, args, *, json_output=False, allow_failure=False):
-            if "cancel" in args and args[-1] == "123":
-                # Simulate failure by returning None (allow_failure=True behavior)
-                return None
-            elif "cancel" in args:
-                # Other cancels succeed
-                return "Cancelled"
-            return super().run(args, json_output=json_output, allow_failure=allow_failure)
-
-    fake_gh = FakeGitHubWithCancelError()
-    result = cancel_superseded_runs(fake_gh, "main", "test-workflow")
-    assert result["total_queued"] == 2
-    assert result["kept"] == 1
-    assert result["cancelled"] == 0  # The only run to cancel (123) failed
-    assert result["cancelled_run_ids"] == []  # No successful cancels
-    assert len(result["errors"]) == 1
-    assert "Failed to cancel run 123" in result["errors"][0]
-
-
-def test_cancel_superseded_runs_handles_list_error(tmp_path: Path) -> None:
-    """Test that cancel_superseded_runs handles list API errors gracefully."""
-    from charlie_work.github import cancel_superseded_runs, GitHubError
-
-    class FakeGitHubWithListError(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-
-        def run(self, args, *, json_output=False, allow_failure=False):
-            if "run" in args and "list" in args:
-                raise GitHubError("List failed")
-            return super().run(args, json_output=json_output, allow_failure=allow_failure)
-
-    fake_gh = FakeGitHubWithListError()
-    result = cancel_superseded_runs(fake_gh, "main", "test-workflow")
-    assert result["total_queued"] == 0
-    assert result["kept"] == 0
-    assert result["cancelled"] == 0
-    assert len(result["errors"]) == 1
-    assert "GitHub API error" in result["errors"][0]
 
 
 def test_github_dependencies_unexpected_type_fail_open(tmp_path: Path) -> None:
@@ -39157,6 +38237,118 @@ def test_status_workers_not_killed_when_real_activity_probe_fresh(tmp_path: Path
     assert workers[0]["health"] == "healthy"
 
 
+@pytest.mark.real_activity_probe_live
+def test_status_workers_surfaces_corroboration_alive_but_polling(tmp_path: Path) -> None:
+    """Issue #1346: an alive-but-polling worker (stale sidecar log mtime, fresh
+    events.jsonl corroboration) must be visibly distinguishable from a genuinely
+    stalled one (stale log AND stale corroboration) in the status()/roll-call
+    workers section.
+
+    Both workers share the same stale sidecar log mtime -- the only signal a
+    log-mtime monitor sees -- so pre-#1346 they printed identically. After
+    #1346 the workers section carries the watchdog's corroboration probe
+    verdict (``last_corroborated_activity_at`` / ``last_corroborated_activity_source``
+    / ``corroboration_fresh``) alongside ``health``, all derived from the same
+    ``real_activity_probe_for`` + ``classify_worker_health`` code path the
+    watchdog uses. The alive-but-polling worker reports ``health="healthy"`` +
+    ``corroboration_fresh=True``; the stalled worker reports
+    ``health="stalled"`` + ``corroboration_fresh=False``.
+
+    Marked ``real_activity_probe_live`` so the autouse stale-probe stub fixture
+    leaves ``real_activity_probe_for`` unstubbed and the real events.jsonl
+    source is exercised.
+    """
+    from datetime import timedelta
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    fresh_time = datetime.now(UTC) - timedelta(minutes=1)
+
+    def _plant_claude_worker(issue_number: int, *, fresh_corroboration: bool) -> None:
+        log_path = sessions_dir / f"issue-{issue_number}.claude.log"
+        log_path.write_text("Working on task...\nLast line", encoding="utf-8")
+        # Stale sidecar log mtime for BOTH workers -- this is the signal that
+        # log-mtime monitors cannot disambiguate.
+        os.utime(log_path, (time.time(), old_time.timestamp()))
+
+        events_path = sessions_dir / f"issue-{issue_number}.events.jsonl"
+        ts = fresh_time if fresh_corroboration else old_time
+        events_path.write_text(
+            f'{{"type": "tool_call", "timestamp": "{ts.isoformat()}"}}\n',
+            encoding="utf-8",
+        )
+        os.utime(events_path, (time.time(), ts.timestamp()))
+
+        sidecar_path = sessions_dir / f"issue-{issue_number}.claude.json"
+        sidecar_path.write_text(
+            json.dumps(
+                {
+                    "issue_number": issue_number,
+                    "branch": f"agent/issue-{issue_number}",
+                    "worktree_path": str(tmp_path / f"worktree-{issue_number}"),
+                    "prompt_path": str(tmp_path / "prompt.md"),
+                    "command": ["claude", "prompt.md"],
+                    "pid": 70000 + issue_number,
+                    "started_at": (datetime.now(UTC) - timedelta(minutes=10)).isoformat(),
+                    "log_path": str(log_path),
+                    "error": None,
+                    "failure_kind": None,
+                    "process_start_time": 1710000000.0,
+                    "reclaimed": None,
+                    # last_activity_at is the sidecar's stored log mtime -- the
+                    # stale signal a log-mtime monitor reads. Both workers
+                    # carry the same stale value so the only disambiguator is
+                    # the corroboration probe.
+                    "last_activity_at": old_time.isoformat(),
+                    "log_bytes": len("Working on task...\nLast line"),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    # Worker 1346: alive-but-polling (stale log, fresh corroboration).
+    _plant_claude_worker(1346, fresh_corroboration=True)
+    # Worker 1347: genuinely stalled (stale log, stale corroboration).
+    _plant_claude_worker(1347, fresh_corroboration=False)
+
+    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+        result = app.status()
+
+    by_issue = {w["issue"]: w for w in result.data["workers"]}
+    assert set(by_issue) == {1346, 1347}
+
+    alive_polling = by_issue[1346]
+    # Acceptance criterion 1: visibly distinguishable. The stale log mtime is
+    # identical to the stalled worker's, but the corroboration fields differ.
+    assert alive_polling["health"] == "healthy"
+    assert alive_polling["corroboration_fresh"] is True
+    assert alive_polling["last_corroborated_activity_at"] is not None
+    assert alive_polling["last_corroborated_activity_source"] is not None
+
+    stalled = by_issue[1347]
+    # Acceptance criterion 3: stale-both classifies stalled.
+    assert stalled["health"] == "stalled"
+    assert stalled["corroboration_fresh"] is False
+
+    # The distinguishing signal: same stale last_activity_at (log mtime), but
+    # the corroboration fields diverge -- exactly the gap #1346 closes.
+    assert alive_polling["last_activity_at"] is not None
+    assert stalled["last_activity_at"] is not None
+    assert alive_polling["corroboration_fresh"] is not stalled["corroboration_fresh"]
+
+
 def test_status_workers_empty_when_no_live_sessions(tmp_path: Path) -> None:
     """Issue #167: workers section should be empty list when no live sessions exist."""
     config = OrchestratorConfig(
@@ -39344,7 +38536,7 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
     with (
         patch("charlie_work.devin_shell.read_session_records", return_value=[fake_record]),
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch(
             "charlie_work.workflow.sweep_orphan_processes",
             return_value=[{"pid": 3492, "name": "python.exe", "command_line": "python worker.py"}],
@@ -39357,7 +38549,9 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
         # Run the stall detection and handling
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        result = _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     # Check that the stalled issue was detected
     assert any(entry["issue"] == 109 for entry in result)
@@ -39459,12 +38653,14 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     before = datetime.now(UTC)
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        result = _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
     after = datetime.now(UTC)
 
     assert any(entry["issue"] == 1034 for entry in result)
@@ -39533,12 +38729,14 @@ def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path:
     before = datetime.now(UTC)
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     updated_sidecar = json.loads(sidecar.read_text(encoding="utf-8"))
     assert updated_sidecar["failure_kind"] == "quota_exhausted"
@@ -39585,12 +38783,14 @@ def test_stall_reap_falls_back_to_stalled_when_no_throttle_signature(tmp_path: P
 
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     updated_sidecar = json.loads(sidecar.read_text(encoding="utf-8"))
     assert updated_sidecar["failure_kind"] == "stalled"
@@ -39639,12 +38839,14 @@ def test_dispatch_defers_after_stall_reap_sets_throttled_until(tmp_path: Path) -
 
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
         # dispatch() re-runs the stall reaper unconditionally at its top (workflow.py
         # dispatch():~1180) before checking is_throttled — keep the same mocks active
@@ -39763,7 +38965,9 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _sweep_orphan_processes_for_dead_sessions(sessions_dir, paths.state_file, config)
+        _sweep_orphan_processes_for_dead_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     # Verify taskkill was called for the orphan PIDs
     assert len(taskkill_calls) == 3
@@ -39905,7 +39109,9 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
         # Run the stall detection and handling
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     # Check that is_session_alive was NOT called (detection skipped)
     mock_alive.assert_not_called()
@@ -39978,155 +39184,6 @@ def test_fleet_dir_platform_defaults() -> None:
     finally:
         if original is not None:
             os.environ["CHARLIE_WORK_FLEET_DIR"] = original
-
-
-def test_fleet_registry_touch_repo_first_call(tmp_path: Path) -> None:
-    """Test that touch_repo sets first_seen and last_seen on first registration."""
-    from charlie_work.fleet_registry import touch_repo
-    from charlie_work.github import GitHub
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir(parents=True, exist_ok=True)
-    paths = runtime_paths(repo_root, ".var/charlie-work")
-
-    # Mock GitHub that returns a nameWithOwner
-    class FakeGitHub(GitHub):
-        def name_with_owner(self) -> str:
-            return "owner/repo"
-
-    gh = FakeGitHub(repo_root=repo_root)
-
-    # Touch repo with isolated fleet dir
-    registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
-
-    assert "repos" in registry
-    assert "owner/repo" in registry["repos"]
-    entry = registry["repos"]["owner/repo"]
-    assert entry["repo_root"] == str(repo_root)
-    assert entry["name_with_owner"] == "owner/repo"
-    assert entry["config_path"] == str(repo_root / "orchestrator.config.yaml")
-    assert entry["state_dir"] == str(paths.root)
-    assert entry["first_seen"] == entry["last_seen"]  # First call: both equal
-
-
-def test_fleet_registry_touch_repo_second_call(tmp_path: Path) -> None:
-    """Test that touch_repo preserves first_seen and bumps last_seen on subsequent calls."""
-    from charlie_work.fleet_registry import touch_repo
-    from charlie_work.github import GitHub
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir(parents=True, exist_ok=True)
-    paths = runtime_paths(repo_root, ".var/charlie-work")
-
-    class FakeGitHub(GitHub):
-        def name_with_owner(self) -> str:
-            return "owner/repo"
-
-    gh = FakeGitHub(repo_root=repo_root)
-
-    # First call
-    registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
-    first_first_seen = registry["repos"]["owner/repo"]["first_seen"]
-    first_last_seen = registry["repos"]["owner/repo"]["last_seen"]
-
-    # Small delay to ensure timestamp difference (need >1s due to second resolution)
-    time.sleep(2.0)
-
-    # Second call
-    registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
-    second_first_seen = registry["repos"]["owner/repo"]["first_seen"]
-    second_last_seen = registry["repos"]["owner/repo"]["last_seen"]
-
-    assert second_first_seen == first_first_seen  # first_seen preserved
-    assert second_last_seen != first_last_seen  # last_seen bumped
-    assert second_last_seen > first_last_seen  # last_seen increased
-
-
-def test_fleet_registry_touch_repo_moved_repo(tmp_path: Path) -> None:
-    """Test that touch_repo updates repo_root when repo is moved."""
-    from charlie_work.fleet_registry import touch_repo
-    from charlie_work.github import GitHub
-
-    repo_root_old = tmp_path / "repo_old"
-    repo_root_old.mkdir(parents=True, exist_ok=True)
-    paths_old = runtime_paths(repo_root_old, ".var/charlie-work")
-
-    class FakeGitHub(GitHub):
-        def name_with_owner(self) -> str:
-            return "owner/repo"
-
-    gh_old = FakeGitHub(repo_root=repo_root_old)
-
-    # First registration
-    registry = touch_repo(str(tmp_path / "fleet"), repo_root_old, paths_old, gh_old)
-    first_first_seen = registry["repos"]["owner/repo"]["first_seen"]
-
-    # Move repo
-    repo_root_new = tmp_path / "repo_new"
-    repo_root_new.mkdir(parents=True, exist_ok=True)
-    paths_new = runtime_paths(repo_root_new, ".var/charlie-work")
-    gh_new = FakeGitHub(repo_root=repo_root_new)
-
-    # Re-register with new path
-    registry = touch_repo(str(tmp_path / "fleet"), repo_root_new, paths_new, gh_new)
-
-    # Should update repo_root but preserve first_seen (same nameWithOwner)
-    entry = registry["repos"]["owner/repo"]
-    assert entry["repo_root"] == str(repo_root_new)
-    assert entry["first_seen"] == first_first_seen  # Preserved on move
-
-
-def test_fleet_registry_touch_repo_gh_error(tmp_path: Path) -> None:
-    """Test that touch_repo silently skips registration on gh error."""
-    from charlie_work.fleet_registry import touch_repo
-    from charlie_work.github import GitHub, GitHubError
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir(parents=True, exist_ok=True)
-    paths = runtime_paths(repo_root, ".var/charlie-work")
-
-    class FakeGitHub(GitHub):
-        def name_with_owner(self) -> str:
-            raise GitHubError("gh not available")
-
-    gh = FakeGitHub(repo_root=repo_root)
-
-    # Should not raise, should return empty registry
-    registry = touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
-    assert registry == {"version": 1, "repos": {}}
-
-
-def test_fleet_registry_uses_state_lock(tmp_path: Path) -> None:
-    """Test that fleet_registry writes go through state.save_state."""
-    from charlie_work.fleet_registry import touch_repo
-    from charlie_work.github import GitHub
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir(parents=True, exist_ok=True)
-    paths = runtime_paths(repo_root, ".var/charlie-work")
-
-    class FakeGitHub(GitHub):
-        def name_with_owner(self) -> str:
-            return "owner/repo"
-
-    gh = FakeGitHub(repo_root=repo_root)
-
-    # Spy on save_state
-    from charlie_work.state import save_state
-
-    original_save_state = save_state
-    calls = []
-
-    def spy_save_state(path: Path, data: dict) -> dict:
-        calls.append(path)
-        return original_save_state(path, data)
-
-    with patch("charlie_work.fleet_registry.save_state", side_effect=spy_save_state):
-        touch_repo(str(tmp_path / "fleet"), repo_root, paths, gh)
-
-    # Verify save_state was called with fleet.json path
-    assert len(calls) == 1
-    assert calls[0] == tmp_path / "fleet" / "fleet.json"
 
 
 def test_global_config_no_global_file(tmp_path: Path) -> None:
@@ -40634,7 +39691,7 @@ def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monke
     # Mock _detect_and_handle_stalled_sessions to track call count
     stall_detection_calls = []
 
-    def mock_stall_detection(sessions_dir, state_file, config):
+    def mock_stall_detection(sessions_dir, state_file, config, *, write_gate):
         stall_detection_calls.append(1)
         return []  # No stalled sessions
 
@@ -40881,6 +39938,21 @@ def test_review_test_adequacy_unchanged_head_not_rerecorded(tmp_path: Path, monk
         "status": "rework_requested",
     }
     save_state(app.paths.state_file, state)
+
+    # Issue #1362 Stage 1: _check_no_op_rework now reads the last verdict
+    # from the file-first review_decision reader, not pr_state["decision"],
+    # so the live request_changes decision must exist on disk too.
+    pr_decision_dir = app.paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "reviewed_head_sha": "abc123abcdefabcdefabcdefabcdefabcdefabcd",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     # Second review on same head: janitor gate blocks (no-op rework check)
     # check_test_adequacy should NOT be called again
@@ -41151,14 +40223,18 @@ def test_fleet_status_isolates_broken_repo(
     args = cli.build_parser().parse_args(["fleet", "status"])
     result = cli.run_fleet_status(args)
 
-    # Verify error isolation
-    assert result.ok is False  # Errors present
-    assert "1 repo(s), 1 error(s)" in result.message
+    # Issue #1372: a repo whose repo_root does not exist is STALE, not a live
+    # failing lane. It is reported in a separate "stale" list that does NOT
+    # flip ok/exit-code, so one corpse cannot degrade fleet-wide tooling.
+    assert result.ok is True  # Stale entries do not flip the exit code
+    assert "1 repo(s)" in result.message
+    assert "1 stale(s)" in result.message
     assert len(result.data["repos"]) == 1
     assert "owner/repo_valid" in result.data["repos"]
-    assert len(result.data["errors"]) == 1
-    assert result.data["errors"][0]["repo_key"] == "owner/repo_broken"
-    assert "does not exist" in result.data["errors"][0]["error"]
+    # The broken repo is in stale, not errors.
+    assert len(result.data["errors"]) == 0
+    assert len(result.data["stale"]) == 1
+    assert result.data["stale"][0]["repo_key"] == "owner/repo_broken"
 
 
 def test_fleet_status_never_mutates(
@@ -41358,6 +40434,15 @@ def test_build_parser_fleet_subcommand() -> None:
     args_single = parser.parse_args(["review-queue"])
     assert args_single.command == "review-queue"
 
+    # Test fleet operator-queue parsing (issue #1314 item 1)
+    args_fleet_operator_queue = parser.parse_args(["fleet", "operator-queue"])
+    assert args_fleet_operator_queue.command == "fleet"
+    assert args_fleet_operator_queue.fleet_command == "operator-queue"
+
+    # Test single-repo operator-queue parsing (issue #1314 item 1)
+    args_operator_queue = parser.parse_args(["operator-queue"])
+    assert args_operator_queue.command == "operator-queue"
+
 
 def test_fleet_review_queue_aggregates_and_isolates_errors(tmp_path: Path, monkeypatch) -> None:
     """Issue #369: fleet review-queue aggregates per repo and isolates errors."""
@@ -41456,6 +40541,141 @@ def test_fleet_review_queue_aggregates_and_isolates_errors(tmp_path: Path, monke
     assert "does not exist" in result.data["errors"][0]["error"]
 
 
+def test_run_command_dispatches_operator_queue(tmp_path: Path) -> None:
+    """Issue #1314 item 1: ``run_command`` routes ``operator-queue`` to
+    ``app.operator_queue()`` and returns its result verbatim.
+
+    Mirrors the established convention that the CLI dispatch branch for a
+    queue command is exercised end-to-end through ``run_command`` rather than
+    only through the ``OrchestratorApp`` method in isolation — a broken
+    dispatch branch (wrong ``args.command`` string, missing branch) would
+    otherwise go undetected by the method-level tests.
+    """
+    args = cli.build_parser().parse_args(["operator-queue"])
+    assert args.command == "operator-queue"
+
+    dispatched: list[str] = []
+    expected = cli.CommandResult(
+        True, "operator queue: 0 issue(s) parked", {"queue": [], "depth": 0}
+    )
+
+    class _FakeApp:
+        def operator_queue(self) -> cli.CommandResult:
+            dispatched.append("operator_queue")
+            return expected
+
+    result = cli.run_command(_FakeApp(), args)  # type: ignore[arg-type]
+
+    assert dispatched == ["operator_queue"]
+    assert result is expected
+
+
+def test_fleet_operator_queue_aggregates_and_isolates_errors(tmp_path: Path, monkeypatch) -> None:
+    """Issue #1314 item 1: fleet operator-queue aggregates per repo and
+    isolates errors, mirroring ``test_fleet_review_queue_aggregates_and_isolates_errors``.
+
+    A broken repo (missing root) is isolated into ``errors`` while the good
+    repo's ``operator_queue()`` result still populates ``per_repo``, and
+    ``CommandResult.ok`` is False only because ``errors`` is non-empty.
+    """
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    repo_ok = tmp_path / "repo_ok"
+    repo_ok.mkdir()
+    config_ok = repo_ok / "orchestrator.config.yaml"
+    config_ok.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\n  operator_queue: agent:operator-queue\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo_ok / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Good repo: one issue carrying the operator_queue label, plus a state.json
+    # entry marking it a mechanical escalation with a terminal_since timestamp.
+    now = datetime.now(UTC)
+    terminal_since = (now - timedelta(days=2)).isoformat().replace("+00:00", "Z")
+    (repo_ok / ".var" / "charlie-work" / "state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "issues": {
+                    "42": {
+                        "number": 42,
+                        "status": "escalated",
+                        "reason_class": "mechanical",
+                        "escalation_reason": "test escalation",
+                        "terminal_since": terminal_since,
+                    }
+                },
+                "prs": {},
+                "events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo_ok": {
+                "repo_root": str(repo_ok),
+                "name_with_owner": "owner/repo_ok",
+                "config_path": str(config_ok),
+                "state_dir": str(repo_ok / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+            "owner/repo_broken": {
+                "repo_root": str(tmp_path / "nonexistent"),
+                "name_with_owner": "owner/repo_broken",
+                "config_path": str(tmp_path / "nonexistent" / "orchestrator.config.yaml"),
+                "state_dir": str(tmp_path / "nonexistent" / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    from charlie_work.github import GitHub
+
+    def mock_issue_list(self, labels=None, state=None):
+        return [
+            {
+                "number": 42,
+                "title": "issue 42",
+                "url": "https://example.test/issues/42",
+                "body": "",
+                "labels": [{"name": "agent:operator-queue"}],
+                "state": "OPEN",
+            }
+        ]
+
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    # run_fleet_operator_queue creates a real GitHub instance; short-circuit the
+    # field-list probe, which would otherwise require an authenticated ``gh`` CLI.
+    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
+
+    args = cli.build_parser().parse_args(["fleet", "operator-queue"])
+    result = cli.run_fleet_operator_queue(args)
+
+    assert result.ok is False
+    assert "1 repo(s), 1 error(s)" in result.message
+    # The good repo's queue still populated despite the broken repo's error.
+    ok_queue = result.data["repos"]["owner/repo_ok"]["queue"]
+    assert len(ok_queue) == 1
+    assert ok_queue[0]["number"] == 42
+    assert ok_queue[0]["reason_class"] == "mechanical"
+    assert ok_queue[0]["terminal_since"] == terminal_since
+    assert result.data["repos"]["owner/repo_ok"]["depth"] == 1
+    # The broken repo is isolated into errors, not mixed into per_repo.
+    assert len(result.data["errors"]) == 1
+    assert result.data["errors"][0]["repo_key"] == "owner/repo_broken"
+    assert "does not exist" in result.data["errors"][0]["error"]
+    assert "owner/repo_broken" not in result.data["repos"]
+
+
 def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
     """Test that loop() reaps stalled sessions even with zero ready/rework candidates (issue #165)."""
     from datetime import UTC, datetime, timedelta
@@ -41466,7 +40686,11 @@ def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    # Issue #1325: dry_run=True suppresses sidecar writes (failure_kind stays
+    # None), so this test must use dry_run=False to verify the sidecar is
+    # actually classified. The stalled PID (99999) does not exist, so
+    # kill_process_tree is a no-op — no real process is harmed.
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
 
     # Create a session record for issue 123 with a live PID and stale log
     sessions_dir = app._layout.sessions_dir
@@ -41890,19 +41114,54 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     # Escalated paths now consolidate on _escalate_issue and pass redispatch_at
     # through issue_extra, so direct entry["redispatch_at"] assignments only
     # remain in the non-escalated branches below.
+    #
+    # issue #1283 Phase A hazard (not in the recon's original list -- found by
+    # the full-suite run for this split): AST-based real-assignment count, not
+    # a raw substring count. `_windowed_redispatch_at`'s own docstring quotes
+    # ``entry["redispatch_at"]`` in prose ("Normalizes ``entry["redispatch_at"]``
+    # to a list of strings..."), and `.count()` over raw source text counted
+    # that quote as a 5th "call site" for as long as the docstring lived in
+    # workflow.py (confirmed: pre-split workflow.py already had exactly 4 real
+    # assignments + this 1 docstring quote = 5 -- the miscounting predates
+    # this extraction). Moving the function (and its docstring) to
+    # dispatch_selection.py dropped the naive count to 4 with zero change to
+    # any real write site -- a false regression signal, the opposite failure
+    # mode from AC7's hazard test but the same root cause (name/text search
+    # over source that doesn't distinguish code from prose). Both files are
+    # scanned and summed via real ast.Assign nodes so neither a docstring
+    # quote nor a future extraction of one of the three named call sites can
+    # produce a false pass or a false failure here.
+    import ast
 
-    import charlie_work.workflow as workflow_module
-    import inspect
+    workflow_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
+    dispatch_selection_path = (
+        Path(__file__).parents[1] / "src" / "charlie_work" / "dispatch_selection.py"
+    )
 
-    workflow_source = inspect.getsource(workflow_module)
+    def _count_redispatch_at_assignments(path: Path) -> int:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        count = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "entry"
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value == "redispatch_at"
+                ):
+                    count += 1
+        return count
 
-    # Count direct redispatch_at assignments to entry. After issue #750, the
-    # escalated call sites all route through _escalate_issue, so this count
-    # only covers non-escalated branches. Any unexpected increase means a new
-    # call site is writing redispatch_at.
-    redispatch_assignments = workflow_source.count('entry["redispatch_at"]')
-    assert redispatch_assignments == 5, (
-        f"Expected 5 redispatch_at assignments, found {redispatch_assignments}"
+    # Any unexpected increase means a new call site is writing redispatch_at.
+    redispatch_assignments = _count_redispatch_at_assignments(
+        workflow_path
+    ) + _count_redispatch_at_assignments(dispatch_selection_path)
+    assert redispatch_assignments == 4, (
+        'Expected 4 real entry["redispatch_at"] assignment statements across '
+        f"workflow.py and dispatch_selection.py, found {redispatch_assignments}"
     )
 
 
@@ -41929,6 +41188,7 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     # Mock GitHub to return an open PR for the issue
     class FakeGitHubForOrphan(FakeGitHub):
@@ -41952,7 +41212,9 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # Load state and verify the transition
     state = load_state(paths.state_file)
@@ -42023,6 +41285,7 @@ def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -42042,7 +41305,9 @@ def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1108"]
@@ -42086,6 +41351,7 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -42123,7 +41389,9 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -42221,7 +41489,9 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -42239,7 +41509,9 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
     assert entry["worker_pid"] == 99999
 
     # The ``escalated`` label edge must have been applied via transition().
-    assert (207, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: dead_dispatched_worker_reap is mechanical, so it lands
+    # agent:operator-queue, not agent:human-needed.
+    assert (207, config.labels.operator_queue) in fake_gh.labels_added
     assert (207, config.labels.in_progress) in fake_gh.labels_removed
 
     # A dedicated reap event must be recorded.
@@ -42254,6 +41526,244 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
     assert payload["reason"] == "dead_dispatched_worker_reap"
     assert payload["reap_minutes"] == 60
     assert payload["exit_code"] == 0
+
+
+def test_orphaned_worker_no_open_pr_mention_flag_reaped_after_grace(tmp_path: Path) -> None:
+    """Issue #1230: a dead dispatched worker with no open PR whose issue already
+    carries ``agent:human-needed`` (applied by a mention-flag escalation) is
+    invisible to the #417 ground-truth label reclaim (no active labels to
+    remove) and invisible to the redispatch cap (never re-dispatched because the
+    terminal label excludes it).  The no-open-PR drift branch sets
+    ``orphan_flagged_at`` but never set ``orphan_drift_at``, so the
+    ``dead_dispatched_reap_minutes`` time-based backstop — which keys off
+    ``orphan_drift_at`` — never fired.  The issue wedged in ``dispatched``
+    indefinitely: not dispatchable (status says a worker owns it), not
+    sweepable (status is not ``escalated``), and the label promises a human
+    review the state machine cannot act on.
+
+    The fix: the no-open-PR drift branch must also stamp ``orphan_drift_at`` so
+    the existing ``dead_dispatched_reap_minutes`` backstop converges the status
+    to ``escalated`` after the grace period, regardless of concurrent
+    label-side transitions.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Seed the jc #1421 shape: dispatched, dead PID, no open PR, and the issue
+    # already carries agent:human-needed from a mention-flag escalation
+    # (merged_pr_mention_flagged_at set).  No active labels are present, so the
+    # #417 reclaim is a no-op and the issue is excluded from dispatch.
+    state = load_state(paths.state_file)
+    state["issues"]["1421"] = {
+        "status": "dispatched",
+        "worker_pid": 45292,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2026-08-09T07:33:24Z",
+        "merged_pr_mention_flagged_at": "2026-08-10T12:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues = [
+        {
+            "number": 1421,
+            "title": "call_model cascade timeout",
+            "url": "https://example.test/issues/1421",
+            "body": "",
+            # Only the terminal human-needed label — no active labels.
+            "labels": [{"name": config.labels.human_needed}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    def _run_sweep() -> None:
+        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
+
+    # Pass 1: the no-open-PR drift branch fires (no active labels to reclaim,
+    # no pushed branch).  It must stamp orphan_drift_at so the time-based
+    # backstop can fire on a later pass.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("orphan_flagged_at") is not None
+    assert entry.get("orphan_drift_at") is not None, (
+        "no-open-PR drift branch must set orphan_drift_at so the "
+        "dead_dispatched_reap_minutes backstop can converge the wedge"
+    )
+    # Status is still dispatched — the grace period has not elapsed.
+    assert entry.get("status") == "dispatched"
+
+    # Simulate the grace period elapsing: rewind orphan_drift_at to 120 minutes
+    # ago (past the 60-minute reap window).
+    old_drift_at = (datetime.now(UTC) - timedelta(minutes=120)).isoformat().replace("+00:00", "Z")
+    st["issues"]["1421"]["orphan_drift_at"] = old_drift_at
+    save_state(paths.state_file, st)
+
+    # Pass 2: the dead_dispatched_reap_minutes backstop must fire and converge
+    # status to escalated, even though the escalation label is already present.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "dead_dispatched_worker_reap"
+    assert entry.get("reason_class") == "mechanical"
+
+    # The reap event must be recorded.
+    reaped_events = [
+        e for e in st.get("events", []) if e.get("kind") == "dead_dispatched_worker_reaped"
+    ]
+    assert len(reaped_events) == 1
+    payload = reaped_events[0]["payload"]
+    assert payload["issue_number"] == 1421
+    assert payload["previous_status"] == "dispatched"
+    assert payload["reason"] == "dead_dispatched_worker_reap"
+    assert payload["reap_minutes"] == 60
+
+
+def test_orphaned_worker_no_open_pr_already_flagged_backstop_backfills(tmp_path: Path) -> None:
+    """Issue #1230 regression: the real wedge precondition is an entry that was
+    flagged on a prior pass (``orphan_flagged_at`` set) but never received an
+    ``orphan_drift_at`` stamp -- either because it was flagged by a pre-#1230
+    build (which set only ``orphan_flagged_at``) or via the reclaim-success
+    branch (which deliberately omits ``orphan_drift_at``).  The original #1230
+    fix placed the ``orphan_drift_at`` stamp behind the
+    ``orphan_flagged_at`` early-return guard, so already-flagged entries hit
+    ``continue`` before the stamp was written and remained permanently
+    unreachable -- the backstop never armed and the issue never escalated.
+
+    The fix decouples the backfill from the guard: ``orphan_drift_at`` is
+    backfilled from ``orphan_flagged_at`` whenever it is missing, BEFORE the
+    duplicate-event guard's early-return.  This test seeds the exact wedge
+    precondition (``orphan_flagged_at`` set, ``orphan_drift_at`` absent, grace
+    period already elapsed) and verifies the backstop arms on the next sweep
+    pass and the issue escalates.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Seed the wedge precondition: orphan_flagged_at is set to 120 minutes ago
+    # (past the 60-minute reap grace) but orphan_drift_at is ABSENT.  This is
+    # the state a pre-#1230-flagged entry (or a reclaim-success entry that
+    # later fell through to the drift branch) would be in.
+    flagged_at = (datetime.now(UTC) - timedelta(minutes=120)).isoformat().replace("+00:00", "Z")
+    state = load_state(paths.state_file)
+    state["issues"]["1421"] = {
+        "status": "dispatched",
+        "worker_pid": 45292,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": (datetime.now(UTC) - timedelta(days=4))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "merged_pr_mention_flagged_at": (datetime.now(UTC) - timedelta(days=3))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "orphan_flagged_at": flagged_at,
+        # orphan_drift_at deliberately ABSENT -- the wedge precondition.
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues = [
+        {
+            "number": 1421,
+            "title": "call_model cascade timeout",
+            "url": "https://example.test/issues/1421",
+            "body": "",
+            # Only the terminal human-needed label -- no active labels, so the
+            # #417 reclaim is a no-op and the issue is excluded from dispatch.
+            "labels": [{"name": config.labels.human_needed}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    def _run_sweep() -> None:
+        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
+
+    # Pass 1: the drift branch is reached (no active labels to reclaim).  The
+    # duplicate-event guard sees orphan_flagged_at already set, but the
+    # backfill must run BEFORE the early-return so orphan_drift_at is armed.
+    # The backstop at the top of the loop already ran this pass with
+    # orphan_drift_at absent, so escalation cannot happen yet -- but the stamp
+    # must now be present for the next pass.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("orphan_drift_at") is not None, (
+        "already-flagged entry must have orphan_drift_at backfilled from "
+        "orphan_flagged_at so the backstop can arm on the next sweep pass"
+    )
+    # Backfill must use the original flag timestamp (not utc_now()) so an
+    # already-wedged entry converges immediately instead of waiting another
+    # full grace window.
+    assert entry.get("orphan_drift_at") == flagged_at
+    # The duplicate-event guard still suppresses the drift event -- no new
+    # orphaned_worker_drift for this issue on this pass.
+    drift_events = [
+        e
+        for e in st.get("events", [])
+        if e.get("kind") == "orphaned_worker_drift"
+        and e.get("payload", {}).get("issue_number") == 1421
+    ]
+    assert len(drift_events) == 0
+    # Status is still dispatched -- the backstop runs at the top of the loop,
+    # before the drift branch, so it could not fire this pass.
+    assert entry.get("status") == "dispatched"
+
+    # Pass 2: the backstop at the top of the loop now sees orphan_drift_at
+    # (backfilled to 120 minutes ago, past the 60-minute grace) and must
+    # escalate.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "dead_dispatched_worker_reap"
+    assert entry.get("reason_class") == "mechanical"
+
+    reaped_events = [
+        e for e in st.get("events", []) if e.get("kind") == "dead_dispatched_worker_reaped"
+    ]
+    assert len(reaped_events) == 1
+    payload = reaped_events[0]["payload"]
+    assert payload["issue_number"] == 1421
+    assert payload["previous_status"] == "dispatched"
+    assert payload["reason"] == "dead_dispatched_worker_reap"
+    assert payload["reap_minutes"] == 60
 
 
 def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -> None:
@@ -42292,6 +41802,18 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
     }
     save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the last-review-decision read in
+    # _detect_and_handle_orphaned_workers is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json,
+    # or it resolves to "missing" and misses the clean-exit-no-op fingerprint
+    # short-circuit this test is exercising.
+    pr_decision_dir = paths.prs / "pr-100"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "abc123"}),
+        encoding="utf-8",
+    )
+
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
             return [
@@ -42325,7 +41847,9 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -42412,7 +41936,9 @@ def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path) -> None:
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -42457,6 +41983,15 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
     }
     save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the decision
+    # must exist on disk (not just in state.json) for `.missing` to be False.
+    pr_decision_dir = paths.prs / "pr-100"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "abc123"}),
+        encoding="utf-8",
+    )
+
     class FakeGitHubForOrphan(FakeGitHub):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
@@ -42485,7 +42020,9 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # Issue 207 has a linked open PR (number 100), so no_pr_orphans is empty
     # and the bulk issue-list sweep must not run.
@@ -42518,6 +42055,7 @@ def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Pa
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -42552,7 +42090,9 @@ def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Pa
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -42604,6 +42144,7 @@ def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) 
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -42638,7 +42179,9 @@ def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -42686,6 +42229,7 @@ def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
         "reviewed_head_sha": "abc123",  # Old head
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     # Mock GitHub to return an open PR with changed head
     class FakeGitHubForOrphan(FakeGitHub):
@@ -42709,7 +42253,9 @@ def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # Load state and verify NO auto-reset
     state = load_state(paths.state_file)
@@ -42772,7 +42318,9 @@ def test_orphaned_worker_detection_with_live_pid(tmp_path: Path) -> None:
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # Load state and verify NO changes
     state = load_state(paths.state_file)
@@ -42818,6 +42366,7 @@ def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     # Mock GitHub to return an open PR
     class FakeGitHubForOrphan(FakeGitHub):
@@ -42845,7 +42394,9 @@ def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # Load state and verify it was treated as dead
     state = load_state(paths.state_file)
@@ -42898,7 +42449,9 @@ def test_orphaned_worker_detection_no_open_pr(tmp_path: Path) -> None:
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # Load state and verify NO status auto-reset
     state = load_state(paths.state_file)
@@ -42958,7 +42511,9 @@ def test_orphaned_worker_detection_no_open_pr_emits_once(tmp_path: Path) -> None
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
         for _ in range(3):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     state = load_state(paths.state_file)
     drift_events = [e for e in state.get("events", []) if e.get("kind") == "orphaned_worker_drift"]
@@ -42996,6 +42551,7 @@ def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_pat
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -43017,7 +42573,9 @@ def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_pat
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -43077,7 +42635,9 @@ def test_orphaned_worker_detection_bulk_sweep_excludes_pre_flagged(tmp_path: Pat
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     events = state.get("events", [])
@@ -43135,7 +42695,9 @@ def test_orphaned_worker_detection_bulk_sweep_does_not_flood_event_buffer(tmp_pa
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     events = state["events"]
@@ -43211,7 +42773,9 @@ def test_orphaned_worker_no_open_pr_completes_interrupted_reclaim(tmp_path: Path
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # The stale active label must have been removed -- this is exactly what
     # _is_dispatchable requires (ready present, no active label) for the
@@ -43250,7 +42814,9 @@ def test_orphaned_worker_no_open_pr_completes_interrupted_reclaim(tmp_path: Path
     fake_gh.labels_added = []
     fake_gh.labels_removed = []
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     assert fake_gh.labels_added == []
     assert fake_gh.labels_removed == []
@@ -43309,7 +42875,9 @@ def test_orphaned_worker_no_open_pr_reclaim_survives_label_api_failure(tmp_path:
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         # Pass 1: the gh API call fails.
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1176"]
@@ -43329,7 +42897,9 @@ def test_orphaned_worker_no_open_pr_reclaim_survives_label_api_failure(tmp_path:
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     assert (1176, config.labels.in_progress) in fake_gh.labels_removed
     assert (1176, config.labels.ready) in fake_gh.labels_added
@@ -43471,7 +43041,9 @@ def test_orphaned_worker_pushed_branch_opens_pr(tmp_path: Path) -> None:
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["935"]
@@ -43568,7 +43140,9 @@ def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(
     fake_gh = FakeGitHubForFailedPr()
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["935"]
@@ -43576,11 +43150,16 @@ def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(
     assert "pr_number" not in entry
 
     events = state.get("events", [])
-    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    # cw#1273: this specific reason now emits its own kind
+    # (pr_create_failed_branch_stranded) instead of the generic
+    # orphaned_worker_drift, after the bounded outer retry (3 attempts)
+    # exhausted -- see workflow.py's orphan-reap sweep.
+    drift_events = [e for e in events if e.get("kind") == "pr_create_failed_branch_stranded"]
     assert len(drift_events) == 1
     assert drift_events[0]["payload"]["reason"] == "dead_worker_branch_pushed_pr_create_failed"
     assert drift_events[0]["payload"]["pr_create_error"] is not None
     assert drift_events[0]["payload"]["worker_reported"] is True
+    assert drift_events[0]["payload"]["branch_name"] == branch
 
     # Must NOT emit the generic no-open-PR drift, which would cause re-dispatch.
     no_pr_events = [
@@ -43590,6 +43169,138 @@ def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(
         and e["payload"].get("reason") == "dead_worker_no_open_pr"
     ]
     assert not no_pr_events
+
+
+def test_orphaned_worker_pr_create_failed_stranded_drift_dedups_on_repeat_sweep(
+    tmp_path: Path,
+) -> None:
+    """cw#1273 AC4: a repeated ``pr_create_failed_branch_stranded`` terminal
+    for the same branch/error within one ``orphan_drift_fingerprint`` window
+    must emit only once -- proven by running the orphan-reap sweep twice
+    against state that still has no PR number and the same failing
+    ``gh pr create``, and asserting the event count stays at 1. This rides
+    the pre-existing ``_drift_fingerprint``/``orphan_drift_fingerprint``
+    dedup mechanism unchanged (see workflow.py's orphan-reap sweep) rather
+    than inventing a second dedup layer for the new event kind.
+    """
+    from unittest.mock import patch
+
+    from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.process_utils import (
+        worker_terminal_status_path,
+        write_worker_terminal_status,
+    )
+    from charlie_work.state import load_state, save_state
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    branch = "agent/issue-935-workers-push-a-finished-branch-but-cannot-open-t"
+    state = load_state(paths.state_file)
+    state["issues"]["935"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+        "branch_name": branch,
+    }
+    save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    terminal_path = worker_terminal_status_path(sessions_dir, 935, "claude")
+    write_worker_terminal_status(
+        terminal_path,
+        pid=1234,
+        exit_code=0,
+        started_at="2026-07-30T00:00:00Z",
+        ended_at="2026-07-30T00:05:00Z",
+        duration_seconds=300.0,
+        worker_outcome={
+            "push_succeeded": True,
+            "pr_created": False,
+            "error": "gh unauthenticated",
+        },
+    )
+
+    in_progress = config.labels.in_progress
+
+    class FakeGitHubForFailedPr(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(repo_root=tmp_path / "not-a-repo")
+            self.issues = [
+                {
+                    "number": 935,
+                    "title": "Workers push a finished branch but cannot open the PR",
+                    "url": "https://example.test/issues/935",
+                    "body": "Workers cannot open PRs because gh is unauthenticated.",
+                    "labels": [{"name": in_progress}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = []
+            self.pr_create_return = None  # PR create fails, every attempt, forever.
+
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForFailedPr()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["935"]
+    assert entry.get("status") == "dispatched"
+    assert "orphan_drift_fingerprint" in entry
+
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "pr_create_failed_branch_stranded"]
+    assert len(drift_events) == 1, (
+        f"expected exactly one pr_create_failed_branch_stranded event across two "
+        f"sweep passes within the same fingerprint window, got {len(drift_events)}"
+    )
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_branch_pushed_pr_create_failed"
+    assert drift_events[0]["payload"]["branch_name"] == branch
+
+    # Positive control: the assertion above is only meaningful if pass 2
+    # actually reached the emit site and was suppressed BY THE FINGERPRINT --
+    # not because some earlier state mutation from pass 1 (status, sidecar
+    # consumption, an unrelated early `continue`) made pass 2 exit before
+    # ever getting there. Clear `orphan_drift_fingerprint` -- the same
+    # "force re-observation" pattern this file already uses elsewhere (e.g.
+    # `test_orphaned_worker_drift_fingerprint_cleared_on_redispatch`) -- and
+    # sweep again: if the mechanism under test is real, this MUST produce a
+    # second event, since nothing else changed.
+    state = load_state(paths.state_file)
+    state["issues"]["935"].pop("orphan_drift_fingerprint", None)
+    save_state(paths.state_file, state)
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "pr_create_failed_branch_stranded"]
+    assert len(drift_events) == 2, (
+        f"expected a second pr_create_failed_branch_stranded event once the "
+        f"fingerprint was cleared (proving the sweep re-reaches the emit site "
+        f"and the first assertion's count==1 was real dedup, not an unrelated "
+        f"early exit), got {len(drift_events)}"
+    )
+    assert drift_events[1]["payload"]["branch_name"] == branch
 
 
 def test_classify_dead_sessions_no_open_pr_happy_path_reclaims_in_one_pass(
@@ -43653,7 +43364,7 @@ def test_classify_dead_sessions_no_open_pr_happy_path_reclaims_in_one_pass(
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     assert (99, config.labels.in_progress) in fake_gh.labels_removed
@@ -43718,7 +43429,9 @@ def test_orphaned_worker_no_open_pr_terminal_label_only_is_left_alone(tmp_path: 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # No GitHub label call at all -- not even a redundant re-add of a label
     # that was already there.
@@ -43797,7 +43510,7 @@ def test_classify_dead_sessions_terminal_label_only_is_left_alone(tmp_path: Path
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     assert fake_gh.labels_added == []
@@ -43946,132 +43659,6 @@ def test_supervisor_config_is_frozen() -> None:
         cfg.poll_interval_seconds = 99  # type: ignore[misc]
 
 
-# ---------------------------------------------------------------------------
-# PostMortemConfig tests (issue #261)
-# ---------------------------------------------------------------------------
-
-
-def test_post_mortem_config_defaults() -> None:
-    """PostMortemConfig defaults are stable and load_config picks them up.
-
-    Issue #260 (corrected premise) added a third default rule: "A tool was
-    rejected by the user" is the Devin CLI's own log/stdout surfacing of a
-    PreToolUse hook block — distinct from the "Tool blocked:" prefix that
-    appears in sessions.db message-node content — and drives
-    post_mortem.classify_and_record's log-tail fallback when the DB is
-    unavailable (see test_post_mortem.py's log-tail fallback tests).
-    """
-    config = load_config()
-    assert isinstance(config.post_mortem, PostMortemConfig)
-    assert config.post_mortem.enabled is True
-    assert config.post_mortem.db_path == ""
-    assert config.post_mortem.message_node_limit == 10
-    assert config.post_mortem.match_window_margin_seconds == 120
-    assert config.post_mortem.signature_rules == (
-        SignatureRule(pattern=r"Tool blocked:", kind="worker_blocked"),
-        SignatureRule(pattern=r"decision\s*:\s*block", kind="worker_blocked"),
-        SignatureRule(pattern=r"A tool was rejected by the user", kind="worker_blocked"),
-    )
-
-
-def test_post_mortem_config_parses_custom_values(tmp_path: Path) -> None:
-    """Custom post_mortem section values, including signature_rules, are parsed correctly."""
-    config_file = tmp_path / "orchestrator.config.yaml"
-    config_file.write_text(
-        """
-post_mortem:
-  enabled: false
-  db_path: "C:/custom/sessions.db"
-  message_node_limit: 5
-  match_window_margin_seconds: 30
-  signature_rules:
-    - pattern: "custom-block-signature"
-      kind: "worker_blocked"
-"""
-    )
-    config = load_config(config_file)
-    assert config.post_mortem.enabled is False
-    assert config.post_mortem.db_path == "C:/custom/sessions.db"
-    assert config.post_mortem.message_node_limit == 5
-    assert config.post_mortem.match_window_margin_seconds == 30
-    assert config.post_mortem.signature_rules == (
-        SignatureRule(pattern="custom-block-signature", kind="worker_blocked"),
-    )
-
-
-def test_post_mortem_config_unknown_key_raises(tmp_path: Path) -> None:
-    """Unknown keys in post_mortem section raise ConfigError."""
-    from charlie_work.config import ConfigError
-
-    config_file = tmp_path / "orchestrator.config.yaml"
-    config_file.write_text(
-        """
-post_mortem:
-  enabled: true
-  unknown_key: 99
-"""
-    )
-    with pytest.raises(ConfigError, match="unknown key"):
-        load_config(config_file)
-
-
-def test_post_mortem_config_wrong_type_raises(tmp_path: Path) -> None:
-    """Wrong types in post_mortem section raise ConfigError."""
-    from charlie_work.config import ConfigError
-
-    config_file = tmp_path / "orchestrator.config.yaml"
-    config_file.write_text(
-        """
-post_mortem:
-  message_node_limit: "not-an-int"
-"""
-    )
-    with pytest.raises(ConfigError, match="must be an int"):
-        load_config(config_file)
-
-
-def test_post_mortem_config_signature_rules_wrong_shape_raises(tmp_path: Path) -> None:
-    """signature_rules must be a list of {pattern, kind} mappings."""
-    from charlie_work.config import ConfigError
-
-    config_file = tmp_path / "orchestrator.config.yaml"
-    config_file.write_text(
-        """
-post_mortem:
-  signature_rules: "not-a-list"
-"""
-    )
-    with pytest.raises(ConfigError, match="must be a list"):
-        load_config(config_file)
-
-
-def test_post_mortem_config_signature_rule_bad_regex_raises(tmp_path: Path) -> None:
-    """An invalid regex pattern in a signature rule raises ConfigError."""
-    from charlie_work.config import ConfigError
-
-    config_file = tmp_path / "orchestrator.config.yaml"
-    config_file.write_text(
-        """
-post_mortem:
-  signature_rules:
-    - pattern: "["
-      kind: "worker_blocked"
-"""
-    )
-    with pytest.raises(ConfigError, match="not a valid regex"):
-        load_config(config_file)
-
-
-def test_post_mortem_config_is_frozen() -> None:
-    """PostMortemConfig is a frozen dataclass."""
-    import dataclasses
-
-    cfg = PostMortemConfig()
-    assert dataclasses.is_dataclass(cfg)
-    with pytest.raises((dataclasses.FrozenInstanceError, TypeError, AttributeError)):
-        cfg.enabled = False  # type: ignore[misc]
-
-
 def test_signature_rule_is_frozen() -> None:
     """SignatureRule is a frozen dataclass."""
     import dataclasses
@@ -44085,22 +43672,6 @@ def test_signature_rule_is_frozen() -> None:
 # ---------------------------------------------------------------------------
 # loop() additions: open_tracked_prs + same-head packet skip
 # ---------------------------------------------------------------------------
-
-
-def _make_loop_app(tmp_path: Path, *, prs: list[dict]) -> tuple[OrchestratorApp, FakeGitHub]:
-    """Build a minimal OrchestratorApp with the given open PRs for loop() tests."""
-    config = OrchestratorConfig(
-        cross_family=CrossFamilyConfig(enabled=False),
-        auto_merge=_approved_automerge(),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    # Ensure PRs passed into loop tests are treated as open even if callers omit state.
-    for pr in prs:
-        pr.setdefault("state", "OPEN")
-    fake_gh.prs = prs
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    return app, fake_gh
 
 
 def test_loop_open_tracked_prs_counted(tmp_path: Path) -> None:
@@ -44219,12 +43790,20 @@ def test_loop_undecided_head_moved_invokes_review(tmp_path: Path) -> None:
 def test_loop_undecided_same_head_skip_still_merges_on_approved_decision_file(
     tmp_path: Path,
 ) -> None:
-    """Regression for review finding #7: a same-head packet skip must still
-    check review-decision.json directly. An operator can write the decision
-    file without state.json reflecting it yet (the already_approved branch
-    only fires once state.json has caught up), so the approval must not stay
-    invisible until the head moves -- it should proceed straight to
-    merge_ready(), same as the decided path.
+    """Regression for review finding #7: an operator-written decision file
+    must not stay invisible until the head moves, even when state.json
+    hasn't caught up -- it should proceed straight to merge_ready(), same as
+    the decided path.
+
+    Pre-#1362 this was reached via the same-head packet-skip branch (which
+    re-checked the decision file directly as a fallback, incrementing
+    ``skipped_reviews``). Issue #1362 Stage 1 made ``already_approved``
+    itself file-first, so the file-only approval is now caught one branch
+    earlier -- ``already_approved`` is True immediately and routes straight
+    to ``merge_ready()`` without ever reaching the packet-skip branch, so
+    ``skipped_reviews`` stays 0. The observable guarantee this test protects
+    (the approval is not invisible; the PR merges) is unchanged; only which
+    internal branch reaches it is.
     """
     pr = {
         "number": 456,
@@ -44268,8 +43847,11 @@ def test_loop_undecided_same_head_skip_still_merges_on_approved_decision_file(
     result = app.loop(limit=0)
 
     # Packet regeneration is still skipped (review() never called)...
-    assert result.data["skipped_reviews"] == 1
     assert 456 not in review_calls
+    # Issue #1362 Stage 1: already_approved is file-first, so this approval
+    # is caught before the packet-skip branch runs at all -- skipped_reviews
+    # stays 0 rather than incrementing (see docstring above).
+    assert result.data["skipped_reviews"] == 0
     # ...but the approval is not left invisible: merge_ready() fires.
     assert len(result.data["merges"]) == 1
     assert result.data["merges"][0]["merged"] is True
@@ -44394,7 +43976,9 @@ def test_classify_dead_sessions_salvages_completed_unpublished_work(
     ]
     gh.pr_create_return = 101
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     # Branch pushed and PR created
     remote_refs = _git(remote, "show-ref")
@@ -44416,8 +44000,11 @@ def test_classify_dead_sessions_salvages_completed_unpublished_work(
     assert events[0]["payload"]["pr_number"] == 101
 
 
-def test_classify_dead_sessions_dirty_worktree_relabels_to_ready(tmp_path: Path) -> None:
-    """Issue #252: a dirty worktree is not salvaged; it relabels to ready."""
+def test_classify_dead_sessions_dirty_worktree_with_commits_salvaged(tmp_path: Path) -> None:
+    """Issue #1130: a dirty worktree that has commits ahead of base IS salvaged.
+    The committed work is pushed and a PR is opened; the working-tree dirt
+    (e.g. shim/scaffolding artifacts not in ``injected_paths``) is irrelevant
+    to the push and survives in the worktree for later inspection."""
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
@@ -44439,16 +44026,658 @@ def test_classify_dead_sessions_dirty_worktree_relabels_to_ready(tmp_path: Path)
     ]
     gh.pr_create_return = 101
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
-    # No PR created, active label removed, ready label added
-    assert not gh.prs_created
+    # Branch pushed and PR created — the committed work is salvaged.
+    remote_refs = _git(remote, "show-ref")
+    assert branch in remote_refs.stdout
+    assert len(gh.prs_created) == 1
+    assert gh.prs_created[0]["head"] == branch
+    # Labels moved to pr_open, not ready.
     assert (253, config.labels.in_progress) in gh.labels_removed
-    assert (253, config.labels.ready) in gh.labels_added
+    assert (253, config.labels.pr_open) in gh.labels_added
+    assert (253, config.labels.ready) not in gh.labels_added
 
     state = json.loads(state_file.read_text(encoding="utf-8"))
-    events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    events = [e for e in state["events"] if e["kind"] == "session_salvaged"]
     assert len(events) == 1
+    assert events[0]["payload"]["issue_number"] == 253
+
+
+def test_classify_dead_sessions_no_commits_relabels_to_ready_issue_1130(
+    tmp_path: Path,
+) -> None:
+    """Issue #1130: a dead session whose worktree has NO commits ahead of base
+    is not salvaged (there is nothing to push); it relabels to ready. This
+    guards the relaxed ``ahead_count > 0`` condition against false positives
+    on empty worktrees."""
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    branch = "agent/issue-1130-empty"
+    info = create_worktree(repo_root, branch, base_ref="origin/main")
+    worktree_path = info.path
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1130, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 1130,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1130",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 101
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
+
+    # No PR created — nothing to salvage.
+    assert not gh.prs_created
+    # Active label removed, ready label added — the ordinary relabel path.
+    assert (1130, config.labels.in_progress) in gh.labels_removed
+    assert (1130, config.labels.ready) in gh.labels_added
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    salvage_events = [e for e in state["events"] if e["kind"] == "session_salvaged"]
+    assert not salvage_events
+    relabel_events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    assert len(relabel_events) == 1
+
+
+def test_worktree_unsafe_launch_failure_with_commits_salvages_before_escalation(
+    tmp_path: Path,
+) -> None:
+    """Issue #1130: a ``worktree_unsafe`` launch failure whose worktree has
+    commits ahead of base must attempt salvage (push + PR) before escalating
+    to ``agent:human-needed``. Salvage-the-commit is the cheap safe action;
+    human adjudication is the fallback only when salvage fails."""
+
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state
+
+    now = datetime.now(UTC)
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    # Create a worktree with one commit beyond origin/main — the stranded
+    # work that ``worktree_unsafe`` refused to reset.
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1130)
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub(repo_root=repo_root)
+    fake_gh.issues = [
+        {
+            "number": 1130,
+            "title": "Salvage test",
+            "url": "https://example.test/issues/1130",
+            "body": "Salvage does not fire",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []  # No open PR.
+    fake_gh.pr_create_return = 200
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-1130.log"
+    log_path.write_text("worktree contains local work, cannot reset\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-1130.json"
+    record = SessionRecord(
+        issue_number=1130,
+        branch=branch,
+        worktree_path=str(worktree_path),
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Launch failure — process never started
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="worktree creation failed: worktree contains local work",
+        failure_kind="worktree_unsafe",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
+    )
+
+    # Salvage fired: branch pushed and PR created.
+    remote_refs = _git(remote, "show-ref")
+    assert branch in remote_refs.stdout
+    assert len(fake_gh.prs_created) == 1
+    assert fake_gh.prs_created[0]["head"] == branch
+
+    # Labels moved to pr_open, NOT human_needed.
+    assert (1130, config.labels.in_progress) in fake_gh.labels_removed
+    assert (1130, config.labels.pr_open) in fake_gh.labels_added
+    assert (1130, config.labels.human_needed) not in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    salvage_events = [e for e in state["events"] if e["kind"] == "session_salvaged"]
+    assert len(salvage_events) == 1
+    assert salvage_events[0]["payload"]["issue_number"] == 1130
+    # No escalation event.
+    escalate_events = [e for e in state["events"] if e["kind"] == "session_failed_escalated"]
+    assert not escalate_events
+
+
+def test_worktree_unsafe_launch_failure_no_commits_still_escalates(
+    tmp_path: Path,
+) -> None:
+    """Issue #1130: a ``worktree_unsafe`` launch failure whose worktree has NO
+    commits ahead of base (e.g. dirty working tree with no commits) still
+    escalates to ``agent:human-needed``. Salvage is only attempted when there
+    is committed work to push."""
+
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state
+
+    now = datetime.now(UTC)
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    # A worktree with no commits ahead, just a dirty file.
+    branch = "agent/issue-1130-no-commits"
+    info = create_worktree(repo_root, branch, base_ref="origin/main")
+    worktree_path = info.path
+    (worktree_path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub(repo_root=repo_root)
+    fake_gh.issues = [
+        {
+            "number": 1130,
+            "title": "Salvage test",
+            "url": "https://example.test/issues/1130",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+    fake_gh.pr_create_return = 200
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-1130.log"
+    log_path.write_text("worktree contains local work, cannot reset\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-1130.json"
+    record = SessionRecord(
+        issue_number=1130,
+        branch=branch,
+        worktree_path=str(worktree_path),
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="worktree creation failed: worktree contains local work",
+        failure_kind="worktree_unsafe",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
+    )
+
+    # No salvage: no PR created.
+    assert not fake_gh.prs_created
+    # Escalation fired: a deterministic (mechanical) launch failure parks on
+    # operator_queue (issue #1266), not human_needed.
+    assert (1130, config.labels.operator_queue) in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    salvage_events = [e for e in state["events"] if e["kind"] == "session_salvaged"]
+    assert not salvage_events
+    escalate_events = [e for e in state["events"] if e["kind"] == "session_failed_escalated"]
+    assert len(escalate_events) == 1
+
+
+def test_phantom_live_worker_preserves_sidecar_for_dirty_worktree_with_commits(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #1130: a phantom live worker whose worktree is PARTIAL (dirty
+    working tree but commits ahead of base) must NOT have its sidecar reaped.
+    The committed work is salvageable; reaping the sidecar would destroy the
+    salvage path. This guards the relaxed ``ahead_count > 0`` preserve
+    condition against the previous ``COMPLETED``-only check."""
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1130, dirty=True)
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree_path),
+            prompt_path=str(worktree_path / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=8282,
+            started_at="2026-08-10T11:15:39Z",
+            log_path=str(tmp_path / "log"),
+            error="probe_error",
+            failure_kind="live_worker_redispatch_averted",
+            process_start_time=5_678_901.0,
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr_list = lambda: []
+    _original_issue_view = fake_gh.issue_view
+
+    def _patched_issue_view(number: int):
+        issue = _original_issue_view(number)
+        return {
+            **issue,
+            "labels": [
+                {"name": "automated-ready"},
+                {"name": "agent:in-progress"},
+            ],
+        }
+
+    fake_gh.issue_view = _patched_issue_view
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_path = sessions_dir / "issue-123.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 123,
+                "branch": branch,
+                "worktree_path": str(worktree_path),
+                "prompt_path": "",
+                "command": ["claude", "-p"],
+                "pid": 8282,
+                "started_at": "2026-08-10T11:15:39Z",
+                "log_path": str(tmp_path / "log"),
+                "error": "probe_error",
+                "failure_kind": "live_worker_redispatch_averted",
+                "process_start_time": 5_678_901.0,
+                "session_id": "test-session-1130",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": branch,
+        "worker_pid": 8282,
+        "worker_process_start_time": 5_678_901.0,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+    }
+    save_state(paths.state_file, seed)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+
+    # The phantom live worker is detected but the sidecar is PRESERVED.
+    assert result.data["phantom_live_worker_count"] == 1
+    assert sidecar_path.exists(), (
+        "Sidecar must not be reaped so the reaper lane can salvage the committed work"
+    )
+
+    # Labels are NOT stripped.
+    assert (123, "agent:in-progress") not in fake_gh.labels_removed
+    assert (123, "automated-ready") not in fake_gh.labels_removed
+
+    state = load_state(paths.state_file)
+    preserve_events = [
+        e
+        for e in state.get("events", [])
+        if e["kind"] == "session_failed_relabeled"
+        and e["payload"]["issue_number"] == 123
+        and e["payload"]["reason"] == "phantom_live_worker_completed_work_preserved"
+    ]
+    assert len(preserve_events) == 1
+
+
+def test_classify_dead_sessions_skips_salvage_when_issue_closed(tmp_path: Path) -> None:
+    """Issue #1221 (check 1): salvage refuses to open a PR when the linked
+    issue is already CLOSED. The dead session's snapshot is stale -- an
+    operator/sibling merged the work and closed the issue inside the staleness
+    window -- so salvage re-checks live issue state at fire time and downgrades
+    to a ``salvage_skipped_already_landed`` event instead of a vestigial PR.
+    """
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1221)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1221, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    # Closed issue still carrying an active label (the secondary defect in
+    # #1221): the active-label gate lets the lane proceed, and salvage's own
+    # closed-issue check must refuse the PR.
+    gh.issues = [
+        {
+            "number": 1221,
+            "title": "Salvage race",
+            "url": "https://example.test/issues/1221",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "CLOSED",
+        }
+    ]
+    gh.pr_create_return = 999  # would-be vestigial salvage PR
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
+
+    # No vestigial PR opened.
+    assert not gh.prs_created
+    # Active label is NOT stripped by the skip path (label cleanup is the
+    # reconcile lane's job); the issue is not re-dispatched.
+    assert (1221, config.labels.in_progress) not in gh.labels_removed
+    assert (1221, config.labels.ready) not in gh.labels_added
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    skip_events = [e for e in state["events"] if e["kind"] == "salvage_skipped_already_landed"]
+    assert len(skip_events) == 1
+    assert skip_events[0]["payload"]["issue_number"] == 1221
+    assert skip_events[0]["payload"]["reason"] == "issue_closed"
+    # The skip path does NOT remove labels -- the payload records active_labels
+    # (what the issue carried at skip time), not removed_labels.
+    assert "removed_labels" not in skip_events[0]["payload"]
+    assert skip_events[0]["payload"]["active_labels"] == [config.labels.in_progress]
+    # No session_salvaged event was emitted.
+    assert not [e for e in state["events"] if e["kind"] == "session_salvaged"]
+
+
+def test_classify_dead_sessions_skips_salvage_when_pr_merged(tmp_path: Path) -> None:
+    """Issue #1221 (check 2): salvage refuses to open a PR when a PR binding to
+    the issue is already MERGED, even if the GitHub issue is still OPEN (the
+    close event lags or the merge closed it after the snapshot)."""
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1221)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1221, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 1221,
+            "title": "Salvage race",
+            "url": "https://example.test/issues/1221",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    # A merged PR whose head ref binds to issue 1221 via the branch prefix.
+    gh.prs = [
+        {
+            "number": 1217,
+            "title": "Fix #1221",
+            "url": "https://example.test/pull/1217",
+            "headRefName": branch,
+            "baseRefName": "main",
+            "headRefOid": "sha-merged",
+            "body": "Closes #1221",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+    gh.pr_create_return = 999
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
+
+    assert not gh.prs_created
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    skip_events = [e for e in state["events"] if e["kind"] == "salvage_skipped_already_landed"]
+    assert len(skip_events) == 1
+    assert skip_events[0]["payload"]["issue_number"] == 1221
+    assert skip_events[0]["payload"]["reason"] == "pr_merged"
+    assert "removed_labels" not in skip_events[0]["payload"]
+    assert skip_events[0]["payload"]["active_labels"] == [config.labels.in_progress]
+    assert not [e for e in state["events"] if e["kind"] == "session_salvaged"]
+
+
+def test_classify_dead_sessions_skips_salvage_when_branch_empty_diff(
+    tmp_path: Path,
+) -> None:
+    """Issue #1221 (check 3): salvage refuses to open a PR when the branch's
+    tree is identical to current main's tree -- the work already landed, so a
+    salvage PR would be vestigial.
+
+    Reproduces the exact race: ``inspect_worktree_state`` resolves its base
+    against a *stale* ``origin/main`` tracking ref (so it sees COMPLETED, ahead
+    of the old tip), while the live remote main has already advanced to include
+    the branch's work. Salvage fetches the live tip before opening a PR and
+    detects the empty tree diff.
+    """
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1221)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1221, branch, worktree_path)
+
+    # Push the worker branch so a second clone can merge it into main.
+    _git(repo_root, "push", "origin", branch)
+
+    # Advance origin/main to include the branch's work via a SECOND clone,
+    # leaving repo_root's origin/main tracking ref stale -- the race window
+    # between the merge landing and the dead session's staleness tripping.
+    clone2 = tmp_path / "clone2"
+    clone2.mkdir(parents=True, exist_ok=True)
+    _git(clone2, "init", "--initial-branch=main")
+    _git(clone2, "config", "user.email", "test@example.test")
+    _git(clone2, "config", "user.name", "Test User")
+    _git(clone2, "config", "commit.gpgSign", "false")
+    _git(clone2, "remote", "add", "origin", str(remote))
+    _git(clone2, "fetch", "origin")
+    _git(clone2, "merge", "--ff-only", f"origin/{branch}")
+    _git(clone2, "push", "origin", "main")
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 1221,
+            "title": "Salvage race",
+            "url": "https://example.test/issues/1221",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 999
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
+
+    # No vestigial PR: the branch contributes nothing beyond current main.
+    assert not gh.prs_created
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    skip_events = [e for e in state["events"] if e["kind"] == "salvage_skipped_already_landed"]
+    assert len(skip_events) == 1
+    assert skip_events[0]["payload"]["issue_number"] == 1221
+    assert skip_events[0]["payload"]["reason"] == "empty_diff"
+    assert "removed_labels" not in skip_events[0]["payload"]
+    assert skip_events[0]["payload"]["active_labels"] == [config.labels.in_progress]
+    assert not [e for e in state["events"] if e["kind"] == "session_salvaged"]
+
+
+def test_classify_dead_sessions_salvage_proceeds_when_merged_pr_search_fails(
+    tmp_path: Path,
+) -> None:
+    """Issue #1221 (check 2 fail-safe): when ``merged_prs_for_issue`` returns
+    ``ok=False``, salvage must NOT treat that as evidence of a merge. It falls
+    through to the empty-diff check (check 3) and, if the branch has real work,
+    opens a PR -- a human reviews salvage PRs anyway.
+
+    The result carries a non-empty list with ``ok=False`` so the test exercises
+    the ``ok`` flag specifically: without it, ``len(merged) > 0`` alone would
+    trigger ``pr_merged`` and suppress the PR.
+    """
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1221)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1221, branch, worktree_path)
+
+    config = OrchestratorConfig()
+
+    class FakeGitHubFailingMergeSearch(FakeGitHub):
+        def merged_prs_for_issue(self, issue_number: int, branch_prefix: str):
+            # Non-empty list with ok=False: a failed search that happened to
+            # return items must NOT be treated as a merge.
+            return github_module._MergedPRSearchResult(
+                [{"number": 1217, "state": "MERGED"}], ok=False
+            )
+
+    gh = FakeGitHubFailingMergeSearch(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 1221,
+            "title": "Salvage race",
+            "url": "https://example.test/issues/1221",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 888
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
+
+    # Salvage proceeded: the ok=False search fell through to the empty-diff
+    # check, which also did not fire (branch has real work), so a PR was opened.
+    assert len(gh.prs_created) == 1
+    assert gh.prs_created[0]["head"] == branch
+    # No skip event -- the fail-safe worked.
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert not [e for e in state["events"] if e["kind"] == "salvage_skipped_already_landed"]
+    salvaged = [e for e in state["events"] if e["kind"] == "session_salvaged"]
+    assert len(salvaged) == 1
+    assert salvaged[0]["payload"]["pr_number"] == 888
+
+
+def test_salvage_branch_empty_diff_returns_false_on_fetch_failure(
+    tmp_path: Path,
+) -> None:
+    """Issue #1221 (check 3 fail-safe): ``salvage_branch_empty_diff`` returns
+    False (do not skip salvage) when ``git fetch origin <base>`` fails -- a
+    transient network error falls back to opening the PR, which a human reviews
+    anyway. This is the fail-safe branch the design relies on but had no test.
+    """
+    from charlie_work.worktree import salvage_branch_empty_diff
+
+    # A git repo with NO origin remote: ``git fetch origin main`` fails.
+    repo_root = tmp_path / "no-remote-clone"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    _git(repo_root, "init", "--initial-branch=main")
+    _git(repo_root, "config", "user.email", "test@example.test")
+    _git(repo_root, "config", "user.name", "Test User")
+    _git(repo_root, "config", "commit.gpgSign", "false")
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(repo_root, "add", "README.md")
+    _git(repo_root, "commit", "-m", "initial commit")
+
+    # No origin remote configured -- fetch will fail.
+    result = salvage_branch_empty_diff(repo_root, "agent/issue-1221", "main")
+    assert result is False
+
+
+def test_salvage_already_landed_proceeds_when_empty_diff_fetch_fails(
+    tmp_path: Path,
+) -> None:
+    """Issue #1221 (check 3 fail-safe, integration): when the git fetch inside
+    ``salvage_branch_empty_diff`` fails, the function returns False and
+    ``_salvage_already_landed`` returns ``(False, None)`` -- salvage proceeds
+    (does not skip) instead of treating the git error as evidence the work
+    already landed. A human reviews salvage PRs anyway.
+    """
+    from charlie_work.workflow import _salvage_already_landed
+
+    # A git repo with NO origin remote: ``git fetch origin main`` fails.
+    repo_root = tmp_path / "no-remote-clone"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    _git(repo_root, "init", "--initial-branch=main")
+    _git(repo_root, "config", "user.email", "test@example.test")
+    _git(repo_root, "config", "user.name", "Test User")
+    _git(repo_root, "config", "commit.gpgSign", "false")
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(repo_root, "add", "README.md")
+    _git(repo_root, "commit", "-m", "initial commit")
+
+    config = OrchestratorConfig()
+
+    class FakeGitHubEmptyMergeSearch(FakeGitHub):
+        def merged_prs_for_issue(self, issue_number: int, branch_prefix: str):
+            return github_module._MergedPRSearchResult([], ok=True)
+
+    gh = FakeGitHubEmptyMergeSearch()
+
+    # Issue is OPEN, no merged PR binds to it, and the fetch inside
+    # salvage_branch_empty_diff fails (no origin remote). The fail-safe
+    # must let salvage proceed: _salvage_already_landed returns (False, None).
+    already_landed, reason = _salvage_already_landed(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch="agent/issue-1221",
+        base_ref="main",
+        issue_number=1221,
+        issue={"state": "OPEN"},
+    )
+    assert already_landed is False
+    assert reason is None
 
 
 def test_session_failed_relabeled_payload_requires_reason() -> None:
@@ -44482,7 +44711,11 @@ def test_classify_dead_sessions_relabel_carries_required_reason(tmp_path: Path) 
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
-    worktree_path, branch = _setup_completed_worktree(repo_root, 978, dirty=True)
+    # Issue #1130: use a no-commits worktree so the relabel path (not salvage)
+    # is taken. A worktree with commits (even dirty) is now salvaged.
+    branch = "agent/issue-978"
+    info = create_worktree(repo_root, branch, base_ref="origin/main")
+    worktree_path = info.path
     sessions_dir, state_file = _make_classify_state(tmp_path)
     _write_dead_session_sidecar(sessions_dir, 978, branch, worktree_path)
 
@@ -44500,7 +44733,9 @@ def test_classify_dead_sessions_relabel_carries_required_reason(tmp_path: Path) 
     ]
     gh.pr_create_return = 101
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     state = json.loads(state_file.read_text(encoding="utf-8"))
     events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
@@ -44553,7 +44788,9 @@ def test_orphaned_worker_reclaim_carries_required_reason(tmp_path: Path) -> None
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
@@ -44620,7 +44857,9 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
 
     def _run_sweep() -> None:
         with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     def _simulate_redispatch(dispatch_index: int) -> None:
         """Simulate a dispatch between sweeps: reset the issue's GitHub labels
@@ -44771,7 +45010,9 @@ def test_orphan_sweep_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> No
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=new_sha),
         patch("charlie_work.workflow.worktree_head_sha", return_value=None),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     st = load_state(paths.state_file)
     entry = st["issues"]["1243"]
@@ -44890,7 +45131,9 @@ def test_orphan_sweep_redispatch_cap_resets_on_stranded_local_commits(
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=remote_sha),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     st = load_state(paths.state_file)
     entry = st["issues"]["1243"]
@@ -44982,7 +45225,9 @@ def test_orphan_sweep_redispatch_cap_first_observation_with_long_history(
 
     # First orphan-sweep pass through the cap code for this issue.
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     st = load_state(paths.state_file)
     entry = st["issues"]["1243"]
@@ -45069,7 +45314,9 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
 
     def _run_sweep() -> None:
         with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     def _simulate_dispatch(dispatch_index: int) -> None:
         """Simulate a real dispatch between sweeps WITHOUT touching
@@ -45185,7 +45432,9 @@ def test_orphan_sweep_redispatch_cap_dedupes_repeated_observation(tmp_path: Path
 
     def _run_sweep() -> None:
         with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     # Run 5 sweep passes -- well past max_auto_redispatch=3 -- WITHOUT ever
     # changing dispatched_at/worker_pid, simulating the #417 reclaim leaving
@@ -45266,7 +45515,9 @@ def test_orphan_sweep_redispatch_cap_counts_distinct_identities_and_escalates(
 
     def _run_sweep() -> None:
         with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     def _simulate_redispatch(worker_pid: int) -> None:
         """A genuine redispatch always assigns a new worker_pid -- change the
@@ -45338,7 +45589,9 @@ def test_classify_dead_sessions_no_commits_relabels_to_ready(tmp_path: Path) -> 
     ]
     gh.pr_create_return = 101
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     assert not gh.prs_created
     assert (254, config.labels.in_progress) in gh.labels_removed
@@ -45370,12 +45623,14 @@ def test_classify_dead_sessions_salvage_push_failure_fallback(tmp_path: Path) ->
     gh.pr_create_return = 101
 
     original_push_branch = workflow_module.push_branch
-    workflow_module.push_branch = lambda repo, br, worktree_path=None: (
+    workflow_module.push_branch = lambda repo, br, worktree_path=None, **kw: (
         False,
         "simulated push failure",
     )
     try:
-        _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+        _classify_dead_sessions_and_update_throttle_state(
+            sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+        )
     finally:
         workflow_module.push_branch = original_push_branch
 
@@ -45444,7 +45699,9 @@ def test_classify_dead_sessions_dead_api_session_settles_budget_ledger(
     ]
     gh.prs = []
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     sessions = ledger_entries(state_file.parent)
     assert len(sessions) == 1, "dead api session must settle into the ledger"
@@ -45496,7 +45753,9 @@ def test_classify_dead_sessions_launch_failed_api_session_settles_budget_ledger(
     ]
     gh.prs = []
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     sessions = ledger_entries(state_file.parent)
     assert len(sessions) == 1, "launch-failed api session must settle into the ledger"
@@ -45565,14 +45824,16 @@ def test_stall_lane_api_budget_kill_over_cap(tmp_path: Path) -> None:
     with (
         patch("charlie_work.worker.is_worker_alive", return_value=True),
         patch(
-            "charlie_work.workflow.kill_process_tree",
+            "charlie_work.write_gate.kill_process_tree",
             side_effect=lambda pid, *_a, **_kw: killed_pids.extend([pid]) or [pid],
         ),
         patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        result = _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     # The budget-killed session is reported in the stalled entries.
     assert any(entry["issue"] == 4801 for entry in result)
@@ -45635,12 +45896,14 @@ def test_stall_lane_api_provider_auth_classification(tmp_path: Path) -> None:
     before = datetime.now(UTC)
     with (
         patch("charlie_work.worker.is_worker_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99998]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99998]),
         patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     from charlie_work.claude_code import _sidecar_path as _api_sidecar_path
 
@@ -45697,7 +45960,7 @@ def test_classify_dead_sessions_api_provider_auth_classification(
     before = datetime.now(UTC)
     with patch("charlie_work.worker.is_worker_alive", return_value=False):
         reaped = _classify_dead_sessions_and_update_throttle_state(
-            sessions_dir, state_file, gh, config
+            sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
         )
 
     # The reaped entry carries the resolved failure_kind (provider_auth, not
@@ -45756,7 +46019,7 @@ def test_classify_dead_sessions_launch_failed_api_provider_auth(
 
     with patch("charlie_work.worker.is_worker_alive", return_value=False):
         reaped = _classify_dead_sessions_and_update_throttle_state(
-            sessions_dir, state_file, gh, config
+            sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
         )
 
     api_reaped = [r for r in reaped if r["issue_number"] == 4804]
@@ -46252,7 +46515,9 @@ def test_orphaned_worker_routes_merge_conflict_to_rework(tmp_path: Path) -> None
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+    _detect_and_handle_orphaned_workers(
+        sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+    )
 
     state = load_state(paths.state_file)
     assert state["issues"]["42"]["status"] == "rework_requested"
@@ -46331,7 +46596,9 @@ def test_orphaned_worker_routes_stale_empty_checks_to_rework(tmp_path: Path) -> 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+    _detect_and_handle_orphaned_workers(
+        sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+    )
 
     state = load_state(paths.state_file)
     assert state["issues"]["42"]["status"] == "rework_requested"
@@ -46531,7 +46798,8 @@ def test_dispatch_failed_retries_are_capped_and_escalate(tmp_path: Path) -> None
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "dispatch_failed_cap_exceeded"
     assert len(state["issues"]["123"]["dispatch_failed_at"]) == 2
-    assert (123, "agent:human-needed") in fake_gh.labels_added
+    # Issue #1266: repeated dispatch failure is a mechanical escalation.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
     # Third dispatch no longer selects the escalated issue.
     result3 = app.dispatch(limit=1)
@@ -46562,7 +46830,8 @@ def test_dispatch_cross_repo_gate_escalates_when_all_paths_absent(tmp_path: Path
     Drives ``OrchestratorApp.dispatch`` (the ``_dispatch_impl`` path that decides
     to escalate instead of dispatch), not ``cross_repo_gate`` in isolation, and
     asserts the three observable effects of the wiring: the label transition to
-    ``agent:human-needed``, the ``dispatch_cross_repo_escalated`` event, and
+    ``agent:operator-queue`` (issue #1266: mechanical reason_class), the
+    ``dispatch_cross_repo_escalated`` event, and
     exclusion from ``session_requests`` (``selected_count == 0``). A regression
     in the wiring that calls the gate would silently reintroduce the exact bug
     this PR fixes with every unit test green, so this test exercises the wiring.
@@ -46586,8 +46855,10 @@ def test_dispatch_cross_repo_gate_escalates_when_all_paths_absent(tmp_path: Path
     # No dispatch_results were produced for the escalated issue.
     assert result.data["dispatch_results"] == []
 
-    # Label transition to human-needed (the redispatch_escalated edge).
-    assert (123, "agent:human-needed") in fake_gh.labels_added
+    # Label transition to operator-queue (the redispatch_escalated edge,
+    # mechanical reason_class per issue #1266 -- a cross-repo target
+    # mismatch is a structural/mechanical failure, not a judgment call).
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
     # The dispatch_cross_repo_escalated event was recorded with the issue number
     # and a cross_repo_target reason.
@@ -46662,6 +46933,7 @@ def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -46687,7 +46959,12 @@ def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
         _detect_and_handle_orphaned_workers(
-            sessions_dir, paths.state_file, config, fake_gh, review_callback=fake_review
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            review_callback=fake_review,
+            write_gate=_wg(paths.state_file),
         )
 
     state = load_state(paths.state_file)
@@ -46731,6 +47008,7 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -46756,7 +47034,12 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
         _detect_and_handle_orphaned_workers(
-            sessions_dir, paths.state_file, config, fake_gh, review_callback=fake_review
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            review_callback=fake_review,
+            write_gate=_wg(paths.state_file),
         )
 
     state = load_state(paths.state_file)
@@ -46777,7 +47060,12 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
     # Second pass must not re-emit the drift.
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         _detect_and_handle_orphaned_workers(
-            sessions_dir, paths.state_file, config, fake_gh, review_callback=fake_review
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            review_callback=fake_review,
+            write_gate=_wg(paths.state_file),
         )
 
     state = load_state(paths.state_file)
@@ -46832,7 +47120,9 @@ def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
         for _ in range(3):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     state = load_state(paths.state_file)
     events = state.get("events", [])
@@ -46878,6 +47168,7 @@ def test_orphaned_worker_approved_rework_dead_worker_auto_resets(tmp_path: Path)
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "approved", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -46899,7 +47190,9 @@ def test_orphaned_worker_approved_rework_dead_worker_auto_resets(tmp_path: Path)
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1109"]
@@ -46962,6 +47255,7 @@ def test_orphaned_worker_approved_rework_clean_exit_no_op_drift(tmp_path: Path) 
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "approved", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -46996,7 +47290,9 @@ def test_orphaned_worker_approved_rework_clean_exit_no_op_drift(tmp_path: Path) 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1109"]
@@ -47071,7 +47367,9 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: P
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1109"]
@@ -47154,7 +47452,9 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     events = state.get("events", [])
@@ -47202,7 +47502,9 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
 
     # Force the identical drift conditions again after the redispatch.
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     events = state.get("events", [])
@@ -47211,6 +47513,109 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
         f"Expected two orphaned_worker_drift events across dispatch generations, "
         f"got {len(drift_events)}"
     )
+
+
+def test_orphaned_worker_unreviewed_open_pr_pending_file_advances_to_pr_open(
+    tmp_path: Path,
+) -> None:
+    """Issue #1362 Stage 1 regression: a dead worker with an OPEN PR that has
+    a *pending* placeholder ``review-decision.json`` (not a missing file, and
+    no ``decision`` recorded in state.json either) must still be advanced
+    from ``agent:in-progress`` to ``agent:pr-open`` -- a pending packet is
+    "no verdict yet" exactly like a wholly-absent decision file, per the
+    #1128 intent this lane implements. The single-reader predicate must check
+    both ``.missing`` and a ``pending`` decision, not ``.missing`` alone --
+    narrowing to ``.missing`` only would silently exclude this PR and
+    re-strand the issue on ``agent:in-progress``, the precise #1128 failure
+    this lane exists to fix.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    in_progress = config.labels.in_progress
+    pr_open = config.labels.pr_open
+
+    state = load_state(paths.state_file)
+    state["issues"]["1578"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    # No ``decision`` key in state -- but the flat file records a pending
+    # placeholder, not a missing file.
+    state["prs"]["1585"] = {}
+    save_state(paths.state_file, state)
+
+    pr_dir = paths.prs / "pr-1585"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "pending"}), encoding="utf-8"
+    )
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 1578,
+                    "title": "Salvage wedge",
+                    "url": "https://example.test/issues/1578",
+                    "body": "Dead worker with open unreviewed PR",
+                    "labels": [{"name": in_progress}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = [
+                {
+                    "number": 1585,
+                    "title": "Salvaged work for #1578",
+                    "url": "https://example.test/pull/1585",
+                    "headRefName": "agent/issue-1578-salvage-wedge",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-deadbeef",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Closes #1578\n\nTests: regression coverage added.",
+                    "labels": [],
+                    "isCrossRepository": False,
+                    "state": "OPEN",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1578"]
+    assert entry["status"] == PASSIVE_OPEN_STATUS, (
+        f"expected open_passive, got {entry['status']!r}"
+    )
+    assert entry.get("dispatched_at") is None
+
+    events = state.get("events", [])
+    advance_events = [e for e in events if e.get("kind") == "orphaned_worker_advanced_to_pr_open"]
+    assert len(advance_events) == 1
+    payload = advance_events[0]["payload"]
+    assert payload["pr_number"] == 1585
+    assert payload["reason"] == "dead_worker_unsafe_to_auto_reset_open_unreviewed_pr"
+
+    # The label swap mirrors the orphaned_worker_opened_pr lane.
+    assert (1578, in_progress) in fake_gh.labels_removed
+    assert (1578, pr_open) in fake_gh.labels_added
 
 
 def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) -> None:
@@ -47280,7 +47685,9 @@ def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1578"]
@@ -47311,7 +47718,9 @@ def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) 
     # A second pass must not re-advance or re-emit (status is no longer
     # dispatched, so the sweep skips it entirely).
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     events = state.get("events", [])
@@ -47389,7 +47798,9 @@ def test_orphaned_worker_unreviewed_open_pr_label_failure_falls_back_to_drift(
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1578"]
@@ -47488,7 +47899,9 @@ def test_orphaned_worker_unreviewed_pr_with_rework_status_advances_not_resets(
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1578"]
@@ -47774,79 +48187,6 @@ def test_dispatch_only_issues_preserves_mixed_fresh_recovery_order(
 
 
 # --- Issue #507: record review verdicts from dead reviewer logs -------------
-
-
-def _make_dead_review_sidecar(
-    reviews_dir: Path,
-    pr_number: int,
-    log_text: str,
-    *,
-    started_at: str | None = None,
-) -> Path:
-    """Create a claude-code review sidecar + log file for a dead reviewer."""
-    reviews_dir.mkdir(parents=True, exist_ok=True)
-    log_path = reviews_dir / f"issue-{pr_number}-review.claude.log"
-    log_path.write_text(log_text, encoding="utf-8")
-    sidecar = {
-        "issue_number": pr_number,
-        "branch": f"agent/issue-{pr_number}-fix",
-        "worktree_path": str(reviews_dir / f"issue-{pr_number}"),
-        "prompt_path": str(reviews_dir / f"issue-{pr_number}-review-prompt.md"),
-        "command": ["claude", "-p", "--permission-mode", "plan"],
-        "pid": 99999,
-        "started_at": started_at or "2026-07-06T12:00:00Z",
-        "log_path": str(log_path),
-        "error": None,
-        "process_start_time": 1.0,
-    }
-    sidecar_path = reviews_dir / f"issue-{pr_number}.claude.json"
-    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
-    return sidecar_path
-
-
-def _write_review_events(
-    reviews_dir: Path, pr_number: int, *, turns: int, tool_calls: int = 0
-) -> Path:
-    """Write a stream-json events sidecar for a reviewer that ran ``turns`` turns.
-
-    ``parse_claude_events`` counts one turn per ``assistant`` event and one tool
-    call per ``tool_use`` content block. Without this sidecar a dead reviewer
-    has zero turns and zero tool calls, which classifies as a launch failure
-    rather than a turn-limit death (issue #588) -- so any test asserting
-    turn-limit behaviour must seed real session telemetry.
-    """
-    reviews_dir.mkdir(parents=True, exist_ok=True)
-    events_path = reviews_dir / f"issue-{pr_number}-review.events.jsonl"
-    lines: list[str] = []
-    for index in range(turns):
-        content: list[dict[str, Any]] = [{"type": "text", "text": f"Analysis step {index + 1}."}]
-        if index < tool_calls:
-            content.append({"type": "tool_use", "id": f"t{index}", "name": "Read", "input": {}})
-        lines.append(json.dumps({"type": "assistant", "message": {"content": content}}))
-    events_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return events_path
-
-
-def _set_review_dispatched_state(
-    app: OrchestratorApp,
-    pr_number: int,
-    issue_number: int,
-    dispatched_at: str,
-) -> None:
-    """Seed state.json with a review_dispatch_dispatched claim."""
-    with state_lock(app.paths.state_file):
-        state = load_state(app.paths.state_file)
-        state["prs"][str(pr_number)] = {
-            "number": pr_number,
-            "issue_number": issue_number,
-            "review_dispatch_status": "review_dispatch_dispatched",
-            "review_dispatched_at": dispatched_at,
-            "review_dispatch_pending_at": None,
-            "review_dispatch_failed_at": None,
-            "reviewer_pid": 99999,
-            "reviewer_process_start_time": 1.0,
-        }
-        save_state(app.paths.state_file, state)
 
 
 def test_parse_review_verdict_from_log_extracts_last_fenced_json(tmp_path: Path) -> None:
@@ -48180,7 +48520,13 @@ def test_record_review_session_metrics_none_preserves_prior_metrics(tmp_path: Pa
         }
         save_state(paths.state_file, state)
 
-    result = app.record_review(456, "approved", summary="lgtm", session_metrics=None)
+    result = app.record_review(
+        456,
+        "approved",
+        summary="lgtm",
+        session_metrics=None,
+        verdict_provenance="fresh_llm_review",
+    )
 
     assert result.ok is True
     state = load_state(paths.state_file)
@@ -48217,7 +48563,13 @@ def test_record_review_session_metrics_replaces_prior_metrics(tmp_path: Path) ->
         "tool_call_count": 2,
         "verdict_source": "events",
     }
-    result = app.record_review(456, "approved", summary="lgtm", session_metrics=new_metrics)
+    result = app.record_review(
+        456,
+        "approved",
+        summary="lgtm",
+        session_metrics=new_metrics,
+        verdict_provenance="fresh_llm_review",
+    )
 
     assert result.ok is True
     state = load_state(paths.state_file)
@@ -48275,7 +48627,11 @@ def test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper(
     assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
 
     stalled = _detect_and_handle_stalled_reviews(
-        reviews_dir, app.paths.state_file, app.config, repo_root
+        reviews_dir,
+        app.paths.state_file,
+        app.config,
+        repo_root,
+        write_gate=_wg(app.paths.state_file),
     )
     assert any(entry.get("pr") == 100 for entry in stalled)
 
@@ -48295,6 +48651,7 @@ def test_record_review_persists_required_changes(tmp_path: Path) -> None:
         "request_changes",
         summary="fix A",
         required_changes=["add null check", "update tests"],
+        verdict_provenance="fresh_llm_review",
     )
 
     decision = json.loads(
@@ -48338,6 +48695,7 @@ def test_cross_family_request_changes_verdict_persists_required_changes(
         parsed.decision,
         summary=parsed.summary,
         required_changes=parsed.required_changes,
+        verdict_provenance="cross_family_review",
     )
     assert result.ok
 
@@ -48385,6 +48743,7 @@ def test_cross_family_legacy_path_verdict_with_empty_required_changes_gets_deriv
         parsed.decision,
         summary=parsed.summary,
         required_changes=parsed.required_changes,
+        verdict_provenance="cross_family_review",
     )
     assert result.ok is True
 
@@ -48411,6 +48770,7 @@ def test_rework_brief_contains_required_changes_from_verdict(tmp_path: Path) -> 
         "request_changes",
         summary="fix A",
         required_changes=findings,
+        verdict_provenance="fresh_llm_review",
     )
 
     brief = (paths.prs / "pr-456" / "rework-prompt.md").read_text(encoding="utf-8")
@@ -48556,8 +48916,15 @@ def test_dispatch_rework_regenerates_brief_after_renderer_change(
 
     Monkeypatching the renderer reproduces that exactly: same decision, same
     mtimes, different output. The brief must pick the change up at dispatch.
+
+    Issue #1283 Phase A: ``_render_required_changes_section`` moved to
+    ``charlie_work/rework_prompts.py``. Its sole in-family caller,
+    ``_render_rework_prompt``, moved with it and resolves the name from
+    ``rework_prompts``'s own module globals, not workflow.py's facade
+    re-export -- so the monkeypatch target below must be
+    ``rework_prompts_module``, not ``workflow_module``.
     """
-    from charlie_work import workflow as workflow_module
+    from charlie_work import rework_prompts as rework_prompts_module
     from charlie_work.workflow import _is_verdict_newer_than_brief
 
     config = OrchestratorConfig(
@@ -48624,7 +48991,7 @@ def test_dispatch_rework_regenerates_brief_after_renderer_change(
 
     # Now the renderer changes, with the decision untouched.
     monkeypatch.setattr(
-        workflow_module,
+        rework_prompts_module,
         "_render_required_changes_section",
         lambda decision: "## Required changes\n\nRENDERED-BY-NEW-CODE\n",
     )
@@ -48728,8 +49095,11 @@ def test_dispatch_rework_does_not_regenerate_when_sidecar_is_unreadable(
     sidecar is readable there. That one regenerates and this one must not, so
     "no regeneration" here is attributable to the sidecar rather than to the
     PR never being selected for dispatch at all.
+
+    Issue #1283 Phase A: see the sibling test's docstring above for why the
+    monkeypatch target is ``rework_prompts_module``, not ``workflow_module``.
     """
-    from charlie_work import workflow as workflow_module
+    from charlie_work import rework_prompts as rework_prompts_module
 
     config = OrchestratorConfig(
         devin=DevinConfig(
@@ -48787,7 +49157,7 @@ def test_dispatch_rework_does_not_regenerate_when_sidecar_is_unreadable(
     os.utime(brief_path, (now + 10, now + 10))
 
     monkeypatch.setattr(
-        workflow_module,
+        rework_prompts_module,
         "_render_required_changes_section",
         lambda decision: "## Required changes\n\nRENDERED-BY-NEW-CODE\n",
     )
@@ -48883,6 +49253,7 @@ def test_rework_brief_falls_back_to_summary_when_required_changes_empty(
         "request_changes",
         summary=reviewer_summary,
         required_changes=[],
+        verdict_provenance="fresh_llm_review",
     )
 
     brief = (paths.prs / "pr-456" / "rework-prompt.md").read_text(encoding="utf-8")
@@ -49095,6 +49466,311 @@ def test_render_required_changes_section_defangs_live_keyword_in_summary_tier() 
 
     assert "does not fix issue 649" in section
     assert _CLOSING_KEYWORD_REF.search(section) is None, "live keyword survived"
+
+
+# --------------------------------------------------------------------------
+# Issue #1269 (W12): the render-side crash-signature guard is the single
+# enforcement point that reaches records already persisted before the
+# collector-side fix in _collect_external_findings shipped -- these tests
+# cover both the new-shape (external_findings field) and old-shape
+# (findings_channel == "external", merged into required_changes) paths.
+# --------------------------------------------------------------------------
+
+
+def test_render_required_changes_section_strips_crash_signature_from_external_findings() -> None:
+    """New shape: a crash-comment body sitting in `external_findings` from
+    before the collector-side fix is stripped at render time; a genuine
+    external finding alongside it survives untouched."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": "Reviewer summary text.",
+        "required_changes": ["fix the off-by-one"],
+        "external_findings": ["A human found a real bug in the retry loop.", crash_body],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "A human found a real bug in the retry loop." in section
+    assert crash_body not in section
+    assert "did not produce a structured verdict" not in section
+    assert "## Findings posted on the PR itself" in section, "new_shape must still be True"
+
+
+def test_render_required_changes_section_all_crash_external_findings_falls_back_to_pointer() -> (
+    None
+):
+    """New shape, entirely crash noise: external_findings ends up empty
+    after filtering, so `new_shape` becomes False and this falls to the
+    ordinary pointer-style ending (_finish_required_changes_section) rather
+    than rendering an external-findings section with nothing real in it."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": "",
+        "required_changes": ["fix the off-by-one"],
+        "external_findings": [crash_body],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "fix the off-by-one" in section
+    assert crash_body not in section
+    assert "## Findings posted on the PR itself" not in section
+    assert "none of which reach this brief" in section, (
+        "the ordinary external-findings pointer must reappear once external_findings "
+        "filters down to empty"
+    )
+
+
+def test_render_required_changes_section_old_shape_strips_crash_signature_from_changes() -> None:
+    """Old shape (findings_channel == "external"): a crash comment merged
+    into required_changes before the collector-side fix is stripped; the
+    reviewer's own genuine item survives (defense-in-depth for a reopened
+    old-shape PR, per issue #1269 open question 3)."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": "",
+        "required_changes": ["fix the off-by-one", crash_body],
+        "findings_channel": "external",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "- fix the off-by-one" in section
+    assert crash_body not in section
+
+
+def test_render_required_changes_section_old_shape_vacuous_all_crash_changes_renders_tier3() -> (
+    None
+):
+    """Old shape, all-crash: when the crash filter empties `changes`
+    entirely AND the leftover summary is the vacuous placeholder
+    (record_review's vacuous-replace path -- the only way this exact
+    combination is reachable), the section must render tier 3, NOT fall
+    through to tier 2 and present the content-free placeholder as if it
+    were real findings. This is the failure mode the "vacuous" marker
+    branch already guards against, reached here through the old-shape
+    "external" path instead of a fresh "vacuous" marker."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": LEGACY_VACUOUS_SUMMARY,
+        "required_changes": [crash_body],
+        "findings_channel": "external",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section
+    assert LEGACY_VACUOUS_SUMMARY not in section
+    assert crash_body not in section
+    assert "did not record a structured findings list" not in section, (
+        "must not fall through to the tier-2 verbatim-summary rendering"
+    )
+
+
+def test_render_required_changes_section_old_shape_blank_summary_all_crash_changes_renders_tier3() -> (
+    None
+):
+    """Same guard, other half of the "vacuous" OR-condition: a blank
+    summary (not the LEGACY_VACUOUS_SUMMARY placeholder) alongside an
+    all-crash `changes` list also renders tier 3, not tier 2's empty-prose
+    rendering."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": "",
+        "required_changes": [crash_body],
+        "findings_channel": "external",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section
+    assert crash_body not in section
+
+
+def test_render_required_changes_section_old_shape_all_crash_changes_preserves_genuine_summary() -> (
+    None
+):
+    """Guard against over-aggression: when the crash filter empties
+    `changes` entirely but the summary is genuine, non-vacuous reviewer
+    prose (the pre-#999 "reviewer chose prose over an itemized list"
+    population -- see `_is_carry_forward_eligible`'s docstring), tier 2
+    must still fire and render that real summary. The vacuous-neutralization
+    guard must only fire on the two known placeholder shapes (blank or
+    LEGACY_VACUOUS_SUMMARY), never on genuine content."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    genuine_summary = (
+        "The retry wrapper swallows the exception type; callers cannot distinguish causes."
+    )
+    decision = {
+        "decision": "request_changes",
+        "summary": genuine_summary,
+        "required_changes": [crash_body],
+        "findings_channel": "external",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert genuine_summary in section
+    assert crash_body not in section
+    assert "REVIEWER FINDINGS UNAVAILABLE" not in section, (
+        "a genuine, non-vacuous summary must not be discarded down to tier 3"
+    )
+
+
+def test_render_required_changes_section_vacuous_guard_does_not_drop_populated_external_findings() -> (
+    None
+):
+    """Hardening (review of 63ce581): the vacuous-neutralization guard's
+    `and not external_findings` clause must not let a co-persisted, populated
+    `external_findings` field get silently discarded.
+
+    No current writer produces this exact shape -- `findings_channel ==
+    "external"` old-shape records and populated `external_findings` are
+    disjoint in every writer today -- but the guard's condition must not
+    silently assume that forever. Before the `and not external_findings`
+    clause, an all-crash old-shape `changes` plus a vacuous summary would
+    neutralize summary_text to "" regardless of `external_findings`, landing
+    in the tier-3 "both empty" branch below -- which returns immediately
+    without ever consulting `external_findings` at all, dropping genuine
+    findings on the floor. With the clause, a populated `external_findings`
+    keeps the guard from firing, so the section falls through to the
+    tier-2 summary-fallback branch instead, which -- because `new_shape` is
+    True -- still calls `_render_external_findings_section` and renders
+    every genuine finding."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    genuine_external_finding = "the retry wrapper swallows the exception type"
+    decision = {
+        "decision": "request_changes",
+        "summary": LEGACY_VACUOUS_SUMMARY,
+        "required_changes": [crash_body],
+        "findings_channel": "external",
+        "external_findings": [genuine_external_finding],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert genuine_external_finding in section, (
+        "populated external_findings must still be rendered, not dropped by "
+        "the vacuous-neutralization guard"
+    )
+    assert crash_body not in section
+    assert "REVIEWER FINDINGS UNAVAILABLE" not in section, (
+        "must not fall through to tier 3 and discard the genuine external findings"
+    )
+
+
+# --------------------------------------------------------------------------
+# Issue #1310: the tier-2 (summary-verbatim) render path -- both the
+# marker-less `summary_text` fallback and the `"derived"` marker branch --
+# must crash-filter `summary` exactly as W12 (#1269) filtered
+# `external_findings`/`required_changes`. A crash-signature body or the
+# LEGACY_VACUOUS_SUMMARY placeholder arriving as a verdict `summary` with
+# an empty findings list must degrade to tier 3, not render verbatim.
+# Production-unreachable today (crash bodies are posted as PR comments,
+# never written into a verdict `summary`), but the suppression contract is
+# "crash noise cannot reach prompt content through any render path."
+# --------------------------------------------------------------------------
+
+
+def test_render_required_changes_section_tier2_crash_summary_degrades_to_tier3() -> None:
+    """Marker-less tier-2 path: a request_changes round whose `summary` is a
+    crash body and whose findings list is empty must NOT render the crash
+    text verbatim -- it degrades to tier 3 (the "findings unavailable"
+    escape hatch), exactly as the other tiers do."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": crash_body,
+        "required_changes": [],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert crash_body not in section, (
+        "tier-2 verbatim emit must not render a crash-signature summary"
+    )
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section, (
+        "must degrade to tier 3 when the summary is a crash body"
+    )
+    assert "did not record a structured findings list" not in section, (
+        "must not fall through to the tier-2 verbatim-summary rendering"
+    )
+
+
+def test_render_required_changes_section_tier2_vacuous_summary_degrades_to_tier3() -> None:
+    """Marker-less tier-2 path: a request_changes round whose `summary` is
+    the LEGACY_VACUOUS_SUMMARY placeholder and whose findings list is empty
+    must degrade to tier 3, not present the content-free placeholder as if
+    it were real findings."""
+    decision = {
+        "decision": "request_changes",
+        "summary": LEGACY_VACUOUS_SUMMARY,
+        "required_changes": [],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert LEGACY_VACUOUS_SUMMARY not in section, (
+        "tier-2 verbatim emit must not render the vacuous placeholder"
+    )
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section, (
+        "must degrade to tier 3 when the summary is the vacuous placeholder"
+    )
+    assert "did not record a structured findings list" not in section
+
+
+def test_render_required_changes_section_tier2_derived_crash_summary_degrades() -> None:
+    """`"derived"` marker branch: a request_changes round stamped
+    `findings_channel == "derived"` whose `summary` is a crash body and
+    whose findings list is empty must degrade to tier 3, not render the
+    crash text verbatim. Without the `and summary_text` guard on the
+    derived branch, the crash guard would neutralize `summary_text` to ""
+    but the branch would still fire and render an empty verbatim summary."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": crash_body,
+        "required_changes": [],
+        "findings_channel": "derived",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert crash_body not in section, (
+        "derived tier-2 verbatim emit must not render a crash-signature summary"
+    )
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section, (
+        "must degrade to tier 3 when the derived summary is a crash body"
+    )
+    assert "did not record a structured findings list" not in section
+
+
+def test_render_required_changes_section_tier2_genuine_summary_still_renders() -> None:
+    """Guard against over-aggression: a genuine, non-crash, non-vacuous
+    summary with an empty findings list must still render verbatim at
+    tier 2. The crash/vacuous guard must only fire on crash-signature
+    bodies or the LEGACY_VACUOUS_SUMMARY placeholder, never on real
+    reviewer prose."""
+    genuine_summary = (
+        "The retry wrapper swallows the exception type; callers cannot distinguish causes."
+    )
+    decision = {
+        "decision": "request_changes",
+        "summary": genuine_summary,
+        "required_changes": [],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert genuine_summary in section, "a genuine summary must still render verbatim at tier 2"
+    assert "REVIEWER FINDINGS UNAVAILABLE" not in section, (
+        "a genuine summary must not be discarded down to tier 3"
+    )
 
 
 def test_no_op_rework_repair_brief_preserves_reviewer_summary(tmp_path: Path) -> None:
@@ -49373,10 +50049,14 @@ def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
         _make_dead_review_sidecar(reviews_dir, pr, "no verdict")
 
     monkeypatch.setattr(WorkerView, "is_alive", lambda self: False)
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda *_: False)
-    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    monkeypatch.setattr("charlie_work.stalled_review_reap.is_pid_alive", lambda *_: False)
+    monkeypatch.setattr(
+        "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
+    )
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert {entry["pr"] for entry in stalled} == set(prs)
     state_after = load_state(state_file)
@@ -49387,65 +50067,19 @@ def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
     assert set(sweep[0]["payload"]["pr_numbers"]) == set(prs)
 
 
-def test_reap_orphaned_review_checkouts_aggregates_same_pass_events(
-    tmp_path: Path,
-) -> None:
-    """Issue #525: multiple lifecycle-reaped PRs in one pass become one sweep event."""
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    reviews_dir = tmp_path / "reviews"
-    state_file = tmp_path / "state.json"
-    config = OrchestratorConfig()
-
-    prs = [100, 200, 300]
-    state = empty_state()
-    for pr in prs:
-        state["prs"][str(pr)] = {
-            "number": pr,
-            "review_dispatch_status": "review_dispatch_dispatched",
-            "review_dispatched_at": "2026-07-20T00:00:00Z",
-            "reviewer_pid": 12345,
-            "reviewer_process_start_time": 1.0,
-        }
-    save_state(state_file, state)
-
-    fake_gh = FakeGitHub()
-    fake_gh.prs = [
-        {
-            "number": pr,
-            "title": f"Fix #{pr}",
-            "url": f"https://example.test/pull/{pr}",
-            "headRefName": f"agent/issue-{pr}-fix",
-            "baseRefName": "main",
-            "headRefOid": f"sha-{pr}",
-            "body": f"Closes #{pr}",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "MERGED",
-        }
-        for pr in prs
-    ]
-
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
-
-    assert reaped == prs
-    state_after = load_state(state_file)
-    sweep = [
-        e
-        for e in state_after["events"]
-        if e.get("kind") == "review_dispatch_lifecycle_reaped_sweep"
-    ]
-    assert len(sweep) == 1
-    assert sweep[0]["payload"]["count"] == len(prs)
-    assert set(sweep[0]["payload"]["pr_numbers"]) == set(prs)
-
-
-def test_review_dispatch_noise_loop_aggregation_preserves_history() -> None:
+def test_review_dispatch_noise_loop_aggregation_preserves_history(tmp_path: Path) -> None:
     """Issue #525: a repeating per-pass noise loop cannot evict unrelated events.
 
     Simulates 5 ghost reviewer sessions x 2 events per pass for 250 passes.
     Without aggregation the events array would hold 2501 entries and evict the
     diagnostic event; with per-kind aggregation it stays at 501.
+
+    Issue #1264 (W6 PR3): this test predates the ``write_gate`` requirement
+    and operates on an in-memory ``state`` dict with no ``state_file``
+    fixture. ``_append_sweep_events`` now requires a real ``WriteGate``, so a
+    ``tmp_path``-scoped one (``dry_run=False``, matching the pre-conversion
+    always-write behavior this test exercises) is threaded through purely to
+    satisfy that contract -- it is never read from disk.
     """
     state = empty_state()
     state = append_event(state, "diagnostic_event", {"note": "keep me"}, max_size=2000)
@@ -49462,7 +50096,9 @@ def test_review_dispatch_noise_loop_aggregation_preserves_history() -> None:
             )
             for pr in prs
         ]
-        state = _append_sweep_events(state, sweep_events, max_size=2000)
+        state = _append_sweep_events(
+            state, sweep_events, max_size=2000, write_gate=_wg(tmp_path / "state.json")
+        )
 
     diagnostic = [e for e in state["events"] if e.get("kind") == "diagnostic_event"]
     assert len(diagnostic) == 1
@@ -49559,7 +50195,9 @@ def test_dispatch_rework_deterministic_failure_kind_escalates_immediately(
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "rework_branch_conflict"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: a deterministic failure_kind escalation is mechanical, so
+    # it lands agent:operator-queue, not agent:human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 def test_dispatch_rework_no_op_rework_cap_escalates(tmp_path: Path) -> None:
@@ -49614,7 +50252,9 @@ def test_dispatch_rework_no_op_rework_cap_escalates(tmp_path: Path) -> None:
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: no_op_rework_escalated is mechanical, so it lands
+    # agent:operator-queue, not agent:human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 def test_dispatch_rework_worker_deaths_dont_count_as_no_op(tmp_path: Path) -> None:
@@ -49674,7 +50314,9 @@ def test_dispatch_rework_worker_deaths_dont_count_as_no_op(tmp_path: Path) -> No
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "worker_death_loop"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: worker_death_loop is mechanical, so it lands
+    # agent:operator-queue, not agent:human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 def test_dispatch_rework_mixed_deaths_and_no_ops_no_op_dominates(tmp_path: Path) -> None:
@@ -49916,6 +50558,771 @@ def test_dispatch_rework_worker_death_loop_includes_stranded_commits(
     assert state["issues"]["123"]["stranded_commits"] == 1
 
 
+def _init_repo_with_remote_inline(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a bare origin remote + local clone with one commit on main.
+
+    Inlined here (instead of importing from test_worktree.py) so this test
+    module stays self-contained for the salvage-push regression tests.
+    Returns ``(remote, repo_root)``.
+
+    Mirrors ``test_worktree._init_repo(bare=True)``: a bare repo cannot
+    receive commits directly, so a temporary non-bare repo is initialized
+    with ``--initial-branch=main``, seeded with one commit, then cloned
+    with ``--bare`` to produce the remote.
+    """
+    import shutil
+
+    # Build a temp non-bare repo with one commit on main, then clone --bare.
+    temp_repo = tmp_path / "remote-temp"
+    temp_repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=temp_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=temp_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=temp_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (temp_repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=temp_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"],
+        cwd=temp_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    remote = tmp_path / "remote"
+    subprocess.run(
+        ["git", "clone", "--bare", str(temp_repo), str(remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    shutil.rmtree(temp_repo, ignore_errors=True)
+
+    repo_root = tmp_path / "repo"
+    subprocess.run(
+        ["git", "clone", str(remote), str(repo_root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return remote, repo_root
+
+
+def test_dispatch_rework_death_loop_salvages_stranded_commits(
+    tmp_path: Path,
+) -> None:
+    """Issue #1239: when a rework worker death-loop reaches the cap, the
+    death-loop gate must attempt to salvage-push stranded commits from the
+    dead worker's worktree BEFORE escalating.  A successful push means the
+    worker completed the rework and died at the final push step — the PR
+    head moves past the request_changes verdict, so the issue is routed to
+    review instead of escalated.
+    """
+    from datetime import UTC, datetime
+
+    from charlie_work.paths import resolved_layout
+    from charlie_work.worktree import push_branch, worktree_path_for_branch
+
+    remote, repo_root = _init_repo_with_remote_inline(tmp_path)
+    branch = "agent/issue-123-fix-search"
+
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    # Create a branch from main and a worktree at the expected orchestrator path.
+    run(["git", "branch", branch])
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    layout = resolved_layout(config, repo_root)
+    wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "worktree", "add", str(wt_path), branch])
+
+    # Push the branch so the remote branch exists at the PR head sha.
+    ok, error = push_branch(repo_root, branch, worktree_path=wt_path)
+    assert ok, error
+    pr_head_sha = run(["git", "rev-parse", branch]).stdout.strip()
+
+    # Add a stranded commit to the worktree (worker completed work but died
+    # before pushing).
+    (wt_path / "fix.txt").write_text("fixed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "completed rework (died before push)"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    local_tip = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.repo_root = repo_root
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+            self.prs[0]["headRefOid"] = pr_head_sha
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [now_iso, now_iso],
+            "worker_death_at": [now_iso, now_iso],
+            "branch_name": branch,
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": pr_head_sha,
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(repo_root, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+    assert result.ok is True
+    assert 123 in result.data.get("salvaged_to_review", [])
+    assert 123 not in result.data.get("worker_death_escalated", [])
+
+    # The remote branch head must have advanced to the worktree's local tip.
+    remote_sha = subprocess.run(
+        ["git", "rev-parse", branch],
+        cwd=remote,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert remote_sha == local_tip
+
+    state = load_state(paths.state_file)
+    # The issue must NOT be escalated (routed to review or stays rework_requested).
+    assert state["issues"]["123"]["status"] != "escalated"
+    # worker_death_at must NOT have been extended (still 2 entries, not 3).
+    assert len(state["issues"]["123"].get("worker_death_at", [])) == 2
+
+    # An event with kind "rework_stranded_commits_salvaged" must exist.
+    events = state.get("events", [])
+    salvage_events = [e for e in events if e.get("kind") == "rework_stranded_commits_salvaged"]
+    assert len(salvage_events) >= 1
+
+
+def test_dispatch_rework_death_loop_empty_death_still_escalates(
+    tmp_path: Path,
+) -> None:
+    """Issue #1239: a death-loop where the worktree has NO stranded commits
+    (the worker died without completing any work) must still escalate with
+    ``worker_death_loop`` — the salvage push is only a reprieve when there
+    is actual completed work to publish.
+    """
+    from datetime import UTC, datetime
+
+    from charlie_work.paths import resolved_layout
+    from charlie_work.worktree import push_branch, worktree_path_for_branch
+
+    remote, repo_root = _init_repo_with_remote_inline(tmp_path)
+    branch = "agent/issue-123-fix-search"
+
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    run(["git", "branch", branch])
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    layout = resolved_layout(config, repo_root)
+    wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "worktree", "add", str(wt_path), branch])
+
+    # Push the branch — but do NOT add any commit (worktree is at the same
+    # sha as the remote branch, so there are no stranded commits to salvage).
+    ok, error = push_branch(repo_root, branch, worktree_path=wt_path)
+    assert ok, error
+    pr_head_sha = run(["git", "rev-parse", branch]).stdout.strip()
+
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.repo_root = repo_root
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+            self.prs[0]["headRefOid"] = pr_head_sha
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [now_iso, now_iso],
+            "worker_death_at": [now_iso, now_iso],
+            "branch_name": branch,
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": pr_head_sha,
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(repo_root, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+    assert result.ok is True
+    assert 123 in result.data.get("worker_death_escalated", [])
+    assert 123 not in result.data.get("salvaged_to_review", [])
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worker_death_loop"
+
+
+def test_reap_restore_rework_requested_salvages_stranded_commits(
+    tmp_path: Path,
+) -> None:
+    """Issue #1239 Path 1: ``_reap_restore_rework_requested`` must
+    salvage-push stranded commits from a dead rework worker's worktree
+    BEFORE counting a death.  When the push succeeds, the issue resets to
+    ``rework_requested`` WITHOUT recording a death — the PR head moved
+    past the request_changes verdict, so the next ``dispatch_rework`` pass
+    routes to review instead of re-dispatching into the same tail-death.
+    """
+    import json
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.paths import resolved_layout
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.worker import WorkerView
+    from charlie_work.workflow import _reap_restore_rework_requested
+    from charlie_work.worktree import push_branch, worktree_path_for_branch
+
+    remote, repo_root = _init_repo_with_remote_inline(tmp_path)
+    branch = "agent/issue-123-fix-search"
+
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    run(["git", "branch", branch])
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    layout = resolved_layout(config, repo_root)
+    wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "worktree", "add", str(wt_path), branch])
+
+    # Push the branch so the remote branch exists at the PR head sha.
+    ok, error = push_branch(repo_root, branch, worktree_path=wt_path)
+    assert ok, error
+    pr_head_sha = run(["git", "rev-parse", branch]).stdout.strip()
+
+    # Add a stranded commit to the worktree.
+    (wt_path / "fix.txt").write_text("fixed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "completed rework (died before push)"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    local_tip = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+    fake_gh.prs[0]["headRefOid"] = pr_head_sha
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": branch,
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": pr_head_sha,
+        }
+        save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the reader is file-first, so the live
+    # request_changes decision must exist on disk.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": pr_head_sha}),
+        encoding="utf-8",
+    )
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("worker died\n", encoding="utf-8")
+
+    worker = WorkerView(
+        adapter_kind="devin",
+        issue_number=123,
+        repo_key="",
+        pid=99999,  # non-existent PID — is_alive() returns False
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        process_start_time=1234567890.0,
+        log_path=str(log_path),
+        worktree_path=str(wt_path),
+        error=None,
+        failure_kind="worker_died",
+        reclaimed=None,
+        branch=branch,
+    )
+
+    open_prs_by_issue = {123: [fake_gh.prs[0]]}
+
+    _reap_restore_rework_requested(
+        paths.state_file,
+        fake_gh,
+        config,
+        open_prs_by_issue,
+        worker,
+        failure_kind="worker_died",
+        repo_root=repo_root,
+        write_gate=_wg(paths.state_file),
+    )
+
+    # The remote branch head must have advanced to the worktree's local tip.
+    remote_sha = subprocess.run(
+        ["git", "rev-parse", branch],
+        cwd=remote,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert remote_sha == local_tip
+
+    state = load_state(paths.state_file)
+    # The issue must be reset to rework_requested (NOT escalated).
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    # worker_death_at must NOT have been extended (no new death recorded).
+    worker_death_at = state["issues"]["123"].get("worker_death_at", [])
+    assert len(worker_death_at) == 0
+
+    # An event with kind "rework_stranded_commits_salvaged" must exist.
+    events = state.get("events", [])
+    salvage_events = [e for e in events if e.get("kind") == "rework_stranded_commits_salvaged"]
+    assert len(salvage_events) >= 1
+
+
+def test_reap_restore_rework_requested_skips_salvage_when_status_not_dispatched(
+    tmp_path: Path,
+) -> None:
+    """Issue #1239 round-2: workers are discovered from sidecar files,
+    decoupled from state.json, so by the time ``_reap_restore_rework_requested``
+    runs the issue's status may have already moved off ``dispatched`` (e.g. a
+    concurrent loop pass re-dispatched or escalated).  In that case the
+    salvage push to the shared origin remote MUST NOT be attempted — an
+    unaudited push for a stale/no-longer-dispatched issue leaves no event trail
+    if it succeeds.  A fresh ``status == "dispatched"`` precondition check
+    (short state_lock scope, before computing the review decision and before
+    any network push) gates the whole salvage path.
+    """
+    import json
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.paths import resolved_layout
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.worker import WorkerView
+    from charlie_work.workflow import _reap_restore_rework_requested
+    from charlie_work.worktree import push_branch, worktree_path_for_branch
+
+    remote, repo_root = _init_repo_with_remote_inline(tmp_path)
+    branch = "agent/issue-124-fix-search"
+
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    run(["git", "branch", branch])
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    layout = resolved_layout(config, repo_root)
+    wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "worktree", "add", str(wt_path), branch])
+
+    # Push the branch so the remote branch exists at the PR head sha.
+    ok, error = push_branch(repo_root, branch, worktree_path=wt_path)
+    assert ok, error
+    pr_head_sha = run(["git", "rev-parse", branch]).stdout.strip()
+
+    # Add a stranded commit to the worktree — the salvage WOULD push this if
+    # the precondition check were absent.
+    (wt_path / "fix.txt").write_text("fixed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "completed rework (died before push)"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+    fake_gh.prs[0]["headRefOid"] = pr_head_sha
+
+    # The issue's status has ALREADY moved off "dispatched" — a concurrent
+    # loop pass re-dispatched it to rework_requested.  This is the
+    # sidecar/state.json decoupling the round-2 review flagged.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "rework_requested",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": branch,
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": pr_head_sha,
+        }
+        save_state(paths.state_file, state)
+
+    # A LIVE request_changes verdict on disk — without the precondition check
+    # the function would proceed past has_request_changes and attempt the push.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": pr_head_sha}),
+        encoding="utf-8",
+    )
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("worker died\n", encoding="utf-8")
+
+    worker = WorkerView(
+        adapter_kind="devin",
+        issue_number=123,
+        repo_key="",
+        pid=99999,  # non-existent PID — is_alive() returns False
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        process_start_time=1234567890.0,
+        log_path=str(log_path),
+        worktree_path=str(wt_path),
+        error=None,
+        failure_kind="worker_died",
+        reclaimed=None,
+        branch=branch,
+    )
+
+    open_prs_by_issue = {123: [fake_gh.prs[0]]}
+
+    _reap_restore_rework_requested(
+        paths.state_file,
+        fake_gh,
+        config,
+        open_prs_by_issue,
+        worker,
+        failure_kind="worker_died",
+        repo_root=repo_root,
+        write_gate=_wg(paths.state_file),
+    )
+
+    # The remote branch head MUST NOT have advanced — no salvage push.
+    remote_sha = subprocess.run(
+        ["git", "rev-parse", branch],
+        cwd=remote,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert remote_sha == pr_head_sha, (
+        f"salvage push attempted for a non-dispatched issue: "
+        f"remote {remote_sha} != pr head {pr_head_sha}"
+    )
+
+    # The issue status must be unchanged (still rework_requested, not reset).
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+
+    # No salvage event must have been recorded.
+    events = state.get("events", [])
+    salvage_events = [e for e in events if e.get("kind") == "rework_stranded_commits_salvaged"]
+    assert len(salvage_events) == 0
+
+
+def test_salvage_rework_stranded_commits_skips_when_status_not_rework_requested(
+    tmp_path: Path,
+) -> None:
+    """Issue #1239 round-3: the death-loop escalation gate's salvage call site
+    (``_salvage_rework_stranded_commits``) receives ``issue_entry`` from the
+    ``head_check_state`` snapshot loaded at the top of ``dispatch_rework``'s
+    candidate loop.  Between that snapshot and this call the issue's status may
+    have already moved off ``rework_requested`` (e.g. a concurrent loop pass
+    dispatched it, escalated it, or the issue was closed).  In that case the
+    salvage push to the shared origin remote MUST NOT be attempted — an
+    unaudited push for a stale/no-longer-rework_requested issue leaves no event
+    trail if it succeeds.  A fresh ``status == "rework_requested"`` precondition
+    check (short state_lock scope, before any network push) gates the salvage,
+    mirroring the ``_reap_restore_rework_requested`` precondition (which checks
+    ``status == "dispatched"`` because that lane handles already-dispatched
+    workers).
+    """
+    from datetime import UTC, datetime
+
+    from charlie_work.paths import resolved_layout
+    from charlie_work.worktree import push_branch, worktree_path_for_branch
+
+    remote, repo_root = _init_repo_with_remote_inline(tmp_path)
+    branch = "agent/issue-123-fix-search"
+
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    # Create a branch from main and a worktree at the expected orchestrator path.
+    run(["git", "branch", branch])
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    layout = resolved_layout(config, repo_root)
+    wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "worktree", "add", str(wt_path), branch])
+
+    # Push the branch so the remote branch exists at the PR head sha.
+    ok, error = push_branch(repo_root, branch, worktree_path=wt_path)
+    assert ok, error
+    pr_head_sha = run(["git", "rev-parse", branch]).stdout.strip()
+
+    # Add a stranded commit to the worktree — the salvage WOULD push this if
+    # the precondition check were absent.
+    (wt_path / "fix.txt").write_text("fixed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "completed rework (died before push)"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.repo_root = repo_root
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+            self.prs[0]["headRefOid"] = pr_head_sha
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    # The issue's status has ALREADY moved off "rework_requested" — a
+    # concurrent loop pass dispatched it (status is now "dispatched").  This
+    # is the head_check_state/state.json decoupling the round-3 review flagged:
+    # the snapshot still says rework_requested, but state.json has advanced.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "dispatched",
+            "redispatch_at": [now_iso, now_iso],
+            "worker_death_at": [now_iso, now_iso],
+            "branch_name": branch,
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": pr_head_sha,
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(repo_root, paths, config, fake_gh)
+
+    # The snapshot issue_entry still says rework_requested (stale) — this is
+    # what dispatch_rework's candidate loop would pass.  The fresh check inside
+    # _salvage_rework_stranded_commits must catch that state.json has moved.
+    stale_issue_entry = {
+        "number": 123,
+        "status": "rework_requested",
+        "branch_name": branch,
+    }
+    pr_data = fake_gh.prs[0]
+
+    result = app._salvage_rework_stranded_commits(123, pr_data, stale_issue_entry)
+
+    # The salvage must report no push.
+    assert result is False
+
+    # The remote branch head MUST NOT have advanced — no salvage push.
+    remote_sha = subprocess.run(
+        ["git", "rev-parse", branch],
+        cwd=remote,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert remote_sha == pr_head_sha, (
+        f"salvage push attempted for a non-rework_requested issue: "
+        f"remote {remote_sha} != pr head {pr_head_sha}"
+    )
+
+    # The issue status must be unchanged (still dispatched, not reset).
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"
+
+    # No salvage event must have been recorded.
+    events = state.get("events", [])
+    salvage_events = [e for e in events if e.get("kind") == "rework_stranded_commits_salvaged"]
+    assert len(salvage_events) == 0
+
+
 def test_windowed_redispatch_at_handles_corrupted_state(tmp_path: Path) -> None:
     """_windowed_redispatch_at must not crash when redispatch_at is corrupted
     (e.g., a string instead of a list). A string value would cause
@@ -50049,7 +51456,11 @@ def test_stalled_review_throttled_rolls_back_attempt_count(monkeypatch, tmp_path
     monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
 
     stalled = _detect_and_handle_stalled_reviews(
-        reviews_dir, app.paths.state_file, app.config, repo_root
+        reviews_dir,
+        app.paths.state_file,
+        app.config,
+        repo_root,
+        write_gate=_wg(app.paths.state_file),
     )
     assert any(entry.get("pr") == 100 for entry in stalled)
 
@@ -51164,6 +52575,112 @@ def test_loop_records_sink_metric_in_completed_event_and_pass_row(
 
 
 # ---------------------------------------------------------------------------
+# Issue #1363 PART 2: preflight gate wiring into OrchestratorApp.loop()
+#
+# Both tests below monkeypatch ``charlie_work.workflow.run_preflight``
+# directly with a canned ``PreflightResult`` rather than driving the real
+# disk/clock/venv/config probes through ``tmp_path``. That is the correct
+# abstraction layer for a *wiring* test: run_preflight's own check logic
+# (disk_floor math, venv_identity path matching, config_freshness
+# once-per-change semantics, ...) is already exhaustively covered at the
+# unit level in test_preflight.py. What is untested until now is whether
+# OrchestratorApp._loop_impl reacts to a PreflightResult correctly -- and
+# canning the result also makes these tests immune to the ambient
+# sys.executable/orchestrator_root() of whatever environment happens to run
+# them (a real venv-synced checkout under CI, a PYTHONPATH-overridden
+# worktree locally, ...), which the real venv_identity check is otherwise
+# sensitive to.
+# ---------------------------------------------------------------------------
+
+
+def test_loop_fatal_preflight_refusal_skips_loop_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC2: a fatal preflight failure must refuse the pass -- _loop_body must
+    never run, a loop_refused_preflight event must be recorded, and loop()
+    must return a non-ok CommandResult naming the failing check -- without
+    a loop_completed event ever appearing."""
+    from charlie_work.preflight import PreflightCheck, PreflightResult
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    fatal_check = PreflightCheck(
+        name="disk_floor", ok=False, detail="0.10 GB free (floor 5 GB)", fatal=True
+    )
+    fake_result = PreflightResult(checks=(fatal_check,))
+    monkeypatch.setattr("charlie_work.workflow.run_preflight", lambda *args, **kwargs: fake_result)
+
+    body_invoked = False
+
+    def stub_body(limit: int | None, *, merge: bool | None, now=None) -> CommandResult:
+        nonlocal body_invoked
+        body_invoked = True
+        return CommandResult(ok=True, message="stub", data={})
+
+    app._loop_body = stub_body  # type: ignore[assignment]
+    result = app.loop(limit=0)
+
+    assert body_invoked is False, "_loop_body ran despite a fatal preflight refusal"
+    assert result.ok is False
+    assert result.data.get("pass_skipped") is True
+    assert result.data.get("reason") == "preflight_refused"
+    assert result.data.get("check") == "disk_floor"
+
+    refused = query_events(paths.state_file, kind="loop_refused_preflight")
+    assert refused, "loop_refused_preflight event was not emitted"
+    assert refused[-1]["payload"]["check"] == "disk_floor"
+
+    completed = query_events(paths.state_file, kind="loop_completed")
+    assert not completed, "loop_completed must not fire when preflight refuses the pass"
+
+
+def test_loop_healthy_preflight_proceeds_with_no_extra_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC3: a fully-passing preflight run must add nothing beyond the
+    ordinary loop event sequence -- no loop_refused_preflight, no
+    preflight_warning/preflight_config_stale noise -- and loop_completed
+    must still fire normally. This is the "healthy host" regression control
+    for AC2: proof that the gate's presence is invisible on a clean pass."""
+    from charlie_work.preflight import PreflightCheck, PreflightResult
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    all_ok_result = PreflightResult(
+        checks=(
+            PreflightCheck(name="disk_floor", ok=True, detail="ok", fatal=True),
+            PreflightCheck(name="clock_sanity", ok=True, detail="ok", fatal=False),
+            PreflightCheck(name="venv_identity", ok=True, detail="ok", fatal=True),
+            PreflightCheck(name="config_freshness", ok=True, detail="ok", fatal=False),
+        )
+    )
+    monkeypatch.setattr(
+        "charlie_work.workflow.run_preflight", lambda *args, **kwargs: all_ok_result
+    )
+
+    def stub_body(limit: int | None, *, merge: bool | None, now=None) -> CommandResult:
+        return CommandResult(
+            ok=True, message="stub", data={"errors": [], "merges": [], "reviews": []}
+        )
+
+    app._loop_body = stub_body  # type: ignore[assignment]
+    result = app.loop(limit=0)
+
+    assert result.ok is True
+    assert not query_events(paths.state_file, kind="loop_refused_preflight")
+    assert not query_events(paths.state_file, kind="preflight_warning")
+    assert not query_events(paths.state_file, kind="preflight_config_stale")
+    completed = query_events(paths.state_file, kind="loop_completed")
+    assert completed, "loop_completed event was not emitted on a healthy preflight pass"
+
+
+# ---------------------------------------------------------------------------
 # Issue #1248: orphan-sweep integration with salvage_push_stranded_commits
 # ---------------------------------------------------------------------------
 #
@@ -51203,6 +52720,7 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 500, "request_changes", "abc123")
 
     class FakeGitHubForSalvage(FakeGitHub):
         def pr_list(self):
@@ -51220,7 +52738,7 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
 
     salvage_calls: list[tuple[Any, ...]] = []
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         salvage_calls.append((repo_root, branch, worktree_path, base_ref))
         return SalvagePushResult(
             pushed=True,
@@ -51238,7 +52756,9 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     assert len(salvage_calls) == 1
     assert salvage_calls[0][1] == "agent/issue-1248"
@@ -51279,6 +52799,92 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
     assert salvage_events[0]["payload"]["new_remote_sha"] == "newsha123"
 
 
+def test_orphaned_worker_salvage_push_threads_dry_run_to_salvage_push_stranded_commits(
+    tmp_path: Path,
+) -> None:
+    """Issue #1326 regression: ``_detect_and_handle_orphaned_workers`` must
+    thread ``write_gate.dry_run`` into ``salvage_push_stranded_commits`` (the
+    higher-traffic call site at workflow.py:2218-2224). Under a dry-run
+    WriteGate the salvage stand-in must receive ``dry_run=True`` -- the
+    existing ``fake_salvage`` stand-ins in this file were only patched for
+    signature compatibility and never asserted the value, so a regression
+    that drops the kwarg would pass silently. This test pins the value.
+    """
+    import charlie_work.workflow as workflow_module
+    from charlie_work.worktree import SalvagePushResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1326"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForSalvage(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 500,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-1326",
+                }
+            ]
+
+    fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
+
+    salvage_calls: list[dict[str, Any]] = []
+
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
+        salvage_calls.append(
+            {
+                "repo_root": repo_root,
+                "branch": branch,
+                "worktree_path": worktree_path,
+                "base_ref": base_ref,
+                "dry_run": dry_run,
+            }
+        )
+        return SalvagePushResult(
+            pushed=True,
+            old_remote_sha="abc123",
+            new_remote_sha="newsha123",
+            commit_count=1,
+        )
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
+    ):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            write_gate=_wg(paths.state_file, dry_run=True),
+        )
+
+    # The salvage stand-in must have been called exactly once for the orphaned
+    # issue's branch, and -- the point of this test -- dry_run must be True.
+    assert len(salvage_calls) == 1
+    assert salvage_calls[0]["branch"] == "agent/issue-1326"
+    assert salvage_calls[0]["dry_run"] is True
+
+
 def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
     tmp_path: Path,
 ) -> None:
@@ -51309,6 +52915,7 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 500, "request_changes", "abc123")
 
     class FakeGitHubForSalvage(FakeGitHub):
         def pr_list(self):
@@ -51324,7 +52931,7 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         return SalvagePushResult(
             pushed=False,
             error="push_failed: network timeout",
@@ -51341,7 +52948,9 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1248"]
@@ -51391,6 +53000,7 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 500, "request_changes", "abc123")
 
     class FakeGitHubForSalvage(FakeGitHub):
         def pr_list(self):
@@ -51406,7 +53016,7 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         return SalvagePushResult(pushed=False, skip_reason="up_to_date", old_remote_sha="abc123")
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -51418,7 +53028,9 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1248"]
@@ -51475,7 +53087,7 @@ def test_orphaned_worker_salvage_push_skips_cross_repository_pr(tmp_path: Path) 
 
     salvage_calls: list[tuple[Any, ...]] = []
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         salvage_calls.append((repo_root, branch, worktree_path, base_ref))
         return SalvagePushResult(pushed=False, skip_reason="should_never_be_called")
 
@@ -51488,6 +53100,710 @@ def test_orphaned_worker_salvage_push_skips_cross_repository_pr(tmp_path: Path) 
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     assert salvage_calls == []
+
+
+def test_dispatch_rework_worktree_foreign_writer_does_not_increment_redispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1393: a rework dispatch that fails at launch with
+    worktree_foreign_writer must NOT increment the redispatch counter.
+
+    A pre-launch environment block (the worktree is a foreign checkout the
+    orchestrator did not create) never started a worker session, so it is
+    not a "worker produced nothing" signal.  Counting it against the
+    redispatch cap converts an operator hygiene problem into a fake
+    "worker quality" escalation (redispatch_cap_exceeded).  Instead, the
+    failure is recorded in a separate blocked_environment_at list and a
+    distinct rework_dispatch_blocked_environment event is emitted.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    blocking_error = (
+        "worktree C:\\repos\\jc-wt-886 is a foreign checkout the "
+        "orchestrator did not create; refusing to adopt it"
+    )
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error=blocking_error,
+                failure_kind="worktree_foreign_writer",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    # First blocked launch: blocked_environment_at grows, redispatch_at stays empty.
+    result = app.dispatch_rework()
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["issues"]["123"].get("redispatch_at") is None
+    assert len(state["issues"]["123"].get("blocked_environment_at", [])) == 1
+
+    # Second blocked launch: still under the cap, still rework_requested.
+    result = app.dispatch_rework()
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["issues"]["123"].get("redispatch_at") is None
+    assert len(state["issues"]["123"].get("blocked_environment_at", [])) == 2
+
+    # Third pass: the candidate-filtering safety net sees
+    # blocked_environment_at == 2 >= max_auto_redispatch (2) and escalates
+    # with dispatch_blocked_environment BEFORE attempting another launch.
+    # This is the correct behavior: the environment conflict is
+    # deterministic, so there is no point dispatching again.
+    result = app.dispatch_rework()
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "dispatch_blocked_environment"
+    assert state["issues"]["123"].get("redispatch_at") is None
+    assert len(state["issues"]["123"]["blocked_environment_at"]) == 2
+    # Mechanical -> operator-queue, not human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
+
+
+def test_dispatch_rework_worktree_foreign_writer_redispatch_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1393: after blocked-environment failures are resolved, a
+    subsequent genuine redispatch failure still counts against the
+    redispatch cap correctly — the blocked_environment_at list did not
+    silently inflate it.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    # First: one blocked-environment failure (does NOT touch redispatch_at).
+    def fake_blocked(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="foreign checkout",
+                failure_kind="worktree_foreign_writer",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_blocked)
+    app.dispatch_rework()
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"].get("redispatch_at") is None
+    assert len(state["issues"]["123"].get("blocked_environment_at", [])) == 1
+
+    # Now: a generic (non-blocked) failure.  redispatch_at should start
+    # from 0 (the blocked failure did not inflate it), so the cap is
+    # NOT exceeded on the first generic failure.
+    def fake_generic(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="git worktree add failed",
+                failure_kind=None,
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_generic)
+    result = app.dispatch_rework()
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert len(state["issues"]["123"]["redispatch_at"]) == 1
+
+
+def test_dispatch_fresh_worktree_foreign_writer_does_not_increment_dispatch_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1393: a fresh dispatch that fails at launch with
+    worktree_foreign_writer must NOT increment the dispatch_failed counter.
+    Instead it uses blocked_environment_at and escalates with
+    dispatch_blocked_environment after the cap.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Avoid the open-PR exclusion by closing the default fixture PR.
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="worktree C:\\wt is a foreign checkout",
+                failure_kind="worktree_foreign_writer",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    # First blocked launch: blocked_environment_at grows, dispatch_failed_at stays empty.
+    result1 = app.dispatch(limit=1)
+    assert result1.ok is False
+    assert result1.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatch_failed"
+    assert state["issues"]["123"].get("dispatch_failed_at") is None
+    assert len(state["issues"]["123"].get("blocked_environment_at", [])) == 1
+
+    # Second blocked launch: still under the cap.
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"].get("dispatch_failed_at") is None
+    assert len(state["issues"]["123"].get("blocked_environment_at", [])) == 2
+
+    # Third blocked launch: exceeds the cap (max_auto_redispatch=2).
+    result3 = app.dispatch(limit=1)
+    assert result3.ok is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "dispatch_blocked_environment"
+    assert state["issues"]["123"].get("dispatch_failed_at") is None
+
+
+def _blocked_env_timestamps(n: int) -> list[str]:
+    """``n`` recent ISO timestamps for pre-seeding ``blocked_environment_at``."""
+    return [
+        (datetime.now(UTC) - timedelta(minutes=i)).isoformat().replace("+00:00", "Z")
+        for i in range(n)
+    ]
+
+
+def test_dispatch_fresh_blocked_environment_reap_resets_counter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1423: at the fresh-dispatch blocked-environment cap exhaustion,
+    a successful foreign-writer reap resets ``blocked_environment_at`` and
+    records the reap in ``foreign_writer_reaps`` instead of escalating."""
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+            max_foreign_writer_reaps=2,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pre-seed: two prior blocked passes (at the cap), so this pass's failure
+    # pushes len(blocked_environment_at) to 3 > max_auto_redispatch(2) and
+    # enters the reap branch.
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "dispatch_failed",
+            "blocked_environment_at": _blocked_env_timestamps(2),
+        }
+        save_state(paths.state_file, state)
+
+    wt_path = tmp_path / "wt-foreign"
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="worktree has a live foreign writer",
+                failure_kind="worktree_foreign_writer",
+                pid=1234,
+                worktree_path=str(wt_path),
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    reap_calls: list[int] = []
+
+    def _fake_reap(failed_result, _config, _state_file, issue_number):
+        reap_calls.append(issue_number)
+        return True
+
+    monkeypatch.setattr("charlie_work.workflow._try_reap_blocked_foreign_writer", _fake_reap)
+
+    result = app.dispatch(limit=1)
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    # Reap succeeded: status is dispatch_failed (NOT escalated), counter reset.
+    assert state["issues"]["123"]["status"] == "dispatch_failed"
+    assert state["issues"]["123"]["blocked_environment_at"] == []
+    # The reap was recorded so a persistently-blocked worktree eventually escalates.
+    assert len(state["issues"]["123"].get("foreign_writer_reaps", [])) == 1
+    assert reap_calls == [123]
+
+
+def test_dispatch_rework_blocked_environment_reap_resets_counter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1423: at the rework-dispatch blocked-environment cap exhaustion
+    (Site 3 — the post-dispatch safety net), a successful foreign-writer reap
+    resets ``blocked_environment_at`` and records the reap in
+    ``foreign_writer_reaps`` instead of escalating.
+
+    Site 3 is defense-in-depth: the pre-filter (Site 2) uses ``>=`` and Site 3
+    uses ``>``, so in normal flow Site 2 always catches an at-cap issue before
+    Site 3 can fire. Site 3 is reachable when Site 2's reap succeeds (resetting
+    the counter) and ``max_auto_redispatch=0`` so the post-dispatch
+    ``len([now]) > 0`` fires Site 3. This test uses that path: Site 2 reaps
+    (recording reap #1), the dispatch fails, and Site 3 reaps again (recording
+    reap #2). Two reaps confirm Site 3 fired — without it, only reap #1 would
+    be recorded and ``blocked_environment_at`` would hold one entry.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.config import WRITER_MARKER_FILENAME
+    from charlie_work.worktree import worktree_path_for_branch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=0,
+            redispatch_window_minutes=240,
+            max_foreign_writer_reaps=2,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "rework-prompt.md").write_text("Fix the issues", encoding="utf-8")
+
+    # Materialize a marker at the worktree path derived from the PR head ref
+    # so Site 2 (pre-filter) reaps and lets the issue proceed to dispatch.
+    branch_pre = str(fake_gh.prs[0]["headRefName"])
+    wt_path_pre = worktree_path_for_branch(tmp_path, branch_pre, app._layout.worktrees)
+    wt_path_pre.mkdir(parents=True, exist_ok=True)
+    marker = {
+        "pid": 1234,
+        "session_id": "foreign-session",
+        "started_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z"),
+        "kind": "worker",
+        "process_start_time": 1234567890.0,
+    }
+    (wt_path_pre / WRITER_MARKER_FILENAME).write_text(json.dumps(marker), encoding="utf-8")
+
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
+    # _reap_idle_foreign_writer is shared by Site 2 (inline) and Site 3 (via
+    # _try_reap_blocked_foreign_writer). Return True without removing the
+    # marker so Site 3 can read it too.
+    monkeypatch.setattr(
+        "charlie_work.workflow._reap_idle_foreign_writer",
+        lambda worktree_path, pid, session_id, marker, _config, **_kw: True,
+    )
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="worktree has a live foreign writer",
+                failure_kind="worktree_foreign_writer",
+                pid=1234,
+                worktree_path=str(wt_path_pre),
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    result = app.dispatch_rework()
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    # Both Site 2 and Site 3 reaped: two reap timestamps recorded. If Site 3
+    # had not fired, only one reap would be recorded and
+    # blocked_environment_at would hold one entry (the post-dispatch failure).
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["issues"]["123"]["blocked_environment_at"] == []
+    assert len(state["issues"]["123"].get("foreign_writer_reaps", [])) == 2
+
+
+def test_dispatch_rework_pre_escalation_safety_net_reaps_foreign_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1423: the rework candidate pre-filter loop's blocked-environment
+    safety net reaps an idle foreign writer before escalating. The marker is
+    read from the worktree path derived from the PR's head ref; on a
+    successful reap the issue proceeds as a legitimate candidate instead of
+    being escalated."""
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.config import WRITER_MARKER_FILENAME
+    from charlie_work.worktree import worktree_path_for_branch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+            max_foreign_writer_reaps=2,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "blocked_environment_at": _blocked_env_timestamps(2),
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "rework-prompt.md").write_text("Fix the issues", encoding="utf-8")
+
+    # Materialize the worktree dir the safety net derives from the PR head ref,
+    # with a live writer marker so the reap path has something to read.
+    branch_pre = str(fake_gh.prs[0]["headRefName"])
+    wt_path_pre = worktree_path_for_branch(tmp_path, branch_pre, app._layout.worktrees)
+    wt_path_pre.mkdir(parents=True, exist_ok=True)
+    marker = {
+        "pid": 1234,
+        "session_id": "foreign-session",
+        "started_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z"),
+        "kind": "worker",
+        "process_start_time": 1234567890.0,
+    }
+    (wt_path_pre / WRITER_MARKER_FILENAME).write_text(json.dumps(marker), encoding="utf-8")
+
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
+    reap_calls: list[int] = []
+
+    def _fake_reap(worktree_path, pid, session_id, marker, _config, **_kw):
+        reap_calls.append(pid)
+        return True
+
+    monkeypatch.setattr("charlie_work.workflow._reap_idle_foreign_writer", _fake_reap)
+
+    # The actual dispatch after the reap succeeds so the issue is dispatched.
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=True,
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    app.dispatch_rework()
+
+    # The safety net reaped the foreign writer instead of escalating.
+    assert reap_calls == [1234]
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] != "escalated"
+    assert state["issues"]["123"]["blocked_environment_at"] == []
+    assert len(state["issues"]["123"].get("foreign_writer_reaps", [])) == 1
+
+
+def test_dispatch_fresh_blocked_environment_reap_cap_escalates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1423 review: once ``foreign_writer_reaps`` reaches
+    ``max_foreign_writer_reaps``, the cap-exhaustion site escalates instead of
+    reaping again — a persistently-blocked worktree cannot loop forever
+    between reap and redispatch."""
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+            max_foreign_writer_reaps=2,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pre-seed: blocked_environment_at at the cap AND foreign_writer_reaps
+    # already at max_foreign_writer_reaps(2). The reap must NOT be attempted;
+    # the issue must escalate.
+    paths.root.mkdir(parents=True, exist_ok=True)
+    reap_ts = _blocked_env_timestamps(2)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "dispatch_failed",
+            "blocked_environment_at": _blocked_env_timestamps(2),
+            "foreign_writer_reaps": reap_ts,
+        }
+        save_state(paths.state_file, state)
+
+    wt_path = tmp_path / "wt-foreign"
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="worktree has a live foreign writer",
+                failure_kind="worktree_foreign_writer",
+                pid=1234,
+                worktree_path=str(wt_path),
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    def _reap_must_not_run(_failed_result, _config, _state_file, _issue_number):
+        raise AssertionError("reap must not be attempted once the reap cap is reached")
+
+    monkeypatch.setattr(
+        "charlie_work.workflow._try_reap_blocked_foreign_writer", _reap_must_not_run
+    )
+
+    result = app.dispatch(limit=1)
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    # Escalated, NOT reaped.
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "dispatch_blocked_environment"
+    # The reap counter is unchanged (no new reap recorded).
+    assert state["issues"]["123"]["foreign_writer_reaps"] == reap_ts
+
+
+def test_cleanup_stale_session_tmp_files_removes_stranded_tmp(
+    tmp_path: Path,
+) -> None:
+    """Issue #1393: cleanup_stale_session_tmp_files removes stranded .json.tmp
+    files from the sessions directory (left behind by an interrupted atomic
+    write) without touching the valid .json sidecar.
+
+    The tmp files are aged past the ``min_age_seconds`` threshold so the sweep
+    treats them as genuinely stranded rather than in-flight.
+    """
+    import os
+
+    from charlie_work.adapters import cleanup_stale_session_tmp_files
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True)
+
+    # A valid sidecar.
+    (sessions_dir / "issue-100.json").write_text('{"ok": true}', encoding="utf-8")
+    # A stranded tmp from an interrupted write.
+    (sessions_dir / "issue-100.json.tmp").write_text('{"ok": ', encoding="utf-8")
+    # Another stranded tmp for a different issue.
+    (sessions_dir / "issue-200.json.tmp").write_text('{"partial": ', encoding="utf-8")
+
+    # Age both tmp files beyond the default 60s threshold so the sweep
+    # treats them as stranded, not in-flight.
+    stale_mtime = time.time() - 120
+    os.utime(sessions_dir / "issue-100.json.tmp", (stale_mtime, stale_mtime))
+    os.utime(sessions_dir / "issue-200.json.tmp", (stale_mtime, stale_mtime))
+
+    removed = cleanup_stale_session_tmp_files(sessions_dir)
+
+    assert removed == 2
+    assert (sessions_dir / "issue-100.json").exists()
+    assert not (sessions_dir / "issue-100.json.tmp").exists()
+    assert not (sessions_dir / "issue-200.json.tmp").exists()
+
+
+def test_cleanup_stale_session_tmp_files_skips_fresh_tmp(tmp_path: Path) -> None:
+    """Issue #1393 regression: a freshly-created (not-yet-replaced) .json.tmp
+    file must survive cleanup_stale_session_tmp_files so the sweep cannot race
+    a legitimate in-flight atomic write between its close() and replace()
+    calls — unlinking the tmp there crashes the writer with FileNotFoundError.
+    """
+    from charlie_work.adapters import cleanup_stale_session_tmp_files
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True)
+
+    # A tmp file a legitimate writer just created and closed but has not yet
+    # replaced — its mtime is "now", well within the 60s grace window.
+    fresh = sessions_dir / "issue-300.json.tmp"
+    fresh.write_text('{"in-flight": ', encoding="utf-8")
+
+    removed = cleanup_stale_session_tmp_files(sessions_dir)
+
+    assert removed == 0
+    assert fresh.exists()
+    assert fresh.read_text(encoding="utf-8") == '{"in-flight": '
+
+
+def test_cleanup_stale_session_tmp_files_missing_dir(tmp_path: Path) -> None:
+    """cleanup_stale_session_tmp_files is a no-op when the sessions dir
+    does not exist (e.g. first-ever dispatch pass)."""
+    from charlie_work.adapters import cleanup_stale_session_tmp_files
+
+    removed = cleanup_stale_session_tmp_files(tmp_path / "nonexistent")
+    assert removed == 0

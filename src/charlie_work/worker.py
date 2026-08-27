@@ -153,6 +153,7 @@ class WorkerHealth(Enum):
     1. liveness → DEAD (unless a fresh probe vetoes, or an inconclusive probe
        defers up to the configured cap)
     2. terminal marker → DEAD (unconditional; overrides a fresh probe)
+    2.5. provider account suspension (api only) → DEAD (issue #1342)
     3. progress staleness → STALLED (unless a fresh or inconclusive probe vetoes it)
     4. wall-clock deadline → SLOW (or RUNAWAY if wall_clock_kill=True)
     5. loop/no-progress (Claude Code only) → SLOW (or RUNAWAY if loop_kill=True, capped at SLOW for Devin)
@@ -710,6 +711,7 @@ def classify_worker_health(
     1. liveness → DEAD (unless a fresh real-session activity signal vetoes it,
        or an inconclusive probe defers up to ``max_inconclusive_probe_deferrals``)
     2. terminal marker → DEAD (unconditional; overrides a fresh probe)
+    2.5. provider account suspension (api only) → DEAD (issue #1342)
     3. progress staleness → STALLED (unless a fresh or inconclusive probe vetoes it)
     4. wall-clock deadline → SLOW (or RUNAWAY if wall_clock_kill=True)
     5. loop/no-progress (Claude Code only) → SLOW (or RUNAWAY if loop_kill=True, capped at SLOW for Devin)
@@ -770,6 +772,21 @@ def classify_worker_health(
 
     # Check for terminal error markers in the log
     has_terminal_error = False
+    # Signal 2.5: provider account suspension (api only, issue #1342). A
+    # suspended provider account returns a terminal billing failure that the
+    # Claude Code CLI retries as a transient rate-limit, so the worker stays
+    # alive but stuck in backoff for stall_minutes. Detect the suspension
+    # signature in the log TAIL (not just the last line — the CLI logs retry
+    # attempts after the suspension message) and kill the worker immediately
+    # so the session ends within one supervision pass. Terminal like Signal 2
+    # — overrides a fresh probe.
+    #
+    # The match is structurally anchored (``_provider_suspension_in_tail``):
+    # the billing phrase must co-occur on the same log line with an HTTP 402
+    # status or a CLI ``Error:``/``API Error:`` prefix, so a live worker that
+    # merely quotes or reviews the trigger phrase in prose/code is NOT killed
+    # (PR #1426 round-2 review).
+    has_provider_suspension = False
     try:
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
         lines = log_text.splitlines()
@@ -779,10 +796,16 @@ def classify_worker_health(
                 if pattern in last_log_line:
                     has_terminal_error = True
                     break
+        if view.adapter_kind == "api":
+            from .claude_code import _provider_suspension_in_tail
+
+            tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+            if _provider_suspension_in_tail(tail):
+                has_provider_suspension = True
     except OSError:
         pass
 
-    if has_terminal_error:
+    if has_terminal_error or has_provider_suspension:
         return WorkerHealth.DEAD
 
     # Signal 3: progress staleness

@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from _sessions_db_fixtures import make_sessions_db
+from _worktree_fixtures import _clone_repo, _git
 from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfig, WatchdogConfig
 from charlie_work.github import GitHubRunResult
 from charlie_work.process_utils import get_process_start_time
@@ -148,22 +149,6 @@ def _init_repo(repo_root: Path, bare: bool = False) -> None:
         (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
         run(["git", "add", "README.md"])
         run(["git", "commit", "-m", "initial commit"])
-
-
-def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
-
-
-def _clone_repo(remote_repo: Path, repo_root: Path) -> None:
-    subprocess.run(
-        ["git", "clone", str(remote_repo), str(repo_root)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    # A fresh clone has no committer identity on CI runners.
-    _git(repo_root, "config", "user.email", "test@example.test")
-    _git(repo_root, "config", "user.name", "Test User")
 
 
 def test_create_and_remove_round_trip(tmp_path: Path) -> None:
@@ -4416,16 +4401,21 @@ def test_worker_authored_dirty_detects_sibling_in_collapsed_untracked_dir(
     dir/`` line in the first place — every file, including a worker-authored
     sibling living next to a nested injected path, gets its own record. There
     is no collapsed line left to special-case or re-probe.
+
+    Uses a non-launcher-owned directory (``.custom/``) because ``.devin/`` is
+    now entirely launcher-owned (issue #1391) — a sibling under ``.devin/``
+    is correctly ignored, so it cannot serve as the "should be detected"
+    case here.
     """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
-    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected = repo_root / ".custom" / "prompts" / "worker.md"
     injected.parent.mkdir(parents=True)
     injected.write_text("injected prompt", encoding="utf-8")
-    sibling = repo_root / ".devin" / "worker-output.txt"
+    sibling = repo_root / ".custom" / "worker-output.txt"
     sibling.write_text("real worker output", encoding="utf-8")
 
-    assert _worker_authored_dirty(repo_root, (".devin/prompts/worker.md",)) is True
+    assert _worker_authored_dirty(repo_root, (".custom/prompts/worker.md",)) is True
 
 
 def test_worker_authored_dirty_untracked_dir_with_only_injected_stays_clean(
@@ -4594,6 +4584,137 @@ def test_worker_authored_dirty_detects_changes_outside_materialize_and_injected(
     (repo_root / "worker-output.txt").write_text("worker result\n", encoding="utf-8")
 
     assert _worker_authored_dirty(repo_root, (), (".devin",)) is True
+
+
+# --- issue #1391: launcher-owned shim dirt is not worker output ---------------
+
+
+def test_worker_authored_dirty_ignores_devin_shim_residue(tmp_path: Path) -> None:
+    """Issue #1391: untracked ``.devin/`` launcher residue (AGENTS.md,
+    hooks.v1.json, hooks/*.py, skills/, worker.md, orchestrator.md) is shim
+    dirt, not worker output. The dirty check must ignore it so a worktree
+    whose only dirt is launcher residue is not refused re-arm."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    # Simulate the full set of shim residue observed in the field.
+    devin = repo_root / ".devin"
+    devin.mkdir(parents=True)
+    (devin / "AGENTS.md").write_text("agents\n", encoding="utf-8")
+    (devin / "worker.md").write_text("worker\n", encoding="utf-8")
+    (devin / "orchestrator.md").write_text("orch\n", encoding="utf-8")
+    (devin / "hooks.v1.json").write_text("{}", encoding="utf-8")
+    hooks_dir = devin / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "pre_tool.py").write_text("# hook\n", encoding="utf-8")
+    skills_dir = devin / "skills"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "foo.py").write_text("# skill\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_devin_prompts_modifications(
+    tmp_path: Path,
+) -> None:
+    """Issue #1391: modified ``.devin/prompts/rework.md`` / ``worker.md`` are
+    shim rewrites, not worker output. Even when tracked, modifications under
+    ``.devin/`` must be ignored by the launcher-owned matcher (independent of
+    ``injected_paths`` / ``materialize_dirs`` config)."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    prompts_dir = repo_root / ".devin" / "prompts"
+    prompts_dir.mkdir(parents=True)
+    for name in ("worker.md", "rework.md"):
+        p = prompts_dir / name
+        p.write_text("original\n", encoding="utf-8")
+        _git(repo_root, "add", str(p))
+    _git(repo_root, "commit", "-m", "track devin prompts")
+    # Simulate the shim rewriting them.
+    (prompts_dir / "worker.md").write_text("rewritten\n", encoding="utf-8")
+    (prompts_dir / "rework.md").write_text("rewritten\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_pr_body_scratch_files(tmp_path: Path) -> None:
+    """Issue #1391: PR body scratch files (``PR_BODY.md``, ``PR_BODY_42.md``,
+    ``.worker-pr-body.md``, ``_pr_body.md``) are launcher/protocol residue,
+    not worker output. The dirty check must ignore all variants."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    for name in ("PR_BODY.md", "PR_BODY_42.md", ".worker-pr-body.md", "_pr_body.md"):
+        (repo_root / name).write_text("# PR body draft\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_git_worktree_dir(tmp_path: Path) -> None:
+    """Issue #1391: untracked ``.git_worktree_dir/`` is launcher residue."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    wt_dir = repo_root / ".git_worktree_dir"
+    wt_dir.mkdir(parents=True)
+    (wt_dir / "cache.json").write_text("{}", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_charlie_writer_deletion(tmp_path: Path) -> None:
+    """Issue #1391: a deleted ``.charlie-writer.json`` marker is protocol
+    residue, not worker output. The writer marker is already in the default
+    ``injected_paths``, so a deletion is excluded by the declared-scaffolding
+    matcher — this test pins that the default config covers the deletion
+    case (not just creation/modification)."""
+    from charlie_work.config import DispatchConfig
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    marker = repo_root / ".charlie-writer.json"
+    marker.write_text('{"pid": 1}\n', encoding="utf-8")
+    _git(repo_root, "add", str(marker))
+    _git(repo_root, "commit", "-m", "track writer marker")
+    # Delete it (simulating a worker or shim removing the marker).
+    marker.unlink()
+
+    assert _worker_authored_dirty(repo_root, DispatchConfig().injected_paths) is False
+
+
+def test_worker_authored_dirty_still_flags_real_work_alongside_shim_dirt(
+    tmp_path: Path,
+) -> None:
+    """Issue #1391 negative control: ignoring launcher residue must NOT excuse
+    genuine worker-authored modifications mixed in with the junk. This is the
+    jc #1514 scenario — two real modified source files alongside shim dirt
+    that were lost when the worktree was force-removed."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    # Shim residue.
+    devin = repo_root / ".devin"
+    devin.mkdir(parents=True)
+    (devin / "AGENTS.md").write_text("agents\n", encoding="utf-8")
+    (repo_root / "PR_BODY.md").write_text("# draft\n", encoding="utf-8")
+    # Real worker output — a tracked source file modification.
+    src = repo_root / "src" / "app.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("original\n", encoding="utf-8")
+    _git(repo_root, "add", str(src))
+    _git(repo_root, "commit", "-m", "add app")
+    src.write_text("modified by worker\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is True
+
+
+def test_worker_authored_dirty_devin_prefix_does_not_collide(tmp_path: Path) -> None:
+    """Issue #1391: a directory that merely shares a string prefix with a
+    launcher-owned dir (``.devin-cache`` vs ``.devin``) must not match —
+    path-segment comparison, not substring matching."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    cache_dir = repo_root / ".devin-cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "marker.txt").write_text("not launcher\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is True
 
 
 def test_inspect_worktree_state_no_commits(tmp_path: Path) -> None:
@@ -5605,8 +5726,8 @@ def test_verify_shared_venv_catches_pth_pointing_outside_main_checkout(tmp_path:
     ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
 
     assert not ok
-    assert "points outside main checkout" in message
-    assert "uv sync --all-extras --reinstall-package charlie-work" in message
+    assert "points outside all configured checkouts" in message
+    assert "uv sync --all-extras" in message
 
 
 def test_verify_shared_venv_approves_pth_pointing_at_main_checkout(tmp_path: Path) -> None:
@@ -5619,7 +5740,130 @@ def test_verify_shared_venv_approves_pth_pointing_at_main_checkout(tmp_path: Pat
     ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
 
     assert ok
-    assert "main checkout" in message
+    assert "configured checkouts" in message
+
+
+def _setup_repo_with_peer_dep(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a repo with a relative editable dep on a peer repo.
+
+    Returns ``(repo_root, peer_src)`` where ``repo_root/pyproject.toml``
+    declares ``ci-fleet = { path = "../ci_runners", editable = true }`` and
+    ``peer_src`` is the peer repo's ``src`` directory containing
+    ``ci_fleet/__init__.py``.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    (repo_root / "pyproject.toml").write_text(
+        '[project]\nname = "charlie-work"\nversion = "0.1.0"\n'
+        '[tool.uv.sources]\nci-fleet = { path = "../ci_runners", editable = true }\n',
+        encoding="utf-8",
+    )
+    peer_root = tmp_path / "ci_runners"
+    peer_src = peer_root / "src"
+    (peer_src / "ci_fleet").mkdir(parents=True)
+    (peer_src / "ci_fleet" / "__init__.py").write_text("", encoding="utf-8")
+    return repo_root, peer_src
+
+
+def test_verify_shared_venv_detects_poisoned_foreign_editable(tmp_path: Path) -> None:
+    """A peer-repo editable .pth pointing at a scratch dir is caught (issue #969 gap 2).
+
+    The old filename filter excluded ``_editable_impl_ci_fleet.pth`` because
+    ``ci_fleet`` is not a top-level package under this repo's ``src``.  The
+    resolved-target test scans every ``.pth`` and flags any path line outside
+    all configured roots.
+    """
+    repo_root, peer_src = _setup_repo_with_peer_dep(tmp_path)
+    scratch = tmp_path / "scratch" / "src"
+    scratch.mkdir(parents=True)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    # Main repo .pth is healthy; foreign .pth is poisoned.
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    (site_packages / "_editable_impl_ci_fleet.pth").write_text(
+        str(scratch.resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert not ok
+    assert "_editable_impl_ci_fleet.pth" in message
+    assert "points outside all configured checkouts" in message
+
+
+def test_verify_shared_venv_approves_healthy_foreign_editable(tmp_path: Path) -> None:
+    """A peer-repo editable .pth pointing at the correct peer src is approved."""
+    repo_root, peer_src = _setup_repo_with_peer_dep(tmp_path)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    (site_packages / "_editable_impl_ci_fleet.pth").write_text(
+        str(peer_src.resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert ok
+    assert "configured checkouts" in message
+
+
+def test_verify_shared_venv_catches_foreign_editable_when_main_is_healthy(
+    tmp_path: Path,
+) -> None:
+    """The false-green scenario from issue #969: main .pth healthy, foreign poisoned.
+
+    The old filter + repair would flag the main .pth, repair it, re-verify
+    only the main .pth, and report success while the foreign editable was still
+    pointing into a scratch tree.  The resolved-target test scans every .pth,
+    so the foreign mismatch is surfaced directly.
+    """
+    repo_root, peer_src = _setup_repo_with_peer_dep(tmp_path)
+    scratch = tmp_path / "scratch" / "src"
+    scratch.mkdir(parents=True)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    (site_packages / "_editable_impl_ci_fleet.pth").write_text(
+        str(scratch.resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert not ok
+    assert "_editable_impl_ci_fleet.pth" in message
+
+
+def test_verify_shared_venv_ignores_non_path_pth_lines(tmp_path: Path) -> None:
+    """``import``/comment ``.pth`` lines are not treated as path targets.
+
+    ``ci_fleet_probe.pth`` and ``_virtualenv.pth`` contain ``import`` lines
+    that :func:`_resolve_pth_line` returns an empty path for.  They must not
+    trigger a false mismatch under the resolved-target test.
+    """
+    repo_root, _peer_src = _setup_repo_with_peer_dep(tmp_path)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    (site_packages / "ci_fleet_probe.pth").write_text(
+        "import sys; exec(__import__('importlib').import_module('ci_fleet_probe')._probe())\n",
+        encoding="utf-8",
+    )
+    (site_packages / "_virtualenv.pth").write_text("import _virtualenv\n", encoding="utf-8")
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert ok
+    assert "configured checkouts" in message
 
 
 def test_clean_worktrees_removes_merged_worktree_and_verifies_shared_venv(
@@ -5653,7 +5897,7 @@ def test_clean_worktrees_removes_merged_worktree_and_verifies_shared_venv(
     assert len(result.data["removed"]) == 1
     assert not info.path.exists()
     assert result.data["venv_ok"] is True
-    assert "main checkout" in result.data["venv_message"]
+    assert "configured checkouts" in result.data["venv_message"]
 
 
 def test_clean_worktrees_skips_dirty_worktree(tmp_path: Path) -> None:
@@ -6239,7 +6483,7 @@ def test_clean_worktrees_surfaces_poisoned_venv_after_removal(tmp_path: Path) ->
     assert result.ok is False
     assert len(result.data["removed"]) == 1
     assert result.data["venv_ok"] is False
-    assert "points outside main checkout" in result.data["venv_message"]
+    assert "points outside all configured checkouts" in result.data["venv_message"]
 
 
 def test_clean_worktrees_skips_open_pr(tmp_path: Path) -> None:
@@ -7610,6 +7854,91 @@ def test_rescue_capture_excludes_scaffolding(
     remove_worktree(repo, info2.path, branch=branch_name)
 
 
+def test_rescue_capture_excludes_launcher_owned_shim_dirt(
+    tmp_path: Path,
+) -> None:
+    """Issue #1391: launcher-owned shim dirt (``.devin/``, ``.git_worktree_dir/``,
+    and a ``PR_BODY*.md`` scratch file) mixed with real tracked worker edits is
+    excluded from the captured rescue tree, while the real worker edits are
+    preserved.
+
+    Calls ``_capture_worktree_work_to_rescue_ref`` directly so the exclusion
+    pathspecs in the capture function are the only thing under test -- the
+    ``_worker_authored_dirty`` matcher that also ignores launcher-owned dirt
+    is not on this code path, so a regression in the capture exclusions cannot
+    be masked by the dirty check refusing to trigger.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    branch_name = "agent/issue-1391-rescue-shim-dirt"
+    info = create_worktree(repo, branch_name, base_ref="origin/main")
+
+    # Real worker edits: a tracked modification + an untracked worker file.
+    # These MUST appear in the rescue tree.
+    worker_readme = "modified by worker\n"
+    (info.path / "README.md").write_text(worker_readme, encoding="utf-8")
+    worker_new = "real worker edit\n"
+    (info.path / "worker_real_edit.txt").write_text(worker_new, encoding="utf-8")
+
+    # Launcher-owned shim dirt. These MUST NOT appear in the rescue tree.
+    (info.path / ".devin").mkdir(exist_ok=True)
+    (info.path / ".devin" / "config.json").write_text('{"shim": true}\n', encoding="utf-8")
+    (info.path / ".git_worktree_dir").mkdir(exist_ok=True)
+    (info.path / ".git_worktree_dir" / "marker").write_text("shim marker\n", encoding="utf-8")
+    # A PR_BODY*.md variant -- the glob exclusion must catch it.
+    pr_body = "draft PR body\n"
+    (info.path / "PR_BODY_1391.md").write_text(pr_body, encoding="utf-8")
+
+    capture = worktree_module._capture_worktree_work_to_rescue_ref(
+        repo, info.path, issue_number=1391
+    )
+
+    assert capture.error is None, f"capture failed: {capture.error}"
+    assert capture.ref_name is not None
+    assert capture.ref_name.startswith(RESCUE_REF_PREFIX)
+    rescue_ref = capture.ref_name
+
+    # Real worker edits ARE present in the rescue tree, byte-for-byte.
+    assert _git(repo, "show", f"{rescue_ref}:README.md").stdout == worker_readme
+    assert _git(repo, "show", f"{rescue_ref}:worker_real_edit.txt").stdout == worker_new
+
+    # Launcher-owned shim paths are EXCLUDED from the rescue tree: ``git show``
+    # for each shim path fails (non-zero exit) because the path does not exist
+    # in the captured tree.
+    for shim_path in (
+        ".devin/config.json",
+        ".git_worktree_dir/marker",
+        "PR_BODY_1391.md",
+    ):
+        show_result = subprocess.run(
+            ["git", "show", f"{rescue_ref}:{shim_path}"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        assert show_result.returncode != 0, (
+            f"shim path {shim_path!r} leaked into the rescue tree; "
+            f"git show returned {show_result.returncode} with stdout="
+            f"{show_result.stdout!r}"
+        )
+
+    # Sanity: no path under a launcher-owned directory or matching the PR body
+    # family appears anywhere in the captured tree.
+    tree_paths = _git(repo, "ls-tree", "-r", "--name-only", rescue_ref).stdout.splitlines()
+    leaked = [
+        p
+        for p in tree_paths
+        if p.startswith(".devin/")
+        or p.startswith(".git_worktree_dir/")
+        or p.startswith("PR_BODY")
+        or p in (".worker-pr-body.md", "_pr_body.md")
+    ]
+    assert leaked == [], f"launcher-owned shim paths leaked into rescue tree: {leaked}"
+
+    # Clean up.
+    remove_worktree(repo, info.path, branch=branch_name)
+
+
 def test_rescue_capture_emits_event_retrievable_via_query_events(
     tmp_path: Path,
 ) -> None:
@@ -7987,5 +8316,82 @@ def test_salvage_push_operator_claimed_marker_skips(tmp_path: Path) -> None:
 
     assert result.pushed is False
     assert result.skip_reason == "operator_claimed"
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
+
+
+# ---------------------------------------------------------------------------
+# Issue #1326: dry_run gate for push_branch / salvage_push_stranded_commits
+# ---------------------------------------------------------------------------
+#
+# Under dry_run=True, push_branch must short-circuit before the ``git push``
+# subprocess call -- no real push reaches origin. salvage_push_stranded_commits
+# threads dry_run through to push_branch. Both tests use real local git repos
+# (bare "origin" remote + clone with linked worktrees) and verify the remote
+# branch tip is unchanged after the call.
+
+
+def test_push_branch_dry_run_does_not_push(tmp_path: Path) -> None:
+    """dry_run=True short-circuits before ``git push``; origin is untouched."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1326-push-dry"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit, never pushed")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    # The branch must NOT exist on origin before the call.
+    show_ref_before = _git(remote, "show-ref")
+    assert branch not in show_ref_before.stdout
+
+    ok, error = push_branch(repo, branch, worktree_path=info.path, dry_run=True)
+
+    # Dry-run returns the natural "nothing happened" success shape.
+    assert ok is True
+    assert error is None
+
+    # The branch must STILL NOT exist on origin -- no real push happened.
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
+    # And the local tip is unchanged (the commit is still only local).
+    assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == local_tip
+
+
+def test_salvage_push_stranded_commits_dry_run_does_not_push(tmp_path: Path) -> None:
+    """dry_run=True threads through to push_branch; origin is untouched.
+
+    The read-only probing (rev-parse, ls-remote, merge-base, rev-list) still
+    runs, but the mutating ``git push`` is suppressed. The salvage returns
+    pushed=True (the "nothing happened" success shape that lets downstream
+    classification proceed under dry-run), but the remote branch tip is
+    unchanged.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1326-salvage-dry"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    # Make a commit that would be stranded (never pushed).
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "stranded commit, never pushed")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    # The branch must NOT exist on origin before the call.
+    show_ref_before = _git(remote, "show-ref")
+    assert branch not in show_ref_before.stdout
+
+    result = salvage_push_stranded_commits(repo, branch, info.path, dry_run=True)
+
+    assert isinstance(result, SalvagePushResult)
+    # Dry-run: push_branch returned (True, None), so salvage reports pushed=True
+    # with the local tip as the would-be new remote SHA -- but no real push
+    # reached origin.
+    assert result.pushed is True
+    assert result.error is None
+    assert result.new_remote_sha == local_tip
+
+    # The branch must STILL NOT exist on origin -- no real push happened.
     show_ref_after = _git(remote, "show-ref")
     assert branch not in show_ref_after.stdout

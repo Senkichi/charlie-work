@@ -583,7 +583,9 @@ def launch_devin_session(
         # Write the worktree writer marker so this process is recorded as the
         # legitimate occupant of the worktree (issue #400).
         try:
-            write_worktree_marker(worktree.path, pid, session_id)
+            write_worktree_marker(
+                worktree.path, pid, session_id, process_start_time=process_start_time
+            )
         except OSError:
             # Best-effort marker write must not derail a successful launch.
             pass
