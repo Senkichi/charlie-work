@@ -772,7 +772,19 @@ def _render_round_findings(decision: dict[str, Any]) -> str:
         parts.append("\n".join(f"- {defang_closing_keywords(item)}" for item in safe_changes))
     if summary_is_usable:
         parts.append(f"Summary: {defang_closing_keywords(summary_text)}")
-    return "\n\n".join(parts)
+    rendered = "\n\n".join(parts)
+    # Issue #1485: prepend the provenance caveat on this fallback path too.
+    # This branch is reached when ``_render_required_changes_section`` declined
+    # to render anything -- approved (always) or ``blocked``-with-content
+    # (intentionally suppressed there). A ``blocked`` log-extracted verdict
+    # asserting "already merged" is exactly the population this caveat exists
+    # to flag: dropping it here reproduces the issue's motivating risk in a
+    # later review round, the precise surface the reviewer flagged. The
+    # delegated-render path above already prepends; this path must too.
+    caveat = _provenance_caveat_from_decision(decision)
+    if caveat:
+        rendered = f"{caveat}\n\n{rendered}" if rendered else caveat
+    return rendered
 
 
 def _render_rework_prompt(
@@ -799,10 +811,18 @@ def _render_rework_prompt(
     required_changes_section = _render_required_changes_section(decision)
     # Issue #1485: prepend the provenance caveat so a worker reading the
     # rework brief knows the verdict was log-extracted and may be incomplete
-    # or incorrect -- re-verify factual claims before acting.
+    # or incorrect -- re-verify factual claims before acting. Prepended even
+    # when ``required_changes_section`` is empty: a ``blocked``-with-content
+    # verdict is suppressed to ``""`` by ``_render_required_changes_section``
+    # (by design, for the worker-brief framing), so gating the caveat on a
+    # non-empty section would silently drop it for exactly the ``blocked``
+    # log-extracted verdicts the caveat exists to flag -- the same
+    # caveat-drop-on-empty-section gap the round-history fallback path closes.
     caveat = _provenance_caveat_from_decision(decision)
-    if caveat and required_changes_section:
-        required_changes_section = f"{caveat}\n\n{required_changes_section}"
+    if caveat:
+        required_changes_section = (
+            f"{caveat}\n\n{required_changes_section}" if required_changes_section else caveat
+        )
     return render_prompt(
         config.dispatch.rework_template,
         {

@@ -34,6 +34,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.rework_prompts import (
     _provenance_caveat_from_decision,
     _render_required_changes_section,
+    _render_rework_prompt,
     _render_round_findings,
 )
 from charlie_work.verdict_parsing import (
@@ -377,4 +378,146 @@ def test_render_round_findings_no_caveat_for_trusted_verdict() -> None:
     }
     rendered = _render_round_findings(decision)
     assert rendered
+    assert "Provenance caveat" not in rendered
+
+
+def test_render_round_findings_blocked_with_content_prepends_caveat() -> None:
+    """Regression for the round-history fallback path (review finding 1).
+
+    A ``blocked`` verdict with populated ``required_changes`` and ``summary``
+    reaches the fallback return path of ``_render_round_findings`` because
+    ``_render_required_changes_section`` intentionally suppresses
+    blocked-with-content to ``""`` (by design, for the worker-brief framing).
+    The provenance caveat must still be prepended on that fallback path -- a
+    blocked log-extracted verdict asserting "already merged" is exactly the
+    population this caveat exists to flag, and the round-history surface is
+    where it would resurface in a later review round, reproducing the
+    issue's own motivating risk.
+    """
+    decision = {
+        "decision": "blocked",
+        "summary": "PR already merged, close it",
+        "required_changes": ["close as duplicate"],
+        "provenance_caveat": provenance_caveat_for("log"),
+    }
+    rendered = _render_round_findings(decision)
+    assert rendered, "round findings must render the blocked round's content"
+    assert "Provenance caveat" in rendered, (
+        "issue #1485: the fallback path must prepend the provenance caveat "
+        "for a blocked log-extracted verdict, not just the delegated-render path"
+    )
+    assert "close as duplicate" in rendered
+    assert "PR already merged, close it" in rendered
+
+
+def test_render_round_findings_blocked_no_caveat_for_trusted_verdict() -> None:
+    """A ``blocked`` verdict with no ``provenance_caveat`` (trusted, not
+    log-extracted) must NOT prepend a caveat on the fallback path."""
+    decision = {
+        "decision": "blocked",
+        "summary": "human judgment",
+        "required_changes": ["x"],
+    }
+    rendered = _render_round_findings(decision)
+    assert rendered
+    assert "Provenance caveat" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Layer 3b: _render_rework_prompt direct-call tests (review finding 2)
+# ---------------------------------------------------------------------------
+
+
+def _render_rework_prompt_for(
+    tmp_path: Path,
+    *,
+    pr_number: int,
+    decision: dict[str, Any],
+) -> str:
+    """Invoke ``_render_rework_prompt`` directly with a decision file on disk.
+
+    Writes ``review-decision.json`` under the PR's state directory exactly as
+    ``record_review`` does, then calls the real renderer -- not a hand-
+    reimplementation of its prepend formula. This is the call site the
+    existing ``test_render_required_changes_section_prepends_caveat`` stood
+    in for with a self-consistency check that never called the real function.
+    """
+    config = OrchestratorConfig()
+    state_file = runtime_paths(tmp_path, config.runtime.state_dir).state_file
+    pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps(decision),
+        encoding="utf-8",
+    )
+    pr = {
+        "number": pr_number,
+        "title": "Fake PR title",
+        "url": f"https://example.test/pull/{pr_number}",
+        "headRefName": "agent/issue-test",
+    }
+    return _render_rework_prompt(state_file, pr, 1, "A dispatch note.", config)
+
+
+def test_render_rework_prompt_prepends_caveat_request_changes(
+    tmp_path: Path,
+) -> None:
+    """Real call to ``_render_rework_prompt``: a ``request_changes`` verdict
+    with ``provenance_caveat`` on disk must surface the caveat in the
+    rendered brief, prepended to the non-empty required-changes section."""
+    rendered = _render_rework_prompt_for(
+        tmp_path,
+        pr_number=777,
+        decision={
+            "decision": "request_changes",
+            "summary": "needs rework",
+            "required_changes": ["fix the bug"],
+            "provenance_caveat": provenance_caveat_for("log"),
+        },
+    )
+    assert "Provenance caveat" in rendered
+    assert "fix the bug" in rendered
+
+
+def test_render_rework_prompt_prepends_caveat_blocked_empty_section(
+    tmp_path: Path,
+) -> None:
+    """Regression for the caveat-drop-on-empty-section gap (review finding 2).
+
+    A ``blocked``-with-content verdict is suppressed to ``""`` by
+    ``_render_required_changes_section`` (by design, for the worker-brief
+    framing). The provenance caveat must still appear in the rendered brief
+    -- gating it on a non-empty section would silently drop it for exactly
+    the blocked log-extracted verdicts the caveat exists to flag.
+    """
+    rendered = _render_rework_prompt_for(
+        tmp_path,
+        pr_number=778,
+        decision={
+            "decision": "blocked",
+            "summary": "PR already merged, close it",
+            "required_changes": ["close as duplicate"],
+            "provenance_caveat": provenance_caveat_for("log"),
+        },
+    )
+    assert "Provenance caveat" in rendered, (
+        "issue #1485: a blocked log-extracted verdict whose required-changes "
+        "section is suppressed to empty must still surface the provenance caveat"
+    )
+
+
+def test_render_rework_prompt_no_caveat_for_trusted_verdict(
+    tmp_path: Path,
+) -> None:
+    """A trusted (no ``provenance_caveat``) ``request_changes`` verdict must
+    NOT surface a caveat in the rendered brief."""
+    rendered = _render_rework_prompt_for(
+        tmp_path,
+        pr_number=779,
+        decision={
+            "decision": "request_changes",
+            "summary": "needs rework",
+            "required_changes": ["fix the bug"],
+        },
+    )
     assert "Provenance caveat" not in rendered
