@@ -199,7 +199,8 @@ test-adequacy gate), `watchdog.*` (supervisor tripwires: stall/wall-clock/
 loop/cost-token budgets, WARN-first by default), `fleet.*`
 (`global_max_concurrent_sessions` — cross-repo worker-count budget),
 `notify.*` (opt-in needs-attention sink: webhook | desktop | shell | file), and
-`runner_allocation.*` (host-wide elastic CI-runner slots — see below).
+`runner_allocation.*` (host-wide elastic CI-runner slots — see below), and
+`runner_capacity_escalation.*` (sustained-window starvation escalation — see below).
 
 ### Self-hosted runner allocation
 
@@ -275,6 +276,40 @@ more runners registered.
 and only falls back to starting every runner when allocation is unavailable.
 Anything that unconditionally starts all listeners while allocation is enabled
 gets undone on the next pass, at the cost of a full hysteresis window of churn.
+
+### Capacity-starvation escalation
+
+`runner_allocation` can only move *already-registered* listeners — it never
+mints a registration. So a repo whose live demand exceeds its registered
+runner capacity while the host-wide budget has idle slots is permanently
+unsatisfiable by allocation alone: the allocator correctly identifies it and
+correctly declines to act, but before #763 that conclusion lived only in a
+log line and a per-pass `notes` entry the operator digest deliberately drops.
+The next starvation was discovered by an operator reading queue times, not
+surfaced by the fleet.
+
+`runner_capacity_escalation.*` arms the durable half: when the same repo stays
+starved for a sustained window, the fleet prologue raises a structured
+`runner_capacity_starvation_escalation` event that surfaces in the operator
+attention digest (not just `events.db`). Scope is detection + event only;
+provisioning/registration stays operator-gated (issue #826 is the
+manual-trigger actuator). It is host-wide (declare it in the global fleet
+layer, not a per-repo config) and inert on any host where `runner_allocation`
+is disabled, since the prologue returns before reaching it:
+
+```yaml
+runner_capacity_escalation:
+  enabled: true                       # default; pure observability, no actuation
+  starvation_escalation_minutes: 15   # sustained window before escalating (default 15)
+```
+
+The window is measured wall-clock from the first starved pass, not by counting
+passes, so it is robust to the supervisor's respawn cadence and to a pass that
+was skipped. The escalation is edge-triggered per episode: it fires once when
+the window is crossed, then stays silent every subsequent pass the starvation
+holds, so a reader can tell "still starved" from "signal stopped working". A
+repo that recovers is dropped from the tracking sidecar so the next episode
+starts a fresh window.
 
 **This repo's own CI check names** (for `auto_merge.required_checks`): `Tests (ubuntu-latest)`,
 `Tests (windows-latest)`, and `Lint`. These correspond to the job `name:` fields in
