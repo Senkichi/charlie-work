@@ -28,6 +28,18 @@ from ci_fleet.config import (  # noqa: F401  (deliberate re-export)
     RunnerScalingConfig,
 )
 
+# Re-exported from the domain module (issue #763) for the same reason
+# ``RunnerAllocationConfig`` is re-exported from ``ci_fleet.config`` above:
+# the dataclass lives in its own module so new code does not land in this
+# over-cap monolith (file-size ratchet, issue #1442), and ``config.py`` wires
+# it into ``OrchestratorConfig`` and delegates parsing to the module that owns
+# the validation. ``tests/test_ci_fleet_seams.py`` guards the ci_fleet seam;
+# the capacity-starvation seam is guarded by ``test_capacity_starvation_escalation.py``.
+from .capacity_starvation_escalation import (  # noqa: F401  (deliberate re-export)
+    RunnerCapacityEscalationConfig,
+    parse_runner_capacity_escalation,
+)
+
 from . import layout
 from .issue_comments import DEFAULT_INCLUDED_ASSOCIATIONS as DEFAULT_COMMENT_ASSOCIATIONS
 
@@ -1915,6 +1927,9 @@ class OrchestratorConfig:
     main_ci_reclaim: MainCiReclaimConfig = field(default_factory=MainCiReclaimConfig)
     runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
     runner_allocation: RunnerAllocationConfig = field(default_factory=RunnerAllocationConfig)
+    runner_capacity_escalation: RunnerCapacityEscalationConfig = field(
+        default_factory=RunnerCapacityEscalationConfig
+    )
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
 
@@ -3483,6 +3498,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "provisions; raise runner_scaling.min_runners to at least the "
             "allocation floor."
         )
+    runner_capacity_escalation = parse_runner_capacity_escalation(data)
     supervisor_data = _section(data, "supervisor")
     for int_key in (
         "poll_interval_seconds",
@@ -3597,6 +3613,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         main_ci_reclaim=main_ci_reclaim,
         runner_scaling=runner_scaling,
         runner_allocation=runner_allocation,
+        runner_capacity_escalation=runner_capacity_escalation,
         supervisor=supervisor,
         post_mortem=post_mortem,
         # ``sources`` is left at its dataclass default here -- this function
