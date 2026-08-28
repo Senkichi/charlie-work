@@ -395,12 +395,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "runner_allocation_refused": "warning",
         "runner_allocation_skipped": "warning",
         "runner_capacity_starved": "warning",
-        # Error, not warning: this is the sustained-window escalation of the
-        # warning-level ``runner_capacity_starved`` condition (issue #763). It
-        # fires only after a repo has been starved for a configured window, so
-        # it is by construction more severe than the per-pass starvation signal
-        # and is the one an operator must act on -- the per-pass signal may
-        # clear on the next pass, this one has not.
+        # Error: sustained-window escalation of runner_capacity_starved (#763).
         "runner_capacity_starvation_escalation": "error",
         # Warning, not info: the deploy went on to succeed, but the checkout
         # was in a state that needed repairing to get there. Logged at info it

@@ -28,6 +28,18 @@ from ci_fleet.config import (  # noqa: F401  (deliberate re-export)
     RunnerScalingConfig,
 )
 
+# Re-exported from the domain module (issue #763) for the same reason
+# ``RunnerAllocationConfig`` is re-exported from ``ci_fleet.config`` above:
+# the dataclass lives in its own module so new code does not land in this
+# over-cap monolith (file-size ratchet, issue #1442), and ``config.py`` wires
+# it into ``OrchestratorConfig`` and delegates parsing to the module that owns
+# the validation. ``tests/test_ci_fleet_seams.py`` guards the ci_fleet seam;
+# the capacity-starvation seam is guarded by ``test_capacity_starvation_escalation.py``.
+from .capacity_starvation_escalation import (  # noqa: F401  (deliberate re-export)
+    RunnerCapacityEscalationConfig,
+    parse_runner_capacity_escalation,
+)
+
 from . import layout
 from .issue_comments import DEFAULT_INCLUDED_ASSOCIATIONS as DEFAULT_COMMENT_ASSOCIATIONS
 
@@ -1698,49 +1710,6 @@ class RunnersConfig:
     default_branch: str = "main"
     workflow_name: str = ""
     fleet_autoscale_prologue: bool = False
-
-
-@dataclass(frozen=True)
-class RunnerCapacityEscalationConfig:
-    """Sustained-window escalation for runner capacity starvation (issue #763).
-
-    The allocator (``runner_allocation``) rebalances *already-registered*
-    listeners and can never mint a registration, so a repo whose live demand
-    exceeds its registered capacity while the host-wide budget has slack is
-    permanently unsatisfiable by allocation alone. ci_fleet's #799 lands an
-    edge-triggered ``runner_capacity_starved`` event the moment that condition
-    turns true, but a single-pass spike can look identical to a sustained
-    shortage, and that event never reaches the operator notify digest -- it
-    lives only in ``events.db``.
-
-    This section arms the *durable* half: when the same repo stays starved for
-    a sustained window, the fleet prologue raises a structured
-    ``runner_capacity_starvation_escalation`` event that surfaces in the
-    operator attention digest (not just ``events.db``), so the next starvation
-    is surfaced instead of discovered by an operator reading queue times.
-
-    Scope is detection + event only. Provisioning/registration stays
-    operator-gated (see issue #826 for the manual-trigger actuator) -- this
-    config never causes a runner to be registered, started, or parked.
-
-    ``enabled`` defaults True because the feature is pure observability: it
-    reads the allocation plan the prologue already computes and writes an
-    event, with no actuation side effect. It is inert on any host where
-    ``runner_allocation.enabled`` is false, since the prologue returns before
-    reaching it. The knob exists for rollback, not opt-in.
-
-    ``starvation_escalation_minutes`` is the sustained window. A repo must
-    stay starved (``demand > capacity`` while host-wide budget has slack) for
-    at least this many minutes before the escalation fires, so a transient
-    spike that clears within one or two fleet passes (default cadence 5 min)
-    does not raise a false alarm. The window is measured wall-clock from the
-    first starved pass, not by counting passes, so it is robust to the
-    supervisor's respawn/restart cadence and to a pass that was skipped.
-    Default 15 min = three default-cadence passes.
-    """
-
-    enabled: bool = True
-    starvation_escalation_minutes: int = 15
 
 
 @dataclass(frozen=True)
@@ -3466,31 +3435,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "provisions; raise runner_scaling.min_runners to at least the "
             "allocation floor."
         )
-    runner_capacity_escalation_data = _section(data, "runner_capacity_escalation")
-    rce_enabled = runner_capacity_escalation_data.get("enabled")
-    if rce_enabled is not None and not isinstance(rce_enabled, bool):
-        raise ConfigError(
-            "config section 'runner_capacity_escalation' key 'enabled' must be a bool, "
-            f"got {type(rce_enabled).__name__}"
-        )
-    rce_minutes = runner_capacity_escalation_data.get("starvation_escalation_minutes")
-    if rce_minutes is not None and (
-        isinstance(rce_minutes, bool) or not isinstance(rce_minutes, int)
-    ):
-        raise ConfigError(
-            "config section 'runner_capacity_escalation' key 'starvation_escalation_minutes' "
-            f"must be an int, got {type(rce_minutes).__name__}"
-        )
-    if isinstance(rce_minutes, int) and not isinstance(rce_minutes, bool) and rce_minutes <= 0:
-        raise ConfigError(
-            "config section 'runner_capacity_escalation' key 'starvation_escalation_minutes' "
-            f"must be > 0, got {rce_minutes}"
-        )
-    runner_capacity_escalation = _build_section(
-        RunnerCapacityEscalationConfig,
-        "runner_capacity_escalation",
-        runner_capacity_escalation_data,
-    )
+    runner_capacity_escalation = parse_runner_capacity_escalation(data)
     supervisor_data = _section(data, "supervisor")
     for int_key in (
         "poll_interval_seconds",
