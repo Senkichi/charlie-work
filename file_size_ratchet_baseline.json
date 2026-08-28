@@ -3,14 +3,14 @@
   "scripts/heartbeat_check.py": 2975,
   "src/charlie_work/claude_code.py": 1788,
   "src/charlie_work/cli.py": 2874,
-  "src/charlie_work/config.py": 3585,
+  "src/charlie_work/config.py": 3602,
   "src/charlie_work/cross_family.py": 884,
   "src/charlie_work/dead_worker_reap.py": 2794,
   "src/charlie_work/devin_shell.py": 873,
   "src/charlie_work/doctor.py": 1392,
-  "src/charlie_work/fleet_dispatch.py": 3328,
+  "src/charlie_work/fleet_dispatch.py": 3378,
   "src/charlie_work/github.py": 3061,
-  "src/charlie_work/instrumentation.py": 1389,
+  "src/charlie_work/instrumentation.py": 1391,
   "src/charlie_work/janitor.py": 2011,
   "src/charlie_work/post_mortem.py": 1516,
   "src/charlie_work/reconcile.py": 3275,
@@ -62,5 +62,5 @@
   "tests/test_worker_health.py": 2215,
   "tests/test_worker_stop_gate.py": 1056,
   "tests/test_worktree.py": 8565,
-  "tests/test_write_gate_enforcement.py": 1637
+  "tests/test_write_gate_enforcement.py": 1645
 }
