@@ -10048,11 +10048,26 @@ class OrchestratorApp:
         prs = self.gh.pr_list()
         queue: list[dict[str, Any]] = []
 
+        # Issue #1229: validate branch-name-derived issue numbers against the
+        # actual open-issue set so a stale branch name (e.g. agent/issue-709-…
+        # left over from a merged PR #709, reused by an unrelated issue-less
+        # PR) cannot bind the PR to a non-existent or closed issue here. This
+        # is the same phantom-binding failure class already fixed at the
+        # dispatch-claim pr_by_issue construction, the dead-session escalation
+        # guard, and the orphaned-worker sweep: review_queue's issue_number
+        # feeds _reroute_stranded_request_changes (a real rework-routing state
+        # mutation) and _emit_stale_ci_verdict_requeued (a state.json write),
+        # so a stale binding would route rework at the wrong issue subject.
+        # Built once before the loop so a single issue_list(state="open") call
+        # (cached within the pass on the real GitHub client) is shared across
+        # every PR in this queue.
+        branch_validator = self._make_branch_issue_validator()
         for pr in prs:
             issue_number = linked_issue_number(
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
+                branch_issue_validator=branch_validator,
             )
             if issue_number is None:
                 continue

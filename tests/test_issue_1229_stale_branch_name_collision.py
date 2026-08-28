@@ -432,3 +432,235 @@ def test_orphaned_worker_stale_branch_does_not_bind_unrelated_pr(
         f"stale branch name bound unrelated PR #1660 to closed issue #709: "
         f"{[e['kind'] for e in wrong_subject_events]}"
     )
+
+
+def test_dispatch_claim_stale_branch_does_not_bind_unrelated_pr_to_closed_issue(
+    tmp_path: Path,
+) -> None:
+    """Issue #1229: a stale branch name must not bind an unrelated PR to a
+    closed issue in the dispatch-claim path's ``pr_by_issue`` construction.
+
+    This test exercises ``_dispatch_impl``'s REAL (non-dry-run) dispatch-claim
+    branch (workflow.py:5557 onward -- the ``pr_by_issue`` construction at
+    ~5598, the claim phase that stamps ``state["issues"][n]`` to
+    ``dispatch_pending``, and the post-launch label transition to
+    ``agent:queued``), NOT the ``dry_run=True`` early-return branch (~5315,
+    which is read-only and never claims an issue or touches a label). A
+    dry-run-only test would assert the validator threading via a spy but could
+    not prove the real claim/launch path ran -- the dry-run branch returns
+    before the claim state write and the label transition, so neither is
+    observable. Running with the default (non-dry-run) ``OrchestratorApp``
+    makes the state/label transitions the proof that the real branch executed.
+
+    Scenario: issue #709 is CLOSED but carries the ready label, so it appears in
+    the dispatch ``issues`` list (``issue_list(state="all")``, issue #427 -- the
+    ready label is intentionally not cleaned for closed issues so externally-
+    merged PRs can be finalized). An unrelated issue-less PR #1660 carries the
+    stale branch ``agent/issue-709-…``. Without the validator, the dispatch-
+    claim ``pr_by_issue`` construction binds PR #1660 to 709, polluting
+    ``issues_with_open_tracked_prs`` with a phantom closed-issue binding. With
+    the validator, 709 is closed so the binding is rejected and ``pr_by_issue``
+    stays free of the phantom binding. A real open dispatchable issue (#123) is
+    still claimed for dispatch -- proven here by the actual state transition
+    (``state["issues"]["123"]`` stamped with a dispatch status) and the
+    ``agent:queued`` label transition, neither of which the dry-run branch
+    performs.
+
+    Note on the validator's role here: ``_is_dispatchable`` independently
+    excludes closed issues, so the validator does not change whether closed
+    #709 is dispatched -- its job in this path is to keep ``pr_by_issue`` free
+    of stale closed-issue bindings (which feed ``issues_with_open_tracked_prs``
+    and the ``live_dispatched`` guard), preserving the single-point-of-
+    enforcement invariant shared with the dead-session and orphan sweeps. The
+    test asserts the threading directly via a ``linked_issue_number`` spy
+    because the dispatch result does not expose ``pr_by_issue``; the state/label
+    transitions are the independent proof that the real (non-dry-run) branch --
+    the one the spy is threaded through -- actually executed.
+    """
+    from unittest.mock import patch
+
+    import charlie_work.workflow as workflow_mod
+    from charlie_work.github import linked_issue_number as _real_linked
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = _fake_with_closed_709()
+    # #709 must carry the ready label to appear in the dispatch issues list
+    # (issue_list(state="all") filters by label, issue #427).
+    for issue in fake_gh.issues:
+        if issue["number"] == 709:
+            issue["labels"] = [{"name": config.labels.ready}]
+    # Replace the default PR #456 (which binds to #123) with only the stale-
+    # branch PR, so the real open issue #123 has no open PR and is dispatchable.
+    fake_gh.prs = [_stale_branch_open_pr()]
+
+    # Default adapter is "manual" -- it writes a session manifest and reports
+    # ok=True without launching a real subprocess, so the real claim/launch
+    # path runs end-to-end in the test environment (same shape as
+    # test_dispatch_selects_ready_issue_without_operator_queue_label).
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    calls: list[dict] = []
+
+    def spy(pr, *, is_cross_repository, branch_prefix, branch_issue_validator=None):
+        result = _real_linked(
+            pr,
+            is_cross_repository=is_cross_repository,
+            branch_prefix=branch_prefix,
+            branch_issue_validator=branch_issue_validator,
+        )
+        calls.append(
+            {
+                "pr_number": pr.get("number"),
+                "branch_issue_validator": branch_issue_validator,
+                "result": result,
+            }
+        )
+        return result
+
+    with patch.object(workflow_mod, "linked_issue_number", spy):
+        result = app.dispatch()
+
+    assert result.ok is True
+    # The real open dispatchable issue #123 is claimed and dispatched via the
+    # REAL (non-dry-run) branch: the dry-run early return never writes a
+    # dispatch status to state.json or adds the agent:queued label, so these
+    # two transitions are the proof the real dispatch-claim branch ran.
+    assert result.data["selected_count"] == 1, (
+        f"expected exactly the real open issue #123 selected for dispatch, "
+        f"got selected_count={result.data['selected_count']}"
+    )
+    session_issues = [s["issue_number"] for s in result.data["sessions"]]
+    assert 123 in session_issues, (
+        f"real open issue #123 was not claimed for dispatch: sessions={session_issues}"
+    )
+    assert 709 not in session_issues, (
+        f"closed issue #709 was wrongly dispatched: sessions={session_issues}"
+    )
+    # The agent:queued label is added ONLY in the real dispatch path's
+    # post-launch transition (~6526); the dry-run branch never touches labels.
+    assert (123, config.labels.queued) in fake_gh.labels_added, (
+        "agent:queued label was not added for #123 -- the real (non-dry-run) "
+        "dispatch-claim branch did not run"
+    )
+    state = load_state(paths.state_file)
+    entry_123 = state.get("issues", {}).get("123")
+    assert entry_123 is not None, (
+        "state.json has no issues['123'] entry -- the real claim phase "
+        "(which stamps dispatch_pending) did not run"
+    )
+    assert entry_123.get("status") in ("dispatch_pending", "manifest_written", "dispatched"), (
+        f"issues['123'] status is {entry_123.get('status')!r}, not a dispatch "
+        "claim/launch status -- the real dispatch-claim branch did not run"
+    )
+
+    # The dispatch-claim pr_by_issue construction (the REAL branch at ~5598,
+    # not the dry-run one at ~5337) threaded the validator and rejected the
+    # stale branch-name binding to closed #709.
+    stale_calls = [c for c in calls if c["pr_number"] == 1660]
+    assert stale_calls, (
+        "dispatch path did not call linked_issue_number for the stale-branch PR #1660"
+    )
+    stale = stale_calls[0]
+    assert stale["branch_issue_validator"] is not None, (
+        "dispatch-claim pr_by_issue did not thread branch_issue_validator "
+        "(stale branch-name binding not validated against the open-issue set)"
+    )
+    assert stale["result"] is None, (
+        f"stale branch name bound unrelated PR #1660 to closed issue #709: "
+        f"linked_issue_number returned {stale['result']}"
+    )
+    # Belt-and-suspenders: the phantom binding must not have dispatched #709.
+    assert (709, config.labels.queued) not in fake_gh.labels_added, (
+        "closed issue #709 received the agent:queued label -- the stale "
+        "branch-name binding leaked into a real dispatch"
+    )
+
+
+def test_review_queue_stale_branch_does_not_bind_unrelated_pr_to_closed_issue(
+    tmp_path: Path,
+) -> None:
+    """Issue #1229: ``review_queue`` must thread ``branch_issue_validator``
+    through its ``linked_issue_number`` call so a stale branch name cannot
+    bind an unrelated PR to a closed issue and route rework at the wrong
+    subject.
+
+    ``review_queue``'s ``issue_number`` feeds
+    ``_reroute_stranded_request_changes`` (a real rework-routing state
+    mutation, issue #784 AC-8 Case 2) and ``_emit_stale_ci_verdict_requeued``
+    (a ``state.json`` write) -- the same phantom-binding failure class already
+    fixed at the dispatch-claim, dead-session, and orphaned-worker sites. A
+    stale ``agent/issue-709-…`` branch on an unrelated issue-less PR #1660,
+    where #709 is CLOSED, must therefore be rejected: ``linked_issue_number``
+    returns None, the PR is skipped at the ``if issue_number is None`` guard,
+    and no rework routing or stale-CI verdict requeue keys off the wrong issue.
+
+    The test asserts the threading directly via a ``linked_issue_number`` spy
+    (the queue result does not expose the validator) and asserts the PR is
+    absent from the queue -- the observable consequence of the rejected
+    binding.
+    """
+    import json
+    from unittest.mock import patch
+
+    import charlie_work.workflow as workflow_mod
+    from charlie_work.github import linked_issue_number as _real_linked
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+
+    fake_gh = _fake_with_closed_709()
+    fake_gh.prs = [_stale_branch_open_pr()]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    calls: list[dict] = []
+
+    def spy(pr, *, is_cross_repository, branch_prefix, branch_issue_validator=None):
+        result = _real_linked(
+            pr,
+            is_cross_repository=is_cross_repository,
+            branch_prefix=branch_prefix,
+            branch_issue_validator=branch_issue_validator,
+        )
+        calls.append(
+            {
+                "pr_number": pr.get("number"),
+                "branch_issue_validator": branch_issue_validator,
+                "result": result,
+            }
+        )
+        return result
+
+    with patch.object(workflow_mod, "linked_issue_number", spy):
+        result = app.review_queue()
+
+    assert result.ok is True
+    # The stale-branch PR #1660 was rejected: the validator was threaded and
+    # returned None, so the PR is skipped at the issue_number-is-None guard
+    # and never enters the queue.
+    stale_calls = [c for c in calls if c["pr_number"] == 1660]
+    assert stale_calls, (
+        "review_queue did not call linked_issue_number for the stale-branch PR #1660"
+    )
+    stale = stale_calls[0]
+    assert stale["branch_issue_validator"] is not None, (
+        "review_queue did not thread branch_issue_validator through "
+        "linked_issue_number (stale branch-name binding not validated "
+        "against the open-issue set)"
+    )
+    assert stale["result"] is None, (
+        f"stale branch name bound unrelated PR #1660 to closed issue #709 in "
+        f"review_queue: linked_issue_number returned {stale['result']}"
+    )
+    queued_prs = [entry["pr"] for entry in result.data["queue"]]
+    assert 1660 not in queued_prs, (
+        f"stale-branch PR #1660 entered the review queue despite the rejected "
+        f"binding: queue={queued_prs}"
+    )
