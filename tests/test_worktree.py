@@ -5730,7 +5730,10 @@ def test_verify_shared_venv_catches_pth_pointing_outside_main_checkout(tmp_path:
     ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
 
     assert not ok
-    assert "points outside all configured checkouts" in message
+    # charlie_work's package root is derivable, so the per-package message names
+    # the expected root rather than the generic "outside all roots" fallback.
+    assert "_editable_impl_charlie_work.pth" in message
+    assert "expected its package root" in message
     assert "uv sync --all-extras" in message
 
 
@@ -5796,7 +5799,9 @@ def test_verify_shared_venv_detects_poisoned_foreign_editable(tmp_path: Path) ->
 
     assert not ok
     assert "_editable_impl_ci_fleet.pth" in message
-    assert "points outside all configured checkouts" in message
+    # ci_fleet's package root is derivable, so the per-package message names the
+    # expected peer root rather than the generic "outside all roots" fallback.
+    assert "expected its package root" in message
 
 
 def test_verify_shared_venv_approves_healthy_foreign_editable(tmp_path: Path) -> None:
@@ -5868,6 +5873,70 @@ def test_verify_shared_venv_ignores_non_path_pth_lines(tmp_path: Path) -> None:
 
     assert ok
     assert "configured checkouts" in message
+
+
+def test_verify_shared_venv_catches_foreign_editable_repointed_at_wrong_root(
+    tmp_path: Path,
+) -> None:
+    """Cross-root false-green (fast-follow #1180): a foreign editable repointed at a
+    *different* configured root must be caught, not accepted.
+
+    ``_editable_impl_ci_fleet.pth`` repointed at ``charlie-work/src`` would pass
+    the old "any configured root" check because ``charlie-work/src`` IS a
+    configured root -- yet import as a silent ``ImportError`` (no ``ci_fleet``
+    package lives there).  The per-package detection validates the line against
+    *the* root inferred from the ``.pth``'s package (``ci_runners/src``), so the
+    wrong-root line is flagged.
+    """
+    repo_root, peer_src = _setup_repo_with_peer_dep(tmp_path)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    # Foreign editable repointed at the WRONG configured root (charlie-work/src
+    # instead of ci_runners/src).  This is the next vector after #969.
+    (site_packages / "_editable_impl_ci_fleet.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert not ok
+    assert "_editable_impl_ci_fleet.pth" in message
+    assert "expected its package root" in message
+    # The expected root (peer_src) must be named, not the wrong root.
+    assert str(peer_src.resolve()) in message
+
+
+def test_verify_shared_venv_unknown_package_falls_back_to_any_root(
+    tmp_path: Path,
+) -> None:
+    """When no per-package root is derivable, the "any configured root" fallback holds.
+
+    A ``.pth`` whose filename matches no known package (so ``_match_pth_to_root``
+    returns ``None``) is still checked: a line outside *all* configured roots is
+    poisoned and surfaces the generic "outside all configured checkouts" message.
+    This preserves the #969 gap-2 behaviour for unknown packages.
+    """
+    repo_root, _peer_src = _setup_repo_with_peer_dep(tmp_path)
+    scratch = tmp_path / "scratch" / "src"
+    scratch.mkdir(parents=True)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    # Unknown package name -> _match_pth_to_root returns None -> fallback path.
+    (site_packages / "_editable_impl_mystery_pkg.pth").write_text(
+        str(scratch.resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert not ok
+    assert "_editable_impl_mystery_pkg.pth" in message
+    assert "points outside all configured checkouts" in message
 
 
 def test_clean_worktrees_removes_merged_worktree_and_verifies_shared_venv(
@@ -6487,7 +6556,9 @@ def test_clean_worktrees_surfaces_poisoned_venv_after_removal(tmp_path: Path) ->
     assert result.ok is False
     assert len(result.data["removed"]) == 1
     assert result.data["venv_ok"] is False
-    assert "points outside all configured checkouts" in result.data["venv_message"]
+    # charlie_work's package root is derivable, so the per-package message names
+    # the expected root rather than the generic "outside all roots" fallback.
+    assert "expected its package root" in result.data["venv_message"]
 
 
 def test_clean_worktrees_skips_open_pr(tmp_path: Path) -> None:

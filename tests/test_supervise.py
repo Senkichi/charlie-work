@@ -27,7 +27,6 @@ from charlie_work.supervise import (
     _BLOCKER_NAMES_IN_MESSAGE,
     _check_venv,
     _command_failure_message,
-    _match_pth_to_root,
     _pending_sync_marker_path,
     _pull_ci_fleet_sibling,
     _record_self_deploy_failure_streak,
@@ -47,6 +46,7 @@ from charlie_work.supervise import (
     try_acquire_supervisor_lock,
 )
 from charlie_work.workflow import CommandResult
+from charlie_work.worktree import _match_pth_to_root
 
 
 # ---------------------------------------------------------------------------
@@ -2169,6 +2169,31 @@ def test_repair_venv_pth_rewrites_foreign_editable_to_peer_root(
     assert ok
     assert ci_fleet_pth.read_text(encoding="utf-8").strip() == str(peer_src.resolve())
     assert "configured checkouts" in message
+    assert "_editable_impl_ci_fleet.pth" in repaired
+
+
+def test_repair_venv_pth_detects_and_rewrites_foreign_editable_repointed_at_wrong_root(
+    tmp_path: Path,
+) -> None:
+    """Cross-root false-green repair (fast-follow #1180).
+
+    ``_editable_impl_ci_fleet.pth`` repointed at ``charlie-work/src`` (a
+    *different* configured root) is detected as poisoned -- the old "any
+    configured root" detection pass would have accepted it because
+    ``charlie-work/src`` IS a configured root, leaving a silent
+    ``ImportError``.  The per-package detection flags it, and the rewrite
+    restores the correct peer root.
+    """
+    # _setup_repo_with_peer_dep_venv creates repo_root at tmp_path / "repo".
+    wrong_root = (tmp_path / "repo" / "src").resolve()
+    repo_root, peer_src, _charlie_pth, ci_fleet_pth = _setup_repo_with_peer_dep_venv(
+        tmp_path, ci_fleet_target=wrong_root
+    )
+
+    ok, message, repaired = _repair_venv_pth(repo_root, repo_root / ".venv")
+
+    assert ok
+    assert ci_fleet_pth.read_text(encoding="utf-8").strip() == str(peer_src.resolve())
     assert "_editable_impl_ci_fleet.pth" in repaired
 
 
