@@ -16,7 +16,12 @@ from typing import Any
 
 from .config import LabelConfig
 from .labels import _edges
-from .state import ESCALATION_REASON_CLASSES, escalation_reason_class, utc_now
+from .state import (
+    ESCALATION_REASON_CLASSES,
+    PASSIVE_OPEN_STATUS,
+    escalation_reason_class,
+    utc_now,
+)
 
 # Issue #1266: the two labels.py edges every escalation call site otherwise
 # hardcodes ("escalated" and "redispatch_escalated") get a mechanical
@@ -416,3 +421,56 @@ def _cap_escalation_pr_extra(
         "last_rework_was_startup_death": False,
         "worker_launched": worker_launched,
     }
+
+
+def _reset_linked_pr_status_to_passive_open(fresh_state: dict[str, Any], pr_number: int) -> None:
+    """Reset a linked PR's own ``status`` to ``PASSIVE_OPEN_STATUS`` (issue #1482).
+
+    ``_deescalate_mechanical_issue`` resets the issue's ``status`` to
+    ``PASSIVE_OPEN_STATUS`` and mirror-clears the linked PR record's
+    escalation-reason fields via ``clear_escalation_on_issue_prs``, but
+    ``clear_escalation_on_issue_prs`` is scoped to escalation-reason fields
+    (``escalation_reason`` / ``reason_class`` / ``escalation_reasons_seen``)
+    by design and never touches ``status``.  Without this reset the PR was
+    left at ``pr.status == "escalated"`` (set by ``_escalate_issue(...,
+    pr_number=...)``) with no GitHub label reflecting it -- a split state
+    (issue ``open_passive``, PR ``escalated``) that silently excluded the PR
+    from packet regeneration forever: ``loop()``'s per-pass regen check
+    skips regenerating an escalated PR's packet, so the stored
+    ``headRefOid`` went stale the moment the PR's head next moved and
+    ``review_queue()``'s stale-packet guard permanently excluded the PR
+    from the review queue.
+
+    Only the verified ``pr_number`` is reset -- not every linked PR, since
+    only this one passed the OPEN/mergeable/janitor gates (matching the
+    operator door ``_apply_pr_reset``, which also acts on a single PR).
+    This does NOT clear the full ``UNESCALATE_PR_RESET_FIELDS`` set -- that
+    is the operator door's broader re-arm, and resetting those counters
+    here would violate the unbounded paid-session loop guard (issue #783
+    hazard (b)); only the per-mechanism rework counter is reset separately
+    by the caller.
+
+    Guard (review on #1482): ``pr_state_str`` at the call site is the
+    PRE-lock GitHub fetch (``self.gh.pr_view`` at the top of
+    ``_deescalate_mechanical_issue``), so the ``pr_state_str == "OPEN"``
+    gate does not defend this in-lock write against a PR that merged/closed
+    on GitHub -- or, more directly, that a concurrent writer (reconcile,
+    another loop lane, an operator ``unescalate``) advanced to a terminal
+    ``status`` in state.json during the window between the pre-lock state
+    load and this in-lock fresh load.  Mirroring the operator door's
+    ``_apply_pr_reset`` (which branches on live PR state and never writes
+    ``PASSIVE_OPEN_STATUS`` over a merged/closed PR) and the sweep's own
+    PR-selection skip (``status not in ("merged", "closed")``), do NOT
+    revert a PR whose fresh status is already terminal: the sweep's job
+    here is to clear a stuck *escalated* PR, not to resurrect a
+    merged/closed one.  Reverting it would create a split state (PR
+    merged/closed on GitHub, ``status == "open_passive"`` in state.json)
+    that reconcile must self-heal -- avoid the divergence at the write
+    instead.  A non-terminal fresh status (``"escalated"`` in the normal
+    path, or any other open-class value) is still reset to the
+    passive-open target.
+    """
+    pr_entry = fresh_state.get("prs", {}).get(str(pr_number))
+    if isinstance(pr_entry, dict):
+        if pr_entry.get("status") not in ("merged", "closed"):
+            pr_entry["status"] = PASSIVE_OPEN_STATUS
