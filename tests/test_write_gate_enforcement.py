@@ -838,7 +838,14 @@ _RATCHET_BASELINE: dict[str, int] = {
     # class as the pre-existing 8 — the ratchet holds at the new count.
     "fleet_dispatch.py": 11,
     "fleet_registry.py": 1,
-    "reconcile.py": 5,
+    # Issue #1241: +1 raw log_event call in the reconcile salvage lane's new
+    # pre-open supersession check (the salvage_skipped_* event emitted when the
+    # shared check_salvage_superseded finds the work already landed). This is
+    # out-of-wave raw territory -- the salvage lane has not been converted to
+    # WriteGate (it predates #1264's wave and uses log_event directly, matching
+    # the existing pr_closing_ref_rewritten / pr_closing_ref_unlinked calls in
+    # the same block). The ratchet holds at the new count.
+    "reconcile.py": 6,
     "state_migration.py": 1,
     "supervise.py": 11,
     "supervisor_lifecycle.py": 3,
