@@ -88,6 +88,13 @@ UNESCALATE_PR_RESET_FIELDS = (
     "rescue_attempted",
     "rescue_cause",
     "rescue_dispatched_at",
+    # Issue #1132: ``charlie unescalate --pr`` did NOT clear the
+    # ``foreign_issue_ref`` marker (observed: unescalate flipped
+    # janitor_blocked -> open_passive but left the park in place, so the PR
+    # stayed invisible). The marker is the third hidden layer under salvage
+    # and head-keyed parks; an operator re-arm must clear it so the next
+    # pass re-probes the linked issue instead of skipping with zero events.
+    "foreign_issue_ref",
 )
 # Issue-record equivalents (dispatch-side caps and stale worker bookkeeping).
 UNESCALATE_ISSUE_RESET_FIELDS = (
