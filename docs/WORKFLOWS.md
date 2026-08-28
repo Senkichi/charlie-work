@@ -127,7 +127,7 @@ Set `devin.adapter: claude-code` (as in
 Each worker gets an isolated git worktree (via `worktree.create_worktree()`,
 junction-linked to a shared `.venv` when `venv_source` is given) and a
 headless `claude -p --permission-mode acceptEdits` process launched inside
-it — promoting the emergent empericus pattern (human hand-assembles a
+it — promoting an emergent manual pattern (human hand-assembles a
 worktree + pastes a prompt into an interactive `claude` session) into code.
 The worktree checkout itself carries the repo's tracked `.claude/settings.json`
 permissions/hooks for free — no separate config plumbing needed for that.

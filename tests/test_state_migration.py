@@ -1,9 +1,9 @@
 """Load-bearing regression tests: production state.json shapes must survive.
 
 The fixture `tests/fixtures/state_production_redacted.json` is a redacted copy of a
-real job-cannon `.var/charlie-work/state.json` (titles/bodies/URLs/paths
+real pre-extraction `.var/charlie-work/state.json` (titles/bodies/URLs/paths
 scrubbed; numbers, statuses, event kinds, and timestamps kept verbatim — see
-docs/design/extraction-dossier.md section 3 "De facto state.json schema"). These
+the internal extraction dossier, section 3 "De facto state.json schema"). These
 tests prove the extracted `state.py` module can round-trip a file written by the
 OLD in-repo orchestrators without dropping fields it doesn't know about.
 """

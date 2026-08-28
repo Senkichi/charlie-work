@@ -11,8 +11,8 @@ into the same hook, and its unpushed local commits get wiped by the very
 next ``git branch -D`` (see ``attempt_refs.py``).
 
 This module reads the Devin CLI's own session store
-(``%APPDATA%\\devin\\cli\\sessions.db``, a SQLite database — see
-``docs/design/extraction-dossier.md`` §4) to recover the worker's terminal
+(``%APPDATA%\\devin\\cli\\sessions.db``, a SQLite database — schema recorded
+in the internal extraction dossier §4) to recover the worker's terminal
 tool call directly, independent of what made it into the log tail. It is a
 strictly best-effort, read-only side channel:
 
@@ -30,7 +30,7 @@ strictly best-effort, read-only side channel:
   content live inside the ``chat_message`` JSON blob (see
   ``_parse_chat_message``), per-session ordering is by ``node_id``, and
   ``created_at`` is an epoch integer. There is still no official Devin CLI
-  documentation for this table (extraction-dossier.md item 23), so any
+  documentation for this table (extraction dossier item 23), so any
   future drift is caught by ``sqlite3.Error`` / defensive JSON parsing and
   treated as schema drift, not a crash.
 """
@@ -81,7 +81,7 @@ def _default_db_path() -> Path:
     """Resolve the Devin CLI's session store default location.
 
     Windows: ``%APPDATA%\\devin\\cli\\sessions.db``. POSIX:
-    ``~/.local/share/devin/cli/sessions.db`` (extraction-dossier.md §4).
+    ``~/.local/share/devin/cli/sessions.db`` (extraction dossier §4).
     Env-expanded at call time, never hardcoded to a literal user path.
     """
     appdata = os.environ.get("APPDATA")

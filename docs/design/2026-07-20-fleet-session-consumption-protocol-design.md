@@ -6,7 +6,7 @@ writing-plans pass) · **Date:** 2026-07-20
 ## 1. Problem
 
 Live orchestrating sessions (this Claude Code session, acting as fleet operator across
-charlie-work and job-cannon) spend heavy token budget on *active* orchestration — polling
+charlie-work and a sibling consumer repo) spend heavy token budget on *active* orchestration — polling
 `gh pr list`, reading worker/reviewer logs, and re-deriving worker health via LLM judgment —
 even though a deterministic supervisor (`supervise.py` + `worker.py`, dispatched every 5
 minutes by the `charlie-fleet-pass` scheduled task) already computes this exact information
@@ -36,7 +36,7 @@ actually need attention, stop spending tokens re-discovering things that don't.
 - **Currently disabled**: `orchestrator.config.yaml` has no `notify:` section, so
   `notify.enabled` defaults to `false`. Nothing is being written today — this is the actual gap,
   not the underlying machinery.
-- `scripts/heartbeat_check.py`: deterministic, cross-repo (cw + job-cannon), prints `OK`/`ANOMALY`
+- `scripts/heartbeat_check.py`: deterministic, cross-repo (this repo + a sibling consumer repo), prints `OK`/`ANOMALY`
   lines per check (dispatch coverage, throttle, stale in-progress, **review-liveness**,
   dispatch-failures, log-freshness, merge-flow, GH rate limit, runner health), exit code 0/1.
 - **This session is itself periodically re-invoked externally** (confirmed by the user) with a
@@ -53,9 +53,10 @@ one-line config flip. No new charlie-work features are required.
 
 ### 3.1 Turn on the file sink (config-only)
 
-Add to `orchestrator.config.yaml` (both charlie-work and job-cannon, if job-cannon runs the same
-notify module — verify before assuming; job-cannon's state dir naming differs, `devin-orchestrator`
-vs `charlie-work`, so it may be a distinct codebase needing its own equivalent):
+Add to `orchestrator.config.yaml` (both charlie-work and any sibling consumer repo, if it runs the
+same notify module — verify before assuming; a sibling repo's state dir naming may differ,
+`devin-orchestrator` vs `charlie-work`, so it may be a distinct codebase needing its own
+equivalent):
 
 ```yaml
 notify:
@@ -79,7 +80,7 @@ tail -f .var/charlie-work/notify/digest.jsonl | grep --line-buffered -E '"health
   — benign transitions (recoveries, HEALTHY, or things the supervisor already
   auto-remediates within its bounded redispatch cap) don't need to interrupt the session.
 - Between events: no polling, no active status-checking. Do other requested work, or go idle.
-- One Monitor per repo (cw, job-cannon) covers the cross-repo scope this session operates over.
+- One Monitor per repo (this repo, sibling consumer repo) covers the cross-repo scope this session operates over.
 
 ### 3.3 Standing heartbeat-wakeup protocol (codifying existing external cadence)
 
@@ -132,14 +133,14 @@ or subagent can't (policy tradeoffs, ambiguous review verdicts, anything flagged
    silently failing (e.g. disk full, path issue) would starve the Monitor channel with no signal.
    Not fixed by this design — flagged as a candidate follow-up check for `heartbeat_check.py`
    (e.g. an OK/ANOMALY line for "digest file freshness"), not required to ship this.
-4. **job-cannon parity — verified.** job-cannon has no `src/charlie_work` of its own; it's
-   orchestrated by the same `charlie_work` package (installed from the charlie-work checkout,
-   invoked via the fleet registry against job-cannon's `repo_root`/`config_path`), confirmed by
-   `config.load_config()` loading job-cannon's `orchestrator.config.yaml` cleanly from
-   charlie-work's own environment. Both repos' `notify:` blocks are live (3.1 shipped, §6).
-   Caveat: job-cannon's `watchdog.enabled=false` (shim log-mtime blindness, see that repo's config
-   comment) means STALLED transitions specifically won't appear in its digest until that
-   structural fix lands — dead-pid reaping and other transitions are unaffected. (The
+4. **Sibling-repo parity — verified.** The sibling consumer repo has no `src/charlie_work` of its
+   own; it's orchestrated by the same `charlie_work` package (installed from the charlie-work
+   checkout, invoked via the fleet registry against the sibling repo's `repo_root`/`config_path`),
+   confirmed by `config.load_config()` loading the sibling repo's `orchestrator.config.yaml`
+   cleanly from charlie-work's own environment. Both repos' `notify:` blocks are live (3.1 shipped,
+   §6). Caveat: the sibling repo's `watchdog.enabled=false` (shim log-mtime blindness, see that
+   repo's config comment) means STALLED transitions specifically won't appear in its digest until
+   that structural fix lands — dead-pid reaping and other transitions are unaffected. (The
    "dead-pid reaping is unaffected" claim was false until #1122/#1108 un-gated
    `_detect_and_handle_orphaned_workers` from `watchdog.enabled`; it is now true.)
 
@@ -147,8 +148,8 @@ or subagent can't (policy tradeoffs, ambiguous review verdicts, anything flagged
 
 1. **Done.** `notify:` block (3.1) added to charlie-work's `orchestrator.config.yaml`, validated
    via `config.load_config()`.
-2. **Done.** job-cannon parity confirmed (same package, different config); `notify:` block added
-   to job-cannon's `orchestrator.config.yaml` too, validated the same way.
+2. **Done.** Sibling-repo parity confirmed (same package, different config); `notify:` block added
+   to the sibling repo's `orchestrator.config.yaml` too, validated the same way.
 3. **Standing practice.** 3.2 (Monitor over digest.jsonl) adopted for live orchestrating sessions
    going forward — session behavior change, not a code change; no further action to "ship."
 4. **Standing practice.** 3.3 adopted as the documented contract for externally-triggered
