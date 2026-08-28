@@ -60,6 +60,13 @@ review_dispatch:
   # turn_cap_large_file_multiplier: 2
   # turn_cap_max_multiplier: 3
   # max_consecutive_turn_limit_misses: 3
+  # Issue #1445: repo file-size cap (lines). A diff that adds code to a file
+  # whose post-diff line count exceeds this cap is a REPORTABLE FINDING in the
+  # review packet (the rubric references this cap, not a hardcoded number).
+  # 0 (default) disables the over-cap finding probe; the rubric prose stays
+  # present. Once issue #1442's high-water-mark line-count ratchet (or its
+  # successor structural signal) lands, that source should rebind this value.
+  # file_size_cap_lines: 0
 
 auto_merge:
   enabled: true

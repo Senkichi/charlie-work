@@ -61,16 +61,22 @@ the robust bound against a retry loop, not this stdin flag; (b) the
 ``.venv`` is missing -- a missing interpreter is treated as fail-OPEN (the
 Stop hook simply cannot launch), which is the intentionally safe direction
 for an environment-setup failure that is not this gate's job to diagnose.
-A third, empirically-confirmed limitation (review round, #1259; tracked as
-#1306): scoping ruff to "changed" files does not distinguish a file this
+A third, empirically-confirmed limitation (review round, #1259; resolved as
+#1306): scoping ruff to "changed" files did not distinguish a file this
 session just wrote from pre-existing untracked debris sitting in a
 long-lived interactive checkout -- ``git status`` reports both identically,
 so a stray untracked ``.py`` file with real lint/format issues left over
-from an unrelated earlier session can still trigger a block in an
-interactive (non-worker) session that never touched it. The two real fixes
-(gitignore the debris pattern, or exclude untracked-and-uncommitted files
-from ruff's scope specifically) are a policy decision left to #1306, not
-something this gate infers on its own.
+from an unrelated earlier session could still trigger a block in an
+interactive (non-worker) session that never touched it. The fix chosen in
+#1306 narrows ruff's scope to tracked-modified + committed-since-base only,
+excluding untracked (``??``) files from the *ruff* surface specifically.
+Untracked files are still included in the W4 emit-site rule and test
+targeting, where a brand-new file legitimately needs coverage -- only the
+ruff lint/format check is narrowed. The residual cost (a worker's genuinely
+new untracked ``.py`` file is not lint/formatted by the gate until it is
+staged or committed) is acceptable: the worker workflow ends with a
+commit+push, at which point the committed-diff surface covers it, and CI
+runs ruff on the whole tree on every push regardless.
 
 Hook contract (verified against the current Claude Code hooks docs and
 working reference implementations at implementation time -- the repo has no
@@ -154,6 +160,14 @@ class ChangedFile:
 
     path: str
     deleted: bool
+    #: True only for ``??`` entries -- a file git has never tracked or staged.
+    #: Used to narrow ruff's scope to tracked-modified + committed-since-base
+    #: only (#1306): an untracked file may be session-written debris that
+    #: predates this session, and ``git status`` cannot tell the two apart, so
+    #: it is excluded from the *ruff* surface while still appearing in the
+    #: W4 emit-site rule and test targeting (a brand-new file legitimately
+    #: needs coverage there). Committed-diff entries are never untracked.
+    untracked: bool = False
 
 
 @dataclass(frozen=True)
@@ -300,7 +314,7 @@ def _changed_files(repo_root: Path) -> tuple[ChangedFile, ...]:
         status, rest = line[:2], line[3:]
         if " -> " in rest:  # rename: "old -> new"; the new path is the live one
             rest = rest.split(" -> ", 1)[1]
-        files.append(ChangedFile(path=rest, deleted="D" in status))
+        files.append(ChangedFile(path=rest, deleted="D" in status, untracked=status == "??"))
     return tuple(files)
 
 
@@ -393,11 +407,19 @@ def _committed_diff_files(repo_root: Path) -> tuple[ChangedFile, ...]:
 def _all_changed_files(repo_root: Path) -> tuple[ChangedFile, ...]:
     """Union of working-tree state and the committed-since-base diff.
 
-    Used for ruff scope, the W4 emit-site rule, and test targeting alike
-    (review-round decision, #1259) -- a file only needs to appear in one of
-    the two sources to count as "changed this session". Working-tree state
-    wins on a path collision (freshest -- e.g. a file committed earlier in
-    the session and then edited again since).
+    Used for the W4 emit-site rule and test targeting (review-round
+    decision, #1259) -- a file only needs to appear in one of the two
+    sources to count as "changed this session". Working-tree state wins on
+    a path collision (freshest -- e.g. a file committed earlier in the
+    session and then edited again since).
+
+    Ruff scope is a *narrowing* of this union, not the union itself: the
+    caller (``_evaluate``) excludes untracked (``??``) files from the ruff
+    surface (#1306), because ``git status`` cannot distinguish a file this
+    session just wrote from pre-existing untracked debris. Untracked files
+    remain in this union so the W4 and test-targeting rules still see them
+    -- a brand-new file legitimately needs test coverage even before it is
+    staged.
     """
     committed = _committed_diff_files(repo_root)
     working_tree = _changed_files(repo_root)
@@ -446,14 +468,17 @@ def _run_ruff(repo_root: Path, py_files: tuple[str, ...]) -> GateResult:
     """Run ``ruff check``/``ruff format --check`` scoped to exactly
     ``py_files`` -- never the whole tree (review-round fix, #1259: a
     pre-existing lint/format issue in a file this session never touched
-    must not spuriously block the stop). A caller with no ``.py`` files in
-    its changed set should not call this at all; as a second line of
-    defense it is also a no-op here.
+    must not spuriously block the stop). The caller (``_evaluate``)
+    further narrows this to tracked-modified + committed-since-base only,
+    excluding untracked ``??`` files (#1306: ``git status`` cannot
+    distinguish session-written debris from pre-existing debris). A caller
+    with no ``.py`` files in its changed set should not call this at all;
+    as a second line of defense it is also a no-op here.
     """
     if not py_files:
         return GateResult(block=False)
     check = _run(
-        ["uv", "run", "--no-sync", "ruff", "check", *py_files],
+        ["uv", "run", "--no-sync", "ruff", "check", "--force-exclude", *py_files],
         cwd=repo_root,
         timeout=RUFF_TIMEOUT_SECONDS,
     )
@@ -462,7 +487,7 @@ def _run_ruff(repo_root: Path, py_files: tuple[str, ...]) -> GateResult:
             block=True, reason="ruff check failed:\n" + (check.stdout + check.stderr).strip()
         )
     fmt = _run(
-        ["uv", "run", "--no-sync", "ruff", "format", "--check", *py_files],
+        ["uv", "run", "--no-sync", "ruff", "format", "--check", "--force-exclude", *py_files],
         cwd=repo_root,
         timeout=RUFF_TIMEOUT_SECONDS,
     )
@@ -497,8 +522,19 @@ def _evaluate(repo_root: Path) -> GateResult:
     changed = _all_changed_files(repo_root)
     if not changed:
         return GateResult(block=False)  # fast path: nothing changed, nothing to check
+    # Ruff scope is narrowed to tracked-modified + committed-since-base only
+    # (#1306): untracked (``??``) files are excluded because ``git status``
+    # cannot distinguish a file this session just wrote from pre-existing
+    # untracked debris that predates the session -- and the latter must never
+    # spuriously block a session that never touched it. Untracked files are
+    # still in ``changed`` for the W4 emit-site rule and test targeting below,
+    # where a brand-new file legitimately needs coverage.
     py_files = tuple(
-        sorted(cf.path for cf in changed if not cf.deleted and cf.path.endswith(".py"))
+        sorted(
+            cf.path
+            for cf in changed
+            if not cf.deleted and cf.path.endswith(".py") and not cf.untracked
+        )
     )
     ruff_result = _run_ruff(repo_root, py_files)
     if ruff_result.block:

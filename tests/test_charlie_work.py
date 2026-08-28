@@ -647,6 +647,8 @@ def test_worker_prompt_renders_issue_values() -> None:
             "branch_name": "agent/issue-123-fix-search",
             "worker_model_tier": "capable",
             "issue_comments": "",
+            "module_map": "",
+            "attachment_budget": "",
         },
     )
 
@@ -667,6 +669,8 @@ def test_claude_code_worker_prompt_renders_issue_values() -> None:
             "branch_name": "agent/issue-123-fix-search",
             "worker_model_tier": "capable",
             "issue_comments": "",
+            "module_map": "",
+            "attachment_budget": "",
         },
     )
 
@@ -11116,6 +11120,49 @@ auto_merge:
     assert config.auto_merge.queue_bot_login == "aviator-app[bot]"
 
 
+def test_auto_merge_config_mergequeue_wedge_hours_defaults_to_24() -> None:
+    """Issue #1401: default AutoMergeConfig() enables the time-in-mergequeue
+    watchdog at 24h -- the live #1751 case ran 28h+ undetected, so the default
+    must be on, not opt-in."""
+    assert AutoMergeConfig().mergequeue_wedge_hours == 24.0
+
+
+def test_load_config_parses_mergequeue_wedge_hours(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_wedge_hours: 6
+"""
+    )
+    config = load_config(config_file)
+    assert config.auto_merge.mergequeue_wedge_hours == 6.0
+
+
+def test_load_config_rejects_negative_mergequeue_wedge_hours(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_wedge_hours: -1
+"""
+    )
+    with pytest.raises(ConfigError, match="must not be negative"):
+        load_config(config_file)
+
+
+def test_load_config_rejects_non_number_mergequeue_wedge_hours(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_wedge_hours: "soon"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be a number"):
+        load_config(config_file)
+
+
 def test_loop_surfaces_unauthorized_merge_in_errors_bucket(tmp_path: Path) -> None:
     """loop() must wire the post-merge tripwire into the errors bucket even when dispatch() had no ready issues and returned an empty merged_prs list (issue #502)."""
     from charlie_work.config import OrchestratorConfig
@@ -18282,6 +18329,65 @@ def test_merge_ready_mergequeue_mode_labels_instead_of_merging(tmp_path: Path) -
     assert persisted["status"] != "merged"
 
 
+def test_merge_ready_mergequeue_stamps_and_preserves_dwell_tracking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1401: merge_ready stamps mergequeue_since/mergequeue_head_sha when
+    a PR enters Aviator's queue, preserves them across passes while the head is
+    frozen (so the wedge watchdog can measure true no-progress dwell), and
+    resets them when the head advances (Aviator rebased -> progress, not a wedge)."""
+    # utc_now() strips microseconds, so two merge_ready calls within the same
+    # wall-clock second produce identical timestamps. Mock it with a per-call
+    # counter so the "head advanced -> fresh dwell window" assertion is
+    # deterministic, not a race against the clock.
+    _utc_call = 0
+
+    def _fake_utc_now() -> str:
+        nonlocal _utc_call
+        _utc_call += 1
+        return f"2026-01-01T00:00:{_utc_call:02d}Z"
+
+    monkeypatch.setattr("charlie_work.workflow.utc_now", _fake_utc_now)
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    app.merge_ready(456, merge=True)
+    first = load_state(paths.state_file)["prs"]["456"]
+    assert first["status"] == "mergequeue"
+    assert first["mergequeue_head_sha"] == "sha-abc123"
+    assert first["mergequeue_since"]
+    first_since = first["mergequeue_since"]
+
+    # Second pass, head unchanged: the queue-enter time is preserved so the
+    # watchdog's dwell measurement is not reset by a no-op re-evaluation pass.
+    app.merge_ready(456, merge=True)
+    second = load_state(paths.state_file)["prs"]["456"]
+    assert second["mergequeue_head_sha"] == "sha-abc123"
+    assert second["mergequeue_since"] == first_since
+
+    # Aviator rebases the PR -> head advances. merge_ready returns early
+    # ("head moved, re-review required") without persisting; a fresh
+    # record_review at the new head re-approves it, and the next merge_ready
+    # stamps a fresh dwell window (progress, not a wedge).
+    fake_gh.pr_head_shas[456] = "sha-abc123-rebased"
+    head_moved = app.merge_ready(456, merge=True)
+    assert head_moved.data["head_moved"] is True
+    app.record_review(
+        456,
+        "approved",
+        summary="ok",
+        verdict_provenance="fresh_llm_review",
+        reviewed_head="sha-abc123-rebased",
+    )
+    app.merge_ready(456, merge=True)
+    third = load_state(paths.state_file)["prs"]["456"]
+    assert third["mergequeue_head_sha"] == "sha-abc123-rebased"
+    assert third["mergequeue_since"] != first_since
+
+
 def test_merge_ready_mergequeue_hold_label_on_pr_prevents_re_add(tmp_path: Path) -> None:
     """Issue #496: an approved PR carrying the configured merge-hold label
     must not be swept back into the mergequeue on subsequent passes."""
@@ -18435,6 +18541,187 @@ def test_merge_ready_mergequeue_mode_unapproved_pr_not_labeled(tmp_path: Path) -
     assert fake_gh.pr_labels_added == []
     assert fake_gh.merged == []
     assert result.data.get("mergequeue_label_applied") is None
+
+
+def test_merge_ready_event_persists_gate_inputs_distinguishing_false_causes(
+    tmp_path: Path,
+) -> None:
+    """Issue #1060: the ``merge_ready`` event must persist the three gate
+    inputs (``summary_ready``, ``approved``, ``require_approved_review``,
+    ``sync_failed``) alongside ``can_merge``, plus ``mergequeue_label_applied``,
+    so a ``can_merge=False`` can be diagnosed from events.db alone.
+
+    The three distinct false-causes -- CI not green, no recorded approval, base
+    sync failed -- must produce three *different* payloads, not three identical
+    ones. Mutating any single input must change the recorded event; if it does
+    not, the record is not load-bearing.
+    """
+
+    def _last_merge_ready_payload(state_file: Path) -> dict[str, Any]:
+        state = load_state(state_file)
+        events = [e for e in state["events"] if e["kind"] == "merge_ready"]
+        assert events, "no merge_ready event was recorded"
+        return events[-1]["payload"]
+
+    gate_keys = {"summary_ready", "approved", "require_approved_review", "sync_failed"}
+
+    # --- Scenario 1: CI not green (summary_ready=False) -------------------
+    # require_current_base=False keeps the base-freshness deferral gate off so
+    # the pass reaches the merge_ready event instead of short-circuiting on a
+    # stale-base deferral (which records a different event kind).
+    config_ci = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed",),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_ci = runtime_paths(tmp_path / "ci", config_ci.runtime.state_dir)
+    fake_gh_ci = FakeGitHubWithChecks(checks=[{"name": "Tests passed", "state": "FAILURE"}])
+    app_ci = OrchestratorApp(tmp_path / "ci", paths_ci, config_ci, fake_gh_ci)
+    app_ci.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    app_ci.merge_ready(456, merge=False)
+    payload_ci = _last_merge_ready_payload(paths_ci.state_file)
+
+    # --- Scenario 2: no recorded approval (approved=False) ----------------
+    config_noappr = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_noappr = runtime_paths(tmp_path / "noappr", config_noappr.runtime.state_dir)
+    fake_gh_noappr = FakeGitHub()
+    app_noappr = OrchestratorApp(tmp_path / "noappr", paths_noappr, config_noappr, fake_gh_noappr)
+    # Deliberately do NOT record a review -> approved=False.
+    app_noappr.merge_ready(456, merge=False)
+    payload_noappr = _last_merge_ready_payload(paths_noappr.state_file)
+
+    # --- Scenario 3: base sync failed (sync_failed=True) ------------------
+    # A genuine merge conflict (mergeable=CONFLICTING) sets sync_failed=True
+    # before the gate, while the default passing checks keep summary_ready=True.
+    config_sync = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            require_approved_review=True,
+        )
+    )
+    paths_sync = runtime_paths(tmp_path / "sync", config_sync.runtime.state_dir)
+    fake_gh_sync = FakeGitHub()
+    fake_gh_sync.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BEHIND",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app_sync = OrchestratorApp(tmp_path / "sync", paths_sync, config_sync, fake_gh_sync)
+    app_sync.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    app_sync.merge_ready(456, merge=False)
+    payload_sync = _last_merge_ready_payload(paths_sync.state_file)
+
+    # All three are can_merge=False but for three distinct reasons, and every
+    # payload carries the gate inputs plus the persisted handoff outcome.
+    for payload in (payload_ci, payload_noappr, payload_sync):
+        assert payload["can_merge"] is False
+        assert gate_keys <= set(payload)
+        assert "mergequeue_label_applied" in payload
+
+    # Scenario 1: CI not green.
+    assert payload_ci["summary_ready"] is False
+    assert payload_ci["approved"] is True
+    assert payload_ci["require_approved_review"] is True
+    assert payload_ci["sync_failed"] is False
+
+    # Scenario 2: no recorded approval.
+    assert payload_noappr["summary_ready"] is True
+    assert payload_noappr["approved"] is False
+    assert payload_noappr["require_approved_review"] is True
+    assert payload_noappr["sync_failed"] is False
+
+    # Scenario 3: base sync failed (merge conflict).
+    assert payload_sync["summary_ready"] is True
+    assert payload_sync["approved"] is True
+    assert payload_sync["require_approved_review"] is True
+    assert payload_sync["sync_failed"] is True
+
+    # The three payloads are distinguishable on the gate-input sub-dict: no two
+    # share the same (summary_ready, approved, sync_failed) triple. Mutating any
+    # single input changes the recorded event -- the record is load-bearing.
+    triples = {
+        (p["summary_ready"], p["approved"], p["sync_failed"])
+        for p in (payload_ci, payload_noappr, payload_sync)
+    }
+    assert len(triples) == 3
+
+
+def test_merge_ready_real_path_return_data_includes_gate_inputs(
+    tmp_path: Path,
+) -> None:
+    """Issue #1060: the real (non-dry-run) ``merge_ready()`` call's returned
+    ``.data`` dict must include the four gate inputs
+    (``summary_ready``, ``approved``, ``require_approved_review``,
+    ``sync_failed``) alongside ``can_merge``, for diagnostic parity with the
+    persisted ``merge_ready`` event. The review found that only the persisted
+    event and the dry-run return were covered -- the real-path in-memory
+    verdict's gate-input spread had no regression test.
+
+    Two scenarios exercise both the ``can_merge=True`` and ``can_merge=False``
+    branches so the assertion is not vacuously satisfied by a missing key
+    defaulting to a falsy value.
+    """
+    gate_keys = {"summary_ready", "approved", "require_approved_review", "sync_failed"}
+
+    # --- Scenario 1: approved + green -> can_merge=True -------------------
+    config_ok = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_ok = runtime_paths(tmp_path / "ok", config_ok.runtime.state_dir)
+    fake_gh_ok = FakeGitHub()
+    app_ok = OrchestratorApp(tmp_path / "ok", paths_ok, config_ok, fake_gh_ok)
+    app_ok.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    result_ok = app_ok.merge_ready(456, merge=False)
+
+    assert result_ok.data["can_merge"] is True
+    assert gate_keys <= set(result_ok.data)
+    assert result_ok.data["summary_ready"] is True
+    assert result_ok.data["approved"] is True
+    assert result_ok.data["require_approved_review"] is True
+    assert result_ok.data["sync_failed"] is False
+
+    # --- Scenario 2: no recorded approval -> can_merge=False --------------
+    config_noappr = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_noappr = runtime_paths(tmp_path / "noappr", config_noappr.runtime.state_dir)
+    fake_gh_noappr = FakeGitHub()
+    app_noappr = OrchestratorApp(tmp_path / "noappr", paths_noappr, config_noappr, fake_gh_noappr)
+    # Deliberately do NOT record a review -> approved=False.
+    result_noappr = app_noappr.merge_ready(456, merge=False)
+
+    assert result_noappr.data["can_merge"] is False
+    assert gate_keys <= set(result_noappr.data)
+    assert result_noappr.data["summary_ready"] is True
+    assert result_noappr.data["approved"] is False
+    assert result_noappr.data["require_approved_review"] is True
+    assert result_noappr.data["sync_failed"] is False
 
 
 def test_merge_ready_mergequeue_parked_pr_excluded_from_merge_train_head(
@@ -19793,6 +20080,105 @@ def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> No
     assert (123, config.labels.needs_rework) in fake_gh.labels_removed
 
 
+def test_dispatch_rework_worktree_unsafe_local_commits_escalates_as_judgment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #807: a rework-dispatch attempt whose failure_kind is
+    ``worktree_unsafe_local_commits`` (genuine unpushed local commits on the
+    worktree branch) must escalate immediately on the FIRST attempt — like a
+    deterministic mechanical failure — but with ``reason_class="judgment"`` so
+    the label lands ``agent:human-needed`` (not ``agent:operator-queue``) and
+    the de-escalation sweep never auto-clears it.
+
+    Mirrors ``test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment``
+    (the fresh-dispatch site) but covers ``_dispatch_rework_impl``'s escalation
+    branch — the rework-dispatch counterpart, which carries the same
+    reason_class-derivation logic.
+
+    Mutation gate: dropping the ``deterministic_judgment`` half of
+    ``immediate_escalation`` in ``_dispatch_rework_impl``'s escalation branch
+    makes this test fail (the issue takes the redispatch-cap path and stays
+    ``rework_requested`` instead of escalating). Reverting the
+    ``_escalation_edge("redispatch_escalated", reason_class)`` to the hardcoded
+    ``"mechanical"`` also fails it (the label lands ``agent:operator-queue``
+    while state carries ``reason_class="judgment"``).
+    """
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; sys.exit(1)",
+            ),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="launch failed: worktree contains local commits",
+                failure_kind="worktree_unsafe_local_commits",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    # A deterministic judgment failure escalates on the FIRST attempt, not
+    # after burning max_auto_redispatch.
+    result = app.dispatch_rework()
+    assert result.ok is False
+    assert result.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe_local_commits"
+    assert state["issues"]["123"]["reason_class"] == "judgment"
+    # Escalated on the FIRST failure — not after burning max_auto_redispatch.
+    assert len(state["issues"]["123"]["redispatch_at"]) == 1
+    # Issue #807: judgment -> agent:human-needed, not agent:operator-queue.
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) in fake_gh.labels_removed
+
+
 def test_dry_run_dispatch_rework_leaves_state_unchanged(tmp_path: Path) -> None:
     """Issue #616: --dry-run rework dispatch must not advance the state machine
     off fabricated adapter results.
@@ -20413,7 +20799,15 @@ def test_merge_ready_dry_run_already_merged_is_noop(tmp_path: Path) -> None:
 
 def test_merge_ready_dry_run_unapproved_reports_can_merge_false(tmp_path: Path) -> None:
     """Issue #614: under --dry-run, an unapproved PR reports can_merge=False
-    without persisting any state."""
+    without persisting any state.
+
+    Issue #1060: the dry-run return payload must also surface the four gate
+    inputs (``summary_ready``, ``approved``, ``require_approved_review``,
+    ``sync_failed``) so the preview has diagnostic parity with the persisted
+    ``merge_ready`` event.  This scenario — checks green but no recorded
+    approval — exercises the ``approved=False`` / ``require_approved_review=True``
+    branch that makes ``can_merge`` False.
+    """
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -20424,6 +20818,13 @@ def test_merge_ready_dry_run_unapproved_reports_can_merge_false(tmp_path: Path) 
     assert result.data["can_merge"] is False
     assert result.data["merged"] is False
     assert result.data["dry_run"] is True
+    # Issue #1060: the four gate inputs are spread into the dry-run payload
+    # from the same dict the gate reads, so the preview explains *why*
+    # can_merge is False without needing events.db.
+    assert result.data["summary_ready"] is True
+    assert result.data["approved"] is False
+    assert result.data["require_approved_review"] is True
+    assert result.data["sync_failed"] is False
     # No state was written for this PR.
     assert "456" not in load_state(paths.state_file)["prs"]
 
@@ -26719,7 +27120,7 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
         started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
         error="worktree creation failed: worktree contains local work",
-        failure_kind="worktree_unsafe",
+        failure_kind="worktree_unsafe_shim_dirt",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
@@ -26730,11 +27131,125 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
     state = load_state(paths.state_file)
     entry = state["issues"]["123"]
     assert entry["status"] == "escalated"
-    assert entry["escalation_reason"] == "worktree_unsafe"
+    assert entry["escalation_reason"] == "worktree_unsafe_shim_dirt"
     # Issue #1266: a deterministic failure_kind escalation is mechanical
     # (same _escalate_issue site as worker_death_loop/redispatch_cap_exceeded
     # in _reap_restore_rework_requested), so this lands agent:operator-queue.
     assert (123, config.labels.operator_queue) in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+    event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
+    assert "session_failed_escalated" in event_kinds
+    assert "rework_requeued" not in event_kinds
+
+
+def test_classify_dead_rework_session_worktree_unsafe_local_commits_escalates_as_judgment(
+    tmp_path: Path,
+) -> None:
+    """Issue #807: a dead rework worker whose failure_kind is
+    ``worktree_unsafe_local_commits`` (genuine unpushed local commits on the
+    worktree branch) must escalate immediately on the first occurrence — like
+    the mechanical deterministic kinds — but with ``reason_class="judgment"`` so
+    the de-escalation sweep never auto-clears it and the label lands
+    ``agent:human-needed`` (not ``agent:operator-queue``).
+
+    Mirrors ``test_classify_dead_rework_session_deterministic_failure_kind_escalates_immediately``
+    (the mechanical sibling) and
+    ``test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment`` (the
+    fresh-dispatch site), but covers the dead-rework-worker path in
+    ``_reap_restore_rework_requested`` — the call site most relevant to the
+    original #807 scenario.
+
+    Mutation gate: reverting ``_reap_restore_rework_requested``'s label edge at
+    the function tail from ``_escalation_edge("redispatch_escalated",
+    reason_class)`` back to the hardcoded ``"mechanical"`` makes this test fail
+    — the issue escalates with ``reason_class="judgment"`` in state but the
+    label transition still lands ``agent:operator-queue``. Dropping the
+    ``deterministic_judgment`` half of ``immediate_escalation`` also fails it
+    (the issue is restored to ``rework_requested`` instead of escalating).
+    """
+    import json
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+    # fake_gh.prs[0]["headRefOid"] defaults to "sha-abc123".
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-fix-search",
+            "redispatch_at": [],  # nowhere near the cap
+        }
+        # Live request_changes decision matching the current head, so this
+        # test isolates the judgment-kind guard rather than finding 1's gate.
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("worktree contains local commits, cannot reset\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(paths.prs / "pr-456" / "rework-prompt.md"),
+        command=("devin", "--prompt-file", "rework-prompt.md"),
+        pid=None,  # Launch failure -- process never started
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="worktree creation failed: worktree contains local commits",
+        failure_kind="worktree_unsafe_local_commits",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
+    )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "worktree_unsafe_local_commits"
+    # Issue #807: a deterministic judgment failure escalates as judgment, so
+    # the label lands agent:human-needed, not agent:operator-queue.
+    assert entry["reason_class"] == "judgment"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
@@ -27207,7 +27722,7 @@ def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
         started_at=now.isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
         error="worktree creation failed: worktree contains local work",
-        failure_kind="worktree_unsafe",
+        failure_kind="worktree_unsafe_shim_dirt",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
@@ -27228,7 +27743,7 @@ def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
     state = load_state(paths.state_file)
     issue_entry = state["issues"]["42"]
     assert issue_entry["status"] == "escalated"
-    assert issue_entry["escalation_reason"] == "worktree_unsafe"
+    assert issue_entry["escalation_reason"] == "worktree_unsafe_shim_dirt"
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 42]
     assert "session_failed_relabeled" not in event_kinds
@@ -27590,7 +28105,9 @@ def test_stall_and_dead_lane_increment_deferral_counter_at_most_once_per_pass(
     ):
         # loop() order and arguments: stall lane runs before the dead lane,
         # which is told not to persist the counter itself this pass.
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
         _classify_dead_sessions_and_update_throttle_state(
             sessions_dir,
             paths.state_file,
@@ -27712,7 +28229,9 @@ def test_stall_then_dead_lane_composition_survives_phantom_post_mortem_sidecar(
                 return_value=inconclusive_probe,
             ),
         ):
-            _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+            _detect_and_handle_stalled_sessions(
+                sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+            )
 
     def _run_dead_lane() -> None:
         with (
@@ -30333,7 +30852,7 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
                 adapter="command",
                 ok=False,
                 error="worktree is unsafe to reuse",
-                failure_kind="worktree_unsafe",
+                failure_kind="worktree_unsafe_shim_dirt",
             )
             for request in requests
         ]
@@ -30345,7 +30864,7 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
 
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
-    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe_shim_dirt"
     # Issue #1266: this deterministic-failure-kind escalation is mechanical,
     # so it lands agent:operator-queue, not agent:human-needed.
     assert (123, config.labels.operator_queue) in fake_gh.labels_added
@@ -31142,12 +31661,14 @@ def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
             **state["prs"]["456"],
             "status": "escalated",
             "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+            "escalation_reasons_seen": ["conflict_rework_attempts_cap_exceeded"],
             "conflict_rework_attempts": 3,
         }
         state["issues"]["123"] = {
             **state["issues"]["123"],
             "status": "escalated",
             "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+            "escalation_reasons_seen": ["conflict_rework_attempts_cap_exceeded"],
         }
         save_state(paths.state_file, state)
 
@@ -35808,6 +36329,7 @@ def test_loop_forwards_shared_now_to_cadence_gated_lanes(
         state_file: Path,
         config: OrchestratorConfig,
         *,
+        write_gate: object,
         now: datetime | None = None,
     ) -> list[dict[str, int]]:
         received["stalled_sessions"] = now
@@ -36606,6 +37128,157 @@ def test_parse_blockers_ignores_downstream_reference_to_self() -> None:
         "_Filed from the fleet-management & worker-supervision design._\n"
     )
     assert parse_blockers(body) == []
+
+
+def test_parse_blockers_quoted_backtick_phrase_does_not_self_block() -> None:
+    """Issue #1454 regression: an issue whose body quotes ANOTHER issue's
+    blocker declaration inside a Markdown backtick code span must not be
+    classified as blocked by the quoted number.
+
+    Reproduces the #1927 incident shape: a bug report ABOUT the parser
+    flapping on #887/#888 quoted their trigger phrase on its own line, with
+    no preceding issue ref in the clause, so the old backward-only guard
+    could not suppress it and the describing issue self-gated on #886.
+    """
+    from charlie_work.github import parse_blockers
+
+    body = (
+        "## Symptom\n\n"
+        "The parser flaps on #887 and #888.\n\n"
+        "Their bodies contain the trigger phrase:\n\n"
+        "`blocked by #886`\n\n"
+        "which the parser reads as a self-declaration.\n"
+    )
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_quoted_double_quote_phrase_does_not_self_block() -> None:
+    """Issue #1454: a trigger phrase inside straight double quotes is quoted
+    prose, not a self-declaration."""
+    from charlie_work.github import parse_blockers
+
+    body = (
+        "## Symptom\n\n"
+        'The parser sees the literal phrase "blocked by #886" in #887\'s '
+        "body and misreads it as a self-declaration.\n"
+    )
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_forward_foreign_ref_does_not_self_block() -> None:
+    """Issue #1454: a match whose clause carries another #NNN AFTER it (e.g.
+    an issue-referencing parenthetical) describes that other issue, not this
+    one. The old guard only looked backward and missed this."""
+    from charlie_work.github import parse_blockers
+
+    body = (
+        "## Symptom\n\n"
+        "The trigger phrase blocked by #886 (see #887) appears verbatim in "
+        "the upstream body.\n"
+    )
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_genuine_declaration_still_gates() -> None:
+    """Issue #1454 regression: a genuine first-person blocker declaration
+    (the #887/#888 shape) must still gate. The quoted-phrase fix must not
+    suppress real declarations."""
+    from charlie_work.github import parse_blockers
+
+    assert parse_blockers("This issue is blocked by #743") == [743]
+    assert parse_blockers("Blocked by #743, #744") == [743, 744]
+    assert parse_blockers("Depends on #123") == [123]
+    assert parse_blockers("Blocked-by: #456") == [456]
+    # Genuine declaration with surrounding prose but no foreign issue ref.
+    body = "## Summary\n\nFix the parser.\n\nBlocked by #886\n"
+    assert parse_blockers(body) == [886]
+
+
+def test_parse_blockers_stray_backtick_elsewhere_does_not_swallow_declaration() -> None:
+    """Issue #1454 rework: an unrelated/unbalanced backtick ELSEWHERE in the
+    body must not pair with a later backtick to form a code span that
+    envelopes a genuine 'Blocked by #NNN' declaration and silently drop it.
+
+    The body below has a stray opening backtick on the first line and a
+    closing backtick on the last line. Against the whole-document span scan
+    (the pre-rework guard 1) the regex ``(`+)(.+?)(\\1)`` with re.DOTALL
+    matches one span whose content runs from "broken thing." through
+    "Blocked by #159" through "See also ", so the declaration is
+    misclassified as quoted prose and dropped -- a false negative. Scoping
+    the span search to the containing clause (bounded by newlines) leaves
+    the clause "Blocked by #159" with no backticks, so the declaration gates.
+    """
+    from charlie_work.github import parse_blockers
+
+    body = "TODO: fix the `broken thing.\nBlocked by #159\nSee also `foo`.\n"
+    assert parse_blockers(body) == [159]
+
+
+def test_parse_blockers_stray_double_quote_elsewhere_does_not_swallow_declaration() -> None:
+    """Issue #1454 rework: an unrelated/unbalanced straight double quote
+    ELSEWHERE in the body must not pair with a later quote to envelope a
+    genuine declaration. Same false-negative shape as the backtick case:
+    ``"([^"]*)"`` matches from the first quote to the next, swallowing the
+    declaration line in between when scanned over the whole document.
+    Scoping to the clause leaves "Blocked by #743" with no quotes, so it
+    gates.
+    """
+    from charlie_work.github import parse_blockers
+
+    body = 'The error was "connection refused.\nBlocked by #743\nThen it said "done".\n'
+    assert parse_blockers(body) == [743]
+
+
+def test_parse_blockers_fenced_code_block_does_not_self_gate() -> None:
+    """Issue #1454 rework round 2: a 'Blocked by #NNN' line inside a real
+    multi-line triple-backtick fenced code block (fence markers on separate
+    lines from the content) must NOT self-gate.
+
+    The clause-scoped inline span guard (round 1) cannot detect this: clause
+    bounds break on newlines, so the fenced content line ``blocked by #886``
+    is its own clause with no fence markers in it, and the declaration is
+    misclassified as a genuine self-declaration. The fenced-block check runs
+    against the full document with absolute offsets and suppresses it.
+    """
+    from charlie_work.github import parse_blockers
+
+    body = (
+        "## Symptom\n\n"
+        "The upstream issue's body contains:\n\n"
+        "```python\n"
+        "blocked by #886\n"
+        "```\n\n"
+        "which the parser used to misread as a self-declaration.\n"
+    )
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_fenced_code_block_tilde_fence_does_not_self_gate() -> None:
+    """Issue #1454 rework round 2: ``~~~`` fences are equivalent to triple-
+    backtick fences in CommonMark and must be detected the same way."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Example\n\n~~~\nblocked by #886\n~~~\n"
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_fenced_block_with_language_tag_does_not_self_gate() -> None:
+    """Issue #1454 rework round 2: an opening fence carrying an info string
+    (e.g. ```` ```bash ````) must still be recognized as a fence."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Repro\n\n```bash\n$ echo 'blocked by #886'\n```\n"
+    assert parse_blockers(body) == []
+
+
+def test_parse_blockers_genuine_declaration_outside_fenced_block_still_gates() -> None:
+    """Issue #1454 rework round 2: a genuine declaration on a line OUTSIDE a
+    fenced block must still gate. The fenced-block guard must not over-suppress
+    real declarations that merely share a document with a fenced block."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Summary\n\nFix the parser.\n\n```python\nblocked by #886\n```\n\nBlocked by #743\n"
+    assert parse_blockers(body) == [743]
 
 
 def test_detect_prose_only_dependencies_do_not_dispatch_before() -> None:
@@ -38136,9 +38809,9 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
     with (
         patch("charlie_work.devin_shell.read_session_records", return_value=[fake_record]),
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch(
-            "charlie_work.workflow.sweep_orphan_processes",
+            "charlie_work.dead_worker_reap.sweep_orphan_processes",
             return_value=[{"pid": 3492, "name": "python.exe", "command_line": "python worker.py"}],
         ),  # Fixed mock return
         patch(
@@ -38149,7 +38822,9 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
         # Run the stall detection and handling
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        result = _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     # Check that the stalled issue was detected
     assert any(entry["issue"] == 109 for entry in result)
@@ -38251,12 +38926,14 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     before = datetime.now(UTC)
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        result = _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
     after = datetime.now(UTC)
 
     assert any(entry["issue"] == 1034 for entry in result)
@@ -38325,12 +39002,14 @@ def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path:
     before = datetime.now(UTC)
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     updated_sidecar = json.loads(sidecar.read_text(encoding="utf-8"))
     assert updated_sidecar["failure_kind"] == "quota_exhausted"
@@ -38377,12 +39056,14 @@ def test_stall_reap_falls_back_to_stalled_when_no_throttle_signature(tmp_path: P
 
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     updated_sidecar = json.loads(sidecar.read_text(encoding="utf-8"))
     assert updated_sidecar["failure_kind"] == "stalled"
@@ -38431,12 +39112,14 @@ def test_dispatch_defers_after_stall_reap_sets_throttled_until(tmp_path: Path) -
 
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
         # dispatch() re-runs the stall reaper unconditionally at its top (workflow.py
         # dispatch():~1180) before checking is_throttled — keep the same mocks active
@@ -38546,7 +39229,9 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
         patch("charlie_work.claude_code.read_worker_records", return_value=[dead_worker]),
         patch("charlie_work.devin_shell.is_session_alive", side_effect=lambda r: r.pid != 1000),
         patch("charlie_work.claude_code.is_worker_alive", side_effect=lambda r: r.pid != 1002),
-        patch("charlie_work.workflow.sweep_orphan_processes", side_effect=mock_sweep_orphan),
+        patch(
+            "charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=mock_sweep_orphan
+        ),
         patch("charlie_work.workflow.os.name", "nt"),  # Force Windows path
         patch("subprocess.run", side_effect=mock_subprocess_run),
     ):
@@ -38699,7 +39384,9 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
         # Run the stall detection and handling
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     # Check that is_session_alive was NOT called (detection skipped)
     mock_alive.assert_not_called()
@@ -39279,7 +39966,7 @@ def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monke
     # Mock _detect_and_handle_stalled_sessions to track call count
     stall_detection_calls = []
 
-    def mock_stall_detection(sessions_dir, state_file, config):
+    def mock_stall_detection(sessions_dir, state_file, config, *, write_gate):
         stall_detection_calls.append(1)
         return []  # No stalled sessions
 
@@ -40274,7 +40961,11 @@ def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    # Issue #1325: dry_run=True suppresses sidecar writes (failure_kind stays
+    # None), so this test must use dry_run=False to verify the sidecar is
+    # actually classified. The stalled PID (99999) does not exist, so
+    # kill_process_tree is a no-op — no real process is harmed.
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
 
     # Create a session record for issue 123 with a live PID and stale log
     sessions_dir = app._layout.sessions_dir
@@ -40692,9 +41383,12 @@ def test_redispatch_timestamps_pruned_outside_window(tmp_path: Path) -> None:
 def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     """Test that redispatch_at is only written by known call sites."""
     # This test verifies by code inspection that redispatch_at is only written in:
-    # 1. dispatch_rework normal paths (success + failure + no-op rework pre-dispatch).
-    # 2. _classify_dead_sessions_and_update_throttle_state normal paths.
-    # 3. _reap_restore_rework_requested (issue #315 review finding 2).
+    # 1. dispatch_rework normal paths (success + no-op rework pre-dispatch) --
+    #    workflow.py, OrchestratorApp.dispatch_rework.
+    # 2. _classify_dead_sessions_and_update_throttle_state normal paths --
+    #    dead_worker_reap.py (issue #1317: moved verbatim from workflow.py).
+    # 3. _reap_restore_rework_requested (issue #315 review finding 2) --
+    #    dead_worker_reap.py (issue #1317: moved verbatim from workflow.py).
     # Escalated paths now consolidate on _escalate_issue and pass redispatch_at
     # through issue_extra, so direct entry["redispatch_at"] assignments only
     # remain in the non-escalated branches below.
@@ -40711,15 +41405,27 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     # dispatch_selection.py dropped the naive count to 4 with zero change to
     # any real write site -- a false regression signal, the opposite failure
     # mode from AC7's hazard test but the same root cause (name/text search
-    # over source that doesn't distinguish code from prose). Both files are
-    # scanned and summed via real ast.Assign nodes so neither a docstring
+    # over source that doesn't distinguish code from prose). All three files
+    # are scanned and summed via real ast.Assign nodes so neither a docstring
     # quote nor a future extraction of one of the three named call sites can
     # produce a false pass or a false failure here.
+    #
+    # issue #1317: the dead-worker/session-reap extraction moved call sites 2
+    # and 3 above out of workflow.py into dead_worker_reap.py verbatim -- the
+    # writers still exist, only their module changed (confirmed real split:
+    # workflow.py=2, dispatch_selection.py=0, dead_worker_reap.py=2, total
+    # unchanged at 4). dead_worker_reap.py is added to the scan so this guard
+    # keeps failing if a genuinely NEW, unknown writer appears in any of the
+    # three files, rather than going blind to two known call sites because
+    # they changed address.
     import ast
 
     workflow_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
     dispatch_selection_path = (
         Path(__file__).parents[1] / "src" / "charlie_work" / "dispatch_selection.py"
+    )
+    dead_worker_reap_path = (
+        Path(__file__).parents[1] / "src" / "charlie_work" / "dead_worker_reap.py"
     )
 
     def _count_redispatch_at_assignments(path: Path) -> int:
@@ -40740,12 +41446,15 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
         return count
 
     # Any unexpected increase means a new call site is writing redispatch_at.
-    redispatch_assignments = _count_redispatch_at_assignments(
-        workflow_path
-    ) + _count_redispatch_at_assignments(dispatch_selection_path)
+    redispatch_assignments = (
+        _count_redispatch_at_assignments(workflow_path)
+        + _count_redispatch_at_assignments(dispatch_selection_path)
+        + _count_redispatch_at_assignments(dead_worker_reap_path)
+    )
     assert redispatch_assignments == 4, (
         'Expected 4 real entry["redispatch_at"] assignment statements across '
-        f"workflow.py and dispatch_selection.py, found {redispatch_assignments}"
+        "workflow.py, dispatch_selection.py, and dead_worker_reap.py, found "
+        f"{redispatch_assignments}"
     )
 
 
@@ -43736,7 +44445,7 @@ def test_worktree_unsafe_launch_failure_with_commits_salvages_before_escalation(
         started_at=now.isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
         error="worktree creation failed: worktree contains local work",
-        failure_kind="worktree_unsafe",
+        failure_kind="worktree_unsafe_local_commits",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
@@ -43827,7 +44536,7 @@ def test_worktree_unsafe_launch_failure_no_commits_still_escalates(
         started_at=now.isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
         error="worktree creation failed: worktree contains local work",
-        failure_kind="worktree_unsafe",
+        failure_kind="worktree_unsafe_shim_dirt",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
@@ -45184,7 +45893,12 @@ def test_classify_dead_sessions_no_commits_relabels_to_ready(tmp_path: Path) -> 
 
 def test_classify_dead_sessions_salvage_push_failure_fallback(tmp_path: Path) -> None:
     """Issue #252: a failed salvage push records failure and falls back to relabel."""
-    from charlie_work import workflow as workflow_module
+    # Issue #1317: push_branch is called bare-name from inside _attempt_salvage,
+    # which moved (verbatim) to dead_worker_reap.py -- so the bare-name lookup
+    # now resolves via dead_worker_reap.py's own globals, not workflow.py's.
+    # Patch it there, not on the (still-valid) workflow.py facade re-export of
+    # _classify_dead_sessions_and_update_throttle_state itself.
+    from charlie_work import dead_worker_reap as workflow_module
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
@@ -45408,14 +46122,16 @@ def test_stall_lane_api_budget_kill_over_cap(tmp_path: Path) -> None:
     with (
         patch("charlie_work.worker.is_worker_alive", return_value=True),
         patch(
-            "charlie_work.workflow.kill_process_tree",
+            "charlie_work.write_gate.kill_process_tree",
             side_effect=lambda pid, *_a, **_kw: killed_pids.extend([pid]) or [pid],
         ),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        result = _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     # The budget-killed session is reported in the stalled entries.
     assert any(entry["issue"] == 4801 for entry in result)
@@ -45478,12 +46194,14 @@ def test_stall_lane_api_provider_auth_classification(tmp_path: Path) -> None:
     before = datetime.now(UTC)
     with (
         patch("charlie_work.worker.is_worker_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99998]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99998]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     from charlie_work.claude_code import _sidecar_path as _api_sidecar_path
 

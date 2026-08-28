@@ -44,6 +44,12 @@ from .safe_path import contains
 from .safe_ref import require_valid_ref_name, require_valid_rev, require_valid_sha
 from .subprocess_runner import RunResult, run_captured
 from . import state as _state
+from .rescue_capture_exclusions import (  # noqa: F401  (deliberate re-export)
+    _build_rescue_capture_exclusions,
+    _filter_redundant_add_exclusions,
+    _is_glob_pathspec,
+)
+from .base_branch import resolve_base_branch_name  # noqa: F401  (deliberate re-export)
 
 _DEFAULT_TIMEOUT_SECONDS = 60
 # Shorter timeout for network-touching git commands (ls-remote, fetch) so a
@@ -52,11 +58,12 @@ _REMOTE_TIMEOUT_SECONDS = 20
 
 # PR body scratch files: workers ad-hoc draft PR bodies into root-level .md
 # files with varying naming conventions (``PR_BODY.md``, ``PR_BODY_<issue>.md``,
-# ``.worker-pr-body.md``, ``_pr_body.md``). All are launcher/protocol residue,
-# not worker output (issue #1391). The regex matches any root-level filename
-# in this family so a new ad-hoc variant does not re-trip the unsafe check.
+# ``.worker-pr-body.md``, ``_pr_body.md``, ``.pr_body_<issue>.md``). All are
+# launcher/protocol residue, not worker output (issue #1391). The regex
+# matches any root-level filename in this family so a new ad-hoc variant does
+# not re-trip the unsafe check.
 _LAUNCHER_OWNED_PR_BODY_RE = re.compile(
-    r"^(?:PR_BODY.*|\.worker-pr-body|_pr_body)\.md$", re.IGNORECASE
+    r"^(?:PR_BODY.*|\.worker-pr-body|_pr_body|\.pr_body.*)\.md$", re.IGNORECASE
 )
 
 
@@ -77,15 +84,81 @@ OPERATOR_MARKER_SESSION_ID = "operator-claim"
 OPERATOR_MARKER_KIND = "operator"
 
 
+# Issue #807: ``worktree_unsafe`` is split at detection time into two
+# discriminable kinds, because the two triggers do not share a correct
+# response. Launch-shim dirt / adapter shim materialization (uncommitted
+# modifications) is genuinely mechanical — auto-clear and redispatch is the
+# right move. Genuine unpushed local commits on the worktree branch are a
+# judgment call — returning the issue to dispatch actively fights the safety
+# system that raised the escalation and risks a second writer on a branch
+# that already has divergent local work. The discriminator is the
+# ``dirty_reason`` string already computed at the raise site; classifying at
+# detection (rather than after the fact) makes the invalid state
+# unrepresentable.
+WORKTREE_UNSAFE_KIND_SHIM_DIRT = "worktree_unsafe_shim_dirt"
+WORKTREE_UNSAFE_KIND_LOCAL_COMMITS = "worktree_unsafe_local_commits"
+WORKTREE_UNSAFE_KINDS: frozenset[str] = frozenset(
+    {WORKTREE_UNSAFE_KIND_SHIM_DIRT, WORKTREE_UNSAFE_KIND_LOCAL_COMMITS}
+)
+
+
+def _worktree_unsafe_kind_from_reason(reason: str) -> str:
+    """Map a ``dirty_reason`` string to its ``worktree_unsafe`` sub-kind.
+
+    The reason strings are produced by ``_worktree_refuse_to_reset_reason``
+    and ``_worktree_dirty_reason``. "uncommitted modifications" denotes
+    shim/adapter dirt (mechanical); "local commit(s)" denotes genuine
+    divergence (judgment). A reason that matches neither known pattern
+    defaults to ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`` — the fail-closed
+    classification toward judgment/human-needed — so a future reason
+    string that doesn't match either pattern escalates as a judgment
+    call rather than being silently treated as mechanical and
+    auto-cleared (which would reproduce the #807 bug the split exists to
+    prevent). This mirrors the fail-closed convention already enforced
+    for an unrecognized explicit ``kind`` in ``WorktreeUnsafeError.__init__``
+    and for an unrecognized ``reason_class`` in
+    ``state.escalation_reason_class``.
+    """
+    if "local commit" in reason:
+        return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+    if "uncommitted modifications" in reason:
+        return WORKTREE_UNSAFE_KIND_SHIM_DIRT
+    return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+
+
 class WorktreeUnsafeError(RuntimeError):
     """Raised when ``create_worktree`` is about to reset a worktree that is
     CONFIRMED to contain local work (uncommitted modifications, or local
     commits not on the remote branch). This is a deterministic finding — the
-    launch shim surfaces it as ``failure_kind="worktree_unsafe"``, which sits
-    in ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` and escalates to a
-    human on first occurrence. Do not raise this for a probe that merely
-    *failed to determine* dirtiness — see ``WorktreeProbeFailedError``.
+    launch shim surfaces it as a ``failure_kind`` equal to ``kind``, which
+    sits in ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` (shim dirt) or
+    ``config.DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS`` (local commits)
+    and escalates to a human on first occurrence. Do not raise this for a
+    probe that merely *failed to determine* dirtiness — see
+    ``WorktreeProbeFailedError``.
+
+    ``kind`` carries the discriminator (issue #807) so the launch shim can
+    emit a distinct ``failure_kind`` at detection time rather than
+    classifying after the fact. It is derived from the ``dirty_reason``
+    string by ``_worktree_unsafe_kind_from_reason`` unless the caller
+    supplies it explicitly, in which case it must be one of
+    ``WORKTREE_UNSAFE_KINDS`` — an unrecognized explicit ``kind`` would
+    silently fail to match either
+    ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` or
+    ``config.DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS``, degrading to
+    the ordinary redispatch-cap path instead of escalating, so this fails
+    closed with a ``ValueError`` rather than allowing that silently.
     """
+
+    def __init__(self, reason: str, *, kind: str | None = None) -> None:
+        if kind is not None and kind not in WORKTREE_UNSAFE_KINDS:
+            raise ValueError(
+                f"invalid WorktreeUnsafeError kind {kind!r}; expected one of "
+                f"{sorted(WORKTREE_UNSAFE_KINDS)}"
+            )
+        self.reason = reason
+        self.kind = kind or _worktree_unsafe_kind_from_reason(reason)
+        super().__init__(reason)
 
 
 class WorktreeProbeFailedError(RuntimeError):
@@ -1991,24 +2064,12 @@ def _capture_worktree_work_to_rescue_ref(
     as values). A capture failure returns a ``RescueCapture`` with ``error``
     set — the caller must refuse the reset in that case, exactly as today.
     """
-    # Build exclusion pathspecs. ``.venv`` is always excluded: it is either a
-    # junction into the shared virtualenv (following it would add every other
-    # worktree's venv contents) or a local venv that is not worker content.
-    # Launcher-owned directories (``.devin``, ``.git_worktree_dir``) are also
-    # excluded: they are shim residue, not worker output, and including them
-    # in the rescue tree pollutes the salvage commit (issue #1391).
-    exclusions: list[str] = [":(exclude).venv"]
-    for d in LAUNCHER_OWNED_DIRS:
-        exclusions.append(f":(exclude){d}")
-    # PR body scratch files are root-level glob patterns; exclude them with
-    # pathspec globs so they do not pollute the rescue tree either.
-    exclusions.append(":(exclude)PR_BODY*.md")
-    exclusions.append(":(exclude).worker-pr-body.md")
-    exclusions.append(":(exclude)_pr_body.md")
-    for p in (*injected_paths, *materialize_dirs):
-        normalized = str(p).replace("\\", "/").strip("/")
-        if normalized:
-            exclusions.append(f":(exclude){normalized}")
+    # Build exclusion pathspecs (see _build_rescue_capture_exclusions):
+    # ``.venv``, launcher-owned directories, PR-body scratch files, and
+    # declared scaffolding paths — pruned of any literal exclusion that
+    # would trip git's ignored-file advice/error (see
+    # _filter_redundant_add_exclusions).
+    exclusions = _build_rescue_capture_exclusions(worktree_path, injected_paths, materialize_dirs)
 
     add_result = run_captured(
         ["git", "add", "-A", "--", ".", *exclusions],
@@ -3151,7 +3212,10 @@ def create_worktree(
         into a new work session, and returns — the reset is permitted because
         the work is now durable on a ref. If capture fails, raises
         ``WorktreeUnsafeError`` exactly as today — capture failure must never
-        downgrade the safety property.
+        downgrade the safety property. The capture's own error detail is
+        appended to the raised message so a capture-stage failure (e.g. a
+        ``git add`` or ``write-tree`` error) is distinguishable from a bare
+        dirty-worktree refusal in logs and escalation payloads.
 
         The working-tree clean is the single enforcement point for the "never
         commit tracked modifications the shim did not itself produce"
@@ -3173,6 +3237,8 @@ def create_worktree(
             _emit_rescue_event(capture, unsafe_reason, check_path)
             _clean_captured_worktree(check_path, capture_injected)
             return
+        if capture.error:
+            raise WorktreeUnsafeError(f"{unsafe_reason}; rescue capture failed: {capture.error}")
         raise WorktreeUnsafeError(unsafe_reason)
 
     def _clean_captured_worktree(wt_path: Path, clean_injected: tuple[str, ...]) -> None:
@@ -4234,30 +4300,6 @@ def push_branch(
     if local_sha_result.stdout.strip() == remote_sha:
         return True, None
     return False, f"remote branch {branch} does not match local tip after push"
-
-
-def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
-    """Convert a base ref (e.g. ``origin/main`` or ``HEAD``) into a branch name.
-
-    ``gh pr create --base`` expects a simple branch name. Remote-tracking refs
-    are stripped to their local branch name; ``HEAD`` falls back to the current
-    branch or ``main``.
-    """
-    if base_ref.startswith("refs/remotes/origin/"):
-        return base_ref[len("refs/remotes/origin/") :]
-    if base_ref.startswith("refs/heads/"):
-        return base_ref[len("refs/heads/") :]
-    if base_ref.startswith("origin/"):
-        return base_ref[len("origin/") :]
-    if base_ref == "HEAD":
-        current_branch = run_captured(
-            ["git", "branch", "--show-current"],
-            cwd=repo_root,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-        )
-        if current_branch.ok and current_branch.stdout.strip():
-            return current_branch.stdout.strip()
-    return "main"
 
 
 def salvage_branch_empty_diff(repo_root: Path, branch: str, base_ref: str) -> bool:

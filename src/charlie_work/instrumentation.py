@@ -218,6 +218,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "session_salvaged": "error",
         "session_stalled": "error",
         "spec_review_failed": "error",
+        # Issue #1453: a worker deliberately concluded the task is structurally
+        # impossible and declared a ``blocked`` outcome. Terminal for the issue
+        # -- escalated to the operator queue with zero redispatches -> error,
+        # parallel to session_failed_escalated / orphan_sweep_redispatch_escalated.
+        "worker_declared_blocked": "error",
         # Issue #1274 (W17): stale_checks_retrigger_attempts reached
         # stale_checks_max_retriggers and the check suite is still missing --
         # no code-fix rework path exists for a run GitHub never created, so
@@ -409,6 +414,22 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "venv_pth_mismatch": "warning",
         "venv_pth_repaired": "warning",
         "worktree_foreign_writer": "warning",
+        # Issue #1444: the module-map section could not be derived from the
+        # live tree at packet build time (unparseable file, missing package
+        # dir, I/O error). Warning, not error: the dispatch proceeds with an
+        # omitted section -- the worker loses placement steering for this one
+        # packet, but no work is lost and the next packet rebuilds the map
+        # against the then-current tree. The consumer is heartbeat_check.py's
+        # check_warning_events, which reads every level='warning' row from
+        # events.db (derived from the level column, never a hardcoded kind
+        # list), so this kind is visible to the operator the moment it fires.
+        "worker_module_map_failed": "warning",
+        # Issue #1460: the attachment-budget dispatch clause could not be
+        # built (`.attachment-budgets.json` present but fails structural
+        # validation via `baseline.load`). Warning, not error: fail-soft
+        # mirrors `worker_module_map_failed` -- the dispatch proceeds with an
+        # omitted clause, never a dispatch failure.
+        "worker_attachment_budget_failed": "warning",
         # Issue #1393: a pre-launch environment block (e.g.
         # worktree_foreign_writer) prevented a dispatch from starting. Warning,
         # not error: the issue is not terminal — the cap may not yet be
@@ -444,6 +465,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # the intended follow-up mechanism working as designed, mirroring
         # flake_rerun_triggered / infra_rerun_triggered below.
         "ci_retriggered_stale_checks": "info",
+        # Issue #1451: the ci_run_never_created remediation declined to
+        # close/reopen a CONFLICTING PR (GitHub cannot build refs/pull/N/merge
+        # while conflicted, so no pull_request workflow run can be created for
+        # ANY event) and routed to the existing merge-conflict rework path
+        # instead. Info, not warning: this is the chooser correctly
+        # discriminating, mirroring ci_retriggered_stale_checks' level.
+        "ci_retrigger_skipped_conflicting": "info",
         "ci_run_never_created": "info",
         "closed_unmerged_pr_state_converged": "info",
         "containment_check": "info",

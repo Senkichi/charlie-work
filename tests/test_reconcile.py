@@ -50,6 +50,7 @@ from charlie_work.reconcile import (
     detect_aviator_stale_blocked,
     detect_drift,
     detect_mergequeue_not_approved,
+    detect_mergequeue_wedged,
 )
 from charlie_work.state import PASSIVE_OPEN_STATUS, empty_state, is_claim_stale, load_state
 from charlie_work.worktree import create_worktree
@@ -2251,6 +2252,10 @@ def test_detect_drift_session_failed_worker_blocked_escalates_instead_of_relabel
     assert len(escalated_drift) == 1
     assert escalated_drift[0].issue_number == 42
     assert "worker_blocked" in escalated_drift[0].detail
+    # Issue #807: detect_drift must carry failure_kind on the drift item so
+    # apply_fixes can derive reason_class (judgment vs mechanical) instead of
+    # hardcoding "mechanical".
+    assert escalated_drift[0].failure_kind == "worker_blocked"
 
     # detect_drift is read-only regardless of the worker_blocked branch.
     assert gh.labels_added == []
@@ -2298,6 +2303,59 @@ def test_apply_fixes_session_failed_escalated_transitions_labels(tmp_path: Path)
     assert len(reconcile_events) == 1
     assert reconcile_events[0]["payload"]["kind"] == "session_failed_escalated"
     assert reconcile_events[0]["payload"]["issue_number"] == 42
+
+
+def test_apply_fixes_session_failed_escalated_judgment_lands_human_needed(
+    tmp_path: Path,
+) -> None:
+    """Issue #807: a dead worker whose failure_kind is
+    ``worktree_unsafe_local_commits`` (a deterministic *judgment* failure, not
+    mechanical) must escalate via the ``redispatch_escalated`` edge
+    (reason_class="judgment"), landing ``agent:human-needed`` -- NOT the
+    mechanical ``redispatch_operator_queued`` edge that lands
+    ``agent:operator-queue``.
+
+    This is the reconcile.py apply-path regression for the #807 bug: before
+    the fix, apply_fixes hardcoded reason_class="mechanical" for every
+    session_failed_escalated drift item, so a genuine-local-commits death
+    detected by reconcile's drift pass (before any workflow.py sweep) landed
+    on operator_queue and became auto-clearable, reproducing the exact
+    blanket-mechanical misclassification #807 split the failure kind to
+    prevent."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(43, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    drift = [
+        DriftItem(
+            kind="session_failed_escalated",
+            issue_number=43,
+            pr_number=None,
+            detail=(
+                "issue #43 session died with deterministic failure "
+                "(worktree_unsafe_local_commits), no open PR; "
+                "suppressing relabel-to-ready, escalating instead"
+            ),
+            fix_actions=("transition issue #43 labels via 'redispatch_escalated' event",),
+            failure_kind="worktree_unsafe_local_commits",
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    # Judgment escalation lands human_needed, not operator_queue.
+    assert (43, config.labels.human_needed) in gh.labels_added
+    assert (43, config.labels.operator_queue) not in gh.labels_added
+    assert (43, config.labels.ready) not in gh.labels_added
+
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    assert reconcile_events[0]["payload"]["kind"] == "session_failed_escalated"
+    assert reconcile_events[0]["payload"]["issue_number"] == 43
+    assert reconcile_events[0]["payload"]["failure_kind"] == "worktree_unsafe_local_commits"
 
 
 def test_detect_drift_session_failed_already_has_ready_label(tmp_path: Path) -> None:
@@ -4246,6 +4304,304 @@ def test_apply_fixes_aviator_stale_blocked_records_label_write_failure() -> None
             fix_actions=("remove label 'blocked' from PR #1400",),
             remove_labels=("blocked",),
             add_labels=(),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    events = [e for e in new_state.get("events", []) if e.get("kind") == "reconcile"]
+    assert any(
+        "label_write_failed: true" in e.get("payload", {}).get("fix_actions", []) for e in events
+    )
+
+
+# ---------------------------------------------------------------------------
+# detect_mergequeue_wedged (issue #1401: mergequeue PR wedged with Aviator
+# FAILURE for 28h+ and no re-alert -- one-shot failed-attempt alarm has no
+# time-in-queue watchdog)
+# ---------------------------------------------------------------------------
+
+
+def _wedged_config(
+    *, mergequeue_label: str = "mergequeue", wedge_hours: float = 24.0
+) -> OrchestratorConfig:
+    return replace(
+        OrchestratorConfig(),
+        auto_merge=replace(
+            OrchestratorConfig().auto_merge,
+            mergequeue_label=mergequeue_label,
+            mergequeue_wedge_hours=wedge_hours,
+        ),
+    )
+
+
+def _failing_check_run(name: str, *, run_id: int) -> dict[str, Any]:
+    return {
+        "id": run_id,
+        "name": name,
+        "status": "completed",
+        "conclusion": "failure",
+        "output": {},
+    }
+
+
+def test_detect_mergequeue_wedged_aviator_failure_escalates() -> None:
+    """Condition 2 (live #1751 shape): PR carries mergequeue + Aviator blocked
+    with aviator/checks completed FAILURE and a genuinely failing non-aviator
+    check -> escalate (strip mergequeue, add human_needed)."""
+    config = _wedged_config()
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-1751",
+        "labels": [{"name": "mergequeue"}, {"name": "blocked"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1751"] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _failing_check_run("Tests passed", run_id=2),
+    ]
+
+    drift = detect_mergequeue_wedged(gh, config, empty_state())
+
+    assert len(drift) == 1
+    item = drift[0]
+    assert item.kind == "mergequeue_wedged"
+    assert item.pr_number == 1751
+    assert item.issue_number == 1751
+    assert item.remove_labels == ("mergequeue",)
+    assert item.add_labels == (config.labels.human_needed,)
+    assert gh.commit_check_runs_calls == ["sha-1751"]
+
+
+def test_detect_mergequeue_wedged_aviator_failure_all_green_does_not_fire() -> None:
+    """When every non-aviator check is green the blocked label is STALE, not a
+    genuine Aviator failure -- that is detect_aviator_stale_blocked's recovery
+    case (remove blocked, re-queue), not an escalation. Condition 2 must stay
+    out of its way to avoid re-queuing AND escalating the same PR in one pass."""
+    config = _wedged_config()
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-1751",
+        "labels": [{"name": "mergequeue"}, {"name": "blocked"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1751"] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _passing_check_run("Tests passed", run_id=2),
+    ]
+
+    assert detect_mergequeue_wedged(gh, config, empty_state()) == []
+
+
+def test_detect_mergequeue_wedged_aviator_pending_does_not_fire_condition2() -> None:
+    """aviator/checks still running (no conclusion) is not a definitive
+    failure -- condition 2 must not escalate a PR mid-evaluation."""
+    config = _wedged_config()
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-1751",
+        "labels": [{"name": "mergequeue"}, {"name": "blocked"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1751"] = [
+        _aviator_check_run(None, run_id=1),
+        _failing_check_run("Tests passed", run_id=2),
+    ]
+
+    assert detect_mergequeue_wedged(gh, config, empty_state()) == []
+
+
+def test_detect_mergequeue_wedged_time_in_queue_escalates() -> None:
+    """Condition 1: PR has carried mergequeue for > wedge_hours with no head
+    movement (state mergequeue_head_sha == live head) -> escalate."""
+    config = _wedged_config(wedge_hours=12.0)
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-frozen",
+        "labels": [{"name": "mergequeue"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    state = empty_state()
+    state["prs"]["1751"] = {
+        "mergequeue_since": (datetime.now(UTC) - timedelta(hours=28)).isoformat(),
+        "mergequeue_head_sha": "sha-frozen",
+        "status": "mergequeue",
+    }
+
+    drift = detect_mergequeue_wedged(gh, config, state)
+
+    assert len(drift) == 1
+    assert drift[0].kind == "mergequeue_wedged"
+    assert drift[0].pr_number == 1751
+    assert drift[0].remove_labels == ("mergequeue",)
+    # No check-run walk when the PR is not blocked.
+    assert gh.commit_check_runs_calls == []
+
+
+def test_detect_mergequeue_wedged_time_in_queue_head_moved_does_not_fire() -> None:
+    """Head movement (Aviator rebased) resets the dwell timer: the recorded
+    mergequeue_head_sha no longer matches the live head, so the PR is making
+    progress and must not be escalated."""
+    config = _wedged_config(wedge_hours=12.0)
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-new",
+        "labels": [{"name": "mergequeue"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    state = empty_state()
+    state["prs"]["1751"] = {
+        "mergequeue_since": (datetime.now(UTC) - timedelta(hours=28)).isoformat(),
+        "mergequeue_head_sha": "sha-old",
+        "status": "mergequeue",
+    }
+
+    assert detect_mergequeue_wedged(gh, config, state) == []
+
+
+def test_detect_mergequeue_wedged_time_in_queue_under_threshold_does_not_fire() -> None:
+    """Dwell under the configured threshold is normal queue progress, not a wedge."""
+    config = _wedged_config(wedge_hours=24.0)
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-frozen",
+        "labels": [{"name": "mergequeue"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    state = empty_state()
+    state["prs"]["1751"] = {
+        "mergequeue_since": (datetime.now(UTC) - timedelta(hours=2)).isoformat(),
+        "mergequeue_head_sha": "sha-frozen",
+        "status": "mergequeue",
+    }
+
+    assert detect_mergequeue_wedged(gh, config, state) == []
+
+
+def test_detect_mergequeue_wedged_time_disabled_still_allows_aviator_failure() -> None:
+    """mergequeue_wedge_hours=0 disables condition 1 only; condition 2 (the
+    definitive Aviator-failure signal) stays armed when mergequeue_label is set."""
+    config = _wedged_config(wedge_hours=0.0)
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-1751",
+        "labels": [{"name": "mergequeue"}, {"name": "blocked"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1751"] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _failing_check_run("Tests passed", run_id=2),
+    ]
+
+    drift = detect_mergequeue_wedged(gh, config, empty_state())
+    assert len(drift) == 1
+
+
+def test_detect_mergequeue_wedged_no_mergequeue_label_config_returns_empty() -> None:
+    """Without a mergequeue_label configured there is no Aviator handoff to watchdog."""
+    config = replace(
+        OrchestratorConfig(),
+        auto_merge=replace(OrchestratorConfig().auto_merge, mergequeue_label=None),
+    )
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-1751",
+        "labels": [{"name": "mergequeue"}, {"name": "blocked"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+
+    assert detect_mergequeue_wedged(gh, config, empty_state()) == []
+
+
+def test_detect_mergequeue_wedged_skips_pr_without_mergequeue_label() -> None:
+    """Cost gate: a PR not carrying the mergequeue label is not in Aviator's queue."""
+    config = _wedged_config()
+    pr = {**_pr(1751, "OPEN"), "headRefOid": "sha-1751", "labels": [{"name": "blocked"}]}
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1751"] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _failing_check_run("Tests passed", run_id=2),
+    ]
+
+    assert detect_mergequeue_wedged(gh, config, empty_state()) == []
+    assert gh.commit_check_runs_calls == []
+
+
+def test_detect_mergequeue_wedged_no_linked_issue_strips_mergequeue_only() -> None:
+    """A cross-repo PR with no resolvable linked issue can still be pulled out
+    of the queue (strip mergequeue); the human_needed escalation is skipped
+    because there is no issue to label."""
+    config = _wedged_config()
+    pr = {
+        **_pr(1751, "OPEN", is_cross_repository=True),
+        "headRefOid": "sha-1751",
+        "labels": [{"name": "mergequeue"}, {"name": "blocked"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1751"] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _failing_check_run("Tests passed", run_id=2),
+    ]
+
+    drift = detect_mergequeue_wedged(gh, config, empty_state())
+    assert len(drift) == 1
+    assert drift[0].issue_number is None
+    assert drift[0].add_labels == ()
+    assert drift[0].remove_labels == ("mergequeue",)
+
+
+def test_apply_fixes_mergequeue_wedged_strips_mergequeue_and_escalates_issue() -> None:
+    config = _wedged_config()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    state["prs"]["1751"] = {
+        "mergequeue_since": (datetime.now(UTC) - timedelta(hours=28)).isoformat(),
+        "mergequeue_head_sha": "sha-frozen",
+        "status": "mergequeue",
+    }
+    drift = [
+        DriftItem(
+            kind="mergequeue_wedged",
+            issue_number=1751,
+            pr_number=1751,
+            detail="PR #1751 wedged in mergequeue",
+            fix_actions=(
+                "remove label 'mergequeue' from PR #1751",
+                "escalate issue #1751 to 'agent:human-needed'",
+            ),
+            remove_labels=("mergequeue",),
+            add_labels=(config.labels.human_needed,),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert gh.pr_labels_removed == [(1751, "mergequeue")]
+    # transition("escalated") adds human_needed and removes active labels via
+    # gh.add_issue_label / gh.remove_issue_label.
+    assert (1751, config.labels.human_needed) in gh.labels_added
+    # Issue state status converges to "escalated".
+    assert new_state["issues"]["1751"]["status"] == "escalated"
+    # The mergequeue dwell-tracking fields are cleared so the post-fix
+    # re-detect does not re-fire condition 1 for the same window.
+    assert "mergequeue_since" not in new_state["prs"]["1751"]
+    assert "mergequeue_head_sha" not in new_state["prs"]["1751"]
+
+
+def test_apply_fixes_mergequeue_wedged_records_label_write_failure() -> None:
+    config = _wedged_config()
+    gh = FakeGitHub(prs=[], issues=[])
+    gh._fail_remove_pr_labels = {(1751, "mergequeue")}
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="mergequeue_wedged",
+            issue_number=1751,
+            pr_number=1751,
+            detail="PR #1751 wedged in mergequeue",
+            fix_actions=("remove label 'mergequeue' from PR #1751",),
+            remove_labels=("mergequeue",),
+            add_labels=(config.labels.human_needed,),
         )
     ]
 
