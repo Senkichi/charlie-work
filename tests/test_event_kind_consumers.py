@@ -40,13 +40,13 @@ Baseline handling (issue's own explicit instruction): the backlog this test
 surfaced was NOT mass-marked audit-only. Every one of the 13 ``audit-only``
 markers below carries a one-clause justification tied to the surrounding
 code (usually: the real state mutation already happened inline, or a sibling
-kind is the actionable one). The two kinds that looked like they should have
-a real consumer -- ``draft_pr_blocked`` (the code's own comment names the
-consumer it doesn't have yet) and ``venv_editable_anchor_violation`` (a hard
-supervisor-refusal safety gate with no confirmed alerting path) -- carry
-``pending #1366`` markers, pointing at the grouped tracking issue filed
-alongside this PR (see ``pending-kinds-inventory.md`` at the repo root for
-the derived inventory and the two kinds' detail).
+kind is the actionable one). The two kinds that originally looked like they
+should have a real consumer -- ``draft_pr_blocked`` and
+``venv_editable_anchor_violation`` -- carried ``pending #1366`` markers until
+issue #1366 added real heartbeat consumers for each
+(``check_draft_pr_blocked_events`` / ``check_supervisor_venv_refusal`` in
+``scripts/heartbeat_check.py``); the markers were dropped at the emission
+sites and the pending backlog is now empty.
 """
 
 from __future__ import annotations
@@ -962,14 +962,16 @@ def test_every_emitted_kind_is_consumed_or_declared(request: object) -> None:
         lines = [f"  {path}:{lineno}: {error}" for path, lineno, error in report.invalid_markers]
         assert False, "invalid `# event-consumer:` marker(s):\n" + "\n".join(lines)
 
-    # Report the pending backlog every run (it must show up, not hide) --
-    # issue #1364's own two entries are the expected floor right now.
-    pending_kinds = {p.kind for p in report.pending}
-    expected_pending = {"draft_pr_blocked", "venv_editable_anchor_violation"}
-    missing_pending = expected_pending - pending_kinds
-    assert not missing_pending, (
-        f"expected pending-marker kinds no longer pending (resolve the tracking issue "
-        f"instead of just deleting the marker, or update this test): {sorted(missing_pending)}"
+    # Issue #1366 resolved the entire pending backlog: ``draft_pr_blocked``
+    # and ``venv_editable_anchor_violation`` now have real heartbeat consumers
+    # (``check_draft_pr_blocked_events`` / ``check_supervisor_venv_refusal``),
+    # so no emitted kind should carry a ``pending #NNNN`` marker. A kind
+    # regressing back to pending means a consumer was removed or a marker was
+    # re-added -- investigate rather than silently accepting it.
+    assert not report.pending, (
+        "event kind(s) carry a `pending #NNNN` marker -- resolve the tracking "
+        "issue by adding a real consumer instead of leaving the marker: "
+        f"{[(p.kind, p.issue) for p in report.pending]}"
     )
 
 
