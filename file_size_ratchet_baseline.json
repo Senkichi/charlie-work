@@ -21,11 +21,11 @@
   "src/charlie_work/supervise.py": 1737,
   "src/charlie_work/verdict_parsing.py": 826,
   "src/charlie_work/worker.py": 1467,
-  "src/charlie_work/workflow.py": 23904,
+  "src/charlie_work/workflow.py": 23901,
   "src/charlie_work/worktree.py": 5402,
   "tests/test_api_budget.py": 1076,
   "tests/test_api_worker.py": 891,
-  "tests/test_charlie_work.py": 54107,
+  "tests/test_charlie_work.py": 54177,
   "tests/test_checks.py": 920,
   "tests/test_claude_code_adapter.py": 4362,
   "tests/test_cli.py": 3599,
@@ -50,7 +50,7 @@
   "tests/test_process_utils.py": 1274,
   "tests/test_prompt_render_contract.py": 995,
   "tests/test_prompt_sections.py": 1092,
-  "tests/test_reconcile.py": 5277,
+  "tests/test_reconcile.py": 5292,
   "tests/test_rework_prompts_split.py": 844,
   "tests/test_stale_checks_retrigger.py": 858,
   "tests/test_state_dir_migration.py": 1524,
@@ -62,5 +62,5 @@
   "tests/test_worker_health.py": 2215,
   "tests/test_worker_stop_gate.py": 1056,
   "tests/test_worktree.py": 8494,
-  "tests/test_write_gate_enforcement.py": 1718
+  "tests/test_write_gate_enforcement.py": 1637
 }

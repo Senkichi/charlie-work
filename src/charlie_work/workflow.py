@@ -3895,20 +3895,15 @@ class OrchestratorApp:
 
         This is the single instrumentation entry point for OrchestratorApp
         methods. It forwards to ``self.write_gate.record_event`` (issue #1324)
-        so every one of its ~70 call sites is dry-run-gated by construction
-        -- under ``dry_run=True`` the gate returns ``state`` unchanged with
-        zero writes to ``events.db`` and zero mutation of the in-memory event
-        ring, matching the WriteGate invariant ("no event at all under
-        dry-run ... a caller migrated onto WriteGate must observe *exactly*
-        the same events.db/state.json footprint under dry-run as a caller
-        that never ran at all"). Under ``dry_run=False`` the gate is a pure
-        passthrough to ``append_event`` with ``self.paths.state_file`` and
-        the repo name auto-bound, so every event is dual-written: once to
-        the bounded convenience cache in ``state.json`` (``EVENT_RING_SIZE``,
-        default 2000) and once to the append-only ``events.db`` audit log.
-
-        ``level`` is forwarded to ``append_event`` so the emit site can declare
-        the level explicitly instead of relying on the central registry.
+        so every one of its ~70 call sites is dry-run-gated by construction:
+        under ``dry_run=True`` the gate returns ``state`` unchanged with zero
+        writes to ``events.db`` and zero mutation of the in-memory event ring
+        (the WriteGate invariant -- "no event at all under dry-run"). Under
+        ``dry_run=False`` the gate is a pure passthrough to ``append_event``
+        with ``self.paths.state_file`` and the repo name auto-bound, dual-writing
+        each event to ``state.json``'s bounded ring (``EVENT_RING_SIZE``, default
+        2000) and the append-only ``events.db`` audit log. ``level`` is forwarded
+        to ``append_event`` so the emit site can declare it explicitly.
         """
         return self.write_gate.record_event(state, kind, payload, level=level)
 
@@ -17959,9 +17954,10 @@ class OrchestratorApp:
 
         ``dry_run`` is threaded honestly: a ``--dry-run`` fleet pass runs the
         sweep in preview mode, which removes nothing (the preview-vs-act class
-        tracked in #614-#619). A ``worktrees_reclaimed`` event is always emitted
-        when the sweep runs, so a maintenance action that left no trace is
-        indistinguishable from one that never ran (lesson from #595/#621).
+        tracked in #614-#619). Under live mode a ``worktrees_reclaimed`` event
+        is emitted so a maintenance action that left no trace is
+        indistinguishable from one that never ran (lesson from #595/#621);
+        under ``dry_run`` the event is suppressed per #1324 (WriteGate).
         The event payload carries a bounded ``skipped_examples`` list (each
         entry's own ``reason`` string) alongside the exact ``skipped_count``,
         plus ``worktrees_registered``/``worktrees_out_of_scope`` -- so a
