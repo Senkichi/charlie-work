@@ -335,14 +335,17 @@ def test_all_verdict_parsing_names_are_reexported_by_identity() -> None:
     Issue #1354 adds ``CAUSE_UNKNOWN``, ``_RESULT_EVENT_CAUSE_FIELDS`` (2
     constants: 12 -> 14) and ``_extract_terminating_cause`` (1 function:
     10 -> 11), for 23 -> 26 overall.
+    Issue #1485 adds ``_EXTRACTED_VERDICT_SOURCES`` (1 constant: 14 -> 15)
+    and ``is_extracted_verdict_source``, ``provenance_caveat_for`` (2
+    functions: 11 -> 13), for 26 -> 29 overall.
     """
     import charlie_work.verdict_parsing as verdict_parsing
     import charlie_work.workflow as workflow
 
     names = _module_level_defined_names(_VERDICT_PARSING_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 26, (
-        f"expected 26 moved units (11 functions + ReviewSessionOutcome + 14 constants), "
+    assert len(names) == 29, (
+        f"expected 29 moved units (13 functions + ReviewSessionOutcome + 15 constants), "
         f"found {len(names)}: {sorted(names)}"
     )
 
