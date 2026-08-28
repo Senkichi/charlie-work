@@ -38833,7 +38833,7 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch(
-            "charlie_work.workflow.sweep_orphan_processes",
+            "charlie_work.dead_worker_reap.sweep_orphan_processes",
             return_value=[{"pid": 3492, "name": "python.exe", "command_line": "python worker.py"}],
         ),  # Fixed mock return
         patch(
@@ -38949,7 +38949,7 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -39025,7 +39025,7 @@ def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path:
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -39079,7 +39079,7 @@ def test_stall_reap_falls_back_to_stalled_when_no_throttle_signature(tmp_path: P
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -39135,7 +39135,7 @@ def test_dispatch_defers_after_stall_reap_sets_throttled_until(tmp_path: Path) -
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -39251,7 +39251,9 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
         patch("charlie_work.claude_code.read_worker_records", return_value=[dead_worker]),
         patch("charlie_work.devin_shell.is_session_alive", side_effect=lambda r: r.pid != 1000),
         patch("charlie_work.claude_code.is_worker_alive", side_effect=lambda r: r.pid != 1002),
-        patch("charlie_work.workflow.sweep_orphan_processes", side_effect=mock_sweep_orphan),
+        patch(
+            "charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=mock_sweep_orphan
+        ),
         patch("charlie_work.workflow.os.name", "nt"),  # Force Windows path
         patch("subprocess.run", side_effect=mock_subprocess_run),
     ):
@@ -41403,9 +41405,12 @@ def test_redispatch_timestamps_pruned_outside_window(tmp_path: Path) -> None:
 def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     """Test that redispatch_at is only written by known call sites."""
     # This test verifies by code inspection that redispatch_at is only written in:
-    # 1. dispatch_rework normal paths (success + failure + no-op rework pre-dispatch).
-    # 2. _classify_dead_sessions_and_update_throttle_state normal paths.
-    # 3. _reap_restore_rework_requested (issue #315 review finding 2).
+    # 1. dispatch_rework normal paths (success + no-op rework pre-dispatch) --
+    #    workflow.py, OrchestratorApp.dispatch_rework.
+    # 2. _classify_dead_sessions_and_update_throttle_state normal paths --
+    #    dead_worker_reap.py (issue #1317: moved verbatim from workflow.py).
+    # 3. _reap_restore_rework_requested (issue #315 review finding 2) --
+    #    dead_worker_reap.py (issue #1317: moved verbatim from workflow.py).
     # Escalated paths now consolidate on _escalate_issue and pass redispatch_at
     # through issue_extra, so direct entry["redispatch_at"] assignments only
     # remain in the non-escalated branches below.
@@ -41422,15 +41427,27 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     # dispatch_selection.py dropped the naive count to 4 with zero change to
     # any real write site -- a false regression signal, the opposite failure
     # mode from AC7's hazard test but the same root cause (name/text search
-    # over source that doesn't distinguish code from prose). Both files are
-    # scanned and summed via real ast.Assign nodes so neither a docstring
+    # over source that doesn't distinguish code from prose). All three files
+    # are scanned and summed via real ast.Assign nodes so neither a docstring
     # quote nor a future extraction of one of the three named call sites can
     # produce a false pass or a false failure here.
+    #
+    # issue #1317: the dead-worker/session-reap extraction moved call sites 2
+    # and 3 above out of workflow.py into dead_worker_reap.py verbatim -- the
+    # writers still exist, only their module changed (confirmed real split:
+    # workflow.py=2, dispatch_selection.py=0, dead_worker_reap.py=2, total
+    # unchanged at 4). dead_worker_reap.py is added to the scan so this guard
+    # keeps failing if a genuinely NEW, unknown writer appears in any of the
+    # three files, rather than going blind to two known call sites because
+    # they changed address.
     import ast
 
     workflow_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
     dispatch_selection_path = (
         Path(__file__).parents[1] / "src" / "charlie_work" / "dispatch_selection.py"
+    )
+    dead_worker_reap_path = (
+        Path(__file__).parents[1] / "src" / "charlie_work" / "dead_worker_reap.py"
     )
 
     def _count_redispatch_at_assignments(path: Path) -> int:
@@ -41451,12 +41468,15 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
         return count
 
     # Any unexpected increase means a new call site is writing redispatch_at.
-    redispatch_assignments = _count_redispatch_at_assignments(
-        workflow_path
-    ) + _count_redispatch_at_assignments(dispatch_selection_path)
+    redispatch_assignments = (
+        _count_redispatch_at_assignments(workflow_path)
+        + _count_redispatch_at_assignments(dispatch_selection_path)
+        + _count_redispatch_at_assignments(dead_worker_reap_path)
+    )
     assert redispatch_assignments == 4, (
         'Expected 4 real entry["redispatch_at"] assignment statements across '
-        f"workflow.py and dispatch_selection.py, found {redispatch_assignments}"
+        "workflow.py, dispatch_selection.py, and dead_worker_reap.py, found "
+        f"{redispatch_assignments}"
     )
 
 
@@ -45895,7 +45915,12 @@ def test_classify_dead_sessions_no_commits_relabels_to_ready(tmp_path: Path) -> 
 
 def test_classify_dead_sessions_salvage_push_failure_fallback(tmp_path: Path) -> None:
     """Issue #252: a failed salvage push records failure and falls back to relabel."""
-    from charlie_work import workflow as workflow_module
+    # Issue #1317: push_branch is called bare-name from inside _attempt_salvage,
+    # which moved (verbatim) to dead_worker_reap.py -- so the bare-name lookup
+    # now resolves via dead_worker_reap.py's own globals, not workflow.py's.
+    # Patch it there, not on the (still-valid) workflow.py facade re-export of
+    # _classify_dead_sessions_and_update_throttle_state itself.
+    from charlie_work import dead_worker_reap as workflow_module
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
@@ -46122,7 +46147,7 @@ def test_stall_lane_api_budget_kill_over_cap(tmp_path: Path) -> None:
             "charlie_work.write_gate.kill_process_tree",
             side_effect=lambda pid, *_a, **_kw: killed_pids.extend([pid]) or [pid],
         ),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -46192,7 +46217,7 @@ def test_stall_lane_api_provider_auth_classification(tmp_path: Path) -> None:
     with (
         patch("charlie_work.worker.is_worker_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99998]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
