@@ -55,7 +55,7 @@ from .config import (
 from .env_sanitize import worker_github_token_findings
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, managed_repo_names, try_acquire_fleet_lock
-from . import layout
+from . import layout, status_snapshot
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from . import rescue as rescue_helpers
@@ -4256,7 +4256,9 @@ class OrchestratorApp:
         )
 
     @_guard_state_lock
-    def status(self) -> CommandResult:
+    def status(self, *, use_cache: bool = True) -> CommandResult:
+        if use_cache and (cached := status_snapshot.read_status_snapshot(self)) is not None:
+            return cached
         issues = self.gh.issue_list(self.config.labels.ready)
         prs = self.gh.pr_list()
         state = load_state_locked(self.paths.state_file)
@@ -4365,6 +4367,8 @@ class OrchestratorApp:
                 operator_claimed,
                 ready_open_count=len(issues),
             ),
+            "snapshot_written_at": None,
+            "cache_age_seconds": None,
         }
 
         # Add runners section if feature is enabled and observation succeeded
@@ -17836,6 +17840,8 @@ class OrchestratorApp:
                 sink_arrivals=sink_arrivals,
                 sink_clears=sink_clears,
             )
+            if not self.dry_run:
+                status_snapshot.write_status_snapshot(self)
             return result
 
     def _maybe_probe_quota_recovery(self, *, now: datetime | None = None) -> None:
