@@ -237,6 +237,93 @@ def test_sweep_resets_linked_pr_status_to_passive_open(tmp_path: Path) -> None:
     assert state["issues"]["123"]["status"] == PASSIVE_OPEN_STATUS
 
 
+@pytest.mark.parametrize("terminal_status", ["merged", "closed"])
+def test_sweep_does_not_revert_pr_that_became_terminal_in_pre_lock_window(
+    tmp_path: Path, terminal_status: str
+) -> None:
+    """Review on #1482: the new ``pr.status = PASSIVE_OPEN_STATUS`` write is
+    guarded against a PR that a concurrent writer advanced to a terminal
+    status ("merged"/"closed") in state.json during the pre-lock
+    GitHub-fetch window.
+
+    ``_deescalate_mechanical_issue`` fetches ``pr_state_str`` from
+    ``self.gh.pr_view`` *before* acquiring the state lock, and gates the
+    clear on ``pr_state_str == "OPEN"`` using that stale pre-lock value.
+    The in-lock fresh state load can then observe a PR a concurrent writer
+    (reconcile, another loop lane, an operator ``unescalate``) already
+    advanced to ``"merged"``/``"closed"``.  Without the guard the
+    unconditional ``status = PASSIVE_OPEN_STATUS`` write would revert that
+    terminal PR to ``open_passive``, creating a split state (PR
+    merged/closed on GitHub, ``open_passive`` in state.json) that
+    reconcile must self-heal -- the exact race the review flagged.
+
+    The race window is simulated by wrapping ``app.gh.pr_view`` so that,
+    when the sweep fetches the PR (after the pre-lock state load selected
+    this PR on its ``"escalated"`` status, but before the in-lock fresh
+    load), a concurrent writer advances the PR's state.json ``status`` to
+    the terminal value.  ``pr_view`` itself still returns ``state == "OPEN"``
+    so the ``pr_state_str == "OPEN"`` gate passes -- isolating the guard to
+    the in-lock fresh-status check, not the pre-lock GitHub gate.
+
+    Mirroring the operator door's ``_apply_pr_reset`` (which branches on
+    live PR state and never writes ``PASSIVE_OPEN_STATUS`` over a
+    merged/closed PR) and this function's own PR-selection skip
+    (``status not in ("merged", "closed")``), the sweep must leave the
+    terminal ``status`` untouched.
+    """
+    app = _app(tmp_path)
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        # Pre-lock state: PR is "escalated" so the sweep's PR-selection
+        # (``status not in ("merged", "closed")``) picks it up.
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "escalation_reason": "session_failed_escalated",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "session_failed_escalated",
+            "reason_class": "mechanical",
+        }
+        save_state(app.paths.state_file, state)
+
+    original_pr_view = app.gh.pr_view
+
+    def _racing_pr_view(number: int) -> dict:
+        # Simulate a concurrent writer advancing the PR to a terminal
+        # status in state.json during the pre-lock GitHub-fetch window --
+        # after the pre-lock state load selected this PR on "escalated",
+        # before the in-lock fresh load.  pr_view still reports OPEN so the
+        # ``pr_state_str == "OPEN"`` gate passes and the guard is the only
+        # thing standing between the write and the revert.
+        with state_lock(app.paths.state_file):
+            racing_state = load_state(app.paths.state_file)
+            racing_pr = racing_state["prs"].get(str(number))
+            if isinstance(racing_pr, dict):
+                racing_pr["status"] = terminal_status
+            save_state(app.paths.state_file, racing_state)
+        return original_pr_view(number)
+
+    app.gh.pr_view = _racing_pr_view
+
+    app._maybe_deescalate_mechanical()
+
+    state = load_state(app.paths.state_file)
+    pr_456 = state["prs"]["456"]
+    # The terminal status is NOT reverted to PASSIVE_OPEN_STATUS -- the
+    # core of the review finding.
+    assert pr_456["status"] == terminal_status
+    assert pr_456["status"] != PASSIVE_OPEN_STATUS
+    # The escalation-reason fields are still mirror-cleared (the guard is
+    # scoped to ``status`` only; clear_escalation_on_issue_prs still runs).
+    assert "escalation_reason" not in pr_456
+    assert "escalation_reasons_seen" not in pr_456
+
+
 def test_deescalation_sweep_leaves_missing_reason_class_untouched(tmp_path: Path) -> None:
     """AC6: an escalation recorded before this field existed -- no
     ``reason_class`` key at all -- must fail closed and stay exactly as

@@ -18653,7 +18653,29 @@ class OrchestratorApp:
             # separately below.
             fresh_pr_for_status = fresh_state["prs"].get(str(pr_number))
             if isinstance(fresh_pr_for_status, dict):
-                fresh_pr_for_status["status"] = PASSIVE_OPEN_STATUS
+                # Review on #1482: ``pr_state_str`` above is the PRE-lock
+                # GitHub fetch (``self.gh.pr_view`` at the top of this
+                # method), so the ``pr_state_str == "OPEN"`` gate does not
+                # defend this in-lock write against a PR that merged/closed
+                # on GitHub -- or, more directly, that a concurrent writer
+                # (reconcile, another loop lane, an operator ``unescalate``)
+                # advanced to a terminal ``status`` in state.json during the
+                # window between the pre-lock state load and this in-lock
+                # fresh load.  Mirroring the operator door's
+                # ``_apply_pr_reset`` (which branches on live PR state and
+                # never writes ``PASSIVE_OPEN_STATUS`` over a merged/closed
+                # PR) and this function's own PR-selection skip
+                # (``status not in ("merged", "closed")``), do NOT revert a
+                # PR whose fresh status is already terminal: the sweep's job
+                # here is to clear a stuck *escalated* PR, not to resurrect a
+                # merged/closed one.  Reverting it would create a split state
+                # (PR merged/closed on GitHub, ``status == "open_passive"`` in
+                # state.json) that reconcile must self-heal -- avoid the
+                # divergence at the write instead.  A non-terminal fresh
+                # status (``"escalated"`` in the normal path, or any other
+                # open-class value) is still reset to the passive-open target.
+                if fresh_pr_for_status.get("status") not in ("merged", "closed"):
+                    fresh_pr_for_status["status"] = PASSIVE_OPEN_STATUS
             if budget_reset_needed:
                 fresh_pr = fresh_state["prs"].get(str(pr_number))
                 if isinstance(fresh_pr, dict):
