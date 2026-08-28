@@ -834,7 +834,20 @@ _RATCHET_BASELINE: dict[str, int] = {
     # and _maybe_reclaim_superseded_main_ci (3) were routed through
     # self.write_gate.save_state, moving both functions into the R9
     # in-predicate bucket. Net decrease: 285 -> 196.
+    #
+    # Issue #1317 (merged on main after this PR's original base): verbatim
+    # extraction of the dead-worker/session-reap family out of workflow.py
+    # into dead_worker_reap.py (byte-identical move, no write-path changes).
+    # The 11 raw sites in that family relocated to the new module; they are
+    # not _record_event calls (the family uses write_gate.append_event
+    # directly for its gated writes, with log_event / _api_write_json_atomic
+    # as the raw primitives), so #1324's centralization does not change their
+    # raw count. workflow.py's actual count drops accordingly (196 -> 185
+    # after the extraction), which the shrink-only ratchet accepts without a
+    # further baseline edit; only the newly-introduced module needs its own
+    # entry.
     "workflow.py": 196,
+    "dead_worker_reap.py": 11,
     # Issue #1423: +2 raw primitives in _reap_idle_foreign_writer (log_event
     # for the foreign_writer_reaped instrumentation event, and kill_orphan_pid
     # for sweeping the reaped writer's orphan processes). This is a standalone
