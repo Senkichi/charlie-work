@@ -560,6 +560,15 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # ``salvage_pushed_stranded_commits`` rather than to
         # ``salvage_push_failed`` (which is a genuine failure to publish).
         "salvage_skipped_already_landed": "info",
+        # Issue #1241: the pre-open reachability re-check found the salvage
+        # branch's tip already reachable from origin/main (the work merged via
+        # a merge commit whose tree differed from the salvage head's tree --
+        # the case ``salvage_skipped_already_landed``'s empty-diff check
+        # misses) and skipped opening a vestigial duplicate PR. Info, sibling
+        # to ``salvage_skipped_already_landed``: the intended outcome, not a
+        # failure. Emitted by both salvage lanes through the shared
+        # ``salvage_superseded.salvage_skip_event_kind`` mapping.
+        "salvage_skipped_superseded": "info",
         "quota_probe_succeeded": "info",
         "readiness_no_ci_rework_requested": "info",
         "reconcile": "info",

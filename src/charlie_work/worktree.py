@@ -4261,6 +4261,62 @@ def salvage_branch_empty_diff(repo_root: Path, branch: str, base_ref: str) -> bo
     return base_tree.stdout.strip() == branch_tree.stdout.strip()
 
 
+def salvage_branch_reachable_from_main(repo_root: Path, branch: str, base_ref: str) -> bool:
+    """Return True if ``branch``'s tip is an ancestor of the live base branch.
+
+    Issue #1241: ``salvage_branch_empty_diff`` compares tree SHAs and misses the
+    common rework-salvage race that motivated this check. The salvage head was a
+    PARENT of the merge commit that landed minutes earlier, so it IS reachable
+    from origin/main (an ancestor) but its tree differs -- main advanced past it
+    via the merge (and possibly further with unrelated commits). A tree-equality
+    check reads "not empty" and opens a duplicate PR; an ancestry check reads
+    "already on main" and skips it. The motivating incident (jc #1677 vs #1673)
+    was exactly this shape: PR #1673 merged the work to main at 22:22Z, the
+    linked issue closed, and three minutes later salvage opened duplicate PR
+    #1677 from a stale worktree whose head commit was already an ancestor of the
+    merge commit.
+
+    ``git fetch origin <base>`` is run first so the ancestry test sees the
+    *live* remote tip, not a stale tracking ref -- the same race
+    ``salvage_branch_empty_diff`` defends against, applied to the stronger
+    check. ``git merge-base --is-ancestor <branch> origin/<base>`` exits 0 when
+    every commit reachable from ``branch`` is also reachable from
+    ``origin/<base>`` (i.e. the branch carries nothing new).
+
+    Fails open (returns False = "do not skip salvage") on any git error -- a
+    transient fetch / ref-resolution / ancestry-check failure falls back to
+    opening the PR, which a human reviews anyway. Only POSITIVE evidence that
+    the work is already on main causes a skip; uncertain state must never
+    silently discard stranded work. ``git fetch`` does not move HEAD and is safe
+    to run against a checkout a supervisor is actively using.
+    """
+    base_branch = resolve_base_branch_name(repo_root, base_ref)
+    fetch = _run_remote_captured(
+        ["git", "fetch", "origin", base_branch],
+        cwd=repo_root,
+    )
+    if not fetch.ok:
+        return False
+    base_ref_resolved = f"origin/{base_branch}"
+    branch_ref = _resolve_salvage_branch_ref(repo_root, branch)
+    if branch_ref is None:
+        return False
+    # ``--is-ancestor`` exits 0 when branch_ref is an ancestor of base (the
+    # work already landed), 1 when it is not (real unlanded work), and >1 on
+    # git errors (treated as "do not skip" -- fail open).
+    result = _run_remote_captured(
+        ["git", "merge-base", "--is-ancestor", branch_ref, base_ref_resolved],
+        cwd=repo_root,
+    )
+    if not result.ok:
+        # A non-zero exit here covers both "not an ancestor" (exit 1, the
+        # common case -- salvage should proceed) and a genuine git error
+        # (exit >1 -- fail open, salvage should proceed). Either way, do not
+        # skip.
+        return False
+    return True
+
+
 # Cap on commit subjects rendered into a salvage body. A runaway branch should
 # not paste hundreds of lines into a PR description; the count is reported so
 # the elision is visible rather than silent.
