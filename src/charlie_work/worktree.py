@@ -671,7 +671,7 @@ def _reap_idle_foreign_writer(
     worktree_path: Path,
     marker: dict[str, Any] | None,
     config: OrchestratorConfig,
-    sessions_dir: Path | None = None,
+    sessions_dir: Path,
     *,
     state_file: Path | None = None,
     issue_number: int | None = None,
@@ -707,9 +707,11 @@ def _reap_idle_foreign_writer(
         semantics at the dispatch-entry boundary)
       * pid missing/dead -> the writer is confirmably gone: clean the marker
         and return ``True`` (the path is clear)
-      * own live session (``sessions_dir`` provided) -> ``False`` (the stall
-        detector owns reaping our own workers so worker-death/rework-cap
-        accounting and sidecar/session-state updates run)
+      * own live session -> ``False`` (the stall detector owns reaping our own
+        workers so worker-death/rework-cap accounting and sidecar/session-state
+        updates run). ``sessions_dir`` is a required parameter (no default) so
+        a call site that drops it raises ``TypeError`` instead of silently
+        disabling this guard.
       * no ``process_start_time`` fingerprint -> ``False`` (cannot safely reap;
         see the PID-recycling defense below)
 
@@ -788,7 +790,10 @@ def _reap_idle_foreign_writer(
     # (with worker-death/rework-cap accounting and sidecar/session-state
     # updates); reaping one here as ``foreign_writer_reaped`` would bypass
     # that accounting. The rework pre-filter previously omitted this guard.
-    if sessions_dir is not None and isinstance(session_id, str) and session_id:
+    # ``sessions_dir`` is a required parameter (no default) so a call site
+    # that drops or misorders it raises ``TypeError`` instead of silently
+    # disabling this guard — the exact bug shape #1443 was filed to fix.
+    if isinstance(session_id, str) and session_id:
         own = _own_live_session_pids(sessions_dir)
         if own.get(session_id) == pid:
             return False

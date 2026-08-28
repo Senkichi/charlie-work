@@ -3727,7 +3727,7 @@ def _try_reap_blocked_foreign_writer(
     config: OrchestratorConfig,
     state_file: Path,
     issue_number: int,
-    sessions_dir: Path | None = None,
+    sessions_dir: Path,
 ) -> bool:
     """Attempt to reap an idle foreign writer at the blocked-environment cap.
 
@@ -3751,6 +3751,12 @@ def _try_reap_blocked_foreign_writer(
     truth) so the pid can never disagree with the ``process_start_time``
     fingerprint passed to ``kill_process_tree``. ``failed_result`` is used
     only to locate the worktree path and confirm the failure kind.
+
+    Issue #1443 review: ``sessions_dir`` is a required parameter (no default).
+    Every production caller passes it explicitly; removing the default converts
+    a silently-disabled own-live-session guard into an immediate ``TypeError``
+    if a future call site drops or reorders the argument — the exact bug shape
+    #1443 was filed to fix.
 
     Returns ``True`` when the writer was reaped, ``False`` otherwise (including
     when the failed result is not a foreign-writer block or the marker is gone).

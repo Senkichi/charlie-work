@@ -53957,6 +53957,143 @@ def test_dispatch_rework_pre_escalation_safety_net_reaps_foreign_writer(
     assert len(state["issues"]["123"].get("foreign_writer_reaps", [])) == 1
 
 
+def test_dispatch_rework_pre_filter_own_live_session_not_reaped_escalated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1443 review: an integration-level regression test exercising
+    Site 2 (the rework pre-filter in ``_dispatch_rework_impl``) through the
+    REAL, non-mocked ``_reap_idle_foreign_writer`` with a genuine own-live-
+    session marker (a sidecar in ``sessions_dir`` matching the marker's
+    session id and pid).
+
+    The own-live-session guard must short-circuit the reap so the marker is
+    NOT removed and the issue is escalated (``dispatch_blocked_environment``)
+    instead of being reaped as ``foreign_writer_reaped``. This pins the guard
+    the rework pre-filter previously re-implemented incompletely (stale-PID
+    only) and dropped, and would fail if ``sessions_dir`` were later dropped
+    or misordered at the Site 2 call site — the exact bug shape #1443 was
+    filed to fix. Unlike the caller-level tests that mock the reap away, this
+    one asserts on the real reap's behavior end-to-end."""
+    from charlie_work.config import WRITER_MARKER_FILENAME
+    from charlie_work.post_mortem import RealActivityProbe
+    from charlie_work.worktree import (
+        read_worktree_marker,
+        worktree_path_for_branch,
+    )
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+            max_foreign_writer_reaps=2,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "blocked_environment_at": _blocked_env_timestamps(2),
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "rework-prompt.md").write_text("Fix the issues", encoding="utf-8")
+
+    # Materialize a marker at the worktree path derived from the PR head ref.
+    # The marker's session id matches a live sidecar in sessions_dir, so the
+    # real ``_reap_idle_foreign_writer`` own-live-session guard must refuse to
+    # reap it (the stall detector owns reaping our own workers).
+    branch_pre = str(fake_gh.prs[0]["headRefName"])
+    wt_path_pre = worktree_path_for_branch(tmp_path, branch_pre, app._layout.worktrees)
+    wt_path_pre.mkdir(parents=True, exist_ok=True)
+    marker = {
+        "pid": 1234,
+        "session_id": "owned-session",
+        "started_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z"),
+        "kind": "worker",
+        "process_start_time": 1234567890.0,
+    }
+    (wt_path_pre / WRITER_MARKER_FILENAME).write_text(json.dumps(marker), encoding="utf-8")
+
+    # Genuine own-live-session sidecar: session id + pid match the marker, and
+    # ``is_pid_alive`` is mocked True so ``_own_live_session_pids`` reports the
+    # session as live. This is what makes the marker "owned", not foreign.
+    sessions_dir = app._layout.sessions_dir
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    (sessions_dir / "issue-123.json").write_text(
+        json.dumps({"session_id": "owned-session", "pid": 1234, "process_start_time": 1.0}),
+        encoding="utf-8",
+    )
+
+    # Mock only the process-liveness, activity-probe, and kill primitives (no
+    # real process or filesystem interaction). The reap function itself is NOT
+    # mocked — this is the integration assertion. ``is_pid_alive`` True keeps
+    # the marker "live" so the reap reaches the own-live-session guard instead
+    # of the stale-pid short-circuit. The activity probe is forced not-fresh so
+    # that WITHOUT the own-live-session guard the reap would proceed to kill
+    # (and the test would fail) — this is what makes the mutation check
+    # deterministic: the guard is the only thing standing between the marker
+    # and the kill path.
+    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    monkeypatch.setattr(
+        "charlie_work.worktree.real_activity_for_worker",
+        lambda *a, **k: RealActivityProbe(sources=()),
+    )
+    kill_calls: list[tuple[int, float | None]] = []
+    monkeypatch.setattr(
+        "charlie_work.worktree.kill_process_tree",
+        lambda pid, st: kill_calls.append((pid, st)) or [pid],
+    )
+    monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
+    monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
+
+    # The issue must be escalated pre-dispatch, so dispatch_sessions must not
+    # be called. A raising fake makes a silent regression loud.
+    def _dispatch_must_not_run(_repo_root, _manifest, _results, _settings, _requests):
+        raise AssertionError("dispatch must not run when the pre-filter escalates")
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _dispatch_must_not_run)
+
+    result = app.dispatch_rework()
+    # The issue was filtered out by the pre-filter (escalated, not dispatched),
+    # so dispatch_rework reports "no rework candidates found" with ok=True —
+    # the same as an empty backlog. The escalation is observable in the result
+    # data and in state (asserted below), not in result.ok.
+    assert result.ok is True
+    assert result.data.get("blocked_environment_escalated") == [123]
+
+    # The own-live-session guard refused to reap: the marker is still present.
+    assert read_worktree_marker(wt_path_pre) is not None
+    # No kill occurred (the guard short-circuited before the kill path).
+    assert kill_calls == []
+
+    state = load_state(paths.state_file)
+    # The issue was escalated (NOT reaped and redispatched).
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "dispatch_blocked_environment"
+    # No reap was recorded — the own-session guard returned False.
+    assert state["issues"]["123"].get("foreign_writer_reaps", []) == []
+
+
 def test_dispatch_fresh_blocked_environment_reap_cap_escalates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
