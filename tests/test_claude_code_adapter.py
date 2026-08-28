@@ -331,7 +331,10 @@ def test_log_worker_census_emits_alive_worker_with_cap(
             json.dumps(record.to_dict()), encoding="utf-8"
         )
 
-        with caplog.at_level("INFO", logger="charlie_work.workflow"):
+        # Issue #1317: _log_worker_census moved (verbatim) to
+        # dead_worker_reap.py -- its `logging.getLogger(__name__)` call
+        # resolves to that module's own real name, not workflow.py's.
+        with caplog.at_level("INFO", logger="charlie_work.dead_worker_reap"):
             _log_worker_census(sessions_dir)
 
         [census_record] = [r for r in caplog.records if "worker census" in r.message]
