@@ -93,6 +93,8 @@ monolith, implementation in the module), matching the #1283-era extractions.
 
 $over_cap_section
 
+$attachment_budget_section
+
 ## Approval criteria
 
 Approve only if all of these are true:

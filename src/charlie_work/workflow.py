@@ -40,12 +40,14 @@ from .citation_check import (
     CitationVerdict,
     drift_fingerprint as citation_drift_fingerprint,
     drifted_verdicts as drifted_citation_verdicts,
+    format_verdict_status_cell,
     verify_citations,
 )
 from .config import (
     AutoMergeConfig,
     CrossFamilyConfig,
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
+    DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
     OrchestratorConfig,
     PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS,
     ReviewDispatchConfig,
@@ -97,6 +99,28 @@ from .pr_create_retry import create_pr_with_retry
 from .issue_comments import render_issue_comments
 from .markdown_fence import fenced_block
 from .module_map import build_module_map
+from .attachment_contracts import baseline as attachment_baseline
+from .attachment_contracts import hook_entry as attachment_hook_entry
+from .attachment_contracts.model import AdvisoryRecord
+from .attachment_contracts.review_delta import (
+    BudgetSection,
+    build_budget_findings,
+    reconstruct_baseline_head_text,
+)
+
+# LOAD-BEARING RE-EXPORT -- NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# below marks a deliberate re-export, not a lint concession.
+#
+# Issue #1460: the attachment-budget dispatch clause and packet-section
+# renderer live in `charlie_work.attachment_budget_prompt`, following the
+# #1442 ratchet's prescribed remedy for over-cap files (extract + re-export
+# through this facade block, matching the `.dispatch_selection` /
+# `.escalation` / `.verdict_parsing` / `.rework_prompts` / `.ci_findings` /
+# `.backlog_reachability` / `.stalled_review_reap` lineage above).
+from .attachment_budget_prompt import (  # noqa: F401  (deliberate re-export)
+    ATTACHMENT_BUDGET_CLAUSE as _ATTACHMENT_BUDGET_CLAUSE,
+    render_attachment_budget_section,
+)
 from .janitor import (
     _calculate_patch_id,
     _diff_content_signature,
@@ -104,6 +128,7 @@ from .janitor import (
     check_test_adequacy,
     detect_cross_pr_revert,
     is_stale_ci_verdict,
+    iter_diff_files,
     required_check_citation_names,
     run_janitor,
     DiffContentSignature,
@@ -143,6 +168,7 @@ from .safe_ref import require_valid_sha
 from .worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
+    WORKTREE_UNSAFE_KINDS,
     WorktreeProbeFailedError,
     _worktree_refuse_to_reset_reason,
     _reap_idle_foreign_writer,
@@ -166,6 +192,11 @@ from .worktree import (
     write_worktree_marker,
 )
 from . import state as _state
+from .unescalate_reset_fields import (
+    REWORK_BUDGET_RESET_BY_ESCALATION_REASON,
+    UNESCALATE_ISSUE_RESET_FIELDS,
+    UNESCALATE_PR_RESET_FIELDS,
+)
 from .state import (
     PASSIVE_OPEN_STATUS,
     StateLockBusy,
@@ -282,6 +313,8 @@ from .escalation import (  # noqa: F401  (deliberate re-export)
     _escalation_edge,
     _escalation_label,
     _repair_reason_class,
+    _worker_launched_before_cap_escalation,
+    _cap_escalation_pr_extra,
     _MECHANICAL_ESCALATION_EDGES,
 )
 
@@ -425,6 +458,15 @@ from .stalled_review_reap import (  # noqa: F401  (deliberate re-export)
     _reap_orphaned_review_checkouts,
     _classify_review_dispatch_stalled_level,
     _append_sweep_events,
+)
+from .queue_sync_coverage import (  # noqa: F401  (deliberate re-export)
+    _QUEUE_SYNC_RETRY_ATTEMPTS,
+    _QUEUE_SYNC_RETRY_BACKOFF_SECONDS,
+    _QUEUE_SYNC_RETRY_SLEEP,
+    _QueueSyncCoverageResult,
+    _fetch_commit_retrying,
+    _fetch_compare_retrying,
+    _queue_sync_merge_covered,
 )
 
 # Issue #1106: a rework session that dies at CLI startup (before the worker's
@@ -1933,6 +1975,7 @@ UNAUTHORIZED_MERGE_ACK_KEY = "unauthorized_merge_acknowledged"
 # stays reported (and keeps pinning ok=False) until it is explicitly acked.
 # Presence here silences the event, never the finding.
 UNAUTHORIZED_MERGE_DETECTED_KEY = "unauthorized_merge_detected"
+
 
 # Issue #934: an operator who legitimately adjudicates and merges a worker PR
 # whose recorded review decision is stale, absent, or pending has no way to
@@ -4042,6 +4085,7 @@ def _reap_restore_rework_requested(
             worker.branch,
             Path(worker.worktree_path),
             base_ref=config.dispatch.base_ref,
+            dry_run=write_gate.dry_run,
         )
 
     # Issue #1239: when stranded commits were published, reset to
@@ -4110,6 +4154,12 @@ def _reap_restore_rework_requested(
         ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+        # Issue #807: a deterministic judgment failure (e.g. genuine local
+        # commits on the worktree branch) escalates immediately like a
+        # terminal_failure but as ``reason_class="judgment"`` so the
+        # de-escalation sweep never auto-clears it.
+        deterministic_judgment = failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+        immediate_escalation = terminal_failure or deterministic_judgment
 
         # Issue #1134: a worker that died before pushing leaves the PR head
         # unchanged, but that is NOT a no-op — the worker may have completed
@@ -4122,28 +4172,29 @@ def _reap_restore_rework_requested(
         worker_death_at = _windowed_worker_death_at(
             entry, window_minutes=config.watchdog.redispatch_window_minutes
         )
-        if not terminal_failure:
+        if not immediate_escalation:
             worker_death_at = worker_death_at + [
                 datetime.now(UTC).isoformat().replace("+00:00", "Z")
             ]
 
         no_op_count = max(0, len(redispatch_at) - len(worker_death_at))
         death_count = len(worker_death_at)
-        death_loop = not terminal_failure and death_count > config.watchdog.max_auto_redispatch
+        death_loop = not immediate_escalation and death_count > config.watchdog.max_auto_redispatch
         no_op_loop = (
-            not terminal_failure
+            not immediate_escalation
             and not death_loop
             and no_op_count > config.watchdog.max_auto_redispatch
         )
-        should_escalate = terminal_failure or death_loop or no_op_loop
+        should_escalate = immediate_escalation or death_loop or no_op_loop
 
         if should_escalate:
-            if terminal_failure:
+            if immediate_escalation:
                 reason = failure_kind
             elif death_loop:
                 reason = "worker_death_loop"
             else:
                 reason = "redispatch_cap_exceeded"
+            reason_class = "judgment" if deterministic_judgment else "mechanical"
             # Preserve worker_pid/worker_process_start_time (issue #282): the
             # recovery probe still needs the fingerprint even after escalation.
             issue_extra: dict[str, Any] = {
@@ -4158,7 +4209,7 @@ def _reap_restore_rework_requested(
                 "reason": "dead_rework_session_escalated",
                 "redispatch_count": len(redispatch_at),
             }
-            if not terminal_failure:
+            if not immediate_escalation:
                 # Persist the death record regardless of which cap fired —
                 # the death still happened, and the consumption side
                 # (_dispatch_rework_impl) reads it from state.
@@ -4179,7 +4230,7 @@ def _reap_restore_rework_requested(
                 state,
                 worker.issue_number,
                 reason=reason,
-                reason_class="mechanical",
+                reason_class=reason_class,
                 issue_extra=issue_extra,
             )
             state = write_gate.append_event(
@@ -4192,7 +4243,7 @@ def _reap_restore_rework_requested(
             entry["status"] = "rework_requested"
             entry["dispatched_at"] = None
             entry["redispatch_at"] = redispatch_at
-            if not terminal_failure:
+            if not immediate_escalation:
                 entry["worker_death_at"] = worker_death_at
             # Preserve worker_pid (issues #165, #282, #295)
             state["issues"][str(worker.issue_number)] = entry
@@ -4229,8 +4280,13 @@ def _reap_restore_rework_requested(
     # Transition labels: escalate (operator_queue for mechanical reasons,
     # human_needed reserved for judgment), or rework_requested (needs_rework),
     # removing the stale in_progress label from the failed launch.
+    # Issue #807: the edge must follow reason_class so a deterministic judgment
+    # failure (genuine local commits) lands agent:human-needed, not
+    # agent:operator-queue. reason_class is only assigned inside the
+    # should_escalate branch above, and this ternary only reads it when
+    # should_escalate is true, so it is always bound on this access.
     edge = (
-        _escalation_edge("redispatch_escalated", "mechanical")
+        _escalation_edge("redispatch_escalated", reason_class)
         if should_escalate
         else "rework_requested"
     )
@@ -4291,6 +4347,14 @@ WORKER_PROMPT_KEYS: frozenset[str] = frozenset(
         # ``worker_module_map_failed`` warning event), never a dispatch
         # failure.
         "module_map",
+        # Issue #1460: the attachment-point placement clause, gated on
+        # `.attachment-budgets.json` presence. Empty string when the marker
+        # is absent or fails to load (fail-soft: omitted clause + a
+        # ``worker_attachment_budget_failed`` warning event), never a
+        # dispatch failure. Deliberately NOT added to REWORK_PROMPT_KEYS --
+        # the rework lane receives budget findings via the review packet's
+        # `$attachment_budget_section` instead.
+        "attachment_budget",
     }
 )
 REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
@@ -4862,21 +4926,29 @@ def _route_dead_worker_to_pre_review_rework(
         ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-        if terminal_failure or len(redispatch_at) > config.watchdog.max_auto_redispatch:
+        # Issue #807: a deterministic judgment failure escalates immediately
+        # but as ``reason_class="judgment"`` so the de-escalation sweep
+        # never auto-clears it.
+        deterministic_judgment = failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+        immediate_escalation = terminal_failure or deterministic_judgment
+        if immediate_escalation or len(redispatch_at) > config.watchdog.max_auto_redispatch:
             # Issue #783: merge conflict / rework-branch conflict / stale-CI
             # redispatch cap are all process failures, not judgment calls.
+            # Issue #807: a deterministic judgment failure (genuine local
+            # commits) is a judgment call, not a process failure.
+            reason_class = "judgment" if deterministic_judgment else "mechanical"
             state = _escalate_issue(
                 state,
                 issue_number,
-                reason=(failure_kind if terminal_failure else "redispatch_cap_exceeded"),
-                reason_class="mechanical",
+                reason=(failure_kind if immediate_escalation else "redispatch_cap_exceeded"),
+                reason_class=reason_class,
                 issue_extra={
                     "redispatch_at": redispatch_at,
                     "pre_review_rework_reason": reason,
                 },
             )
             write_gate.save_state(state)
-            edge = _escalation_edge("redispatch_escalated", "mechanical")
+            edge = _escalation_edge("redispatch_escalated", reason_class)
             result = write_gate.transition(gh, config.labels, issue_number, edge)
             if result.outcome != TransitionOutcome.APPLIED:
                 entry = state["issues"].get(str(issue_number), {})
@@ -5102,8 +5174,8 @@ def _classify_dead_sessions_and_update_throttle_state(
 
             if (
                 failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-                and w.issue_number not in open_prs_by_issue
-            ):
+                or failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+            ) and w.issue_number not in open_prs_by_issue:
                 try:
                     issue = gh.issue_view(w.issue_number)
                 except Exception:
@@ -5118,9 +5190,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # a human without attempting the cheap safe action (push the
                 # branch + open a PR) inverts the priority: salvage-the-commit
                 # first, human adjudication only when salvage fails.
+                # Issue #807: ``worktree_unsafe`` is split at detection time
+                # into ``worktree_unsafe_shim_dirt`` and
+                # ``worktree_unsafe_local_commits``; both are covered by
+                # ``WORKTREE_UNSAFE_KINDS``. The ``ahead_count > 0`` gate below
+                # naturally filters shim dirt (uncommitted modifications, no
+                # commits ahead) so salvage only fires for genuine local
+                # commits — the case it was designed for.
                 salvaged_from_unsafe = False
                 if (
-                    failure_kind == "worktree_unsafe"
+                    failure_kind in WORKTREE_UNSAFE_KINDS
                     and repo_root is not None
                     and w.branch
                     and active_labels
@@ -5161,11 +5240,17 @@ def _classify_dead_sessions_and_update_throttle_state(
                         ) + [now.isoformat().replace("+00:00", "Z")]
                         # Issue #783: a deterministic launch failure kind is a
                         # process failure, not a judgment call -- mechanical.
+                        # Issue #807: a deterministic judgment failure kind
+                        # (genuine local commits) is a judgment call -- judgment.
+                        deterministic_judgment = (
+                            failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                        )
+                        reason_class = "judgment" if deterministic_judgment else "mechanical"
                         state = _escalate_issue(
                             state,
                             w.issue_number,
                             reason=failure_kind,
-                            reason_class="mechanical",
+                            reason_class=reason_class,
                             issue_extra={"redispatch_at": redispatch_at},
                         )
                         state["issues"][str(w.issue_number)].pop("worker_pid", None)
@@ -5175,7 +5260,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             gh,
                             config.labels,
                             w.issue_number,
-                            _escalation_edge("redispatch_escalated", "mechanical"),
+                            _escalation_edge("redispatch_escalated", reason_class),
                         )
                         state = write_gate.append_event(
                             state,
@@ -5487,23 +5572,32 @@ def _classify_dead_sessions_and_update_throttle_state(
                     # same block, so it bypasses the redispatch-count cap entirely
                     # and escalates on the very first occurrence.
                     terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                    # Issue #807: a deterministic judgment failure escalates
+                    # immediately but as ``reason_class="judgment"``.
+                    deterministic_judgment = (
+                        failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                    )
+                    immediate_escalation = terminal_failure or deterministic_judgment
                     if (
-                        terminal_failure
+                        immediate_escalation
                         or len(redispatch_at) > config.watchdog.max_auto_redispatch
                     ):
                         # Escalate to human review instead of relabeling to ready
                         reason = (
                             failure_kind
-                            if terminal_failure and failure_kind is not None
+                            if immediate_escalation and failure_kind is not None
                             else "redispatch_cap_exceeded"
                         )
                         # Issue #783: dead worker session / redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
+                        # Issue #807: a deterministic judgment failure (genuine
+                        # local commits) is a judgment call -- judgment.
+                        reason_class = "judgment" if deterministic_judgment else "mechanical"
                         state = _escalate_issue(
                             state,
                             w.issue_number,
                             reason=reason,
-                            reason_class="mechanical",
+                            reason_class=reason_class,
                             issue_extra={"redispatch_at": redispatch_at},
                         )
                         # Issue #282: preserve the liveness fingerprint for the
@@ -5515,7 +5609,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             gh,
                             config.labels,
                             w.issue_number,
-                            _escalation_edge("redispatch_escalated", "mechanical"),
+                            _escalation_edge("redispatch_escalated", reason_class),
                         )
                         state = write_gate.append_event(
                             state,
@@ -8904,11 +8998,12 @@ class OrchestratorApp:
                             else:
                                 status = "escalated"
                                 dispatched_at = None
+                                reason_class = "mechanical"
                                 state = _escalate_issue(
                                     state,
                                     request.issue_number,
                                     reason="dispatch_blocked_environment",
-                                    reason_class="mechanical",
+                                    reason_class=reason_class,
                                     issue_extra=entry,
                                 )
                                 entry = dict(state["issues"][str(request.issue_number)])
@@ -8959,26 +9054,35 @@ class OrchestratorApp:
                             and failed_result.failure_kind
                             in DETERMINISTIC_ESCALATION_FAILURE_KINDS
                         )
+                        # Issue #807: a deterministic judgment failure escalates
+                        # immediately but as ``reason_class="judgment"``.
+                        deterministic_judgment = (
+                            failed_result is not None
+                            and failed_result.failure_kind
+                            in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                        )
+                        immediate_escalation = terminal_failure or deterministic_judgment
                         entry["dispatch_failed_at"] = all_attempts
                         if (
-                            terminal_failure
+                            immediate_escalation
                             or len(recent) > self.config.watchdog.max_auto_redispatch
                         ):
                             status = "escalated"
                             dispatched_at = None
+                            reason_class = "judgment" if deterministic_judgment else "mechanical"
                             state = _escalate_issue(
                                 state,
                                 request.issue_number,
                                 reason=(
                                     failed_result.failure_kind
                                     if (
-                                        terminal_failure
+                                        immediate_escalation
                                         and failed_result is not None
                                         and failed_result.failure_kind is not None
                                     )
                                     else "dispatch_failed_cap_exceeded"
                                 ),
-                                reason_class="mechanical",
+                                reason_class=reason_class,
                                 issue_extra=entry,
                             )
                             # Re-read the escalation fields _escalate_issue merged in,
@@ -9029,6 +9133,10 @@ class OrchestratorApp:
                                         "line": v.citation.line,
                                         "end_line": v.citation.end_line,
                                         "status": v.status.value,
+                                        "resolved_path": v.resolved_path.replace("\\", "/")
+                                        if v.resolved_path
+                                        else None,
+                                        "candidates": list(v.candidates) if v.candidates else None,
                                     }
                                     for v in drift_verdicts
                                 ],
@@ -9115,7 +9223,10 @@ class OrchestratorApp:
                     # deterministic launch failure that retrying cannot fix
                     # (escalation_reason carries the failure_kind) — escalate to
                     # human-needed and remove the issue from the dispatch pool.
-                    edge = _escalation_edge("redispatch_escalated", "mechanical")
+                    # Issue #807: a deterministic judgment failure uses
+                    # ``reason_class="judgment"`` so the label lands on
+                    # human-needed, not operator_queued.
+                    edge = _escalation_edge("redispatch_escalated", reason_class)
                     result = transition(
                         self.gh,
                         self.config.labels,
@@ -10864,6 +10975,12 @@ class OrchestratorApp:
             else None
         )
 
+        # Issue #1460: attachment-budget review-packet section. Cheap gate
+        # first -- most PRs touch neither `.attachment-budgets.json` nor a
+        # baselined host file, so the reconstruct/build path below is
+        # skipped for them entirely (section renders "").
+        attachment_budget_section = self._build_attachment_budget_section(diff, pr_number)
+
         # Issue #1036: compare-and-swap the head immediately before committing
         # this packet's outputs (prompt + decision). ``pr`` was snapshotted
         # once, at the top of this method, and everything since -- diff
@@ -10981,6 +11098,7 @@ class OrchestratorApp:
                 "diff_size_section": diff_size_section,
                 "ci_status_section": ci_status_section,
                 "over_cap_section": over_cap_section,
+                "attachment_budget_section": attachment_budget_section,
                 "prior_review_section": prior_review_section,
             },
         )
@@ -14774,159 +14892,11 @@ class OrchestratorApp:
             },
         )
 
-    # PR-record bookkeeping that must not survive an operator re-arm: attempt
-    # counters and caches that would otherwise instantly re-escalate the PR
-    # (counters at cap) or feed the pipeline frozen pre-escalation data
-    # (janitor/CI caches — pr-lifecycle.md: escalated PRs freeze their cached
-    # janitor state forever, e.g. #548 showing "Tests pending" 12h after the
-    # checks passed).
-    _UNESCALATE_PR_RESET_FIELDS = (
-        "review_dispatch_attempt_count",
-        # Issue #1351: companion baseline to review_dispatch_attempt_count.
-        # Cleared on re-arm alongside the counter so the next review() for the
-        # same head starts a fresh dispatch cycle (counter is 0 either way, but
-        # this keeps the pair consistent with the other _last_head baselines).
-        "review_dispatch_attempt_last_head",
-        "review_log_unreadable_streak",
-        # Issue #1439: turn-limit miss streak must not survive a re-arm, or
-        # the cap-aware backstop would re-escalate instantly on the next
-        # turn-limit death.
-        "review_turn_limit_miss_streak",
-        "request_changes_count",
-        "conflict_rework_attempts",
-        "conflict_rework_attempts_last_head",
-        "no_op_rework_attempts",
-        "no_op_rework_attempts_last_head",
-        "review_dispatch_status",
-        "review_dispatch_failed_at",
-        "review_dispatch_pending_at",
-        "review_dispatched_at",
-        "reviewer_pid",
-        "reviewer_process_start_time",
-        "review_turn_limit_summary_posted",
-        "review_miss_summary_posted",
-        "janitor_ok",
-        "janitor_failures",
-        "janitor_warnings",
-        # Same frozen-cache hazard as janitor_ok/janitor_failures above: once
-        # a head is flagged never-created, the dedup marker would otherwise
-        # silently suppress a fresh event even after an operator re-arms the
-        # PR and the same head is still stuck.
-        "ci_run_never_created_head",
-        "escalation_reason",
-        # Issue #1461: clear the append-only escalation history so a re-arm
-        # gives every lane a genuinely fresh dedup slate.
-        "escalation_reasons_seen",
-        "label_error",
-        # Issue #1099: the per-head cross-family regeneration record holds both
-        # budgets. Leaving it behind makes the re-arm inert -- loop() reads the
-        # spent counters and parks the PR again on the very next pass, so the
-        # operator's unescalate accomplishes nothing without also hand-editing
-        # state.json. That is the same "re-arm does not stick" shape this
-        # command exists to fix.
-        "cross_family_regen",
-        # Rescue tier (issue #555): rescue_attempted is the durable "used my
-        # one shot" marker. Only charlie unescalate clears it (this tuple) —
-        # every other code path treats a present marker as permanent.
-        "rescue_attempted",
-        "rescue_cause",
-        "rescue_dispatched_at",
-    )
-    # Issue-record equivalents (dispatch-side caps and stale worker bookkeeping).
-    _UNESCALATE_ISSUE_RESET_FIELDS = (
-        "dispatch_failed_at",
-        "redispatch_at",
-        "worker_death_at",
-        # Issue #1243: the orphan-sweep no-open-PR redispatch cap tracking
-        # fields must reset on human un-escalate so the cap starts fresh
-        # after the operator re-arms the issue.
-        "orphan_redispatch_head_sha",
-        "orphan_redispatch_at",
-        "orphan_redispatch_counted_dispatch",
-        "escalation_reason",
-        # Issue #1461: clear the append-only escalation history so a re-arm
-        # gives every lane a genuinely fresh dedup slate.
-        "escalation_reasons_seen",
-        # Issue #783: a human-authorized manual unescalate clears the reason
-        # class (the escalation itself is gone) and resets the auto
-        # de-escalation counter -- unlike the automated sweep, which never
-        # resets its own counter (that is the oscillation guard; see
-        # _maybe_deescalate_mechanical). The one-time cap-notification marker
-        # must reset alongside the counter it gates: without this, a human
-        # unescalate -> re-escalate -> re-hit-the-cap cycle would silently
-        # suppress the second `deescalation_cap_exhausted` event because the
-        # stale marker from the first cap-hit survived the reset, leaving
-        # the oscillation guard's terminal state undiagnosable the second
-        # time around.
-        "reason_class",
-        "auto_deescalation_count",
-        "deescalation_cap_notified_at",
-        # Issue #1093: the per-escalation-episode marker for the rework
-        # budget reset must clear alongside the escalation it tracks, so a
-        # manual re-arm gives the next sweep clear a clean slate.
-        "rework_budget_reset_for_terminal_since",
-        "label_error",
-        "worker_pid",
-        "worker_process_start_time",
-        "dispatched_at",
-    )
-    # Issue #1093: the de-escalation sweep's once-per-episode rework-budget
-    # reset must zero the per-mechanism PR counter that ACTUALLY gates the
-    # cleared ``escalation_reason``, not a counter belonging to a different
-    # lane.  ``_route_janitor_gate_failure_to_rework`` escalates with reason
-    # ``f"{attempts_key}_cap_exceeded"`` (or ``_stall_exceeded``) and reads
-    # ``attempts_key`` itself on the next pass; ``record_review`` escalates
-    # with ``max_rework_cycles_exceeded`` and reads ``request_changes_count``.
-    # Resetting ``request_changes_count`` for a ``no_op_rework_attempts_*``
-    # clear (the PR's own reproduction scenario) left the real gating counter
-    # untouched, so the router re-escalated on the very next detection -- the
-    # promised "fresh rework budget" never applied to the lane it serves.
-    #
-    # Each lane's counter is reset together with its head-baseline
-    # (``_last_head``) and stall-clock (``_stall_since`` / ``_stall_head``)
-    # companions so the next detection re-baselines instead of inheriting a
-    # stale head/stall snapshot from the exhausted episode.  Escalation
-    # reasons with no per-mechanism rework counter (e.g.
-    # ``session_failed_escalated``, ``worktree_unsafe``) are absent from the
-    # map: there is no rework budget to reset for them, so the clear resets
-    # nothing extra.  ``auto_deescalation_count`` still independently bounds
-    # total clears (Issue #783 hazard (b)), so the per-episode reset cannot
-    # unbound the paid-session loop.
-    _REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[str, tuple[str, ...]]] = {
-        "max_rework_cycles_exceeded": ("request_changes_count", ()),
-        "no_op_rework_attempts_cap_exceeded": (
-            "no_op_rework_attempts",
-            (
-                "no_op_rework_attempts_last_head",
-                "no_op_rework_attempts_stall_since",
-                "no_op_rework_attempts_stall_head",
-            ),
-        ),
-        "no_op_rework_attempts_stall_exceeded": (
-            "no_op_rework_attempts",
-            (
-                "no_op_rework_attempts_last_head",
-                "no_op_rework_attempts_stall_since",
-                "no_op_rework_attempts_stall_head",
-            ),
-        ),
-        "conflict_rework_attempts_cap_exceeded": (
-            "conflict_rework_attempts",
-            (
-                "conflict_rework_attempts_last_head",
-                "conflict_rework_attempts_stall_since",
-                "conflict_rework_attempts_stall_head",
-            ),
-        ),
-        "conflict_rework_attempts_stall_exceeded": (
-            "conflict_rework_attempts",
-            (
-                "conflict_rework_attempts_last_head",
-                "conflict_rework_attempts_stall_since",
-                "conflict_rework_attempts_stall_head",
-            ),
-        ),
-    }
+    # Re-arm field sets live in unescalate_reset_fields.py (extracted under the
+    # #1442 ratchet); the aliases keep ``self._...`` call sites and tests intact.
+    _UNESCALATE_PR_RESET_FIELDS = UNESCALATE_PR_RESET_FIELDS
+    _UNESCALATE_ISSUE_RESET_FIELDS = UNESCALATE_ISSUE_RESET_FIELDS
+    _REWORK_BUDGET_RESET_BY_ESCALATION_REASON = REWORK_BUDGET_RESET_BY_ESCALATION_REASON
 
     def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> str | None:
         """Re-run the worktree safety check for an issue (issue #849).
@@ -15092,10 +15062,14 @@ class OrchestratorApp:
         # changed nothing causal — the next rework dispatch reproduces the
         # escalation deterministically. Re-run the safety check and refuse to
         # clear while the worktree still fails it.
+        # Issue #807: ``worktree_unsafe`` is split into
+        # ``worktree_unsafe_shim_dirt`` and ``worktree_unsafe_local_commits``;
+        # both are covered by ``WORKTREE_UNSAFE_KINDS`` so the safety re-check
+        # fires for either kind.
         if (
             issue_number is not None
             and issue_stuck
-            and issue_state.get("escalation_reason") == "worktree_unsafe"
+            and issue_state.get("escalation_reason") in WORKTREE_UNSAFE_KINDS
         ):
             unsafe_reason = self._worktree_still_unsafe(issue_number, state)
             if unsafe_reason:
@@ -16111,10 +16085,25 @@ class OrchestratorApp:
                         },
                     )
 
+        # Issue #1060: derive ``can_merge`` from a single dict of gate inputs
+        # and persist that same dict in the ``merge_ready`` event below. The
+        # gate and the record now read from one source, so a future added
+        # condition cannot silently fall out of the persisted payload the way
+        # ``mergequeue_label_applied`` did (it existed only in the in-memory
+        # return dict, never in events.db, so a query for it was vacuously 0
+        # for every PR that has ever existed). A hand-maintained list of keys
+        # drifts from the expression it describes; this dict *is* the
+        # expression.
+        merge_gate_inputs = {
+            "summary_ready": summary.ready,
+            "approved": approved,
+            "require_approved_review": self.config.auto_merge.require_approved_review,
+            "sync_failed": sync_failed,
+        }
         can_merge = (
-            summary.ready
-            and (approved or not self.config.auto_merge.require_approved_review)
-            and not sync_failed
+            merge_gate_inputs["summary_ready"]
+            and (merge_gate_inputs["approved"] or not merge_gate_inputs["require_approved_review"])
+            and not merge_gate_inputs["sync_failed"]
         )
         # Issue #840: escalation gate on the merge-execution block. An
         # approved, green, conflict-free PR whose linked issue (or the PR
@@ -16677,6 +16666,17 @@ class OrchestratorApp:
                     "merge_hold": merge_hold,
                     "merge_hold_check_unavailable": merge_hold_check_unavailable,
                     "cancel_superseded_runs_results": cancel_results,
+                    # Issue #1060: persist the Aviator handoff outcome so a
+                    # query for it is no longer vacuously 0 for every PR. This
+                    # key previously existed only in the in-memory return dict
+                    # below, never in events.db.
+                    "mergequeue_label_applied": mergequeue_label_applied,
+                    # Issue #1060: persist the three gate inputs alongside the
+                    # conclusion so a ``can_merge=False`` can be diagnosed from
+                    # events.db alone. Spread from the same dict the gate reads
+                    # (``merge_gate_inputs`` above) so a future added condition
+                    # cannot silently fall out of the record.
+                    **merge_gate_inputs,
                 },
             )
             # Issue #747: emit a dedicated terminal success event on the
@@ -16729,6 +16729,9 @@ class OrchestratorApp:
             "merge_hold": merge_hold,
             "merge_hold_check_unavailable": merge_hold_check_unavailable,
             "escalated_merge_hold": escalated_merge_hold,
+            # Issue #1060: surface the gate inputs in the in-memory verdict
+            # too, for diagnostic parity with the persisted event.
+            **merge_gate_inputs,
         }
         message = "merge readiness evaluated"
         if cross_pr_revert_detected:
@@ -16949,10 +16952,20 @@ class OrchestratorApp:
         diff = self.gh.pr_diff(pr_number)
         containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)
 
+        # Issue #1060: mirror the real path's dict-based gate so the two
+        # duplicated gates cannot drift -- a future condition added to one but
+        # not the other would silently diverge the dry-run preview from the
+        # real verdict.
+        merge_gate_inputs = {
+            "summary_ready": summary.ready,
+            "approved": approved,
+            "require_approved_review": self.config.auto_merge.require_approved_review,
+            "sync_failed": sync_failed,
+        }
         can_merge = (
-            summary.ready
-            and (approved or not self.config.auto_merge.require_approved_review)
-            and not sync_failed
+            merge_gate_inputs["summary_ready"]
+            and (merge_gate_inputs["approved"] or not merge_gate_inputs["require_approved_review"])
+            and not merge_gate_inputs["sync_failed"]
         )
         # Issue #840: mirror the real path's escalation gate so the dry-run
         # preview accurately reports "would be held" instead of "would merge"
@@ -17046,6 +17059,9 @@ class OrchestratorApp:
                 "merge_hold": merge_hold,
                 "merge_hold_check_unavailable": merge_hold_check_unavailable,
                 "escalated_merge_hold": escalated_merge_hold,
+                # Issue #1060: surface the gate inputs in the dry-run preview
+                # too, for diagnostic parity with the persisted event.
+                **merge_gate_inputs,
                 "dry_run": True,
             },
         )
@@ -17291,6 +17307,163 @@ class OrchestratorApp:
                 report_path=report_path,
             )
         return self._cross_family_section(result.report_path), result
+
+    def _read_advisories_from_pr_comment(
+        self, pr_number: int
+    ) -> tuple[AdvisoryRecord, ...] | None:
+        """Read worker-published advisories from the PR-comment channel (#1466).
+
+        Scans the PR's issue-level comments (a PR is also an issue, so its
+        top-level comments live at ``repos/{owner}/{repo}/issues/<n>/comments``)
+        for the most recent one whose body starts with
+        ``ADVISORY_COMMENT_MARKER`` and parses it via
+        ``attachment_hook_entry.parse_advisories_comment``.
+
+        Returns ``None`` when no marker comment is present (the caller falls
+        back to the local advisories log), or a tuple (possibly ``()``) when
+        one is -- a present marker with no parseable records is still a
+        present channel, so the caller does NOT fall back and the review
+        packet renders an empty redirects-not-taken list rather than the
+        "log not available" NOTE.
+
+        The most-recent marker comment wins: a worker re-posts the comment on
+        each push, so the latest one reflects the current head's advisories
+        and any older marker comment is stale. ``_gh_api_list`` returns
+        comments in chronological order (GitHub's default for that endpoint),
+        so the last match in the list is the newest.
+
+        Fail-soft: any GitHub API error (``_gh_api_list`` swallows them and
+        returns ``[]``) yields ``None`` -- a transient API failure degrades to
+        the local-log fallback rather than blocking packet generation, since
+        this section is advisory-only.
+        """
+        owner_repo = "{owner}/{repo}"
+        comments = _gh_api_list(self.gh, f"repos/{owner_repo}/issues/{pr_number}/comments")
+        marker_body: str | None = None
+        for item in comments:
+            body = item.get("body")
+            if isinstance(body, str) and body.lstrip().startswith(
+                attachment_hook_entry.ADVISORY_COMMENT_MARKER
+            ):
+                marker_body = body
+        if marker_body is None:
+            return None
+        parsed = attachment_hook_entry.parse_advisories_comment(marker_body)
+        # ``parse_advisories_comment`` returns ``None`` only for a body that
+        # does not start with the marker -- which the loop above already
+        # guaranteed -- so this is always a tuple here. Guard anyway so a
+        # future change to the parser's contract cannot make this method
+        # silently return ``None`` for a present-but-malformed marker comment
+        # (which would wrongly trigger the local-log fallback).
+        return parsed if parsed is not None else ()
+
+    def _build_attachment_budget_section(self, diff: str, pr_number: int) -> str:
+        """Build ``$attachment_budget_section`` for the review packet (#1460).
+
+        Cheap gate first: if `.attachment-budgets.json` is absent, or this
+        diff touches neither the baseline file itself nor any file that
+        currently hosts a baselined attachment point, the section renders
+        ``""`` -- the vast majority of PRs never approach this feature at
+        all, so nothing past the gate (diff-hunk reconstruction, advisories
+        read) runs for them.
+
+        Once gated in: the base-commit baseline text is read best-effort
+        (a ``TamperError``/``OSError`` degrades to "no entries", same as a
+        missing file -- this section is advisory-only and must never raise);
+        the PR-head text is reconstructed from the diff (or read straight off
+        disk when the baseline file itself isn't part of this diff); a
+        reconstruction failure sets ``head_unreadable`` rather than guessing.
+
+        Advisories are read best-effort, with "log file doesn't exist"
+        (``advisory_log_exists`` False) distinguished from "log exists but
+        has nothing relevant" -- only the former sets
+        ``advisories_unavailable``.
+
+        Issue #1466: the advisories source is now a two-tier fallback. The
+        PR-comment channel is tried FIRST -- the worker publishes a single
+        machine-readable PR comment (marker ``ADVISORY_COMMENT_MARKER`` +
+        fenced JSON array of its ``AdvisoryRecord`` entries) at PR-open time
+        and on subsequent pushes, because the worker's worktree-local
+        ``.var/attachment-contracts/advisories.jsonl`` is generally invisible
+        to the orchestrator's ``repo_root``. When a marker comment is present
+        (``parse_advisories_comment`` returns a tuple, even ``()``), that
+        channel wins and the local log is not consulted. Only when NO marker
+        comment exists does the builder fall back to the local advisories
+        file; and only when NEITHER channel is available does
+        ``advisories_unavailable`` fire the "log not available" NOTE.
+        """
+        marker_path = self.repo_root / attachment_baseline.BASELINE_FILENAME
+        if not marker_path.is_file():
+            return ""
+
+        changed_files = _diff_content_signature(diff).changed_files
+        baseline_touched = attachment_baseline.BASELINE_FILENAME in changed_files
+
+        try:
+            base_document = attachment_baseline.load(marker_path)
+            base_entries = attachment_baseline.entries_of(base_document)
+        except (attachment_baseline.TamperError, OSError):
+            base_entries = ()
+        hosts_baselined = changed_files & {entry.file for entry in base_entries}
+
+        if not (baseline_touched or hosts_baselined):
+            return ""
+
+        try:
+            base_baseline_text: str | None = marker_path.read_text(encoding="utf-8")
+        except OSError:
+            base_baseline_text = None
+
+        if baseline_touched:
+            file_diff_lines: list[str] = []
+            is_new_baseline_file = False
+            for name, is_new, hunks in iter_diff_files(diff):
+                if name == attachment_baseline.BASELINE_FILENAME:
+                    file_diff_lines = hunks
+                    is_new_baseline_file = is_new
+                    break
+            head_baseline_text = reconstruct_baseline_head_text(
+                None if is_new_baseline_file else base_baseline_text,
+                "\n".join(file_diff_lines),
+            )
+        else:
+            # Baseline file itself untouched by this diff: its head content
+            # is its base content.
+            head_baseline_text = base_baseline_text
+
+        if baseline_touched and head_baseline_text is None:
+            section = BudgetSection(
+                bumps=(),
+                blocking_bumps=(),
+                saturated_touched=(),
+                redirects_not_taken=(),
+                head_unreadable=True,
+                advisories_unavailable=False,
+            )
+        else:
+            advisories: tuple[AdvisoryRecord, ...] | None
+            # Issue #1466: prefer the worker-published PR-comment channel.
+            # ``_read_advisories_from_pr_comment`` returns ``None`` when no
+            # marker comment is present (fall back to the local log) and a
+            # tuple (possibly ``()``) when one is (that channel wins, even
+            # if empty -- a present marker with no records is a clean pass,
+            # not an unavailable channel).
+            pr_comment_advisories = self._read_advisories_from_pr_comment(pr_number)
+            if pr_comment_advisories is not None:
+                advisories = pr_comment_advisories
+            elif attachment_hook_entry.advisory_log_exists(self.repo_root):
+                advisories = attachment_hook_entry.read_advisories(self.repo_root)
+            else:
+                advisories = None
+            section = build_budget_findings(
+                base_baseline_text=base_baseline_text,
+                head_baseline_text=head_baseline_text,
+                changed_files=changed_files,
+                baseline_touched=baseline_touched,
+                advisories=advisories,
+            )
+
+        return render_attachment_budget_section(section)
 
     def _build_prior_review_section(
         self,
@@ -18962,18 +19135,14 @@ class OrchestratorApp:
             escalation_reason = f"{attempts_key}_cap_exceeded"
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
+                worker_launched = _worker_launched_before_cap_escalation(state, issue_number)
                 state = _escalate_issue(
                     state,
                     issue_number,
                     reason=escalation_reason,
                     reason_class="mechanical",
                     pr_number=pr_number,
-                    pr_extra={
-                        attempts_key: attempts,
-                        # Issue #1106: clear startup-death flags on escalate.
-                        "last_rework_failure_kind": None,
-                        "last_rework_was_startup_death": False,
-                    },
+                    pr_extra=_cap_escalation_pr_extra(attempts_key, attempts, worker_launched),
                 )
                 state = self._record_event(
                     state,
@@ -18984,6 +19153,7 @@ class OrchestratorApp:
                         "reason": reason,
                         "escalation_reason": escalation_reason,
                         "attempts": attempts,
+                        "worker_launched": worker_launched,
                     },
                 )
                 save_state(self.paths.state_file, state)
@@ -21057,7 +21227,11 @@ class OrchestratorApp:
         # operation that changed nothing causal — the next rework dispatch
         # reproduces the escalation deterministically. Re-run the safety
         # check and skip clearing while the worktree still fails it.
-        if issue_entry.get("escalation_reason") == "worktree_unsafe":
+        # Issue #807: ``worktree_unsafe`` is split into
+        # ``worktree_unsafe_shim_dirt`` and ``worktree_unsafe_local_commits``;
+        # both are covered by ``WORKTREE_UNSAFE_KINDS`` so the safety re-check
+        # fires for either kind.
+        if issue_entry.get("escalation_reason") in WORKTREE_UNSAFE_KINDS:
             unsafe_reason = self._worktree_still_unsafe(issue_number, state)
             if unsafe_reason:
                 return _deescalation_skip("worktree_still_unsafe", issue_number)
@@ -23745,19 +23919,30 @@ class OrchestratorApp:
                         entry, window_minutes=self.config.watchdog.redispatch_window_minutes
                     ) + [now.isoformat().replace("+00:00", "Z")]
                     terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                    # Issue #807: a deterministic judgment failure escalates
+                    # immediately but as ``reason_class="judgment"``.
+                    deterministic_judgment = (
+                        failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                    )
+                    immediate_escalation = terminal_failure or deterministic_judgment
                     if (
-                        terminal_failure
+                        immediate_escalation
                         or len(redispatch_at) > self.config.watchdog.max_auto_redispatch
                     ):
                         # Escalate to human review
-                        reason = failure_kind if terminal_failure else "redispatch_cap_exceeded"
+                        reason = (
+                            failure_kind if immediate_escalation else "redispatch_cap_exceeded"
+                        )
                         # Issue #783: dead worker session / redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
+                        # Issue #807: a deterministic judgment failure (genuine
+                        # local commits) is a judgment call -- judgment.
+                        reason_class = "judgment" if deterministic_judgment else "mechanical"
                         state = _escalate_issue(
                             state,
                             request.issue_number,
                             reason=reason,
-                            reason_class="mechanical",
+                            reason_class=reason_class,
                             issue_extra={
                                 "redispatch_at": redispatch_at,
                                 "dispatched_at": None,
@@ -23765,7 +23950,7 @@ class OrchestratorApp:
                         )
                         entry = state["issues"][str(request.issue_number)]
                         save_state(self.paths.state_file, state)
-                        edge = _escalation_edge("redispatch_escalated", "mechanical")
+                        edge = _escalation_edge("redispatch_escalated", reason_class)
                         result = transition(
                             self.gh,
                             self.config.labels,
@@ -23948,6 +24133,7 @@ class OrchestratorApp:
             branch,
             wt_path,
             base_ref=self.config.dispatch.base_ref,
+            dry_run=self.write_gate.dry_run,
         )
         if not result.pushed:
             return False
@@ -24703,6 +24889,55 @@ class OrchestratorApp:
             )
             return ""
 
+    def _build_attachment_budget_value(self, issue_number: int) -> str:
+        """Derive the attachment-budget dispatch clause (issue #1460).
+
+        Marker-file presence is the ONLY activation switch: a repo that has
+        never run `attachment_contracts baseline` (no `.attachment-budgets.json`
+        at the repo root) gets an empty clause, silently -- this feature is
+        opt-in per repo, not a default every worker prompt must carry.
+
+        When the marker file IS present, its structural validity is checked
+        via `baseline.load` (not just existence) before the clause is
+        emitted, so a hand-corrupted or tampered baseline never ships
+        placement instructions that reference a broken `check-file` command.
+        Fail-soft, mirroring `_build_module_map_value`'s contract exactly: a
+        `TamperError` yields an empty clause (omitted section) plus a
+        `worker_attachment_budget_failed` warning event, never a dispatch
+        failure.
+
+        `log_event` (not `self._record_event`) is used for the same reason
+        `_build_module_map_value` uses it: `_write_worker_prompt` runs
+        outside a state-lock context, so the module-level, lock-free
+        primitive is the only one available here.
+        """
+        marker_path = self.repo_root / attachment_baseline.BASELINE_FILENAME
+        if not marker_path.is_file():
+            return ""
+        try:
+            attachment_baseline.load(marker_path)
+        except (attachment_baseline.TamperError, OSError, ValueError) as exc:
+            # ``TamperError`` covers baseline's own structural checks
+            # (schema version, entry shape, duplicate keys); ``ValueError``
+            # additionally covers a bare ``json.JSONDecodeError`` (a subclass
+            # of ``ValueError``) from genuinely malformed JSON, which
+            # ``baseline.loads`` does not wrap into a ``TamperError`` itself.
+            # ``OSError`` guards a read race between the ``is_file()`` check
+            # above and this read. Mirrors ``hook_entry._resolve_mode``'s
+            # except clause for the same reason.
+            log_event(
+                self.paths.state_file,
+                "worker_attachment_budget_failed",
+                {
+                    "issue_number": issue_number,
+                    "error": str(exc),
+                },
+                repo=self.repo_root.name,
+                level="warning",
+            )
+            return ""
+        return _ATTACHMENT_BUDGET_CLAUSE
+
     def _write_worker_prompt(
         self, issue: dict[str, Any], *, template: str | None = None, dry_run: bool = False
     ) -> Path:
@@ -24734,6 +24969,12 @@ class OrchestratorApp:
                 # failure. ``_build_module_map_value`` is the single point of
                 # enforcement for that fail-soft contract.
                 "module_map": self._build_module_map_value(issue_number),
+                # Issue #1460: the attachment-point placement clause, gated
+                # solely on `.attachment-budgets.json`'s presence. Fail-soft
+                # like module_map: a malformed baseline yields an empty
+                # string (omitted clause) plus a
+                # ``worker_attachment_budget_failed`` warning event.
+                "attachment_budget": self._build_attachment_budget_value(issue_number),
             },
         )
         # Issue #714: enforce the no-merge contract on the *rendered output*
@@ -24790,150 +25031,65 @@ class OrchestratorApp:
             repo_root=self.repo_root,
         )
 
+    def _fetch_commit_retrying(self, sha: str, *, leg: str) -> tuple[dict[str, Any] | None, str]:
+        """Thin delegate to ``queue_sync_coverage._fetch_commit_retrying``.
+
+        Kept as a bound method (rather than inlining the free-function call
+        at each call site) so any existing or future monkeypatch of
+        ``self._fetch_commit_retrying`` keeps working, mirroring
+        ``_write_rework_prompt``'s wrapper shape.
+        """
+        return _fetch_commit_retrying(self.gh, sha, leg=leg)
+
+    def _fetch_compare_retrying(
+        self, base: str, head: str, *, leg: str
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Thin delegate to ``queue_sync_coverage._fetch_compare_retrying``."""
+        return _fetch_compare_retrying(self.gh, base, head, leg=leg)
+
     def _queue_sync_merge_covered(
         self,
         pr: dict[str, Any],
         reviewed_head_sha: str | None,
         live_head_sha: str | None,
-    ) -> bool:
-        """Return True iff the merged head is an approval-covered queue sync-merge.
+    ) -> _QueueSyncCoverageResult:
+        """Thin delegate to ``queue_sync_coverage._queue_sync_merge_covered``.
 
-        Issue #1194: Aviator's mergequeue syncs a PR branch with main before
-        merging, so the merged head is a bot-authored merge commit whose
-        parents are the approved head and a main commit — a structural false
-        positive for the #502 tripwire's strict SHA equality. Recognize that
-        shape, and only that shape, as covered by the recorded approval. All
-        four conditions must hold (fail closed on every missing or ambiguous
-        signal — an unanswerable question keeps the finding firing, and the
-        existing ack flow remains the escape hatch):
+        See that function's docstring for the full four-condition predicate
+        (issue #1194) and the retry/indeterminate contract (job-cannon PRs
+        #1888, #1916, #1904, #1895).
 
-        1. the live head is a merge commit with exactly two parents;
-        2. exactly one parent IS the approved ``reviewed_head_sha``;
-        3. the other parent is reachable from the base branch as it stood
-           immediately BEFORE this PR's merge — anchored at the merge
-           commit's first parent, NOT at current main. Post-merge, current
-           main reaches everything the PR carried (including a smuggled
-           second parent) through the merge commit itself, so a naive
-           "reachable from main" test is vacuously true and enforces
-           nothing. Reachability from pre-merge main is the discriminating
-           form: nothing this PR introduced can be reachable from there.
-           This condition is the load-bearing one — it bounds the merged
-           content to (approved head + prior main) regardless of who
-           authored the commit;
-        4. the merge commit's author login is the configured
-           ``auto_merge.queue_bot_login`` and its committer is GitHub's
-           web-flow (both identity signals, same rationale as
-           ``_verify_synced_head``: either alone is spoofable via crafted
-           git metadata). Identity is defense-in-depth on top of (3), not a
-           substitute for it. Unset ``queue_bot_login`` disables recognition
-           entirely — the tripwire behaves exactly as before #1194.
-
-        Suppressions are audit-logged (``unauthorized_merge_queue_sync_covered``,
-        events.db via ``log_event`` — this path holds no state lock) so every
-        exercised gate exception leaves a queryable trail; consumer is the
-        operator auditing tripwire behavior, mirroring the skip-event pattern.
+        ``queue_sync_coverage.py`` is deliberately pure (issue #1264's
+        per-module WriteGate raw-primitive-call ratchet -- a new module
+        starts at baseline 0, so a raw ``log_event`` call moved there would
+        read as new growth even though it was already present, and already
+        counted, in this file). This wrapper therefore emits the
+        ``unauthorized_merge_queue_sync_covered`` audit event itself on a
+        covered result, exactly where that raw call already lived (and was
+        already counted) before the extraction.
         """
         queue_bot_login = self.config.auto_merge.queue_bot_login
-        if not queue_bot_login:
-            return False
-        if not reviewed_head_sha or not live_head_sha:
-            return False
-
-        head_result = self.gh.commit(live_head_sha)
-        head_commit = (
-            head_result.value
-            if isinstance(head_result, GitHubRunResult)
-            and head_result.ok
-            and isinstance(head_result.value, dict)
-            else None
+        result = _queue_sync_merge_covered(
+            self.gh,
+            queue_bot_login,
+            pr,
+            reviewed_head_sha,
+            live_head_sha,
         )
-        if not head_commit:
-            return False
-
-        parents = [
-            str(p.get("sha"))
-            for p in (head_commit.get("parents") or [])
-            if isinstance(p, dict) and p.get("sha")
-        ]
-        if len(parents) != 2:
-            return False
-        matching = [p for p in parents if p == reviewed_head_sha]
-        if len(matching) != 1:
-            # Zero matches: not a sync of the approved head. Two matches: a
-            # degenerate both-parents-approved merge — nothing to sync, so
-            # nothing this path needs to bless; fail closed.
-            return False
-        other_parent = next(p for p in parents if p != reviewed_head_sha)
-
-        # Identity (condition 4). Checked before the extra API calls of
-        # condition 3 purely to keep the miss path cheap; order does not
-        # affect the verdict since all conditions are conjunctive.
-        author = head_commit.get("author")
-        author_login = author.get("login") if isinstance(author, dict) else None
-        committer = head_commit.get("committer")
-        committer_login = committer.get("login") if isinstance(committer, dict) else None
-        commit_meta = head_commit.get("commit")
-        commit_committer = commit_meta.get("committer") if isinstance(commit_meta, dict) else None
-        committer_name = (
-            commit_committer.get("name") if isinstance(commit_committer, dict) else None
-        )
-        if (
-            author_login != queue_bot_login
-            or committer_login != "web-flow"
-            or committer_name != "GitHub"
-        ):
-            return False
-
-        # Condition 3: anchor at pre-merge main via the landing merge
-        # commit's first parent. GitHub commits merges on the base branch,
-        # so parents[0] of merge_commit_sha is the base tip this merge
-        # advanced. If the queue fast-forwarded instead (merge commit == the
-        # sync commit itself), parents[0] is the approved head, the compare
-        # below cannot succeed, and the finding keeps firing — fail closed.
-        merge_commit_sha = pr.get("mergeCommitOid")
-        if not merge_commit_sha:
-            return False
-        landing_result = self.gh.commit(str(merge_commit_sha))
-        landing_commit = (
-            landing_result.value
-            if isinstance(landing_result, GitHubRunResult)
-            and landing_result.ok
-            and isinstance(landing_result.value, dict)
-            else None
-        )
-        if not landing_commit:
-            return False
-        landing_parents = [
-            str(p.get("sha"))
-            for p in (landing_commit.get("parents") or [])
-            if isinstance(p, dict) and p.get("sha")
-        ]
-        if not landing_parents:
-            return False
-        pre_merge_base = landing_parents[0]
-
-        comparison = self.gh.compare(pre_merge_base, other_parent)
-        if not isinstance(comparison, dict):
-            return False
-        # "identical"/"behind" mean other_parent introduces zero commits not
-        # already on pre-merge main; "ahead"/"diverged" (or anything else)
-        # mean it carries content this approval never covered.
-        if comparison.get("status") not in ("identical", "behind"):
-            return False
-
-        log_event(
-            self.paths.state_file,
-            "unauthorized_merge_queue_sync_covered",
-            {
-                "pr": pr.get("number"),
-                "reviewed_head_sha": reviewed_head_sha,
-                "live_head_sha": live_head_sha,
-                "sync_parent": other_parent,
-                "pre_merge_base": pre_merge_base,
-                "queue_bot_login": queue_bot_login,
-            },
-        )
-        return True
+        if result.covered:
+            log_event(
+                self.paths.state_file,
+                "unauthorized_merge_queue_sync_covered",
+                {
+                    "pr": pr.get("number"),
+                    "reviewed_head_sha": reviewed_head_sha,
+                    "live_head_sha": live_head_sha,
+                    "sync_parent": result.sync_parent,
+                    "pre_merge_base": result.pre_merge_base,
+                    "queue_bot_login": queue_bot_login,
+                },
+            )
+        return result
 
     def _detect_unauthorized_merges(
         self, merged_prs: list[dict[str, Any]] | None = None
@@ -25034,12 +25190,12 @@ class OrchestratorApp:
             # evaluated lazily: only for approved decisions with a genuine
             # head mismatch and no override, so the common paths (matching
             # head, unapproved, overridden) never pay its API calls.
-            queue_sync_covered = (
-                approved
-                and not head_matches
-                and not override_authorized
-                and self._queue_sync_merge_covered(pr, reviewed_head_sha, live_head_sha)
+            coverage_result = (
+                self._queue_sync_merge_covered(pr, reviewed_head_sha, live_head_sha)
+                if approved and not head_matches and not override_authorized
+                else None
             )
+            queue_sync_covered = coverage_result is not None and coverage_result.covered
             if (
                 (not approved or not head_matches)
                 and not override_authorized
@@ -25050,17 +25206,30 @@ class OrchestratorApp:
                     is_cross_repository=pr.get("isCrossRepository"),
                     branch_prefix=prefix,
                 )
-                candidates.append(
-                    {
-                        "pr": pr_number,
-                        "issue": issue_number,
-                        "head": head,
-                        "decision": decision_value,
-                        "reviewed_head_sha": reviewed_head_sha,
-                        "live_head_sha": live_head_sha,
-                        "review_dispatch_enabled": review_dispatch_enabled,
-                    }
-                )
+                candidate: dict[str, Any] = {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "head": head,
+                    "decision": decision_value,
+                    "reviewed_head_sha": reviewed_head_sha,
+                    "live_head_sha": live_head_sha,
+                    "review_dispatch_enabled": review_dispatch_enabled,
+                }
+                # coverage_result is only non-None when _queue_sync_merge_covered
+                # actually ran (approved + head mismatch + no override) and did
+                # not return covered=True -- i.e. exactly the cases this
+                # candidate is being appended for. Distinguish "the API never
+                # answered" (indeterminate) from "the shape was checked and
+                # rejected" (not_covered) in the finding itself, so triage does
+                # not have to re-derive it from events.db.
+                if coverage_result is not None:
+                    if coverage_result.indeterminate:
+                        candidate["coverage_check"] = "indeterminate"
+                        candidate["coverage_check_error"] = coverage_result.reason
+                    else:
+                        candidate["coverage_check"] = "not_covered"
+                        candidate["coverage_reason"] = coverage_result.reason
+                candidates.append(candidate)
         reported = self._apply_unauthorized_merge_baseline(candidates)
         # Announce on the bounded set, never on raw candidates: the arming pass
         # deliberately reports nothing, and an acked finding is deliberately
@@ -25315,6 +25484,14 @@ class OrchestratorApp:
                         "reviewed_head_sha": candidate.get("reviewed_head_sha"),
                         "live_head_sha": candidate.get("live_head_sha"),
                         "review_dispatch_enabled": candidate.get("review_dispatch_enabled"),
+                        # Issue #1194 retry fix: present only for candidates that
+                        # went through _queue_sync_merge_covered (approved +
+                        # head-mismatch + no override) and were not covered --
+                        # None for every other finding shape (unapproved,
+                        # missing decision, ...). See _QueueSyncCoverageResult.
+                        "coverage_check": candidate.get("coverage_check"),
+                        "coverage_check_error": candidate.get("coverage_check_error"),
+                        "coverage_reason": candidate.get("coverage_reason"),
                     }
                 state[key] = record
                 for candidate in fresh:
@@ -25329,6 +25506,9 @@ class OrchestratorApp:
                             "reviewed_head_sha": candidate.get("reviewed_head_sha"),
                             "live_head_sha": candidate.get("live_head_sha"),
                             "review_dispatch_enabled": candidate.get("review_dispatch_enabled"),
+                            "coverage_check": candidate.get("coverage_check"),
+                            "coverage_check_error": candidate.get("coverage_check_error"),
+                            "coverage_reason": candidate.get("coverage_reason"),
                         },
                     )
                 save_state(self.paths.state_file, state)
@@ -26263,13 +26443,7 @@ class OrchestratorApp:
         lines.append("| citation | status |")
         lines.append("|---|---|")
         for v in drifted:
-            status_cell = v.status.value
-            if v.resolved_path:
-                # Surface where the file actually moved to for STALE_PREFIX
-                # verdicts so the worker can grep in the right place.
-                resolved_display = v.resolved_path.replace("\\", "/")
-                status_cell = f"{status_cell} (now at `{resolved_display}`)"
-            lines.append(f"| `{v.citation.raw}` | {status_cell} |")
+            lines.append(f"| `{v.citation.raw}` | {format_verdict_status_cell(v)} |")
         body = "\n".join(lines)
         issue_dir = self.paths.issues / f"issue-{issue_number}"
         try:

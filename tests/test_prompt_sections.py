@@ -23,6 +23,9 @@ ISSUE_VALUES = {
     # tests render against a tmp_path with no src/charlie_work tree; the
     # real writer (``_write_worker_prompt``) derives it from the live tree.
     "module_map": "",
+    # Issue #1460: the attachment-budget dispatch clause. Empty for the same
+    # reason module_map is empty above.
+    "attachment_budget": "",
     "pr_number": 456,
     "pr_title": "fix: search is broken",
     "pr_url": "https://example.test/pull/456",
@@ -188,6 +191,7 @@ def test_attacker_controlled_placeholders_not_expanded() -> None:
         "worker_model_tier": "capable",
         "issue_comments": "",
         "module_map": "",
+        "attachment_budget": "",
     }
 
     for template_name in ("worker.md", "worker_claude_code.md"):

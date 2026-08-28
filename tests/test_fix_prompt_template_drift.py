@@ -162,6 +162,7 @@ def test_packaged_review_template_is_satisfied_by_its_call_site() -> None:
             "diff_size_section": "",
             "ci_status_section": "",
             "over_cap_section": "",
+            "attachment_budget_section": "",
             "prior_review_section": "",
         },
     )

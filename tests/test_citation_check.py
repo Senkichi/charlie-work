@@ -95,11 +95,15 @@ def test_parse_multiple_distinct_citations() -> None:
 
 def test_verify_ok_for_valid_line(tmp_path: Path) -> None:
     _write(tmp_path, "src/workflow.py", ["a", "def f():", "    pass"])
-    # Resolve via bare basename under src/.
+    # A bare basename that resolves uniquely to a valid line is info-level
+    # ``RESOLVED_BY_BASENAME`` (issue #1452), not ``OK`` -- the literal path
+    # ``workflow.py`` does not exist; the basename ``workflow.py`` resolves to
+    # ``src/workflow.py``. The citation is usable, just imprecise.
     verdicts = verify_citations("workflow.py:2 drifted", tmp_path)
     assert len(verdicts) == 1
-    assert verdicts[0].status is CitationStatus.OK
+    assert verdicts[0].status is CitationStatus.RESOLVED_BY_BASENAME
     assert "def f():" in (verdicts[0].current_line_text or "")
+    assert verdicts[0].resolved_path is not None
 
 
 def test_verify_out_of_range(tmp_path: Path) -> None:
@@ -121,8 +125,9 @@ def test_verify_empty_line_is_drift(tmp_path: Path) -> None:
 
 def test_verify_range_ok(tmp_path: Path) -> None:
     _write(tmp_path, "src/workflow.py", [f"line{i}" for i in range(10)])
+    # Bare basename resolves uniquely -> RESOLVED_BY_BASENAME (info), not OK.
     verdicts = verify_citations("workflow.py:3-5 is the block", tmp_path)
-    assert verdicts[0].status is CitationStatus.OK
+    assert verdicts[0].status is CitationStatus.RESOLVED_BY_BASENAME
 
 
 def test_verify_range_out_of_range_when_end_exceeds(tmp_path: Path) -> None:
@@ -156,10 +161,13 @@ def test_verify_resolves_bare_basename_two_levels_deep(tmp_path: Path) -> None:
 
     assert len(verdicts) == 2
     assert verdicts[0].citation.path == "checks.py"
-    assert verdicts[0].status is CitationStatus.OK
+    # Bare basenames that resolve uniquely report RESOLVED_BY_BASENAME (info),
+    # not OK -- the literal paths do not exist; the basenames resolve two
+    # levels deep under src/. The line content still validates.
+    assert verdicts[0].status is CitationStatus.RESOLVED_BY_BASENAME
     assert "TARGET_CHECKS_LINE" in (verdicts[0].current_line_text or "")
     assert verdicts[1].citation.path == "workflow.py"
-    assert verdicts[1].status is CitationStatus.OK
+    assert verdicts[1].status is CitationStatus.RESOLVED_BY_BASENAME
     assert "TARGET_WORKFLOW_LINE" in (verdicts[1].current_line_text or "")
 
 
@@ -251,7 +259,9 @@ def test_verify_content_ok_when_stamped_content_matches(tmp_path: Path) -> None:
     verdicts = verify_citations(
         "workflow.py:1", tmp_path, commit_sha="abc1234", fetch_file_lines_at_commit=fetch
     )
-    assert verdicts[0].status is CitationStatus.OK
+    # Bare basename resolves uniquely and content matches -> RESOLVED_BY_BASENAME
+    # (info), not OK. No content drift because the stamped content matches.
+    assert verdicts[0].status is CitationStatus.RESOLVED_BY_BASENAME
 
 
 def test_verify_content_drift_skipped_when_fetch_returns_none(tmp_path: Path) -> None:
@@ -263,8 +273,9 @@ def test_verify_content_drift_skipped_when_fetch_returns_none(tmp_path: Path) ->
     verdicts = verify_citations(
         "workflow.py:1", tmp_path, commit_sha="abc1234", fetch_file_lines_at_commit=fetch
     )
-    # Falls back to coordinate-only check -> OK (line exists, non-blank).
-    assert verdicts[0].status is CitationStatus.OK
+    # Falls back to coordinate-only check; bare basename resolves uniquely and
+    # the line is valid -> RESOLVED_BY_BASENAME (info), not OK.
+    assert verdicts[0].status is CitationStatus.RESOLVED_BY_BASENAME
 
 
 def test_verify_content_drift_not_run_for_out_of_range(tmp_path: Path) -> None:
@@ -323,3 +334,131 @@ def test_fingerprint_differs_for_different_status_same_line(tmp_path: Path) -> N
     fp_oor = drift_fingerprint([CitationVerdict(c, CitationStatus.OUT_OF_RANGE)])
     fp_empty = drift_fingerprint([CitationVerdict(c, CitationStatus.EMPTY_LINE)])
     assert fp_oor != fp_empty
+
+
+# --------------------------------------------------------------------------- #
+# basename resolution: RESOLVED_BY_BASENAME / AMBIGUOUS_BASENAME (issue #1452)
+# --------------------------------------------------------------------------- #
+
+
+def test_verify_resolved_by_basename_for_unique_match_outside_source_roots(
+    tmp_path: Path,
+) -> None:
+    # Issue #1452 root cause: the old basename index walked only
+    # ``src/``/``scripts/``/``tests/``, so a bare basename whose real file lived
+    # in another directory (job-cannon's ``job_finder/``) reported
+    # ``file_missing``. The new index derives from ``git ls-files`` (or a full
+    # tree walk in a non-git tmp_path), so a file under an arbitrary directory
+    # resolves. A unique match with a valid line reports
+    # ``RESOLVED_BY_BASENAME`` (info), not ``file_missing`` and not ``OK``.
+    lines = [f"line{i}" for i in range(11)]  # index 9 == line 10
+    lines[9] = "TARGET_ATS_PROBER_LINE"
+    _write(tmp_path, "job_finder/web/ats_prober.py", lines)
+
+    verdicts = verify_citations("ats_prober.py:10 is the defect", tmp_path)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].status is CitationStatus.RESOLVED_BY_BASENAME
+    assert "TARGET_ATS_PROBER_LINE" in (verdicts[0].current_line_text or "")
+    assert verdicts[0].resolved_path is not None
+    assert verdicts[0].resolved_path.replace("\\", "/").endswith("job_finder/web/ats_prober.py")
+
+
+def test_verify_ambiguous_basename_surfaces_candidates(tmp_path: Path) -> None:
+    # A bare basename matching more than one tracked file is a real citation
+    # defect: the author must disambiguate with a directory prefix. The verdict
+    # reports ``AMBIGUOUS_BASENAME`` with every candidate (repo-root-relative
+    # POSIX strings) so the drift comment can surface them.
+    _write(tmp_path, "job_finder/db/_jobs.py", ["db jobs"])
+    _write(tmp_path, "job_finder/web/scheduler/_jobs.py", ["web jobs"])
+
+    verdicts = verify_citations("_jobs.py:1 is the defect", tmp_path)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].status is CitationStatus.AMBIGUOUS_BASENAME
+    candidates = verdicts[0].candidates
+    assert candidates is not None
+    assert len(candidates) == 2
+    assert "job_finder/db/_jobs.py" in candidates
+    assert "job_finder/web/scheduler/_jobs.py" in candidates
+
+
+def test_verify_ambiguous_basename_is_drift(tmp_path: Path) -> None:
+    # AMBIGUOUS_BASENAME is a real defect -> it must appear in
+    # ``drifted_verdicts`` and produce a non-empty fingerprint so the dispatch
+    # flag-comment path fires.
+    _write(tmp_path, "job_finder/db/_jobs.py", ["db jobs"])
+    _write(tmp_path, "job_finder/web/scheduler/_jobs.py", ["web jobs"])
+
+    verdicts = verify_citations("_jobs.py:1 is the defect", tmp_path)
+
+    assert len(drifted_verdicts(verdicts)) == 1
+    assert drift_fingerprint(verdicts) != ""
+
+
+def test_verify_resolved_by_basename_is_not_drift(tmp_path: Path) -> None:
+    # RESOLVED_BY_BASENAME is info-level: it must NOT appear in
+    # ``drifted_verdicts`` and must produce an empty fingerprint, so the
+    # dispatch flag-comment path does not raise a false alarm for a usable
+    # bare-basename citation.
+    _write(tmp_path, "job_finder/web/ats_prober.py", ["x", "y", "z"])
+
+    verdicts = verify_citations("ats_prober.py:2 is the defect", tmp_path)
+
+    assert verdicts[0].status is CitationStatus.RESOLVED_BY_BASENAME
+    assert drifted_verdicts(verdicts) == []
+    assert drift_fingerprint(verdicts) == ""
+
+
+def test_verify_truly_absent_file_still_file_missing(tmp_path: Path) -> None:
+    # Acceptance criterion 2: a control citation naming a truly absent file
+    # (no tracked file shares the basename) still reports ``file_missing``.
+    _write(tmp_path, "src/real.py", ["x", "y", "z"])
+
+    verdicts = verify_citations("nonexistent.py:10 is the defect", tmp_path)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].status is CitationStatus.FILE_MISSING
+    assert len(drifted_verdicts(verdicts)) == 1
+
+
+def test_verify_line_range_validates_against_resolved_path(tmp_path: Path) -> None:
+    # Acceptance criterion 3: line-range validation runs against the resolved
+    # path, not the missing literal one. A range beyond EOF on the resolved
+    # file is still flagged as ``OUT_OF_RANGE`` (drift), even though the
+    # basename resolved.
+    _write(tmp_path, "job_finder/web/ats_prober.py", ["only one line"])
+
+    verdicts = verify_citations("ats_prober.py:5000 is the defect", tmp_path)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].status is CitationStatus.OUT_OF_RANGE
+    assert len(drifted_verdicts(verdicts)) == 1
+
+
+def test_verify_resolved_by_basename_then_empty_line_is_empty_line(
+    tmp_path: Path,
+) -> None:
+    # A bare basename that resolves uniquely but lands on a blank line is
+    # ``EMPTY_LINE`` (drift), not ``RESOLVED_BY_BASENAME`` -- the coordinate
+    # defect takes precedence over the info-level resolution.
+    _write(tmp_path, "job_finder/web/ats_prober.py", ["code()", "", "more()"])
+
+    verdicts = verify_citations("ats_prober.py:2 is the defect", tmp_path)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].status is CitationStatus.EMPTY_LINE
+
+
+def test_verify_literal_path_still_ok_when_it_exists(tmp_path: Path) -> None:
+    # A citation whose literal path exists at repo_root-relative location is
+    # ``OK`` -- the new basename logic only applies when the literal path is
+    # missing. This guards against a regression where every citation is
+    # reclassified as basename-resolved.
+    _write(tmp_path, "src/charlie_work/workflow.py", ["x", "def f():", "    pass"])
+
+    verdicts = verify_citations("src/charlie_work/workflow.py:2 drifted", tmp_path)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].status is CitationStatus.OK
+    assert verdicts[0].resolved_path is None

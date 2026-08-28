@@ -648,6 +648,7 @@ def test_worker_prompt_renders_issue_values() -> None:
             "worker_model_tier": "capable",
             "issue_comments": "",
             "module_map": "",
+            "attachment_budget": "",
         },
     )
 
@@ -669,6 +670,7 @@ def test_claude_code_worker_prompt_renders_issue_values() -> None:
             "worker_model_tier": "capable",
             "issue_comments": "",
             "module_map": "",
+            "attachment_budget": "",
         },
     )
 
@@ -18541,6 +18543,187 @@ def test_merge_ready_mergequeue_mode_unapproved_pr_not_labeled(tmp_path: Path) -
     assert result.data.get("mergequeue_label_applied") is None
 
 
+def test_merge_ready_event_persists_gate_inputs_distinguishing_false_causes(
+    tmp_path: Path,
+) -> None:
+    """Issue #1060: the ``merge_ready`` event must persist the three gate
+    inputs (``summary_ready``, ``approved``, ``require_approved_review``,
+    ``sync_failed``) alongside ``can_merge``, plus ``mergequeue_label_applied``,
+    so a ``can_merge=False`` can be diagnosed from events.db alone.
+
+    The three distinct false-causes -- CI not green, no recorded approval, base
+    sync failed -- must produce three *different* payloads, not three identical
+    ones. Mutating any single input must change the recorded event; if it does
+    not, the record is not load-bearing.
+    """
+
+    def _last_merge_ready_payload(state_file: Path) -> dict[str, Any]:
+        state = load_state(state_file)
+        events = [e for e in state["events"] if e["kind"] == "merge_ready"]
+        assert events, "no merge_ready event was recorded"
+        return events[-1]["payload"]
+
+    gate_keys = {"summary_ready", "approved", "require_approved_review", "sync_failed"}
+
+    # --- Scenario 1: CI not green (summary_ready=False) -------------------
+    # require_current_base=False keeps the base-freshness deferral gate off so
+    # the pass reaches the merge_ready event instead of short-circuiting on a
+    # stale-base deferral (which records a different event kind).
+    config_ci = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed",),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_ci = runtime_paths(tmp_path / "ci", config_ci.runtime.state_dir)
+    fake_gh_ci = FakeGitHubWithChecks(checks=[{"name": "Tests passed", "state": "FAILURE"}])
+    app_ci = OrchestratorApp(tmp_path / "ci", paths_ci, config_ci, fake_gh_ci)
+    app_ci.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    app_ci.merge_ready(456, merge=False)
+    payload_ci = _last_merge_ready_payload(paths_ci.state_file)
+
+    # --- Scenario 2: no recorded approval (approved=False) ----------------
+    config_noappr = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_noappr = runtime_paths(tmp_path / "noappr", config_noappr.runtime.state_dir)
+    fake_gh_noappr = FakeGitHub()
+    app_noappr = OrchestratorApp(tmp_path / "noappr", paths_noappr, config_noappr, fake_gh_noappr)
+    # Deliberately do NOT record a review -> approved=False.
+    app_noappr.merge_ready(456, merge=False)
+    payload_noappr = _last_merge_ready_payload(paths_noappr.state_file)
+
+    # --- Scenario 3: base sync failed (sync_failed=True) ------------------
+    # A genuine merge conflict (mergeable=CONFLICTING) sets sync_failed=True
+    # before the gate, while the default passing checks keep summary_ready=True.
+    config_sync = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            require_approved_review=True,
+        )
+    )
+    paths_sync = runtime_paths(tmp_path / "sync", config_sync.runtime.state_dir)
+    fake_gh_sync = FakeGitHub()
+    fake_gh_sync.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "BEHIND",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app_sync = OrchestratorApp(tmp_path / "sync", paths_sync, config_sync, fake_gh_sync)
+    app_sync.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    app_sync.merge_ready(456, merge=False)
+    payload_sync = _last_merge_ready_payload(paths_sync.state_file)
+
+    # All three are can_merge=False but for three distinct reasons, and every
+    # payload carries the gate inputs plus the persisted handoff outcome.
+    for payload in (payload_ci, payload_noappr, payload_sync):
+        assert payload["can_merge"] is False
+        assert gate_keys <= set(payload)
+        assert "mergequeue_label_applied" in payload
+
+    # Scenario 1: CI not green.
+    assert payload_ci["summary_ready"] is False
+    assert payload_ci["approved"] is True
+    assert payload_ci["require_approved_review"] is True
+    assert payload_ci["sync_failed"] is False
+
+    # Scenario 2: no recorded approval.
+    assert payload_noappr["summary_ready"] is True
+    assert payload_noappr["approved"] is False
+    assert payload_noappr["require_approved_review"] is True
+    assert payload_noappr["sync_failed"] is False
+
+    # Scenario 3: base sync failed (merge conflict).
+    assert payload_sync["summary_ready"] is True
+    assert payload_sync["approved"] is True
+    assert payload_sync["require_approved_review"] is True
+    assert payload_sync["sync_failed"] is True
+
+    # The three payloads are distinguishable on the gate-input sub-dict: no two
+    # share the same (summary_ready, approved, sync_failed) triple. Mutating any
+    # single input changes the recorded event -- the record is load-bearing.
+    triples = {
+        (p["summary_ready"], p["approved"], p["sync_failed"])
+        for p in (payload_ci, payload_noappr, payload_sync)
+    }
+    assert len(triples) == 3
+
+
+def test_merge_ready_real_path_return_data_includes_gate_inputs(
+    tmp_path: Path,
+) -> None:
+    """Issue #1060: the real (non-dry-run) ``merge_ready()`` call's returned
+    ``.data`` dict must include the four gate inputs
+    (``summary_ready``, ``approved``, ``require_approved_review``,
+    ``sync_failed``) alongside ``can_merge``, for diagnostic parity with the
+    persisted ``merge_ready`` event. The review found that only the persisted
+    event and the dry-run return were covered -- the real-path in-memory
+    verdict's gate-input spread had no regression test.
+
+    Two scenarios exercise both the ``can_merge=True`` and ``can_merge=False``
+    branches so the assertion is not vacuously satisfied by a missing key
+    defaulting to a falsy value.
+    """
+    gate_keys = {"summary_ready", "approved", "require_approved_review", "sync_failed"}
+
+    # --- Scenario 1: approved + green -> can_merge=True -------------------
+    config_ok = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_ok = runtime_paths(tmp_path / "ok", config_ok.runtime.state_dir)
+    fake_gh_ok = FakeGitHub()
+    app_ok = OrchestratorApp(tmp_path / "ok", paths_ok, config_ok, fake_gh_ok)
+    app_ok.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    result_ok = app_ok.merge_ready(456, merge=False)
+
+    assert result_ok.data["can_merge"] is True
+    assert gate_keys <= set(result_ok.data)
+    assert result_ok.data["summary_ready"] is True
+    assert result_ok.data["approved"] is True
+    assert result_ok.data["require_approved_review"] is True
+    assert result_ok.data["sync_failed"] is False
+
+    # --- Scenario 2: no recorded approval -> can_merge=False --------------
+    config_noappr = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            require_approved_review=True,
+            require_current_base=False,
+        )
+    )
+    paths_noappr = runtime_paths(tmp_path / "noappr", config_noappr.runtime.state_dir)
+    fake_gh_noappr = FakeGitHub()
+    app_noappr = OrchestratorApp(tmp_path / "noappr", paths_noappr, config_noappr, fake_gh_noappr)
+    # Deliberately do NOT record a review -> approved=False.
+    result_noappr = app_noappr.merge_ready(456, merge=False)
+
+    assert result_noappr.data["can_merge"] is False
+    assert gate_keys <= set(result_noappr.data)
+    assert result_noappr.data["summary_ready"] is True
+    assert result_noappr.data["approved"] is False
+    assert result_noappr.data["require_approved_review"] is True
+    assert result_noappr.data["sync_failed"] is False
+
+
 def test_merge_ready_mergequeue_parked_pr_excluded_from_merge_train_head(
     tmp_path: Path,
 ) -> None:
@@ -19897,6 +20080,105 @@ def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> No
     assert (123, config.labels.needs_rework) in fake_gh.labels_removed
 
 
+def test_dispatch_rework_worktree_unsafe_local_commits_escalates_as_judgment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #807: a rework-dispatch attempt whose failure_kind is
+    ``worktree_unsafe_local_commits`` (genuine unpushed local commits on the
+    worktree branch) must escalate immediately on the FIRST attempt — like a
+    deterministic mechanical failure — but with ``reason_class="judgment"`` so
+    the label lands ``agent:human-needed`` (not ``agent:operator-queue``) and
+    the de-escalation sweep never auto-clears it.
+
+    Mirrors ``test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment``
+    (the fresh-dispatch site) but covers ``_dispatch_rework_impl``'s escalation
+    branch — the rework-dispatch counterpart, which carries the same
+    reason_class-derivation logic.
+
+    Mutation gate: dropping the ``deterministic_judgment`` half of
+    ``immediate_escalation`` in ``_dispatch_rework_impl``'s escalation branch
+    makes this test fail (the issue takes the redispatch-cap path and stays
+    ``rework_requested`` instead of escalating). Reverting the
+    ``_escalation_edge("redispatch_escalated", reason_class)`` to the hardcoded
+    ``"mechanical"`` also fails it (the label lands ``agent:operator-queue``
+    while state carries ``reason_class="judgment"``).
+    """
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; sys.exit(1)",
+            ),
+        ),
+        watchdog=WatchdogConfig(
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="launch failed: worktree contains local commits",
+                failure_kind="worktree_unsafe_local_commits",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    # A deterministic judgment failure escalates on the FIRST attempt, not
+    # after burning max_auto_redispatch.
+    result = app.dispatch_rework()
+    assert result.ok is False
+    assert result.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe_local_commits"
+    assert state["issues"]["123"]["reason_class"] == "judgment"
+    # Escalated on the FIRST failure — not after burning max_auto_redispatch.
+    assert len(state["issues"]["123"]["redispatch_at"]) == 1
+    # Issue #807: judgment -> agent:human-needed, not agent:operator-queue.
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) in fake_gh.labels_removed
+
+
 def test_dry_run_dispatch_rework_leaves_state_unchanged(tmp_path: Path) -> None:
     """Issue #616: --dry-run rework dispatch must not advance the state machine
     off fabricated adapter results.
@@ -20517,7 +20799,15 @@ def test_merge_ready_dry_run_already_merged_is_noop(tmp_path: Path) -> None:
 
 def test_merge_ready_dry_run_unapproved_reports_can_merge_false(tmp_path: Path) -> None:
     """Issue #614: under --dry-run, an unapproved PR reports can_merge=False
-    without persisting any state."""
+    without persisting any state.
+
+    Issue #1060: the dry-run return payload must also surface the four gate
+    inputs (``summary_ready``, ``approved``, ``require_approved_review``,
+    ``sync_failed``) so the preview has diagnostic parity with the persisted
+    ``merge_ready`` event.  This scenario — checks green but no recorded
+    approval — exercises the ``approved=False`` / ``require_approved_review=True``
+    branch that makes ``can_merge`` False.
+    """
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -20528,6 +20818,13 @@ def test_merge_ready_dry_run_unapproved_reports_can_merge_false(tmp_path: Path) 
     assert result.data["can_merge"] is False
     assert result.data["merged"] is False
     assert result.data["dry_run"] is True
+    # Issue #1060: the four gate inputs are spread into the dry-run payload
+    # from the same dict the gate reads, so the preview explains *why*
+    # can_merge is False without needing events.db.
+    assert result.data["summary_ready"] is True
+    assert result.data["approved"] is False
+    assert result.data["require_approved_review"] is True
+    assert result.data["sync_failed"] is False
     # No state was written for this PR.
     assert "456" not in load_state(paths.state_file)["prs"]
 
@@ -26823,7 +27120,7 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
         started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
         error="worktree creation failed: worktree contains local work",
-        failure_kind="worktree_unsafe",
+        failure_kind="worktree_unsafe_shim_dirt",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
@@ -26834,11 +27131,125 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
     state = load_state(paths.state_file)
     entry = state["issues"]["123"]
     assert entry["status"] == "escalated"
-    assert entry["escalation_reason"] == "worktree_unsafe"
+    assert entry["escalation_reason"] == "worktree_unsafe_shim_dirt"
     # Issue #1266: a deterministic failure_kind escalation is mechanical
     # (same _escalate_issue site as worker_death_loop/redispatch_cap_exceeded
     # in _reap_restore_rework_requested), so this lands agent:operator-queue.
     assert (123, config.labels.operator_queue) in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+
+    event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
+    assert "session_failed_escalated" in event_kinds
+    assert "rework_requeued" not in event_kinds
+
+
+def test_classify_dead_rework_session_worktree_unsafe_local_commits_escalates_as_judgment(
+    tmp_path: Path,
+) -> None:
+    """Issue #807: a dead rework worker whose failure_kind is
+    ``worktree_unsafe_local_commits`` (genuine unpushed local commits on the
+    worktree branch) must escalate immediately on the first occurrence — like
+    the mechanical deterministic kinds — but with ``reason_class="judgment"`` so
+    the de-escalation sweep never auto-clears it and the label lands
+    ``agent:human-needed`` (not ``agent:operator-queue``).
+
+    Mirrors ``test_classify_dead_rework_session_deterministic_failure_kind_escalates_immediately``
+    (the mechanical sibling) and
+    ``test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment`` (the
+    fresh-dispatch site), but covers the dead-rework-worker path in
+    ``_reap_restore_rework_requested`` — the call site most relevant to the
+    original #807 scenario.
+
+    Mutation gate: reverting ``_reap_restore_rework_requested``'s label edge at
+    the function tail from ``_escalation_edge("redispatch_escalated",
+    reason_class)`` back to the hardcoded ``"mechanical"`` makes this test fail
+    — the issue escalates with ``reason_class="judgment"`` in state but the
+    label transition still lands ``agent:operator-queue``. Dropping the
+    ``deterministic_judgment`` half of ``immediate_escalation`` also fails it
+    (the issue is restored to ``rework_requested`` instead of escalating).
+    """
+    import json
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+    # fake_gh.prs[0]["headRefOid"] defaults to "sha-abc123".
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-fix-search",
+            "redispatch_at": [],  # nowhere near the cap
+        }
+        # Live request_changes decision matching the current head, so this
+        # test isolates the judgment-kind guard rather than finding 1's gate.
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("worktree contains local commits, cannot reset\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(paths.prs / "pr-456" / "rework-prompt.md"),
+        command=("devin", "--prompt-file", "rework-prompt.md"),
+        pid=None,  # Launch failure -- process never started
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="worktree creation failed: worktree contains local commits",
+        failure_kind="worktree_unsafe_local_commits",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
+    )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "worktree_unsafe_local_commits"
+    # Issue #807: a deterministic judgment failure escalates as judgment, so
+    # the label lands agent:human-needed, not agent:operator-queue.
+    assert entry["reason_class"] == "judgment"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
@@ -27311,7 +27722,7 @@ def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
         started_at=now.isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
         error="worktree creation failed: worktree contains local work",
-        failure_kind="worktree_unsafe",
+        failure_kind="worktree_unsafe_shim_dirt",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
@@ -27332,7 +27743,7 @@ def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
     state = load_state(paths.state_file)
     issue_entry = state["issues"]["42"]
     assert issue_entry["status"] == "escalated"
-    assert issue_entry["escalation_reason"] == "worktree_unsafe"
+    assert issue_entry["escalation_reason"] == "worktree_unsafe_shim_dirt"
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 42]
     assert "session_failed_relabeled" not in event_kinds
@@ -30441,7 +30852,7 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
                 adapter="command",
                 ok=False,
                 error="worktree is unsafe to reuse",
-                failure_kind="worktree_unsafe",
+                failure_kind="worktree_unsafe_shim_dirt",
             )
             for request in requests
         ]
@@ -30453,7 +30864,7 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
 
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
-    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe_shim_dirt"
     # Issue #1266: this deterministic-failure-kind escalation is mechanical,
     # so it lands agent:operator-queue, not agent:human-needed.
     assert (123, config.labels.operator_queue) in fake_gh.labels_added
@@ -44014,7 +44425,7 @@ def test_worktree_unsafe_launch_failure_with_commits_salvages_before_escalation(
         started_at=now.isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
         error="worktree creation failed: worktree contains local work",
-        failure_kind="worktree_unsafe",
+        failure_kind="worktree_unsafe_local_commits",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
@@ -44105,7 +44516,7 @@ def test_worktree_unsafe_launch_failure_no_commits_still_escalates(
         started_at=now.isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
         error="worktree creation failed: worktree contains local work",
-        failure_kind="worktree_unsafe",
+        failure_kind="worktree_unsafe_shim_dirt",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 

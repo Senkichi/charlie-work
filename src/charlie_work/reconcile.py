@@ -29,7 +29,11 @@ from pathlib import Path
 from typing import Any
 
 from .closing_reference import closing_issues_referenced_numbers, validate_closing_reference
-from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
+from .config import (
+    DETERMINISTIC_ESCALATION_FAILURE_KINDS,
+    DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
+    OrchestratorConfig,
+)
 from .escalation import (
     _escalate_issue,
     _escalation_edge,
@@ -1738,9 +1742,9 @@ def detect_drift(
                         if issue and _issue_state(issue) == "OPEN":
                             issue_labels = label_names(issue)
                             active_labels = issue_labels & labels_cfg.active
-                            if (
-                                active_labels
-                                and failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                            if active_labels and (
+                                failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                                or failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
                             ):
                                 drift.append(
                                     DriftItem(
@@ -1756,6 +1760,14 @@ def detect_drift(
                                             f"transition issue #{w.issue_number} labels via "
                                             "'redispatch_escalated' event",
                                         ),
+                                        # Issue #807: carry the failure_kind so
+                                        # apply_fixes can derive reason_class
+                                        # (judgment vs mechanical) instead of
+                                        # hardcoding "mechanical" -- a
+                                        # worktree_unsafe_local_commits death
+                                        # is a judgment call and must land
+                                        # human_needed, not operator_queue.
+                                        failure_kind=failure_kind,
                                     )
                                 )
                                 # Mark this issue as handled to avoid double-emission with
@@ -2962,17 +2974,27 @@ def apply_fixes(
             # via the same "redispatch_escalated" label edge workflow.py's
             # reaper uses, instead of relabeling to ready.
             # Issue #1266: this DriftItem is only ever raised when
-            # failure_kind is in DETERMINISTIC_ESCALATION_FAILURE_KINDS (see
+            # failure_kind is in DETERMINISTIC_ESCALATION_FAILURE_KINDS or
+            # DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS (see
             # detect_drift) -- the exact gate workflow.py's own dead-session
-            # reapers use to set reason_class="mechanical" unconditionally.
-            # This is a first-escalation path (reconcile.py detected a dead
-            # worker before any workflow.py sweep did), not a label-repair
-            # path, so it must independently resolve the mechanical edge
-            # rather than hardcoding "redispatch_escalated" -- otherwise the
-            # same dead-worker condition lands on a different label purely
+            # reapers use to resolve reason_class. This is a first-escalation
+            # path (reconcile.py detected a dead worker before any
+            # workflow.py sweep did), not a label-repair path, so it must
+            # independently resolve the reason_class from the carried
+            # failure_kind rather than hardcoding it -- otherwise the same
+            # dead-worker condition lands on a different label purely
             # because reconcile.py's drift pass caught it first.
+            # Issue #807: a worktree_unsafe_local_commits death is a judgment
+            # call (reason_class="judgment", lands human_needed), not a
+            # mechanical one (reason_class="mechanical", lands
+            # operator_queue). Hardcoding "mechanical" here reproduced the
+            # #807 bug through the reconcile.py path.
             if item.issue_number is not None:
-                edge = _escalation_edge("redispatch_escalated", "mechanical")
+                deterministic_judgment = (
+                    item.failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                )
+                reason_class = "judgment" if deterministic_judgment else "mechanical"
+                edge = _escalation_edge("redispatch_escalated", reason_class)
                 result = transition(gh, config.labels, item.issue_number, edge)
                 fix_actions = list(item.fix_actions)
                 if result.outcome != TransitionOutcome.APPLIED:
