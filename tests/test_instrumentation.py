@@ -1545,6 +1545,32 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
             "scanned there."
         ),
     ),
+    _UnresolvedKindSite(
+        path="dead_worker_reap.py",
+        scope="_attempt_salvage",
+        source="salvage_skip_event_kind(skip_reason)",
+        reason=(
+            "Issue #1241: salvage_skip_event_kind maps skip_reason to one of "
+            "two registered literals (salvage_skipped_already_landed for the "
+            "#1221 reasons, salvage_skipped_superseded for the new "
+            "commits_reachable reason), both in _LEVEL_BY_KIND. The mapping "
+            "is verified by test_salvage_skip_event_kind_only_returns_registered_kinds "
+            "in tests/test_salvage_superseded_1241.py."
+        ),
+    ),
+    _UnresolvedKindSite(
+        path="reconcile.py",
+        scope="apply_fixes",
+        source="salvage_skip_event_kind(skip_reason)",
+        reason=(
+            "Issue #1241: same salvage_skip_event_kind mapping as the "
+            "dead_worker_reap.py/_attempt_salvage entry above -- the reconcile "
+            "salvage lane and the workflow salvage lane share the single "
+            "enforcement point in salvage_superseded.py. Both target literals "
+            "are in _LEVEL_BY_KIND and verified by "
+            "test_salvage_skip_event_kind_only_returns_registered_kinds."
+        ),
+    ),
 )
 
 

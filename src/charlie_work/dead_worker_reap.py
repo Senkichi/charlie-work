@@ -136,12 +136,12 @@ from .worktree import (
     inspect_worktree_state,
     push_branch,
     resolve_base_branch_name,
-    salvage_branch_empty_diff,
     salvage_push_stranded_commits,
     summarize_branch_work,
     worktree_ahead_of_sha,
     worktree_path_for_branch,
 )
+from .salvage_superseded import check_salvage_superseded, salvage_skip_event_kind
 from .write_gate import WriteGate, require_write_gate
 
 
@@ -1883,6 +1883,13 @@ def _classify_dead_sessions_and_update_throttle_state(
                             state_file=state_file,
                             failure_kind=failure_kind,
                             issue_title=issue.get("title") if issue else None,
+                            # Issue #1241: pass the live issue so the shared
+                            # supersession check's closed-issue branch fires
+                            # here too -- without it the check would have to
+                            # re-fetch via ``gh.issue_view`` (an extra round
+                            # trip) and, worse, the caller already has the
+                            # freshest snapshot.
+                            issue=issue,
                             write_gate=write_gate,
                         )
 
@@ -2568,15 +2575,24 @@ def _salvage_already_landed(
 ) -> tuple[bool, str | None]:
     """Return ``(already_landed, reason)`` if salvage should be skipped.
 
-    Issue #1221: a dead session's snapshot (issue, pr_number, branch) can be
-    stale by the time staleness trips and salvage fires -- the linked issue may
-    have been closed and/or its PR merged by an operator or sibling worker
-    inside the staleness threshold window. Re-check LIVE terminal state at fire
-    time instead of trusting the snapshot. Any one of these means a salvage PR
-    would be vestigial (a duplicate of already-landed work):
+    Issue #1221 / #1241: a dead session's snapshot (issue, pr_number, branch)
+    can be stale by the time staleness trips and salvage fires -- the linked
+    issue may have been closed and/or its PR merged by an operator or sibling
+    worker inside the staleness threshold window, and (the #1241 race) the
+    branch's commits may already be reachable from origin/main via a merge
+    commit whose tree differs from the salvage head's tree. Re-check LIVE
+    terminal state at fire time instead of trusting the snapshot.
+
+    This is now a thin delegate to the shared single enforcement point
+    ``salvage_superseded.check_salvage_superseded`` so the workflow salvage
+    lane and the reconcile salvage lane cannot diverge on which checks fire
+    or in which order. The shared check covers:
 
     1. the linked issue is CLOSED (``issue`` carries ``state`` from the
-       caller's ``gh.issue_view`` -- one call, already made).
+       caller's ``gh.issue_view`` -- one call, already made; if ``issue`` is
+       None the shared check fetches it via ``gh.issue_view`` so the
+       closed-issue check still fires on the reconcile lane, which had not
+       fetched).
     2. a PR binding to this issue is MERGED (``gh.merged_prs_for_issue`` -- one
        call). A failed search (``ok=False``) is treated as "unknown", which
        falls through to opening the PR; a human reviews salvage PRs anyway.
@@ -2585,24 +2601,27 @@ def _salvage_already_landed(
        is the belt-and-suspenders for the case where (1)/(2) miss (e.g. a
        squash-merge that closed the issue but whose PR search lags, or work
        landed via a sibling branch). Fails safe (returns False) on git error.
+    4. (#1241) the salvage branch's tip is an ANCESTOR of origin/main
+       (``salvage_branch_reachable_from_main`` -- a fetch + ``git merge-base
+       --is-ancestor``). This catches the #1241 race that (3) misses: a merge
+       commit incorporated the salvage head while main advanced with other
+       commits, so the trees differ (empty-diff reads "not empty") but the
+       salvage head carries nothing new (ancestry reads "already on main").
+       Fails open on git error.
 
     ``reason`` is a short string identifying which check fired, recorded in the
-    ``salvage_skipped_already_landed`` event for diagnosis.
+    skip event (``salvage_skipped_already_landed`` for reasons 1-3,
+    ``salvage_skipped_superseded`` for reason 4) for diagnosis.
     """
-    # (1) Issue closed.
-    if issue is not None and str(issue.get("state") or "").upper() == "CLOSED":
-        return True, "issue_closed"
-
-    # (2) A merged PR binds to this issue.
-    merged = gh.merged_prs_for_issue(issue_number, config.dispatch.branch_prefix)
-    if getattr(merged, "ok", True) and len(merged) > 0:
-        return True, "pr_merged"
-
-    # (3) The branch's tree is identical to current main's tree.
-    if salvage_branch_empty_diff(repo_root, branch, base_ref):
-        return True, "empty_diff"
-
-    return False, None
+    return check_salvage_superseded(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch=branch,
+        base_ref=base_ref,
+        issue_number=issue_number,
+        issue=issue,
+    )
 
 
 def _attempt_salvage(
@@ -2661,9 +2680,15 @@ def _attempt_salvage(
             # Issue #282: preserve the liveness fingerprint so the recovery
             # path can verify the worker is dead before the worktree is
             # reclaimed.
+            # Issue #1241: the event kind is mapped from the skip reason so the
+            # new reachability skip (``commits_reachable``) emits
+            # ``salvage_skipped_superseded`` while the #1221 reasons keep their
+            # existing ``salvage_skipped_already_landed`` event.
             state = write_gate.append_event(
                 state,
-                "salvage_skipped_already_landed",
+                salvage_skip_event_kind(
+                    skip_reason
+                ),  # event-consumer: audit-only -- kind resolves to one of two registered literals (salvage_skipped_already_landed / salvage_skipped_superseded), both in _LEVEL_BY_KIND; the actionable state mutation (worktree reap) happens in the caller, this event is the observable skip record (issue #1241)
                 {
                     "issue_number": issue_number,
                     "failure_kind": failure_kind,
