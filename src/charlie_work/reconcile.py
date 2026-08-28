@@ -75,6 +75,7 @@ from .worktree import (
     resolve_base_branch_name,
     summarize_branch_work,
 )
+from .salvage_superseded import check_salvage_superseded, salvage_skip_event_kind
 
 logger = logging.getLogger(__name__)
 
@@ -3022,97 +3023,152 @@ def apply_fixes(
                 salvage_error = "repo_root not available"
                 pr_number = None
                 if repo_root is not None:
-                    push_ok, push_error = push_branch(repo_root, item.branch)
-                    if push_ok:
-                        has_pr_create = getattr(gh, "pr_create", None) is not None
-                        if has_pr_create:
-                            # Same janitor body gate as a worker-authored PR --
-                            # boilerplate alone can never satisfy it. Derive the
-                            # rationale from the worker's own commit log rather
-                            # than injecting the gate's keywords.
-                            salvage_body = (
-                                f"Closes #{item.issue_number}\n\n"
-                                "Salvaged by the orchestrator from a completed-but-unpublished "
-                                "worker worktree."
+                    # Issue #1241: before pushing/opening a PR, re-check LIVE
+                    # terminal state through the shared single enforcement
+                    # point (``check_salvage_superseded``). This salvage lane
+                    # is the second of the two salvage paths (the workflow
+                    # lane is the other) and previously had NO supersession
+                    # check -- it opened a vestigial duplicate PR whenever the
+                    # work had already landed through a sibling merge while
+                    # the dead session's snapshot still looked stranded. On a
+                    # skip, do NOT push, do NOT open a PR, and do NOT relabel
+                    # to ready (the work already landed -- redispatching would
+                    # loop). Label convergence is left to the closed-issue /
+                    # merged-PR drift kinds that fire alongside this one. The
+                    # skip is recorded as an observable event plus a
+                    # fix_action on the reconcile event.
+                    superseded, skip_reason = check_salvage_superseded(
+                        gh=gh,
+                        config=config,
+                        repo_root=repo_root,
+                        branch=item.branch,
+                        base_ref=item.base_branch,
+                        issue_number=item.issue_number,
+                    )
+                    if superseded:
+                        if state_path is not None:
+                            log_event(
+                                state_path,
+                                salvage_skip_event_kind(
+                                    skip_reason
+                                ),  # event-consumer: audit-only -- kind resolves to one of two registered literals (salvage_skipped_already_landed / salvage_skipped_superseded), both in _LEVEL_BY_KIND; the actionable label convergence happens in the sibling closed-issue / merged-PR drift kinds, this event is the observable skip record (issue #1241)
+                                {
+                                    "issue_number": item.issue_number,
+                                    "reason": skip_reason,
+                                    "branch": item.branch,
+                                },
                             )
-                            branch_summary = summarize_branch_work(
-                                repo_root,
-                                item.branch,
-                                item.base_branch,
-                                test_path_globs=config.test_adequacy.test_path_globs,
-                            )
-                            if branch_summary:
-                                salvage_body = f"{salvage_body}\n\n{branch_summary}"
-                            # cw#1263: canonicalize/validate the closing-reference
-                            # line the same way workflow.py's `_open_salvage_pr`
-                            # does, via the shared `closing_reference` module.
-                            # `workflow.py` imports `reconcile.py` (for
-                            # `apply_fixes`/`detect_drift`), so importing
-                            # `workflow._open_salvage_pr` back into this module
-                            # would cycle -- the standalone third module is what
-                            # lets both salvage-body builders share one
-                            # implementation without either importing the other.
-                            closing_ref = validate_closing_reference(
-                                salvage_body, item.issue_number, repo=_repo_slug(gh), gh=gh
-                            )
-                            salvage_body = closing_ref.body
-                            if closing_ref.changed and state_path is not None:
-                                log_event(
-                                    state_path,
-                                    "pr_closing_ref_rewritten",
-                                    {
-                                        "issue_number": item.issue_number,
-                                        "findings": list(closing_ref.findings),
-                                        "source": "session_unpublished_work_salvaged",
-                                    },
+                        item = DriftItem(
+                            kind=item.kind,
+                            issue_number=item.issue_number,
+                            pr_number=item.pr_number,
+                            detail=item.detail,
+                            fix_actions=item.fix_actions + (f"salvage_skipped: {skip_reason}",),
+                            remove_labels=(),
+                            add_labels=(),
+                            branch=item.branch,
+                            base_branch=item.base_branch,
+                        )
+                        # Skip the push/PR/relabel block: mark salvage_ok True
+                        # with no PR so the ``if salvage_ok`` label-swap block
+                        # below runs against empty remove/add label sets (a
+                        # no-op) rather than falling through to the
+                        # relabel-to-ready fallback. The work already landed;
+                        # redispatch is wrong.
+                        salvage_ok = True
+                        salvage_error = None
+                    else:
+                        push_ok, push_error = push_branch(repo_root, item.branch)
+                        if push_ok:
+                            has_pr_create = getattr(gh, "pr_create", None) is not None
+                            if has_pr_create:
+                                # Same janitor body gate as a worker-authored PR --
+                                # boilerplate alone can never satisfy it. Derive the
+                                # rationale from the worker's own commit log rather
+                                # than injecting the gate's keywords.
+                                salvage_body = (
+                                    f"Closes #{item.issue_number}\n\n"
+                                    "Salvaged by the orchestrator from a completed-but-unpublished "
+                                    "worker worktree."
                                 )
-                            # cw#1273: route through the bounded outer retry
-                            # + duplicate-PR guard instead of calling
-                            # gh.pr_create directly, matching workflow.py's
-                            # _open_salvage_pr (the other pr_create call site).
-                            retry_result = create_pr_with_retry(
-                                gh,
-                                head=item.branch,
-                                base=item.base_branch,
-                                title=f"Salvaged work for issue #{item.issue_number}",
-                                body=salvage_body,
-                                max_retries=config.runtime.pr_create_retry_max_attempts,
-                                base_seconds=config.runtime.pr_create_retry_base_seconds,
-                            )
-                            pr_number = retry_result.pr_number
-                        if pr_number is not None:
-                            salvage_ok = True
-                            # `pr_number` is falsy (0) under `dry_run`, where no
-                            # real PR was opened -- only probe a real, truthy PR
-                            # number (mirrors workflow.py::_open_salvage_pr).
-                            if pr_number and state_path is not None:
-                                query_ok = True
-                                try:
-                                    pr_view = gh.pr_view(
-                                        pr_number, fields=PR_CLOSING_ISSUES_FIELDS
-                                    )
-                                except Exception:
-                                    pr_view = {}
-                                    query_ok = False
-                                linked_numbers = closing_issues_referenced_numbers(pr_view)
-                                # Only log when the query itself succeeded --
-                                # a transient `gh` failure must not be conflated
-                                # with a genuine unlinked-PR miss (see
-                                # workflow.py::_open_salvage_pr for rationale).
-                                if query_ok and item.issue_number not in linked_numbers:
+                                branch_summary = summarize_branch_work(
+                                    repo_root,
+                                    item.branch,
+                                    item.base_branch,
+                                    test_path_globs=config.test_adequacy.test_path_globs,
+                                )
+                                if branch_summary:
+                                    salvage_body = f"{salvage_body}\n\n{branch_summary}"
+                                # cw#1263: canonicalize/validate the closing-reference
+                                # line the same way workflow.py's `_open_salvage_pr`
+                                # does, via the shared `closing_reference` module.
+                                # `workflow.py` imports `reconcile.py` (for
+                                # `apply_fixes`/`detect_drift`), so importing
+                                # `workflow._open_salvage_pr` back into this module
+                                # would cycle -- the standalone third module is what
+                                # lets both salvage-body builders share one
+                                # implementation without either importing the other.
+                                closing_ref = validate_closing_reference(
+                                    salvage_body, item.issue_number, repo=_repo_slug(gh), gh=gh
+                                )
+                                salvage_body = closing_ref.body
+                                if closing_ref.changed and state_path is not None:
                                     log_event(
                                         state_path,
-                                        "pr_closing_ref_unlinked",
+                                        "pr_closing_ref_rewritten",
                                         {
                                             "issue_number": item.issue_number,
-                                            "pr_number": pr_number,
-                                            "linked_issue_numbers": sorted(linked_numbers),
+                                            "findings": list(closing_ref.findings),
+                                            "source": "session_unpublished_work_salvaged",
                                         },
                                     )
+                                # cw#1273: route through the bounded outer retry
+                                # + duplicate-PR guard instead of calling
+                                # gh.pr_create directly, matching workflow.py's
+                                # _open_salvage_pr (the other pr_create call site).
+                                retry_result = create_pr_with_retry(
+                                    gh,
+                                    head=item.branch,
+                                    base=item.base_branch,
+                                    title=f"Salvaged work for issue #{item.issue_number}",
+                                    body=salvage_body,
+                                    max_retries=config.runtime.pr_create_retry_max_attempts,
+                                    base_seconds=config.runtime.pr_create_retry_base_seconds,
+                                )
+                                pr_number = retry_result.pr_number
+                            if pr_number is not None:
+                                salvage_ok = True
+                                # `pr_number` is falsy (0) under `dry_run`, where no
+                                # real PR was opened -- only probe a real, truthy PR
+                                # number (mirrors workflow.py::_open_salvage_pr).
+                                if pr_number and state_path is not None:
+                                    query_ok = True
+                                    try:
+                                        pr_view = gh.pr_view(
+                                            pr_number, fields=PR_CLOSING_ISSUES_FIELDS
+                                        )
+                                    except Exception:
+                                        pr_view = {}
+                                        query_ok = False
+                                    linked_numbers = closing_issues_referenced_numbers(pr_view)
+                                    # Only log when the query itself succeeded --
+                                    # a transient `gh` failure must not be conflated
+                                    # with a genuine unlinked-PR miss (see
+                                    # workflow.py::_open_salvage_pr for rationale).
+                                    if query_ok and item.issue_number not in linked_numbers:
+                                        log_event(
+                                            state_path,
+                                            "pr_closing_ref_unlinked",
+                                            {
+                                                "issue_number": item.issue_number,
+                                                "pr_number": pr_number,
+                                                "linked_issue_numbers": sorted(linked_numbers),
+                                            },
+                                        )
+                            else:
+                                salvage_error = "gh pr create failed or returned no PR number"
                         else:
-                            salvage_error = "gh pr create failed or returned no PR number"
-                    else:
-                        salvage_error = push_error or "git push failed"
+                            salvage_error = push_error or "git push failed"
 
                 if salvage_ok:
                     label_ok = True
