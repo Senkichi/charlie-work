@@ -184,7 +184,7 @@ def _git_ls_files(repo_root: Path) -> list[Path] | None:
     Uses the git index rather than a filesystem walk so the basename index
     covers the *entire* tracked tree -- not a hardcoded set of source roots.
     A repo whose real source files live outside ``src/``/``scripts/``/``tests/``
-    (e.g. job-cannon's ``job_finder/`` tree) is fully covered here, which is the
+    (e.g. a sibling repo's ``job_finder/`` tree) is fully covered here, which is the
     root cause this function exists: the prior hardcoded-root walk missed those
     files and every bare-basename citation reported ``file_missing`` (issue
     #1452). Returns ``None`` when git is unavailable or ``repo_root`` is not a

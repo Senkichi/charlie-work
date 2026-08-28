@@ -127,7 +127,7 @@ def resolve_cli_binary(name: str) -> str:
     find the underlying ``.exe`` it wraps (the npm shim pattern is stable —
     ``"%dp0%\\node_modules\\<pkg>\\bin\\<name>.exe" %*``) and use that ``.exe``
     path directly as ``argv[0]``. ``CreateProcessW`` then invokes it without
-    any shell interposed. Ported from job-cannon's
+    any shell interposed. Ported from a sibling repo's
     ``claude_client._resolve_cli_binary`` (commit fe0cdde7), which fixed the
     identical class of bug for the same npm-installed CLI shims.
 

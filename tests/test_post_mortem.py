@@ -1561,14 +1561,14 @@ def test_real_activity_for_worker_matches_real_fleet_working_directory_shape(
     """
     db_path = tmp_path / "sessions.db"
     real_fleet_worktree_path = (
-        r"C:\Users\senki\repos\charlie-work\.var\charlie-work\worktrees"
+        r"C:\Users\operator\repos\charlie-work\.var\charlie-work\worktrees"
         r"\agent-issue-203-redundant-re-dispatch"
     )
     # Recorded working_directory shares zero prefix with the worktree path
     # above -- only the trailing (worktrees-dir, issue-slug) segment pair
     # matches, exactly like the production sample values.
     recorded_working_directory = (
-        r"C:\Users\senki\AppData\Local\Temp\claude\some-other-session-root"
+        r"C:\Users\operator\AppData\Local\Temp\claude\some-other-session-root"
         r"\worktrees\agent-issue-203-redundant-re-dispatch"
     )
     _build_sessions_db(
@@ -1601,7 +1601,7 @@ def test_find_matching_session_suffix_fallback_rejects_different_issue_slug(
     _build_sessions_db(
         db_path,
         working_directory=(
-            r"C:\Users\senki\AppData\Local\Temp\other-root"
+            r"C:\Users\operator\AppData\Local\Temp\other-root"
             r"\worktrees\agent-issue-999-unrelated"
         ),
         nodes=[("assistant", "working", "2026-07-11T11:57:00")],
@@ -1611,7 +1611,7 @@ def test_find_matching_session_suffix_fallback_rejects_different_issue_slug(
 
     probe = real_activity_for_worker(
         config.post_mortem,
-        r"C:\Users\senki\repos\charlie-work\.var\charlie-work\worktrees\agent-issue-203-fix",
+        r"C:\Users\operator\repos\charlie-work\.var\charlie-work\worktrees\agent-issue-203-fix",
         "2026-07-11T11:55:00+00:00",
         12345,
         now,
@@ -1809,7 +1809,7 @@ def test_find_matching_session_suffix_fallback_requires_parent_segment_match(
     _build_sessions_db(
         db_path,
         working_directory=(
-            r"C:\Users\senki\AppData\Local\Temp\some-unrelated-tool-cache"
+            r"C:\Users\operator\AppData\Local\Temp\some-unrelated-tool-cache"
             r"\agent-issue-203-fix"
         ),
         nodes=[("assistant", "working", "2026-07-11T11:57:00")],
@@ -1819,7 +1819,7 @@ def test_find_matching_session_suffix_fallback_requires_parent_segment_match(
 
     probe = real_activity_for_worker(
         config.post_mortem,
-        r"C:\Users\senki\repos\charlie-work\.var\charlie-work\worktrees\agent-issue-203-fix",
+        r"C:\Users\operator\repos\charlie-work\.var\charlie-work\worktrees\agent-issue-203-fix",
         "2026-07-11T11:55:00+00:00",
         12345,
         now,

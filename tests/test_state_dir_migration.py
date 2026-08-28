@@ -125,8 +125,8 @@ def test_normalize_path_key_folds_separator_and_case() -> None:
     the separator and is never case-folded, so equality here is proof the
     module's own normalization is doing the work, independent of host OS.
     """
-    git_style = PurePosixPath("C:/Users/senki/repos/Job-Cannon/.claude/Worktrees/FOO")
-    disk_style = Path(r"C:\Users\SENKI\repos\job-cannon\.claude\worktrees\foo")
+    git_style = PurePosixPath("C:/Users/operator/repos/Job-Cannon/.claude/Worktrees/FOO")
+    disk_style = Path(r"C:\Users\OPERATOR\repos\job-cannon\.claude\worktrees\foo")
 
     assert _normalize_path_key(git_style) == _normalize_path_key(disk_style)  # type: ignore[arg-type]
 

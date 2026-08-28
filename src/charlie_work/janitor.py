@@ -205,7 +205,7 @@ class JanitorVerdict:
     # that ran and failed). Consumers must branch on this structured field,
     # never on the "Required check(s) missing" failure-message text, to
     # decide whether a gh Actions query for the head SHA is warranted.
-    # job-cannon 2026-08-06/07: GitHub Actions silently created no workflow
+    # Observed on a sibling repo 2026-08-06/07: GitHub Actions silently created no workflow
     # run for pushed heads; detection added so the janitor gate distinguishes
     # "CI never started" from "CI failed".
     missing_required_checks: tuple[str, ...] = ()

@@ -503,7 +503,7 @@ def body_has_crash_signature(text: str) -> bool:
 # (issue #1354). These are the fields that diagnose WHY the session ended:
 # ``is_error`` / ``subtype`` / ``api_error_status`` / ``terminal_reason`` /
 # ``stop_reason``. Verified against a live Claude Code stream-json result
-# event captured from job-cannon issue-1736's review events.jsonl (see
+# event captured from a sibling repo's issue-1736 review events.jsonl (see
 # ``tests/fixtures/claude_code_result_event_success.json``).
 _RESULT_EVENT_CAUSE_FIELDS: tuple[str, ...] = (
     "is_error",

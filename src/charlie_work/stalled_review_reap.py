@@ -436,7 +436,7 @@ def _detect_and_handle_stalled_reviews(
         # relaunch straight into the same limit -- a redispatch loop that
         # runs every stale-claim interval for as long as the provider window
         # is closed, instead of backing off via the same reviewer-quota gate
-        # the launch-time path uses (job-cannon PRs #1342/#1343/#1344/#1346,
+        # the launch-time path uses (a sibling repo's PRs #1342/#1343/#1344/#1346,
         # 2026-07-21: 20+ hours of hot redispatch into a session-limit wall).
         #
         # Issue #1069: the log read itself can fail (OSError) or yield an

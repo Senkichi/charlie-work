@@ -840,7 +840,7 @@ class AutoMergeConfig:
     # preserves current behavior. Takes precedence over the legacy `admin` field.
     merge_flags: tuple[str, ...] = ()
     # Post-merge branch deletion is best-effort and can never abort the
-    # merge/label sequence (the empericus local-worktree failure mode).
+    # merge/label sequence (the local-worktree failure mode seen on one operator host).
     delete_branch: bool = True
     require_approved_review: bool = True
     required_checks: tuple[str, ...] = ()
@@ -1044,7 +1044,7 @@ class RuntimeConfig:
         # failure's marker match and every downstream reap path: reviewer
         # workers that died on this message got no throttled_until cooldown
         # and were relaunched straight into the same limit every stale-claim
-        # interval (job-cannon PRs #1342/#1343/#1344/#1346 stuck 5.5-20+
+        # interval (a sibling repo's PRs #1342/#1343/#1344/#1346 stuck 5.5-20+
         # hours in a redispatch loop before this was added).
         "hit your session limit",
     )
@@ -1110,7 +1110,7 @@ class RuntimeConfig:
     # against GitHub in a single pass. The bound is mandatory, not defensive.
     # Every subject whose ``label_error`` key is absent costs one live
     # ``issue_view`` call, and measured at the time of the fix *every* escalated
-    # subject was in that arm -- 8 in charlie-work and 49 in job-cannon. Sweeping
+    # subject was in that arm -- 8 in charlie-work and 49 in the sibling repo. Sweeping
     # all 57 in one pass would add ~57 sequential ``gh`` subprocess calls to a
     # loop pass that is shared sequentially between both repos, which is the
     # starvation mechanism of #1078. Bounding converges over a handful of passes

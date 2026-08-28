@@ -148,7 +148,7 @@ def _deescalation_skip(reason: str, issue_number: int) -> dict[str, Any]:
     ``_maybe_deescalate_mechanical`` collapsed into a bare ``continue``. The
     resulting ``deescalation_pass_completed`` event recorded a candidate count
     and nothing else, so "48 candidates, 0 cleared" -- the steady state on the
-    job-cannon fleet for 274 consecutive passes -- was not diagnosable from
+    sibling repo's fleet for 274 consecutive passes -- was not diagnosable from
     ``events.db`` at all and cost a full manual investigation to explain.
 
     Naming the reason at the branch (rather than having the caller re-derive
@@ -344,7 +344,7 @@ def _collect_escalated_label_subjects(
     flag false, so the set is empty and the sweep has nothing to do for as long
     as the flag stays off -- which, measured at the time of the fix, was every
     pass for ~8 days. (Not "never": ``escalated_label_repaired`` did fire once,
-    job-cannon 2026-07-28T21:36:56Z, repairing 10 issues. That single run is the
+    in a sibling repo, 2026-07-28T21:36:56Z, repairing 10 issues. That single run is the
     argument *for* the fix, not against it.) Deriving the subjects from ``state``
     instead is the whole fix -- the repair set must not depend on the dispatch
     lane being on.

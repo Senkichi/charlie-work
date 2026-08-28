@@ -585,9 +585,9 @@ def _assert_config_repo_matches(config_arg: Path | None, repo_root: Path) -> Non
     ``--config`` selects the *config*; it never selected the *state*. ``repo_root``
     comes from ``--repo`` (defaulting to cwd), and ``runtime_paths`` resolves a
     **relative** ``state_dir`` against it. Every managed repo uses a relative
-    ``state_dir``, so ``charlie --config <job-cannon> tripwire ack 1392`` run from
-    a charlie-work cwd loaded job-cannon's settings and wrote job-cannon's ack into
-    *charlie-work's* state file — exit 0, no warning, and job-cannon's finding
+    ``state_dir``, so ``charlie --config <sibling-repo> tripwire ack 1392`` run from
+    a charlie-work cwd loaded the sibling repo's settings and wrote its ack into
+    *charlie-work's* state file — exit 0, no warning, and the sibling repo's finding
     still pinned ``ok=False``.
 
     That silence is the danger, not the misroute: a misdirected write into a keyed
