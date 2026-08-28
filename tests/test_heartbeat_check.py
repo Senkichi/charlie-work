@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -376,6 +377,370 @@ def test_check_review_liveness_falls_back_to_packet_mtime_when_state_timestamp_m
     assert "pr-200" in report.lines[0]
 
 
+def _write_state_multi(state_dir: Path, prs: dict[int, dict[str, Any]]) -> None:
+    """Write a state.json with multiple PR entries (``_write_state`` covers one)."""
+    state = {"version": 1, "prs": {str(n): pr_state for n, pr_state in prs.items()}}
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+
+def test_check_review_liveness_escalated_pr_not_anomaly(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Regression for issue #1357.
+
+    An escalated PR (``status == "escalated"`` in state.json) keeps its
+    placeholder ``decision="pending"`` packet file forever -- the escalation
+    gate stops further dispatch, so no review ever completes to overwrite it.
+    The liveness check must NOT count it as an open claim or trip ANOMALY; it
+    should be surfaced in the facts string as ``escalated=N`` instead.
+    """
+    frozen_now = datetime(2026, 8, 19, 5, 13, 0, tzinfo=timezone.utc)
+    repo = _make_repo(hb, tmp_path)
+    # Live-case shape: pr-1736 escalated, packet dir untouched, pending
+    # decision file from packet-build time ~14h before the beat.
+    _patch_gh(monkeypatch, hb, [1736])
+    _make_pr_dirs(
+        repo.state_dir,
+        1736,
+        pr_mtime=(frozen_now - timedelta(hours=14)).timestamp(),
+    )
+    _write_state(
+        repo.state_dir,
+        1736,
+        {
+            "status": "escalated",
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": _iso(871, base=frozen_now),
+            "reviewer_pid": None,
+        },
+    )
+
+    report = hb.Report()
+    hb.check_review_liveness(report, repo, now=frozen_now)
+
+    assert not report.anomaly
+    assert report.lines and "review-liveness" in report.lines[0]
+    assert "open_claims=0" in report.lines[0]
+    assert "escalated=1" in report.lines[0]
+    # The escalated PR's stale dir must not appear in an ANOMALY detail line.
+    assert "pr-1736" not in report.lines[0]
+
+
+def test_check_review_liveness_escalated_mixed_with_still_stale_open_claim(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1357 AC2: a non-escalated stale open claim still fires ANOMALY.
+
+    With one escalated PR (skipped) and one genuinely in-flight open claim
+    past the stale threshold, the check must still ANOMALY on the in-flight
+    one only -- escalated accounting must not silently swallow real liveness
+    failures. The escalated PR is surfaced as ``escalated=1`` in the facts.
+    """
+    frozen_now = datetime(2026, 8, 19, 5, 13, 0, tzinfo=timezone.utc)
+    repo = _make_repo(hb, tmp_path)
+    _patch_gh(monkeypatch, hb, [1736, 2000])
+    _make_pr_dirs(
+        repo.state_dir,
+        1736,
+        pr_mtime=(frozen_now - timedelta(hours=14)).timestamp(),
+    )
+    _make_pr_dirs(repo.state_dir, 2000)
+    _write_state_multi(
+        repo.state_dir,
+        {
+            1736: {
+                "status": "escalated",
+                "review_dispatch_status": "review_dispatch_dispatched",
+                "review_dispatched_at": _iso(871, base=frozen_now),
+                "reviewer_pid": None,
+            },
+            2000: {
+                "review_dispatch_status": "review_dispatch_dispatched",
+                "review_dispatched_at": _iso(60, base=frozen_now),
+                "reviewer_pid": 24616,
+                "reviewer_process_start_time": 1000.0,
+            },
+        },
+    )
+    monkeypatch.setattr(hb, "psutil", FakePsutil({24616: (False, None)}))
+
+    report = hb.Report()
+    hb.check_review_liveness(report, repo, now=frozen_now)
+
+    assert report.anomaly
+    assert "pr-2000" in report.lines[0]
+    assert "threshold=45m" in report.lines[0]
+    # The escalated PR is not in the ANOMALY detail but is in the facts.
+    assert "escalated=1" in report.lines[0]
+    assert "open_claims=1" in report.lines[0]
+    # The escalated PR's dir must not be listed as a stale claim dir.
+    assert "pr-1736" not in report.lines[0]
+
+
+def test_check_review_liveness_non_escalated_pending_status_still_counts(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1357 AC2 guard: only ``status == "escalated"`` is skipped.
+
+    A PR whose state entry lacks ``status: "escalated"`` (here, no ``status``
+    key at all, just a stale pending dispatch) must still be counted as an open
+    claim and trip ANOMALY past the threshold -- the escalation carve-out is
+    exact, not a fuzzy "pending-looking" match.
+    """
+    frozen_now = datetime(2026, 8, 19, 5, 13, 0, tzinfo=timezone.utc)
+    repo = _make_repo(hb, tmp_path)
+    _patch_gh(monkeypatch, hb, [3000])
+    _make_pr_dirs(repo.state_dir, 3000)
+    _write_state(
+        repo.state_dir,
+        3000,
+        {
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": _iso(60, base=frozen_now),
+            "reviewer_pid": 24616,
+            "reviewer_process_start_time": 1000.0,
+        },
+    )
+    monkeypatch.setattr(hb, "psutil", FakePsutil({24616: (False, None)}))
+
+    report = hb.Report()
+    hb.check_review_liveness(report, repo, now=frozen_now)
+
+    assert report.anomaly
+    assert "pr-3000" in report.lines[0]
+    assert "open_claims=1" in report.lines[0]
+    assert "escalated=" not in report.lines[0]
+
+
+def test_review_claim_timestamp_completed_rebuilt_uses_prompt_mtime(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Regression for issue #1403.
+
+    A completed prior cycle (``review_dispatch_status ==
+    review_dispatch_completed``) whose packet was rebuilt for a newer head:
+    state.json still carries the PRIOR cycle's ``review_dispatched_at`` (stale),
+    but the on-disk decision is back to ``pending`` head-stamped with the new
+    head.  ``_review_claim_timestamp`` must anchor on the packet-rebuild
+    evidence (``review-prompt.md`` mtime) instead of the stale dispatch time.
+    """
+    pr_dir = tmp_path / "prs" / "pr-1395"
+    pr_dir.mkdir(parents=True)
+    rebuild_time = datetime(2026, 8, 23, 0, 52, 19, tzinfo=timezone.utc)
+    (pr_dir / "review-prompt.md").write_text("prompt", encoding="utf-8")
+    os.utime(pr_dir / "review-prompt.md", (rebuild_time.timestamp(),) * 2)
+
+    pr_state = {
+        "review_dispatch_status": "review_dispatch_completed",
+        # Prior cycle's dispatch time -- 138m before the beat, the false
+        # ANOMALY source from the 2026-08-23T01:07Z incident.
+        "review_dispatched_at": "2026-08-22T22:49:27Z",
+        # Prior cycle's reviewed head.
+        "reviewed_head_sha": "prior-cycle-head-sha",
+    }
+    decision = {"decision": "pending", "reviewed_head_sha": "new-head-sha"}
+
+    timestamp = hb._review_claim_timestamp(pr_state, pr_dir=pr_dir, decision=decision)
+    assert timestamp is not None
+    parsed = hb.parse_iso(timestamp)
+    assert parsed == rebuild_time
+
+
+def test_review_claim_timestamp_completed_same_head_rebuilt_uses_prompt_mtime(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Regression for issue #1436.
+
+    A completed prior cycle whose packet was rebuilt for the SAME head (no SHA
+    advance): the on-disk decision is back to ``pending`` with
+    ``reviewed_head_sha`` EQUAL to state.json's.  The #1403 guard keyed on SHA
+    inequality and fell through, so the newest-timestamp fallback dated the
+    claim by the prior cycle's ``review_dispatched_at`` (false 467m ANOMALY on
+    pr-1432).  The pending decision while status is completed is itself the
+    rebuild evidence; ``_review_claim_timestamp`` must anchor on the
+    ``review-prompt.md`` mtime regardless of SHA equality.
+    """
+    pr_dir = tmp_path / "prs" / "pr-1432"
+    pr_dir.mkdir(parents=True)
+    rebuild_time = datetime(2026, 8, 24, 9, 17, 38, tzinfo=timezone.utc)
+    (pr_dir / "review-prompt.md").write_text("prompt", encoding="utf-8")
+    os.utime(pr_dir / "review-prompt.md", (rebuild_time.timestamp(),) * 2)
+
+    pr_state = {
+        "review_dispatch_status": "review_dispatch_completed",
+        # Prior cycle's dispatch time -- 467m before the 09:55Z beat, the
+        # false ANOMALY source from the 2026-08-24T09:55Z incident.
+        "review_dispatched_at": "2026-08-24T02:07:25Z",
+        # Same head as the on-disk decision -- the case #1403 missed.
+        "reviewed_head_sha": "93bf8ed",
+    }
+    decision = {"decision": "pending", "reviewed_head_sha": "93bf8ed"}
+
+    timestamp = hb._review_claim_timestamp(pr_state, pr_dir=pr_dir, decision=decision)
+    assert timestamp is not None
+    parsed = hb.parse_iso(timestamp)
+    assert parsed == rebuild_time
+
+
+def test_review_claim_timestamp_completed_prompt_older_than_dispatch_uses_dispatch(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Issue #1436 guard: the prompt mtime must not be older than the prior
+    cycle's ``review_dispatched_at``.
+
+    If the prompt file's mtime predates the completed cycle's dispatch (clock
+    skew / a packet that was not actually rebuilt), the newer of the two is
+    used so the change can only shrink a false age and never hide a genuinely
+    stale claim from before the completed cycle.
+    """
+    pr_dir = tmp_path / "prs" / "pr-43"
+    pr_dir.mkdir(parents=True)
+    # Prompt mtime OLDER than the prior cycle's dispatch.
+    stale_prompt_time = datetime(2026, 8, 22, 20, 0, 0, tzinfo=timezone.utc)
+    (pr_dir / "review-prompt.md").write_text("prompt", encoding="utf-8")
+    os.utime(pr_dir / "review-prompt.md", (stale_prompt_time.timestamp(),) * 2)
+
+    pr_state = {
+        "review_dispatch_status": "review_dispatch_completed",
+        "review_dispatched_at": "2026-08-22T22:49:27Z",
+        "reviewed_head_sha": "same-head-sha",
+    }
+    decision = {"decision": "pending", "reviewed_head_sha": "same-head-sha"}
+
+    assert (
+        hb._review_claim_timestamp(pr_state, pr_dir=pr_dir, decision=decision)
+        == "2026-08-22T22:49:27Z"
+    )
+
+
+def test_review_claim_timestamp_completed_missing_prompt_falls_back_to_state(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Issue #1436: when the prompt file is missing, the SHA comparison
+    survives only as a tiebreak and we fall back to current behavior (the
+    newest-timestamp fallback) regardless of SHA equality.
+    """
+    pr_dir = tmp_path / "prs" / "pr-44"
+    pr_dir.mkdir(parents=True)
+
+    pr_state = {
+        "review_dispatch_status": "review_dispatch_completed",
+        "review_dispatched_at": "2026-08-22T22:49:27Z",
+        "reviewed_head_sha": "same-head-sha",
+    }
+    decision = {"decision": "pending", "reviewed_head_sha": "same-head-sha"}
+
+    assert (
+        hb._review_claim_timestamp(pr_state, pr_dir=pr_dir, decision=decision)
+        == "2026-08-22T22:49:27Z"
+    )
+
+
+def test_check_review_liveness_completed_rebuilt_no_false_anomaly(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Regression for issue #1403: end-to-end check.
+
+    Production shape from the 2026-08-23T01:07Z beat on pr-1395: a prior review
+    cycle completed at 22:49:27Z (``review_dispatch_status ==
+    review_dispatch_completed``, ``reviewed_head_sha`` = prior head), then the
+    rework cycle rebuilt the packet for a new head at 00:52:19Z (on-disk
+    ``review-decision.json`` back to ``pending`` head-stamped with the new
+    head, ``review-prompt.md`` rewritten).  ``dispatch_reviews()`` had not yet
+    launched the next reviewer (waiting on the PR's Tests check), so
+    ``review_dispatched_at`` still carried the prior cycle's 22:49:27Z.  The
+    beat at 01:07Z must measure the claim age from the rebuild (~15m), not the
+    stale prior dispatch (~138m), and must NOT ANOMALY.
+    """
+    frozen_now = datetime(2026, 8, 23, 1, 7, 0, tzinfo=timezone.utc)
+    rebuild_time = datetime(2026, 8, 23, 0, 52, 19, tzinfo=timezone.utc)
+    repo = _make_repo(hb, tmp_path)
+    _patch_gh(monkeypatch, hb, [1395])
+    pr_dir = repo.state_dir / "prs" / "pr-1395"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "pr.json").write_text("{}", encoding="utf-8")
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "pending", "reviewed_head_sha": "new-head-sha"}),
+        encoding="utf-8",
+    )
+    (pr_dir / "review-prompt.md").write_text("prompt", encoding="utf-8")
+    os.utime(pr_dir / "review-prompt.md", (rebuild_time.timestamp(),) * 2)
+    _write_state(
+        repo.state_dir,
+        1395,
+        {
+            "review_dispatch_status": "review_dispatch_completed",
+            "review_dispatched_at": "2026-08-22T22:49:27Z",
+            "reviewed_head_sha": "prior-cycle-head-sha",
+            "reviewer_pid": None,
+        },
+    )
+
+    report = hb.Report()
+    hb.check_review_liveness(report, repo, now=frozen_now)
+
+    assert not report.anomaly
+    assert report.lines and "review-liveness" in report.lines[0]
+    assert "open_claims=1" in report.lines[0]
+    # ~15m from the rebuild, not ~138m from the stale prior dispatch.
+    assert "oldest_min=15" in report.lines[0]
+    assert "138" not in report.lines[0]
+
+
+def test_check_review_liveness_completed_same_head_rebuilt_no_false_anomaly(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Regression for issue #1436: end-to-end check.
+
+    Production shape from the 2026-08-24T09:55Z beat on pr-1432: a prior review
+    cycle completed at 02:07:25Z (``review_dispatch_status ==
+    review_dispatch_completed``, ``reviewed_head_sha`` = 93bf8ed), then the
+    rework cycle rebuilt the packet for the SAME head at 09:17:38Z (on-disk
+    ``review-decision.json`` back to ``pending`` head-stamped with the same
+    93bf8ed, ``review-prompt.md`` rewritten).  ``dispatch_reviews()`` had not
+    yet launched the next reviewer, so ``review_dispatched_at`` still carried
+    the prior cycle's 02:07:25Z.  The #1403 guard keyed on SHA inequality and
+    fell through, so the beat would date the claim by the stale prior dispatch
+    (~467m) and ANOMALY.  The beat at 09:55Z must measure the claim age from
+    the rebuild (~38m, under the 45m threshold), not the stale prior dispatch,
+    and must NOT ANOMALY.
+    """
+    frozen_now = datetime(2026, 8, 24, 9, 55, 0, tzinfo=timezone.utc)
+    rebuild_time = datetime(2026, 8, 24, 9, 17, 38, tzinfo=timezone.utc)
+    repo = _make_repo(hb, tmp_path)
+    _patch_gh(monkeypatch, hb, [1432])
+    pr_dir = repo.state_dir / "prs" / "pr-1432"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "pr.json").write_text("{}", encoding="utf-8")
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "pending", "reviewed_head_sha": "93bf8ed"}),
+        encoding="utf-8",
+    )
+    (pr_dir / "review-prompt.md").write_text("prompt", encoding="utf-8")
+    os.utime(pr_dir / "review-prompt.md", (rebuild_time.timestamp(),) * 2)
+    _write_state(
+        repo.state_dir,
+        1432,
+        {
+            "review_dispatch_status": "review_dispatch_completed",
+            "review_dispatched_at": "2026-08-24T02:07:25Z",
+            "reviewed_head_sha": "93bf8ed",
+            "reviewer_pid": None,
+        },
+    )
+
+    report = hb.Report()
+    hb.check_review_liveness(report, repo, now=frozen_now)
+
+    assert not report.anomaly
+    assert report.lines and "review-liveness" in report.lines[0]
+    assert "open_claims=1" in report.lines[0]
+    # ~37m from the rebuild, not ~467m from the stale prior dispatch.
+    assert "oldest_min=37" in report.lines[0]
+    assert "467" not in report.lines[0]
+
+
 # ---------------------------------------------------------------------------
 # Smoke tests for the remaining checks (review-liveness is covered above).
 # Each test exercises one check's OK and/or anomaly path with stubbed I/O.
@@ -580,6 +945,447 @@ def test_check_dispatch_coverage_anomaly_possibly_spurious_when_degraded(
     assert "dispatchable across 2 consecutive beats" in report.lines[0]
 
 
+# ---------------------------------------------------------------------------
+# check_dispatch_coverage drain-at-cap (issue #1424)
+# ---------------------------------------------------------------------------
+
+
+def _write_dispatch_event(
+    state_dir: Path,
+    *,
+    concurrency_governor: dict[str, Any],
+    deferred_by_concurrency_count: int = 0,
+    ts: str | None = None,
+) -> Path:
+    """Seed a ``dispatch`` event row in ``state_dir/events.db``.
+
+    Mirrors the payload shape ``workflow.py``'s dispatch path writes: a
+    top-level ``concurrency_governor`` sub-dict (with ``dispatch_limit``,
+    ``fleet_concurrency_limit`` / ``fleet_live_session_count`` when the fleet
+    governor is enabled) and a sibling ``deferred_by_concurrency_count``.
+    Uses the production ``events`` schema by hand rather than importing
+    ``charlie_work.instrumentation``, matching ``_write_events_db``.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = state_dir / "events.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts              TEXT    NOT NULL,
+                kind            TEXT    NOT NULL,
+                payload         TEXT    NOT NULL,
+                repo            TEXT,
+                correlation_id  TEXT,
+                pr_number       INTEGER,
+                issue_number    INTEGER,
+                level           TEXT DEFAULT 'info'
+            )
+            """
+        )
+        payload = json.dumps(
+            {
+                "concurrency_governor": concurrency_governor,
+                "deferred_by_concurrency_count": deferred_by_concurrency_count,
+            }
+        )
+        conn.execute(
+            "INSERT INTO events (ts, kind, payload, level) VALUES (?, 'dispatch', ?, 'info')",
+            (ts or _iso(1), payload),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def test_check_dispatch_coverage_drain_note_when_fleet_at_cap(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1424: fleet-wide cap saturated -> drain note, not anomaly.
+
+    The repo is at 2/5 in-progress (below its per-repo cap of 5), but the
+    fleet governor shows fleet_live=5/fleet_cap=5 -- the sibling repo holds
+    the other slots. The old per-repo denominator read this as a dispatch
+    failure; the governor-based condition recognises it as designed drain.
+    """
+    repo = _make_repo(hb, tmp_path)
+    repo.config_path.write_text("dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8")
+    issues = [
+        {"number": 1401, "labels": [], "updatedAt": _iso(1)},
+        {"number": 1402, "labels": [], "updatedAt": _iso(1)},
+    ]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    _write_dispatch_event(
+        repo.state_dir,
+        concurrency_governor={
+            "clamped": True,
+            "dispatch_limit": 0,
+            "concurrency_limit": 5,
+            "live_session_count": 2,
+            "available_slots": 3,
+            "fleet_concurrency_limit": 5,
+            "fleet_live_session_count": 5,
+        },
+        deferred_by_concurrency_count=4,
+    )
+    prev = {"dispatchable_issues": [1401, 1402]}
+    new: dict[str, Any] = {}
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report, repo, prev, new, skip_delta=False, blocked_numbers=None, blocked_err=""
+    )
+    assert not report.anomaly
+    line = report.lines[0]
+    assert "draining at cap" in line
+    assert "fleet_live=5/fleet_cap=5" in line
+    assert "dispatchable across 2 consecutive beats" not in line
+
+
+def test_check_dispatch_coverage_anomaly_when_governor_has_free_slots(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1424: governor shows free slots and issues persist -> anomaly.
+
+    The fleet has room (fleet_live=3/fleet_cap=5) and the last dispatch had
+    dispatch_limit=5 with zero deferrals -- there was capacity but the issues
+    were not picked up. This is the #1398 head-of-line case, which is real.
+    """
+    repo = _make_repo(hb, tmp_path)
+    repo.config_path.write_text("dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8")
+    issues = [
+        {"number": 1398, "labels": [], "updatedAt": _iso(1)},
+    ]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    _write_dispatch_event(
+        repo.state_dir,
+        concurrency_governor={
+            "clamped": False,
+            "dispatch_limit": 5,
+            "concurrency_limit": 5,
+            "live_session_count": 2,
+            "available_slots": 3,
+            "fleet_concurrency_limit": 5,
+            "fleet_live_session_count": 3,
+        },
+        deferred_by_concurrency_count=0,
+    )
+    prev = {"dispatchable_issues": [1398]}
+    new: dict[str, Any] = {}
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report, repo, prev, new, skip_delta=False, blocked_numbers=None, blocked_err=""
+    )
+    assert report.anomaly
+    assert "dispatchable across 2 consecutive beats" in report.lines[0]
+    assert "draining at cap" not in report.lines[0]
+
+
+def test_check_dispatch_coverage_drain_note_when_dispatch_limit_at_deferred(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1424: dispatch_limit <= deferred_by_concurrency_count -> drain note.
+
+    The fleet governor is not enabled (no fleet_concurrency_limit in the
+    payload), but the effective dispatch_limit was 1 with 4 deferred issues
+    -- the backlog exceeds the per-pass dispatch rate, so the backlog is
+    draining at the allowed rate.
+    """
+    repo = _make_repo(hb, tmp_path)
+    repo.config_path.write_text("dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8")
+    issues = [
+        {"number": 1401, "labels": [], "updatedAt": _iso(1)},
+        {"number": 1402, "labels": [], "updatedAt": _iso(1)},
+    ]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    _write_dispatch_event(
+        repo.state_dir,
+        concurrency_governor={
+            "clamped": True,
+            "dispatch_limit": 1,
+            "concurrency_limit": 5,
+            "live_session_count": 4,
+            "available_slots": 1,
+        },
+        deferred_by_concurrency_count=4,
+    )
+    prev = {"dispatchable_issues": [1401, 1402]}
+    new: dict[str, Any] = {}
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report, repo, prev, new, skip_delta=False, blocked_numbers=None, blocked_err=""
+    )
+    assert not report.anomaly
+    line = report.lines[0]
+    assert "draining at cap" in line
+    assert "dispatch_limit=1" in line
+    assert "dispatchable across 2 consecutive beats" not in line
+
+
+def test_check_dispatch_coverage_fallback_per_repo_cap_when_no_events_db(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1424: no events.db -> fall back to the per-repo cap check.
+
+    A fresh install with no dispatch events yet cannot provide governor data.
+    The existing per-repo cap drain condition is preserved as a conservative
+    fallback so the check does not regress on repos without instrumentation.
+    """
+    repo = _make_repo(hb, tmp_path)
+    repo.config_path.write_text("dispatch:\n  max_concurrent_sessions: 3\n", encoding="utf-8")
+    # 3 in-progress issues fill the per-repo cap; 2 dispatchable persist.
+    issues = [
+        {"number": 10, "labels": [{"name": "agent:in-progress"}], "updatedAt": _iso(1)},
+        {"number": 11, "labels": [{"name": "agent:in-progress"}], "updatedAt": _iso(1)},
+        {"number": 12, "labels": [{"name": "agent:in-progress"}], "updatedAt": _iso(1)},
+        {"number": 20, "labels": [], "updatedAt": _iso(1)},
+        {"number": 21, "labels": [], "updatedAt": _iso(1)},
+    ]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    # No events.db written -- _last_dispatch_drain_signal returns None.
+    prev = {"dispatchable_issues": [20, 21]}
+    new: dict[str, Any] = {}
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report, repo, prev, new, skip_delta=False, blocked_numbers=None, blocked_err=""
+    )
+    assert not report.anomaly
+    line = report.lines[0]
+    assert "draining at cap" in line
+    assert "in_progress=3/cap=3" in line
+
+
+# ---------------------------------------------------------------------------
+# check_armable_backlog (issue #armable-backlog, added 2026-08-23)
+# ---------------------------------------------------------------------------
+
+
+def _issue(number: int, labels: tuple[str, ...] = ()) -> dict[str, Any]:
+    return {"number": number, "labels": [{"name": name} for name in labels]}
+
+
+def test_check_armable_backlog_ok_when_runway_plenty(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """runway >= floor -> OK, regardless of any armable backlog.
+
+    Uses an explicit dispatch.max_concurrent_sessions cap (floor=3) rather
+    than the default, so get_dispatch_cap's config-reading path is exercised
+    too, not just the ARMABLE_RUNWAY_FLOOR_DEFAULT fallback.
+    """
+    repo = _make_repo(hb, tmp_path)
+    repo.config_path.write_text("dispatch:\n  max_concurrent_sessions: 3\n", encoding="utf-8")
+    issues = [
+        _issue(1, ("automated-ready",)),
+        _issue(2, ("automated-ready",)),
+        _issue(3, ("automated-ready",)),
+    ]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=None, blocked_err="")
+    assert not report.anomaly
+    assert "plenty armed" in report.lines[0]
+    assert "runway=3 floor=3" in report.lines[0]
+
+
+def test_check_armable_backlog_ok_when_genuinely_empty(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """runway < floor but no armable issues -> OK, backlog genuinely empty."""
+    repo = _make_repo(hb, tmp_path)
+    issues = [_issue(1, ("automated-ready",)), _issue(2, ("blocked",))]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=None, blocked_err="")
+    assert not report.anomaly
+    assert "genuinely empty" in report.lines[0]
+    assert "runway=1 floor=3 armable=0" in report.lines[0]
+    assert "gated=1" in report.lines[0]
+
+
+def test_check_armable_backlog_anomaly_when_armable_nonempty(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """runway < floor and armable non-empty -> ANOMALY listing numbers + gating labels."""
+    repo = _make_repo(hb, tmp_path)
+    issues = [_issue(10), _issue(5)]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=None, blocked_err="")
+    assert report.anomaly
+    line = report.lines[0]
+    assert "runway thin (0 < floor 3)" in line
+    assert "2 un-triaged armable issue(s)" in line
+    assert "[5, 10]" in line
+    for gating_label in sorted(hb.ARMABLE_GATING_LABELS):
+        assert gating_label in line
+    assert hb.ARMED_LABEL in line
+
+
+def test_check_armable_backlog_agent_label_counts_active_never_armable(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """An agent:* label buckets an issue as active, so it can never inflate armable."""
+    repo = _make_repo(hb, tmp_path)
+    issues = [_issue(7, ("agent:in-progress",))]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=None, blocked_err="")
+    assert not report.anomaly
+    line = report.lines[0]
+    assert "genuinely empty" in line
+    assert "armable=0" in line
+    assert "active=1" in line
+
+
+@pytest.mark.parametrize(
+    "gating_label",
+    [
+        "blocked",
+        "needs-design",
+        "human-action",
+        "question",
+        "wontfix",
+        "duplicate",
+        "invalid",
+    ],
+)
+def test_check_armable_backlog_gating_label_counts_gated_never_armable(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path, gating_label: str
+) -> None:
+    """Each gating label buckets an issue as gated, so it can never inflate armable.
+
+    Parametrized over the literal label strings rather than iterating
+    hb.ARMABLE_GATING_LABELS directly, so a future accidental narrowing of
+    that set (e.g. dropping "wontfix") would fail this test loudly instead
+    of silently shrinking the parametrization along with the constant.
+    """
+    assert gating_label in hb.ARMABLE_GATING_LABELS  # keeps the literal list honest
+    repo = _make_repo(hb, tmp_path)
+    issues = [_issue(7, (gating_label,))]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=None, blocked_err="")
+    assert not report.anomaly
+    line = report.lines[0]
+    assert "genuinely empty" in line
+    assert "armable=0" in line
+    assert "gated=1" in line
+
+
+def test_check_armable_backlog_blocked_number_counts_gated_never_armable(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """An issue in blocked_numbers buckets as gated even with no labels at all."""
+    repo = _make_repo(hb, tmp_path)
+    issues = [_issue(7)]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers={7}, blocked_err="")
+    assert not report.anomaly
+    line = report.lines[0]
+    assert "genuinely empty" in line
+    assert "armable=0" in line
+    assert "gated=1" in line
+
+
+def test_check_armable_backlog_anomaly_when_gh_fails(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (False, None, "gh: rate limited"))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=None, blocked_err="")
+    assert report.anomaly
+    assert "gh: rate limited" in report.lines[0]
+
+
+def test_check_armable_backlog_preview_truncation(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """More than ARMABLE_PREVIEW_LIMIT armable issues -> preview + "(+N more)" suffix."""
+    repo = _make_repo(hb, tmp_path)
+    total_armable = hb.ARMABLE_PREVIEW_LIMIT + 2
+    issues = [_issue(n) for n in range(1, total_armable + 1)]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=None, blocked_err="")
+    assert report.anomaly
+    line = report.lines[0]
+    assert f"{total_armable} un-triaged armable issue(s)" in line
+    expected_preview = list(range(1, hb.ARMABLE_PREVIEW_LIMIT + 1))
+    assert str(expected_preview) in line
+    assert "(+2 more)" in line
+
+
+def test_check_armable_backlog_blocked_err_caveat_on_ok_line(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    issues = [
+        _issue(1, ("automated-ready",)),
+        _issue(2, ("automated-ready",)),
+        _issue(3, ("automated-ready",)),
+    ]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(
+        report,
+        repo,
+        blocked_numbers=None,
+        blocked_err="charlie fleet status --json timed out",
+    )
+    assert not report.anomaly
+    assert "plenty armed" in report.lines[0]
+    assert (
+        "(blocked-issue lookup degraded: charlie fleet status --json timed out)" in report.lines[0]
+    )
+
+
+def test_check_armable_backlog_blocked_err_caveat_on_anomaly_line(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    issues = [_issue(10), _issue(5)]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(
+        report,
+        repo,
+        blocked_numbers=None,
+        blocked_err="blocked-issue lookup failed",
+    )
+    assert report.anomaly
+    assert "(blocked-issue lookup degraded: blocked-issue lookup failed)" in report.lines[0]
+
+
+def test_check_armable_backlog_mutation_arming_issue_clears_anomaly(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Sanity check on test 3's anomaly: arming the sole armable issue with
+    ``automated-ready`` (rather than leaving it un-triaged) moves it out of the
+    armable bucket entirely, which must clear the anomaly -- confirming the
+    anomaly is actually driven by the un-triaged/armable state and not some
+    other coincidental property of this issue.
+    """
+    repo = _make_repo(hb, tmp_path)
+    issues = [_issue(10)]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report_before = hb.Report()
+    hb.check_armable_backlog(report_before, repo, blocked_numbers=None, blocked_err="")
+    assert report_before.anomaly
+
+    armed_issues = [_issue(10, ("automated-ready",))]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, armed_issues, ""))
+    report_after = hb.Report()
+    hb.check_armable_backlog(report_after, repo, blocked_numbers=None, blocked_err="")
+    assert not report_after.anomaly
+    assert "genuinely empty" in report_after.lines[0]
+    assert "armable=0" in report_after.lines[0]
+
+
 def test_check_in_progress_staleness_anomaly_when_unchanged_across_beats(
     hb: ModuleType, tmp_path: Path
 ) -> None:
@@ -591,6 +1397,266 @@ def test_check_in_progress_staleness_anomaly_when_unchanged_across_beats(
     hb.check_in_progress_staleness(report, repo, [(99, updated)], prev, new, skip_delta=False)
     assert report.anomaly
     assert "99" in report.lines[0]
+
+
+# --------------------------------------------------------------------------
+# Issue #1379: worktree mtime as a second liveness signal for in-progress-stale
+# --------------------------------------------------------------------------
+
+_BRANCH_99 = "agent/issue-99-some-fix-title-here"
+
+
+def _set_file_mtime(path: Path, dt: datetime) -> None:
+    """Set a file's mtime to ``dt`` (derived-relative, never hardcoded)."""
+    ts = dt.timestamp()
+    os.utime(path, (ts, ts))
+
+
+def _write_state_issues(repo: Any, issues: dict[str, Any]) -> None:
+    """Write a state.json with the given ``issues`` map under repo.state_dir."""
+    state_json = repo.state_dir / "state.json"
+    state_json.parent.mkdir(parents=True, exist_ok=True)
+    state_json.write_text(json.dumps({"issues": issues}), encoding="utf-8")
+
+
+def _make_worktree_with_file(
+    hb: ModuleType, repo: Any, branch: str, file_age_min: float, now: datetime
+) -> Path:
+    """Create the worktree dir for ``branch`` with one file aged ``file_age_min``.
+
+    The worktree path is derived via ``hb._worktree_path_for_branch`` (the same
+    slugify the production check uses), so a slug mismatch between the check
+    and the orchestrator's worktree creation surfaces here as a missing-dir
+    failure rather than a silent false ANOMALY.
+    """
+    wt = hb._worktree_path_for_branch(repo, branch)
+    wt.mkdir(parents=True, exist_ok=True)
+    src = wt / "src"
+    src.mkdir(exist_ok=True)
+    f = src / "main.py"
+    f.write_text("# worker activity\n", encoding="utf-8")
+    _set_file_mtime(f, now - timedelta(minutes=file_age_min))
+    return wt
+
+
+def test_in_progress_stale_ok_when_worktree_fresh(hb: ModuleType, tmp_path: Path) -> None:
+    """AC1: zero recent events but worktree file modified inside the window -> OK."""
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated}}
+    new: dict[str, Any] = {}
+    _write_state_issues(repo, {"99": {"branch_name": _BRANCH_99}})
+    # Worktree file 5 minutes old -- well inside the 30-minute window.
+    _make_worktree_with_file(hb, repo, _BRANCH_99, file_age_min=5, now=now)
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert not report.anomaly
+    line = report.lines[0]
+    assert line.startswith("OK ")
+    assert "worktree-fresh=1" in line
+    assert "worktree mtime" in line
+    assert "99" in line
+
+
+def test_in_progress_stale_anomaly_when_worktree_stale(hb: ModuleType, tmp_path: Path) -> None:
+    """AC2: zero recent events AND no worktree file newer than window -> ANOMALY with both ages."""
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated}}
+    new: dict[str, Any] = {}
+    _write_state_issues(repo, {"99": {"branch_name": _BRANCH_99}})
+    # Worktree file 60 minutes old -- outside the 30-minute window (dead worker).
+    _make_worktree_with_file(hb, repo, _BRANCH_99, file_age_min=60, now=now)
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert report.anomaly
+    line = report.lines[0]
+    assert line.startswith("ANOMALY ")
+    assert "no events across 2 beats" in line
+    assert "worktree idle" in line
+    assert "99" in line
+
+
+def test_in_progress_stale_anomaly_when_worktree_missing(hb: ModuleType, tmp_path: Path) -> None:
+    """AC3: worktree dir does not exist -> events-only ANOMALY with 'no worktree found'."""
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated}}
+    new: dict[str, Any] = {}
+    _write_state_issues(repo, {"99": {"branch_name": _BRANCH_99}})
+    # Deliberately do NOT create the worktree dir.
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert report.anomaly
+    line = report.lines[0]
+    assert line.startswith("ANOMALY ")
+    assert "no worktree found" in line
+    assert "99" in line
+
+
+def test_in_progress_stale_ok_mixed_fresh_and_stale(hb: ModuleType, tmp_path: Path) -> None:
+    """Mixed: one worktree-fresh (OK) and one worktree-stale (ANOMALY) -> ANOMALY wins."""
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated, "100": updated}}
+    new: dict[str, Any] = {}
+    branch_100 = "agent/issue-100-another-fix-title"
+    _write_state_issues(
+        repo,
+        {"99": {"branch_name": _BRANCH_99}, "100": {"branch_name": branch_100}},
+    )
+    # #99 is alive (5m), #100 is dead (60m).
+    _make_worktree_with_file(hb, repo, _BRANCH_99, file_age_min=5, now=now)
+    _make_worktree_with_file(hb, repo, branch_100, file_age_min=60, now=now)
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated), (100, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert report.anomaly
+    line = report.lines[0]
+    assert "#100" in line
+    assert "worktree idle" in line
+    # #99 must NOT appear in the ANOMALY detail (it was exonerated by worktree mtime).
+    assert "#99" not in line
+
+
+def test_in_progress_stale_excludes_git_dir(hb: ModuleType, tmp_path: Path) -> None:
+    """``.git/`` file activity must not count as worker activity (issue #1379)."""
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated}}
+    new: dict[str, Any] = {}
+    _write_state_issues(repo, {"99": {"branch_name": _BRANCH_99}})
+    wt = _make_worktree_with_file(hb, repo, _BRANCH_99, file_age_min=60, now=now)
+    # Plant a fresh file under .git/ (background git op) -- must NOT exonerate.
+    git_dir = wt / ".git"
+    git_dir.mkdir(exist_ok=True)
+    fresh_git_file = git_dir / "HEAD"
+    fresh_git_file.write_text("ref: refs/heads/main\n", encoding="utf-8")
+    _set_file_mtime(fresh_git_file, now - timedelta(minutes=1))
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert report.anomaly
+    assert "worktree idle" in report.lines[0]
+
+
+def _make_junction(junction: Path, target: Path) -> None:
+    """Create a real Windows directory junction ``junction`` -> ``target``.
+
+    ``os.symlink`` creates a symlink, not a junction -- and ``os.path.islink``
+    returns ``False`` for a junction, which is exactly the gap issue #1379's
+    review found. A real junction (via ``mklink /J``) reproduces the
+    production ``.venv`` junction shape this fleet uses, so the test exercises
+    the actual failure path rather than a symlink stand-in that ``islink``
+    would already catch.
+    """
+    target.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(target.resolve())],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+_windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="junctions are a Windows reparse-point type"
+)
+
+
+@_windows_only
+def test_in_progress_stale_excludes_junction_mtime(hb: ModuleType, tmp_path: Path) -> None:
+    """A ``.venv`` junction's fresh file must NOT exonerate a dead worker.
+
+    Issue #1379 review: ``os.path.islink`` does not detect Windows junctions
+    and ``os.walk(followlinks=False)`` recurses straight through one, so a
+    shared ``.venv`` junction's unrelated mtimes could mask a genuinely dead
+    worker. This plants a real junction (``mklink /J``, not ``os.symlink``)
+    with a fresh file inside it and asserts the dead worktree still flags.
+    """
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated}}
+    new: dict[str, Any] = {}
+    _write_state_issues(repo, {"99": {"branch_name": _BRANCH_99}})
+    # Worktree itself is dead: only a 60m-old file (outside the 30m window).
+    wt = _make_worktree_with_file(hb, repo, _BRANCH_99, file_age_min=60, now=now)
+    # Plant a .venv junction pointing at a shared target with a FRESH file
+    # (1m old -- well inside the window). Without the reparse-point fix this
+    # fresh file would be walked and exonerate the dead worker (false OK).
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    fresh_venv_file = shared_venv / "pyvenv.cfg"
+    fresh_venv_file.write_text("home = shared\n", encoding="utf-8")
+    _set_file_mtime(fresh_venv_file, now - timedelta(minutes=1))
+    _make_junction(wt / ".venv", shared_venv)
+    # Sanity: the junction really is a junction (islink returns False), so
+    # this test genuinely exercises the islink-blind path, not a symlink.
+    assert not os.path.islink(wt / ".venv")
+    assert os.path.isdir(wt / ".venv")
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert report.anomaly
+    assert "worktree idle" in report.lines[0]
+
+
+def test_in_progress_stale_honors_worktrees_dir_override(hb: ModuleType, tmp_path: Path) -> None:
+    """``claude_code.worktrees_dir`` override must be honored (issue #1379 review).
+
+    The worktrees root defaults to ``<state_dir>/worktrees``; a repo that sets
+    ``claude_code.worktrees_dir`` places worktrees elsewhere. The check must
+    look at the configured location, not the default -- otherwise it
+    under-reports (a fresh worktree at the override location reads as missing
+    -> false ANOMALY). Mirrors ``charlie_work.paths.resolved_layout``.
+    """
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated}}
+    new: dict[str, Any] = {}
+    _write_state_issues(repo, {"99": {"branch_name": _BRANCH_99}})
+    # Configure an explicit (relative) worktrees_dir override.
+    override_root = tmp_path / "custom-worktrees"
+    repo.config_path.write_text(
+        "claude_code:\n  worktrees_dir: custom-worktrees\n", encoding="utf-8"
+    )
+    # Build the worktree at the OVERRIDE location (not the default
+    # state_dir/worktrees), with a fresh file inside the 30m window.
+    wt = hb._worktree_path_for_branch(repo, _BRANCH_99, worktrees_dir=override_root)
+    wt.mkdir(parents=True, exist_ok=True)
+    src = wt / "src"
+    src.mkdir(exist_ok=True)
+    f = src / "main.py"
+    f.write_text("# worker activity\n", encoding="utf-8")
+    _set_file_mtime(f, now - timedelta(minutes=5))
+    # The default location must NOT exist, so a check that ignores the
+    # override would read "no worktree found" (false ANOMALY).
+    default_wt = repo.state_dir / "worktrees" / hb._slugify_branch(_BRANCH_99)
+    assert not default_wt.exists()
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert not report.anomaly
+    line = report.lines[0]
+    assert line.startswith("OK ")
+    assert "worktree-fresh=1" in line
 
 
 def test_check_dispatch_failures_ok_when_no_dir(hb: ModuleType, tmp_path: Path) -> None:
@@ -1401,6 +2467,119 @@ def test_check_warning_events_covers_synthetic_kind_not_hardcoded(
     assert "totally_novel_warning_kind_xyz" in report.lines[-1]
 
 
+def test_check_warning_events_buckets_expected_operational_separately_from_rare(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """AC2 (#1271, corrected AC from the binding-decisions comment): a mixed
+    fixture with expected-operational kinds at volume plus one rare genuine
+    warning kind. The expected kinds must appear ONLY in the summarized
+    count line; the rare kind must appear in the detailed list; and the
+    COMBINED expected-operational share -- not just one kind -- must be
+    absent from the detailed list."""
+    repo = _make_repo(hb, tmp_path)
+    rows = (
+        [(_iso(1), "session_exited", "warning") for _ in range(5)]
+        + [(_iso(1), "dispatch_stale", "warning") for _ in range(3)]
+        + [(_iso(1), "worktree_foreign_writer", "warning")]
+    )
+    _write_events_db(repo.state_dir, rows)
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_warning_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+
+    detail_lines = [line for line in report.lines if "new warning-level event(s)" in line]
+    summary_lines = [line for line in report.lines if "routine operational warnings" in line]
+    assert len(detail_lines) == 1, report.lines
+    assert len(summary_lines) == 1, report.lines
+
+    # The rare kind is in the detailed list, never the summary.
+    assert "worktree_foreign_writer" in detail_lines[0]
+    assert "worktree_foreign_writer" not in summary_lines[0]
+
+    # The expected-operational kinds are in the summary, absent (combined,
+    # not just one of them) from the detailed list.
+    assert "session_exited" in summary_lines[0]
+    assert "dispatch_stale" in summary_lines[0]
+    assert "session_exited" not in detail_lines[0]
+    assert "dispatch_stale" not in detail_lines[0]
+
+    # Counts and sorted-by-kind-name ordering within the summary.
+    assert "dispatch_stale=3" in summary_lines[0]
+    assert "session_exited=5" in summary_lines[0]
+    assert summary_lines[0].index("dispatch_stale=3") < summary_lines[0].index("session_exited=5")
+    assert "8 routine operational warnings" in summary_lines[0]
+
+
+def test_check_warning_events_all_expected_operational_omits_detail_line(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """When every new warning is expected-operational, no detailed-listing
+    line is emitted at all -- only the summary. The summary line must still
+    carry the `warning_rows=`/`new_since_last_beat=` facts the operator's
+    digest relies on -- this is the dominant production case (#1271's own
+    7-day sample: expected-operational kinds were the majority of all
+    warnings), so those facts cannot be conditional on a detail line also
+    firing."""
+    repo = _make_repo(hb, tmp_path)
+    rows = [(_iso(1), "runner_capacity_starved", "warning") for _ in range(2)] + [
+        (_iso(1), "draft_pr_ready_held", "warning")
+    ]
+    _write_events_db(repo.state_dir, rows)
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_warning_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert not any("new warning-level event(s)" in line for line in report.lines)
+    assert any("routine operational warnings" in line for line in report.lines)
+    assert any("warning_rows=" in line for line in report.lines)
+    assert any("new_since_last_beat=3" in line for line in report.lines)
+
+
+def test_check_warning_events_deterministic_across_runs(hb: ModuleType, tmp_path: Path) -> None:
+    """AC4 (#1271): running check_warning_events twice over the same fixture
+    yields byte-identical report lines -- this script feeds the operator's
+    deterministic heartbeat digest, so no dict/set-order dependent output."""
+    repo = _make_repo(hb, tmp_path)
+    rows = (
+        [(_iso(1), "session_exited", "warning") for _ in range(5)]
+        + [(_iso(1), "dispatch_stale", "warning") for _ in range(3)]
+        + [(_iso(1), "runner_capacity_starved", "warning") for _ in range(2)]
+        + [(_iso(1), "draft_pr_ready_held", "warning")]
+        + [(_iso(1), "worktree_foreign_writer", "warning")]
+    )
+    _write_events_db(repo.state_dir, rows)
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+    report1 = hb.Report()
+    hb.check_warning_events(report1, repo, baseline)
+    report2 = hb.Report()
+    hb.check_warning_events(report2, repo, baseline)
+
+    assert report1.lines == report2.lines
+    assert not report1.anomaly
+
+
+def test_heartbeat_check_source_has_no_hardcoded_expected_operational_kind_literals() -> None:
+    """AC3 (#1271): heartbeat_check.py must reach every
+    EXPECTED_OPERATIONAL_KINDS member only via the imported frozenset --
+    never as a hardcoded literal anywhere in the file (code, comments, or
+    docstrings alike). Source-derived from the live frozenset, not a
+    maintained list here, so adding a member later needs no change to this
+    test or to heartbeat_check.py."""
+    from charlie_work.instrumentation import EXPECTED_OPERATIONAL_KINDS
+
+    source_path = Path(__file__).parent.parent / "scripts" / "heartbeat_check.py"
+    source = source_path.read_text(encoding="utf-8")
+
+    assert EXPECTED_OPERATIONAL_KINDS, "the set must not be empty for this test to mean anything"
+    for kind in EXPECTED_OPERATIONAL_KINDS:
+        assert kind not in source, (
+            f"{kind!r} appears as a literal in heartbeat_check.py -- it must be "
+            "reached only via the imported EXPECTED_OPERATIONAL_KINDS frozenset"
+        )
+
+
 def test_check_warning_events_excludes_old_row(hb: ModuleType, tmp_path: Path) -> None:
     """Positive control mirroring
     `test_check_error_events_excludes_old_row_despite_sql_trap_shape`: a row
@@ -1436,6 +2615,147 @@ def test_report_warn_does_not_set_anomaly(hb: ModuleType) -> None:
     report.warn("some-check", "some non-fatal detail")
     assert report.anomaly is False
     assert report.lines == ["WARN some-check: some non-fatal detail"]
+
+
+# ---------------------------------------------------------------------------
+# check_infra_blocked_events (issue #1383, AC4)
+#
+# Mirrors the check_error_events / check_warning_events coverage above: a
+# missing or unreadable events.db is an anomaly (this check cannot vouch for
+# a repo it cannot read), and the ok/warn/anom branching follows the
+# production precedence -- an ``infra_blocked_escalated`` row newer than
+# baseline is an anomaly; otherwise a ``check_infra_blocked`` row newer than
+# baseline is a warning; otherwise OK.
+# ---------------------------------------------------------------------------
+
+
+def test_check_infra_blocked_events_anomaly_when_db_missing(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """A missing events.db is an anomaly, matching
+    `test_check_error_events_anomaly_when_db_missing`: this check's entire
+    job is "did any infra-blocked escalation fire," and a registered repo
+    with no events.db is a repo this check cannot vouch for."""
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert report.anomaly
+    assert "no events.db" in report.lines[-1]
+
+
+def test_check_infra_blocked_events_anomaly_when_table_missing(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = repo.state_dir / "events.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE unrelated (id INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert report.anomaly
+    assert "no events table" in report.lines[-1]
+
+
+def test_check_infra_blocked_events_anomaly_when_db_unreadable(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    (repo.state_dir / "events.db").write_bytes(b"not a sqlite database at all")
+
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert report.anomaly
+
+
+def test_check_infra_blocked_events_ok_when_no_relevant_events(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """An events.db with only unrelated kinds (no check_infra_blocked, no
+    infra_blocked_escalated) yields OK with the row-count facts."""
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(
+        repo.state_dir,
+        [(_iso(1), "dispatch_started", "info"), (_iso(1), "self_deploy_alarm", "error")],
+    )
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert "blocked_rows=0" in report.lines[-1]
+    assert "escalated_rows=0" in report.lines[-1]
+    assert report.lines[-1].startswith("OK ")
+
+
+def test_check_infra_blocked_events_warn_when_blocked_since_baseline(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """A ``check_infra_blocked`` row newer than baseline (with no
+    ``infra_blocked_escalated``) surfaces as a WARN without setting
+    ``anomaly`` -- the infra condition is being held, not yet escalated."""
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(repo.state_dir, [(_iso(1), "check_infra_blocked", "warning")])
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert "check_infra_blocked since last beat" in report.lines[-1]
+    assert report.lines[-1].startswith("WARN ")
+
+
+def test_check_infra_blocked_events_anom_when_escalated_since_baseline(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """An ``infra_blocked_escalated`` row newer than baseline is an ANOMALY
+    -- the persistence threshold was reached and an operator-facing
+    escalation fired. Precedence over the warn branch: even when
+    ``check_infra_blocked`` rows are also present, the escalation is the
+    finding that surfaces."""
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(
+        repo.state_dir,
+        [
+            (_iso(1), "check_infra_blocked", "warning"),
+            (_iso(1), "infra_blocked_escalated", "error"),
+        ],
+    )
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert report.anomaly, report.lines
+    assert "infra_blocked_escalated since last beat" in report.lines[-1]
+    assert report.lines[-1].startswith("ANOMALY ")
+
+
+def test_check_infra_blocked_events_excludes_old_rows(hb: ModuleType, tmp_path: Path) -> None:
+    """Rows older than baseline are excluded from the new-since-last-beat
+    counts, matching the check_error_events/check_warning_events
+    old-row-exclusion convention."""
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(
+        repo.state_dir,
+        [
+            (_iso(60), "check_infra_blocked", "warning"),
+            (_iso(60), "infra_blocked_escalated", "error"),
+        ],
+    )
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=5)
+    report = hb.Report()
+    hb.check_infra_blocked_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert "blocked_rows=1" in report.lines[-1]
+    assert "escalated_rows=1" in report.lines[-1]
+    assert report.lines[-1].startswith("OK ")
 
 
 # ---------------------------------------------------------------------------
@@ -2004,3 +3324,611 @@ def test_check_stale_open_issue_mentions_degrades_gracefully_when_git_log_fails(
     assert report.anomaly
     assert "#817" in report.lines[-1]
     assert "commit-message scan degraded" in report.lines[-1]
+
+
+# ---------------------------------------------------------------------------
+# Disk-free check (issue #1359)
+# ---------------------------------------------------------------------------
+
+
+class _FakeUsage:
+    """Stand-in for the namedtuple returned by shutil.disk_usage."""
+
+    def __init__(self, total: int, free: int) -> None:
+        self.total = total
+        self.free = free
+        self.used = total - free
+
+
+def _set_fleet_dir_to(hb: ModuleType, monkeypatch: Any, path: Path) -> None:
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(path))
+
+
+def _disk_usage_stub(total: int, free: int):
+    return lambda path: _FakeUsage(total, free)
+
+
+def test_check_disk_space_ok_when_free_above_thresholds(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    _set_fleet_dir_to(hb, monkeypatch, tmp_path)
+    # 500 GB free of 1000 GB (50%) -- well above both thresholds.
+    monkeypatch.setattr(hb.shutil, "disk_usage", _disk_usage_stub(1000 * 1024**3, 500 * 1024**3))
+    repo = _make_repo(hb, tmp_path)
+    report = hb.Report()
+    hb.check_disk_space(report, [repo])
+    assert not report.anomaly
+    line = report.lines[0]
+    assert line.startswith("OK disk-space ")
+    assert "free=500.0GB" in line
+    assert "(50.0%)" in line
+
+
+def test_check_disk_space_warn_between_soft_and_hard(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    _set_fleet_dir_to(hb, monkeypatch, tmp_path)
+    # 50 GB free of 1000 GB (5.0%): below the 100 GB soft threshold but above
+    # the 20 GB hard threshold -> WARN, never an anomaly.
+    monkeypatch.setattr(hb.shutil, "disk_usage", _disk_usage_stub(1000 * 1024**3, 50 * 1024**3))
+    repo = _make_repo(hb, tmp_path)
+    report = hb.Report()
+    hb.check_disk_space(report, [repo])
+    assert not report.anomaly
+    line = report.lines[0]
+    assert line.startswith("WARN disk-space ")
+    assert "below soft threshold" in line
+
+
+def test_check_disk_space_anomaly_below_hard_bytes(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    _set_fleet_dir_to(hb, monkeypatch, tmp_path)
+    # 10 GB free of 1000 GB: below the 20 GB hard threshold -> ANOMALY.
+    monkeypatch.setattr(hb.shutil, "disk_usage", _disk_usage_stub(1000 * 1024**3, 10 * 1024**3))
+    repo = _make_repo(hb, tmp_path)
+    report = hb.Report()
+    hb.check_disk_space(report, [repo])
+    assert report.anomaly
+    line = report.lines[0]
+    assert line.startswith("ANOMALY disk-space ")
+    assert "below hard threshold" in line
+
+
+def test_check_disk_space_anomaly_below_hard_ratio(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Free bytes above the 20 GB floor but free ratio below 1% still trips."""
+    _set_fleet_dir_to(hb, monkeypatch, tmp_path)
+    # 25 GB free of 3000 GB (~0.83%): 25 > 20 GB so the byte branch alone would
+    # not fire, but 0.83% < 1% -> ANOMALY via the ratio branch.
+    monkeypatch.setattr(hb.shutil, "disk_usage", _disk_usage_stub(3000 * 1024**3, 25 * 1024**3))
+    repo = _make_repo(hb, tmp_path)
+    report = hb.Report()
+    hb.check_disk_space(report, [repo])
+    assert report.anomaly
+    assert "below hard threshold" in report.lines[0]
+
+
+def test_check_disk_space_dedupes_by_drive_anchor(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Two repos whose state_dirs share a volume report one line, not two."""
+    _set_fleet_dir_to(hb, monkeypatch, tmp_path)
+    monkeypatch.setattr(hb.shutil, "disk_usage", _disk_usage_stub(1000 * 1024**3, 500 * 1024**3))
+    repo_a = hb.RepoInfo(
+        slug="a/repo",
+        repo_root=tmp_path,
+        state_dir=tmp_path / "state_a",
+        config_path=Path(""),
+    )
+    repo_b = hb.RepoInfo(
+        slug="b/repo",
+        repo_root=tmp_path,
+        state_dir=tmp_path / "state_b",
+        config_path=Path(""),
+    )
+    report = hb.Report()
+    hb.check_disk_space(report, [repo_a, repo_b])
+    disk_lines = [ln for ln in report.lines if "disk-space" in ln]
+    assert len(disk_lines) == 1
+
+
+def test_check_disk_space_derives_volumes_from_state_dirs_not_hardcoded(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """The probed path must come from the registered state_dir, not a constant."""
+    _set_fleet_dir_to(hb, monkeypatch, tmp_path)
+    probed: list[str] = []
+    state_dir = tmp_path / "registered-state"
+
+    def _capture(path: str) -> _FakeUsage:
+        probed.append(path)
+        return _FakeUsage(1000 * 1024**3, 500 * 1024**3)
+
+    monkeypatch.setattr(hb.shutil, "disk_usage", _capture)
+    repo = hb.RepoInfo(
+        slug="a/repo",
+        repo_root=tmp_path,
+        state_dir=state_dir,
+        config_path=Path(""),
+    )
+    report = hb.Report()
+    hb.check_disk_space(report, [repo])
+    # The state_dir path (resolved) must be among the probed paths -- the
+    # volume set is configuration-derived, not a hardcoded drive letter.
+    assert any(str(state_dir.resolve()) == p or state_dir.resolve() == Path(p) for p in probed)
+    assert not report.anomaly
+
+
+def test_check_disk_space_anomaly_when_stat_fails(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    _set_fleet_dir_to(hb, monkeypatch, tmp_path)
+
+    def _raise(path: str) -> _FakeUsage:
+        raise OSError("no such volume")
+
+    monkeypatch.setattr(hb.shutil, "disk_usage", _raise)
+    repo = _make_repo(hb, tmp_path)
+    report = hb.Report()
+    hb.check_disk_space(report, [repo])
+    assert report.anomaly
+    assert "cannot stat volume" in report.lines[0]
+
+
+def test_check_disk_space_no_repos_still_checks_fleet_dir(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """With zero registered repos the fleet-dir volume is still probed."""
+    _set_fleet_dir_to(hb, monkeypatch, tmp_path)
+    monkeypatch.setattr(hb.shutil, "disk_usage", _disk_usage_stub(1000 * 1024**3, 500 * 1024**3))
+    report = hb.Report()
+    hb.check_disk_space(report, [])
+    assert not report.anomaly
+    assert len(report.lines) == 1
+    assert "disk-space" in report.lines[0]
+
+
+# ---------------------------------------------------------------------------
+# Suppression registry (issue #1361)
+# ---------------------------------------------------------------------------
+# Seven scenarios per the issue's acceptance criteria:
+#   1. empty/missing registry -> byte-identical to pre-#1361 behavior
+#   2. active entry matched by check name only -> SUPPRESSED, verbatim detail
+#   3. match narrowed by repo
+#   4. match narrowed by substring
+#   5. expiry boundary: an entry expiring today is expired
+#   6. unmatched accounting in the summary line
+#   7. malformed entry fails closed
+
+
+def test_suppression_registry_missing_file_is_empty_and_noop(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """AC1: a missing registry file loads as zero entries, not an error, and
+    a Report with zero suppressions behaves exactly like pre-#1361 code --
+    every other test in this file constructs `hb.Report()` with no
+    suppressions arg for exactly this reason."""
+    entries, err = hb.load_suppression_registry(tmp_path / "does-not-exist.yaml")
+    assert entries == []
+    assert err is None
+
+    report = hb.Report()
+    assert report.suppressions == []
+    report.anom("some-check", "some detail")
+    assert report.lines == ["ANOMALY some-check: some detail"]
+    assert report.anomaly
+    assert report.suppression_summary() is None
+
+
+def test_suppression_active_entry_matched_by_check_name_only(hb: ModuleType) -> None:
+    """AC2: an active, unscoped (no repo, no match substring) entry converts
+    ANOMALY into SUPPRESSED and the detail text survives verbatim."""
+    entry = hb.SuppressionEntry(
+        check="some-check", issue=42, expires="2099-01-01", repo=None, match=""
+    )
+    report = hb.Report(suppressions=[entry])
+    report.anom("some-check", "42 things went sideways")
+
+    assert report.lines == [
+        "SUPPRESSED some-check: [#42 until 2099-01-01] 42 things went sideways"
+    ]
+    assert not report.anomaly
+
+
+def test_suppression_narrowed_by_repo(hb: ModuleType) -> None:
+    """AC3 (this issue's repo-narrowing scenario): an entry scoped to one
+    repo does not suppress the same check name emitted for a different
+    repo, but does suppress it for the repo it names."""
+    entry = hb.SuppressionEntry(
+        check="some-check", issue=7, expires="2099-01-01", repo="owner/repo-a"
+    )
+    report = hb.Report(suppressions=[entry])
+
+    report.anom("some-check owner/repo-b", "detail for repo b")
+    assert report.lines[-1] == "ANOMALY some-check owner/repo-b: detail for repo b"
+    assert report.anomaly
+
+    report.anom("some-check owner/repo-a", "detail for repo a")
+    assert (
+        report.lines[-1]
+        == "SUPPRESSED some-check owner/repo-a: [#7 until 2099-01-01] detail for repo a"
+    )
+
+
+def test_suppression_narrowed_by_substring(hb: ModuleType) -> None:
+    """`match` narrows suppression to details containing that substring;
+    an unrelated detail for the same check still surfaces as ANOMALY."""
+    entry = hb.SuppressionEntry(
+        check="some-check", issue=9, expires="2099-01-01", match="known flaky condition"
+    )
+    report = hb.Report(suppressions=[entry])
+
+    report.anom("some-check", "unrelated failure, never seen before")
+    assert report.lines[-1] == "ANOMALY some-check: unrelated failure, never seen before"
+    assert report.anomaly
+
+    report.anom("some-check", "known flaky condition: count=3")
+    assert (
+        report.lines[-1]
+        == "SUPPRESSED some-check: [#9 until 2099-01-01] known flaky condition: count=3"
+    )
+
+
+def test_suppression_expiry_boundary_expiring_today_is_expired(hb: ModuleType) -> None:
+    """AC7 boundary case: an entry whose `expires` date equals the run's
+    current date is already expired (inclusive), not suppressed for one
+    more day -- the resurfaced line is annotated and flips the exit code."""
+    now = datetime(2026, 9, 30, 12, 0, tzinfo=timezone.utc)
+    entry = hb.SuppressionEntry(check="some-check", issue=5, expires="2026-09-30")
+    report = hb.Report(suppressions=[entry], now=now)
+
+    report.anom("some-check", "still happening")
+
+    assert report.lines == [
+        "ANOMALY some-check: [suppression #5 EXPIRED 2026-09-30] still happening"
+    ]
+    assert report.anomaly
+
+
+def test_suppression_expiry_boundary_day_before_is_still_active(hb: ModuleType) -> None:
+    now = datetime(2026, 9, 29, 23, 59, tzinfo=timezone.utc)
+    entry = hb.SuppressionEntry(check="some-check", issue=5, expires="2026-09-30")
+    report = hb.Report(suppressions=[entry], now=now)
+
+    report.anom("some-check", "still happening")
+
+    assert report.lines == ["SUPPRESSED some-check: [#5 until 2026-09-30] still happening"]
+    assert not report.anomaly
+
+
+def test_suppression_unmatched_accounting_in_summary(hb: ModuleType) -> None:
+    """AC5/AC7: the summary line accounts active/expired-by-date entries
+    plus, orthogonally, how many matched nothing this run -- a signal that
+    the underlying condition cleared and the entry is a deletion candidate."""
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    matched_active = hb.SuppressionEntry(check="check-a", issue=1, expires="2099-01-01")
+    unmatched_active = hb.SuppressionEntry(check="check-b", issue=2, expires="2099-01-01")
+    matched_expired = hb.SuppressionEntry(check="check-c", issue=3, expires="2026-08-01")
+    report = hb.Report(suppressions=[matched_active, unmatched_active, matched_expired], now=now)
+
+    report.anom("check-a", "detail a")
+    report.anom("check-c", "detail c")
+
+    assert report.suppression_summary() == "active=2 expired=1 unmatched=1"
+
+
+def test_suppression_no_suppressions_summary_is_none(hb: ModuleType) -> None:
+    report = hb.Report()
+    assert report.suppression_summary() is None
+
+
+def test_suppression_malformed_yaml_fails_closed(hb: ModuleType, tmp_path: Path) -> None:
+    """AC4/AC7: unparseable YAML is a load error, entries come back empty
+    (fail closed -- nothing this run can be silently suppressed)."""
+    path = tmp_path / "heartbeat-suppressions.yaml"
+    path.write_text("check: [unterminated\n", encoding="utf-8")
+
+    entries, err = hb.load_suppression_registry(path)
+
+    assert entries == []
+    assert err is not None
+    assert "YAML parse error" in err
+
+
+def test_suppression_malformed_entry_missing_required_field_fails_closed(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """AC4/AC7: a syntactically valid YAML list whose entry is missing a
+    required field (`expires`) is malformed too -- fail closed rather than
+    silently defaulting the missing field."""
+    path = tmp_path / "heartbeat-suppressions.yaml"
+    path.write_text(
+        "- check: some-check\n  issue: 1\n  note: missing expires\n",
+        encoding="utf-8",
+    )
+
+    entries, err = hb.load_suppression_registry(path)
+
+    assert entries == []
+    assert err is not None
+    assert "entry 0" in err
+
+    # Wired through Report exactly like every other ANOMALY: fail-closed
+    # means this ANOMALY is additive, and with entries == [] nothing else
+    # this run can be suppressed.
+    report = hb.Report(suppressions=entries)
+    report.anom("suppression-registry", err)
+    assert report.anomaly
+    assert report.lines == [f"ANOMALY suppression-registry: {err}"]
+
+
+def test_suppression_malformed_entry_bad_repo_type_fails_closed(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    path = tmp_path / "heartbeat-suppressions.yaml"
+    path.write_text(
+        "- check: some-check\n  issue: 1\n  expires: '2099-01-01'\n  repo: 123\n",
+        encoding="utf-8",
+    )
+    entries, err = hb.load_suppression_registry(path)
+    assert entries == []
+    assert err is not None
+    assert "repo" in err
+
+
+def test_suppression_integration_with_check_stale_open_issue_mentions(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """End-to-end through the real per-repo check: the seeded-registry shape
+    (base check name + repo, no embedded repo suffix in `check`) suppresses
+    the actual stale-open-issue-mentions anomaly for the matching repo, and
+    the exit-code-relevant `anomaly` flag stays False."""
+    repo = _make_repo(hb, tmp_path)  # slug="owner/repo"
+    _stale_mention_gh_dispatch(
+        monkeypatch,
+        hb,
+        open_numbers=[817],
+        merged_prs=[
+            {
+                "number": 824,
+                "headRefName": "fix/817-fleet-health-latch",
+                "title": "t",
+                "body": _REAL_PR824_BODY_EXCERPT,
+                "closingIssuesReferences": [],
+                "mergedAt": "2026-07-31T17:51:40Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(hb, "get_merged_commit_messages", lambda root, limit: (True, [], ""))
+
+    entry = hb.SuppressionEntry(
+        check="stale-open-issue-mentions",
+        issue=1361,
+        expires="2099-01-01",
+        repo="owner/repo",
+        match="referenced by merged work",
+    )
+    report = hb.Report(suppressions=[entry])
+    hb.check_stale_open_issue_mentions(report, repo)
+
+    assert not report.anomaly
+    assert report.lines[-1].startswith(
+        "SUPPRESSED stale-open-issue-mentions owner/repo: [#1361 until 2099-01-01]"
+    )
+    assert "#817" in report.lines[-1]
+    assert "PR #824" in report.lines[-1]
+
+
+def test_seeded_registry_loads_and_matches_both_fleet_repos(hb: ModuleType) -> None:
+    """The registry checked into the repo (scripts/heartbeat-suppressions.yaml)
+    parses cleanly and covers both fleet repos with a live (non-expired, as
+    of this test's authorship) tracking issue."""
+    registry_path = Path(__file__).parent.parent / "scripts" / "heartbeat-suppressions.yaml"
+    entries, err = hb.load_suppression_registry(registry_path)
+
+    assert err is None
+    assert len(entries) == 2
+    repos = {e.repo for e in entries}
+    assert repos == {"Senkichi/charlie-work", "Senkichi/job-cannon"}
+    for e in entries:
+        assert e.check == "stale-open-issue-mentions"
+        assert e.issue == 1361
+        assert e.expires == "2026-09-30"
+
+
+def test_seeded_registry_actually_suppresses_the_real_per_repo_check_name(
+    hb: ModuleType,
+) -> None:
+    """Closes the gap the two tests above leave open individually: parsing
+    the checked-in registry and matching *some* check name each prove half
+    the path. This proves the file on disk suppresses the exact string
+    `check_stale_open_issue_mentions` emits for each real fleet repo
+    (f"stale-open-issue-mentions {repo.slug}") -- not a stand-in owner/repo
+    slug, and not a hypothetical shape. If a future edit bakes the repo
+    suffix into the seeded `check:` field instead of using the separate
+    `repo:` field, this test fails loudly; the two tests above would not."""
+    registry_path = Path(__file__).parent.parent / "scripts" / "heartbeat-suppressions.yaml"
+    entries, err = hb.load_suppression_registry(registry_path)
+    assert err is None
+
+    for real_slug in ("Senkichi/charlie-work", "Senkichi/job-cannon"):
+        report = hb.Report(suppressions=entries)
+        check = f"stale-open-issue-mentions {real_slug}"
+        detail = (
+            "18 open issue(s) referenced by merged work with no closure path: "
+            "#817 (PR #824 fix/817-fleet-health-latch) (open=18)"
+        )
+        report.anom(check, detail)
+
+        assert not report.anomaly, f"registry failed to suppress real slug {real_slug}"
+        assert report.lines[-1].startswith(f"SUPPRESSED {check}: [#1361 until 2026-09-30]")
+
+
+# ---------------------------------------------------------------------------
+# Blocked-issue lookup economy (issue #1438)
+# ---------------------------------------------------------------------------
+
+
+def _write_fleet_json(
+    hb: ModuleType, fleet_dir: Path, repos: list[tuple[str, Path, Path]]
+) -> None:
+    """Write a fleet.json registering ``repos`` under ``fleet_dir``.
+
+    Each tuple is (slug, repo_root, state_dir). ``config_path`` is left
+    empty so config-reading checks degrade to their no-config path rather
+    than parsing a real file.
+    """
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "repos": {
+            slug: {"repo_root": str(root), "state_dir": str(state)} for slug, root, state in repos
+        }
+    }
+    (fleet_dir / "fleet.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_main_runs_charlie_fleet_status_exactly_once_per_beat(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1438: ``charlie fleet status --json`` must be invoked exactly
+    once per heartbeat run, not once per consumer per repo.
+
+    The fleet status snapshot cannot meaningfully change between checks
+    within one beat, so main() fetches it once before the per-repo loop and
+    threads the result (or the degraded-marker) into every consumer. This
+    test installs a counting fake ``subprocess.run`` over the full ``main()``
+    run with two registered repos -- which exercises both the
+    dispatch-coverage and armable-backlog consumers for each repo (four
+    consumer call-sites total) -- and asserts the charlie fleet status
+    subprocess fires exactly once.
+    """
+    fleet_dir = tmp_path / "fleet"
+    repo_a_root = tmp_path / "repo-a"
+    repo_a_state = tmp_path / "state-a"
+    repo_b_root = tmp_path / "repo-b"
+    repo_b_state = tmp_path / "state-b"
+    for d in (repo_a_root, repo_a_state, repo_b_root, repo_b_state):
+        d.mkdir(parents=True, exist_ok=True)
+    _write_fleet_json(
+        hb,
+        fleet_dir,
+        [("owner/repo-a", repo_a_root, repo_a_state), ("owner/repo-b", repo_b_root, repo_b_state)],
+    )
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+    monkeypatch.setenv("CHARLIE_WORK_HEARTBEAT_STATE", str(tmp_path / "hb-state.json"))
+    monkeypatch.setenv(
+        "CHARLIE_WORK_HEARTBEAT_SUPPRESSIONS", str(tmp_path / "no-suppressions.yaml")
+    )
+
+    fleet_status_payload = json.dumps(
+        {
+            "data": {
+                "repos": {
+                    "owner/repo-a": {"blocked": []},
+                    "owner/repo-b": {"blocked": []},
+                }
+            }
+        }
+    )
+
+    charlie_status_calls: list[int] = []  # records the timeout kwarg per call
+
+    class _FakeProc:
+        def __init__(self, *, returncode: int, stdout: str, stderr: str) -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(args, *a, **k):
+        if args[:4] == ["charlie", "fleet", "status", "--json"]:
+            charlie_status_calls.append(k.get("timeout"))
+            return _FakeProc(returncode=0, stdout=fleet_status_payload, stderr="")
+        # Every other subprocess (gh, git log, schtasks, ...) fails benignly;
+        # the checks degrade to ANOMALY/OK lines without crashing.
+        return _FakeProc(returncode=1, stdout="", stderr="fake subprocess disabled in test")
+
+    monkeypatch.setattr(hb.subprocess, "run", fake_run)
+
+    hb.main()
+
+    assert len(charlie_status_calls) == 1, (
+        f"expected exactly one charlie fleet status --json call per beat, "
+        f"got {len(charlie_status_calls)}"
+    )
+    # Issue #1438 AC: timeout >= 120s so the bound is an outlier detector,
+    # not the median runtime.
+    assert charlie_status_calls[0] >= 120, (
+        f"expected timeout >= 120s, got {charlie_status_calls[0]}"
+    )
+
+
+def test_main_annotates_all_consumers_when_fleet_status_degrades(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1438 AC: the degraded path still annotates all four consumer
+    check lines (dispatch-coverage + armable-backlog, for each of two repos).
+
+    When ``charlie fleet status --json`` fails, the single degraded-marker
+    string is threaded into every consumer. This test captures main()'s
+    stdout and asserts each of the four consumer check lines carries the
+    degraded caveat.
+    """
+    fleet_dir = tmp_path / "fleet"
+    repo_a_root = tmp_path / "repo-a"
+    repo_a_state = tmp_path / "state-a"
+    repo_b_root = tmp_path / "repo-b"
+    repo_b_state = tmp_path / "state-b"
+    for d in (repo_a_root, repo_a_state, repo_b_root, repo_b_state):
+        d.mkdir(parents=True, exist_ok=True)
+    _write_fleet_json(
+        hb,
+        fleet_dir,
+        [("owner/repo-a", repo_a_root, repo_a_state), ("owner/repo-b", repo_b_root, repo_b_state)],
+    )
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+    monkeypatch.setenv("CHARLIE_WORK_HEARTBEAT_STATE", str(tmp_path / "hb-state.json"))
+    monkeypatch.setenv(
+        "CHARLIE_WORK_HEARTBEAT_SUPPRESSIONS", str(tmp_path / "no-suppressions.yaml")
+    )
+
+    degraded_marker = "timed out after 120 seconds"
+
+    class _FakeProc:
+        def __init__(self, *, returncode: int, stdout: str, stderr: str) -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(args, *a, **k):
+        if args[:4] == ["charlie", "fleet", "status", "--json"]:
+            # Simulate the timeout path: subprocess.TimeoutExpired is a
+            # SubprocessError subclass, which get_blocked_issue_numbers
+            # catches and converts into the degraded-marker string.
+            raise subprocess.TimeoutExpired(cmd=args, timeout=k.get("timeout", 120))
+        # dispatch-coverage's run_gh_json must succeed with an empty issue
+        # list so the check reaches its OK line (where the degraded caveat
+        # is appended); other subprocesses fail benignly.
+        if args[:2] == ["gh", "issue"] and "list" in args:
+            return _FakeProc(returncode=0, stdout="[]", stderr="")
+        return _FakeProc(returncode=1, stdout="", stderr="fake subprocess disabled in test")
+
+    monkeypatch.setattr(hb.subprocess, "run", fake_run)
+
+    import io
+
+    captured = io.StringIO()
+    monkeypatch.setattr(hb.sys, "stdout", captured)
+    hb.main()
+    output = captured.getvalue()
+
+    for slug in ("owner/repo-a", "owner/repo-b"):
+        assert any(
+            f"dispatch-coverage {slug}:" in line and degraded_marker in line
+            for line in output.splitlines()
+        ), f"dispatch-coverage {slug} missing degraded caveat in:\n{output}"
+        assert any(
+            f"armable-backlog {slug}:" in line and degraded_marker in line
+            for line in output.splitlines()
+        ), f"armable-backlog {slug} missing degraded caveat in:\n{output}"

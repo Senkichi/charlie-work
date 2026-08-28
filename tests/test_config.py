@@ -15,6 +15,7 @@ from charlie_work.config import (
     DispatchConfig,
     OrchestratorConfig,
     RuntimeConfig,
+    build_config_from_data,
     load_config,
 )
 from charlie_work.global_config import load_layered_config
@@ -250,6 +251,38 @@ def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
     assert config.review_dispatch.max_local_review_processes == 4
 
 
+def test_load_config_review_dispatch_file_size_cap_lines_override(tmp_path: Path) -> None:
+    """Issue #1445: ``review_dispatch.file_size_cap_lines`` is read from YAML
+    via the ``_RD_INT_KEYS`` wiring in ``build_config_from_data`` -- the
+    ``review_dispatch:`` section (``ReviewDispatchConfig``), not the unrelated
+    ``review:`` section (``ReviewConfig``)."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  file_size_cap_lines: 1234
+""",
+    )
+    config = load_config(config_file)
+    assert config.review_dispatch.file_size_cap_lines == 1234
+
+
+def test_load_config_review_dispatch_file_size_cap_lines_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    """Issue #1445: ``_RD_INT_KEYS`` validation rejects a non-int
+    ``file_size_cap_lines`` in the ``review_dispatch:`` section."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review_dispatch:
+  file_size_cap_lines: "not-an-int"
+""",
+    )
+    with pytest.raises(ConfigError, match="review_dispatch.*file_size_cap_lines.*must be an int"):
+        load_config(config_file)
+
+
 def test_load_config_quota_probe_defaults() -> None:
     """QuotaProbeConfig defaults: enabled, flat 15-minute interval, Haiku."""
     config = load_config(Path("nonexistent.yaml"))
@@ -284,6 +317,33 @@ def test_load_config_quota_probe_enabled_rejects_non_bool(tmp_path: Path) -> Non
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, "quota_probe:\n  enabled: not-a-bool\n")
     with pytest.raises(ConfigError, match="quota_probe.*enabled.*must be a bool"):
+        load_config(config_file)
+
+
+def test_load_config_supervisor_self_deploy_pull_ci_fleet_default() -> None:
+    """SupervisorConfig.self_deploy_pull_ci_fleet defaults to False (issue #552)."""
+    config = load_config(Path("nonexistent.yaml"))
+    assert config.supervisor.self_deploy_pull_ci_fleet is False
+
+
+def test_load_config_supervisor_self_deploy_pull_ci_fleet_accepts_true(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """supervisor:
+  self_deploy_pull_ci_fleet: true
+""",
+    )
+    config = load_config(config_file)
+    assert config.supervisor.self_deploy_pull_ci_fleet is True
+
+
+def test_load_config_supervisor_self_deploy_pull_ci_fleet_rejects_non_bool(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, "supervisor:\n  self_deploy_pull_ci_fleet: not-a-bool\n")
+    with pytest.raises(ConfigError, match="supervisor.*self_deploy_pull_ci_fleet.*must be a bool"):
         load_config(config_file)
 
 
@@ -840,6 +900,141 @@ def test_load_config_readiness_no_ci_minutes_accepts_valid_int(tmp_path: Path) -
     )
     config = load_config(config_file)
     assert config.auto_merge.readiness_no_ci_minutes == 30
+
+
+def test_load_config_stale_checks_grace_minutes_rejects_bool_true(tmp_path: Path) -> None:
+    """Issue #1274 (W17): YAML boolean true is not a valid integer minutes value."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_grace_minutes: true
+""",
+    )
+    with pytest.raises(ConfigError, match="stale_checks_grace_minutes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_stale_checks_grace_minutes_rejects_bool_false(tmp_path: Path) -> None:
+    """Issue #1274 (W17): YAML boolean false silently means 0 if treated as int."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_grace_minutes: false
+""",
+    )
+    with pytest.raises(ConfigError, match="stale_checks_grace_minutes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_stale_checks_grace_minutes_rejects_negative(tmp_path: Path) -> None:
+    """Issue #1274 (W17): negative minutes is semantically meaningless."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_grace_minutes: -1
+""",
+    )
+    with pytest.raises(ConfigError, match="stale_checks_grace_minutes.*must not be negative"):
+        load_config(config_file)
+
+
+def test_load_config_stale_checks_grace_minutes_accepts_valid_int(tmp_path: Path) -> None:
+    """Issue #1274 (W17): zero and positive integers are both accepted."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_grace_minutes: 0
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.stale_checks_grace_minutes == 0
+
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_grace_minutes: 20
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.stale_checks_grace_minutes == 20
+
+
+def test_load_config_stale_checks_max_retriggers_rejects_bool_true(tmp_path: Path) -> None:
+    """Issue #1274 (W17): YAML boolean true is not a valid integer count."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_max_retriggers: true
+""",
+    )
+    with pytest.raises(ConfigError, match="stale_checks_max_retriggers.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_stale_checks_max_retriggers_rejects_bool_false(tmp_path: Path) -> None:
+    """Issue #1274 (W17): YAML boolean false silently means 0 if treated as int."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_max_retriggers: false
+""",
+    )
+    with pytest.raises(ConfigError, match="stale_checks_max_retriggers.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_stale_checks_max_retriggers_rejects_negative(tmp_path: Path) -> None:
+    """Issue #1274 (W17): a negative retrigger cap is semantically meaningless."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_max_retriggers: -1
+""",
+    )
+    with pytest.raises(ConfigError, match="stale_checks_max_retriggers.*must not be negative"):
+        load_config(config_file)
+
+
+def test_load_config_stale_checks_max_retriggers_accepts_valid_int(tmp_path: Path) -> None:
+    """Issue #1274 (W17): zero (no retries) and positive counts are both accepted."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_max_retriggers: 0
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.stale_checks_max_retriggers == 0
+
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_max_retriggers: 5
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.stale_checks_max_retriggers == 5
+
+
+def test_load_config_stale_checks_defaults_when_absent(tmp_path: Path) -> None:
+    """Issue #1274 (W17): an absent `review` section (or absent keys within an
+    otherwise-present one) falls back to ReviewConfig's documented defaults --
+    no silent zero/None, matching the sibling
+    auto_merge.ci_run_never_created_grace_minutes default-fallback shape.
+    """
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, "review:\n  max_rework_cycles: 2\n")
+    config = load_config(config_file)
+    assert config.review.stale_checks_grace_minutes == 15
+    assert config.review.stale_checks_max_retriggers == 3
 
 
 def test_api_worker_config_defaults() -> None:
@@ -1403,6 +1598,75 @@ def test_label_config_is_frozen() -> None:
         labels.complexity_high = "x"  # type: ignore[misc]
 
 
+# ---------------------------------------------------------------------------
+# LabelConfig — operator_queue (issue #1266: mechanical-escalation routing)
+# ---------------------------------------------------------------------------
+
+
+def test_label_config_operator_queue_default() -> None:
+    from charlie_work.config import LabelConfig
+
+    assert LabelConfig().operator_queue == "agent:operator-queue"
+
+
+def test_label_config_operator_queue_in_terminal_set() -> None:
+    """A mechanically-escalated issue must never re-enter dispatch.
+
+    ``operator_queue`` has to be a member of ``terminal`` -- that set is what
+    ``OrchestratorApp._is_dispatchable`` (and the standalone dispatch-backlog
+    reachability check) intersect against to exclude an issue from selection.
+    Without this membership, an operator-queued issue would still carry
+    ``automated-ready`` and get redispatched out from under the operator.
+    """
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.operator_queue in labels.terminal
+
+
+def test_label_config_operator_queue_in_workflow_labels() -> None:
+    """Unlike ``prose_only_deps``, operator_queue is actively added/removed by
+    automated ``labels.py`` transitions (the operator_queued/
+    redispatch_operator_queued edges, and the de-escalation cap-exhaustion
+    path), so it must be a ``workflow_labels`` member -- otherwise
+    ``_compute_remove`` would never strip it on a transition away from it.
+    """
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.operator_queue in labels.workflow_labels
+
+
+def test_label_config_operator_queue_in_all_for_bootstrap() -> None:
+    """The label is in ``all`` so bootstrap_labels creates it on GitHub."""
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.operator_queue in labels.all
+
+
+def test_label_config_operator_queue_not_in_active_set() -> None:
+    """A terminal escalation state is not an "actively being worked" state."""
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.operator_queue not in labels.active
+
+
+def test_label_config_operator_queue_is_overridable(tmp_path: Path) -> None:
+    """The label string is configurable via the labels: section like every
+    other label -- issue #1266 forbids hardcoding it anywhere but here."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """labels:
+  operator_queue: agent:needs-operator
+""",
+    )
+    config = load_config(config_file)
+    assert config.labels.operator_queue == "agent:needs-operator"
+
+
 # --- Issue #600: runner_allocation is host-wide only; cross-validate floors ---
 
 
@@ -1663,3 +1927,208 @@ runner_capacity_escalation:
         match="runner_capacity_escalation.*starvation_escalation_minutes.*must be > 0",
     ):
         load_config(config_file)
+
+
+def test_build_config_from_data_require_worker_github_token_rejects_non_bool() -> None:
+    """Issue #1001: dispatch.require_worker_github_token must be a bool."""
+    with pytest.raises(ConfigError, match="require_worker_github_token.*must be a bool"):
+        build_config_from_data({"dispatch": {"require_worker_github_token": "true"}})
+
+
+# ---------------------------------------------------------------------------
+# Issue #1383: auto_merge.infra_blocked validation error paths.
+#
+# Mirrors the per-field rejection convention established for every other
+# auto_merge / review sub-section (e.g. stale_checks_*): unknown key,
+# wrong type per field, bool-for-int rejection, and negative-value
+# rejection. The happy path (YAML parse + round-trip) is covered in
+# test_charlie_work.py::test_infra_blocked_config_parses_from_yaml.
+# ---------------------------------------------------------------------------
+
+
+_IB_HEADER = "auto_merge:\n  required_checks: [Tests passed]\n  infra_blocked:\n"
+
+
+def test_load_config_infra_blocked_defaults_when_absent(tmp_path: Path) -> None:
+    """An absent infra_blocked section yields InfraBlockedConfig's documented
+    defaults -- no silent zero/None, matching the sibling
+    stale_checks default-fallback shape."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        "auto_merge:\n  required_checks: [Tests passed]\n",
+    )
+    config = load_config(config_file)
+    cfg = config.auto_merge.infra_blocked
+    assert cfg.enabled is True
+    assert cfg.instant_fail_seconds == 10
+    assert cfg.persistence_passes == 3
+    assert cfg.escalation_window_minutes == 60
+    assert cfg.annotation_patterns == (
+        "the job was not started",
+        "actions budget is preventing further use",
+        "no runner matching",
+        "usage limit",
+    )
+
+
+def test_load_config_infra_blocked_rejects_non_mapping(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        "auto_merge:\n  required_checks: [Tests passed]\n  infra_blocked: not-a-map\n",
+    )
+    with pytest.raises(ConfigError, match="infra_blocked.*must be a mapping"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_rejects_unknown_key(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    bogus_key: 1\n",
+    )
+    with pytest.raises(ConfigError, match="infra_blocked.*has unknown key"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_annotation_patterns_rejects_non_list(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    annotation_patterns: billing-exhausted\n",
+    )
+    with pytest.raises(ConfigError, match="annotation_patterns.*must be a list of strings"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_instant_fail_seconds_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    instant_fail_seconds: ten\n",
+    )
+    with pytest.raises(ConfigError, match="instant_fail_seconds.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_instant_fail_seconds_rejects_bool(
+    tmp_path: Path,
+) -> None:
+    """YAML boolean true is not a valid integer count (matches the
+    stale_checks_max_retriggers bool-rejection convention)."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    instant_fail_seconds: true\n",
+    )
+    with pytest.raises(ConfigError, match="instant_fail_seconds.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_instant_fail_seconds_rejects_negative(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    instant_fail_seconds: -1\n",
+    )
+    with pytest.raises(ConfigError, match="instant_fail_seconds.*must be >= 0"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_persistence_passes_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    persistence_passes: three\n",
+    )
+    with pytest.raises(ConfigError, match="persistence_passes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_persistence_passes_rejects_bool(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    persistence_passes: false\n",
+    )
+    with pytest.raises(ConfigError, match="persistence_passes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_persistence_passes_rejects_negative(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    persistence_passes: -2\n",
+    )
+    with pytest.raises(ConfigError, match="persistence_passes.*must be >= 0"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_escalation_window_minutes_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    escalation_window_minutes: 1h\n",
+    )
+    with pytest.raises(ConfigError, match="escalation_window_minutes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_escalation_window_minutes_rejects_bool(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    escalation_window_minutes: true\n",
+    )
+    with pytest.raises(ConfigError, match="escalation_window_minutes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_escalation_window_minutes_rejects_negative(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    escalation_window_minutes: -5\n",
+    )
+    with pytest.raises(ConfigError, match="escalation_window_minutes.*must be >= 0"):
+        load_config(config_file)
+
+
+def test_load_config_infra_blocked_enabled_rejects_non_bool(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        _IB_HEADER + "    enabled: yes-please\n",
+    )
+    with pytest.raises(ConfigError, match="infra_blocked.enabled.*must be a bool"):
+        load_config(config_file)
+
+
+def test_provider_suspended_is_deterministic_escalation_failure_kind() -> None:
+    """Issue #1342: ``provider_suspended`` must sit in
+    DETERMINISTIC_ESCALATION_FAILURE_KINDS so a suspended provider account
+    escalates to an operator on the first occurrence instead of burning the
+    auto-redispatch cap on a deterministic external billing failure."""
+    from charlie_work.config import DETERMINISTIC_ESCALATION_FAILURE_KINDS
+
+    assert "provider_suspended" in DETERMINISTIC_ESCALATION_FAILURE_KINDS

@@ -438,7 +438,11 @@ def launch_devin_session(
             # takes the ordinary redispatch-cap path (issue #288 follow-up, PR #314).
             failure_kind = "worktree_probe_failed"
         elif isinstance(exc, WorktreeUnsafeError):
-            failure_kind = "worktree_unsafe"
+            # Issue #807: the discriminator (shim dirt vs local commits) is
+            # computed at detection time and carried on the exception, so the
+            # launch shim emits a distinct failure_kind without classifying
+            # after the fact.
+            failure_kind = exc.kind
         elif isinstance(exc, ReworkBranchConflictError):
             failure_kind = "rework_branch_conflict"
         elif isinstance(exc, WorktreeForeignWriterError):
@@ -450,7 +454,11 @@ def launch_devin_session(
         record = SessionRecord(
             issue_number=issue_number,
             branch=branch,
-            worktree_path=getattr(exc, "worktree_path", "")
+            # str() is load-bearing: the exception stores a Path, and an
+            # unserializable field here destroys this whole failure record
+            # mid-json.dump, downgrading the diagnosis to a generic launch
+            # failure that burns the rework cap (issue #1184).
+            worktree_path=str(getattr(exc, "worktree_path", ""))
             if isinstance(exc, WorktreeForeignWriterError)
             else "",
             prompt_path=str(prompt_path),
@@ -579,7 +587,9 @@ def launch_devin_session(
         # Write the worktree writer marker so this process is recorded as the
         # legitimate occupant of the worktree (issue #400).
         try:
-            write_worktree_marker(worktree.path, pid, session_id)
+            write_worktree_marker(
+                worktree.path, pid, session_id, process_start_time=process_start_time
+            )
         except OSError:
             # Best-effort marker write must not derail a successful launch.
             pass

@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from _sessions_db_fixtures import make_sessions_db
+from _worktree_fixtures import _clone_repo, _git
 from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfig, WatchdogConfig
 from charlie_work.github import GitHubRunResult
 from charlie_work.process_utils import get_process_start_time
@@ -21,6 +22,11 @@ from charlie_work import worktree as worktree_module
 from charlie_work.worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
+    RESCUE_REF_PREFIX,
+    RescueCapture,
+    WORKTREE_UNSAFE_KINDS,
+    WORKTREE_UNSAFE_KIND_LOCAL_COMMITS,
+    WORKTREE_UNSAFE_KIND_SHIM_DIRT,
     WorktreeCleanResult,
     WorktreeCleanGH,
     WorktreeInfo,
@@ -31,6 +37,7 @@ from charlie_work.worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
     ReworkMergeConflict,
+    SalvagePushResult,
     _clear_declared_scaffolding_collisions,
     _default_worktrees_dir,
     _eligible_for_scaffolding_repair,
@@ -43,6 +50,7 @@ from charlie_work.worktree import (
     _restore_declared_scaffolding_modifications,
     _worker_authored_dirty,
     _worktree_refuse_to_reset_reason,
+    _worktree_unsafe_kind_from_reason,
     clean_worktrees,
     create_review_checkout,
     create_worktree,
@@ -53,13 +61,33 @@ from charlie_work.worktree import (
     read_worktree_marker,
     remove_review_checkout,
     remove_worktree,
+    salvage_push_stranded_commits,
     verify_shared_venv,
+    worktree_head_sha,
     write_worktree_marker,
     _is_git_tracked,
     _materialize_directory,
     _slugify,
     _unlink_reparse_point,
 )
+
+
+def _force_capture_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch rescue capture to always fail so the refusal path is exercised.
+
+    Issue #849 added rescue capture before ``WorktreeUnsafeError`` — when
+    capture succeeds, the reset proceeds and no error is raised. The existing
+    refusal tests below test the safety property that a correct refusal
+    prevents data loss; they must run with capture disabled to exercise the
+    refusal path. The rescue capture path itself is tested by the
+    ``test_rescue_capture_*`` tests at the end of this file.
+    """
+    monkeypatch.setattr(
+        "charlie_work.worktree._capture_worktree_work_to_rescue_ref",
+        lambda *args, **kwargs: RescueCapture(
+            ref_name=None, commit_sha=None, error="forced capture failure for refusal test"
+        ),
+    )
 
 
 def _init_repo(repo_root: Path, bare: bool = False) -> None:
@@ -125,22 +153,6 @@ def _init_repo(repo_root: Path, bare: bool = False) -> None:
         (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
         run(["git", "add", "README.md"])
         run(["git", "commit", "-m", "initial commit"])
-
-
-def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
-
-
-def _clone_repo(remote_repo: Path, repo_root: Path) -> None:
-    subprocess.run(
-        ["git", "clone", str(remote_repo), str(repo_root)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    # A fresh clone has no committer identity on CI runners.
-    _git(repo_root, "config", "user.email", "test@example.test")
-    _git(repo_root, "config", "user.name", "Test User")
 
 
 def test_create_and_remove_round_trip(tmp_path: Path) -> None:
@@ -1505,7 +1517,9 @@ def test_rework_reuse_resets_on_non_ff_different_patch_id(tmp_path: Path) -> Non
     remove_worktree(repo_root, info1.path)
 
 
-def test_rework_reuse_refuses_non_ff_with_dirty_worktree(tmp_path: Path) -> None:
+def test_rework_reuse_refuses_non_ff_with_dirty_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Rework reuse path must refuse to reset an existing worktree that has
     uncommitted modifications and is non-FF diverged from origin."""
     remote_repo = tmp_path / "remote"
@@ -1530,6 +1544,7 @@ def test_rework_reuse_refuses_non_ff_with_dirty_worktree(tmp_path: Path) -> None
     _git(remote_repo, "commit", "--amend", "-m", "add feature (remote)")
     _git(remote_repo, "checkout", "main")
 
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
         create_worktree(
             repo_root,
@@ -1665,7 +1680,9 @@ def test_rework_reclaims_detached_worktree_at_target_path(tmp_path: Path) -> Non
     remove_worktree(repo_root, info2.path)
 
 
-def test_rework_reclaim_refuses_dirty_detached_worktree(tmp_path: Path) -> None:
+def test_rework_reclaim_refuses_dirty_detached_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A detached leftover worktree with uncommitted work must not be silently
     clobbered by the by-path reclaim — WorktreeUnsafeError, work survives."""
     repo_root = tmp_path / "repo"
@@ -1676,6 +1693,7 @@ def test_rework_reclaim_refuses_dirty_detached_worktree(tmp_path: Path) -> None:
     _git(info1.path, "checkout", "--detach")
     (info1.path / "dirty.txt").write_text("uncommitted worker edit\n", encoding="utf-8")
 
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
         create_worktree(repo_root, branch_name, rework=True)
 
@@ -2154,7 +2172,9 @@ def test_recovery_fetch_fallback_on_missing_remote_branch(tmp_path: Path) -> Non
     remove_worktree(repo_root, info2.path)
 
 
-def test_redispatch_refuses_to_reset_with_unpushed_commits(tmp_path: Path) -> None:
+def test_redispatch_refuses_to_reset_with_unpushed_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Issue #257: a redispatch with local commits not on the remote branch
     must hard-refuse to reset the worktree rather than discarding work.
     """
@@ -2175,6 +2195,7 @@ def test_redispatch_refuses_to_reset_with_unpushed_commits(tmp_path: Path) -> No
     _git(info1.path, "commit", "-m", "worker commit before death")
 
     # Redispatch must refuse to reset the worktree because it has local commits.
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has 1 local commit"):
         create_worktree(
             repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, issue_number=261
@@ -2189,7 +2210,9 @@ def test_redispatch_refuses_to_reset_with_unpushed_commits(tmp_path: Path) -> No
     remove_worktree(repo_root, info1.path)
 
 
-def test_second_redispatch_refuses_with_unpushed_commits(tmp_path: Path) -> None:
+def test_second_redispatch_refuses_with_unpushed_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Issue #257: each redispatch with local commits not on the remote branch
     must hard-refuse to reset; the worktree is left intact.
     """
@@ -2207,6 +2230,7 @@ def test_second_redispatch_refuses_with_unpushed_commits(tmp_path: Path) -> None
     _git(info1.path, "add", "attempt1.txt")
     _git(info1.path, "commit", "-m", "attempt 1 work")
 
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has 1 local commit"):
         create_worktree(
             repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, issue_number=262
@@ -2303,7 +2327,9 @@ def test_recovery_dirty_worktree_salvaged(tmp_path: Path) -> None:
     remove_worktree(repo_root, info2.path)
 
 
-def test_fresh_dispatch_dirty_worktree_refuses_to_reset(tmp_path: Path) -> None:
+def test_fresh_dispatch_dirty_worktree_refuses_to_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Issue #257: Fresh dispatch with a dirty stale worktree must hard-refuse
     to reset rather than discarding uncommitted modifications.
     """
@@ -2330,6 +2356,7 @@ def test_fresh_dispatch_dirty_worktree_refuses_to_reset(tmp_path: Path) -> None:
     assert status_result.stdout.strip()
 
     # Fresh dispatch must refuse to reset the dirty worktree.
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
         create_worktree(repo_root, branch_name, base_ref="HEAD")
 
@@ -2368,7 +2395,9 @@ def test_fresh_dispatch_ignores_injected_only_dirtiness(tmp_path: Path) -> None:
     remove_worktree(repo_root, info2.path)
 
 
-def test_fresh_dispatch_still_refuses_worker_authored_dirtiness(tmp_path: Path) -> None:
+def test_fresh_dispatch_still_refuses_worker_authored_dirtiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Issue #381: worker-authored uncommitted changes still hard-refuse fresh dispatch."""
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo, bare=True)
@@ -2386,6 +2415,7 @@ def test_fresh_dispatch_still_refuses_worker_authored_dirtiness(tmp_path: Path) 
 
     (info1.path / "worker-change.txt").write_text("worker work\n", encoding="utf-8")
 
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
         create_worktree(repo_root, branch_name, base_ref="HEAD", config=config)
 
@@ -2562,7 +2592,7 @@ def test_recovery_transient_fetch_failure_via_probe_aborts(tmp_path: Path) -> No
 
 
 def test_fresh_dispatch_dirty_worktree_with_broken_remote_refuses_to_reset(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Issue #257: A dirty worktree must be refused even if the remote is broken.
 
@@ -2595,6 +2625,7 @@ def test_fresh_dispatch_dirty_worktree_with_broken_remote_refuses_to_reset(
     _git(repo_root, "remote", "set-url", "origin", "file:///nonexistent/path")
 
     # Fresh dispatch should refuse to reset the dirty worktree without trying to push.
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
         create_worktree(repo_root, branch_name, base_ref="HEAD")
 
@@ -4374,16 +4405,21 @@ def test_worker_authored_dirty_detects_sibling_in_collapsed_untracked_dir(
     dir/`` line in the first place — every file, including a worker-authored
     sibling living next to a nested injected path, gets its own record. There
     is no collapsed line left to special-case or re-probe.
+
+    Uses a non-launcher-owned directory (``.custom/``) because ``.devin/`` is
+    now entirely launcher-owned (issue #1391) — a sibling under ``.devin/``
+    is correctly ignored, so it cannot serve as the "should be detected"
+    case here.
     """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
-    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected = repo_root / ".custom" / "prompts" / "worker.md"
     injected.parent.mkdir(parents=True)
     injected.write_text("injected prompt", encoding="utf-8")
-    sibling = repo_root / ".devin" / "worker-output.txt"
+    sibling = repo_root / ".custom" / "worker-output.txt"
     sibling.write_text("real worker output", encoding="utf-8")
 
-    assert _worker_authored_dirty(repo_root, (".devin/prompts/worker.md",)) is True
+    assert _worker_authored_dirty(repo_root, (".custom/prompts/worker.md",)) is True
 
 
 def test_worker_authored_dirty_untracked_dir_with_only_injected_stays_clean(
@@ -4552,6 +4588,137 @@ def test_worker_authored_dirty_detects_changes_outside_materialize_and_injected(
     (repo_root / "worker-output.txt").write_text("worker result\n", encoding="utf-8")
 
     assert _worker_authored_dirty(repo_root, (), (".devin",)) is True
+
+
+# --- issue #1391: launcher-owned shim dirt is not worker output ---------------
+
+
+def test_worker_authored_dirty_ignores_devin_shim_residue(tmp_path: Path) -> None:
+    """Issue #1391: untracked ``.devin/`` launcher residue (AGENTS.md,
+    hooks.v1.json, hooks/*.py, skills/, worker.md, orchestrator.md) is shim
+    dirt, not worker output. The dirty check must ignore it so a worktree
+    whose only dirt is launcher residue is not refused re-arm."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    # Simulate the full set of shim residue observed in the field.
+    devin = repo_root / ".devin"
+    devin.mkdir(parents=True)
+    (devin / "AGENTS.md").write_text("agents\n", encoding="utf-8")
+    (devin / "worker.md").write_text("worker\n", encoding="utf-8")
+    (devin / "orchestrator.md").write_text("orch\n", encoding="utf-8")
+    (devin / "hooks.v1.json").write_text("{}", encoding="utf-8")
+    hooks_dir = devin / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "pre_tool.py").write_text("# hook\n", encoding="utf-8")
+    skills_dir = devin / "skills"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "foo.py").write_text("# skill\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_devin_prompts_modifications(
+    tmp_path: Path,
+) -> None:
+    """Issue #1391: modified ``.devin/prompts/rework.md`` / ``worker.md`` are
+    shim rewrites, not worker output. Even when tracked, modifications under
+    ``.devin/`` must be ignored by the launcher-owned matcher (independent of
+    ``injected_paths`` / ``materialize_dirs`` config)."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    prompts_dir = repo_root / ".devin" / "prompts"
+    prompts_dir.mkdir(parents=True)
+    for name in ("worker.md", "rework.md"):
+        p = prompts_dir / name
+        p.write_text("original\n", encoding="utf-8")
+        _git(repo_root, "add", str(p))
+    _git(repo_root, "commit", "-m", "track devin prompts")
+    # Simulate the shim rewriting them.
+    (prompts_dir / "worker.md").write_text("rewritten\n", encoding="utf-8")
+    (prompts_dir / "rework.md").write_text("rewritten\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_pr_body_scratch_files(tmp_path: Path) -> None:
+    """Issue #1391: PR body scratch files (``PR_BODY.md``, ``PR_BODY_42.md``,
+    ``.worker-pr-body.md``, ``_pr_body.md``) are launcher/protocol residue,
+    not worker output. The dirty check must ignore all variants."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    for name in ("PR_BODY.md", "PR_BODY_42.md", ".worker-pr-body.md", "_pr_body.md"):
+        (repo_root / name).write_text("# PR body draft\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_git_worktree_dir(tmp_path: Path) -> None:
+    """Issue #1391: untracked ``.git_worktree_dir/`` is launcher residue."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    wt_dir = repo_root / ".git_worktree_dir"
+    wt_dir.mkdir(parents=True)
+    (wt_dir / "cache.json").write_text("{}", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_charlie_writer_deletion(tmp_path: Path) -> None:
+    """Issue #1391: a deleted ``.charlie-writer.json`` marker is protocol
+    residue, not worker output. The writer marker is already in the default
+    ``injected_paths``, so a deletion is excluded by the declared-scaffolding
+    matcher — this test pins that the default config covers the deletion
+    case (not just creation/modification)."""
+    from charlie_work.config import DispatchConfig
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    marker = repo_root / ".charlie-writer.json"
+    marker.write_text('{"pid": 1}\n', encoding="utf-8")
+    _git(repo_root, "add", str(marker))
+    _git(repo_root, "commit", "-m", "track writer marker")
+    # Delete it (simulating a worker or shim removing the marker).
+    marker.unlink()
+
+    assert _worker_authored_dirty(repo_root, DispatchConfig().injected_paths) is False
+
+
+def test_worker_authored_dirty_still_flags_real_work_alongside_shim_dirt(
+    tmp_path: Path,
+) -> None:
+    """Issue #1391 negative control: ignoring launcher residue must NOT excuse
+    genuine worker-authored modifications mixed in with the junk. This is the
+    jc #1514 scenario — two real modified source files alongside shim dirt
+    that were lost when the worktree was force-removed."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    # Shim residue.
+    devin = repo_root / ".devin"
+    devin.mkdir(parents=True)
+    (devin / "AGENTS.md").write_text("agents\n", encoding="utf-8")
+    (repo_root / "PR_BODY.md").write_text("# draft\n", encoding="utf-8")
+    # Real worker output — a tracked source file modification.
+    src = repo_root / "src" / "app.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("original\n", encoding="utf-8")
+    _git(repo_root, "add", str(src))
+    _git(repo_root, "commit", "-m", "add app")
+    src.write_text("modified by worker\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is True
+
+
+def test_worker_authored_dirty_devin_prefix_does_not_collide(tmp_path: Path) -> None:
+    """Issue #1391: a directory that merely shares a string prefix with a
+    launcher-owned dir (``.devin-cache`` vs ``.devin``) must not match —
+    path-segment comparison, not substring matching."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    cache_dir = repo_root / ".devin-cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "marker.txt").write_text("not launcher\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is True
 
 
 def test_inspect_worktree_state_no_commits(tmp_path: Path) -> None:
@@ -5563,8 +5730,8 @@ def test_verify_shared_venv_catches_pth_pointing_outside_main_checkout(tmp_path:
     ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
 
     assert not ok
-    assert "points outside main checkout" in message
-    assert "uv sync --all-extras --reinstall-package charlie-work" in message
+    assert "points outside all configured checkouts" in message
+    assert "uv sync --all-extras" in message
 
 
 def test_verify_shared_venv_approves_pth_pointing_at_main_checkout(tmp_path: Path) -> None:
@@ -5577,7 +5744,130 @@ def test_verify_shared_venv_approves_pth_pointing_at_main_checkout(tmp_path: Pat
     ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
 
     assert ok
-    assert "main checkout" in message
+    assert "configured checkouts" in message
+
+
+def _setup_repo_with_peer_dep(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a repo with a relative editable dep on a peer repo.
+
+    Returns ``(repo_root, peer_src)`` where ``repo_root/pyproject.toml``
+    declares ``ci-fleet = { path = "../ci_runners", editable = true }`` and
+    ``peer_src`` is the peer repo's ``src`` directory containing
+    ``ci_fleet/__init__.py``.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    (repo_root / "pyproject.toml").write_text(
+        '[project]\nname = "charlie-work"\nversion = "0.1.0"\n'
+        '[tool.uv.sources]\nci-fleet = { path = "../ci_runners", editable = true }\n',
+        encoding="utf-8",
+    )
+    peer_root = tmp_path / "ci_runners"
+    peer_src = peer_root / "src"
+    (peer_src / "ci_fleet").mkdir(parents=True)
+    (peer_src / "ci_fleet" / "__init__.py").write_text("", encoding="utf-8")
+    return repo_root, peer_src
+
+
+def test_verify_shared_venv_detects_poisoned_foreign_editable(tmp_path: Path) -> None:
+    """A peer-repo editable .pth pointing at a scratch dir is caught (issue #969 gap 2).
+
+    The old filename filter excluded ``_editable_impl_ci_fleet.pth`` because
+    ``ci_fleet`` is not a top-level package under this repo's ``src``.  The
+    resolved-target test scans every ``.pth`` and flags any path line outside
+    all configured roots.
+    """
+    repo_root, peer_src = _setup_repo_with_peer_dep(tmp_path)
+    scratch = tmp_path / "scratch" / "src"
+    scratch.mkdir(parents=True)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    # Main repo .pth is healthy; foreign .pth is poisoned.
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    (site_packages / "_editable_impl_ci_fleet.pth").write_text(
+        str(scratch.resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert not ok
+    assert "_editable_impl_ci_fleet.pth" in message
+    assert "points outside all configured checkouts" in message
+
+
+def test_verify_shared_venv_approves_healthy_foreign_editable(tmp_path: Path) -> None:
+    """A peer-repo editable .pth pointing at the correct peer src is approved."""
+    repo_root, peer_src = _setup_repo_with_peer_dep(tmp_path)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    (site_packages / "_editable_impl_ci_fleet.pth").write_text(
+        str(peer_src.resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert ok
+    assert "configured checkouts" in message
+
+
+def test_verify_shared_venv_catches_foreign_editable_when_main_is_healthy(
+    tmp_path: Path,
+) -> None:
+    """The false-green scenario from issue #969: main .pth healthy, foreign poisoned.
+
+    The old filter + repair would flag the main .pth, repair it, re-verify
+    only the main .pth, and report success while the foreign editable was still
+    pointing into a scratch tree.  The resolved-target test scans every .pth,
+    so the foreign mismatch is surfaced directly.
+    """
+    repo_root, peer_src = _setup_repo_with_peer_dep(tmp_path)
+    scratch = tmp_path / "scratch" / "src"
+    scratch.mkdir(parents=True)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    (site_packages / "_editable_impl_ci_fleet.pth").write_text(
+        str(scratch.resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert not ok
+    assert "_editable_impl_ci_fleet.pth" in message
+
+
+def test_verify_shared_venv_ignores_non_path_pth_lines(tmp_path: Path) -> None:
+    """``import``/comment ``.pth`` lines are not treated as path targets.
+
+    ``ci_fleet_probe.pth`` and ``_virtualenv.pth`` contain ``import`` lines
+    that :func:`_resolve_pth_line` returns an empty path for.  They must not
+    trigger a false mismatch under the resolved-target test.
+    """
+    repo_root, _peer_src = _setup_repo_with_peer_dep(tmp_path)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    (site_packages / "ci_fleet_probe.pth").write_text(
+        "import sys; exec(__import__('importlib').import_module('ci_fleet_probe')._probe())\n",
+        encoding="utf-8",
+    )
+    (site_packages / "_virtualenv.pth").write_text("import _virtualenv\n", encoding="utf-8")
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert ok
+    assert "configured checkouts" in message
 
 
 def test_clean_worktrees_removes_merged_worktree_and_verifies_shared_venv(
@@ -5611,7 +5901,7 @@ def test_clean_worktrees_removes_merged_worktree_and_verifies_shared_venv(
     assert len(result.data["removed"]) == 1
     assert not info.path.exists()
     assert result.data["venv_ok"] is True
-    assert "main checkout" in result.data["venv_message"]
+    assert "configured checkouts" in result.data["venv_message"]
 
 
 def test_clean_worktrees_skips_dirty_worktree(tmp_path: Path) -> None:
@@ -6197,7 +6487,7 @@ def test_clean_worktrees_surfaces_poisoned_venv_after_removal(tmp_path: Path) ->
     assert result.ok is False
     assert len(result.data["removed"]) == 1
     assert result.data["venv_ok"] is False
-    assert "points outside main checkout" in result.data["venv_message"]
+    assert "points outside all configured checkouts" in result.data["venv_message"]
 
 
 def test_clean_worktrees_skips_open_pr(tmp_path: Path) -> None:
@@ -7222,7 +7512,9 @@ def test_rework_refuses_foreign_worktree_at_unexpected_path(tmp_path: Path) -> N
     _git(repo_root, "worktree", "remove", str(foreign_wt), "--force")
 
 
-def test_rework_refuses_dirty_worktree_at_adoption(tmp_path: Path) -> None:
+def test_rework_refuses_dirty_worktree_at_adoption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Issue #1118: a rework dispatch (non-recovery) must refuse to adopt a
     worktree that is dirty at adoption time — never commit tracked
     modifications the shim did not itself produce.
@@ -7243,6 +7535,7 @@ def test_rework_refuses_dirty_worktree_at_adoption(tmp_path: Path) -> None:
     # worktree directory).
     (info.path / "file.txt").write_text("uncommitted foreign edit\n", encoding="utf-8")
 
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError):
         create_worktree(repo_root, branch_name, rework=True, worktrees_dir=worktrees_dir)
 
@@ -7418,6 +7711,7 @@ def test_worktree_unsafe_still_escalates_when_writer_marker_is_dead(
         "charlie_work.worktree.is_pid_alive",
         lambda pid, start: False,
     )
+    _force_capture_failure(monkeypatch)
 
     with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
         create_worktree(
@@ -7437,3 +7731,764 @@ def test_worktree_unsafe_still_escalates_when_writer_marker_is_dead(
 
     # Clean up.
     remove_worktree(repo, info.path, branch=branch_name)
+
+
+# --- Issue #807: worktree_unsafe kind split at detection time ---
+
+
+def test_worktree_unsafe_error_classifies_shim_dirt_from_uncommitted_modifications() -> None:
+    """Issue #807: a ``WorktreeUnsafeError`` raised for uncommitted modifications
+    (launch-shim dirt / adapter shim materialization) must carry
+    ``kind="worktree_unsafe_shim_dirt"`` — the mechanical kind that stays in
+    ``DETERMINISTIC_ESCALATION_FAILURE_KINDS`` and is eligible for auto-de-escalation.
+    """
+    exc = WorktreeUnsafeError("worktree has uncommitted modifications")
+    assert exc.kind == "worktree_unsafe_shim_dirt"
+
+
+def test_worktree_unsafe_error_classifies_local_commits_from_unpushed_commits() -> None:
+    """Issue #807: a ``WorktreeUnsafeError`` raised for local commits not on the
+    remote branch (genuine divergence) must carry
+    ``kind="worktree_unsafe_local_commits"`` — the judgment kind that escalates
+    immediately but is NOT eligible for auto-de-escalation.
+    """
+    exc = WorktreeUnsafeError("worktree has 1 local commit(s) not on remote branch")
+    assert exc.kind == "worktree_unsafe_local_commits"
+
+
+def test_worktree_unsafe_error_explicit_kind_overrides_reason_derivation() -> None:
+    """Issue #807: an explicit ``kind`` argument takes precedence over the
+    auto-derived kind from the reason string, so callers that already know the
+    discriminator can pass it directly."""
+    exc = WorktreeUnsafeError(
+        "worktree has uncommitted modifications",
+        kind="worktree_unsafe_local_commits",
+    )
+    assert exc.kind == "worktree_unsafe_local_commits"
+
+
+def test_worktree_unsafe_error_rejects_unrecognized_explicit_kind() -> None:
+    """Issue #807: an explicit ``kind`` that isn't one of ``WORKTREE_UNSAFE_KINDS``
+    must fail closed with ``ValueError`` rather than being accepted silently. A
+    stray/unrecognized kind would match neither
+    ``DETERMINISTIC_ESCALATION_FAILURE_KINDS`` nor
+    ``DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS``, so it would silently
+    degrade to the ordinary redispatch-cap path instead of escalating.
+    """
+    with pytest.raises(ValueError):
+        WorktreeUnsafeError(
+            "worktree has uncommitted modifications",
+            kind="worktree_unsafe_bogus",
+        )
+
+
+def test_worktree_unsafe_error_derived_kind_is_always_a_known_kind() -> None:
+    """Issue #807: a reason string that matches neither known discriminator
+    pattern must still derive a kind from ``WORKTREE_UNSAFE_KINDS`` (the
+    fail-closed fallback), never an unrecognized or empty kind."""
+    exc = WorktreeUnsafeError("worktree is in an unexpected state")
+    assert exc.kind in WORKTREE_UNSAFE_KINDS
+
+
+def test_worktree_unsafe_kind_fallback_is_local_commits_not_shim_dirt() -> None:
+    """Issue #807 rework: a reason string that matches neither known pattern
+    must fail closed toward ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`` (judgment /
+    human-needed), NOT ``WORKTREE_UNSAFE_KIND_SHIM_DIRT`` (mechanical /
+    auto-clearable). Defaulting an unrecognized reason to the mechanical kind
+    inverts this codebase's fail-closed convention and could silently reproduce
+    the #807 bug for any future reason string that doesn't match the
+    'local commit' or 'uncommitted modifications' substring checks — the
+    de-escalation sweep would auto-clear it and return the issue to dispatch
+    instead of escalating to a human.
+    """
+    # Direct function-level assertion on the fallback path.
+    assert (
+        _worktree_unsafe_kind_from_reason("worktree is in an unexpected state")
+        == WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+    )
+    # End-to-end through WorktreeUnsafeError construction.
+    exc = WorktreeUnsafeError("worktree is in an unexpected state")
+    assert exc.kind == WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+
+
+def test_worktree_unsafe_kind_shim_dirt_reason_classifies_as_shim_dirt() -> None:
+    """Issue #807 rework: the 'uncommitted modifications' reason string (shim /
+    adapter dirt) must still classify as ``WORKTREE_UNSAFE_KIND_SHIM_DIRT``
+    after the fallback was flipped to ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS``.
+    This guards against the fallback-flip silently misclassifying shim dirt as
+    a judgment call, which would make every shim-dirt escalation
+    non-auto-clearable."""
+    assert (
+        _worktree_unsafe_kind_from_reason("worktree has uncommitted modifications")
+        == WORKTREE_UNSAFE_KIND_SHIM_DIRT
+    )
+    exc = WorktreeUnsafeError("worktree has uncommitted modifications")
+    assert exc.kind == WORKTREE_UNSAFE_KIND_SHIM_DIRT
+
+
+# --- Issue #849: rescue capture makes worktree_unsafe refusal recoverable ---
+
+
+def test_rescue_capture_preserves_dirty_worktree_and_permits_reset(
+    tmp_path: Path,
+) -> None:
+    """AC1: a dirty worktree is captured to a rescue ref and create_worktree
+    then succeeds. The captured ref's content matches the pre-reset working
+    tree byte-for-byte, including untracked files."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    branch_name = "agent/issue-849-rescue-ac1"
+    info1 = create_worktree(repo, branch_name, base_ref="origin/main")
+
+    # Worker-authored dirty content: a tracked modification + an untracked file.
+    (info1.path / "README.md").write_text("modified by worker\n", encoding="utf-8")
+    (info1.path / "worker_new_file.txt").write_text(
+        "new untracked worker content\n", encoding="utf-8"
+    )
+
+    pre_reset_readme = (info1.path / "README.md").read_text(encoding="utf-8")
+    pre_reset_new_file = (info1.path / "worker_new_file.txt").read_text(encoding="utf-8")
+
+    # Re-dispatch: the stale dirty worktree triggers _raise_if_unsafe_to_reset,
+    # which captures the work to a rescue ref and then permits the reset.
+    info2 = create_worktree(repo, branch_name, base_ref="origin/main", issue_number=849)
+
+    # create_worktree succeeded (no exception) and rescue_capture is populated.
+    assert info2.rescue_capture is not None
+    assert info2.rescue_capture.ref_name is not None
+    assert info2.rescue_capture.error is None
+    assert info2.rescue_capture.ref_name.startswith(RESCUE_REF_PREFIX)
+
+    rescue_ref = info2.rescue_capture.ref_name
+
+    # The captured ref's tree matches the pre-reset working tree byte-for-byte.
+    rescued_readme = _git(repo, "show", f"{rescue_ref}:README.md").stdout
+    assert rescued_readme == pre_reset_readme
+
+    rescued_new_file = _git(repo, "show", f"{rescue_ref}:worker_new_file.txt").stdout
+    assert rescued_new_file == pre_reset_new_file
+
+    # Clean up.
+    remove_worktree(repo, info2.path, branch=branch_name)
+
+
+def test_rescue_capture_failure_still_raises_worktree_unsafe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC2: when capture fails, WorktreeUnsafeError is still raised and no
+    reset occurs. Capture failure must never downgrade the safety property."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    branch_name = "agent/issue-849-rescue-ac2"
+    info1 = create_worktree(repo, branch_name, base_ref="origin/main")
+
+    # Worker-authored dirty content.
+    (info1.path / "worker_wip.txt").write_text("work in progress\n", encoding="utf-8")
+
+    # Force capture to fail.
+    monkeypatch.setattr(
+        "charlie_work.worktree._capture_worktree_work_to_rescue_ref",
+        lambda *args, **kwargs: RescueCapture(
+            ref_name=None, commit_sha=None, error="forced capture failure"
+        ),
+    )
+
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+        create_worktree(repo, branch_name, base_ref="origin/main", issue_number=849)
+
+    # No reset occurred — the dirty content survives untouched.
+    assert info1.path.exists()
+    assert (info1.path / "worker_wip.txt").read_text(encoding="utf-8") == "work in progress\n"
+
+    # Clean up.
+    remove_worktree(repo, info1.path, branch=branch_name)
+
+
+def test_rescue_capture_excludes_scaffolding(
+    tmp_path: Path,
+) -> None:
+    """AC3: injected_paths / materialize_dirs scaffolding is excluded from the
+    captured content, consistent with _worker_authored_dirty."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    # Config with an injected path (e.g. a prompt file the orchestrator writes).
+    from charlie_work.config import DispatchConfig, OrchestratorConfig
+
+    config = OrchestratorConfig(dispatch=DispatchConfig(injected_paths=(".charlie-writer.json",)))
+
+    branch_name = "agent/issue-849-rescue-ac3"
+    info1 = create_worktree(repo, branch_name, base_ref="origin/main", config=config)
+
+    # Worker-authored file (should be captured).
+    (info1.path / "worker_authored.txt").write_text("worker content\n", encoding="utf-8")
+    # Scaffolding file (should be excluded — HEAD version in the rescue tree).
+    (info1.path / ".charlie-writer.json").write_text('{"injected": true}\n', encoding="utf-8")
+
+    info2 = create_worktree(
+        repo, branch_name, base_ref="origin/main", issue_number=849, config=config
+    )
+
+    assert info2.rescue_capture is not None
+    assert info2.rescue_capture.ref_name is not None
+    rescue_ref = info2.rescue_capture.ref_name
+
+    # Worker-authored file IS in the rescue ref's tree.
+    rescued_worker = _git(repo, "show", f"{rescue_ref}:worker_authored.txt").stdout
+    assert rescued_worker == "worker content\n"
+
+    # Scaffolding file is NOT in the rescue ref's tree with the injected
+    # content — it has HEAD's version (which is absent, since the file was
+    # untracked). The rescue tree should not contain .charlie-writer.json at all.
+    show_result = subprocess.run(
+        ["git", "show", f"{rescue_ref}:.charlie-writer.json"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert show_result.returncode != 0  # file does not exist in the rescue tree
+
+    # Clean up.
+    remove_worktree(repo, info2.path, branch=branch_name)
+
+
+def test_rescue_capture_excludes_launcher_owned_shim_dirt(
+    tmp_path: Path,
+) -> None:
+    """Issue #1391: launcher-owned shim dirt (``.devin/``, ``.git_worktree_dir/``,
+    and a ``PR_BODY*.md`` scratch file) mixed with real tracked worker edits is
+    excluded from the captured rescue tree, while the real worker edits are
+    preserved.
+
+    Calls ``_capture_worktree_work_to_rescue_ref`` directly so the exclusion
+    pathspecs in the capture function are the only thing under test -- the
+    ``_worker_authored_dirty`` matcher that also ignores launcher-owned dirt
+    is not on this code path, so a regression in the capture exclusions cannot
+    be masked by the dirty check refusing to trigger.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    branch_name = "agent/issue-1391-rescue-shim-dirt"
+    info = create_worktree(repo, branch_name, base_ref="origin/main")
+
+    # Real worker edits: a tracked modification + an untracked worker file.
+    # These MUST appear in the rescue tree.
+    worker_readme = "modified by worker\n"
+    (info.path / "README.md").write_text(worker_readme, encoding="utf-8")
+    worker_new = "real worker edit\n"
+    (info.path / "worker_real_edit.txt").write_text(worker_new, encoding="utf-8")
+
+    # Launcher-owned shim dirt. These MUST NOT appear in the rescue tree.
+    (info.path / ".devin").mkdir(exist_ok=True)
+    (info.path / ".devin" / "config.json").write_text('{"shim": true}\n', encoding="utf-8")
+    (info.path / ".git_worktree_dir").mkdir(exist_ok=True)
+    (info.path / ".git_worktree_dir" / "marker").write_text("shim marker\n", encoding="utf-8")
+    # A PR_BODY*.md variant -- the glob exclusion must catch it.
+    pr_body = "draft PR body\n"
+    (info.path / "PR_BODY_1391.md").write_text(pr_body, encoding="utf-8")
+
+    capture = worktree_module._capture_worktree_work_to_rescue_ref(
+        repo, info.path, issue_number=1391
+    )
+
+    assert capture.error is None, f"capture failed: {capture.error}"
+    assert capture.ref_name is not None
+    assert capture.ref_name.startswith(RESCUE_REF_PREFIX)
+    rescue_ref = capture.ref_name
+
+    # Real worker edits ARE present in the rescue tree, byte-for-byte.
+    assert _git(repo, "show", f"{rescue_ref}:README.md").stdout == worker_readme
+    assert _git(repo, "show", f"{rescue_ref}:worker_real_edit.txt").stdout == worker_new
+
+    # Launcher-owned shim paths are EXCLUDED from the rescue tree: ``git show``
+    # for each shim path fails (non-zero exit) because the path does not exist
+    # in the captured tree.
+    for shim_path in (
+        ".devin/config.json",
+        ".git_worktree_dir/marker",
+        "PR_BODY_1391.md",
+    ):
+        show_result = subprocess.run(
+            ["git", "show", f"{rescue_ref}:{shim_path}"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        assert show_result.returncode != 0, (
+            f"shim path {shim_path!r} leaked into the rescue tree; "
+            f"git show returned {show_result.returncode} with stdout="
+            f"{show_result.stdout!r}"
+        )
+
+    # Sanity: no path under a launcher-owned directory or matching the PR body
+    # family appears anywhere in the captured tree.
+    tree_paths = _git(repo, "ls-tree", "-r", "--name-only", rescue_ref).stdout.splitlines()
+    leaked = [
+        p
+        for p in tree_paths
+        if p.startswith(".devin/")
+        or p.startswith(".git_worktree_dir/")
+        or p.startswith("PR_BODY")
+        or p in (".worker-pr-body.md", "_pr_body.md")
+    ]
+    assert leaked == [], f"launcher-owned shim paths leaked into rescue tree: {leaked}"
+
+    # Clean up.
+    remove_worktree(repo, info.path, branch=branch_name)
+
+
+def test_rescue_capture_emits_event_retrievable_via_query_events(
+    tmp_path: Path,
+) -> None:
+    """AC4: the emitted event records the rescue ref and is retrievable via
+    query_events."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.instrumentation import query_events
+    from charlie_work.paths import runtime_paths
+
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(repo, config.runtime.state_dir)
+    state_file = paths.state_file
+
+    branch_name = "agent/issue-849-rescue-ac4"
+    info1 = create_worktree(repo, branch_name, base_ref="origin/main")
+
+    # Worker-authored dirty content.
+    (info1.path / "worker_wip.txt").write_text("rescue me\n", encoding="utf-8")
+
+    info2 = create_worktree(
+        repo, branch_name, base_ref="origin/main", issue_number=849, config=config
+    )
+
+    assert info2.rescue_capture is not None
+    assert info2.rescue_capture.ref_name is not None
+    rescue_ref = info2.rescue_capture.ref_name
+
+    # The event is retrievable via query_events.
+    events = query_events(state_file, kind="worktree_rescue_captured")
+    assert len(events) >= 1
+    rescue_events = [e for e in events if e.get("payload", {}).get("rescue_ref") == rescue_ref]
+    assert len(rescue_events) == 1
+    payload = rescue_events[0]["payload"]
+    assert payload["rescue_ref"] == rescue_ref
+    assert payload["issue_number"] == 849
+    assert payload["commit_sha"] is not None
+
+    # Clean up.
+    remove_worktree(repo, info2.path, branch=branch_name)
+
+
+def test_rework_reuse_capture_cleans_worktree_before_ff(
+    tmp_path: Path,
+) -> None:
+    """Rework finding: rework=True + dirty-worktree + capture-succeeds +
+    ff-only-succeeds-despite-dirt.
+
+    The reuse-in-place branch captures dirty content to a rescue ref, then
+    must clean the working tree before the ff-only merge. Without the clean,
+    a dirty file the ff doesn't touch silently survives into the new work
+    session and can be committed under the next worker's name — the exact
+    hazard the "never commit tracked modifications the shim did not itself
+    produce" invariant exists to prevent.
+
+    This test asserts on the resulting worktree's on-disk state, not just on
+    the rescue ref's content.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo = tmp_path / "repo"
+    _clone_repo(remote_repo, repo)
+
+    branch_name = "agent/issue-849-rework-reuse-clean"
+    info1 = create_worktree(repo, branch_name, base_ref="origin/main")
+    # Push the branch so origin knows about it (required for rework reuse).
+    _git(repo, "push", "origin", branch_name)
+
+    # Worker-authored dirty content:
+    # - A tracked modification to README.md (exists in initial commit; the
+    #   ff-only below adds file2.txt and does NOT touch README.md, so without
+    #   the clean the modification would survive the ff).
+    # - An untracked file (also not touched by the ff).
+    dirty_readme = "modified by worker\n"
+    (info1.path / "README.md").write_text(dirty_readme, encoding="utf-8")
+    (info1.path / "worker_untracked.txt").write_text(
+        "untracked worker content\n", encoding="utf-8"
+    )
+
+    # Advance the branch on origin so the local worktree is behind and can
+    # fast-forward. The new commit adds file2.txt — it does NOT touch
+    # README.md, so the ff-only would succeed even with a dirty README.md.
+    _git(remote_repo, "checkout", branch_name)
+    (remote_repo / "file2.txt").write_text("remote change\n", encoding="utf-8")
+    _git(remote_repo, "add", "file2.txt")
+    _git(remote_repo, "commit", "-m", "add file2 on remote")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    # Re-dispatch with rework=True: the existing worktree is dirty, so
+    # _capture_or_raise fires. Capture succeeds → the working tree is
+    # cleaned → the ff-only merge proceeds on a clean tree.
+    info2 = create_worktree(repo, branch_name, rework=True, issue_number=849)
+
+    # Rescue capture is populated.
+    assert info2.rescue_capture is not None
+    assert info2.rescue_capture.ref_name is not None
+    assert info2.rescue_capture.error is None
+    rescue_ref = info2.rescue_capture.ref_name
+
+    # The worktree was reused in-place and fast-forwarded to the origin tip.
+    assert info2.path == info1.path
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+
+    # ON-DISK STATE: the dirty content is GONE from the working tree.
+    # README.md is back to HEAD's version ("hello\n"), not the worker's
+    # modification. Without the fix, this would still be "modified by worker\n".
+    assert (info2.path / "README.md").read_text(encoding="utf-8") == "hello\n"
+
+    # The untracked worker file is gone. Without the fix, it would survive.
+    assert not (info2.path / "worker_untracked.txt").exists()
+
+    # The ff-only brought in file2.txt from the remote.
+    assert (info2.path / "file2.txt").read_text(encoding="utf-8") == "remote change\n"
+
+    # The working tree is clean (no worker-authored dirt survives).
+    status = _git(info2.path, "status", "--porcelain")
+    assert status.stdout.strip() == ""
+
+    # The rescue ref preserved the dirty content byte-for-byte.
+    rescued_readme = _git(repo, "show", f"{rescue_ref}:README.md").stdout
+    assert rescued_readme == dirty_readme
+    rescued_untracked = _git(repo, "show", f"{rescue_ref}:worker_untracked.txt").stdout
+    assert rescued_untracked == "untracked worker content\n"
+
+    # Clean up.
+    remove_worktree(repo, info2.path, branch=branch_name)
+
+
+def test_worktree_head_sha_returns_real_head(tmp_path: Path) -> None:
+    """Issue #1243: worktree_head_sha against a real repo returns the actual
+    HEAD SHA -- the local half of the orphan-sweep progress fingerprint."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    expected = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert worktree_head_sha(repo) == expected
+
+    # A new commit moves the reported SHA (stranded-commit detection).
+    (repo / "work.txt").write_text("stranded\n", encoding="utf-8")
+    _git(repo, "add", "work.txt")
+    _git(repo, "commit", "-m", "stranded work")
+    new_expected = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert new_expected != expected
+    assert worktree_head_sha(repo) == new_expected
+
+
+def test_worktree_head_sha_missing_dir_returns_none(tmp_path: Path) -> None:
+    assert worktree_head_sha(tmp_path / "does-not-exist") is None
+
+
+def test_worktree_head_sha_non_repo_dir_returns_none(tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert worktree_head_sha(plain) is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #1248: salvage_push_stranded_commits
+# ---------------------------------------------------------------------------
+#
+# All tests here use real local git repos (a bare "origin" remote + a clone
+# that owns the linked worktrees under test) -- the established pattern for
+# worktree.py functions in this file. No network, no gh.
+
+
+def test_salvage_push_stranded_fast_forward(tmp_path: Path) -> None:
+    """Remote at X, worktree has 2 unpushed commits on top -> pure FF push."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a1"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    ok, error = push_branch(repo, branch, worktree_path=info.path)
+    assert ok, error
+    old_remote_sha = _git(remote, "rev-parse", branch).stdout.strip()
+
+    for name in ("first.txt", "second.txt"):
+        (info.path / name).write_text(f"{name}\n", encoding="utf-8")
+        _git(info.path, "add", name)
+        _git(info.path, "commit", "-m", f"add {name}")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert isinstance(result, SalvagePushResult)
+    assert result.pushed is True
+    assert result.skip_reason is None
+    assert result.error is None
+    assert result.old_remote_sha == old_remote_sha
+    assert result.new_remote_sha == local_tip
+    assert result.commit_count == 2
+
+    assert _git(remote, "rev-parse", branch).stdout.strip() == local_tip
+
+
+def test_salvage_push_diverged_leaves_remote_untouched(tmp_path: Path) -> None:
+    """Remote advanced with a commit the worktree has fetched but is not an
+    ancestor of the local tip -> skip_reason="diverged", remote unchanged.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a2"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+    ok, error = push_branch(repo, branch, worktree_path=info.path)
+    assert ok, error
+    old_remote_sha = _git(remote, "rev-parse", branch).stdout.strip()
+
+    # Local, unpushed commit.
+    (info.path / "local.txt").write_text("local\n", encoding="utf-8")
+    _git(info.path, "add", "local.txt")
+    _git(info.path, "commit", "-m", "local unpushed commit")
+
+    # A second clone pushes a sibling commit on the same branch, advancing
+    # origin without the first worktree's knowledge.
+    other_clone = tmp_path / "other-clone"
+    _clone_repo(remote, other_clone)
+    _git(other_clone, "checkout", branch)
+    (other_clone / "remote.txt").write_text("remote\n", encoding="utf-8")
+    _git(other_clone, "add", "remote.txt")
+    _git(other_clone, "commit", "-m", "remote sibling commit")
+    _git(other_clone, "push", "origin", branch)
+
+    # Fetch the new remote tip into the worktree's object store so
+    # `_object_exists` succeeds and the divergence (not "unknown object") is
+    # what `_is_ancestor` actually detects.
+    _git(info.path, "fetch", "origin", branch)
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "diverged"
+    assert result.error is None
+    assert result.old_remote_sha != old_remote_sha  # remote moved via other_clone
+    assert _git(remote, "rev-parse", branch).stdout.strip() == result.old_remote_sha
+
+
+def test_salvage_push_remote_head_not_local(tmp_path: Path) -> None:
+    """Remote tip is unknown to the worktree's object store (never fetched)
+    -> skip_reason="remote_head_not_local", distinct from "diverged".
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a3"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+    ok, error = push_branch(repo, branch, worktree_path=info.path)
+    assert ok, error
+
+    (info.path / "local.txt").write_text("local\n", encoding="utf-8")
+    _git(info.path, "add", "local.txt")
+    _git(info.path, "commit", "-m", "local unpushed commit")
+
+    other_clone = tmp_path / "other-clone"
+    _clone_repo(remote, other_clone)
+    _git(other_clone, "checkout", branch)
+    (other_clone / "remote.txt").write_text("remote\n", encoding="utf-8")
+    _git(other_clone, "add", "remote.txt")
+    _git(other_clone, "commit", "-m", "remote sibling commit")
+    _git(other_clone, "push", "origin", branch)
+
+    # Deliberately do NOT fetch -- the worktree has never heard of the new
+    # remote tip.
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "remote_head_not_local"
+    assert result.error is None
+
+
+def test_salvage_push_up_to_date_skips(tmp_path: Path) -> None:
+    """Local branch tip already equals the remote tip -> no push attempted."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a4"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+    ok, error = push_branch(repo, branch, worktree_path=info.path)
+    assert ok, error
+    remote_sha = _git(remote, "rev-parse", branch).stdout.strip()
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "up_to_date"
+    assert result.old_remote_sha == remote_sha
+    assert _git(remote, "rev-parse", branch).stdout.strip() == remote_sha
+
+
+def test_salvage_push_never_pushed_creates_branch(tmp_path: Path) -> None:
+    """Branch never reached origin, worktree has commits beyond the base ->
+    pushed=True, old_remote_sha=None, branch created on the bare repo.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a5"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit, never pushed")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    # Confirm the branch is genuinely absent on origin before salvage.
+    show_ref_before = _git(remote, "show-ref")
+    assert branch not in show_ref_before.stdout
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is True
+    assert result.skip_reason is None
+    assert result.old_remote_sha is None
+    assert result.new_remote_sha == local_tip
+    assert result.commit_count == 1
+    assert _git(remote, "rev-parse", branch).stdout.strip() == local_tip
+
+
+def test_salvage_push_never_pushed_no_commits_beyond_base_skips(tmp_path: Path) -> None:
+    """Branch never reached origin AND has no commits beyond the base ->
+    skip_reason="no_commits_beyond_base", no branch created.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a6"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+    # No commits made -- worktree HEAD is exactly origin/main's tip.
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "no_commits_beyond_base"
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
+
+
+def test_salvage_push_no_worktree_skips(tmp_path: Path) -> None:
+    """Worktree directory does not exist -> skip_reason="no_worktree"."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    missing_path = tmp_path / "does-not-exist"
+
+    result = salvage_push_stranded_commits(repo, "agent/issue-1248-a7", missing_path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "no_worktree"
+
+
+def test_salvage_push_live_writer_marker_skips(tmp_path: Path) -> None:
+    """A live (this-process) worker writer marker refuses the push."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a8-worker"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit, never pushed")
+
+    # The current test process's own pid is alive by construction.
+    write_worktree_marker(info.path, os.getpid(), "worker-session-1", kind="worker")
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "live_writer_marker"
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
+
+
+def test_salvage_push_operator_claimed_marker_skips(tmp_path: Path) -> None:
+    """An operator-claim marker refuses the push regardless of pid liveness."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a8-operator"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit, never pushed")
+
+    write_worktree_marker(
+        info.path, os.getpid(), OPERATOR_MARKER_SESSION_ID, kind=OPERATOR_MARKER_KIND
+    )
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "operator_claimed"
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
+
+
+# ---------------------------------------------------------------------------
+# Issue #1326: dry_run gate for push_branch / salvage_push_stranded_commits
+# ---------------------------------------------------------------------------
+#
+# Under dry_run=True, push_branch must short-circuit before the ``git push``
+# subprocess call -- no real push reaches origin. salvage_push_stranded_commits
+# threads dry_run through to push_branch. Both tests use real local git repos
+# (bare "origin" remote + clone with linked worktrees) and verify the remote
+# branch tip is unchanged after the call.
+
+
+def test_push_branch_dry_run_does_not_push(tmp_path: Path) -> None:
+    """dry_run=True short-circuits before ``git push``; origin is untouched."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1326-push-dry"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit, never pushed")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    # The branch must NOT exist on origin before the call.
+    show_ref_before = _git(remote, "show-ref")
+    assert branch not in show_ref_before.stdout
+
+    ok, error = push_branch(repo, branch, worktree_path=info.path, dry_run=True)
+
+    # Dry-run returns the natural "nothing happened" success shape.
+    assert ok is True
+    assert error is None
+
+    # The branch must STILL NOT exist on origin -- no real push happened.
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
+    # And the local tip is unchanged (the commit is still only local).
+    assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == local_tip
+
+
+def test_salvage_push_stranded_commits_dry_run_does_not_push(tmp_path: Path) -> None:
+    """dry_run=True threads through to push_branch; origin is untouched.
+
+    The read-only probing (rev-parse, ls-remote, merge-base, rev-list) still
+    runs, but the mutating ``git push`` is suppressed. The salvage returns
+    pushed=True (the "nothing happened" success shape that lets downstream
+    classification proceed under dry-run), but the remote branch tip is
+    unchanged.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1326-salvage-dry"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    # Make a commit that would be stranded (never pushed).
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "stranded commit, never pushed")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    # The branch must NOT exist on origin before the call.
+    show_ref_before = _git(remote, "show-ref")
+    assert branch not in show_ref_before.stdout
+
+    result = salvage_push_stranded_commits(repo, branch, info.path, dry_run=True)
+
+    assert isinstance(result, SalvagePushResult)
+    # Dry-run: push_branch returned (True, None), so salvage reports pushed=True
+    # with the local tip as the would-be new remote SHA -- but no real push
+    # reached origin.
+    assert result.pushed is True
+    assert result.error is None
+    assert result.new_remote_sha == local_tip
+
+    # The branch must STILL NOT exist on origin -- no real push happened.
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout

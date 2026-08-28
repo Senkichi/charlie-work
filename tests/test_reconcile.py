@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -11,6 +10,13 @@ from typing import Any
 
 import pytest
 
+from _reconcile_fixtures import (
+    FakeGitHub,
+    _init_bare_remote_and_clone,
+    _issue,
+    _pr,
+    _setup_completed_worktree,
+)
 from _sessions_db_fixtures import make_sessions_db
 from charlie_work.config import (
     LabelConfig,
@@ -44,6 +50,7 @@ from charlie_work.reconcile import (
     detect_aviator_stale_blocked,
     detect_drift,
     detect_mergequeue_not_approved,
+    detect_mergequeue_wedged,
 )
 from charlie_work.state import PASSIVE_OPEN_STATUS, empty_state, is_claim_stale, load_state
 from charlie_work.worktree import create_worktree
@@ -54,146 +61,13 @@ from charlie_work.workflow import OrchestratorApp
 _config_labels = LabelConfig()
 
 
-class FakeGitHub:
-    """Records every call so tests can assert detect_drift never mutates."""
-
-    def __init__(
-        self,
-        *,
-        prs: list[dict[str, Any]],
-        issues: list[dict[str, Any]],
-        fail_add_labels: set[tuple[int, str]] | None = None,
-        fail_remove_labels: set[tuple[int, str]] | None = None,
-        repo_root: Any = None,
-        pr_create_return: int | None = None,
-        rate_limit_sufficient: bool = True,
-        rate_limit_remaining: int = 10000,
-        rate_limit_reset: int = 0,
-    ) -> None:
-        self._prs = prs
-        self._issues = issues
-        self.run_calls: list[list[str]] = []
-        self.labels_added: list[tuple[int, str]] = []
-        self.labels_removed: list[tuple[int, str]] = []
-        self._fail_add_labels = fail_add_labels or set()
-        self._fail_remove_labels = fail_remove_labels or set()
-        self.repo_root = repo_root
-        self.prs_created: list[dict[str, Any]] = []
-        self.pr_create_return = pr_create_return
-        self._rate_limit_sufficient = rate_limit_sufficient
-        self._rate_limit_remaining = rate_limit_remaining
-        self._rate_limit_reset = rate_limit_reset
-        # PR-scoped label tracking, distinct from the issue-scoped lists above.
-        self.pr_labels_added: list[tuple[int, str]] = []
-        self.pr_labels_removed: list[tuple[int, str]] = []
-        self._fail_add_pr_labels: set[tuple[int, str]] = set()
-        self._fail_remove_pr_labels: set[tuple[int, str]] = set()
-        # sha -> list of check-run dicts, for detect_aviator_stale_blocked.
-        self.check_runs_by_sha: dict[str, list[dict[str, Any]]] = {}
-        self.commit_check_runs_calls: list[str] = []
-
-    def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
-        self.run_calls.append(args)
-        if args[:2] == ["pr", "list"]:
-            return self._prs
-        if args[:2] == ["issue", "list"]:
-            # Model the real ``gh issue list --state all --limit 500`` cap for
-            # mutation tests that revert _fetch_issues to the pre-#762 path.
-            return self._issues[:reconcile_list_limit]
-        if args[0] == "api" and "pulls?state=all" in args[1]:
-            url = args[1]
-            page_match = re.search(r"[?&]page=(\d+)", url)
-            page = int(page_match.group(1)) if page_match else 1
-            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
-            per_page = int(per_page_match.group(1)) if per_page_match else 100
-            start = (page - 1) * per_page
-            return self._prs[start : start + per_page]
-        if args[0] == "api" and "issues?state=all" in args[1]:
-            url = args[1]
-            page_match = re.search(r"[?&]page=(\d+)", url)
-            page = int(page_match.group(1)) if page_match else 1
-            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
-            per_page = int(per_page_match.group(1)) if per_page_match else 100
-            start = (page - 1) * per_page
-            return self._issues[start : start + per_page]
-        if args[0] == "api":
-            return [] if json_output else ""
-        raise AssertionError(f"unexpected gh.run call: {args}")
-
-    def add_issue_label(self, number: int, label: str) -> bool:
-        self.labels_added.append((number, label))
-        return (number, label) not in self._fail_add_labels
-
-    def remove_issue_label(self, number: int, label: str) -> bool:
-        self.labels_removed.append((number, label))
-        return (number, label) not in self._fail_remove_labels
-
-    def add_pr_label(self, number: int, label: str) -> bool:
-        self.pr_labels_added.append((number, label))
-        return (number, label) not in self._fail_add_pr_labels
-
-    def remove_pr_label(self, number: int, label: str) -> bool:
-        self.pr_labels_removed.append((number, label))
-        return (number, label) not in self._fail_remove_pr_labels
-
-    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
-        self.commit_check_runs_calls.append(sha)
-        return self.check_runs_by_sha.get(sha)
-
-    def pr_create(self, head: str, base: str, title: str, body: str) -> int | None:
-        self.prs_created.append({"head": head, "base": base, "title": title, "body": body})
-        return self.pr_create_return
-
-    def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
-        return (
-            self._rate_limit_sufficient,
-            self._rate_limit_remaining,
-            self._rate_limit_reset,
-        )
-
-    def name_with_owner(self) -> str:
-        return "owner/test-repo"
-
-
-def _pr(
-    number: int,
-    state: str = "OPEN",
-    *,
-    head_ref: str | None = None,
-    body: str = "",
-    title: str = "",
-    is_cross_repository: bool = False,
-) -> dict[str, Any]:
-    return {
-        "number": number,
-        "title": title,
-        "url": f"https://example.test/pull/{number}",
-        "headRefName": head_ref or f"agent/issue-{number}-x",
-        "baseRefName": "main",
-        "body": body,
-        "state": state,
-        "labels": [],
-        "isCrossRepository": is_cross_repository,
-    }
-
-
-def _issue(number: int, labels: list[str], state: str = "OPEN") -> dict[str, Any]:
-    return {
-        "number": number,
-        "title": f"issue {number}",
-        "url": f"https://example.test/issues/{number}",
-        "body": "",
-        "labels": [{"name": label} for label in labels],
-        "state": state,
-    }
-
-
 def _raw_rest_pr(
     number: int,
     state: str = "open",
     *,
     merged: bool = False,
     merged_at: str | None = None,
+    closed_at: str | None = None,
     head_ref: str = "agent/issue-1-x",
     head_repo: str | None = "owner/test-repo",
     base_repo: str | None = "owner/test-repo",
@@ -202,6 +76,9 @@ def _raw_rest_pr(
 
     This is the shape ``_normalize_reconcile_pr`` sees in production, but
     existing test fixtures all set the normalized ``RECONCILE_PR_FIELDS`` keys.
+    ``closed_at`` is the REST ``pulls`` snake_case field that the normalizer
+    maps to the camelCase ``closedAt`` (issue #1398); it defaults to ``None``
+    so pre-existing callers are unaffected.
     """
     return {
         "number": number,
@@ -222,6 +99,7 @@ def _raw_rest_pr(
         "labels": [],
         "merged": merged,
         "merged_at": merged_at,
+        "closed_at": closed_at,
     }
 
 
@@ -361,7 +239,19 @@ def test_fetch_prs_normalizes_raw_rest_pulls() -> None:
     (no ``headRefName``, ``head``/``base`` sub-objects, ``merged_at``) to the
     ``RECONCILE_PR_FIELDS`` shape. Existing test fixtures already carry the
     normalized keys, so the transformation branch was previously unexercised.
+
+    Issue #1398: the REST ``pulls`` endpoint names the close time
+    ``closed_at`` (snake_case); the normalizer must surface it as the
+    camelCase ``closedAt`` so the closed-unmerged convergence rules can
+    compare it against the issue's active-session start. A typo on that one
+    mapping line would silently revert the #1398 fix while passing every
+    guard test in test_fix_reconcile.py (which all use the already-normalized
+    ``_pr`` fixture), so this assertion pins the production code path:
+    ``_fetch_prs`` -> ``_normalize_reconcile_pr`` on a raw REST payload.
     """
+    # Derive the close timestamp from the clock so a date-window filter can
+    # never rot this seed (test-hygiene rule).
+    closed_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
     merged = _raw_rest_pr(1, state="closed", merged_at="2026-08-05T00:00:00Z")
     open_same = _raw_rest_pr(2, state="open")
     cross = _raw_rest_pr(
@@ -372,11 +262,12 @@ def test_fetch_prs_normalizes_raw_rest_pulls() -> None:
         base_repo="owner/test-repo",
     )
     deleted_fork = _raw_rest_pr(4, state="open", head_repo=None)
-    gh = FakeGitHub(prs=[merged, open_same, cross, deleted_fork], issues=[])
+    closed_unmerged = _raw_rest_pr(5, state="closed", closed_at=closed_at)
+    gh = FakeGitHub(prs=[merged, open_same, cross, deleted_fork, closed_unmerged], issues=[])
 
     result = _fetch_prs(gh)
 
-    assert len(result) == 4
+    assert len(result) == 5
     assert result[0]["state"] == "MERGED"
     assert result[0]["headRefName"] == "agent/issue-1-x"
     assert result[0]["url"] == "https://example.test/pull/1"
@@ -384,6 +275,14 @@ def test_fetch_prs_normalizes_raw_rest_pulls() -> None:
     assert result[2]["isCrossRepository"] is True
     assert result[3]["isCrossRepository"] is None
     assert all("headRefName" in pr for pr in result)
+    # Issue #1398: the snake_case REST ``closed_at`` must survive the
+    # _fetch_prs/_normalize_reconcile_pr pipeline as the camelCase ``closedAt``
+    # with the identical value, and PRs that omit it must normalize to None.
+    assert result[4]["closedAt"] == closed_at
+    assert result[4]["state"] == "CLOSED"
+    assert result[0]["closedAt"] is None  # merged PR: closed_at not set on the seed
+    assert result[1]["closedAt"] is None  # open PR: closed_at absent
+    assert all("closedAt" in pr for pr in result)
 
 
 def test_normalize_reconcile_pr_is_idempotent_on_gh_shape() -> None:
@@ -831,6 +730,37 @@ def test_detect_drift_finds_terminal_state_stale_via_terminal_since(tmp_path: Pa
     assert matches[0].fix_actions == ()
 
 
+def test_detect_drift_finds_terminal_state_stale_for_operator_queue(tmp_path: Path) -> None:
+    """Issue #1266 counterpart of the test above: a mechanical escalation
+    parks on `agent:operator-queue` instead of `agent:human-needed`, and the
+    #947 staleness alert must watch that label too -- otherwise an issue
+    whose de-escalation sweep stopped clearing it (e.g. sweep itself broken,
+    not merely mid-retry) would sit in the sink forever with no alert at
+    all, silently reintroducing the exact invisibility #947 fixed for the
+    judgment-escalation case. The detail message must name the label that is
+    actually present (`operator-queue`), not hardcode `human-needed`."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(894, [config.labels.operator_queue])])
+    state = empty_state()
+    now = datetime(2026, 1, 10, tzinfo=UTC)
+    state["issues"]["894"] = {
+        "number": 894,
+        "status": "escalated",
+        "reason_class": "mechanical",
+        "terminal_since": "2026-01-05T00:00:00Z",  # 5 days before `now`
+    }
+
+    drift = detect_drift(gh, state, config, now=now)
+
+    matches = [item for item in drift if item.kind == "terminal_state_stale"]
+    assert len(matches) == 1
+    assert matches[0].issue_number == 894
+    assert "5.0 day" in matches[0].detail
+    assert config.labels.operator_queue in matches[0].detail
+    assert config.labels.human_needed not in matches[0].detail
+    assert matches[0].fix_actions == ()
+
+
 def test_detect_drift_terminal_state_stale_not_yet_due(tmp_path: Path) -> None:
     """A fresh escalation (age below the configured threshold) must not fire
     -- this is the negative control for the positive case above."""
@@ -1027,6 +957,56 @@ def test_apply_fixes_merged_outside_orchestrator_transitions_labels() -> None:
     for label in sorted(config.labels.workflow_labels - {config.labels.done}):
         assert (10, label) in gh.labels_removed
     assert new_state["prs"]["1"]["status"] == "merged"
+
+
+def test_apply_fixes_merged_outside_orchestrator_stamps_and_preserves_merged_at() -> None:
+    """Issue #747: ``apply_fixes`` must stamp ``merged_at`` when a PR transitions
+    non-merged -> merged via the ``merged_outside_orchestrator`` drift fix, and
+    must preserve an existing ``merged_at`` unchanged when the PR is already
+    recorded as merged. The latter is the issue-still-active re-run path, where
+    ``detect_drift`` re-emits the drift item even though state status is already
+    ``'merged'`` (see reconcile.detect_drift: ``state_status != "merged" or
+    issue_still_active``); the ``merged_at`` guard stops that re-run from
+    back-dating the original observation time."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    drift = [
+        DriftItem(
+            kind="merged_outside_orchestrator",
+            issue_number=10,
+            pr_number=1,
+            detail="PR #1 merged outside orchestrator",
+            fix_actions=("mark state prs[1].status = 'merged'",),
+        )
+    ]
+
+    # Genuine transition: prior status is not 'merged' -> merged_at is stamped.
+    state = empty_state()
+    state["prs"]["1"] = {"status": "reviewing"}
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["prs"]["1"]["status"] == "merged"
+    stamped = new_state["prs"]["1"].get("merged_at")
+    assert stamped is not None
+    assert stamped  # non-empty ISO 8601 timestamp
+    # The stamp is a real 'Z'-suffixed utc_now() value, not a stale literal.
+    assert stamped.endswith("Z")
+
+    # Re-run where the PR is already recorded as merged (the issue-still-active
+    # path, where detect_drift re-emits the drift despite status == 'merged'):
+    # the original merged_at must be preserved unchanged, never back-dated.
+    # Derived from the real clock (one day in the past) so no date-window
+    # filter can ever rot this seed.
+    original_merged_at = (
+        (datetime.now(UTC) - timedelta(days=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state2 = empty_state()
+    state2["prs"]["1"] = {"status": "merged", "merged_at": original_merged_at}
+    new_state2 = apply_fixes(gh, state2, drift, config)
+    assert new_state2["prs"]["1"]["status"] == "merged"
+    assert new_state2["prs"]["1"]["merged_at"] == original_merged_at
 
 
 def test_apply_fixes_contradiction_removes_active_labels_directly() -> None:
@@ -2126,6 +2106,81 @@ def test_apply_fixes_session_failed_relabeled_idempotent(tmp_path: Path) -> None
     assert len(reconcile_events) == 1
 
 
+def test_apply_fixes_session_failed_relabeled_carries_structured_reason(
+    tmp_path: Path,
+) -> None:
+    """Issue #978: the ``reconcile`` event for a ``session_failed_relabeled``
+    drift item must carry the machine-readable ``reason``/``failure_kind`` as
+    structured payload fields, not only buried in the free-text ``detail``
+    string. A query on ``json_extract(payload, '$.reason')`` must not return
+    NULL the way it did when the "why" lived only in English prose."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    drift = [
+        DriftItem(
+            kind="session_failed_relabeled",
+            issue_number=42,
+            pr_number=None,
+            reason="dead_session_no_open_pr",
+            failure_kind="rate_limited",
+            detail="issue #42 session died with rate_limited, no open PR",
+            fix_actions=(
+                f"remove label '{config.labels.in_progress}' from issue #42",
+                f"add label '{config.labels.ready}' to issue #42",
+            ),
+            remove_labels=(config.labels.in_progress,),
+            add_labels=(config.labels.ready,),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    payload = reconcile_events[0]["payload"]
+    assert payload["kind"] == "session_failed_relabeled"
+    assert payload["reason"] == "dead_session_no_open_pr"
+    assert payload["failure_kind"] == "rate_limited"
+
+
+def test_apply_fixes_session_failed_relabeled_reason_absent_when_unset(
+    tmp_path: Path,
+) -> None:
+    """Issue #978: a drift item that does not carry ``reason``/``failure_kind``
+    must not produce a reconcile payload with those keys present-as-None. The
+    payload shape for items without structured fields is unchanged."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    drift = [
+        DriftItem(
+            kind="session_failed_relabeled",
+            issue_number=42,
+            pr_number=None,
+            detail="issue #42 session died, no open PR",
+            fix_actions=(f"remove label '{config.labels.in_progress}' from issue #42",),
+            remove_labels=(config.labels.in_progress,),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    payload = reconcile_events[0]["payload"]
+    assert "reason" not in payload
+    assert "failure_kind" not in payload
+
+
 def test_detect_drift_session_failed_worker_blocked_escalates_instead_of_relabel(
     tmp_path: Path,
 ) -> None:
@@ -2197,6 +2252,10 @@ def test_detect_drift_session_failed_worker_blocked_escalates_instead_of_relabel
     assert len(escalated_drift) == 1
     assert escalated_drift[0].issue_number == 42
     assert "worker_blocked" in escalated_drift[0].detail
+    # Issue #807: detect_drift must carry failure_kind on the drift item so
+    # apply_fixes can derive reason_class (judgment vs mechanical) instead of
+    # hardcoding "mechanical".
+    assert escalated_drift[0].failure_kind == "worker_blocked"
 
     # detect_drift is read-only regardless of the worker_blocked branch.
     assert gh.labels_added == []
@@ -2205,9 +2264,15 @@ def test_detect_drift_session_failed_worker_blocked_escalates_instead_of_relabel
 
 def test_apply_fixes_session_failed_escalated_transitions_labels(tmp_path: Path) -> None:
     """Issue #261 F5: apply_fixes must transition session_failed_escalated
-    via the 'redispatch_escalated' label edge (adds human_needed, removes
+    via the 'redispatch_escalated' label edge (adds operator_queue, removes
     the other workflow labels) rather than removing active labels /
-    re-adding ready like session_failed_relabeled does."""
+    re-adding ready like session_failed_relabeled does.
+
+    Issue #1266: this DriftItem only ever fires for a deterministic
+    failure_kind (see detect_drift), which workflow.py's own equivalent
+    dead-session sweeps always treat as reason_class="mechanical" -- so the
+    edge resolves to operator_queued, landing agent:operator-queue rather
+    than agent:human-needed."""
     config = OrchestratorConfig()
     gh = FakeGitHub(
         prs=[],
@@ -2230,7 +2295,7 @@ def test_apply_fixes_session_failed_escalated_transitions_labels(tmp_path: Path)
 
     new_state = apply_fixes(gh, state, drift, config)
 
-    assert (42, config.labels.human_needed) in gh.labels_added
+    assert (42, config.labels.operator_queue) in gh.labels_added
     assert (42, config.labels.ready) not in gh.labels_added
     # ready must never be added for an escalated worker_blocked session.
 
@@ -2238,6 +2303,59 @@ def test_apply_fixes_session_failed_escalated_transitions_labels(tmp_path: Path)
     assert len(reconcile_events) == 1
     assert reconcile_events[0]["payload"]["kind"] == "session_failed_escalated"
     assert reconcile_events[0]["payload"]["issue_number"] == 42
+
+
+def test_apply_fixes_session_failed_escalated_judgment_lands_human_needed(
+    tmp_path: Path,
+) -> None:
+    """Issue #807: a dead worker whose failure_kind is
+    ``worktree_unsafe_local_commits`` (a deterministic *judgment* failure, not
+    mechanical) must escalate via the ``redispatch_escalated`` edge
+    (reason_class="judgment"), landing ``agent:human-needed`` -- NOT the
+    mechanical ``redispatch_operator_queued`` edge that lands
+    ``agent:operator-queue``.
+
+    This is the reconcile.py apply-path regression for the #807 bug: before
+    the fix, apply_fixes hardcoded reason_class="mechanical" for every
+    session_failed_escalated drift item, so a genuine-local-commits death
+    detected by reconcile's drift pass (before any workflow.py sweep) landed
+    on operator_queue and became auto-clearable, reproducing the exact
+    blanket-mechanical misclassification #807 split the failure kind to
+    prevent."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(43, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    drift = [
+        DriftItem(
+            kind="session_failed_escalated",
+            issue_number=43,
+            pr_number=None,
+            detail=(
+                "issue #43 session died with deterministic failure "
+                "(worktree_unsafe_local_commits), no open PR; "
+                "suppressing relabel-to-ready, escalating instead"
+            ),
+            fix_actions=("transition issue #43 labels via 'redispatch_escalated' event",),
+            failure_kind="worktree_unsafe_local_commits",
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    # Judgment escalation lands human_needed, not operator_queue.
+    assert (43, config.labels.human_needed) in gh.labels_added
+    assert (43, config.labels.operator_queue) not in gh.labels_added
+    assert (43, config.labels.ready) not in gh.labels_added
+
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    assert reconcile_events[0]["payload"]["kind"] == "session_failed_escalated"
+    assert reconcile_events[0]["payload"]["issue_number"] == 43
+    assert reconcile_events[0]["payload"]["failure_kind"] == "worktree_unsafe_local_commits"
 
 
 def test_detect_drift_session_failed_already_has_ready_label(tmp_path: Path) -> None:
@@ -3037,39 +3155,6 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
 
-def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
-    """Create a bare remote repo and a local clone, return (remote, clone)."""
-    remote = tmp_path / "remote"
-    remote.mkdir(parents=True, exist_ok=True)
-    _git(remote, "init", "--bare", "--initial-branch=main")
-    clone = tmp_path / "clone"
-    clone.mkdir(parents=True, exist_ok=True)
-    _git(clone, "init", "--initial-branch=main")
-    _git(clone, "config", "user.email", "test@example.test")
-    _git(clone, "config", "user.name", "Test User")
-    _git(clone, "config", "commit.gpgSign", "false")
-    _git(clone, "remote", "add", "origin", str(remote))
-    (clone / "README.md").write_text("hello\n", encoding="utf-8")
-    _git(clone, "add", "README.md")
-    _git(clone, "commit", "-m", "initial commit")
-    _git(clone, "push", "-u", "origin", "main")
-    return remote, clone
-
-
-def _setup_completed_worktree(
-    repo_root: Path, issue_number: int, dirty: bool = False
-) -> tuple[Path, str]:
-    """Create a worktree with one commit beyond origin/main. Return (worktree_path, branch)."""
-    branch = f"agent/issue-{issue_number}"
-    info = create_worktree(repo_root, branch, base_ref="origin/main")
-    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
-    _git(info.path, "add", "feature.txt")
-    _git(info.path, "commit", "-m", "feature commit")
-    if dirty:
-        (info.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
-    return info.path, branch
-
-
 def _write_dead_session_sidecar(
     sessions_dir: Path, issue_number: int, branch: str, worktree_path: Path
 ) -> None:
@@ -3247,8 +3332,10 @@ def test_detect_drift_completed_unpublished_work_salvaged(tmp_path: Path) -> Non
     assert not relabel
 
 
-def test_detect_drift_dirty_worktree_relabels(tmp_path: Path) -> None:
-    """Issue #252: dead session with dirty worktree still relabels to ready."""
+def test_detect_drift_dirty_worktree_with_commits_salvaged(tmp_path: Path) -> None:
+    """Issue #1130: dead session with a dirty worktree that has commits ahead
+    of base emits salvage drift, not relabel-to-ready. The committed work is
+    salvageable regardless of working-tree dirt (shim/scaffolding artifacts)."""
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
     worktree_path, branch = _setup_completed_worktree(repo_root, 253, dirty=True)
 
@@ -3266,10 +3353,10 @@ def test_detect_drift_dirty_worktree_relabels(tmp_path: Path) -> None:
     drift = detect_drift(gh, state, config, repo_root=repo_root)
 
     salvage = [d for d in drift if d.kind == "session_unpublished_work_salvaged"]
-    assert not salvage
+    assert len(salvage) == 1
+    assert salvage[0].issue_number == 253
     relabel = [d for d in drift if d.kind == "session_failed_relabeled"]
-    assert len(relabel) == 1
-    assert relabel[0].issue_number == 253
+    assert not relabel
 
 
 def test_detect_drift_no_commits_relabels(tmp_path: Path) -> None:
@@ -3525,7 +3612,7 @@ def test_reconcile_fix_deferred_when_supervisor_lock_held(tmp_path: Path) -> Non
         supervisor_lock.release()
 
     assert result.ok is True
-    assert result.data.get("skipped") is True
+    assert result.data.get("pass_skipped") is True
     assert result.data.get("reason") == "supervisor_lock_held"
 
 
@@ -4228,6 +4315,304 @@ def test_apply_fixes_aviator_stale_blocked_records_label_write_failure() -> None
     )
 
 
+# ---------------------------------------------------------------------------
+# detect_mergequeue_wedged (issue #1401: mergequeue PR wedged with Aviator
+# FAILURE for 28h+ and no re-alert -- one-shot failed-attempt alarm has no
+# time-in-queue watchdog)
+# ---------------------------------------------------------------------------
+
+
+def _wedged_config(
+    *, mergequeue_label: str = "mergequeue", wedge_hours: float = 24.0
+) -> OrchestratorConfig:
+    return replace(
+        OrchestratorConfig(),
+        auto_merge=replace(
+            OrchestratorConfig().auto_merge,
+            mergequeue_label=mergequeue_label,
+            mergequeue_wedge_hours=wedge_hours,
+        ),
+    )
+
+
+def _failing_check_run(name: str, *, run_id: int) -> dict[str, Any]:
+    return {
+        "id": run_id,
+        "name": name,
+        "status": "completed",
+        "conclusion": "failure",
+        "output": {},
+    }
+
+
+def test_detect_mergequeue_wedged_aviator_failure_escalates() -> None:
+    """Condition 2 (live #1751 shape): PR carries mergequeue + Aviator blocked
+    with aviator/checks completed FAILURE and a genuinely failing non-aviator
+    check -> escalate (strip mergequeue, add human_needed)."""
+    config = _wedged_config()
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-1751",
+        "labels": [{"name": "mergequeue"}, {"name": "blocked"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1751"] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _failing_check_run("Tests passed", run_id=2),
+    ]
+
+    drift = detect_mergequeue_wedged(gh, config, empty_state())
+
+    assert len(drift) == 1
+    item = drift[0]
+    assert item.kind == "mergequeue_wedged"
+    assert item.pr_number == 1751
+    assert item.issue_number == 1751
+    assert item.remove_labels == ("mergequeue",)
+    assert item.add_labels == (config.labels.human_needed,)
+    assert gh.commit_check_runs_calls == ["sha-1751"]
+
+
+def test_detect_mergequeue_wedged_aviator_failure_all_green_does_not_fire() -> None:
+    """When every non-aviator check is green the blocked label is STALE, not a
+    genuine Aviator failure -- that is detect_aviator_stale_blocked's recovery
+    case (remove blocked, re-queue), not an escalation. Condition 2 must stay
+    out of its way to avoid re-queuing AND escalating the same PR in one pass."""
+    config = _wedged_config()
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-1751",
+        "labels": [{"name": "mergequeue"}, {"name": "blocked"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1751"] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _passing_check_run("Tests passed", run_id=2),
+    ]
+
+    assert detect_mergequeue_wedged(gh, config, empty_state()) == []
+
+
+def test_detect_mergequeue_wedged_aviator_pending_does_not_fire_condition2() -> None:
+    """aviator/checks still running (no conclusion) is not a definitive
+    failure -- condition 2 must not escalate a PR mid-evaluation."""
+    config = _wedged_config()
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-1751",
+        "labels": [{"name": "mergequeue"}, {"name": "blocked"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1751"] = [
+        _aviator_check_run(None, run_id=1),
+        _failing_check_run("Tests passed", run_id=2),
+    ]
+
+    assert detect_mergequeue_wedged(gh, config, empty_state()) == []
+
+
+def test_detect_mergequeue_wedged_time_in_queue_escalates() -> None:
+    """Condition 1: PR has carried mergequeue for > wedge_hours with no head
+    movement (state mergequeue_head_sha == live head) -> escalate."""
+    config = _wedged_config(wedge_hours=12.0)
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-frozen",
+        "labels": [{"name": "mergequeue"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    state = empty_state()
+    state["prs"]["1751"] = {
+        "mergequeue_since": (datetime.now(UTC) - timedelta(hours=28)).isoformat(),
+        "mergequeue_head_sha": "sha-frozen",
+        "status": "mergequeue",
+    }
+
+    drift = detect_mergequeue_wedged(gh, config, state)
+
+    assert len(drift) == 1
+    assert drift[0].kind == "mergequeue_wedged"
+    assert drift[0].pr_number == 1751
+    assert drift[0].remove_labels == ("mergequeue",)
+    # No check-run walk when the PR is not blocked.
+    assert gh.commit_check_runs_calls == []
+
+
+def test_detect_mergequeue_wedged_time_in_queue_head_moved_does_not_fire() -> None:
+    """Head movement (Aviator rebased) resets the dwell timer: the recorded
+    mergequeue_head_sha no longer matches the live head, so the PR is making
+    progress and must not be escalated."""
+    config = _wedged_config(wedge_hours=12.0)
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-new",
+        "labels": [{"name": "mergequeue"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    state = empty_state()
+    state["prs"]["1751"] = {
+        "mergequeue_since": (datetime.now(UTC) - timedelta(hours=28)).isoformat(),
+        "mergequeue_head_sha": "sha-old",
+        "status": "mergequeue",
+    }
+
+    assert detect_mergequeue_wedged(gh, config, state) == []
+
+
+def test_detect_mergequeue_wedged_time_in_queue_under_threshold_does_not_fire() -> None:
+    """Dwell under the configured threshold is normal queue progress, not a wedge."""
+    config = _wedged_config(wedge_hours=24.0)
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-frozen",
+        "labels": [{"name": "mergequeue"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    state = empty_state()
+    state["prs"]["1751"] = {
+        "mergequeue_since": (datetime.now(UTC) - timedelta(hours=2)).isoformat(),
+        "mergequeue_head_sha": "sha-frozen",
+        "status": "mergequeue",
+    }
+
+    assert detect_mergequeue_wedged(gh, config, state) == []
+
+
+def test_detect_mergequeue_wedged_time_disabled_still_allows_aviator_failure() -> None:
+    """mergequeue_wedge_hours=0 disables condition 1 only; condition 2 (the
+    definitive Aviator-failure signal) stays armed when mergequeue_label is set."""
+    config = _wedged_config(wedge_hours=0.0)
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-1751",
+        "labels": [{"name": "mergequeue"}, {"name": "blocked"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1751"] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _failing_check_run("Tests passed", run_id=2),
+    ]
+
+    drift = detect_mergequeue_wedged(gh, config, empty_state())
+    assert len(drift) == 1
+
+
+def test_detect_mergequeue_wedged_no_mergequeue_label_config_returns_empty() -> None:
+    """Without a mergequeue_label configured there is no Aviator handoff to watchdog."""
+    config = replace(
+        OrchestratorConfig(),
+        auto_merge=replace(OrchestratorConfig().auto_merge, mergequeue_label=None),
+    )
+    pr = {
+        **_pr(1751, "OPEN"),
+        "headRefOid": "sha-1751",
+        "labels": [{"name": "mergequeue"}, {"name": "blocked"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+
+    assert detect_mergequeue_wedged(gh, config, empty_state()) == []
+
+
+def test_detect_mergequeue_wedged_skips_pr_without_mergequeue_label() -> None:
+    """Cost gate: a PR not carrying the mergequeue label is not in Aviator's queue."""
+    config = _wedged_config()
+    pr = {**_pr(1751, "OPEN"), "headRefOid": "sha-1751", "labels": [{"name": "blocked"}]}
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1751"] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _failing_check_run("Tests passed", run_id=2),
+    ]
+
+    assert detect_mergequeue_wedged(gh, config, empty_state()) == []
+    assert gh.commit_check_runs_calls == []
+
+
+def test_detect_mergequeue_wedged_no_linked_issue_strips_mergequeue_only() -> None:
+    """A cross-repo PR with no resolvable linked issue can still be pulled out
+    of the queue (strip mergequeue); the human_needed escalation is skipped
+    because there is no issue to label."""
+    config = _wedged_config()
+    pr = {
+        **_pr(1751, "OPEN", is_cross_repository=True),
+        "headRefOid": "sha-1751",
+        "labels": [{"name": "mergequeue"}, {"name": "blocked"}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha["sha-1751"] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _failing_check_run("Tests passed", run_id=2),
+    ]
+
+    drift = detect_mergequeue_wedged(gh, config, empty_state())
+    assert len(drift) == 1
+    assert drift[0].issue_number is None
+    assert drift[0].add_labels == ()
+    assert drift[0].remove_labels == ("mergequeue",)
+
+
+def test_apply_fixes_mergequeue_wedged_strips_mergequeue_and_escalates_issue() -> None:
+    config = _wedged_config()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    state["prs"]["1751"] = {
+        "mergequeue_since": (datetime.now(UTC) - timedelta(hours=28)).isoformat(),
+        "mergequeue_head_sha": "sha-frozen",
+        "status": "mergequeue",
+    }
+    drift = [
+        DriftItem(
+            kind="mergequeue_wedged",
+            issue_number=1751,
+            pr_number=1751,
+            detail="PR #1751 wedged in mergequeue",
+            fix_actions=(
+                "remove label 'mergequeue' from PR #1751",
+                "escalate issue #1751 to 'agent:human-needed'",
+            ),
+            remove_labels=("mergequeue",),
+            add_labels=(config.labels.human_needed,),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert gh.pr_labels_removed == [(1751, "mergequeue")]
+    # transition("escalated") adds human_needed and removes active labels via
+    # gh.add_issue_label / gh.remove_issue_label.
+    assert (1751, config.labels.human_needed) in gh.labels_added
+    # Issue state status converges to "escalated".
+    assert new_state["issues"]["1751"]["status"] == "escalated"
+    # The mergequeue dwell-tracking fields are cleared so the post-fix
+    # re-detect does not re-fire condition 1 for the same window.
+    assert "mergequeue_since" not in new_state["prs"]["1751"]
+    assert "mergequeue_head_sha" not in new_state["prs"]["1751"]
+
+
+def test_apply_fixes_mergequeue_wedged_records_label_write_failure() -> None:
+    config = _wedged_config()
+    gh = FakeGitHub(prs=[], issues=[])
+    gh._fail_remove_pr_labels = {(1751, "mergequeue")}
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="mergequeue_wedged",
+            issue_number=1751,
+            pr_number=1751,
+            detail="PR #1751 wedged in mergequeue",
+            fix_actions=("remove label 'mergequeue' from PR #1751",),
+            remove_labels=("mergequeue",),
+            add_labels=(config.labels.human_needed,),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    events = [e for e in new_state.get("events", []) if e.get("kind") == "reconcile"]
+    assert any(
+        "label_write_failed: true" in e.get("payload", {}).get("fix_actions", []) for e in events
+    )
+
+
 class _EmptyStdoutGitHub:
     """``gh`` exits 0 but writes nothing to stdout.
 
@@ -4352,7 +4737,9 @@ def test_detect_mergequeue_not_approved_regression_pr_695(tmp_path: Path) -> Non
     assert len(reconcile_events) == 1
     assert reconcile_events[0]["payload"]["kind"] == "mergequeue_revoked"
     assert reconcile_events[0]["payload"]["pr_number"] == 695
-    assert new_state["prs"] == {}
+    # Issue #1402: apply_fixes now records the revocation reason in state so
+    # merge_ready can distinguish self-revocation from #823 rejection.
+    assert new_state["prs"] == {"695": {"mergequeue_revoked_reason": "not_approved"}}
 
 
 def test_detect_mergequeue_not_approved_leaves_approved_at_head_alone(tmp_path: Path) -> None:
@@ -4586,6 +4973,141 @@ def test_apply_fixes_mergequeue_revoked_records_label_write_failure() -> None:
     )
 
 
+def test_detect_mergequeue_not_approved_stale_head_records_revocation_reason(
+    tmp_path: Path,
+) -> None:
+    """Issue #1402: a stale-head revocation (approved at an older head, the
+    #819 cooperative self-revocation case) must carry
+    ``mergequeue_revoked_reason='stale_head_pending_carry_forward'`` on the
+    DriftItem so ``merge_ready`` can distinguish it from Aviator's #823 silent
+    rejection and avoid the false handoff-failure alarm."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    pr = {
+        **_pr(703, "OPEN"),
+        "headRefOid": "sha-703-new",
+        "labels": [{"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    _write_review_decision(
+        tmp_path, config, 703, {"decision": "approved", "reviewed_head_sha": "sha-703-old"}
+    )
+
+    drift = detect_mergequeue_not_approved(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].mergequeue_revoked_reason == "stale_head_pending_carry_forward"
+
+
+def test_detect_mergequeue_not_approved_not_approved_records_revocation_reason(
+    tmp_path: Path,
+) -> None:
+    """Issue #1402: a genuine not-approved revocation (request_changes verdict,
+    the PR #695 case) must carry ``mergequeue_revoked_reason='not_approved'``
+    so it is distinguishable from the stale-head self-revocation."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    pr = {
+        **_pr(695, "OPEN"),
+        "headRefOid": "sha-695-live",
+        "labels": [{"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    _write_review_decision(
+        tmp_path,
+        config,
+        695,
+        {"decision": "request_changes", "reviewed_head_sha": "sha-695-live"},
+    )
+
+    drift = detect_mergequeue_not_approved(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].mergequeue_revoked_reason == "not_approved"
+
+
+def test_detect_mergequeue_not_approved_missing_decision_records_not_approved(
+    tmp_path: Path,
+) -> None:
+    """Issue #1402: a missing decision file (never reviewed) must also carry
+    ``mergequeue_revoked_reason='not_approved'``."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    pr = {
+        **_pr(701, "OPEN"),
+        "headRefOid": "sha-701",
+        "labels": [{"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+
+    drift = detect_mergequeue_not_approved(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].mergequeue_revoked_reason == "not_approved"
+
+
+def test_apply_fixes_mergequeue_revoked_writes_reason_to_state(tmp_path: Path) -> None:
+    """Issue #1402: ``apply_fixes`` must persist
+    ``mergequeue_revoked_reason`` to ``state["prs"][n]`` so ``merge_ready``
+    can read it cross-pass. Verifies the stale-head reason is written; the
+    not-approved reason is covered by the symmetric structure."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="mergequeue_revoked",
+            issue_number=None,
+            pr_number=695,
+            detail="PR #695 carries mergequeue but is not approved at its current head",
+            fix_actions=(f"remove label {mergequeue_label!r} from PR #695",),
+            remove_labels=(mergequeue_label,),
+            mergequeue_revoked_reason="stale_head_pending_carry_forward",
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert (
+        new_state["prs"]["695"]["mergequeue_revoked_reason"] == "stale_head_pending_carry_forward"
+    )
+    # The reconcile event also carries the reason for observability.
+    events = [e for e in new_state.get("events", []) if e.get("kind") == "reconcile"]
+    assert any(
+        e.get("payload", {}).get("mergequeue_revoked_reason") == "stale_head_pending_carry_forward"
+        for e in events
+    )
+
+
+def test_apply_fixes_mergequeue_revoked_without_reason_does_not_write_field(
+    tmp_path: Path,
+) -> None:
+    """Issue #1402: a ``mergequeue_revoked`` DriftItem without a
+    ``mergequeue_revoked_reason`` (e.g. from a pre-#1402 reconcile or a
+    hand-constructed drift item) must not synthesize a reason -- the field
+    stays absent so ``merge_ready`` treats the revocation as a #823 case
+    (the safe default)."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="mergequeue_revoked",
+            issue_number=None,
+            pr_number=695,
+            detail="PR #695 carries mergequeue but is not approved at its current head",
+            fix_actions=(f"remove label {mergequeue_label!r} from PR #695",),
+            remove_labels=(mergequeue_label,),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert "mergequeue_revoked_reason" not in new_state["prs"].get("695", {})
+
+
 def test_reconcile_dry_run_fix_does_not_mutate_local_state(tmp_path: Path) -> None:
     """Issue #615: mop-up --fix --dry-run must not remove checkouts or write state."""
     config = OrchestratorConfig()
@@ -4728,3 +5250,28 @@ def test_reconcile_dry_run_without_fix_still_reports_drift(tmp_path: Path) -> No
 
     after_state = json.loads(paths.state_file.read_text(encoding="utf-8"))
     assert after_state["prs"]["1"]["status"] == "reviewing"
+
+
+def test_apply_fixes_has_no_dry_run_parameter() -> None:
+    """Issue #1051: ``apply_fixes`` must NOT accept a ``dry_run`` parameter.
+
+    The dry-run invariant for ``mop-up --fix`` is enforced at a single point --
+    the ``if fix and not dry_run and drift:`` gate in ``_reconcile_locked``
+    (workflow.py), which short-circuits before ``apply_fixes`` is ever called.
+    Adding a ``dry_run`` parameter to ``apply_fixes`` would create unreachable
+    dead code: the caller guarantees ``dry_run`` is False on every code path
+    that reaches ``apply_fixes``, so any ``dry_run``-conditional branch inside
+    it can never fire from a real CLI invocation. This test locks in the
+    single-point-of-enforcement design so the dead-code pattern is not
+    reintroduced (e.g. by a PR that threads ``dry_run`` into ``apply_fixes``
+    without also restructuring the caller gate to let it through).
+    """
+    import inspect
+
+    sig = inspect.signature(apply_fixes)
+    assert "dry_run" not in sig.parameters, (
+        "apply_fixes must not accept a dry_run parameter (issue #1051): "
+        "the caller-level `not dry_run` gate in _reconcile_locked is the "
+        "single enforcement point; a dry_run param here would be unreachable "
+        "dead code."
+    )

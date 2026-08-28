@@ -38,7 +38,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp, _collect_escalated_label_subjects
 
-from test_charlie_work import FakeGitHub
+from _fakes_github import FakeGitHub
 
 
 def _events(state, kind: str) -> list[dict]:
@@ -84,7 +84,10 @@ def test_dispatch_reviews_attempt_cap_escalates_with_label(tmp_path: Path) -> No
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["status"] == "escalated"
     assert state["issues"]["123"]["status"] == "escalated"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: max_review_dispatch_attempts_exceeded is mechanical (a
+    # process-attempt-cap limit, not a judgment call), so it lands
+    # agent:operator-queue, not agent:human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
     escalated_events = _events(state, "review_dispatch_escalated")
     assert len(escalated_events) == 1
@@ -185,10 +188,12 @@ def test_dispatch_reviews_attempt_cap_escalation_label_failure_records_error(
     assert state["prs"]["456"]["status"] == "escalated"
     label_error = state["issues"]["123"].get("label_error")
     assert label_error is not None
-    assert label_error["edge"] == "escalated"
+    # Issue #1266: this is the same mechanical site as the test above, so
+    # the edge is the operator-queue counterpart, not "escalated".
+    assert label_error["edge"] == "operator_queued"
     assert label_error["outcome"] == "partial_failure"
     # state.json round-trips through JSON, so tuples become lists.
-    assert label_error["add_failures"] == [[123, config.labels.human_needed]]
+    assert label_error["add_failures"] == [[123, config.labels.operator_queue]]
 
 
 class _ABSENT:
@@ -280,6 +285,102 @@ def test_dispatch_reviews_self_heals_escalated_label_error_retry(tmp_path: Path)
     assert (123, config.labels.human_needed) in fake_gh.labels_added
     state = load_state(paths.state_file)
     # The prior label_error was cleared (set to None) on successful repair.
+    assert state["issues"]["123"]["label_error"] is None
+
+
+def test_dispatch_reviews_self_heals_mechanical_escalation_to_operator_queue(
+    tmp_path: Path,
+) -> None:
+    """Issue #1266: the self-heal sweep must repair a mechanical escalation
+    (``reason_class == "mechanical"``) to ``agent:operator-queue``, not
+    ``agent:human-needed`` -- the pre-#1266 self-heal tests above only ever
+    seed an issue entry with no ``reason_class`` at all, which
+    ``_repair_reason_class`` fails closed to "judgment" for. This is the
+    mechanical counterpart, exercising the ``_repair_reason_class`` ->
+    ``_escalation_edge`` -> ``_escalation_label`` chain inside
+    ``_repair_escalated_labels`` end to end via the real ``dispatch_reviews``
+    entry point.
+    """
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True, max_review_dispatch_attempts=2)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _write_review_packet(paths, 456, "sha-abc123")
+    _seed_escalated_pr(paths, 456, 123)  # label_error absent -- never attempted
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"]["reason_class"] = "mechanical"
+        save_state(paths.state_file, state)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["escalated_skipped"] == [456]
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
+    assert (123, config.labels.human_needed) not in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["label_error"] is None
+    repair_events = _events(state, "escalated_label_repaired")
+    assert len(repair_events) == 1
+    assert 123 in repair_events[0]["payload"]["issue_numbers"]
+
+
+def test_dispatch_reviews_repair_does_not_clobber_correct_operator_queue_label(
+    tmp_path: Path,
+) -> None:
+    """Issue #1266: if a mechanical escalation already carries the correct
+    ``agent:operator-queue`` label on GitHub (label_error is a stale dict
+    from an earlier failed attempt that has since resolved, e.g. by a
+    concurrent manual fix), the repair sweep must recognize the label is
+    already right and must NOT call transition() -- which would strip
+    operator_queue's workflow-label siblings and re-add nothing wrong, but
+    would needlessly churn the label history and (per the reason_class-blind
+    version of this code, before #1266) could have clobbered it back to
+    human_needed. Spy on issue_view to prove the check actively verified
+    live GitHub state rather than skipping via the label_error=None fast
+    path (which never reason-class-derives anything at all)."""
+
+    class SpyGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issue_view_calls: list[int] = []
+
+        def issue_view(self, number: int):
+            self.issue_view_calls.append(number)
+            return super().issue_view(number)
+
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True, max_review_dispatch_attempts=2)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = SpyGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _write_review_packet(paths, 456, "sha-abc123")
+    _seed_escalated_pr(
+        paths,
+        456,
+        123,
+        label_error={"edge": "operator_queued", "outcome": "partial_failure"},
+    )
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"]["reason_class"] = "mechanical"
+        save_state(paths.state_file, state)
+    # The label is already correctly applied on GitHub despite the stale
+    # failure record in state.
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.operator_queue}]
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert fake_gh.issue_view_calls == [123]
+    assert (123, config.labels.human_needed) not in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_removed
+    state = load_state(paths.state_file)
+    # Verified clean -- label_error is now None, not left as the stale dict.
     assert state["issues"]["123"]["label_error"] is None
 
 
@@ -780,7 +881,7 @@ def test_dispatch_reviews_keeps_its_state_lock_guard(tmp_path: Path, monkeypatch
     result = app.dispatch_reviews()
 
     assert result.ok is True
-    assert result.data["skipped"] is True
+    assert result.data["pass_skipped"] is True
     assert result.data["reason"] == "state_lock_busy"
     # And nothing was mutated on the way out -- a skip is a skip.
     assert (123, config.labels.human_needed) not in fake_gh.labels_added
@@ -908,7 +1009,9 @@ def test_record_review_escalated_pr_blocks_and_writes_no_decision(tmp_path: Path
         save_state(app.paths.state_file, state)
     before = load_state(app.paths.state_file)
 
-    result = app.record_review(456, "approved", summary="lgtm")
+    result = app.record_review(
+        456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is False
     assert "unescalate" in result.message
@@ -936,7 +1039,9 @@ def test_record_review_escalated_linked_issue_blocks_even_if_pr_state_is_clean(
         state["issues"]["123"] = {"number": 123, "status": "escalated"}
         save_state(app.paths.state_file, state)
 
-    result = app.record_review(456, "approved", summary="lgtm")
+    result = app.record_review(
+        456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is False
     assert "unescalate" in result.message
@@ -989,7 +1094,7 @@ def test_dispatch_deterministic_failure_kind_escalates_on_first_failure(
     app, fake_gh = _closed_pr_app(tmp_path)
     monkeypatch.setattr(
         "charlie_work.workflow.dispatch_sessions",
-        _fake_dispatch_sessions_factory("worktree_unsafe"),
+        _fake_dispatch_sessions_factory("worktree_unsafe_shim_dirt"),
     )
 
     result = app.dispatch(limit=1)
@@ -997,8 +1102,41 @@ def test_dispatch_deterministic_failure_kind_escalates_on_first_failure(
     assert result.ok is False
     state = load_state(app.paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
-    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe_shim_dirt"
     # Escalated on the FIRST failure -- not after burning max_auto_redispatch.
+    assert len(state["issues"]["123"]["dispatch_failed_at"]) == 1
+    # Issue #1266: a deterministic launch failure is mechanical, so it lands
+    # agent:operator-queue, not agent:human-needed.
+    assert (123, app.config.labels.operator_queue) in fake_gh.labels_added
+
+
+def test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #807: a ``worktree_unsafe_local_commits`` failure (genuine unpushed
+    local commits on the worktree branch) must escalate immediately on first
+    occurrence — like a deterministic mechanical failure — but with
+    ``reason_class="judgment"`` so the de-escalation sweep never auto-clears it.
+
+    Without the split (the mutation), ``worktree_unsafe_local_commits`` is not
+    in any deterministic set, so it takes the redispatch-cap path instead of
+    escalating immediately — the issue stays ``dispatch_failed``, not
+    ``escalated``, and this test fails.
+    """
+    app, fake_gh = _closed_pr_app(tmp_path)
+    monkeypatch.setattr(
+        "charlie_work.workflow.dispatch_sessions",
+        _fake_dispatch_sessions_factory("worktree_unsafe_local_commits"),
+    )
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is False
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe_local_commits"
+    assert state["issues"]["123"]["reason_class"] == "judgment"
+    # Escalated on the FIRST failure — not after burning max_auto_redispatch.
     assert len(state["issues"]["123"]["dispatch_failed_at"]) == 1
     assert (123, app.config.labels.human_needed) in fake_gh.labels_added
 
@@ -1102,11 +1240,11 @@ def _fake_dispatch_result_factory(
         (
             "deterministic_failure_escalates_first_try",
             False,
-            "worktree_unsafe",
+            "worktree_unsafe_shim_dirt",
             None,
             "escalated",
             2,
-            "worktree_unsafe",
+            "worktree_unsafe_shim_dirt",
         ),
     ],
 )

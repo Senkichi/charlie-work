@@ -1,4 +1,4 @@
-"""Tests for issues #1036 and #1038: two faces of one defect in workflow.py's
+"""Tests for issues #1036, #1038, and #1072: defects in workflow.py's
 writes to ``review-decision.json``.
 
 Both sites read a snapshot at time T0 (a PR-head snapshot for #1036, a
@@ -23,6 +23,15 @@ T0..T1 window is silently clobbered.
   ``state_lock`` that guards the state.json half of the transition, and
   refusing to write when the on-disk verdict's identity no longer matches
   what the caller observed.
+
+- #1072 (``record_review()``'s compare-and-swap guard): the #1036 guard
+  covered only ``review()``'s packet-commit tail exit. Two earlier exits
+  (CI-required-check-failure and Tier-1 test-adequacy hard gate) returned
+  through ``record_review()`` and bypassed it, pinning verdicts to heads
+  that moved mid-build. Fixed by pushing the guard into ``record_review()``
+  itself so every caller gets it by construction. The operator CLI
+  (``charlie verdict``) is the one exempt caller (issue #467's
+  explicit-choice design) and passes ``allow_stale_head=True``.
 """
 
 from __future__ import annotations
@@ -31,14 +40,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from charlie_work.config import OrchestratorConfig
+from charlie_work.config import OrchestratorConfig, TestAdequacyConfig
 from charlie_work.paths import runtime_paths
 
 from charlie_work.workflow import OrchestratorApp
 
 # Reuse the shared FakeGitHub whose default PR #456 is janitor-green and
 # linked to issue #123.
-from test_charlie_work import FakeGitHub
+from _fakes_github import FakeGitHub, FakeGitHubWithChecksAndAnnotations
 
 
 class FakeGitHubHeadMovesOnSecondView(FakeGitHub):
@@ -230,3 +239,263 @@ def test_update_approval_head_still_applies_when_decision_unchanged(tmp_path: Pa
     assert on_disk["decision"] == "approved"
     assert on_disk["reviewed_head_sha"] == "new-head"
     assert on_disk["carried_forward_from"] == ["old-head"]
+
+
+# --- Issue #1072: record_review() compare-and-swap guard ---------------------
+
+
+class FakeGitHubHeadMovesWithChecks(FakeGitHubWithChecksAndAnnotations):
+    """Like FakeGitHubHeadMovesOnSecondView but with configurable checks.
+
+    Used to test the CI-failure exit in review(), which needs failing
+    required checks AND a head that moves between the build-start snapshot
+    and record_review()'s live fetch.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        first_head: str,
+        second_head: str,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._first_head = first_head
+        self._second_head = second_head
+        self._pr_view_calls = 0
+
+    def pr_view(self, number: int):  # type: ignore[override]
+        self._pr_view_calls += 1
+        pr = super().pr_view(number)
+        pr["headRefOid"] = self._first_head if self._pr_view_calls == 1 else self._second_head
+        return pr
+
+
+def test_record_review_rejects_stale_packet_head_without_allow_stale_head(
+    tmp_path: Path,
+) -> None:
+    """Issue #1072: record_review() must refuse to pin a verdict to a packet
+    head that has been superseded by a live head, when the caller is an
+    automated path (allow_stale_head defaults to False).
+
+    This is the core fix: pushing the compare-and-swap guard into
+    record_review() itself so every automated caller gets it by
+    construction, not just the packet-commit exit that #1036 happened to
+    guard.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+packet diff"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Generate a packet at head "sha-abc123".
+    review_result = app.review(456)
+    assert review_result.ok is True
+
+    # Simulate a new commit landing after the packet was generated.
+    fake_gh.pr_head_shas[456] = "sha-new789"
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+
+    # An automated caller passing the stale packet head must be rejected.
+    result = app.record_review(
+        456,
+        "approved",
+        summary="lgtm",
+        reviewed_head="sha-abc123",
+        verdict_provenance="fresh_llm_review",
+    )
+    assert result.ok is False
+    assert result.data["reason"] == "head_moved_during_build"
+    assert result.data["packet_head_sha"] == "sha-abc123"
+    assert result.data["live_head_sha"] == "sha-new789"
+    # The pending decision written by review() must be untouched.
+    assert json.loads(decision_path.read_text(encoding="utf-8")).get("decision") == "pending"
+
+
+def test_record_review_allows_stale_packet_head_with_allow_stale_head(
+    tmp_path: Path,
+) -> None:
+    """Issue #1072: the operator CLI exemption. allow_stale_head=True
+    preserves issue #467's explicit-choice design — a human deliberately
+    pinning a verdict to a superseded head is allowed, because the failure
+    direction is toward redundant work (re-review next pass), never toward
+    authorizing a merge on the wrong head.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+packet diff"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    review_result = app.review(456)
+    assert review_result.ok is True
+
+    fake_gh.pr_head_shas[456] = "sha-new789"
+
+    # The operator CLI passes allow_stale_head=True and is allowed to proceed.
+    result = app.record_review(
+        456,
+        "approved",
+        summary="lgtm",
+        reviewed_head="sha-abc123",
+        allow_stale_head=True,
+        verdict_provenance="fresh_llm_review",
+    )
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-abc123"
+    assert decision["reviewed_head_source"] == "packet"
+
+
+def test_record_review_allows_live_head_when_packet_stale(tmp_path: Path) -> None:
+    """Issue #1072: choosing the live head (which has moved past the packet)
+    is always allowed — the verdict is pinned to the current head, not a
+    stale one. The guard only rejects pinning to a *superseded* head.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+packet diff"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    review_result = app.review(456)
+    assert review_result.ok is True
+
+    fake_gh.pr_head_shas[456] = "sha-new789"
+    fake_gh.diffs[456] = "diff --git a/file b/file\n+unreviewed change"
+
+    # Choosing the live head is fine — no allow_stale_head needed.
+    result = app.record_review(
+        456,
+        "approved",
+        summary="lgtm",
+        reviewed_head="sha-new789",
+        verdict_provenance="fresh_llm_review",
+    )
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == "sha-new789"
+    assert decision["reviewed_head_source"] == "live"
+
+
+def test_review_ci_failure_exit_rejects_verdict_when_head_moved(
+    tmp_path: Path,
+) -> None:
+    """Issue #1072: the CI-required-check-failure exit in review() routes
+    through record_review() before the #1036 packet-commit guard. When the
+    head moves between the build-start snapshot and record_review()'s live
+    fetch, the verdict must not be recorded.
+
+    This exit fires before the packet is written in the current pass, so
+    packet_head_sha comes from a *previous* packet. We plant one with the
+    snapshot head so the new guard in record_review() can detect the
+    mismatch.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            enabled=True,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubHeadMovesWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9002},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        annotations_by_check_run_id={},
+        first_head="sha-1",
+        second_head="sha-2",
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Plant a previous packet at the snapshot head so packet_head_sha == "sha-1".
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "pr.json").write_text(
+        json.dumps({"headRefOid": "sha-1", "number": 456}), encoding="utf-8"
+    )
+
+    result = app.review(456)
+
+    assert result.ok is False
+    assert result.data["reason"] == "head_moved_during_build"
+    assert result.data["packet_head_sha"] == "sha-1"
+    assert result.data["live_head_sha"] == "sha-2"
+
+    # No verdict was recorded.
+    decision_path = pr_dir / "review-decision.json"
+    assert not decision_path.exists()
+
+
+def test_review_test_adequacy_exit_rejects_verdict_when_head_moved(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Issue #1072: the Tier-1 test-adequacy hard gate exit in review() also
+    routes through record_review() before the #1036 guard. When the head
+    moves between the build-start snapshot and record_review()'s live fetch,
+    the verdict must not be recorded.
+
+    Unlike the CI-failure exit, this exit fires AFTER the packet is written
+    in the current pass, so packet_head_sha is the snapshot head from the
+    just-written pr.json — no manual packet planting needed.
+    """
+    from charlie_work.config import ReviewConfig
+    from charlie_work.janitor import TestAdequacyFacts, TestAdequacyVerdict
+
+    config = OrchestratorConfig(
+        test_adequacy=TestAdequacyConfig(enabled=True, exempt_marker="Test-exempt:"),
+        review=ReviewConfig(max_rework_cycles=2),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubHeadMovesOnSecondView(first_head="sha-1", second_head="sha-2")
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    hard_fail_verdict = TestAdequacyVerdict(
+        ok=False,
+        failures=("Product code changed (15 LOC added) but no test files changed.",),
+        warnings=(),
+        facts=TestAdequacyFacts(
+            added_product_loc=15,
+            added_test_loc=0,
+            assertion_count=0,
+            test_files_changed=0,
+            untested_product_files=("src/foo.py",),
+            exempt=False,
+            exempt_reason="",
+        ),
+    )
+    monkeypatch.setattr(
+        "charlie_work.workflow.check_test_adequacy",
+        lambda diff, pr, cfg: hard_fail_verdict,
+    )
+
+    result = app.review(456)
+
+    assert result.ok is False
+    assert result.data["reason"] == "head_moved_during_build"
+    assert result.data["packet_head_sha"] == "sha-1"
+    assert result.data["live_head_sha"] == "sha-2"
+
+    # The packet was written (pr.json exists) but no verdict was recorded.
+    pr_dir = paths.prs / "pr-456"
+    assert (pr_dir / "pr.json").exists()
+    decision_path = pr_dir / "review-decision.json"
+    if decision_path.exists():
+        assert json.loads(decision_path.read_text(encoding="utf-8")).get("decision") == "pending"

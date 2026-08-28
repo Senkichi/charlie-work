@@ -19,6 +19,13 @@ ISSUE_VALUES = {
     "branch_name": "agent/issue-123-fix-search",
     "worker_model_tier": "capable",
     "issue_comments": "",
+    # Issue #1444: the module-map section value. Empty here because these
+    # tests render against a tmp_path with no src/charlie_work tree; the
+    # real writer (``_write_worker_prompt``) derives it from the live tree.
+    "module_map": "",
+    # Issue #1460: the attachment-budget dispatch clause. Empty for the same
+    # reason module_map is empty above.
+    "attachment_budget": "",
     "pr_number": 456,
     "pr_title": "fix: search is broken",
     "pr_url": "https://example.test/pull/456",
@@ -144,7 +151,10 @@ def test_rendered_worker_prompts_contain_shared_section_text_and_no_placeholders
         assert "- Solve only issue #123." in prompt
         assert "If the fix touches security-sensitive behavior" in prompt
         assert "**Containment:**" in prompt
-        assert "never resolve, cd into, or modify any other checkout" in prompt
+        assert (
+            "never resolve, cd into, or modify any path outside the assigned worktree root"
+            in prompt
+        )
         assert not re.search(r"\$section_\w+", prompt), (
             f"leftover $section_ placeholder in rendered {template_name}"
         )
@@ -180,6 +190,8 @@ def test_attacker_controlled_placeholders_not_expanded() -> None:
         "branch_name": "agent/issue-8-test",
         "worker_model_tier": "capable",
         "issue_comments": "",
+        "module_map": "",
+        "attachment_budget": "",
     }
 
     for template_name in ("worker.md", "worker_claude_code.md"):
@@ -750,6 +762,136 @@ def test_assert_execution_contract_accepts_override_with_carve_out(
     )
     # Must not raise — the override carries the execution-contract carve-out.
     assert_execution_contract(prompt)
+
+
+def test_worker_prompts_contain_widened_containment_clause() -> None:
+    """Verify that worker/rework prompts carry the widened containment clause (issue #1010).
+
+    The clause must forbid any path outside the assigned worktree root — not
+    just other checkouts of the same repo.  A rework worker can wander to a
+    sibling repo just as easily as a fresh-dispatch worker.
+    """
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "**Containment:**" in prompt
+        assert "any path outside the assigned worktree root" in prompt
+
+
+def test_assert_containment_passes_for_package_templates() -> None:
+    """The guard accepts prompts rendered from the package templates (issue #1010)."""
+    from charlie_work.prompts import assert_containment
+
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+        prompt = _render_worker_with_sections(template_name)
+        # Must not raise — the package templates all reference
+        # $section_scope_contract with the widened wording.
+        assert_containment(prompt)
+
+
+def test_assert_containment_rejects_flat_override_without_clause(
+    tmp_path: Path,
+) -> None:
+    """The guard catches a flat override that drops the containment clause (issue #1010).
+
+    A repo-local flat whole-file ``worker.md`` override that does not reference
+    ``$section_scope_contract`` renders without the containment clause,
+    dispatching workers with no prohibition against editing a sibling repo's
+    checkout.  The guard must refuse to let it through.
+    """
+    from charlie_work.prompts import (
+        MissingContainmentError,
+        assert_containment,
+    )
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    (override_dir / "worker.md").write_text(
+        "# Worker Task\n\nGo fix the issue. No containment clause here.\n",
+        encoding="utf-8",
+    )
+    prompt = render_prompt(
+        "worker.md",
+        ISSUE_VALUES,
+        search_dirs=(override_dir,),
+    )
+    assert "**Containment:**" not in prompt
+
+    with pytest.raises(MissingContainmentError) as exc_info:
+        assert_containment(prompt, context="worker prompt for issue #123")
+    assert "issue #1010" in str(exc_info.value)
+    assert "worker prompt for issue #123" in str(exc_info.value)
+
+
+def test_assert_containment_rejects_old_repo_scoped_wording(
+    tmp_path: Path,
+) -> None:
+    """The guard catches a flat override that reverts to the old repo-scoped wording (issue #1010).
+
+    The old wording forbade only "any other checkout of the repo" — which does
+    not cover a different repo at all.  A flat override that carries the old
+    wording must be caught, since it leaves the exact gap issue #1010 describes.
+    """
+    from charlie_work.prompts import (
+        MissingContainmentError,
+        assert_containment,
+    )
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    (override_dir / "worker.md").write_text(
+        "# Worker Task: Issue #$issue_number\n\n"
+        "## Scope contract\n\n"
+        "- **Containment:** All file edits happen in the worktree; never "
+        "modify any other checkout of the repo.\n",
+        encoding="utf-8",
+    )
+    prompt = render_prompt(
+        "worker.md",
+        ISSUE_VALUES,
+        search_dirs=(override_dir,),
+    )
+    assert "**Containment:**" in prompt
+    assert "any path outside the assigned worktree root" not in prompt
+
+    with pytest.raises(MissingContainmentError):
+        assert_containment(prompt, context="worker prompt for issue #123")
+
+
+def test_assert_containment_accepts_override_with_widened_clause(
+    tmp_path: Path,
+) -> None:
+    """The guard accepts a flat override that does carry the widened clause (issue #1010)."""
+    from charlie_work.prompts import assert_containment
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    (override_dir / "worker.md").write_text(
+        "# Worker Task: Issue #$issue_number\n\n"
+        "## Scope contract\n\n"
+        "- **Containment:** All file edits happen in the worktree; never "
+        "modify any path outside the assigned worktree root.\n",
+        encoding="utf-8",
+    )
+    prompt = render_prompt(
+        "worker.md",
+        ISSUE_VALUES,
+        search_dirs=(override_dir,),
+    )
+    # Must not raise — the override carries the widened containment clause.
+    assert_containment(prompt)
+
+
+def test_rework_template_references_scope_contract_section() -> None:
+    """Verify that rework.md references $section_scope_contract (issue #1010).
+
+    A rework worker can wander to a sibling repo just as easily as a
+    fresh-dispatch worker, so the containment clause must appear in rework
+    prompts too.
+    """
+    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
+    text = (prompts_dir / "rework.md").read_text(encoding="utf-8")
+
+    assert "$section_scope_contract" in text
 
 
 def test_review_template_contains_test_adequacy_section_placeholder() -> None:

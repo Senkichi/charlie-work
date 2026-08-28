@@ -426,8 +426,25 @@ def test_kill_process_tree_self_pid_exempt(monkeypatch: Any) -> None:
     assert kill_attempts == []
 
 
-def test_kill_process_tree_enumerates_children() -> None:
-    """Test that kill_process_tree enumerates and includes child PIDs."""
+def test_kill_process_tree_enumerates_children(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that kill_process_tree enumerates children and kills the process tree.
+
+    The assertion strategy decouples from ``kill_process_tree``'s internal
+    enumeration *result*, which is best-effort by design (``_enumerate_child_pids``
+    swallows transient CIM/proc failures and returns ``[]``). Under full-suite
+    load the internal single-shot enumeration can fail even when the test's
+    retry-loop enumeration succeeded, so asserting ``child_pid in killed``
+    couples two independent enumerations and flakes (#608, #681, #1064).
+
+    Instead we verify three things:
+    1. The parent PID is in ``killed`` (the kill was reported).
+    2. ``kill_process_tree`` called ``_enumerate_child_pids`` (enumeration was
+       attempted — structural, via spy). Catches a regression that removes the
+       enumeration call.
+    3. Each enumerated child is actually dead (behavioral). ``taskkill /T``
+       (Windows) or ``killpg`` (POSIX) kills the tree regardless of enumeration,
+       so this is the reliable signal that the tree kill worked.
+    """
     # Spawn a real parent process that will spawn a child
     # On POSIX, use start_new_session=True to avoid sharing pytest's process group
     # The parent imports ``sys`` before referencing ``sys.executable``; without it
@@ -499,15 +516,63 @@ def test_kill_process_tree_enumerates_children() -> None:
                 f"cannot assert on the killed set"
             )
 
+        # Spy on ``_enumerate_child_pids`` to verify ``kill_process_tree`` calls
+        # it (structural assertion). The spy is installed AFTER the retry loop
+        # above, which imported ``_enumerate_child_pids`` into a local name --
+        # monkeypatching the module attribute only affects ``kill_process_tree``'s
+        # module-level reference, not the retry loop's already-bound local. This
+        # lets us distinguish ``kill_process_tree``'s internal call from the
+        # retry loop's calls. The internal enumeration's *result* is best-effort
+        # (can return ``[]`` under load), so we assert on the *call*, not the
+        # result -- a regression that removes the enumeration call fails here.
+        import charlie_work.process_utils as _pu
+
+        enumerate_calls: list[int] = []
+        _real_enumerate = _pu._enumerate_child_pids
+
+        def _spy_enumerate(spy_pid: int) -> list[int]:
+            enumerate_calls.append(spy_pid)
+            return _real_enumerate(spy_pid)
+
+        monkeypatch.setattr(_pu, "_enumerate_child_pids", _spy_enumerate)
+
         # Kill the parent process tree
         killed = kill_process_tree(parent_proc.pid, expected_start_time=None)
 
-        # Check that the parent PID is in the killed list
+        # 1. The parent PID must be in the killed list (kill was reported).
         assert parent_proc.pid in killed
 
-        # Check that the enumerated child PIDs are in the killed list
+        # 2. ``kill_process_tree`` must call ``_enumerate_child_pids`` with the
+        #    parent PID (enumeration was attempted). This catches a regression
+        #    that removes or skips the enumeration call -- the structural
+        #    guarantee the test name promises. We do NOT assert on the result
+        #    (which children appear in ``killed``) because that result is
+        #    best-effort and transiently empty under load (#1064).
+        assert parent_proc.pid in enumerate_calls, (
+            f"kill_process_tree did not call _enumerate_child_pids for "
+            f"parent {parent_proc.pid}; enumeration was skipped"
+        )
+
+        # 3. Behavioral assertion: each enumerated child must be actually dead.
+        #    ``taskkill /T`` (Windows) or ``killpg`` (POSIX) kills the tree
+        #    regardless of enumeration, so child liveness is the reliable signal
+        #    that the tree kill worked. A bounded retry accommodates kill-signal
+        #    propagation latency under load. This catches a regression that
+        #    breaks the tree kill (e.g. dropping ``/T`` from ``taskkill``) while
+        #    being immune to the enumeration-result race that flaked the prior
+        #    assertion (``assert child_pid in killed``).
         for child_pid in child_pids:
-            assert child_pid in killed
+            child_dead = False
+            child_deadline = time.monotonic() + 5.0
+            while time.monotonic() < child_deadline:
+                if not is_pid_alive(child_pid):
+                    child_dead = True
+                    break
+                time.sleep(0.1)
+            assert child_dead, (
+                f"child {child_pid} still alive after kill_process_tree; "
+                f"tree kill did not reach the child"
+            )
     finally:
         # Clean up if still alive
         if parent_proc.poll() is None:
@@ -719,6 +784,211 @@ def test_is_pid_alive_treats_start_time_none_as_indeterminate(tmp_path: Path) ->
     finally:
         proc.kill()
         proc.wait(timeout=5)
+
+
+# --- issue #1371: ACCESS_DENIED fail-closed ---------------------------------
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_is_pid_alive_false_for_protected_system_process() -> None:
+    """Issue #1371 acceptance criterion #1.
+
+    ``is_pid_alive`` must return ``False`` for a real protected/system PID
+    discovered at test runtime -- not a hardcoded guess.  PID 4 (the Windows
+    ``System`` process) is always present and always returns
+    ``ERROR_ACCESS_DENIED`` for ``OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)``
+    from a non-administrator token.  If no protected PID is discoverable, the
+    test skips cleanly.
+    """
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    # Discover a protected PID at runtime.  PID 4 (System) is the canonical
+    # always-present protected process on Windows NT; OpenProcess with limited
+    # rights returns 0 + ERROR_ACCESS_DENIED for it from a non-elevated token.
+    candidate_pids = [4]
+    protected_pid: int | None = None
+    for candidate in candidate_pids:
+        handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, candidate)
+        if not handle:
+            if kernel32.GetLastError() == 5:  # ERROR_ACCESS_DENIED
+                protected_pid = candidate
+                break
+        else:
+            kernel32.CloseHandle(handle)
+
+    if protected_pid is None:
+        pytest.skip("no protected PID discoverable on this host")
+
+    # Any start time -- the identity check is never reached because the handle
+    # open fails with ACCESS_DENIED.
+    assert is_pid_alive(protected_pid, 123.456) is False
+    assert is_pid_alive(protected_pid) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_is_pid_alive_access_denied_returns_false_with_monkeypatched_openprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #1371 acceptance criterion #3.
+
+    Simulate the ACCESS_DENIED path with an injected ``OpenProcess`` and assert
+    ``False`` -- without any snapshot fallback being able to verify identity.
+    The monkeypatched ``OpenProcess`` returns 0 (failure) and
+    ``GetLastError`` returns 5 (``ERROR_ACCESS_DENIED``), which is exactly the
+    recycled-pid-onto-protected-process scenario.
+    """
+
+    class _FakeKernel32:
+        """Minimal kernel32 stub that makes OpenProcess fail with ACCESS_DENIED."""
+
+        def OpenProcess(self, access: int, inherit: bool, pid: int) -> int:
+            return 0  # failure -> caller checks GetLastError
+
+        def GetLastError(self) -> int:
+            return 5  # ERROR_ACCESS_DENIED
+
+        def CloseHandle(self, handle: int) -> int:
+            return 1
+
+        def GetExitCodeProcess(self, handle: int, exit_code: Any) -> int:
+            return 0  # not reached
+
+    fake = _FakeKernel32()
+    # ``is_pid_alive`` resolves ``ctypes.windll.kernel32`` at call time, so
+    # patch the attribute on the ctypes.windll proxy.
+    import ctypes
+
+    monkeypatch.setattr(ctypes.windll, "kernel32", fake, raising=False)
+
+    # No snapshot fallback is present in the implementation, so identity cannot
+    # be verified -- the assertion must hold purely from the ACCESS_DENIED path.
+    assert is_pid_alive(6262, 123.456) is False
+    assert is_pid_alive(6262) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_is_pid_alive_invalid_parameter_dead_pid_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #1371 acceptance criterion #4: no behavior change for the dead-pid path.
+
+    ``ERROR_INVALID_PARAMETER`` (87) from ``OpenProcess`` means the PID does not
+    exist.  This path must still return ``False`` -- the fix only changed the
+    ``ERROR_ACCESS_DENIED`` branch.
+    """
+
+    class _FakeKernel32:
+        def OpenProcess(self, access: int, inherit: bool, pid: int) -> int:
+            return 0  # failure
+
+        def GetLastError(self) -> int:
+            return 87  # ERROR_INVALID_PARAMETER
+
+        def CloseHandle(self, handle: int) -> int:
+            return 1
+
+        def GetExitCodeProcess(self, handle: int, exit_code: Any) -> int:
+            return 0  # not reached
+
+    fake = _FakeKernel32()
+    import ctypes
+
+    monkeypatch.setattr(ctypes.windll, "kernel32", fake, raising=False)
+
+    assert is_pid_alive(999999, 123.456) is False
+    assert is_pid_alive(999999) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only: ctypes.windll kernel32 stub")
+def test_is_pid_alive_get_exit_code_failure_fallthrough_uses_start_time_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #1371 audit: Windows ``GetExitCodeProcess`` failure fallthrough.
+
+    When ``OpenProcess`` succeeds but ``GetExitCodeProcess`` fails, the function
+    must NOT declare the PID alive without verifying start-time identity.  It
+    falls through to the identity check: ``True`` on a matching
+    ``expected_start_time`` and ``False`` on a mismatched one (recycled PID).
+    """
+
+    class _FakeKernel32:
+        def OpenProcess(self, access: int, inherit: bool, pid: int) -> int:
+            return 1  # success -- a nonzero handle
+
+        def GetLastError(self) -> int:
+            return 0
+
+        def GetExitCodeProcess(self, handle: int, exit_code: Any) -> int:
+            return 0  # failure -- cannot read exit code
+
+        def CloseHandle(self, handle: int) -> int:
+            return 1
+
+    fake = _FakeKernel32()
+    import ctypes
+
+    monkeypatch.setattr(ctypes.windll, "kernel32", fake, raising=False)
+
+    matching_start = 1000.0
+    mismatched_start = 5000.0
+
+    # Matching start time -> identity verified -> alive (True).
+    with patch(
+        "charlie_work.process_utils.get_process_start_time",
+        return_value=matching_start,
+    ):
+        assert is_pid_alive(6262, matching_start) is True
+
+    # Mismatched start time -> identity mismatch -> recycled -> False.
+    with patch(
+        "charlie_work.process_utils.get_process_start_time",
+        return_value=mismatched_start,
+    ):
+        assert is_pid_alive(6262, matching_start) is False
+
+
+def test_is_pid_alive_posix_permission_error_fallthrough_uses_start_time_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #1371 audit: POSIX ``PermissionError`` fallthrough.
+
+    When ``os.kill(pid, 0)`` raises ``PermissionError`` (process exists but we
+    cannot signal it), the function must NOT declare the PID alive without
+    verifying start-time identity.  It falls through to the identity check:
+    ``True`` on a matching ``expected_start_time`` and ``False`` on a mismatched
+    one (recycled PID).
+
+    Not gated behind a POSIX-only skip: CI runs self-hosted on Windows, so the
+    POSIX branch is forced via a ``sys.platform`` monkeypatch to ensure the path
+    is actually exercised rather than skipped on every CI run.
+    """
+    # Force the POSIX branch regardless of the host platform.
+    monkeypatch.setattr("charlie_work.process_utils.sys.platform", "linux")
+
+    def fake_kill(pid: int, sig: int) -> None:
+        raise PermissionError("simulated: process exists but cannot signal")
+
+    monkeypatch.setattr("charlie_work.process_utils.os.kill", fake_kill)
+
+    matching_start = 1000.0
+    mismatched_start = 5000.0
+
+    # Matching start time -> identity verified -> alive (True).
+    with patch(
+        "charlie_work.process_utils.get_process_start_time",
+        return_value=matching_start,
+    ):
+        assert is_pid_alive(6262, matching_start) is True
+
+    # Mismatched start time -> identity mismatch -> recycled -> False.
+    with patch(
+        "charlie_work.process_utils.get_process_start_time",
+        return_value=mismatched_start,
+    ):
+        assert is_pid_alive(6262, matching_start) is False
 
 
 def _capture_popen_call(monkeypatch: pytest.MonkeyPatch) -> MagicMock:

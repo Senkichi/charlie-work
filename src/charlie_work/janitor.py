@@ -168,6 +168,18 @@ class JanitorVerdict:
     # is_infra_failure_block is the caller's signal to escalate to a human --
     # there is no code-fix rework path for an infra failure.
     infra_definitive_failed: tuple[str, ...] = ()
+    # Issue #1383: required checks that failed because of a fleet-wide
+    # infrastructure condition (Actions budget/runner outage), reclassified
+    # at the check-ingestion data boundary before the janitor gate runs.
+    # is_infra_blocked_block mirrors is_infra_failure_block: True only when
+    # an infra_blocked required check is the SOLE janitor blocker this pass.
+    # Consumers must branch on this structured flag, never on the
+    # failure-message text. Distinct from is_infra_failure_block (#841,
+    # per-PR CANCELLED/INFRA_FAILURE/TIMED_OUT): infra_blocked is escalated
+    # once per window across passes, never per-PR, and never routed to
+    # rework or auto-rerun.
+    infra_blocked_checks: tuple[str, ...] = ()
+    is_infra_blocked_block: bool = False
     # Structured flag for _check_no_op_rework's finding (either variant:
     # patch-id or head-SHA unchanged since the last request_changes verdict).
     # Consumers must branch on this, never on the failure-message text.
@@ -197,6 +209,17 @@ class JanitorVerdict:
     # run for pushed heads; detection added so the janitor gate distinguishes
     # "CI never started" from "CI failed".
     missing_required_checks: tuple[str, ...] = ()
+    # Issue #1133: True only when "Required check(s) missing" is the SOLE
+    # janitor failure -- every other gate (state, mergeable, failed checks,
+    # linked issue, body, draft, no-op-rework, ...) already passed. This is
+    # the transient population: a brand-new PR whose required checks simply
+    # haven't reported yet, which self-heals within one CI cycle. Distinct
+    # from the durable "CI never started" case, which is detected separately
+    # by _detect_ci_run_never_created and recorded as
+    # ``ci_run_never_created_head`` on the PR state. Consumers must branch on
+    # this structured flag, never on the failure-message text -- same rule as
+    # is_draft_only_block/is_check_failure_block above.
+    is_missing_checks_only_block: bool = False
 
 
 def _calculate_patch_id(diff: str) -> str:
@@ -403,9 +426,24 @@ def run_janitor(
             "stale-CI (all findings cite required checks that are green now)"
         )
     elif repo_root is not None:
-        is_no_op_rework = _check_no_op_rework(pr, pr_state, failures, warnings, repo_root, pr_diff)
+        is_no_op_rework = _check_no_op_rework(
+            pr, pr_state, failures, warnings, repo_root, pr_diff, review_decision=review_decision
+        )
 
     is_check_failure_block = bool(failed_required_checks) and not failures
+
+    # Issue #1133: mirror the "*_only_block" pattern for the transient
+    # "Required check(s) missing" case. ``failures`` here still excludes the
+    # "Required check(s) failed" message (appended below) but DOES include the
+    # "Required check(s) missing" message (appended in _check_required_checks
+    # above) -- so ``len(failures) == 1`` with non-empty ``missing_required_checks``
+    # means the missing-checks failure is the sole blocker. Co-occurring
+    # unavailable/infra-failed checks, draft, merge conflict, body, etc. all
+    # lengthen ``failures`` and disqualify this flag, correctly leaving them
+    # in the durable (dead) population.
+    is_missing_checks_only_block = (
+        bool(missing_required_checks) and not failed_required_checks and len(failures) == 1
+    )
 
     # issue #841: mirror is_check_failure_block for infra-failed required
     # checks. `failures` at this point still excludes the "Required check(s)
@@ -421,6 +459,26 @@ def run_janitor(
         summary is not None
         and bool(summary.infra_failed)
         and not failed_required_checks
+        and not summary.missing
+        and not summary.unavailable
+        and not summary.infra_blocked
+        and non_required_checks_failures == 0
+    )
+    # Issue #1383: mirror is_infra_failure_block for infra_blocked required
+    # checks (fleet-wide billing/runner outage). True only when
+    # infra_blocked is non-empty and is the SOLE janitor blocker -- no
+    # genuine code failure, no per-PR infra_failed/missing/unavailable
+    # co-occurrence, and nothing else in `failures`. Mutually exclusive with
+    # is_infra_failure_block (each excludes the other's bucket) so a
+    # co-occurring infra_failed + infra_blocked combination disqualifies
+    # both flags, correctly leaving the PR in the durable blocked population
+    # for the caller's general handling rather than silently picking one.
+    infra_blocked_checks = summary.infra_blocked if summary is not None else ()
+    is_infra_blocked_block = (
+        summary is not None
+        and bool(summary.infra_blocked)
+        and not failed_required_checks
+        and not summary.infra_failed
         and not summary.missing
         and not summary.unavailable
         and non_required_checks_failures == 0
@@ -483,11 +541,14 @@ def run_janitor(
         infra_rerun_run_ids=infra_rerun_run_ids,
         infra_rerun_attempts=infra_rerun_attempts,
         infra_definitive_failed=infra_definitive_failed,
+        infra_blocked_checks=infra_blocked_checks,
+        is_infra_blocked_block=is_infra_blocked_block,
         is_no_op_rework=is_no_op_rework,
         no_op_check_skipped_stale_ci=no_op_check_skipped_stale_ci,
         is_draft=is_draft,
         is_draft_only_block=is_draft_only_block,
         missing_required_checks=missing_required_checks,
+        is_missing_checks_only_block=is_missing_checks_only_block,
     )
 
 
@@ -528,6 +589,15 @@ def _check_required_checks(
     if summary.infra_failed:
         failures.append(
             f"CI never ran (infrastructure failure): {', '.join(summary.infra_failed)}"
+        )
+    if summary.infra_blocked:
+        # Issue #1383: a fleet-wide infra block (billing/runner outage) is a
+        # gate failure (the PR cannot merge while the infra is down) but is
+        # NOT routed to rework -- the caller branches on
+        # is_infra_blocked_block to hold the PR and emit a distinct event.
+        failures.append(
+            f"Required check(s) infra-blocked (billing/runner outage): "
+            f"{', '.join(summary.infra_blocked)}"
         )
     if summary.missing:
         failures.append(f"Required check(s) missing: {', '.join(summary.missing)}")
@@ -690,12 +760,14 @@ def _check_no_op_rework(
     warnings: list[str],
     repo_root: Path,
     pr_diff: str | None = None,
+    *,
+    review_decision: Mapping[str, Any] | None = None,
 ) -> bool:
     """Check if the PR has actual content changes since a request_changes verdict.
 
-    When a PR has a request_changes verdict in its state, compare the current
-    patch-id against the reviewed_patch_id from that verdict. If they match,
-    the rework produced no actual content changes (no-op rework).
+    When a PR has a request_changes verdict, compare the current patch-id
+    against the reviewed_patch_id from that verdict. If they match, the
+    rework produced no actual content changes (no-op rework).
 
     This is superior to head SHA comparison because base-update merges can
     advance the head SHA without changing the actual diff content (issue #222).
@@ -711,8 +783,13 @@ def _check_no_op_rework(
     if not pr_state:
         return False
 
-    # Check if the most recent verdict was request_changes
-    decision = pr_state.get("decision")
+    # Issue #1362 Stage 1: the "was the last verdict request_changes" gate must
+    # read the file-first review_decision mapping (run_janitor's own
+    # ``review_decision`` param, already resolved by callers via
+    # ``self._review_decision(pr_number)``), never ``pr_state["decision"]``
+    # directly -- otherwise a crash between the file write and the state write
+    # leaves this check acting on stale state.json (the #1340 divergence class).
+    decision = (review_decision or {}).get("decision")
     if decision != "request_changes":
         return False
 
@@ -763,6 +840,21 @@ def _check_no_op_rework(
 
     # Fallback: head SHA comparison (only when patch-id check could not run)
 
+    # Issue #1362 Stage 3: this reads ``pr_state["reviewed_head_sha"]``
+    # directly rather than through ``review_decision``/``resolve_decision_payload``
+    # (unlike the ``decision`` gate just above). That is now safe to read as
+    # *cache*: ``reviewed_head_sha`` is refreshed from the file at the start
+    # of every already-tracked PR's ``loop()`` evaluation
+    # (``_refresh_pr_decision_cache`` -- skipped only for a PR not yet present
+    # in ``state["prs"]``, and a PR in that state is passed to this function
+    # as ``pr_state={}``/``None``, which the ``if not pr_state: return False``
+    # guard at the top of this function already rejects before execution
+    # ever reaches this fallback) and by each of the four writer-adjacent
+    # mirrors, so it can no longer lag the file the way it could before
+    # Stage 3 introduced that invariant. Reading
+    # ``pr_state`` here directly (rather than threading a second
+    # ``review_decision``-shaped parameter through every ``_check_no_op_rework``
+    # caller) is deliberate, not an oversight left over from Stage 1.
     reviewed_head_sha = pr_state.get("reviewed_head_sha")
     if not reviewed_head_sha:
         return False

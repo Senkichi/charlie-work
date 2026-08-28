@@ -29,37 +29,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from _unescalate_fixtures import _app, _events
 from charlie_work import cli
-from charlie_work.config import OrchestratorConfig, PostMortemConfig
+from charlie_work.config import OrchestratorConfig
 from charlie_work.labels import TransitionOutcome, transition
-from charlie_work.paths import runtime_paths
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state, state_lock
-from charlie_work.workflow import OrchestratorApp
 
-from test_charlie_work import FakeGitHub
-from test_cli import _FakeGitHub, _make_repo
-
-
-def _events(state, kind: str) -> list[dict]:
-    return [e for e in state.get("events", []) if e.get("kind") == kind]
-
-
-def _app(tmp_path: Path) -> OrchestratorApp:
-    # Isolate post_mortem.db_path from the real Devin sessions.db. The default
-    # (db_path="") resolves to %APPDATA%\devin\cli\sessions.db at read time;
-    # on a self-hosted CI runner that file exists with real session data, so
-    # issue_worker_liveness's real-activity probe could surface a stale
-    # timestamp for the test PID and flip the verdict from inconclusive-defer
-    # (live=True, refuse) to conclusive-stale (live=False, proceed) -- dropping
-    # the ``issue_worker_alive`` key the refusal branch sets. Pointing at a
-    # nonexistent path under tmp_path makes every probe source error out
-    # (inconclusive), which is the condition both #625 tests depend on.
-    config = OrchestratorConfig(
-        post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db"))
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    return OrchestratorApp(tmp_path, paths, config, fake_gh)
+from _cli_fixtures import _FakeGitHub, _make_repo
+from _fakes_github import FakeGitHub
 
 
 # --- labels.py: the two new label edges, tested directly via transition() ---
@@ -156,6 +133,57 @@ def test_unescalate_escalated_open_pr_resets_and_relabels(tmp_path: Path) -> Non
     assert len(_events(state, "unescalate")) == 1
 
 
+def test_unescalate_reset_covers_every_rework_lane_companion() -> None:
+    """Every companion field a lane's auto de-escalation resets must also be
+    reset by the operator door. Derived from the map, not hand-listed, so a
+    new lane (or a new companion) that lands in one place and not the other
+    fails here instead of re-escalating in production (PR #1449)."""
+    from charlie_work.workflow import OrchestratorApp
+
+    reset = set(OrchestratorApp._UNESCALATE_PR_RESET_FIELDS)
+    missing: set[str] = set()
+    for counter, companions in OrchestratorApp._REWORK_BUDGET_RESET_BY_ESCALATION_REASON.values():
+        missing |= ({counter} | set(companions)) - reset
+    assert not missing, sorted(missing)
+
+
+def test_unescalate_clears_rework_stall_clock_for_both_lanes(tmp_path: Path) -> None:
+    """A stall clock started during the exhausted episode must not survive the
+    re-arm: _check_janitor_rework_stall restarts from utc_now() only when the
+    key is unset, and a cap escalation never clears it, so a stale start makes
+    the very next janitor pass fire ``*_stall_exceeded`` at attempt 1."""
+    app = _app(tmp_path)
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+            "conflict_rework_attempts": 3,
+            "conflict_rework_attempts_last_head": "sha-old",
+            "conflict_rework_attempts_stall_since": "2026-08-25T16:30:18Z",
+            "conflict_rework_attempts_stall_head": "sha-old",
+            "no_op_rework_attempts": 1,
+            "no_op_rework_attempts_stall_since": "2026-08-25T16:30:18Z",
+            "no_op_rework_attempts_stall_head": "sha-old",
+        }
+        state["issues"]["123"] = {"number": 123, "status": "escalated"}
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(pr_number=456)
+
+    assert result.ok is True and result.data["changed"] is True
+    pr_entry = load_state(app.paths.state_file)["prs"]["456"]
+    for stale_field in (
+        "conflict_rework_attempts_stall_since",
+        "conflict_rework_attempts_stall_head",
+        "no_op_rework_attempts_stall_since",
+        "no_op_rework_attempts_stall_head",
+    ):
+        assert stale_field not in pr_entry, stale_field
+
+
 def test_unescalate_janitor_blocked_pr_uses_same_rearm_path(tmp_path: Path) -> None:
     app = _app(tmp_path)
     with state_lock(app.paths.state_file):
@@ -202,6 +230,38 @@ def test_unescalate_merged_pr_normalizes_status_without_label_edge(tmp_path: Pat
     # PR is left for finalization/reconcile, so no label edge must fire.
     assert app.gh.labels_added == []
     assert app.gh.labels_removed == []
+
+
+def test_unescalate_merged_pr_stamps_merged_at_on_transition(tmp_path: Path) -> None:
+    """Issue #747: ``unescalate`` normalizing an escalated PR whose live GitHub
+    state is MERGED is a non-merged -> merged transition, so it must stamp
+    ``merged_at`` (the same pattern as the other five merged_at sites) so merge
+    throughput/latency stay computable from state.json regardless of which path
+    finalized the PR. The guard is on the pre-reset entry's status, so a
+    concurrent writer that already flipped the entry to 'merged' between the
+    snapshot and the in-lock apply is not back-dated."""
+    app = _app(tmp_path)
+    app.gh.prs[0]["state"] = "MERGED"
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "review_dispatch_attempt_count": 3,
+        }
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(pr_number=456)
+
+    assert result.ok is True
+    state = load_state(app.paths.state_file)
+    pr_entry = state["prs"]["456"]
+    assert pr_entry["status"] == "merged"
+    # merged_at is stamped on the genuine escalated -> merged transition.
+    assert "merged_at" in pr_entry
+    assert pr_entry["merged_at"]
+    assert pr_entry["merged_at"].endswith("Z")
 
 
 def test_unescalate_escalated_issue_with_no_pr_drops_status_and_requeues(tmp_path: Path) -> None:
@@ -486,3 +546,215 @@ def test_unescalate_concurrent_writer_fields_survive_the_write(tmp_path: Path) -
     assert state["prs"]["456"]["concurrent_field"] == "must-survive"
     assert state["issues"]["123"]["concurrent_issue_field"] == "must-survive"
     assert state["prs"]["456"]["status"] == PASSIVE_OPEN_STATUS
+
+
+# --- Issue #849: unescalate worktree safety re-check ---
+
+
+def test_unescalate_refuses_worktree_unsafe_when_worktree_still_dirty(
+    tmp_path: Path,
+) -> None:
+    """Issue #849: ``unescalate`` must refuse to clear a ``worktree_unsafe``
+    escalation while the worktree still has uncommitted worker-authored
+    content. Clearing the label without inspecting the worktree reports
+    success for an operation that changed nothing causal — the next rework
+    dispatch reproduces the escalation deterministically.
+    """
+    import subprocess
+
+    from charlie_work.worktree import worktree_path_for_branch
+
+    branch = "agent/issue-849-unescalate-refuse"
+    # Init a real git repo at tmp_path.
+    subprocess.run(["git", "init", "-b", "main", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test User"],
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "README.md").write_text("initial\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", "README.md"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "initial"], check=True, capture_output=True
+    )
+
+    app = _app(tmp_path)
+    wt_path = worktree_path_for_branch(app.repo_root, branch, app._layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "worktree", "add", str(wt_path), "-b", branch],
+        check=True,
+        capture_output=True,
+    )
+    # Make the worktree dirty.
+    (wt_path / "worker_wip.txt").write_text("uncommitted work\n", encoding="utf-8")
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "worktree_unsafe_shim_dirt",
+            "reason_class": "mechanical",
+            "branch_name": branch,
+        }
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(None, 123, dry_run=False)
+
+    # unescalate refuses to clear — the worktree is still unsafe.
+    assert result.ok is True
+    assert result.data["changed"] is False
+    assert result.data["worktree_still_unsafe"] is True
+
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe_shim_dirt"
+    # The dirty worktree content survives.
+    assert (wt_path / "worker_wip.txt").read_text(encoding="utf-8") == "uncommitted work\n"
+
+
+# --- Issue #1391: closed-PR path drops issue in the same call ----------------
+
+
+def test_unescalate_closed_pr_drops_escalated_issue_in_same_call(tmp_path: Path) -> None:
+    """Issue #1391 defect 1: when the resolved PR is CLOSED on GitHub and the
+    issue is escalated with no other open PR, ``unescalate --issue N`` must
+    drop the issue to baseline in the SAME call (``unescalated_requeued``),
+    not leave it escalated for a second call to take the no-live-PR path."""
+    app = _app(tmp_path)
+    app.gh.prs[0]["state"] = "CLOSED"
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+        }
+        state["issues"]["123"] = {"number": 123, "status": "escalated"}
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(issue_number=123)
+
+    assert result.ok is True
+    assert result.data["changed"] is True
+    assert result.data["label_edge"] == "unescalated_requeued"
+    state = load_state(app.paths.state_file)
+    # PR normalized to closed.
+    assert state["prs"]["456"]["status"] == "closed"
+    # Issue dropped to baseline (no status key).
+    assert "status" not in state["issues"]["123"]
+    # The requeued label edge fired.
+    removed = {label for (num, label) in app.gh.labels_removed if num == 123}
+    assert removed == app.config.labels.workflow_labels
+
+
+def test_unescalate_merged_pr_drops_escalated_issue_in_same_call(tmp_path: Path) -> None:
+    """Issue #1391 defect 1: MERGED PR on GitHub with an escalated issue and
+    no other open PR also drops the issue in the same call."""
+    app = _app(tmp_path)
+    app.gh.prs[0]["state"] = "MERGED"
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+        }
+        state["issues"]["123"] = {"number": 123, "status": "escalated"}
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(issue_number=123)
+
+    assert result.ok is True
+    assert result.data["changed"] is True
+    assert result.data["label_edge"] == "unescalated_requeued"
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["status"] == "merged"
+    assert "status" not in state["issues"]["123"]
+
+
+def test_unescalate_closed_pr_leaves_issue_when_other_open_pr_exists(
+    tmp_path: Path,
+) -> None:
+    """Issue #1391 defect 1 negative control: when the resolved PR is terminal
+    on GitHub but ANOTHER open PR references the same issue, the issue must
+    be left to finalization/reconcile (not dropped) — the other PR is still
+    live."""
+    app = _app(tmp_path)
+    app.gh.prs[0]["state"] = "CLOSED"
+    # Add a second open PR for the same issue.
+    app.gh.prs.append(
+        {
+            "number": 789,
+            "title": "Fix #123: alt",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-123-alt",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    )
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+        }
+        state["prs"]["789"] = {
+            "number": 789,
+            "issue_number": 123,
+            "status": "reviewing",
+        }
+        state["issues"]["123"] = {"number": 123, "status": "escalated"}
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(issue_number=123)
+
+    assert result.ok is True
+    # PR 456 is normalized to closed, but the issue is left escalated
+    # because PR 789 is still open.
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["status"] == "closed"
+    assert state["issues"]["123"]["status"] == "escalated"
+    # No label edge (leave to finalization/reconcile).
+    assert result.data["label_edge"] is None
+
+
+def test_unescalate_closed_pr_leaves_non_escalated_issue(tmp_path: Path) -> None:
+    """Issue #1391 defect 1 negative control: a terminal PR on GitHub with a
+    non-escalated issue must leave the issue alone — the drop path only
+    applies to escalated issues."""
+    app = _app(tmp_path)
+    app.gh.prs[0]["state"] = "CLOSED"
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+        }
+        # Issue is reviewing, not escalated.
+        state["issues"]["123"] = {"number": 123, "status": "reviewing"}
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(pr_number=456)
+
+    assert result.ok is True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["status"] == "closed"
+    # Issue left as-is.
+    assert state["issues"]["123"]["status"] == "reviewing"
+    assert result.data["label_edge"] is None

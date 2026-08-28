@@ -56,7 +56,17 @@ Schema::
         elapsed_seconds REAL,
         error_count     INTEGER DEFAULT 0,
         merge_count     INTEGER DEFAULT 0,
-        review_count    INTEGER DEFAULT 0
+        review_count    INTEGER DEFAULT 0,
+        -- Issue #1083: the ``agent:human-needed`` sink metric. Autonomy
+        -- (merge_count/review_count) is never reported without its drop rate:
+        -- ``sink_arrivals`` counts issues that entered the sink this pass,
+        -- ``sink_clears`` counts issues the de-escalation sweep drained, and
+        -- ``sink_population`` is the point-in-time census of parked issues.
+        -- Appended at the end so existing index-based readers (verify_events)
+        -- keep working without re-deriving column positions.
+        sink_population INTEGER DEFAULT 0,
+        sink_arrivals   INTEGER DEFAULT 0,
+        sink_clears     INTEGER DEFAULT 0
     );
 """
 
@@ -118,7 +128,10 @@ CREATE TABLE IF NOT EXISTS loop_passes (
     elapsed_seconds REAL,
     error_count     INTEGER DEFAULT 0,
     merge_count     INTEGER DEFAULT 0,
-    review_count    INTEGER DEFAULT 0
+    review_count    INTEGER DEFAULT 0,
+    sink_population INTEGER DEFAULT 0,
+    sink_arrivals   INTEGER DEFAULT 0,
+    sink_clears     INTEGER DEFAULT 0
 );
 """
 
@@ -136,6 +149,10 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # -----------------------------------------------------------------
         # error-level kinds: conditions that ended a lane or lost work
         # -----------------------------------------------------------------
+        # Issue #1342: a provider account suspension is a terminal billing
+        # failure — the operator must learn about it in minutes, not after the
+        # redispatch cap drains. Error, like the other *_escalated kinds.
+        "api_worker_provider_suspended": "error",
         "cross_family_verdict_abandoned": "error",
         # The head-SHA guard could not adjudicate, so no verdict is recorded on
         # this pass. Since #1081 an unusable report is regenerated (bounded per
@@ -148,19 +165,42 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # head. Terminal for this lane -> error.
         "cross_family_report_regen_exhausted": "error",
         "dispatch_blocked_chain_dead": "error",
+        # Issue #1010: the pre-flight cross-repo gate escalated an issue whose
+        # referenced file paths were all absent from the target repo, ending
+        # its dispatch lane this pass. Terminal for the lane -> error, like the
+        # other *_escalated kinds.
+        "dispatch_cross_repo_escalated": "error",
         "dispatch_failed": "error",
         "fleet_pass_config_error": "error",
         "github_error": "error",
         "github_not_found_error": "error",
+        # Issue #1383: fleet-wide infra block (Actions budget/runner outage)
+        # has persisted across the configured pass threshold -- one
+        # operator-facing escalation per window, not per PR. Terminal for
+        # the affected PRs' lane this pass -> error, parallel to
+        # infra_rerun_escalated.
+        "infra_blocked_escalated": "error",
         "infra_rerun_escalated": "error",
         "intake_failed": "error",
         "janitor_rework_cycle_failed": "error",
         "janitor_rework_escalated": "error",
+        # Issue #1363: a fatal preflight check (disk_floor, venv_identity)
+        # failed at the top of a loop pass, so `_loop_body` never ran this
+        # pass -- no partial work was created. Error, not warning: this is
+        # the pass's terminal outcome, the replacement for what used to be a
+        # generic mid-pass crash (e.g. `fleet_pass_config_error`).
+        "loop_refused_preflight": "error",
         "merge_blocked": "error",
         "merge_deferred_stale_base_alarm": "error",
         "merge_failed": "error",
         "merge_failed_attempt_alarm": "error",
         "operator_claim_failed": "error",
+        # Issue #1243: the orphan-sweep no-open-PR redispatch path hit the
+        # same per-issue cap the rework lane enforces (worker_death_loop)
+        # with an unchanged branch head across attempts -- a death loop with
+        # no progress and no bound. Terminal for the issue -> error, parallel
+        # to session_failed_escalated.
+        "orphan_sweep_redispatch_escalated": "error",
         "orphan_processes_killed": "error",
         "orphaned_worker_routed_to_review": "error",
         "pre_review_rework_routed": "error",
@@ -178,13 +218,47 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "session_salvaged": "error",
         "session_stalled": "error",
         "spec_review_failed": "error",
+        # Issue #1453: a worker deliberately concluded the task is structurally
+        # impossible and declared a ``blocked`` outcome. Terminal for the issue
+        # -- escalated to the operator queue with zero redispatches -> error,
+        # parallel to session_failed_escalated / orphan_sweep_redispatch_escalated.
+        "worker_declared_blocked": "error",
+        # Issue #1274 (W17): stale_checks_retrigger_attempts reached
+        # stale_checks_max_retriggers and the check suite is still missing --
+        # no code-fix rework path exists for a run GitHub never created, so
+        # this escalates straight to a human via _escalate_issue +
+        # transition(..., "escalated"), the same pair infra_rerun_escalated /
+        # janitor_rework_escalated use. Terminal for the lane -> error, like
+        # the other *_escalated kinds in this section.
+        "stale_checks_retrigger_exhausted": "error",
         "supervisor_restart_watchdog_disabled": "error",
+        # The supervise-loop wrapper's WedgeWatchdog detected that the
+        # supervisor child was alive but had not updated its heartbeat in
+        # well beyond the configured pass-timeout bound, and terminated it
+        # so the scheduled task's next tick relaunches a fresh daemon
+        # (issue #728). Error, not warning: a wedged supervisor was doing
+        # no fleet work and every surface reported green -- the kill is the
+        # recovery, and the event is the only record that it happened.
+        "supervisor_wedged_killed": "error",
         "supervisor_zero_pass_alarm": "error",
         "unauthorized_merge_detected": "error",
+        # The supervisor's startup guard found an editable .pth in the running
+        # interpreter's venv pointing outside the interpreter-derived checkout
+        # (the 2026-08-05 scratch-clone repoint shape). The pass is refused
+        # before config load, so this is terminal for the pass -> error.
+        "venv_editable_anchor_violation": "error",
+        "venv_pth_repair_failed": "error",
         # -----------------------------------------------------------------
         # warning-level kinds: handled-but-notable conditions
         # -----------------------------------------------------------------
         "ci_fleet_worktree_dirty": "warning",
+        # Issue #1260: the diff-coverage static probe (W3) flagged one or more
+        # non-test files whose added branch logic outran the diff's added
+        # tests. Warning, not error: the probe is advisory-only and never
+        # blocks -- the flag is the signal, not a hold -- but this is the
+        # substrate for the 2-week false-positive measurement window before
+        # any promotion to a hard gate is considered.
+        "coverage_probe_flagged": "warning",
         "cross_family_verdict_unparseable": "warning",
         # The packet was forced stale so an unusable cross-family report gets
         # regenerated. The lane recovers, but it needed repair to get there and
@@ -201,6 +275,21 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "cross_family_regen_not_reached": "warning",
         "dead_dispatched_worker_reaped": "warning",
         "deescalation_cap_exhausted": "warning",
+        # Issue #1383: a required check failed due to a fleet-wide infra
+        # condition (Actions budget/runner outage) rather than the PR's
+        # code. Warning, not error: the PR is held without rework (not
+        # escalated), and the operator-facing escalation is the separate
+        # ``infra_blocked_escalated`` error kind, emitted once per window
+        # only when the condition persists. Consumed by heartbeat_check.py's
+        # ``check_infra_blocked_events`` (AC4) and by the cross-pass
+        # escalation tracker in ``_loop_impl``.
+        "check_infra_blocked": "warning",
+        # Issue #1000: a path:line citation in a dispatch-ready issue no longer
+        # matches the working tree (file renamed/deleted, line out of range, or
+        # blank). Warning, not error: dispatch is not gated on drift -- the flag
+        # comment is the signal, not a hold -- but a repeating burst on one issue
+        # means its citations keep rotting faster than anyone corrects them.
+        "dispatch_citation_drift_flagged": "warning",
         "dispatch_merged_pr_mention_flagged": "warning",
         "dispatch_merged_pr_references_closed": "warning",
         "dispatch_skip_blocked": "warning",
@@ -209,16 +298,75 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "draft_pr_blocked": "warning",
         "draft_pr_ready_failed": "warning",
         "draft_pr_ready_held": "warning",
+        # Issue #1372: a fleet registry entry whose repo_root no longer exists
+        # is stale, not a live failing lane. Warning, not error: the lane is
+        # skipped (not crashed), the daemon's pass completes, and the entry is
+        # reported separately so one corpse cannot degrade fleet-wide tooling.
+        # Emitted into the daemon's own events.db, never into the dead entry's
+        # recorded state_dir (which would resurrect a zombie directory).
+        "fleet_registry_stale_entry": "warning",
         "flake_rerun_failed": "warning",
         "graphql_rate_limit_deferred": "warning",
         "infra_rerun_failed": "warning",
         "janitor_rework_stalled": "warning",
         "main_ci_reclaim_failed": "warning",
+        # Issue #1314 item 3: the operator-queue depth gauge. Warning, not
+        # error: a deep queue is a growing backlog of mechanical escalations
+        # the de-escalation sweep has not yet cleared, not a fault that ended
+        # a lane or lost work. The event fires when depth exceeds the
+        # configured ``operator_queue_depth_threshold``; a chronically deep
+        # queue fires every pass the gauge is due, which is why the kind is
+        # also in ``EXPECTED_OPERATIONAL_KINDS`` -- ``heartbeat_check.py``
+        # buckets it into a summarized count instead of interleaving it with
+        # flat detailed listings of genuinely rare warnings.
+        "operator_queue_depth": "warning",
+        # cw#1263: the orchestrator's own salvage-PR-body builders had to
+        # rewrite the ``Closes #N`` line before handing the body to
+        # ``gh pr create``. Warning, not error: the rewrite happens before
+        # creation, so the body is still usable -- but a recurring burst
+        # indicates the salvage builders are drifting from the canonical
+        # form again.
+        "pr_closing_ref_rewritten": "warning",
+        # cw#1263: after ``gh pr create`` succeeded, GitHub's own
+        # ``closingIssuesReferences`` resolution did not include the
+        # intended issue -- the PR was created but will not auto-close it on
+        # merge. Warning, not error: the PR still exists and is still
+        # actionable, but the issue's lifecycle labels will not flip
+        # automatically without a human or a later reconcile pass noticing.
+        "pr_closing_ref_unlinked": "warning",
+        # cw#1273: the outer `gh pr create` retry ladder (pr_create_retry.py)
+        # exhausted every attempt for a branch a worker had already pushed --
+        # the branch is stranded (pushed, no PR, no further retry). Warning,
+        # not error: the branch still exists and can be recovered by hand or
+        # by a later pass, but this is the specific, actionable signal the
+        # generic `orphaned_worker_drift` finding used to bury (#1273's "4 of
+        # 36 escalations were pushed-branch-no-PR"). Emitted from the
+        # orphan-reap sweep's existing `_drift_fingerprint` dedup path
+        # (workflow.py), never from pr_create_retry.py itself -- that module
+        # has no state_file/fingerprint state to dedup against.
+        "pr_create_failed_branch_stranded": "warning",
+        # Issue #1363: a non-fatal preflight check (clock_sanity) failed at
+        # the top of a loop pass. Warning, not error: the pass still ran
+        # (_loop_body was not skipped) -- this is a tripwire for an operator
+        # to notice, not a terminal outcome for the pass.
+        "preflight_warning": "warning",
+        # Issue #1363: config_freshness detected a config file mtime change
+        # since the supervisor loaded it (or since the last pass that
+        # observed it) -- the silent-inert-edit trap made loud. Warning, not
+        # error: this does not hot-reload or block the pass.
+        "preflight_config_stale": "warning",
         "quota_probe_failed": "warning",
         "required_changes_vacuous": "warning",
         "review_dispatch_lifecycle_reaped": "warning",
         "review_packet_template_stale": "warning",
         "review_quota_exhausted": "warning",
+        # Issue #1251: a PR whose diff.patch is empty (zero-file diff vs base)
+        # was skipped before claiming a paid reviewer session. Warning, not
+        # info: an empty diff is a symptom of an upstream bug (e.g. #1221's
+        # vestigial duplicate PRs), not a routine dispatch outcome. A
+        # repeating burst on one PR is the signal that a salvage/duplicate
+        # path keeps producing zero-delta PRs.
+        "review_dispatch_skipped_empty_diff": "warning",
         # The stale-claim recovery sweep (issue #487's "never claimed/dispatched"
         # path) skipped a PR without acting on it -- prompt_path was missing from
         # state or the file it names no longer exists on disk. Warning, not info:
@@ -226,7 +374,24 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # skip was silent, so a repeating burst is the only signal that recovery
         # kept giving up rather than the PR not needing recovery.
         "review_stale_claim_recovery_skipped": "warning",
+        # Issue #736: the stranded-verdict reconciliation sweep found an
+        # on-disk decision but ``record_review`` refused to ingest it (e.g.
+        # the #467/#1072 stale-head guard fired). Warning, not error: the
+        # sweep itself is not broken, it correctly declined a verdict it
+        # could not safely apply, and the PR is left for a fresh review
+        # dispatch. Sibling to the success case ``review_verdict_reconciled``,
+        # emitted from the same call site with an explicit ``level="warning"``.
+        "review_verdict_reconcile_failed": "warning",
         "rework_issue_fetch_skipped": "warning",
+        # Issue #1239: a dead rework worker's stranded commits were
+        # salvage-pushed (the worker completed the rework but died before
+        # ``git push``), so the death is NOT counted toward the death-loop
+        # cap and the issue is routed to review instead of escalated.
+        # Warning, not error: no work was lost -- the push recovered the
+        # completed commit and the issue continues to review. Sibling to
+        # ``dead_dispatched_worker_reaped`` (a reaped death) but with the
+        # recovery made explicit.
+        "rework_stranded_commits_salvaged": "warning",
         "runner_allocation_refused": "warning",
         "runner_allocation_skipped": "warning",
         "runner_capacity_starved": "warning",
@@ -247,12 +412,73 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "session_rate_limit_deferred": "warning",
         "supervise_relaunch_cap_reached": "warning",
         "unauthorized_merge_check_skipped": "warning",
+        # Issue #1261: the unwired-symbol static probe (W20 item 1) flagged a
+        # new public function/method/class referenced only from tests/ and
+        # nowhere in src/. Warning, not error: same posture as
+        # coverage_probe_flagged above -- advisory-only, never blocking, and
+        # the substrate for the same 2-week false-positive measurement window.
+        "unwired_symbol": "warning",
+        "venv_pth_mismatch": "warning",
+        "venv_pth_repaired": "warning",
         "worktree_foreign_writer": "warning",
+        # Issue #1444: the module-map section could not be derived from the
+        # live tree at packet build time (unparseable file, missing package
+        # dir, I/O error). Warning, not error: the dispatch proceeds with an
+        # omitted section -- the worker loses placement steering for this one
+        # packet, but no work is lost and the next packet rebuilds the map
+        # against the then-current tree. The consumer is heartbeat_check.py's
+        # check_warning_events, which reads every level='warning' row from
+        # events.db (derived from the level column, never a hardcoded kind
+        # list), so this kind is visible to the operator the moment it fires.
+        "worker_module_map_failed": "warning",
+        # Issue #1460: the attachment-budget dispatch clause could not be
+        # built (`.attachment-budgets.json` present but fails structural
+        # validation via `baseline.load`). Warning, not error: fail-soft
+        # mirrors `worker_module_map_failed` -- the dispatch proceeds with an
+        # omitted clause, never a dispatch failure.
+        "worker_attachment_budget_failed": "warning",
+        # Issue #1393: a pre-launch environment block (e.g.
+        # worktree_foreign_writer) prevented a dispatch from starting. Warning,
+        # not error: the issue is not terminal — the cap may not yet be
+        # exhausted, and the operator can resolve the conflict (e.g. remove a
+        # stale checkout) to unblock the next pass. The escalation when the
+        # cap IS exhausted goes through session_failed_escalated (error).
+        "dispatch_blocked_environment": "warning",
+        "rework_dispatch_blocked_environment": "warning",
+        # Issue #1423: a foreign writer that was alive but idle past the stall
+        # threshold was reaped (killed + marker cleaned) instead of blocking
+        # dispatch or escalating to a human. Warning, not error: the reap is a
+        # recovery, not a fault — the zombie is gone and dispatch proceeds. The
+        # sibling ``dispatch_blocked_environment_reaped`` /
+        # ``rework_dispatch_blocked_environment_reaped`` record the same reap at
+        # the blocked-environment cap exhaustion point (counter reset + retry
+        # instead of escalation).
+        "foreign_writer_reaped": "warning",
+        "dispatch_blocked_environment_reaped": "warning",
+        "rework_dispatch_blocked_environment_reaped": "warning",
+        # Issue #849: rescue capture preserves work before a reset. Warning
+        # level because it means a worktree had uncommitted work that was
+        # about to be lost — the capture succeeded, but the condition that
+        # triggered it is worth attention.
+        "worktree_rescue_captured": "warning",
         # -----------------------------------------------------------------
         # info-level kinds: routine bookkeeping, success, recovery, and
         # other ordinary lifecycle events
         # -----------------------------------------------------------------
         "check_failure_rework_requested": "info",
+        # Issue #1274 (W17): a mechanical retrigger (close/reopen, or an
+        # empty-commit push fallback) was actually issued for a PR whose
+        # head was marked ci_run_never_created. Info, not warning: this is
+        # the intended follow-up mechanism working as designed, mirroring
+        # flake_rerun_triggered / infra_rerun_triggered below.
+        "ci_retriggered_stale_checks": "info",
+        # Issue #1451: the ci_run_never_created remediation declined to
+        # close/reopen a CONFLICTING PR (GitHub cannot build refs/pull/N/merge
+        # while conflicted, so no pull_request workflow run can be created for
+        # ANY event) and routed to the existing merge-conflict rework path
+        # instead. Info, not warning: this is the chooser correctly
+        # discriminating, mirroring ci_retriggered_stale_checks' level.
+        "ci_retrigger_skipped_conflicting": "info",
         "ci_run_never_created": "info",
         "closed_unmerged_pr_state_converged": "info",
         "containment_check": "info",
@@ -261,7 +487,21 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "deescalation_pass_completed": "info",
         "deescalation_reason_class_backfilled": "info",
         "dispatch": "info",
+        # Issue #1129: open-PR backpressure clamped fresh-issue dispatch. Info,
+        # not warning: this is the intended self-pacing behavior (armed issues
+        # wait in the backlog instead of as open stale PRs), not a fault. The
+        # event exists so "0 dispatched with N dispatchable" is diagnosable from
+        # events.db rather than reading as idleness.
+        "dispatch_backpressure": "info",
         "dispatch_closed_unmerged_ready_stripped": "info",
+        # Issue #1336: an operator deliberately re-armed a mention-only
+        # flagged issue (removed agent:human-needed), so the mention-only
+        # dispatch exclusion lifted and the issue re-entered candidates.
+        # Info, not warning: this is the sanctioned operator re-queue path
+        # doing its job, not a fault -- the warning-level
+        # dispatch_merged_pr_mention_flagged already records the original
+        # judgment escalation; this records its deliberate resolution.
+        "dispatch_merged_pr_mention_rearmed": "info",
         "dispatch_rework": "info",
         "draft_pr_ready_triggered": "info",
         "escalated_label_repaired": "info",
@@ -269,6 +509,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "flake_rerun_triggered": "info",
         "fleet_canary": "info",
         "fleet_job_observations": "info",
+        "fleet_lane_completed": "info",
         "head_moved": "info",
         "infra_rerun_triggered": "info",
         "intake": "info",
@@ -280,13 +521,50 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "main_ci_reclaim_cancelled": "info",
         "merge_conflict_rework_requested": "info",
         "merge_deferred_stale_base": "info",
+        # Issue #934: operator-issued authorization to merge a worker PR whose
+        # recorded review decision is stale, absent, or pending. An info-level
+        # audit event: it records an explicit operator action, not a fault --
+        # the tripwire and merge-check read it as authorization, never as an
+        # error. Sibling to ``unauthorized_merge_acknowledged`` (the post-merge
+        # retrospective ack), but emitted at authorization time, before the
+        # merge.
+        "merge_authorized": "info",
         "merge_ready": "info",
+        # Issue #747: the merge lane emitted events for every outcome except
+        # success, so merge throughput was unobservable from events.db. This
+        # is the terminal success event, fired exactly once on the fleet's own
+        # direct-merge path (``merge_ready``'s ``merge_pr`` branch). The
+        # ``actor`` payload field distinguishes fleet-merged PRs from
+        # externally-merged PRs, which are recorded by the separate
+        # ``finalize_externally_merged`` / ``merged_outside_orchestrator``
+        # events and never carry this kind.
+        "merge_succeeded": "info",
         "no_op_rework_repair_requested": "info",
         "operator_claim": "info",
         "operator_claim_released": "info",
+        # Issue #1128: a dead worker with an OPEN but unreviewed PR is
+        # advanced from ``agent:in-progress`` to ``agent:pr-open`` so review
+        # dispatch can claim the salvage PR. Info-level recovery bookkeeping,
+        # sibling to ``orphaned_worker_opened_pr``.
+        "orphaned_worker_advanced_to_pr_open": "info",
         "orphaned_worker_drift": "info",
         "orphaned_worker_opened_pr": "info",
         "orphaned_worker_recovered": "info",
+        # Issue #1248: a dead worker's committed-but-unpushed work was
+        # published by the orphan sweep (fast-forward only). The sibling
+        # ``salvage_push_failed`` is the attempted-but-failed case -- warning,
+        # because stranded work is sitting in a worktree the sweep could not
+        # publish and will otherwise be redispatched over.
+        "salvage_pushed_stranded_commits": "info",
+        "salvage_push_failed": "warning",
+        # Issue #1221: the pre-open re-check found the work already landed
+        # (issue closed, a PR already merged, or the branch's diff against
+        # main is empty) and skipped opening a vestigial duplicate PR. Info,
+        # not warning: this is the intended outcome of the fix -- the caller
+        # treats the skip as "handled" (no redispatch), sibling to
+        # ``salvage_pushed_stranded_commits`` rather than to
+        # ``salvage_push_failed`` (which is a genuine failure to publish).
+        "salvage_skipped_already_landed": "info",
         "quota_probe_succeeded": "info",
         "readiness_no_ci_rework_requested": "info",
         "reconcile": "info",
@@ -295,9 +573,37 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "reconcile_pass_skipped": "info",
         "record_review": "info",
         "rescue_dispatched": "info",
+        # One outcome record per self-deploy sibling-pull attempt (pulled /
+        # unchanged / skipped / failed, discriminated by the payload's ok and
+        # skipped_reason/error fields). Info because the common case is routine
+        # bookkeeping; failures additionally log at WARNING and are deliberately
+        # outside the self_deploy_alarm streak (a sibling wedge bounds staleness
+        # but does not block orchestrator deploys).
+        "self_deploy_ci_fleet_pull": "info",
+        "ci_fleet_provenance": "info",
         "review_dispatch": "info",
         "review_dispatch_claim": "info",
+        # Issue #1258: the janitor's CI-red short-circuit in review() never
+        # emitted a dedicated event -- only whatever record_review() itself
+        # logs (decision-agnostic, no CI-specific marker). Covers BOTH the
+        # pre-existing sole-failure short-circuit (a required check is the
+        # only janitor failure) and the co-occurring case added alongside
+        # this kind (a required check fails together with another
+        # non-merge-conflict janitor failure). Info, not error/warning: this
+        # is the deterministic gate doing its job -- routing to rework
+        # without ever starting a paid reviewer session -- not a condition
+        # that ended a lane or lost work.
+        "review_dispatch_skipped_ci_red": "info",
         "review_packet": "info",
+        # Issue #736: the stranded-verdict reconciliation sweep found an
+        # on-disk decision that state never ingested (state write lost, but
+        # the packet head still matches live) and successfully replayed it
+        # through ``record_review``. Info, not warning: this is the sweep
+        # doing its job -- recovering a verdict that was always valid, just
+        # never applied. The failure case is the sibling
+        # ``review_verdict_reconcile_failed``, emitted from the same call
+        # site at warning level.
+        "review_verdict_reconciled": "info",
         "rework_already_pushed": "info",
         "rework_brief_regenerated": "info",
         "runner_allocation": "info",
@@ -313,6 +619,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "supervisor_started": "info",
         "unauthorized_merge_acknowledged": "info",
         "unauthorized_merge_baseline_armed": "info",
+        # The #502 tripwire recognized a mergequeue sync-merge (#1194) and
+        # suppressed the finding. Routine under an active merge queue -- fires
+        # on every legitimate sync-merge -- but kept in the audit trail so
+        # suppressions are queryable next to the findings they replaced.
+        "unauthorized_merge_queue_sync_covered": "info",
         "unescalate": "info",
         "verdict_carried_forward_clean_rebase": "info",
         "verdict_carried_forward_line_content": "info",
@@ -325,6 +636,20 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
 # that refer to ``_ERROR_KINDS`` / ``_WARNING_KINDS`` continue to work.
 _ERROR_KINDS = frozenset({k for k, v in _LEVEL_BY_KIND.items() if v == "error"})
 _WARNING_KINDS = frozenset({k for k, v in _LEVEL_BY_KIND.items() if v == "warning"})
+
+# Issue #1271: re-exported, not declared here. ``heartbeat_check.py`` is
+# stdlib-only by design (see ``scripts/README.md``) and this module imports
+# ``ci_fleet.observability``/``ci_fleet.provenance`` below at module load, so
+# declaring the frozenset in this module and having the script import it
+# from here would make a broken ``ci_fleet`` install crash the script with
+# an unhandled ImportError on exactly the failure class it exists to report.
+# ``charlie_work.event_kinds`` is the genuine leaf (stdlib-only, no further
+# charlie_work/ci_fleet imports) that both this module and
+# ``heartbeat_check.py`` import from -- see its module docstring. Every
+# member must be registered in ``_LEVEL_BY_KIND`` at ``"warning"`` --
+# bucketing only makes sense for warnings -- which
+# ``test_expected_operational_kinds_are_all_registered_warnings`` enforces.
+from charlie_work.event_kinds import EXPECTED_OPERATIONAL_KINDS  # noqa: E402,F401
 
 
 def _now_iso() -> str:
@@ -593,6 +918,27 @@ def _dedupe_events(db_conn: sqlite3.Connection) -> int:
     return deleted
 
 
+def _add_sink_metric_columns(db_conn: sqlite3.Connection) -> None:
+    """Add the issue #1083 sink-metric columns to ``loop_passes``.
+
+    ``ALTER TABLE … ADD COLUMN`` cannot name a column that already exists, so
+    each addition is guarded by a ``PRAGMA table_info`` check. That makes this
+    idempotent: a database file opened by a newer build (which created the
+    columns via ``CREATE TABLE``) and then handed back to an older build that
+    re-runs this migration is a no-op rather than a crash. The columns are
+    appended at the end of the table so existing index-based readers
+    (``scripts/verify_events.py``) keep working without re-deriving positions.
+    """
+    existing = {row[1] for row in db_conn.execute("PRAGMA table_info(loop_passes)")}
+    if "sink_population" not in existing:
+        db_conn.execute("ALTER TABLE loop_passes ADD COLUMN sink_population INTEGER DEFAULT 0")
+    if "sink_arrivals" not in existing:
+        db_conn.execute("ALTER TABLE loop_passes ADD COLUMN sink_arrivals INTEGER DEFAULT 0")
+    if "sink_clears" not in existing:
+        db_conn.execute("ALTER TABLE loop_passes ADD COLUMN sink_clears INTEGER DEFAULT 0")
+    db_conn.commit()
+
+
 def _run_db_migrations(db_conn: sqlite3.Connection) -> None:
     """Run one-time database migrations guarded by ``PRAGMA user_version``.
 
@@ -607,6 +953,12 @@ def _run_db_migrations(db_conn: sqlite3.Connection) -> None:
         # importer (issue #557). Runs once per database file.
         _dedupe_events(db_conn)
         db_conn.execute("PRAGMA user_version = 1")
+    if version < 2:
+        # Migration v2 (issue #1083): add the sink-metric columns to
+        # ``loop_passes`` for pre-existing databases. New databases get them
+        # from ``CREATE TABLE``; this step brings old files forward.
+        _add_sink_metric_columns(db_conn)
+        db_conn.execute("PRAGMA user_version = 2")
 
 
 def _get_db(state_path: Path) -> sqlite3.Connection | None:
@@ -740,11 +1092,22 @@ def record_loop_pass(
     error_count: int = 0,
     merge_count: int = 0,
     review_count: int = 0,
+    sink_population: int = 0,
+    sink_arrivals: int = 0,
+    sink_clears: int = 0,
 ) -> None:
     """Record or update a loop pass summary in the ``loop_passes`` table.
 
     On first call (with ``completed_at=None``) an INSERT is issued.
     On second call (with ``completed_at`` set) an UPDATE is issued.
+
+    The ``sink_*`` keyword arguments (issue #1083) record the
+    ``agent:human-needed`` sink metric alongside autonomy throughput so one
+    is never reported without the other: ``sink_population`` is the
+    point-in-time census of parked issues, ``sink_arrivals`` the count that
+    entered the sink this pass, and ``sink_clears`` the count the
+    de-escalation sweep drained this pass. They default to 0 and are
+    ignored on the INSERT (start-of-pass) call, which only reserves the row.
     """
     conn = _get_db(state_path)
     if conn is None:
@@ -759,15 +1122,17 @@ def record_loop_pass(
                 conn.execute(
                     """INSERT OR IGNORE INTO loop_passes
                        (correlation_id, started_at, completed_at, ok,
-                        elapsed_seconds, error_count, merge_count, review_count)
-                       VALUES (?, ?, NULL, NULL, NULL, 0, 0, 0)""",
+                        elapsed_seconds, error_count, merge_count, review_count,
+                        sink_population, sink_arrivals, sink_clears)
+                       VALUES (?, ?, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0)""",
                     (correlation_id, started_at),
                 )
             else:
                 conn.execute(
                     """UPDATE loop_passes
                        SET completed_at = ?, ok = ?, elapsed_seconds = ?,
-                           error_count = ?, merge_count = ?, review_count = ?
+                           error_count = ?, merge_count = ?, review_count = ?,
+                           sink_population = ?, sink_arrivals = ?, sink_clears = ?
                        WHERE correlation_id = ?""",
                     (
                         completed_at,
@@ -776,6 +1141,9 @@ def record_loop_pass(
                         error_count,
                         merge_count,
                         review_count,
+                        sink_population,
+                        sink_arrivals,
+                        sink_clears,
                         correlation_id,
                     ),
                 )

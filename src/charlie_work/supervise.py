@@ -26,7 +26,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from . import fleet_registry, git_pull_blockers, layout, worktree
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
@@ -351,38 +351,81 @@ def _find_venv_path(repo_root: Path) -> Path | None:
     return None
 
 
-def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
-    """Atomically rewrite the project editable ``.pth`` to point at ``repo_root/src``.
+def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str, list[str]]:
+    """Atomically rewrite poisoned editable ``.pth`` lines to their configured roots.
 
-    Scans ``site-packages`` for ``.pth`` files whose names contain a top-level
-    package name from ``repo_root/src``.  Every path line in those files that
-    resolves anywhere other than ``repo_root/src`` is rewritten to the correct
-    absolute path, then the file is replaced atomically via temp-file +
-    ``.replace()``.
+    Scans every ``.pth`` in site-packages (no filename filter -- see
+    :func:`worktree.verify_shared_venv`).  For each path-bearing line that
+    resolves outside all configured checkouts, the correct target is derived
+    from :func:`worktree._configured_editable_roots` by matching the package
+    name embedded in the ``.pth`` filename against the packages each root
+    provides.
+
+    The per-package root is the fix for issue #969 gap 1: the former repair
+    rewrote *every* poisoned line to a single ``main_src`` constant
+    (``repo_root/src``), which is correct for this repo's own packages but is a
+    hard ``ImportError`` for a foreign editable like ``ci_fleet`` -- there is
+    no ``ci_fleet`` package under ``charlie-work/src``.  Widening the
+    verification filter without fixing this first would have auto-written that
+    error as the first statement of every self-deploy attempt.
+
+    When the correct root for a poisoned ``.pth`` cannot be determined (the
+    filename matches no known package, or matches several ambiguously), the
+    file is left untouched and reported as unrepairable.  Refusing to write a
+    wrong root is strictly safer than guessing: a missed repair surfaces as a
+    verification mismatch on re-check, while a wrong repair surfaces as a
+    silent ``ImportError`` that verifies clean because the line now equals a
+    configured root.
+
+    Returns ``(ok, message, repaired_files)``.  ``repaired_files`` lists the
+    ``.pth`` filenames that were successfully rewritten, even when ``ok`` is
+    ``False`` because other files were unrepairable.  This closes the
+    partial-repair-looks-like-no-op gap surfaced in PR #1176 review: a mixed
+    poisoned/unmatchable scenario previously returned ``False`` with a message
+    naming only the unrepairable entries, leaving the files that *were*
+    rewritten indistinguishable from a no-op failure in ``events.db``.
     """
     site_packages = worktree._site_packages_dir(venv_path)
     if not site_packages:
-        return False, "could not locate site-packages in shared venv"
-    main_src = (repo_root / "src").resolve()
-    package_names = worktree._top_level_package_names(repo_root)
-    project_pth_files = [
-        pth
-        for pth in site_packages.glob("*.pth")
-        if any(name in pth.name for name in package_names)
-    ]
-    if not project_pth_files:
-        return False, "no editable .pth found for project packages"
+        return False, "could not locate site-packages in shared venv", []
+    roots = worktree._configured_editable_roots(repo_root)
+    if not roots:
+        return False, "could not derive configured editable roots from repo", []
+    # package_name -> src_root, for matching a .pth filename to its target.
+    package_to_root: dict[str, Path] = {}
+    for src_root, package_names in roots:
+        for name in package_names:
+            package_to_root[name] = src_root
 
-    repaired_any = False
-    for pth in project_pth_files:
+    repaired_files: list[str] = []
+    unrepairable: list[str] = []
+    for pth in site_packages.glob("*.pth"):
         original = pth.read_text(encoding="utf-8")
         lines = original.splitlines()
+        # First pass: are any lines poisoned, and can we target this .pth?
+        poisoned = False
+        for raw_line in lines:
+            target = worktree._resolve_pth_line(site_packages, raw_line)
+            if target == Path():
+                continue
+            if any(contains(root, target) for root, _ in roots):
+                continue
+            poisoned = True
+            break
+        if not poisoned:
+            continue
+
+        correct_root = _match_pth_to_root(pth, package_to_root)
+        if correct_root is None:
+            unrepairable.append(pth.name)
+            continue
+
         new_lines: list[str] = []
         changed = False
         for raw_line in lines:
             target = worktree._resolve_pth_line(site_packages, raw_line)
-            if target != Path() and target != main_src:
-                new_lines.append(str(main_src))
+            if target != Path() and not any(contains(root, target) for root, _ in roots):
+                new_lines.append(str(correct_root))
                 changed = True
             else:
                 new_lines.append(raw_line)
@@ -397,22 +440,71 @@ def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
             tmp.write_text(new_content, encoding="utf-8")
             tmp.replace(pth)
         except OSError as exc:
-            return False, f"failed to rewrite {pth.name}: {exc}"
-        repaired_any = True
+            return False, f"failed to rewrite {pth.name}: {exc}", repaired_files
+        repaired_files.append(pth.name)
 
-    if not repaired_any:
-        return False, "editable .pth did not require rewriting"
-    return True, "rewrote editable .pth to point at main checkout src"
+    if unrepairable:
+        return (
+            False,
+            (
+                "could not determine correct root for editable .pth: "
+                + ", ".join(sorted(unrepairable))
+            ),
+            repaired_files,
+        )
+    if not repaired_files:
+        return False, "editable .pth did not require rewriting", []
+    return True, "rewrote editable .pth targets to configured checkouts", repaired_files
+
+
+def _match_pth_to_root(pth: Path, package_to_root: dict[str, Path]) -> Path | None:
+    """Return the configured ``src`` root a poisoned ``.pth`` should point at.
+
+    Matches the package name embedded in the ``.pth`` filename (e.g.
+    ``_editable_impl_charlie_work.pth`` -> ``charlie_work``) against the keys of
+    ``package_to_root``.  Only real package names (from
+    :func:`worktree._package_directories`, which excludes loose ``.py`` stems)
+    are in the map, so the substring hazard from the old
+    :func:`worktree._top_level_package_names` filter does not apply.
+
+    Returns ``None`` when zero or more-than-one package names match after
+    longest-name disambiguation, so the caller can refuse to repair rather
+    than write a wrong root (issue #969 gap 1).
+    """
+    matches = sorted(
+        ((name, root) for name, root in package_to_root.items() if name in pth.name),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0][1]
+    # Ambiguous: only accept the longest (most specific) name when it is
+    # strictly longer than the runner-up.  A tie means two packages are
+    # equally plausible and the correct target is genuinely unknown.
+    if len(matches[0][0]) > len(matches[1][0]):
+        return matches[0][1]
+    return None
 
 
 def _check_venv(repo_root: Path) -> SelfDeployResult:
     """Verify the orchestrator venv's editable ``.pth`` and repair on mismatch.
 
     Reads the venv's editable ``.pth`` via ``worktree.verify_shared_venv`` and
-    checks that it resolves to ``repo_root/src``.  On mismatch, logs loudly and
-    atomically rewrites the ``.pth`` text to the correct target.  All errors
-    are returned as values.
+    checks that every path line resolves into a configured checkout.  On
+    mismatch, logs loudly, emits a ``venv_pth_mismatch`` event, and atomically
+    rewrites the ``.pth`` text to the correct per-package target.  A successful
+    repair emits ``venv_pth_repaired``; a failed repair or re-verification
+    emits ``venv_pth_repair_failed``.  All errors are returned as values.
+
+    The events close the observability gap from issue #969 gap 3: across
+    20,727 rows in ``events.db`` zero matched any venv- or pth-related kind,
+    so a silent auto-repair was indistinguishable from never having had a
+    problem -- and a false green (the old filter reporting "repaired" over a
+    still-poisoned foreign editable) left no trace at all.
     """
+    state_path = _self_deploy_state_path(repo_root)
     venv_path = _find_venv_path(repo_root)
     if venv_path is None:
         return SelfDeployResult(
@@ -434,9 +526,26 @@ def _check_venv(repo_root: Path) -> SelfDeployResult:
         )
 
     logger.error("ORCHESTRATOR VENV PTH MISMATCH: %s", venv_message)
+    log_event(
+        state_path,
+        "venv_pth_mismatch",
+        {"venv_path": str(venv_path), "detail": venv_message},
+    )
 
-    repair_ok, repair_message = _repair_venv_pth(repo_root, venv_path)
+    repair_ok, repair_message, repaired_files = _repair_venv_pth(repo_root, venv_path)
     if not repair_ok:
+        failed_payload: dict[str, Any] = {
+            "venv_path": str(venv_path),
+            "detail": repair_message,
+        }
+        # Record which .pth files WERE successfully rewritten even though the
+        # overall call reports failure (unrepairable entries, or a mid-loop
+        # OSError on a later file).  Without this a partial repair is
+        # indistinguishable from a no-op failure in events.db -- the gap
+        # surfaced in PR #1176 review.
+        if repaired_files:
+            failed_payload["repaired_files"] = repaired_files
+        log_event(state_path, "venv_pth_repair_failed", failed_payload)
         return SelfDeployResult(
             ok=False,
             pulled=False,
@@ -447,6 +556,13 @@ def _check_venv(repo_root: Path) -> SelfDeployResult:
 
     venv_ok, venv_message = worktree.verify_shared_venv(repo_root, venv_path)
     if not venv_ok:
+        reverify_payload: dict[str, Any] = {
+            "venv_path": str(venv_path),
+            "detail": f"re-verification failed after repair: {venv_message}",
+        }
+        if repaired_files:
+            reverify_payload["repaired_files"] = repaired_files
+        log_event(state_path, "venv_pth_repair_failed", reverify_payload)
         return SelfDeployResult(
             ok=False,
             pulled=False,
@@ -455,6 +571,13 @@ def _check_venv(repo_root: Path) -> SelfDeployResult:
             error=f"venv pth repair did not fix the mismatch: {venv_message}",
         )
 
+    repaired_payload: dict[str, Any] = {
+        "venv_path": str(venv_path),
+        "detail": repair_message,
+    }
+    if repaired_files:
+        repaired_payload["repaired_files"] = repaired_files
+    log_event(state_path, "venv_pth_repaired", repaired_payload)
     return SelfDeployResult(
         ok=True,
         pulled=False,
@@ -814,6 +937,7 @@ def self_deploy(
     sync_timeout: int = 300,
     dry_run: bool = False,
     failure_alarm_threshold: int = DEFAULT_SELF_DEPLOY_FAILURE_ALARM,
+    pull_ci_fleet: bool = False,
 ) -> SelfDeployResult:
     """FF-pull ``origin/main`` and run ``uv sync`` when dependency files changed.
 
@@ -866,6 +990,7 @@ def self_deploy(
         run_command=run_command,
         pull_timeout=pull_timeout,
         sync_timeout=sync_timeout,
+        pull_ci_fleet=pull_ci_fleet,
     )
     _log_self_deploy_outcome(repo_root, result)
     _record_self_deploy_failure_streak(repo_root, result, threshold=failure_alarm_threshold)
@@ -1062,6 +1187,90 @@ def _repair_lossless_pull_blockers(
     return PullBlockerRepair(cleared=tuple(sorted(cleared)), retained=tuple(sorted(retained)))
 
 
+def _pull_ci_fleet_sibling(
+    repo_root: Path,
+    *,
+    run_command: Callable[..., RunResult],
+    timeout: int,
+) -> None:
+    """FF-pull ``origin/main`` in the declared ``ci-fleet`` sibling checkout.
+
+    Deploy-clone half of issue #552: ``self_deploy`` only ever pulls the
+    orchestrator checkout, so a dedicated daemon layout's editable ``ci_fleet``
+    sibling would otherwise freeze at clone time, silently. Gated by
+    ``supervisor.self_deploy_pull_ci_fleet`` (default false -- in a dev layout
+    the sibling is a working repo whose HEAD must never be moved out from
+    under a session).
+
+    Fail-safe preconditions, checked here rather than trusted from config: the
+    sibling must be on ``main`` with a clean tree, else the pull is skipped
+    and the skip reason recorded. Every outcome -- pulled, unchanged, skipped,
+    failed -- lands in events.db as ``self_deploy_ci_fleet_pull`` so sibling
+    staleness is observable instead of silent; failures additionally log at
+    WARNING. Deliberately excluded from the ``self_deploy_alarm`` failure
+    streak: a sibling wedge bounds staleness but does not block orchestrator
+    deploys, and conflating the two would page at the wrong severity.
+
+    Never raises; the caller's deploy result is already decided.
+    """
+    payload: dict[str, object] = {"ok": False}
+    try:
+        from .ci_fleet_anchor import declared_ci_fleet_root
+
+        declared_src = declared_ci_fleet_root()
+        if declared_src is None:
+            payload["skipped_reason"] = "no declared ci-fleet path source to pull"
+        else:
+            sibling = declared_src.parent
+            branch_res = run_command(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=sibling, timeout_seconds=timeout
+            )
+            status_res = run_command(
+                ["git", "status", "--porcelain"], cwd=sibling, timeout_seconds=timeout
+            )
+            payload["sibling"] = str(sibling)
+            if not branch_res.ok or not status_res.ok:
+                payload["skipped_reason"] = (
+                    f"could not inspect sibling: {branch_res.error or status_res.error}"
+                )
+            elif branch_res.stdout.strip() != "main":
+                payload["skipped_reason"] = (
+                    f"sibling on branch {branch_res.stdout.strip()!r}, not main"
+                )
+            elif status_res.stdout.strip():
+                payload["skipped_reason"] = "sibling tree is dirty"
+            else:
+                before = run_command(
+                    ["git", "rev-parse", "HEAD"], cwd=sibling, timeout_seconds=timeout
+                )
+                pull_res = run_command(
+                    ["git", "pull", "--ff-only", "origin", "main"],
+                    cwd=sibling,
+                    timeout_seconds=timeout,
+                )
+                after = run_command(
+                    ["git", "rev-parse", "HEAD"], cwd=sibling, timeout_seconds=timeout
+                )
+                payload["from_sha"] = before.stdout.strip() if before.ok else None
+                payload["to_sha"] = after.stdout.strip() if after.ok else None
+                if pull_res.ok:
+                    payload["ok"] = True
+                    payload["changed"] = (
+                        before.ok and after.ok and before.stdout.strip() != after.stdout.strip()
+                    )
+                else:
+                    payload["error"] = _command_failure_message(
+                        ["git", "pull", "--ff-only", "origin", "main"],
+                        pull_res,
+                        "ci-fleet sibling pull failed",
+                    )
+    except Exception as exc:  # noqa: BLE001 -- must never fail the deploy that succeeded
+        payload["error"] = f"{type(exc).__name__}: {exc}"
+    if not payload["ok"]:
+        logger.warning("ci-fleet sibling pull did not run: %s", payload)
+    log_event(_self_deploy_state_path(repo_root), "self_deploy_ci_fleet_pull", payload)
+
+
 def _self_deploy_attempt(
     repo_root: Path,
     marker_path: Path,
@@ -1070,6 +1279,7 @@ def _self_deploy_attempt(
     run_command: Callable[..., RunResult],
     pull_timeout: int,
     sync_timeout: int,
+    pull_ci_fleet: bool = False,
 ) -> SelfDeployResult:
     """Perform the real (non-preview) pull/diff/sync attempt.
 
@@ -1154,6 +1364,12 @@ def _self_deploy_attempt(
                 ),
             )
         after_sha = after_res.stdout.strip()
+
+        if pull_ci_fleet:
+            # Best-effort and deliberately outside the deploy's ok/error flow:
+            # the orchestrator deploy above already succeeded, and a sibling
+            # that cannot be pulled is bounded staleness, not a failed deploy.
+            _pull_ci_fleet_sibling(repo_root, run_command=run_command, timeout=pull_timeout)
 
         marker = _read_marker(marker_path) if marker_path.exists() else None
         marker_from = marker.get("from_sha") if marker else None
@@ -1306,6 +1522,37 @@ def run_supervised(
     # Import here to avoid circular imports (supervise ← workflow ← supervise)
     from .workflow import CommandResult
 
+    # Same interpreter-anchored refusal as run_fleet_supervise: a repointed
+    # editable means everything below runs unreviewed code (issue #974).
+    from .venv_anchor import verify_interpreter_anchored_editables
+
+    anchor = verify_interpreter_anchored_editables()
+    if not anchor.ok:
+        logger.error("VENV EDITABLE ANCHOR VIOLATION: %s", anchor.detail)
+        log_event(
+            app.paths.state_file,
+            # event-consumer: pending #1366 -- hard supervisor-refusal safety gate (issue
+            # #974) with no confirmed alerting path beyond this log line + the refusal itself
+            "venv_editable_anchor_violation",
+            {"detail": anchor.detail},
+        )
+        return CommandResult(False, f"refusing to supervise: {anchor.detail}", {})
+    logger.info("Venv editable anchor: %s", anchor.detail)
+
+    # Record where ci_fleet was actually imported from plus the sibling
+    # repo's HEAD and dirty-state (issue #954). Same instrumentation as
+    # run_fleet_supervise: the editable .pth means the supervisor runs
+    # whatever is saved in the sibling working tree, committed or not.
+    # This records, it does not prevent. Best-effort, never raises.
+    from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
+
+    provenance = ci_fleet_provenance_snapshot()
+    log_event(
+        app.paths.state_file,
+        "ci_fleet_provenance",
+        ci_fleet_provenance_payload(provenance),
+    )
+
     # Single-instance guard
     lock_path = layout.supervisor_lock_path(app.paths.root)
     lock = try_acquire_supervisor_lock(lock_path)
@@ -1315,6 +1562,18 @@ def run_supervised(
             "supervisor already running (supervisor.lock held)",
             {},
         )
+
+    # Issue #1339: ensure every LabelConfig-derived label exists on the repo
+    # once at supervisor startup, so a new LabelConfig field converges to its
+    # label with no operator action. ``ensure_labels`` is idempotent, records
+    # failures as events (not exceptions), and never blocks the loop. Guarded
+    # so a stand-in app without the method (tests) is tolerated.
+    ensure = getattr(app, "ensure_labels", None)
+    if callable(ensure):
+        try:
+            ensure()
+        except Exception as exc:  # noqa: BLE001 — never block supervisor startup
+            logger.warning("startup label ensure failed: %s", exc)
 
     # Apply CLI overrides on top of the configured supervisor section as a
     # single ``dataclasses.replace`` — one config object instead of parallel

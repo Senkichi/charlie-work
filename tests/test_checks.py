@@ -12,8 +12,10 @@ from charlie_work.checks import (
     _run_id_from_link,
     classify_check_failures,
     classify_infra_failures,
+    is_infra_blocked_check,
     summarize_checks,
 )
+from charlie_work.config import InfraBlockedConfig
 from charlie_work.workflow import _non_required_check_findings
 
 
@@ -514,3 +516,405 @@ def test_is_infra_run_delegates_to_classify_check_run() -> None:
             f"_is_infra_run must not re-inline the {literal!r} state literal; "
             "route through _CheckClassification instead"
         )
+
+
+def test_summarize_checks_requires_all_configured_checks() -> None:
+    checks = [
+        {"name": "Tests passed", "state": "SUCCESS"},
+        {"name": "Lint & Format", "bucket": "pass"},
+        {"name": "Pre-commit", "state": "FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("Tests passed", "Lint & Format", "Pre-commit"))
+
+    assert summary.ready is False
+    assert summary.passed == ("Tests passed", "Lint & Format")
+    assert summary.failed == ("Pre-commit",)
+    assert summary.infra_failed == ()
+
+
+def test_summarize_checks_duplicate_runs_failure_then_success() -> None:
+    """Regression test for issue #1: duplicate runs with FAILURE then SUCCESS should classify as failed."""
+    checks = [
+        {"name": "test", "state": "FAILURE"},
+        {"name": "test", "state": "SUCCESS"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.passed == ()
+    assert summary.infra_failed == ()
+
+
+def test_summarize_checks_duplicate_runs_success_then_failure() -> None:
+    """Regression test for issue #1: duplicate runs with SUCCESS then FAILURE should classify as failed."""
+    checks = [
+        {"name": "test", "state": "SUCCESS"},
+        {"name": "test", "state": "FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.passed == ()
+    assert summary.infra_failed == ()
+
+
+def test_summarize_checks_duplicate_runs_all_success() -> None:
+    """Duplicate runs with all SUCCESS should classify as passed."""
+    checks = [
+        {"name": "test", "state": "SUCCESS"},
+        {"name": "test", "state": "SUCCESS"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is True
+    assert summary.passed == ("test",)
+    assert summary.failed == ()
+    assert summary.infra_failed == ()
+
+
+def test_summarize_checks_duplicate_runs_pending_then_success() -> None:
+    """Duplicate runs with PENDING then SUCCESS should classify as pending."""
+    checks = [
+        {"name": "test", "state": "PENDING"},
+        {"name": "test", "state": "SUCCESS"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.pending == ("test",)
+    assert summary.passed == ()
+    assert summary.failed == ()
+    assert summary.infra_failed == ()
+
+
+def test_summarize_checks_duplicate_runs_failure_then_pending() -> None:
+    """Duplicate runs with FAILURE then PENDING should classify as failed (worst-of)."""
+    checks = [
+        {"name": "test", "state": "FAILURE"},
+        {"name": "test", "state": "PENDING"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.pending == ()
+    assert summary.infra_failed == ()
+
+
+def test_summarize_checks_empty_state_and_bucket_classifies_as_pending() -> None:
+    """Regression test for issue #95: null/empty state+bucket should classify as pending."""
+    checks = [
+        {"name": "test", "state": None, "bucket": None},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.pending == ("test",)
+    assert summary.failed == ()
+    assert summary.infra_failed == ()
+
+
+def test_summarize_checks_empty_string_state_and_bucket_classifies_as_pending() -> None:
+    """Regression test for issue #95: empty string state+bucket should classify as pending."""
+    checks = [
+        {"name": "test", "state": "", "bucket": ""},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.pending == ("test",)
+    assert summary.failed == ()
+
+
+def test_summarize_checks_cancelled_classifies_as_infra_failed() -> None:
+    """Regression test for issue #210: CANCELLED state should classify as infrastructure failure."""
+    checks = [
+        {"name": "test", "state": "CANCELLED"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+    assert summary.pending == ()
+
+
+def test_summarize_checks_timed_out_classifies_as_infra_failed() -> None:
+    """Issue #841: TIMED_OUT is a documented GitHub Actions conclusion value
+    distinct from this repo's observed CANCELLED-on-timeout behavior, but it
+    must not fall through the catch-all into a code failure -- there is no
+    code fix for a job that ran out of time."""
+    checks = [
+        {"name": "test", "state": "TIMED_OUT"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+
+
+def test_summarize_checks_cancelled_case_insensitive() -> None:
+    """CANCELLED state classification should be case-insensitive."""
+    checks = [
+        {"name": "test", "state": "cancelled"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+
+
+def test_summarize_checks_mixed_cancelled_and_failure() -> None:
+    """Mixed CANCELLED and FAILURE states should classify each separately."""
+    checks = [
+        {"name": "test1", "state": "CANCELLED"},
+        {"name": "test2", "state": "FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test1", "test2"))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test1",)
+    assert summary.failed == ("test2",)
+    assert summary.pending == ()
+
+
+def test_summarize_checks_duplicate_runs_cancelled_then_success() -> None:
+    """Duplicate runs with CANCELLED then SUCCESS should classify as infra_failed (worst-of)."""
+    checks = [
+        {"name": "test", "state": "CANCELLED"},
+        {"name": "test", "state": "SUCCESS"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+    assert summary.pending == ()
+
+
+def test_summarize_checks_failure_takes_priority_over_cancelled() -> None:
+    """FAILURE should take priority over CANCELLED in worst-of semantics."""
+    checks = [
+        {"name": "test", "state": "CANCELLED"},
+        {"name": "test", "state": "FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.infra_failed == ()
+    assert summary.pending == ()
+
+
+def test_summarize_checks_infra_failure_marker_classifies_as_infra_failed() -> None:
+    """INFRA_FAILURE marker state should classify as infrastructure failure."""
+    checks = [
+        {"name": "test", "state": "INFRA_FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+    assert summary.pending == ()
+
+
+def test_summarize_checks_infra_failure_case_insensitive() -> None:
+    """INFRA_FAILURE state classification should be case-insensitive."""
+    checks = [
+        {"name": "test", "state": "infra_failure"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
+
+
+def test_summarize_checks_failure_takes_priority_over_infra_failure() -> None:
+    """FAILURE should take priority over INFRA_FAILURE in worst-of semantics."""
+    checks = [
+        {"name": "test", "state": "INFRA_FAILURE"},
+        {"name": "test", "state": "FAILURE"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.failed == ("test",)
+    assert summary.infra_failed == ()
+
+
+def test_summarize_checks_none_returns_unavailable_required_checks() -> None:
+    """Command-level gh failure (checks=None) marks every required check unavailable."""
+    summary = summarize_checks(None, ("Tests",))
+
+    assert summary.ready is False
+    assert summary.unavailable == ("Tests",)
+    assert summary.passed == ()
+    assert summary.pending == ()
+    assert summary.failed == ()
+
+
+# ---------------------------------------------------------------------------
+# Issue #1383: infra_blocked classification
+# ---------------------------------------------------------------------------
+
+
+def test_infra_blocked_zero_step_job_classified() -> None:
+    """AC1: a FAILURE job with zero steps is infra_blocked."""
+    job = {"conclusion": "FAILURE", "steps": []}
+    assert is_infra_blocked_check(job, [], InfraBlockedConfig()) is True
+
+
+def test_infra_blocked_setup_only_steps_classified() -> None:
+    """AC1: a FAILURE job with only setup steps is infra_blocked."""
+    job = {
+        "conclusion": "FAILURE",
+        "steps": [
+            {"name": "Set up job", "conclusion": "SUCCESS"},
+            {"name": "Checkout", "conclusion": "SUCCESS"},
+        ],
+    }
+    assert is_infra_blocked_check(job, [], InfraBlockedConfig()) is True
+
+
+def test_infra_blocked_budget_annotation_classified() -> None:
+    """AC1: a FAILURE job with a budget annotation is infra_blocked."""
+    job = {"conclusion": "FAILURE", "steps": [{"name": "Run tests", "conclusion": "FAILURE"}]}
+    annotations = [
+        {"message": "The job was not started because your spending limit needs to be increased."}
+    ]
+    assert is_infra_blocked_check(job, annotations, InfraBlockedConfig()) is True
+
+
+def test_infra_blocked_instant_fail_no_steps_classified() -> None:
+    """AC1: a FAILURE job with no steps array is infra_blocked (zero-step
+    signal). The timestamps are incidental -- classification rests on the
+    missing ``steps`` key, not on any timing threshold (round-2 #1383)."""
+    job = {
+        "conclusion": "FAILURE",
+        "started_at": "2026-08-21T10:00:00Z",
+        "completed_at": "2026-08-21T10:00:05Z",
+    }
+    assert is_infra_blocked_check(job, [], InfraBlockedConfig()) is True
+
+
+def test_infra_blocked_missing_steps_key_no_timestamps_classified() -> None:
+    """Round-2 #1383 regression: a FAILURE job with NO ``steps`` key at all
+    and NO timestamps must classify as infra_blocked, restoring the
+    pre-#1383 ``is_infrastructure_failure`` behavior. The prior code only
+    handled an empty ``steps`` list under Signal 2 and gated the missing-key
+    case on an instant-fail duration that required timestamps -- so this
+    shape (a real Actions API omission with no timing data) returned False
+    and routed the outage back to rework."""
+    job = {"conclusion": "FAILURE"}
+    assert is_infra_blocked_check(job, [], InfraBlockedConfig()) is True
+    # Also covers the null-value shape (key present, value None).
+    assert (
+        is_infra_blocked_check({"conclusion": "FAILURE", "steps": None}, [], InfraBlockedConfig())
+        is True
+    )
+
+
+def test_infra_blocked_real_test_failure_not_classified() -> None:
+    """A FAILURE job with real test steps is NOT infra_blocked."""
+    job = {
+        "conclusion": "FAILURE",
+        "steps": [
+            {"name": "Set up job", "conclusion": "SUCCESS"},
+            {"name": "Run tests", "conclusion": "FAILURE"},
+        ],
+    }
+    assert is_infra_blocked_check(job, [], InfraBlockedConfig()) is False
+
+
+def test_infra_blocked_non_failure_conclusion_not_classified() -> None:
+    """A SUCCESS/CANCELLED job is never infra_blocked."""
+    assert is_infra_blocked_check({"conclusion": "SUCCESS"}, [], InfraBlockedConfig()) is False
+    assert is_infra_blocked_check({"conclusion": "CANCELLED"}, [], InfraBlockedConfig()) is False
+
+
+def test_infra_blocked_disabled_config_not_classified() -> None:
+    """When config.enabled is False, no classification happens."""
+    cfg = InfraBlockedConfig(enabled=False)
+    job = {"conclusion": "FAILURE", "steps": []}
+    assert is_infra_blocked_check(job, [], cfg) is False
+
+
+def test_infra_blocked_custom_annotation_pattern() -> None:
+    """Config-listed annotation patterns are matched (not hardcoded in code)."""
+    cfg = InfraBlockedConfig(annotation_patterns=("billing exhausted",))
+    job = {"conclusion": "FAILURE", "steps": [{"name": "Run tests", "conclusion": "FAILURE"}]}
+    annotations = [{"message": "Error: billing exhausted for this account"}]
+    assert is_infra_blocked_check(job, annotations, cfg) is True
+
+
+def test_infra_blocked_missing_steps_classifies_even_with_zero_instant_fail_threshold() -> None:
+    """Round-2 #1383: ``instant_fail_seconds=0`` does NOT disable
+    classification of a missing-``steps`` key. The zero-step signal is
+    independent of the (now reserved) timing threshold -- a FAILURE job
+    with no step data never started the work regardless of how long it
+    ran, mirroring the pre-#1383 ``is_infrastructure_failure``. The prior
+    code returned False here because the missing-key case was gated on
+    ``instant_fail_seconds > 0`` under Signal 3."""
+    cfg = InfraBlockedConfig(instant_fail_seconds=0)
+    job = {
+        "conclusion": "FAILURE",
+        "started_at": "2026-08-21T10:00:00Z",
+        "completed_at": "2026-08-21T10:00:03Z",
+    }
+    assert is_infra_blocked_check(job, [], cfg) is True
+
+
+def test_summarize_checks_infra_blocked_marker_routed_to_infra_blocked_bucket() -> None:
+    """A check with state=INFRA_BLOCKED is routed to the infra_blocked bucket, not failed."""
+    checks = [{"name": "Tests passed", "state": "INFRA_BLOCKED"}]
+    summary = summarize_checks(checks, ("Tests passed",))
+
+    assert summary.infra_blocked == ("Tests passed",)
+    assert summary.failed == ()
+    assert summary.infra_failed == ()
+    assert summary.ready is False
+
+
+def test_summarize_checks_infra_blocked_does_not_affect_ready_when_empty() -> None:
+    """An empty infra_blocked bucket does not block readiness."""
+    checks = [{"name": "Tests passed", "state": "SUCCESS"}]
+    summary = summarize_checks(checks, ("Tests passed",))
+
+    assert summary.infra_blocked == ()
+    assert summary.ready is True
+
+
+def test_summarize_checks_failed_takes_precedence_over_infra_blocked() -> None:
+    """When a check name has both a FAILURE and an INFRA_BLOCKED run, failed wins (worst-of)."""
+    checks = [
+        {"name": "Tests passed", "state": "INFRA_BLOCKED"},
+        {"name": "Tests passed", "state": "FAILURE"},
+    ]
+    summary = summarize_checks(checks, ("Tests passed",))
+
+    assert summary.failed == ("Tests passed",)
+    assert summary.infra_blocked == ()
+    assert summary.missing == ()
