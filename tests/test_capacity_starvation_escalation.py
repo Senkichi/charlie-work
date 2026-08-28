@@ -35,6 +35,7 @@ from charlie_work.config import (
     RunnerScalingConfig,
     load_config,
 )
+from charlie_work.global_config import load_layered_config
 from charlie_work.fleet_dispatch import (
     _build_fleet_attention_digest,
     _run_fleet_allocation_prologue,
@@ -202,6 +203,67 @@ runner_capacity_escalation:
         match="runner_capacity_escalation.*starvation_escalation_minutes.*must be > 0",
     ):
         load_config(config_file)
+
+
+# --- Layered-config host-wide-only rejection (global_config.load_layered_config) ---
+# Mirrors the runner_allocation precedent in tests/test_config.py
+# (test_load_layered_config_rejects_per_repo_runner_allocation and its
+# 'accepts at global layer' counterpart). runner_capacity_escalation is the
+# same shape of host-wide concern (issue #763), so the per-repo rejection
+# branch in global_config.py:200-205 needs the same regression coverage.
+
+
+def test_load_layered_config_rejects_per_repo_runner_capacity_escalation(
+    tmp_path: Path,
+) -> None:
+    """Issue #763: a per-repo ``runner_capacity_escalation`` section must be
+    rejected by ``load_layered_config``.
+
+    The merge is section-by-section with the per-repo file winning per key, so
+    without the explicit rejection in ``global_config.load_layered_config`` a
+    per-repo ``orchestrator.config.yaml`` could silently override a host-wide
+    capacity signal -- three repos holding three opinions about one machine's
+    starvation window. The section is documented host-wide-only (see
+    ``RunnerCapacityEscalationConfig``); make the invalid state
+    unrepresentable rather than merely unused, exactly as ``runner_allocation``
+    does (issue #600).
+    """
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "config.yaml").write_text(
+        "runner_capacity_escalation:\n  enabled: true\n", encoding="utf-8"
+    )
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _write_config(
+        repo_root / "orchestrator.config.yaml",
+        "runner_capacity_escalation:\n  enabled: true\n  starvation_escalation_minutes: 2\n",
+    )
+
+    with pytest.raises(ConfigError, match="host-wide only"):
+        load_layered_config(repo_root, fleet_dir_override=str(fleet))
+
+
+def test_load_layered_config_accepts_global_runner_capacity_escalation(
+    tmp_path: Path,
+) -> None:
+    """The rejection is scoped to the per-repo layer; the global fleet layer
+    keeps ``runner_capacity_escalation`` and parses it through to the dataclass
+    with the configured (non-default) values, not silently falling back to
+    defaults."""
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "config.yaml").write_text(
+        "runner_capacity_escalation:\n  enabled: false\n  starvation_escalation_minutes: 30\n",
+        encoding="utf-8",
+    )
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    # No per-repo config at all -- the global layer stands alone.
+    config = load_layered_config(repo_root, fleet_dir_override=str(fleet))
+    assert config.runner_capacity_escalation.enabled is False
+    assert config.runner_capacity_escalation.starvation_escalation_minutes == 30
 
 
 # ---------------------------------------------------------------------------
