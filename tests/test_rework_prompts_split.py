@@ -307,14 +307,16 @@ def test_all_rework_prompts_names_are_reexported_by_identity() -> None:
     line 334 keeps resolving through the new import chain (``workflow`` ->
     ``rework_prompts`` -> ``review_decision``), so the identity check below
     still holds for it even though it is no longer in ``names``.
+    Issue #1485 adds ``_provenance_caveat_from_decision`` (1 function:
+    11 -> 12 core-chain functions), for 16 -> 17 overall.
     """
     import charlie_work.rework_prompts as rework_prompts
     import charlie_work.workflow as workflow
 
     names = _module_level_defined_names(_REWORK_PROMPTS_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 16, (
-        f"expected 16 moved/added units (11 core-chain functions + "
+    assert len(names) == 17, (
+        f"expected 17 moved/added units (12 core-chain functions + "
         f"_write_text_atomic + 4 constants, after issue #1362 Stage 1 hoisted "
         f"_round_history_entries out to review_decision.py), found {len(names)}: "
         f"{sorted(names)}"

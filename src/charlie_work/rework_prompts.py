@@ -35,6 +35,27 @@ from .review_decision import resolve_decision_payload
 from .verdict_parsing import body_has_crash_signature
 
 
+def _provenance_caveat_from_decision(decision: dict[str, Any] | None) -> str:
+    """Return the provenance caveat stored in a decision dict, or ``""``.
+
+    Issue #1485: ``record_review`` persists a ``provenance_caveat`` field
+    into ``review-decision.json`` when a verdict was extracted from a dead
+    reviewer's session artifacts (``verdict_source`` = ``"log"``/
+    ``"events"``/``"file:*"``) rather than emitted as a clean structured
+    completion. This reads that field back so renderers can prepend it to
+    the findings section, warning a human to re-verify factual claims
+    before acting.
+
+    Returns ``""`` when the field is absent (a non-extracted verdict, or
+    a pre-#1485 record) so callers can unconditionally prepend without a
+    separate existence check.
+    """
+    if not isinstance(decision, dict):
+        return ""
+    caveat = decision.get("provenance_caveat")
+    return caveat.strip() if isinstance(caveat, str) and caveat.strip() else ""
+
+
 def _rework_prompt_search_dirs(
     config: OrchestratorConfig, repo_root: Path | None = None
 ) -> tuple[Path, ...]:
@@ -722,6 +743,11 @@ def _render_round_findings(decision: dict[str, Any]) -> str:
             rendered = rendered.replace(_EXTERNAL_FINDINGS_POINTER, "").rstrip("\n") + "\n"
         if summary_is_usable and _REQUIRED_CHANGES_TIER1_INTRO in rendered:
             rendered = f"{rendered.rstrip()}\n\nSummary: {defang_closing_keywords(summary_text)}\n"
+        # Issue #1485: prepend the provenance caveat so a reviewer reading
+        # round history knows a prior round's verdict was log-extracted.
+        caveat = _provenance_caveat_from_decision(decision)
+        if caveat:
+            rendered = f"{caveat}\n\n{rendered}"
         return rendered
 
     # `_render_required_changes_section` declined to render anything for
@@ -746,7 +772,19 @@ def _render_round_findings(decision: dict[str, Any]) -> str:
         parts.append("\n".join(f"- {defang_closing_keywords(item)}" for item in safe_changes))
     if summary_is_usable:
         parts.append(f"Summary: {defang_closing_keywords(summary_text)}")
-    return "\n\n".join(parts)
+    rendered = "\n\n".join(parts)
+    # Issue #1485: prepend the provenance caveat on this fallback path too.
+    # This branch is reached when ``_render_required_changes_section`` declined
+    # to render anything -- approved (always) or ``blocked``-with-content
+    # (intentionally suppressed there). A ``blocked`` log-extracted verdict
+    # asserting "already merged" is exactly the population this caveat exists
+    # to flag: dropping it here reproduces the issue's motivating risk in a
+    # later review round, the precise surface the reviewer flagged. The
+    # delegated-render path above already prepends; this path must too.
+    caveat = _provenance_caveat_from_decision(decision)
+    if caveat:
+        rendered = f"{caveat}\n\n{rendered}" if rendered else caveat
+    return rendered
 
 
 def _render_rework_prompt(
@@ -771,6 +809,20 @@ def _render_rework_prompt(
     pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
     decision = resolve_decision_payload(pr_dir)
     required_changes_section = _render_required_changes_section(decision)
+    # Issue #1485: prepend the provenance caveat so a worker reading the
+    # rework brief knows the verdict was log-extracted and may be incomplete
+    # or incorrect -- re-verify factual claims before acting. Prepended even
+    # when ``required_changes_section`` is empty: a ``blocked``-with-content
+    # verdict is suppressed to ``""`` by ``_render_required_changes_section``
+    # (by design, for the worker-brief framing), so gating the caveat on a
+    # non-empty section would silently drop it for exactly the ``blocked``
+    # log-extracted verdicts the caveat exists to flag -- the same
+    # caveat-drop-on-empty-section gap the round-history fallback path closes.
+    caveat = _provenance_caveat_from_decision(decision)
+    if caveat:
+        required_changes_section = (
+            f"{caveat}\n\n{required_changes_section}" if required_changes_section else caveat
+        )
     return render_prompt(
         config.dispatch.rework_template,
         {
