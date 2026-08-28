@@ -131,6 +131,11 @@ MIN_BEAT_INTERVAL_MINUTES = 10
 # loop) and threaded into every consumer, so this timeout is paid at most once
 # per beat, not once per consumer per repo.
 CHARLIE_STATUS_TIMEOUT_SECONDS = 120
+# Issue #1463: ``fleet status --json`` serves from the status-snapshot cache
+# by default. A cache older than this threshold means the blocked set may not
+# reflect the current state — surface a staleness warning so downstream checks
+# annotate their output as degraded rather than silently trusting stale data.
+STATUS_CACHE_STALE_SECONDS = 600
 
 # in-progress-stale worktree mtime threshold (issue #1379). The events-based
 # check flags an issue when its GitHub updatedAt hasn't moved across 2 beats,
@@ -552,6 +557,17 @@ def get_blocked_issue_numbers(any_repo_root: Path) -> tuple[dict[str, set[int]],
         }
     except (KeyError, TypeError) as exc:
         return {}, f"charlie fleet status --json unexpected payload shape: {exc}"
+    # Issue #1463: surface stale-cache degradation. ``fleet status --json``
+    # serves from the status-snapshot cache by default; a very stale cache
+    # means the blocked set may not reflect the current state. The blocked
+    # data is still returned (it is the best available), but a staleness
+    # warning is returned so downstream checks annotate their output.
+    ages = [a for r in repos.values() if isinstance(a := r.get("cache_age_seconds"), (int, float))]
+    if ages and max(ages) > STATUS_CACHE_STALE_SECONDS:
+        return blocked_by_repo, (
+            f"status snapshot cache {max(ages):.0f}s old "
+            f"(>{STATUS_CACHE_STALE_SECONDS}s); blocked set may be stale"
+        )
     return blocked_by_repo, ""
 
 

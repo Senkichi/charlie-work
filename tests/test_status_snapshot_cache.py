@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from charlie_work import status_snapshot
 from charlie_work.cli import build_parser, run_fleet_status
 from charlie_work.config import (
     ConfigError,
@@ -126,7 +127,7 @@ def test_status_serves_from_fresh_snapshot(tmp_path: Path) -> None:
     assert result.ok is True
     # The cached payload's domain fields are preserved verbatim; the
     # freshness fields (snapshot_written_at / cache_age_seconds) are injected
-    # by _read_status_snapshot and are asserted separately below.
+    # by read_status_snapshot and are asserted separately below.
     assert result.data["ready_issue_count"] == 42
     assert result.data["available_issue_count"] == 7
     # Zero GitHub API calls — the cache was served, not the live path.
@@ -218,13 +219,13 @@ def test_status_use_cache_false_bypasses_cache(tmp_path: Path) -> None:
 
 
 def test_write_status_snapshot_creates_valid_file(tmp_path: Path) -> None:
-    """``_write_status_snapshot`` writes a parseable envelope with the live
+    """``write_status_snapshot`` writes a parseable envelope with the live
     status data."""
     app, _gh = _make_app(tmp_path)
 
-    app._write_status_snapshot()
+    status_snapshot.write_status_snapshot(app)
 
-    snapshot_path = app._status_snapshot_file
+    snapshot_path = status_snapshot.snapshot_path(app.paths.root)
     assert snapshot_path.exists()
     envelope = json.loads(snapshot_path.read_text(encoding="utf-8"))
     assert "snapshot_written_at" in envelope
@@ -234,7 +235,7 @@ def test_write_status_snapshot_creates_valid_file(tmp_path: Path) -> None:
 
 
 def test_write_then_read_roundtrip(tmp_path: Path) -> None:
-    """A snapshot written by ``_write_status_snapshot`` is served by a
+    """A snapshot written by ``write_status_snapshot`` is served by a
     subsequent ``status()`` call with zero GitHub API calls."""
     app, gh = _make_app(tmp_path)
 
@@ -243,7 +244,7 @@ def test_write_then_read_roundtrip(tmp_path: Path) -> None:
     assert gh.issue_list_calls > 0
 
     # Write the snapshot (also calls status(use_cache=False) internally).
-    app._write_status_snapshot()
+    status_snapshot.write_status_snapshot(app)
     calls_after_write = gh.issue_list_calls
 
     # Second call: should serve from cache (zero new API calls).
@@ -259,18 +260,18 @@ def test_write_then_read_roundtrip(tmp_path: Path) -> None:
 
 
 def test_write_status_snapshot_does_not_recurse(tmp_path: Path) -> None:
-    """``_write_status_snapshot`` calls ``status(use_cache=False)`` — it must
+    """``write_status_snapshot`` calls ``status(use_cache=False)`` — it must
     not serve from a pre-existing stale snapshot (which would write stale
     data instead of a fresh live computation)."""
     app, gh = _make_app(tmp_path)
     # Plant a stale snapshot with bogus data.
     _write_snapshot(tmp_path, {"ready_issue_count": 999}, age_seconds=999)
 
-    app._write_status_snapshot()
+    status_snapshot.write_status_snapshot(app)
 
     # The written snapshot should contain the LIVE data (1 issue), not the
     # stale bogus data (999).
-    snapshot_path = app._status_snapshot_file
+    snapshot_path = status_snapshot.snapshot_path(app.paths.root)
     envelope = json.loads(snapshot_path.read_text(encoding="utf-8"))
     assert envelope["data"]["ready_issue_count"] == 1
     # And the live computation must have run (GitHub API calls were made).
@@ -352,10 +353,11 @@ def _build_loop_app(root: Path, *, dry_run: bool) -> OrchestratorApp:
 def test_loop_pass_writes_status_snapshot(tmp_path: Path) -> None:
     """A full ``app.loop()`` pass (non-dry-run) writes
     ``status-snapshot.json`` as a side effect — the real production wiring
-    (``_loop_impl`` -> ``_write_status_snapshot``), not a direct unit call."""
+    (``_loop_impl`` -> ``status_snapshot.write_status_snapshot``), not a
+    direct unit call."""
     frozen_now = datetime.now(UTC) + timedelta(hours=1)
     app = _build_loop_app(tmp_path / "live", dry_run=False)
-    snapshot_path = app._status_snapshot_file
+    snapshot_path = status_snapshot.snapshot_path(app.paths.root)
 
     assert not snapshot_path.exists(), "precondition: no snapshot yet"
 
@@ -379,7 +381,7 @@ def test_loop_pass_dry_run_does_not_write_status_snapshot(tmp_path: Path) -> Non
     ``fleet status --json`` would serve as if it were real."""
     frozen_now = datetime.now(UTC) + timedelta(hours=1)
     app = _build_loop_app(tmp_path / "dry", dry_run=True)
-    snapshot_path = app._status_snapshot_file
+    snapshot_path = status_snapshot.snapshot_path(app.paths.root)
 
     assert not snapshot_path.exists(), "precondition: no snapshot yet"
 
@@ -514,4 +516,115 @@ def test_no_cache_cli_flag_threads_use_cache_into_status(
     assert mock_app.status.call_args.kwargs.get("use_cache") is expected_use_cache, (
         f"argv={argv} should thread use_cache={expected_use_cache} into "
         f"OrchestratorApp.status(); got call_args={mock_app.status.call_args}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1463 round-3 review: roll-call --no-cache parity + freshness consumers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_use_cache"),
+    [
+        (["roll-call"], True),
+        (["roll-call", "--no-cache"], False),
+    ],
+    ids=["roll-call-default-True", "roll-call-no-cache-False"],
+)
+def test_roll_call_no_cache_flag_threads_use_cache(
+    argv: list[str], expected_use_cache: bool
+) -> None:
+    """Round-3 review: ``roll-call`` silently gained cache-serving behavior
+    when ``status()`` grew its ``use_cache`` default. This test confirms
+    ``roll-call`` now has ``--no-cache`` parity with ``fleet status``: the
+    default threads ``use_cache=True``, and ``--no-cache`` threads ``False``.
+    """
+    from charlie_work.cli import run_command
+
+    args = build_parser().parse_args(argv)
+    mock_app = MagicMock()
+    mock_app.status.return_value = MagicMock(ok=True, data={})
+
+    run_command(mock_app, args)
+
+    mock_app.status.assert_called_once()
+    assert mock_app.status.call_args.kwargs.get("use_cache") is expected_use_cache, (
+        f"argv={argv} should thread use_cache={expected_use_cache} into "
+        f"OrchestratorApp.status(); got call_args={mock_app.status.call_args}"
+    )
+
+
+def test_fleet_status_human_readable_shows_cache_age_when_cached(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """Round-3 review: the human-readable (non ``--json``) fleet status
+    renderer must print cache freshness so an operator can distinguish a
+    cached response from a live one — the ``snapshot_written_at`` /
+    ``cache_age_seconds`` fields round-1 required need a real consumer."""
+    from charlie_work import cli
+    from charlie_work.workflow import CommandResult
+
+    fake_result = CommandResult(
+        True,
+        "fleet status: 1 repo(s), 0 error(s), 0 stale(s)",
+        {
+            "repos": {
+                "owner/repo": {
+                    "ready_issue_count": 5,
+                    "active_issue_count": 2,
+                    "blocked": [],
+                    "stalled": [],
+                    "cache_age_seconds": 42.0,
+                }
+            },
+            "errors": [],
+            "stale": [],
+            "api_worker_report": None,
+        },
+    )
+    monkeypatch.setattr(cli, "run_fleet_status", lambda args: fake_result)
+
+    rc = cli.main(["fleet", "status"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "(cached, 42s old)" in out, (
+        f"human-readable fleet status must show cache age for cached repos; got:\n{out}"
+    )
+
+
+def test_fleet_status_human_readable_omits_cache_age_when_live(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    """A live (non-cached) response has ``cache_age_seconds=None``; the
+    renderer must NOT print a cache-age line, so a live response is
+    distinguishable from a cached one by the absence of the line."""
+    from charlie_work import cli
+    from charlie_work.workflow import CommandResult
+
+    fake_result = CommandResult(
+        True,
+        "fleet status: 1 repo(s), 0 error(s), 0 stale(s)",
+        {
+            "repos": {
+                "owner/repo": {
+                    "ready_issue_count": 5,
+                    "active_issue_count": 2,
+                    "blocked": [],
+                    "stalled": [],
+                    "cache_age_seconds": None,
+                }
+            },
+            "errors": [],
+            "stale": [],
+            "api_worker_report": None,
+        },
+    )
+    monkeypatch.setattr(cli, "run_fleet_status", lambda args: fake_result)
+
+    rc = cli.main(["fleet", "status"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "cached" not in out.lower(), (
+        f"human-readable fleet status must not show cache age for live repos; got:\n{out}"
     )

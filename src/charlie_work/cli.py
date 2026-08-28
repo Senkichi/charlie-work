@@ -108,6 +108,16 @@ def _add_dry_run(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
 
 
+def _add_no_cache_arg(parser: argparse.ArgumentParser) -> None:
+    """Add ``--no-cache`` (issue #1463) to ``fleet status`` and ``roll-call``."""
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=False,
+        help="Bypass the status-snapshot cache (#1463); compute live status.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=CLI_NAME)
     parser.add_argument("--config", type=Path, default=None)
@@ -120,7 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("roll-call")
+    roll_call = subparsers.add_parser("roll-call")
+    _add_no_cache_arg(roll_call)
     doctor = subparsers.add_parser("doctor")
     doctor.add_argument(
         "--adapter-probe",
@@ -292,16 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
     fleet = subparsers.add_parser("fleet")
     fleet_sub = fleet.add_subparsers(dest="fleet_command", required=True)
     fleet_status_parser = fleet_sub.add_parser("status")
-    fleet_status_parser.add_argument(
-        "--no-cache",
-        action="store_true",
-        default=False,
-        help=(
-            "Bypass the status-snapshot cache (issue #1463) and compute the "
-            "full live status. Use when you need a guaranteed-fresh view "
-            "rather than the last loop pass's snapshot."
-        ),
-    )
+    _add_no_cache_arg(fleet_status_parser)
     fleet_sub.add_parser("review-queue")
     fleet_sub.add_parser("operator-queue")
 
@@ -2394,7 +2396,7 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
 
 def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult:
     if args.command == "roll-call":
-        return app.status()
+        return app.status(use_cache=not getattr(args, "no_cache", False))
     if args.command == "bootstrap-labels":
         return app.bootstrap_labels()
     if args.command == "intake":
@@ -2666,6 +2668,9 @@ def main(argv: list[str] | None = None) -> int:
                 # which one it is.
                 suffix = _render_backlog_reachability(repo_data.get("backlog_reachability"))
                 print(line + suffix)
+                cache_age = repo_data.get("cache_age_seconds")
+                if cache_age is not None:
+                    print(f"    (cached, {cache_age:.0f}s old)")
             errors = result.data.get("errors", [])
             if errors:
                 print("Errors:")

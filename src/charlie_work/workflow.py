@@ -55,7 +55,7 @@ from .config import (
 from .env_sanitize import worker_github_token_findings
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, managed_repo_names, try_acquire_fleet_lock
-from . import layout
+from . import layout, status_snapshot
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from . import rescue as rescue_helpers
@@ -6845,21 +6845,8 @@ class OrchestratorApp:
 
     @_guard_state_lock
     def status(self, *, use_cache: bool = True) -> CommandResult:
-        # Issue #1463: serve from the per-repo status-snapshot cache when it
-        # is fresher than ``runtime.status_snapshot_ttl_seconds``. The snapshot
-        # is written at the end of every loop pass (atomic temp-file +
-        # replace), so a lock-free read here is safe by construction — we
-        # either read the previous complete snapshot or no file at all, never a
-        # partial write. This turns a ~50s serial GitHub API walk into a
-        # sub-second file read on an idle host and eliminates the state-lock
-        # contention that pushed wall time past the heartbeat's 60s cap during
-        # concurrent loop passes. ``use_cache=False`` (``--no-cache`` on the
-        # CLI, or the loop pass's own snapshot-write call) bypasses the cache
-        # and performs the live computation.
-        if use_cache:
-            cached = self._read_status_snapshot()
-            if cached is not None:
-                return cached
+        if use_cache and (cached := status_snapshot.read_status_snapshot(self)) is not None:
+            return cached
         issues = self.gh.issue_list(self.config.labels.ready)
         prs = self.gh.pr_list()
         state = load_state_locked(self.paths.state_file)
@@ -6968,11 +6955,6 @@ class OrchestratorApp:
                 operator_claimed,
                 ready_open_count=len(issues),
             ),
-            # Issue #1463 review: freshness signals so consumers
-            # (``heartbeat_check.py``, humans) can distinguish a live
-            # computation (both ``None``) from a cached snapshot (timestamp +
-            # age). See ``_read_status_snapshot`` for the cached-side
-            # injection.
             "snapshot_written_at": None,
             "cache_age_seconds": None,
         }
@@ -6982,95 +6964,6 @@ class OrchestratorApp:
             data["runners"] = runners_data
 
         return CommandResult(True, "status complete", data)
-
-    # --- Issue #1463: status-snapshot cache -------------------------------
-    # The loop pass writes ``status()``'s result to ``status-snapshot.json``
-    # at the end of every pass; ``status()`` serves from that snapshot when
-    # fresh. See the ``status_snapshot_ttl_seconds`` config knob and
-    # ``layout.status_snapshot_path``.
-
-    @property
-    def _status_snapshot_file(self) -> Path:
-        return layout.status_snapshot_path(self.paths.root)
-
-    def _read_status_snapshot(self) -> CommandResult | None:
-        """Return a cached ``status()`` result if the snapshot is fresh.
-
-        Returns ``None`` when the snapshot is absent, stale, or unreadable —
-        the caller falls back to a live computation in all those cases. The
-        read is lock-free: ``_write_status_snapshot`` uses atomic temp-file +
-        ``replace``, so this reader either sees the previous complete snapshot
-        or no file at all, never a partial write (issue #1463).
-        """
-        ttl = self.config.runtime.status_snapshot_ttl_seconds
-        if ttl <= 0:
-            return None
-        snapshot_path = self._status_snapshot_file
-        if not snapshot_path.exists():
-            return None
-        try:
-            with snapshot_path.open("r", encoding="utf-8-sig") as handle:
-                envelope = json.load(handle)
-        except (json.JSONDecodeError, OSError, ValueError):
-            # Corrupt or transiently-unreadable snapshot — fall back to live.
-            return None
-        if not isinstance(envelope, dict):
-            return None
-        written_at = envelope.get("snapshot_written_at")
-        if not isinstance(written_at, str):
-            return None
-        try:
-            written_ts = datetime.fromisoformat(written_at.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        age = (datetime.now(UTC) - written_ts).total_seconds()
-        if age > ttl:
-            return None
-        data = envelope.get("data")
-        if not isinstance(data, dict):
-            return None
-        # Issue #1463 review: surface cache freshness into the ``data`` dict
-        # itself, not just ``CommandResult.message`` (which ``run_fleet_status``
-        # discards). ``snapshot_written_at`` / ``cache_age_seconds`` let
-        # ``heartbeat_check.py`` and human operators distinguish a fresh live
-        # response (both ``None``) from a cached one (timestamp + age), so a
-        # stale-but-still-within-TTL snapshot can never be mistaken for a
-        # current reading. Injected here rather than stored in the envelope's
-        # ``data`` so the written snapshot never carries a stale freshness
-        # field of its own.
-        data = dict(data)
-        data["snapshot_written_at"] = written_at
-        data["cache_age_seconds"] = round(age, 1)
-        return CommandResult(True, "status complete (cached)", data)
-
-    def _write_status_snapshot(self) -> None:
-        """Write a fresh ``status()`` snapshot for ``fleet status`` to serve.
-
-        Called at the end of every loop pass (``_loop_impl``). Computes the
-        live status (bypassing the cache) and writes it atomically so a
-        concurrent ``fleet status --json`` invocation never sees a partial
-        file. Best-effort: failures are logged but never propagate — a failed
-        snapshot write must not crash the loop pass (issue #1463).
-        """
-        try:
-            result = self.status(use_cache=False)
-            if not result.ok:
-                return
-            envelope = {
-                "snapshot_written_at": utc_now(),
-                "data": result.data,
-            }
-            snapshot_path = self._status_snapshot_file
-            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = snapshot_path.with_suffix(snapshot_path.suffix + ".tmp")
-            with tmp_path.open("w", encoding="utf-8") as handle:
-                json.dump(envelope, handle, indent=2, sort_keys=True)
-                handle.write("\n")
-            tmp_path.replace(snapshot_path)
-        except Exception:
-            logging.getLogger(__name__).warning(
-                "status snapshot write failed for %s", self.repo_root, exc_info=True
-            )
 
     def claim(self, issue_number: int, release: bool = False) -> CommandResult:
         """Record or release an operator claim on an issue.
@@ -20538,18 +20431,8 @@ class OrchestratorApp:
                 sink_arrivals=sink_arrivals,
                 sink_clears=sink_clears,
             )
-            # Issue #1463: write a status-snapshot cache so ``fleet status
-            # --json`` can serve from it (lock-free, no GitHub API calls)
-            # instead of recomputing the ~50s serial API walk on every
-            # heartbeat beat. The GitHub client's list cache is still warm
-            # from this pass's dispatch/intake work, so the live status
-            # computation here is far cheaper than a cold ``fleet status``
-            # invocation. Best-effort: ``_write_status_snapshot`` logs and
-            # swallows all failures. Gated on ``not self.dry_run``: a dry-run
-            # pass must not touch the filesystem (cf. #1412, #1413 -- the same
-            # dry-run invariant that gates every other loop-pass write).
             if not self.dry_run:
-                self._write_status_snapshot()
+                status_snapshot.write_status_snapshot(self)
             return result
 
     def _maybe_probe_quota_recovery(self, *, now: datetime | None = None) -> None:
