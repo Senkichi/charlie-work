@@ -18627,6 +18627,33 @@ class OrchestratorApp:
             # gating counter untouched, so the router re-escalated on the next
             # detection.  See ``_REWORK_BUDGET_RESET_BY_ESCALATION_REASON``.
             clear_escalation_on_issue_prs(fresh_state, issue_number)
+            # Issue #1482: reset the linked PR's own ``status`` field to the
+            # same ``PASSIVE_OPEN_STATUS`` target the operator ``unescalate``
+            # door uses for a live OPEN PR (``_apply_pr_reset``).  The PR is
+            # already verified OPEN on GitHub (the ``pr_state_str == "OPEN"``
+            # gate above), so the target is the passive-open status.
+            # ``clear_escalation_on_issue_prs`` is scoped to escalation-reason
+            # fields (``escalation_reason`` / ``reason_class`` /
+            # ``escalation_reasons_seen``) by design and docstring -- it never
+            # touches ``status``, so without this reset the PR was left at
+            # ``pr.status == "escalated"`` (set by ``_escalate_issue(...,
+            # pr_number=...)``) with no GitHub label reflecting it.  That split
+            # state silently excluded the PR from packet regeneration forever:
+            # ``loop()``'s per-pass regen check skips regenerating an escalated
+            # PR's packet, so the stored ``headRefOid`` went stale the moment
+            # the PR's head next moved and ``review_queue()``'s stale-packet
+            # guard permanently excluded the PR from the review queue.  Only
+            # the verified ``pr_number`` is reset -- not every linked PR, since
+            # only this one passed the OPEN/mergeable/janitor gates (matching
+            # the operator door, which also acts on a single PR).  This does
+            # NOT clear the full ``UNESCALATE_PR_RESET_FIELDS`` set -- that is
+            # the operator door's broader re-arm, and resetting those counters
+            # here would violate the unbounded paid-session loop guard (issue
+            # #783 hazard (b)); only the per-mechanism rework counter is reset
+            # separately below.
+            fresh_pr_for_status = fresh_state["prs"].get(str(pr_number))
+            if isinstance(fresh_pr_for_status, dict):
+                fresh_pr_for_status["status"] = PASSIVE_OPEN_STATUS
             if budget_reset_needed:
                 fresh_pr = fresh_state["prs"].get(str(pr_number))
                 if isinstance(fresh_pr, dict):

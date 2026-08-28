@@ -130,6 +130,11 @@ def test_deescalation_sweep_clears_mechanical_and_leaves_judgment_untouched(
     pr_456 = state["prs"]["456"]
     assert "escalation_reason" not in pr_456
     assert "escalation_reasons_seen" not in pr_456
+    # Issue #1482: the PR record's own ``status`` must be reset to the same
+    # PASSIVE_OPEN_STATUS target the issue was reset to -- the sweep must not
+    # leave a split state (issue open_passive, PR escalated) that silently
+    # excludes the PR from packet regeneration forever.
+    assert pr_456["status"] == PASSIVE_OPEN_STATUS
 
     # The judgment issue on an identically-shaped PR is completely untouched.
     issue_124 = state["issues"]["124"]
@@ -157,6 +162,79 @@ def test_deescalation_sweep_clears_mechanical_and_leaves_judgment_untouched(
     # Only the mechanical issue was ever a candidate -- the judgment issue's
     # entry never enters the candidate query at all (AC2).
     assert passes[0]["payload"]["candidates"] == 1
+
+
+def test_sweep_resets_linked_pr_status_to_passive_open(tmp_path: Path) -> None:
+    """Issue #1482: ``_deescalate_mechanical_issue`` resets the issue's
+    ``status`` to ``PASSIVE_OPEN_STATUS`` and mirror-clears the linked PR
+    record's escalation-reason fields via ``clear_escalation_on_issue_prs``,
+    but it must ALSO reset the PR record's own ``status`` field.
+
+    ``_escalate_issue(..., pr_number=...)`` (the escalation write path) sets
+    ``pr.status = "escalated"`` whenever a PR-side escalation is recorded
+    (e.g. ``dead_dispatched_worker_reap``, ``dispatch_blocked_environment``,
+    ``worker_death_loop``).  ``clear_escalation_on_issue_prs`` is scoped to
+    escalation-reason fields (``escalation_reason`` / ``reason_class`` /
+    ``escalation_reasons_seen``) by design and docstring -- it never touches
+    ``status``.  Before this fix the PR was left at
+    ``pr.status == "escalated"`` with no GitHub label reflecting it, which
+    silently excluded it from packet regeneration forever: ``loop()``'s
+    per-pass regen check deliberately skips regenerating an escalated PR's
+    packet, so the stored ``headRefOid`` went stale the moment the PR's head
+    next moved and ``review_queue()``'s stale-packet guard permanently
+    excluded the PR from the review queue.
+
+    The sweep must reset the linked PR's ``status`` to the same
+    ``PASSIVE_OPEN_STATUS`` target the operator ``unescalate`` door uses for
+    a live OPEN PR (``_apply_pr_reset``), so the two doors cannot diverge on
+    the PR-side status reset.  It must NOT clear the full
+    ``UNESCALATE_PR_RESET_FIELDS`` set -- that is the operator door's
+    broader re-arm, and resetting those counters here would violate the
+    unbounded paid-session loop guard (issue #783 hazard (b)); only the
+    per-mechanism rework counter is reset (already covered by the
+    ``_REWORK_BUDGET_RESET_BY_ESCALATION_REASON`` tests below).
+    """
+    app = _app(tmp_path)
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            # PR-side status was set to "escalated" by _escalate_issue's
+            # pr_number= path (e.g. dead_dispatched_worker_reap).
+            "status": "escalated",
+            "escalation_reason": "dead_dispatched_worker_reap",
+            # A counter the sweep must NOT touch (hazard (b) guard): only the
+            # per-mechanism counter gating the CLEARED reason is reset, and
+            # dead_dispatched_worker_reap has no rework-budget entry, so this
+            # unrelated review-lane counter survives the clear.
+            "request_changes_count": 2,
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "dead_dispatched_worker_reap",
+            "reason_class": "mechanical",
+        }
+        save_state(app.paths.state_file, state)
+
+    app._maybe_deescalate_mechanical()
+
+    state = load_state(app.paths.state_file)
+    pr_456 = state["prs"]["456"]
+    # The PR-side status is reset to the same target the operator door uses
+    # for a live OPEN PR -- the core of issue #1482.
+    assert pr_456["status"] == PASSIVE_OPEN_STATUS
+    # The escalation-reason fields are still mirror-cleared (regression guard
+    # for the existing clear_escalation_on_issue_prs behavior).
+    assert "escalation_reason" not in pr_456
+    assert "escalation_reasons_seen" not in pr_456
+    # The unrelated review-lane counter survives -- the sweep does NOT apply
+    # the operator door's full UNESCALATE_PR_RESET_FIELDS (hazard (b)).
+    assert pr_456["request_changes_count"] == 2
+    # The issue side is cleared as before.
+    assert state["issues"]["123"]["status"] == PASSIVE_OPEN_STATUS
 
 
 def test_deescalation_sweep_leaves_missing_reason_class_untouched(tmp_path: Path) -> None:

@@ -147,6 +147,58 @@ def test_unescalate_reset_covers_every_rework_lane_companion() -> None:
     assert not missing, sorted(missing)
 
 
+def test_operator_and_automated_doors_agree_on_pr_status_reset_target(
+    tmp_path: Path,
+) -> None:
+    """Issue #1482: the operator ``unescalate`` door and the automated
+    ``_deescalate_mechanical_issue`` sweep must both reset a live OPEN PR's
+    ``status`` to ``PASSIVE_OPEN_STATUS``.  Before this fix the automated
+    door reset the issue's status but left ``pr.status == "escalated"``,
+    producing a split state with no GitHub label that silently excluded the
+    PR from packet regeneration forever.
+
+    This is the cross-door agreement assertion the issue asks for: both doors
+    are exercised on equivalent escalated-PR setups (issue + PR both
+    ``escalated``, PR OPEN on GitHub) and must converge on the same
+    PR-side ``status``.  A future change to one door's PR-status target that
+    forgets the other fails here instead of reintroducing the split state.
+    """
+    app = _app(tmp_path)
+
+    def _seed() -> None:
+        with state_lock(app.paths.state_file):
+            state = load_state(app.paths.state_file)
+            state["prs"]["456"] = {
+                "number": 456,
+                "issue_number": 123,
+                "status": "escalated",
+                "escalation_reason": "session_failed_escalated",
+            }
+            state["issues"]["123"] = {
+                "number": 123,
+                "status": "escalated",
+                "escalation_reason": "session_failed_escalated",
+                "reason_class": "mechanical",
+            }
+            save_state(app.paths.state_file, state)
+
+    # Operator door.
+    _seed()
+    op_result = app.unescalate(pr_number=456)
+    assert op_result.ok and op_result.data["changed"] is True
+    operator_pr_status = load_state(app.paths.state_file)["prs"]["456"]["status"]
+
+    # Automated door -- re-seed the identical escalated state and run the
+    # sweep instead of the operator command.
+    _seed()
+    app._maybe_deescalate_mechanical()
+    automated_pr_status = load_state(app.paths.state_file)["prs"]["456"]["status"]
+
+    assert operator_pr_status == PASSIVE_OPEN_STATUS
+    assert automated_pr_status == PASSIVE_OPEN_STATUS
+    assert operator_pr_status == automated_pr_status
+
+
 def test_unescalate_clears_rework_stall_clock_for_both_lanes(tmp_path: Path) -> None:
     """A stall clock started during the exhausted episode must not survive the
     re-arm: _check_janitor_rework_stall restarts from utc_now() only when the
