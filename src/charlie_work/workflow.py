@@ -8051,15 +8051,12 @@ class OrchestratorApp:
                     # failure (e.g. draft + empty body) is not auto-readied
                     # -- `is_draft_only_block` is False -- but the park is
                     # still worth distinguishing from routine janitor_gate
-                    # bookkeeping so it's greppable via
-                    # query_events(kind="draft_pr_blocked") rather than a
-                    # manual `gh pr list` sweep.
+                    # bookkeeping so it's surfaced by heartbeat_check.py's
+                    # check_draft_pr_blocked_events (issue #1366) rather than
+                    # only a manual `gh pr list` sweep.
                     event_kind = "draft_pr_blocked" if verdict.is_draft else "janitor_gate"
                     state = self._record_event(
                         state,
-                        # event-consumer: pending #1366 -- draft_pr_blocked has no automated
-                        # consumer yet, only the query_events(kind=...) grep the comment above
-                        # names; janitor_gate (the other branch) is separately consumed
                         event_kind,
                         {"pr_number": pr_number, "failures": list(verdict.failures)},
                     )
