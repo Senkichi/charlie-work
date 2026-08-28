@@ -88,9 +88,16 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+# Marks in the baseline are multiples of this quantum (rounded UP from the
+# live count) -- see "Quantized marks" in the module docstring. Authoritative
+# declaration is in scripts/refresh_file_size_ratchet.py (the sole baseline
+# writer); tests/test_refresh_file_size_ratchet.py asserts the two agree.
+from _ratchet_constants import MARK_QUANTUM as MARK_QUANTUM
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _BASELINE_PATH = _REPO_ROOT / "file_size_ratchet_baseline.json"
@@ -99,12 +106,6 @@ _BASELINE_PATH = _REPO_ROOT / "file_size_ratchet_baseline.json"
 # ratchet's covered set. Same value the extraction lineage records cap-exemption
 # bands against (tests/test_stalled_review_reap_split.py).
 FILE_SIZE_CAP = 800
-
-# Marks in the baseline are multiples of this quantum (rounded UP from the
-# live count) -- see "Quantized marks" in the module docstring. Declared in
-# scripts/refresh_file_size_ratchet.py as well (the sole baseline writer);
-# tests/test_refresh_file_size_ratchet.py asserts the two constants agree.
-MARK_QUANTUM = 200
 
 # The facade re-export pattern a worker must follow instead of growing an
 # over-cap monolith. Names the domain modules the #1283 Phase-A extraction
@@ -368,7 +369,7 @@ def test_keystone_never_writes_the_baseline(
     write-on-shrink side effect dirtied the baseline on every local pytest
     run; workers committed the dirt per the preflight guidance, and those
     exact-count edits collided in merge after merge."""
-    import test_file_size_ratchet as mod
+    mod = sys.modules[__name__]
 
     baseline_file = tmp_path / "file_size_ratchet_baseline.json"
     original = json.dumps({"src/charlie_work/big.py": 1000}, indent=2) + "\n"

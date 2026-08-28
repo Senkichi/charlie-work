@@ -57,14 +57,16 @@ def test_quantize_mark_rounds_up_and_preserves_exact_multiples(refresh_mod) -> N
         assert refresh_mod._quantize_mark(lines) >= lines
 
 
-def test_mark_quantum_matches_the_ratchet_test_module(refresh_mod) -> None:
-    """Drift guard: MARK_QUANTUM is declared in both the script (the writer)
-    and tests/test_file_size_ratchet.py (the enforcement doc / remedy text).
-    Deterministic convergence -- concurrent PRs producing byte-identical
-    baseline lines -- only holds if every writer uses the same quantum."""
-    import test_file_size_ratchet as ratchet_test_mod
+def test_mark_quantum_matches_the_shared_test_constant(refresh_mod) -> None:
+    """Drift guard: MARK_QUANTUM is declared in the script (the writer) and in
+    tests/_ratchet_constants.py (imported by tests/test_file_size_ratchet.py
+    for the remedy text -- test modules may not import each other, so the
+    shared value lives in an underscore module). Deterministic convergence --
+    concurrent PRs producing byte-identical baseline lines -- only holds if
+    every writer uses the same quantum."""
+    from _ratchet_constants import MARK_QUANTUM
 
-    assert refresh_mod.MARK_QUANTUM == ratchet_test_mod.MARK_QUANTUM
+    assert refresh_mod.MARK_QUANTUM == MARK_QUANTUM
 
 
 # ---------------------------------------------------------------------------

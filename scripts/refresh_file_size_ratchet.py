@@ -68,8 +68,8 @@ FILE_SIZE_CAP = 800
 # Marks are recorded as multiples of this quantum (rounded UP from the live
 # line count). Growth within a bucket needs no baseline edit; concurrent PRs
 # bumping a file into the same bucket write the identical value and merge
-# cleanly. tests/test_file_size_ratchet.py declares the same constant; the
-# script tests assert the two stay equal.
+# cleanly. tests/_ratchet_constants.py declares the same constant for the test
+# side; tests/test_refresh_file_size_ratchet.py asserts the two stay equal.
 MARK_QUANTUM = 200
 
 _BASELINE_NAME = "file_size_ratchet_baseline.json"
