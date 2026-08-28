@@ -824,3 +824,68 @@ def _extract_review_session_summary(
         tool_call_count=tool_call_count,
         terminating_cause=_extract_terminating_cause(events_path, log_path, exit_code=exit_code),
     )
+
+
+# Issue #1485: a verdict extracted from a dead reviewer's log/events/file
+# (verdict_source = "log", "events", or "file:<path>") was reconstructed
+# from an incomplete session, not emitted as a clean structured completion.
+# Such a verdict may contain factual claims (e.g. "already merged",
+# "duplicate", "byte-identical") that are objectively wrong because the
+# reviewer was cut off mid-analysis. A provenance caveat must accompany
+# these verdicts when they are surfaced as operator instructions, so a
+# human reading them knows to re-verify factual claims before acting on
+# a destructive-adjacent action like closing a PR.
+
+# The ``verdict_source`` values that indicate an extracted (reconstructed)
+# verdict rather than a clean structured completion. ``None`` means the
+# verdict was recorded by a direct caller (operator CLI, CI gate) with no
+# parser involved -- those are trusted. ``"log"``/``"events"``/``"file:*"``
+# all come from the reap path (``_reap_review_verdicts``) scraping a dead
+# reviewer's artifacts.
+_EXTRACTED_VERDICT_SOURCES: frozenset[str] = frozenset({"log", "events"})
+
+
+def is_extracted_verdict_source(verdict_source: str | None) -> bool:
+    """Return True when ``verdict_source`` indicates a reconstructed verdict.
+
+    A verdict with ``verdict_source`` of ``"log"``, ``"events"``, or
+    ``"file:<path>"`` was extracted from a dead reviewer's session
+    artifacts rather than emitted as a clean structured completion. Such
+    verdicts may be incomplete or contain objectively wrong factual claims
+    (issue #1485).
+
+    ``None`` (a direct operator/CI-gate call with no parser involved) is
+    NOT extracted -- those verdicts are trusted.
+    """
+    if verdict_source is None:
+        return False
+    if verdict_source in _EXTRACTED_VERDICT_SOURCES:
+        return True
+    return verdict_source.startswith("file:")
+
+
+def provenance_caveat_for(verdict_source: str | None) -> str | None:
+    """Return the provenance caveat text for an extracted verdict, or ``None``.
+
+    Issue #1485: when a review verdict was reconstructed from a partial
+    session log (``verdict_source`` = ``"log"``/``"events"``/``"file:*"``),
+    it may be incomplete or contain objectively wrong factual claims. This
+    returns a caveat string that callers should surface alongside the
+    verdict's ``required_changes`` so a human knows to re-verify before
+    acting.
+
+    Returns ``None`` for a non-extracted verdict (``verdict_source`` is
+    ``None``), so callers can conditionally render without a separate
+    ``is_extracted_verdict_source`` check.
+    """
+    if not is_extracted_verdict_source(verdict_source):
+        return None
+    return (
+        "**Provenance caveat (issue #1485):** This verdict was "
+        "reconstructed from a partial reviewer session log "
+        f"(verdict_source: {verdict_source}) and may be incomplete or "
+        'incorrect. Re-verify any factual claims (e.g. "already merged", '
+        '"duplicate", "byte-identical") before acting on them, '
+        "especially before taking destructive-adjacent actions like "
+        "closing a PR."
+    )

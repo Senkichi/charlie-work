@@ -328,6 +328,7 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     _REVIEW_FALLBACK_MTIME_SLACK_S,
     _REVIEW_FALLBACK_MAX_CANDIDATES,
     _DEFAULT_REVIEW_SESSION_LIMIT_MARKERS,
+    _EXTRACTED_VERDICT_SOURCES,
     _REVIEW_THROTTLE_TAIL_CHARS,
     _RESULT_EVENT_CAUSE_FIELDS,
     _validate_review_verdict,
@@ -343,6 +344,8 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     REVIEW_SESSION_FAILED_HEADING,
     REVIEW_SESSION_SUMMARY_HEADING,
     body_has_crash_signature,
+    is_extracted_verdict_source,
+    provenance_caveat_for,
 )
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -367,6 +370,7 @@ from .rework_prompts import (  # noqa: F401  (deliberate re-export)
     _finish_required_changes_section,
     _is_verdict_newer_than_brief,
     _next_round_number,
+    _provenance_caveat_from_decision,
     _read_review_decision,
     _render_external_findings_section,
     _render_required_changes_section,
@@ -11685,6 +11689,22 @@ class OrchestratorApp:
         # it absent (no parser was involved).
         if verdict_source is not None:
             decision_payload["verdict_source"] = verdict_source
+        # Issue #1485: when a verdict was extracted from a dead reviewer's
+        # session artifacts (verdict_source = "log"/"events"/"file:*") rather
+        # than emitted as a clean structured completion, it may be incomplete
+        # or contain objectively wrong factual claims (e.g. "already merged",
+        # "duplicate"). Persist a provenance caveat into the decision file so
+        # every downstream surface (PR comment, rework brief, round-history)
+        # can render it and a human knows to re-verify before acting on a
+        # destructive-adjacent action like closing a PR. Only applies to
+        # ``blocked``/``request_changes`` -- an ``approved`` verdict has no
+        # required_changes to caveat, and the issue scopes to verdicts that
+        # route to operator instructions.
+        provenance_caveat: str | None = None
+        if decision in {"request_changes", "blocked"}:
+            provenance_caveat = provenance_caveat_for(verdict_source)
+            if provenance_caveat is not None:
+                decision_payload["provenance_caveat"] = provenance_caveat
         decision_path = pr_dir / "review-decision.json"
         # Issue #1268 (W11): per-round archive directory. ``round_number`` is
         # declared here (rather than inside the lock below) so it survives
@@ -12132,6 +12152,14 @@ class OrchestratorApp:
             body_parts = [header]
             if summary_text:
                 body_parts.append(summary_text)
+            # Issue #1485: surface the provenance caveat in the PR comment
+            # before the required-changes section so an operator reading it
+            # knows to re-verify factual claims before acting. ``provenance_
+            # caveat`` is computed above (near the decision_payload build)
+            # and is only set for log-extracted blocked/request_changes
+            # verdicts.
+            if provenance_caveat is not None:
+                body_parts.append(provenance_caveat)
             # Issue #792's `findings_channel == "derived"` marker (set above,
             # ~15326) means `effective_required_changes` is not a real
             # structured list -- it is `[summary_text.strip()]`, the exact
