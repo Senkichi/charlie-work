@@ -53353,6 +53353,20 @@ def test_orphaned_worker_salvage_push_threads_dry_run_to_salvage_push_stranded_c
             ]
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
+    # Issue #1229: the branch-issue validator in _detect_and_handle_orphaned_workers
+    # rejects branch-name bindings to issues absent from the open-issue list, so
+    # #1326 must be seeded as an OPEN issue for the pr_by_issue binding to survive
+    # and the salvage loop to fire.
+    fake_gh.issues.append(
+        {
+            "number": 1326,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1326",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     salvage_calls: list[dict[str, Any]] = []
 

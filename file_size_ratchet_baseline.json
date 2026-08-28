@@ -25,7 +25,7 @@
   "src/charlie_work/worktree.py": 5459,
   "tests/test_api_budget.py": 1076,
   "tests/test_api_worker.py": 891,
-  "tests/test_charlie_work.py": 54107,
+  "tests/test_charlie_work.py": 54355,
   "tests/test_checks.py": 920,
   "tests/test_claude_code_adapter.py": 4362,
   "tests/test_cli.py": 3599,
