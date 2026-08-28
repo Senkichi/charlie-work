@@ -585,3 +585,81 @@ def test_is_transient_repo_resolution_failure_classifier() -> None:
     # Unrelated: not transient repo failure.
     assert not is_transient_repo_resolution_failure("http 404")
     assert not is_transient_repo_resolution_failure("network timeout")
+
+
+# ---------------------------------------------------------------------------
+# Legacy marker backward-compat (pre-#1132 deploy-time state.json)
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_marker_without_confirmations_skipped_silently(tmp_path: Path) -> None:
+    """A pre-#1132 ``foreign_issue_ref`` marker planted directly into
+    state.json (no ``confirmations`` key — the shape production state.json
+    entries have on deploy) is treated as already-confirmed by the
+    ``_loop_body`` early-skip: the PR is skipped with zero ``issue_view``
+    calls and no digest re-emission, and the marker is left untouched (no
+    ``confirmations`` key is written).
+
+    This is the deploy-time backward-compat contract: existing parks are not
+    re-processed, re-confirmed, or re-alerted. It also demonstrates that the
+    ``same_issue and prev_conf is None`` branch in ``_mark_foreign_issue_ref``
+    is unreachable via the loop — the early-skip (``confirmed =
+    confirmations is None or ...``) handles legacy markers before that method
+    is ever called, so the marker is never migrated.
+    """
+    config = _foreign_pr_config()
+    fake_gh = _PermanentIssueNotFoundGitHub()
+    app = _make_app(tmp_path, fake_gh, config)
+
+    import charlie_work.workflow as wf_mod
+
+    original_emit = wf_mod.emit_digest
+    captured: list[Any] = []
+
+    def _capture(notify_config, digest):
+        captured.append(digest)
+
+    wf_mod.emit_digest = _capture
+    try:
+        # Plant a pre-#1132 legacy marker directly into state.json: no
+        # ``confirmations`` key. Use a recent detected_at so the reprobe
+        # cadence has NOT elapsed (reprobe_hours default 24) and the
+        # confirmed-marker skip path is taken without any issue_view call.
+        now_ts = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        with wf_mod.state_lock(app.paths.state_file):
+            state = load_state(app.paths.state_file)
+            state["prs"]["1586"] = {
+                "number": 1586,
+                "foreign_issue_ref": {
+                    "issue": 1576,
+                    "detected_at": now_ts,
+                    "reason": "pre-#1132 legacy park",
+                },
+            }
+            save_state(app.paths.state_file, state)
+
+        # Run a loop pass.
+        result = app.loop(limit=0)
+
+        # The PR is skipped (parked) with zero issue_view calls — the
+        # legacy marker is treated as confirmed and never re-probed (cadence
+        # not elapsed) nor re-confirmed.
+        assert fake_gh.issue_view_calls == 0
+        assert result.data["parked_prs"] == [1586]
+
+        # No digest re-emission — the legacy park was already alerted when
+        # first written; it must not re-fire on every pass.
+        assert captured == []
+
+        # The marker is unchanged: still no ``confirmations`` key. The
+        # early-skip path does not migrate the field, and
+        # ``_mark_foreign_issue_ref`` was never called (proving its
+        # ``same_issue and prev_conf is None`` branch is unreachable via
+        # the loop).
+        state = load_state(app.paths.state_file)
+        marker = state["prs"]["1586"]["foreign_issue_ref"]
+        assert "confirmations" not in marker
+        assert marker["issue"] == 1576
+        assert marker["detected_at"] == now_ts
+    finally:
+        wf_mod.emit_digest = original_emit

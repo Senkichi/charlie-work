@@ -3932,3 +3932,73 @@ def test_main_annotates_all_consumers_when_fleet_status_degrades(
             f"armable-backlog {slug}:" in line and degraded_marker in line
             for line in output.splitlines()
         ), f"armable-backlog {slug} missing degraded caveat in:\n{output}"
+
+
+# ---------------------------------------------------------------------------
+# Issue #1463 round-3: get_blocked_issue_numbers reads cache freshness
+# ---------------------------------------------------------------------------
+
+
+class _FakeStatusProc:
+    def __init__(self, *, stdout: str) -> None:
+        self.returncode = 0
+        self.stdout = stdout
+        self.stderr = ""
+
+
+def _fleet_status_payload(*, cache_age_seconds: float | None) -> str:
+    """Build a ``charlie fleet status --json`` payload with one repo."""
+    repo_data: dict[str, Any] = {
+        "ready_issue_count": 3,
+        "blocked": [{"issue": 42, "blockers": []}],
+        "cache_age_seconds": cache_age_seconds,
+    }
+    return json.dumps(
+        {"ok": True, "message": "fleet status", "data": {"repos": {"owner/repo": repo_data}}}
+    )
+
+
+def test_get_blocked_issue_numbers_warns_on_stale_cache(
+    hb: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round-3 review: ``get_blocked_issue_numbers`` must read
+    ``cache_age_seconds`` and return a staleness warning when the cache is
+    older than ``STATUS_CACHE_STALE_SECONDS``. The blocked data is still
+    returned (it is the best available) — only the error string signals
+    degradation so downstream checks annotate their output."""
+    payload = _fleet_status_payload(cache_age_seconds=900.0)
+    monkeypatch.setattr(hb.subprocess, "run", lambda *a, **k: _FakeStatusProc(stdout=payload))
+
+    blocked, err = hb.get_blocked_issue_numbers(tmp_path)
+
+    assert blocked == {"owner/repo": {42}}, "blocked data must still be returned"
+    assert "stale" in err.lower(), f"expected staleness warning in err; got: {err!r}"
+    assert "900" in err, f"expected cache age in warning; got: {err!r}"
+
+
+def test_get_blocked_issue_numbers_no_warning_on_fresh_cache(
+    hb: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A fresh cache (age ≤ ``STATUS_CACHE_STALE_SECONDS``) must NOT produce a
+    staleness warning — the error string is empty, same as a live response."""
+    payload = _fleet_status_payload(cache_age_seconds=30.0)
+    monkeypatch.setattr(hb.subprocess, "run", lambda *a, **k: _FakeStatusProc(stdout=payload))
+
+    blocked, err = hb.get_blocked_issue_numbers(tmp_path)
+
+    assert blocked == {"owner/repo": {42}}
+    assert err == "", f"fresh cache must not produce a warning; got: {err!r}"
+
+
+def test_get_blocked_issue_numbers_no_warning_on_live_response(
+    hb: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A live response (``cache_age_seconds=None``) must NOT produce a
+    staleness warning — there is no cache to be stale."""
+    payload = _fleet_status_payload(cache_age_seconds=None)
+    monkeypatch.setattr(hb.subprocess, "run", lambda *a, **k: _FakeStatusProc(stdout=payload))
+
+    blocked, err = hb.get_blocked_issue_numbers(tmp_path)
+
+    assert blocked == {"owner/repo": {42}}
+    assert err == "", f"live response must not produce a warning; got: {err!r}"

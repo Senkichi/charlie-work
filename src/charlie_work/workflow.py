@@ -55,7 +55,7 @@ from .config import (
 from .env_sanitize import worker_github_token_findings
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, managed_repo_names, try_acquire_fleet_lock
-from . import layout
+from . import layout, status_snapshot
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from . import rescue as rescue_helpers
@@ -4330,7 +4330,9 @@ class OrchestratorApp:
         )
 
     @_guard_state_lock
-    def status(self) -> CommandResult:
+    def status(self, *, use_cache: bool = True) -> CommandResult:
+        if use_cache and (cached := status_snapshot.read_status_snapshot(self)) is not None:
+            return cached
         issues = self.gh.issue_list(self.config.labels.ready)
         prs = self.gh.pr_list()
         state = load_state_locked(self.paths.state_file)
@@ -4439,6 +4441,8 @@ class OrchestratorApp:
                 operator_claimed,
                 ready_open_count=len(issues),
             ),
+            "snapshot_written_at": None,
+            "cache_age_seconds": None,
         }
 
         # Add runners section if feature is enabled and observation succeeded
@@ -17691,7 +17695,16 @@ class OrchestratorApp:
         window (minutes) clears before two 5-minute passes complete.
 
         Legacy markers (pre-#1132, no ``confirmations`` field) are treated as
-        already-confirmed so existing parks are not re-processed.
+        already-confirmed by the early-skip in ``_loop_body`` (``confirmed =
+        confirmations is None or ...``), so they never reach this method via
+        the loop. The ``same_issue and prev_conf is None`` branch below is a
+        defensive guard kept for direct/non-loop call sites: without it a
+        legacy marker would hit ``prev_conf + 1`` (``None + 1`` -> TypeError)
+        and could re-emit the one-shot digest. It does NOT silently migrate
+        the field on existing production markers — that handling lives in the
+        early-skip, which leaves the marker untouched (no ``confirmations``
+        key is written). See
+        ``test_legacy_marker_without_confirmations_skipped_silently``.
 
         Returns True only when the confirmation threshold is first reached for
         this (pr, issue) pair, so the caller emits the one-shot attention
@@ -17705,9 +17718,14 @@ class OrchestratorApp:
             same_issue = marker.get("issue") == issue_number
             prev_conf = marker.get("confirmations")
             if same_issue and prev_conf is None:
-                # Legacy marker (pre-#1132, no confirmations field): already
-                # confirmed. Migrate the field silently; do not re-emit the
-                # digest (it was emitted when the marker was first written).
+                # Defensive guard for a legacy marker (pre-#1132, no
+                # ``confirmations`` field) reaching this method via a
+                # non-loop call site. Unreachable via ``_loop_body``: the
+                # early-skip there treats ``confirmations is None`` as
+                # confirmed and skips before this method is called, leaving
+                # the marker untouched (no migration). Kept to avoid a
+                # ``None + 1`` TypeError on the ``elif same_issue`` branch
+                # and to suppress a spurious digest re-emit.
                 new_conf = confirm_passes
                 emit = False
             elif same_issue:
@@ -17945,6 +17963,8 @@ class OrchestratorApp:
                 sink_arrivals=sink_arrivals,
                 sink_clears=sink_clears,
             )
+            if not self.dry_run:
+                status_snapshot.write_status_snapshot(self)
             return result
 
     def _maybe_probe_quota_recovery(self, *, now: datetime | None = None) -> None:
