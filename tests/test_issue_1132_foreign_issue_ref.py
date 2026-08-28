@@ -370,6 +370,92 @@ def test_self_heal_touches_clock_when_still_not_found(tmp_path: Path) -> None:
         wf_mod.emit_digest = original_emit
 
 
+class _RepoResolutionFailureOnViewGitHub(FakeGitHub):
+    """``issue_view`` raises a transient repository-level resolution failure.
+
+    Used to exercise the reprobe path: a parked marker is re-probed, and the
+    reprobe itself hits a transient ``Could not resolve to a Repository``
+    failure (the same shape as the #1132 incident). This must NOT reset the
+    re-probe clock — a transient failure is not evidence the issue is absent.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.issues = []
+        self.prs = [_foreign_pr()]
+        self.issue_view_calls = 0
+
+    def issue_view(self, number: int):
+        if number == 1576:
+            self.issue_view_calls += 1
+            raise GitHubNotFoundError(
+                "GraphQL: Could not resolve to a Repository with the name "
+                "'Senkichi/job-cannon'. (repository)"
+            )
+        return super().issue_view(number)
+
+
+def test_self_heal_transient_failure_during_reprobe_leaves_clock_untouched(
+    tmp_path: Path,
+) -> None:
+    """A transient repository-level resolution failure occurring *during*
+    reprobe must leave the marker and the re-probe clock untouched, matching
+    the treatment the main per-PR park decision gives a transient failure.
+
+    Before this fix, the reprobe path's ``except GitHubNotFoundError`` handler
+    treated every not-found — including a transient repo-resolution failure —
+    as "genuinely absent" and reset ``last_reprobe_at``. That reintroduced the
+    #1132 root-cause conflation (bounded by the reprobe cadence, not infinite):
+    a transient dip during reprobe would push the next reprobe out by a full
+    cadence window even though the issue's absence was never confirmed.
+    """
+    from charlie_work.state import state_lock
+
+    config = _foreign_pr_config(
+        foreign_issue_ref_confirm_passes=1,
+        foreign_issue_ref_reprobe_hours=24,
+    )
+    # Park with a permanent issue-level 404 first.
+    fake_gh = _PermanentIssueNotFoundGitHub()
+    app = _make_app(tmp_path, fake_gh, config)
+
+    import charlie_work.workflow as wf_mod
+
+    original_emit = wf_mod.emit_digest
+    wf_mod.emit_digest = lambda notify_config, digest: None
+    try:
+        # Park the PR (confirm_passes=1, permanent issue-level 404).
+        app.loop(limit=0)
+
+        # Plant an old detected_at so the reprobe cadence has elapsed.
+        old_ts = (datetime.now(UTC) - timedelta(hours=25)).isoformat().replace("+00:00", "Z")
+        with state_lock(app.paths.state_file):
+            state = load_state(app.paths.state_file)
+            state["prs"]["1586"]["foreign_issue_ref"]["detected_at"] = old_ts
+            save_state(app.paths.state_file, state)
+
+        # Swap in a fake that raises a transient repo-resolution failure on
+        # issue_view — the reprobe itself hits the #1132 incident shape.
+        app.gh = _RepoResolutionFailureOnViewGitHub()
+
+        # Pass 2: reprobe fires, hits a transient repo-resolution failure.
+        result2 = app.loop(limit=0)
+        state = load_state(app.paths.state_file)
+        # Marker still present.
+        assert "foreign_issue_ref" in state["prs"]["1586"]
+        # The re-probe clock was NOT reset — a transient failure is not
+        # evidence the issue is absent, so the next cadence window retries
+        # from the same anchor (detected_at), not from now.
+        assert "last_reprobe_at" not in state["prs"]["1586"]["foreign_issue_ref"]
+        # detected_at is preserved untouched.
+        assert state["prs"]["1586"]["foreign_issue_ref"]["detected_at"] == old_ts
+
+        # The PR is still parked.
+        assert 1586 in result2.data.get("parked_prs", [])
+    finally:
+        wf_mod.emit_digest = original_emit
+
+
 def test_self_heal_disabled_when_reprobe_hours_zero(tmp_path: Path) -> None:
     """When ``foreign_issue_ref_reprobe_hours=0``, self-heal is disabled —
     the marker is never re-probed and the PR stays parked."""

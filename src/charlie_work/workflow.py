@@ -19370,7 +19370,21 @@ class OrchestratorApp:
                             )
                             # Fall through to per-PR processing below; the
                             # marker has been cleared so the try block runs.
-                        except GitHubNotFoundError:
+                        except GitHubNotFoundError as exc:
+                            # Issue #1132: ``GitHubNotFoundError`` conflates a
+                            # permanent issue-level 404 with a transient
+                            # repository-level resolution failure (same
+                            # conflation the main per-PR park decision above
+                            # guards against). A transient repo-resolution
+                            # failure during reprobe is NOT evidence the issue
+                            # is absent — leave the marker AND the re-probe
+                            # clock untouched so the next cadence window retries
+                            # from the same anchor, matching the
+                            # ``GitHubError`` handler below. Only a permanent
+                            # issue-level 404 resets the re-probe clock.
+                            if is_transient_repo_resolution_failure(str(exc)):
+                                parked_prs.append(pr_number)
+                                continue
                             # Still genuinely not found — reset the re-probe
                             # clock so the next check is gated from now.
                             _touch_foreign_issue_ref_marker(
