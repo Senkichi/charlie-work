@@ -1,0 +1,169 @@
+{
+ "available_month_labels": [
+  "2026-07",
+  "2026-08"
+ ],
+ "cluster_b_detail": "128 module(s) scanned with no AP archetype matched at all: d28ce28f0eae42ce1da0eba742f41cf24966f24d:src/devin_orchestrator/__init__.py, d28ce28f0eae42ce1da0eba742f41cf24966f24d:src/devin_orchestrator/__main__.py, d28ce28f0eae42ce1da0eba742f41cf24966f24d:src/devin_orchestrator/cli.py, d28ce28f0eae42ce1da0eba742f41cf24966f24d:src/devin_orchestrator/prompts.py, d28ce28f0eae42ce1da0eba742f41cf24966f24d:src/devin_orchestrator/state.py, 197a85b49a812715a4a872551d0fec538bd1e9ea:src/charlie_work/__init__.py, 197a85b49a812715a4a872551d0fec538bd1e9ea:src/charlie_work/__main__.py, 197a85b49a812715a4a872551d0fec538bd1e9ea:src/charlie_work/api_worker.py, 197a85b49a812715a4a872551d0fec538bd1e9ea:src/charlie_work/cli.py, 197a85b49a812715a4a872551d0fec538bd1e9ea:src/charlie_work/env_sanitize.py",
+ "cluster_b_score": 128,
+ "criteria": [
+  {
+   "detail": "saturated at all 4 samples where present",
+   "name": "orchestrator_saturated",
+   "passed": true
+  },
+  {
+   "detail": "saturated at all 4 samples where present",
+   "name": "test_charlie_work_saturated",
+   "passed": true
+  },
+  {
+   "detail": "saturated at all 3 anchor samples",
+   "name": "test_worktree_saturated_at_anchors",
+   "passed": true
+  },
+  {
+   "detail": "zero false-positive saturations; positive control: 13/13 counterexample module(s) were present in the tree at some sample (queried)",
+   "name": "counterexamples_clean",
+   "passed": true
+  }
+ ],
+ "passed": true,
+ "requested_months": 6,
+ "samples": [
+  {
+   "date": "2026-07-01",
+   "label": "2026-07",
+   "parse_failures": [],
+   "point_count": 22,
+   "saturated": [],
+   "saturated_count": 0,
+   "sha": "d28ce28f0eae42ce1da0eba742f41cf24966f24d"
+  },
+  {
+   "date": "2026-08-01",
+   "label": "2026-08",
+   "parse_failures": [],
+   "point_count": 442,
+   "saturated": [
+    "class:src/charlie_work/github.py:GitHub",
+    "class:src/charlie_work/workflow.py:OrchestratorApp",
+    "test_module:tests/test_charlie_work.py:tests/test_charlie_work.py::module",
+    "test_module:tests/test_claude_code_adapter.py:tests/test_claude_code_adapter.py::module",
+    "test_module:tests/test_fleet_dispatch.py:tests/test_fleet_dispatch.py::module",
+    "test_module:tests/test_janitor.py:tests/test_janitor.py::module",
+    "test_module:tests/test_reconcile.py:tests/test_reconcile.py::module",
+    "test_module:tests/test_runner_allocation.py:tests/test_runner_allocation.py::module",
+    "test_module:tests/test_worktree.py:tests/test_worktree.py::module"
+   ],
+   "saturated_count": 9,
+   "sha": "197a85b49a812715a4a872551d0fec538bd1e9ea"
+  },
+  {
+   "date": "2026-08-16",
+   "label": "anchor",
+   "parse_failures": [],
+   "point_count": 589,
+   "saturated": [
+    "class:src/charlie_work/github.py:GitHub",
+    "class:src/charlie_work/wedge_watchdog.py:WedgeWatchdog",
+    "class:src/charlie_work/workflow.py:OrchestratorApp",
+    "test_module:tests/test_api_budget.py:tests/test_api_budget.py::module",
+    "test_module:tests/test_charlie_work.py:tests/test_charlie_work.py::module",
+    "test_module:tests/test_claude_code_adapter.py:tests/test_claude_code_adapter.py::module",
+    "test_module:tests/test_cli.py:tests/test_cli.py::module",
+    "test_module:tests/test_config.py:tests/test_config.py::module",
+    "test_module:tests/test_devin_shell.py:tests/test_devin_shell.py::module",
+    "test_module:tests/test_doctor.py:tests/test_doctor.py::module",
+    "test_module:tests/test_fleet_dispatch.py:tests/test_fleet_dispatch.py::module",
+    "test_module:tests/test_github.py:tests/test_github.py::module",
+    "test_module:tests/test_heartbeat_check.py:tests/test_heartbeat_check.py::module",
+    "test_module:tests/test_instrumentation.py:tests/test_instrumentation.py::module",
+    "test_module:tests/test_janitor.py:tests/test_janitor.py::module",
+    "test_module:tests/test_merge_preflight_hook.py:tests/test_merge_preflight_hook.py::module",
+    "test_module:tests/test_post_mortem.py:tests/test_post_mortem.py::module",
+    "test_module:tests/test_prompt_sections.py:tests/test_prompt_sections.py::module",
+    "test_module:tests/test_reconcile.py:tests/test_reconcile.py::module",
+    "test_module:tests/test_state_dir_migration.py:tests/test_state_dir_migration.py::module",
+    "test_module:tests/test_supervise.py:tests/test_supervise.py::module",
+    "test_module:tests/test_worker_health.py:tests/test_worker_health.py::module",
+    "test_module:tests/test_worktree.py:tests/test_worktree.py::module"
+   ],
+   "saturated_count": 23,
+   "sha": "1ead8585f58f832c5442dc3d7173a662348e150a"
+  },
+  {
+   "date": "2026-08-17",
+   "label": "anchor",
+   "parse_failures": [],
+   "point_count": 628,
+   "saturated": [
+    "class:src/charlie_work/github.py:GitHub",
+    "class:src/charlie_work/wedge_watchdog.py:WedgeWatchdog",
+    "class:src/charlie_work/workflow.py:OrchestratorApp",
+    "test_module:tests/test_api_budget.py:tests/test_api_budget.py::module",
+    "test_module:tests/test_charlie_work.py:tests/test_charlie_work.py::module",
+    "test_module:tests/test_checks.py:tests/test_checks.py::module",
+    "test_module:tests/test_claude_code_adapter.py:tests/test_claude_code_adapter.py::module",
+    "test_module:tests/test_cli.py:tests/test_cli.py::module",
+    "test_module:tests/test_config.py:tests/test_config.py::module",
+    "test_module:tests/test_devin_shell.py:tests/test_devin_shell.py::module",
+    "test_module:tests/test_doctor.py:tests/test_doctor.py::module",
+    "test_module:tests/test_fleet_dispatch.py:tests/test_fleet_dispatch.py::module",
+    "test_module:tests/test_github.py:tests/test_github.py::module",
+    "test_module:tests/test_heartbeat_check.py:tests/test_heartbeat_check.py::module",
+    "test_module:tests/test_instrumentation.py:tests/test_instrumentation.py::module",
+    "test_module:tests/test_janitor.py:tests/test_janitor.py::module",
+    "test_module:tests/test_merge_preflight_hook.py:tests/test_merge_preflight_hook.py::module",
+    "test_module:tests/test_post_mortem.py:tests/test_post_mortem.py::module",
+    "test_module:tests/test_prompt_sections.py:tests/test_prompt_sections.py::module",
+    "test_module:tests/test_reconcile.py:tests/test_reconcile.py::module",
+    "test_module:tests/test_state_dir_migration.py:tests/test_state_dir_migration.py::module",
+    "test_module:tests/test_supervise.py:tests/test_supervise.py::module",
+    "test_module:tests/test_worker.py:tests/test_worker.py::module",
+    "test_module:tests/test_worker_health.py:tests/test_worker_health.py::module",
+    "test_module:tests/test_worker_stop_gate.py:tests/test_worker_stop_gate.py::module",
+    "test_module:tests/test_worktree.py:tests/test_worktree.py::module"
+   ],
+   "saturated_count": 26,
+   "sha": "7373d47b2d0cf4612dd5600de9f66c320000ac1f"
+  },
+  {
+   "date": "2026-08-23",
+   "label": "anchor",
+   "parse_failures": [],
+   "point_count": 697,
+   "saturated": [
+    "class:src/charlie_work/github.py:GitHub",
+    "class:src/charlie_work/wedge_watchdog.py:WedgeWatchdog",
+    "class:src/charlie_work/workflow.py:OrchestratorApp",
+    "test_module:tests/test_api_budget.py:tests/test_api_budget.py::module",
+    "test_module:tests/test_charlie_work.py:tests/test_charlie_work.py::module",
+    "test_module:tests/test_checks.py:tests/test_checks.py::module",
+    "test_module:tests/test_claude_code_adapter.py:tests/test_claude_code_adapter.py::module",
+    "test_module:tests/test_cli.py:tests/test_cli.py::module",
+    "test_module:tests/test_config.py:tests/test_config.py::module",
+    "test_module:tests/test_devin_shell.py:tests/test_devin_shell.py::module",
+    "test_module:tests/test_doctor.py:tests/test_doctor.py::module",
+    "test_module:tests/test_fleet_dispatch.py:tests/test_fleet_dispatch.py::module",
+    "test_module:tests/test_github.py:tests/test_github.py::module",
+    "test_module:tests/test_heartbeat_check.py:tests/test_heartbeat_check.py::module",
+    "test_module:tests/test_instrumentation.py:tests/test_instrumentation.py::module",
+    "test_module:tests/test_janitor.py:tests/test_janitor.py::module",
+    "test_module:tests/test_merge_preflight_hook.py:tests/test_merge_preflight_hook.py::module",
+    "test_module:tests/test_post_mortem.py:tests/test_post_mortem.py::module",
+    "test_module:tests/test_process_utils.py:tests/test_process_utils.py::module",
+    "test_module:tests/test_prompt_sections.py:tests/test_prompt_sections.py::module",
+    "test_module:tests/test_reconcile.py:tests/test_reconcile.py::module",
+    "test_module:tests/test_routing.py:tests/test_routing.py::module",
+    "test_module:tests/test_state_dir_migration.py:tests/test_state_dir_migration.py::module",
+    "test_module:tests/test_supervise.py:tests/test_supervise.py::module",
+    "test_module:tests/test_worker.py:tests/test_worker.py::module",
+    "test_module:tests/test_worker_health.py:tests/test_worker_health.py::module",
+    "test_module:tests/test_worker_stop_gate.py:tests/test_worker_stop_gate.py::module",
+    "test_module:tests/test_worktree.py:tests/test_worktree.py::module"
+   ],
+   "saturated_count": 28,
+   "sha": "9de0b9fc14279ef3578424bfb8fa6687d6eb12a9"
+  }
+ ]
+}

@@ -44,7 +44,8 @@ markers = [
 line-length = 99
 src = ["src", "tests"]
 # Frozen reference copies from the archived freecode repo — docs, not live code.
-extend-exclude = ["docs/freecode-salvage/reference"]
+# scratchpad/ is untracked ad-hoc investigation scratch, not source.
+extend-exclude = ["docs/freecode-salvage/reference", "scratchpad"]
 
 [tool.uv.sources]
 ci-fleet = { path = "../ci_runners", editable = true }

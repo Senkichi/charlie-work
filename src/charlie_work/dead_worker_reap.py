@@ -98,7 +98,11 @@ from .closing_reference import (
     closing_issues_referenced_numbers,
     validate_closing_reference,
 )
-from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
+from .config import (
+    DETERMINISTIC_ESCALATION_FAILURE_KINDS,
+    DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
+    OrchestratorConfig,
+)
 from .cross_repo_gate import cross_repo_scope_gate
 from .dispatch_selection import _windowed_redispatch_at, _windowed_worker_death_at
 from .escalation import _escalate_issue, _escalation_edge
@@ -115,22 +119,19 @@ from .paths import resolved_layout
 from .pr_create_retry import create_pr_with_retry
 from .process_utils import (
     is_pid_alive,
-    kill_orphan_pid,
-    kill_process_tree,
     sweep_orphan_processes,
 )
 from .review_decision import review_decision
 from .rework_prompts import _write_rework_prompt
 from .state import (
-    append_event,
     load_state,
     load_state_locked,
-    save_state,
     set_throttled_until,
     state_lock,
 )
 from .worker import WorkerHealth, WorkerView
 from .worktree import (
+    WORKTREE_UNSAFE_KINDS,
     SalvagePushResult,
     inspect_worktree_state,
     push_branch,
@@ -455,6 +456,7 @@ def _detect_and_handle_stalled_sessions(
     state_file: Path,
     config: OrchestratorConfig,
     *,
+    write_gate: WriteGate,
     now: datetime | None = None,
 ) -> list[dict[str, int]]:
     """Detect stalled sessions (live PID but dead agent) and handle them.
@@ -496,7 +498,25 @@ def _detect_and_handle_stalled_sessions(
 
     Returns a list of {issue, pid} dicts for stalled sessions (for exclusion from
     dispatch in the same pass).
+
+    Issue #1325: all process kills (``kill_process_tree``,
+    ``kill_orphan_pid``), state/event writes (``append_event``,
+    ``save_state``), and sidecar writes (``update_worker_log_stat``, the
+    budget-exceeded sidecar write, ``classify_and_record``,
+    ``update_session_record_with_failure_classification`` /
+    ``update_worker_record_with_failure_classification``) are gated on
+    ``write_gate.dry_run`` so a ``dry_run=True`` gate suppresses them
+    exactly as ``--dry-run`` promises. The sidecar-writing helpers
+    themselves do not accept a ``write_gate``/``dry_run`` parameter; they
+    are gated at the call site instead, keeping the change scoped to this
+    function (the subject of #1325) and avoiding a caller sweep across
+    the dead-session lane and other consumers that intentionally write
+    sidecars unconditionally. The ``write_gate`` parameter follows the
+    Convention B explicit-threading pattern (``require_write_gate()``)
+    already used by ``_sweep_orphan_processes_for_dead_sessions`` and the
+    dead-session lane.
     """
+    write_gate = require_write_gate(write_gate)
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import (
         get_rate_limit_defer_until,
@@ -543,7 +563,15 @@ def _detect_and_handle_stalled_sessions(
 
         # Update log stat fields for progress tracking. This also clears any
         # stale rate-limit defer deadline when the log has resumed growing.
-        update_worker_log_stat(sessions_dir, w)
+        # Issue #1325: gated on ``write_gate.dry_run`` so the sidecar is not
+        # mutated under ``--dry-run``. Detection (``classify_worker_health``,
+        # ``real_activity_probe_for``) operates on the pre-fetched
+        # ``WorkerView`` from ``iter_workers`` and does not re-read the
+        # sidecar, so skipping this write does not affect this pass's
+        # classification — it only suppresses the sidecar mutation for the
+        # next pass, which is exactly what ``--dry-run`` promises.
+        if not write_gate.dry_run:
+            update_worker_log_stat(sessions_dir, w)
 
         # Issues #280/#301: corroborate sidecar mtime against real-session activity
         # (sessions.db message_nodes, per-PID Devin log mtime, and Claude Code
@@ -566,7 +594,11 @@ def _detect_and_handle_stalled_sessions(
         # period and was the very mechanism that opened Finding 1's pass-2
         # phantom-sidecar window.
         new_count = _next_inconclusive_probe_deferred_count(w, probe, health)
-        update_worker_log_stat(sessions_dir, w, inconclusive_probe_deferred_count=new_count)
+        # Issue #1325: gated on ``write_gate.dry_run`` so the sidecar is not
+        # mutated under ``--dry-run``. The counter is a persisted cross-pass
+        # escalation cap; under dry-run it must not advance on disk.
+        if not write_gate.dry_run:
+            update_worker_log_stat(sessions_dir, w, inconclusive_probe_deferred_count=new_count)
 
         # Issue #484: in-flight api per-session budget kill. Independent of the
         # STALLED/DEAD classification below — an api worker over its
@@ -578,14 +610,16 @@ def _detect_and_handle_stalled_sessions(
         # 0/unset the check is entirely dormant. Non-api workers are never
         # budget-evaluated. The kill uses the shared ``kill_process_tree``
         # helper (no-console-window discipline on Windows, full process tree
-        # reaped) — not reimplemented here.
+        # reaped) — not reimplemented here. Issue #1325: both the tree kill
+        # and the orphan kill now route through ``write_gate`` so
+        # ``dry_run=True`` suppresses them.
         if w.adapter_kind == "api" and _api_session_over_budget(w, config):
-            killed_pids = kill_process_tree(w.pid, w.process_start_time)
+            killed_pids = write_gate.kill_process_tree(w.pid, w.process_start_time)
             orphan_pids_budget: list[int] = []
             orphan_processes = sweep_orphan_processes(w.worktree_path)
             if orphan_processes:
                 for orphan in orphan_processes:
-                    kill_orphan_pid(orphan["pid"])
+                    write_gate.kill_process(orphan["pid"])
                     killed_pids.append(orphan["pid"])
                 orphan_pids_budget = [o["pid"] for o in orphan_processes]
 
@@ -595,23 +629,25 @@ def _detect_and_handle_stalled_sessions(
             # budget-exceeded verdict is not overridden by a coincidental
             # throttle/auth log-tail match. The dead-session lane's
             # classification call then short-circuits on the already-set
-            # failure_kind.
+            # failure_kind. Issue #1325: gated on ``write_gate.dry_run`` so
+            # the sidecar is not mutated under ``--dry-run``.
             from .claude_code import _sidecar_path as _api_sidecar_path
             from .claude_code import _write_json_atomic as _api_write_json_atomic
 
             api_sidecar = _api_sidecar_path(sessions_dir, w.issue_number, "api")
-            try:
-                with api_sidecar.open("r", encoding="utf-8") as handle:
-                    api_payload = json.load(handle)
-                if isinstance(api_payload, dict):
-                    api_payload["failure_kind"] = "budget_exceeded"
-                    _api_write_json_atomic(api_sidecar, api_payload)
-            except (OSError, json.JSONDecodeError):
-                pass
+            if not write_gate.dry_run:
+                try:
+                    with api_sidecar.open("r", encoding="utf-8") as handle:
+                        api_payload = json.load(handle)
+                    if isinstance(api_payload, dict):
+                        api_payload["failure_kind"] = "budget_exceeded"
+                        _api_write_json_atomic(api_sidecar, api_payload)
+                except (OSError, json.JSONDecodeError):
+                    pass
 
             with state_lock(state_file):
                 state = load_state(state_file)
-                state = append_event(
+                state = write_gate.append_event(
                     state,
                     "session_budget_exceeded",
                     {
@@ -622,9 +658,8 @@ def _detect_and_handle_stalled_sessions(
                         "orphan_pids": orphan_pids_budget if orphan_pids_budget else None,
                         "provider": w.provider,
                     },
-                    state_path=state_file,
                 )
-                save_state(state_file, state)
+                write_gate.save_state(state)
 
             stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
             continue
@@ -649,7 +684,12 @@ def _detect_and_handle_stalled_sessions(
                         config.runtime.throttle_resume_margin_s,
                     )
                     if defer_until is not None:
-                        update_worker_log_stat(sessions_dir, w, rate_limit_defer_until=defer_until)
+                        # Issue #1325: gated on ``write_gate.dry_run`` so the
+                        # sidecar is not mutated under ``--dry-run``.
+                        if not write_gate.dry_run:
+                            update_worker_log_stat(
+                                sessions_dir, w, rate_limit_defer_until=defer_until
+                            )
                         with state_lock(state_file):
                             state = load_state(state_file)
                             state = set_throttled_until(
@@ -658,7 +698,7 @@ def _detect_and_handle_stalled_sessions(
                                 reason="rate_limited",
                                 adapter_kind=w.adapter_kind,
                             )
-                            state = append_event(
+                            state = write_gate.append_event(
                                 state,
                                 "session_rate_limit_deferred",
                                 {
@@ -666,22 +706,25 @@ def _detect_and_handle_stalled_sessions(
                                     "pid": w.pid,
                                     "defer_until": defer_until,
                                 },
-                                state_path=state_file,
                             )
-                            save_state(state_file, state)
+                            write_gate.save_state(state)
                         continue
 
-            # Kill the process tree (with start-time verification to prevent PID recycling)
-            killed_pids = kill_process_tree(w.pid, w.process_start_time)
+            # Kill the process tree (with start-time verification to prevent PID recycling).
+            # Issue #1325: routed through ``write_gate.kill_process_tree`` so
+            # ``dry_run=True`` suppresses the kill (returns ``[]``).
+            killed_pids = write_gate.kill_process_tree(w.pid, w.process_start_time)
 
             # Sweep for orphan processes that survived the tree kill (Windows-only)
             # This catches detached/daemonized processes (e.g., nohup-style background processes)
             orphan_pids: list[int] = []
             orphan_processes = sweep_orphan_processes(w.worktree_path)
             if orphan_processes:
-                # Kill detected orphans to prevent them from running rejected code
+                # Kill detected orphans to prevent them from running rejected code.
+                # Issue #1325: routed through ``write_gate.kill_process`` so
+                # ``dry_run=True`` suppresses the kill.
                 for orphan in orphan_processes:
-                    kill_orphan_pid(orphan["pid"])
+                    write_gate.kill_process(orphan["pid"])
                     killed_pids.append(orphan["pid"])
                 orphan_pids = [o["pid"] for o in orphan_processes]
 
@@ -694,45 +737,59 @@ def _detect_and_handle_stalled_sessions(
             # existing "skip if already classified" short-circuit. Best-effort
             # and read-only: any DB problem degrades to extraction_error and
             # this never changes what happens next.
-            classify_and_record(sessions_dir, config, w, now=now)
+            # Issue #1325: gated on ``write_gate.dry_run`` so the sidecar is
+            # not mutated under ``--dry-run``. The return value is discarded
+            # at this call site, so suppressing the call has no downstream
+            # effect on this pass's event payload (which itself is suppressed
+            # under dry-run via ``write_gate.append_event``).
+            if not write_gate.dry_run:
+                classify_and_record(sessions_dir, config, w, now=now)
 
             # Classify the sidecar (adapter-specific dispatch): log-tail
             # classification runs first, falling back to failure_kind "stalled"
             # only when the log shows no provider throttle signature.
+            # Issue #1325: gated on ``write_gate.dry_run`` so the sidecar is
+            # not mutated under ``--dry-run``. Under dry-run the return values
+            # stay ``None``, which means no ``throttled_until`` is persisted
+            # (``write_gate.save_state`` is already a no-op) and the event
+            # payload (itself suppressed via ``write_gate.append_event``)
+            # would carry ``failure_kind=None`` — consistent with "nothing
+            # happened," which is exactly what ``--dry-run`` promises.
             resolved_failure_kind: str | None = None
             throttled_until: str | None = None
-            if w.adapter_kind == "devin":
-                resolved_failure_kind, throttled_until = (
-                    update_session_record_with_failure_classification(
-                        sessions_dir,
-                        w.issue_number,
-                        fallback_kind="stalled",
-                        config=config,
+            if not write_gate.dry_run:
+                if w.adapter_kind == "devin":
+                    resolved_failure_kind, throttled_until = (
+                        update_session_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="stalled",
+                            config=config,
+                        )
                     )
-                )
-            elif w.adapter_kind == "claude-code":
-                resolved_failure_kind, throttled_until = (
-                    update_worker_record_with_failure_classification(
-                        sessions_dir,
-                        w.issue_number,
-                        fallback_kind="stalled",
-                        config=config,
+                elif w.adapter_kind == "claude-code":
+                    resolved_failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="stalled",
+                            config=config,
+                        )
                     )
-                )
-            elif w.adapter_kind == "api":
-                # api sidecars share the claude-code classification helper but
-                # land as issue-<n>.api.json and get provider-auth classification
-                # (issue #484). adapter_kind="api" selects both the sidecar
-                # suffix and the auth-pattern check inside _classify_session_failure.
-                resolved_failure_kind, throttled_until = (
-                    update_worker_record_with_failure_classification(
-                        sessions_dir,
-                        w.issue_number,
-                        fallback_kind="stalled",
-                        config=config,
-                        adapter_kind="api",
+                elif w.adapter_kind == "api":
+                    # api sidecars share the claude-code classification helper but
+                    # land as issue-<n>.api.json and get provider-auth classification
+                    # (issue #484). adapter_kind="api" selects both the sidecar
+                    # suffix and the auth-pattern check inside _classify_session_failure.
+                    resolved_failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="stalled",
+                            config=config,
+                            adapter_kind="api",
+                        )
                     )
-                )
 
             if resolved_failure_kind and throttled_until:
                 # A throttle signature was found in the log tail even though
@@ -747,7 +804,7 @@ def _detect_and_handle_stalled_sessions(
                         reason=resolved_failure_kind,
                         adapter_kind=w.adapter_kind,
                     )
-                    save_state(state_file, state)
+                    write_gate.save_state(state)
 
             # Log the event
             log_path = Path(w.log_path)
@@ -797,7 +854,7 @@ def _detect_and_handle_stalled_sessions(
 
             with state_lock(state_file):
                 state = load_state(state_file)
-                state = append_event(
+                state = write_gate.append_event(
                     state,
                     event_kind,
                     {
@@ -814,9 +871,8 @@ def _detect_and_handle_stalled_sessions(
                         "latest_real_activity_at": probe_payload.get("latest_timestamp"),
                         "latest_real_activity_source": probe_payload.get("latest_source"),
                     },
-                    state_path=state_file,
                 )
-                save_state(state_file, state)
+                write_gate.save_state(state)
 
             stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
 
@@ -1184,6 +1240,7 @@ def _reap_restore_rework_requested(
             worker.branch,
             Path(worker.worktree_path),
             base_ref=config.dispatch.base_ref,
+            dry_run=write_gate.dry_run,
         )
 
     # Issue #1239: when stranded commits were published, reset to
@@ -1252,6 +1309,12 @@ def _reap_restore_rework_requested(
         ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+        # Issue #807: a deterministic judgment failure (e.g. genuine local
+        # commits on the worktree branch) escalates immediately like a
+        # terminal_failure but as ``reason_class="judgment"`` so the
+        # de-escalation sweep never auto-clears it.
+        deterministic_judgment = failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+        immediate_escalation = terminal_failure or deterministic_judgment
 
         # Issue #1134: a worker that died before pushing leaves the PR head
         # unchanged, but that is NOT a no-op — the worker may have completed
@@ -1264,28 +1327,29 @@ def _reap_restore_rework_requested(
         worker_death_at = _windowed_worker_death_at(
             entry, window_minutes=config.watchdog.redispatch_window_minutes
         )
-        if not terminal_failure:
+        if not immediate_escalation:
             worker_death_at = worker_death_at + [
                 datetime.now(UTC).isoformat().replace("+00:00", "Z")
             ]
 
         no_op_count = max(0, len(redispatch_at) - len(worker_death_at))
         death_count = len(worker_death_at)
-        death_loop = not terminal_failure and death_count > config.watchdog.max_auto_redispatch
+        death_loop = not immediate_escalation and death_count > config.watchdog.max_auto_redispatch
         no_op_loop = (
-            not terminal_failure
+            not immediate_escalation
             and not death_loop
             and no_op_count > config.watchdog.max_auto_redispatch
         )
-        should_escalate = terminal_failure or death_loop or no_op_loop
+        should_escalate = immediate_escalation or death_loop or no_op_loop
 
         if should_escalate:
-            if terminal_failure:
+            if immediate_escalation:
                 reason = failure_kind
             elif death_loop:
                 reason = "worker_death_loop"
             else:
                 reason = "redispatch_cap_exceeded"
+            reason_class = "judgment" if deterministic_judgment else "mechanical"
             # Preserve worker_pid/worker_process_start_time (issue #282): the
             # recovery probe still needs the fingerprint even after escalation.
             issue_extra: dict[str, Any] = {
@@ -1300,7 +1364,7 @@ def _reap_restore_rework_requested(
                 "reason": "dead_rework_session_escalated",
                 "redispatch_count": len(redispatch_at),
             }
-            if not terminal_failure:
+            if not immediate_escalation:
                 # Persist the death record regardless of which cap fired —
                 # the death still happened, and the consumption side
                 # (_dispatch_rework_impl) reads it from state.
@@ -1321,7 +1385,7 @@ def _reap_restore_rework_requested(
                 state,
                 worker.issue_number,
                 reason=reason,
-                reason_class="mechanical",
+                reason_class=reason_class,
                 issue_extra=issue_extra,
             )
             state = write_gate.append_event(
@@ -1334,7 +1398,7 @@ def _reap_restore_rework_requested(
             entry["status"] = "rework_requested"
             entry["dispatched_at"] = None
             entry["redispatch_at"] = redispatch_at
-            if not terminal_failure:
+            if not immediate_escalation:
                 entry["worker_death_at"] = worker_death_at
             # Preserve worker_pid (issues #165, #282, #295)
             state["issues"][str(worker.issue_number)] = entry
@@ -1371,8 +1435,13 @@ def _reap_restore_rework_requested(
     # Transition labels: escalate (operator_queue for mechanical reasons,
     # human_needed reserved for judgment), or rework_requested (needs_rework),
     # removing the stale in_progress label from the failed launch.
+    # Issue #807: the edge must follow reason_class so a deterministic judgment
+    # failure (genuine local commits) lands agent:human-needed, not
+    # agent:operator-queue. reason_class is only assigned inside the
+    # should_escalate branch above, and this ternary only reads it when
+    # should_escalate is true, so it is always bound on this access.
     edge = (
-        _escalation_edge("redispatch_escalated", "mechanical")
+        _escalation_edge("redispatch_escalated", reason_class)
         if should_escalate
         else "rework_requested"
     )
@@ -1513,21 +1582,29 @@ def _route_dead_worker_to_pre_review_rework(
         ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-        if terminal_failure or len(redispatch_at) > config.watchdog.max_auto_redispatch:
+        # Issue #807: a deterministic judgment failure escalates immediately
+        # but as ``reason_class="judgment"`` so the de-escalation sweep
+        # never auto-clears it.
+        deterministic_judgment = failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+        immediate_escalation = terminal_failure or deterministic_judgment
+        if immediate_escalation or len(redispatch_at) > config.watchdog.max_auto_redispatch:
             # Issue #783: merge conflict / rework-branch conflict / stale-CI
             # redispatch cap are all process failures, not judgment calls.
+            # Issue #807: a deterministic judgment failure (genuine local
+            # commits) is a judgment call, not a process failure.
+            reason_class = "judgment" if deterministic_judgment else "mechanical"
             state = _escalate_issue(
                 state,
                 issue_number,
-                reason=(failure_kind if terminal_failure else "redispatch_cap_exceeded"),
-                reason_class="mechanical",
+                reason=(failure_kind if immediate_escalation else "redispatch_cap_exceeded"),
+                reason_class=reason_class,
                 issue_extra={
                     "redispatch_at": redispatch_at,
                     "pre_review_rework_reason": reason,
                 },
             )
             write_gate.save_state(state)
-            edge = _escalation_edge("redispatch_escalated", "mechanical")
+            edge = _escalation_edge("redispatch_escalated", reason_class)
             result = write_gate.transition(gh, config.labels, issue_number, edge)
             if result.outcome != TransitionOutcome.APPLIED:
                 entry = state["issues"].get(str(issue_number), {})
@@ -1753,8 +1830,8 @@ def _classify_dead_sessions_and_update_throttle_state(
 
             if (
                 failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-                and w.issue_number not in open_prs_by_issue
-            ):
+                or failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+            ) and w.issue_number not in open_prs_by_issue:
                 try:
                     issue = gh.issue_view(w.issue_number)
                 except Exception:
@@ -1769,9 +1846,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # a human without attempting the cheap safe action (push the
                 # branch + open a PR) inverts the priority: salvage-the-commit
                 # first, human adjudication only when salvage fails.
+                # Issue #807: ``worktree_unsafe`` is split at detection time
+                # into ``worktree_unsafe_shim_dirt`` and
+                # ``worktree_unsafe_local_commits``; both are covered by
+                # ``WORKTREE_UNSAFE_KINDS``. The ``ahead_count > 0`` gate below
+                # naturally filters shim dirt (uncommitted modifications, no
+                # commits ahead) so salvage only fires for genuine local
+                # commits — the case it was designed for.
                 salvaged_from_unsafe = False
                 if (
-                    failure_kind == "worktree_unsafe"
+                    failure_kind in WORKTREE_UNSAFE_KINDS
                     and repo_root is not None
                     and w.branch
                     and active_labels
@@ -1812,11 +1896,17 @@ def _classify_dead_sessions_and_update_throttle_state(
                         ) + [now.isoformat().replace("+00:00", "Z")]
                         # Issue #783: a deterministic launch failure kind is a
                         # process failure, not a judgment call -- mechanical.
+                        # Issue #807: a deterministic judgment failure kind
+                        # (genuine local commits) is a judgment call -- judgment.
+                        deterministic_judgment = (
+                            failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                        )
+                        reason_class = "judgment" if deterministic_judgment else "mechanical"
                         state = _escalate_issue(
                             state,
                             w.issue_number,
                             reason=failure_kind,
-                            reason_class="mechanical",
+                            reason_class=reason_class,
                             issue_extra={"redispatch_at": redispatch_at},
                         )
                         state["issues"][str(w.issue_number)].pop("worker_pid", None)
@@ -1826,7 +1916,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             gh,
                             config.labels,
                             w.issue_number,
-                            _escalation_edge("redispatch_escalated", "mechanical"),
+                            _escalation_edge("redispatch_escalated", reason_class),
                         )
                         state = write_gate.append_event(
                             state,
@@ -2138,23 +2228,32 @@ def _classify_dead_sessions_and_update_throttle_state(
                     # same block, so it bypasses the redispatch-count cap entirely
                     # and escalates on the very first occurrence.
                     terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                    # Issue #807: a deterministic judgment failure escalates
+                    # immediately but as ``reason_class="judgment"``.
+                    deterministic_judgment = (
+                        failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                    )
+                    immediate_escalation = terminal_failure or deterministic_judgment
                     if (
-                        terminal_failure
+                        immediate_escalation
                         or len(redispatch_at) > config.watchdog.max_auto_redispatch
                     ):
                         # Escalate to human review instead of relabeling to ready
                         reason = (
                             failure_kind
-                            if terminal_failure and failure_kind is not None
+                            if immediate_escalation and failure_kind is not None
                             else "redispatch_cap_exceeded"
                         )
                         # Issue #783: dead worker session / redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
+                        # Issue #807: a deterministic judgment failure (genuine
+                        # local commits) is a judgment call -- judgment.
+                        reason_class = "judgment" if deterministic_judgment else "mechanical"
                         state = _escalate_issue(
                             state,
                             w.issue_number,
                             reason=reason,
-                            reason_class="mechanical",
+                            reason_class=reason_class,
                             issue_extra={"redispatch_at": redispatch_at},
                         )
                         # Issue #282: preserve the liveness fingerprint for the
@@ -2166,7 +2265,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             gh,
                             config.labels,
                             w.issue_number,
-                            _escalation_edge("redispatch_escalated", "mechanical"),
+                            _escalation_edge("redispatch_escalated", reason_class),
                         )
                         state = write_gate.append_event(
                             state,

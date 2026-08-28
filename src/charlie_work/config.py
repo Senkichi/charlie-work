@@ -72,11 +72,21 @@ def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, 
 DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
     {
         "worker_blocked",
-        "worktree_unsafe",
+        "worktree_unsafe_shim_dirt",
         "rework_branch_conflict",
         "cross_repo_hop",
         "provider_suspended",
     }
+)
+# Issue #807: failure kinds that escalate immediately (like
+# DETERMINISTIC_ESCALATION_FAILURE_KINDS) but as ``reason_class="judgment"``
+# rather than ``"mechanical"``, so the de-escalation sweep never auto-clears
+# them. ``worktree_unsafe_local_commits`` — genuine unpushed local commits on
+# the worktree branch — is a judgment call: returning the issue to dispatch
+# actively fights the safety system that raised the escalation and risks a
+# second writer on a branch that already has divergent local work.
+DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
+    {"worktree_unsafe_local_commits"}
 )
 # Deliberately excluded: "worktree_probe_failed" (see worktree.WorktreeProbeFailedError).
 # A failed safety probe (e.g. git status --porcelain hitting an index lock) is
@@ -889,6 +899,20 @@ class AutoMergeConfig:
     # firing exactly as before, so the control's failure mode is unchanged
     # until an operator names the bot.
     queue_bot_login: str | None = None
+    # Issue #1401: time-in-mergequeue watchdog. When a PR has carried the
+    # Aviator ``mergequeue`` label for more than this many hours with no head
+    # movement (Aviator never rebased it) and no merge, reconcile escalates it
+    # to a human instead of re-evaluating it forever. The per-pass
+    # ``consecutive_failed_merge_attempts`` counter is a one-shot alarm that
+    # resets on any can_merge pass, so a PR alternating can_merge true/false --
+    # or one Aviator itself keeps failing -- is invisible after its first
+    # alarm. This knob is the independent time-in-queue bound. 0 disables the
+    # time-based trigger (the Aviator-failure trigger below is independent of
+    # it). The companion Aviator-failure trigger (mergequeue + Aviator
+    # ``blocked`` + aviator/checks completed-failure) is unconditional when
+    # ``mergequeue_label`` is set -- it is a definitive "Aviator will not merge
+    # this" signal, not a heuristic, so it does not need a time floor.
+    mergequeue_wedge_hours: float = 24.0
 
     def __post_init__(self) -> None:
         legacy_to_strategy = {
@@ -2504,6 +2528,21 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         # Store the stripped value: it is compared against the GitHub commit
         # author login, where surrounding whitespace can never match.
         auto_merge_data["queue_bot_login"] = stripped_queue_bot_login
+    mergequeue_wedge_hours = auto_merge_data.get("mergequeue_wedge_hours")
+    if mergequeue_wedge_hours is not None:
+        if isinstance(mergequeue_wedge_hours, bool) or not isinstance(
+            mergequeue_wedge_hours, (int, float)
+        ):
+            raise ConfigError(
+                "config section 'auto_merge' key 'mergequeue_wedge_hours' must be a "
+                f"number, got {type(mergequeue_wedge_hours).__name__}"
+            )
+        if mergequeue_wedge_hours < 0:
+            raise ConfigError(
+                "config section 'auto_merge' key 'mergequeue_wedge_hours' "
+                f"must not be negative, got {mergequeue_wedge_hours}"
+            )
+        auto_merge_data["mergequeue_wedge_hours"] = float(mergequeue_wedge_hours)
     # Issue #1383: nested infra_blocked section under auto_merge.
     infra_blocked_data = auto_merge_data.get("infra_blocked")
     if infra_blocked_data is not None:

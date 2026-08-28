@@ -623,15 +623,16 @@ def test_exhausted_bound_escalates_to_operator_queue(tmp_path: Path) -> None:
 
 def test_exhaustion_guard_skips_when_already_escalated_for_this_reason(tmp_path: Path) -> None:
     """Direct unit coverage for ``_escalate_stale_checks_exhaustion``'s own
-    dedup guard (``existing_pr_state.get("escalation_reason") ==
-    exhaustion_reason``), calling the method directly rather than through
-    ``review()``. The method's own docstring calls this guard
-    belt-and-suspenders relative to ``review()``'s structural
-    escalated-visibility early return (``test_exhausted_escalation_does_not_refire_on_a_later_pass``
-    below proves that structural path); this test proves the guard clause
-    itself trips independent of that early return -- the one case the
-    docstring names as the reason it exists (something resets ``status``
-    while ``escalation_reason`` survives). No ``state_lock`` should even be
+    dedup guard (``existing_pr_state.get("escalation_reasons_seen")``
+    membership, issue #1461: was ``escalation_reason`` equality), calling the
+    method directly rather than through ``review()``. The method's own
+    docstring calls this guard belt-and-suspenders relative to ``review()``'s
+    structural escalated-visibility early return
+    (``test_exhausted_escalation_does_not_refire_on_a_later_pass`` below
+    proves that structural path); this test proves the guard clause itself
+    trips independent of that early return -- the one case the docstring
+    names as the reason it exists (something resets ``status`` while
+    ``escalation_reason`` survives). No ``state_lock`` should even be
     entered: zero label calls, zero events, and the pre-existing issue state
     left untouched.
     """
@@ -646,6 +647,7 @@ def test_exhaustion_guard_skips_when_already_escalated_for_this_reason(tmp_path:
             "status": "escalated",
             "escalation_reason": "stale_checks_retrigger_exhausted",
             "reason_class": "mechanical",
+            "escalation_reasons_seen": ["stale_checks_retrigger_exhausted"],
         }
         save_state(app.paths.state_file, state)
 
@@ -655,7 +657,10 @@ def test_exhaustion_guard_skips_when_already_escalated_for_this_reason(tmp_path:
         head_sha=_STALE_HEAD,
         attempts=3,
         max_retriggers=3,
-        existing_pr_state={"escalation_reason": "stale_checks_retrigger_exhausted"},
+        existing_pr_state={
+            "escalation_reason": "stale_checks_retrigger_exhausted",
+            "escalation_reasons_seen": ["stale_checks_retrigger_exhausted"],
+        },
     )
 
     assert result is None
