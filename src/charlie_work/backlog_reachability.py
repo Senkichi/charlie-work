@@ -73,6 +73,7 @@ def classify_backlog_reachability(
     operator_claimed: set[int] | None = None,
     *,
     ready_open_count: int | None = None,
+    mention_covered: dict[int, list[int]] | None = None,
 ) -> dict[str, Any]:
     """Issue #944: observe the *unfiltered* open backlog and record why nothing dispatched.
 
@@ -109,6 +110,22 @@ def classify_backlog_reachability(
     issues the caller already saw. It is never True by default, because a
     reassuring value standing in for an unrun check is this bug wearing a
     different field name.
+
+    ``mention_covered`` (issue #1337) maps issue numbers to the merged PR
+    numbers that mention them in free text and whose mention-only dispatch
+    exclusion has NOT been lifted by operator re-arm. An issue in this map
+    bins as ``mention_covered_awaiting_operator`` -- not ``dispatchable`` --
+    mirroring the dispatch-side exclusion computed from the same
+    ``_merged_pr_referenced_issue_numbers`` + ``_mention_rearmed_issue_numbers``
+    helpers the caller invokes. The map is derived from (not a parallel
+    re-implementation of) the dispatch predicate: the caller computes it by
+    calling the same methods ``_dispatch_impl`` uses, so a change to the
+    exclusion semantics automatically applies here. ``mention_covered_prs``
+    carries the issue->PR-numbers detail so the reason names the mentioning
+    PR(s), not just the exclusion. Fail-open: a ``None`` or empty map (e.g.
+    when the merged-PR list fetch failed) leaves the bin at zero and issues
+    classify as ``dispatchable``, matching the blocker check's fail-open
+    behaviour -- the classifier is advisory and must not raise.
     """
     reachability: dict[str, Any] = {
         "observed": False,
@@ -136,6 +153,18 @@ def classify_backlog_reachability(
         # this bin holds the issues the dependency gate rejects. The bins
         # still partition -- every fetched issue lands in exactly one.
         "blocked_by_open_dependency": 0,
+        # Issue #1337: an automated-ready issue that a merged PR mentions in
+        # free text (and whose mention-only exclusion has not been lifted by
+        # operator re-arm) is excluded from dispatch by _dispatch_impl's
+        # merged_pr_issue_numbers filter. Without this bin the classifier
+        # reported such an issue as ``dispatchable`` on every heartbeat check
+        # forever, while dispatch silently dropped it each pass -- the exact
+        # contradiction ("dispatchable across N beats but never dispatched")
+        # that triggered a manual investigation for #1059. The map is derived
+        # from the same _merged_pr_referenced_issue_numbers +
+        # _mention_rearmed_issue_numbers helpers dispatch uses, so the
+        # exclusion semantics cannot drift between the two paths.
+        "mention_covered_awaiting_operator": 0,
         # An issue with no ``number`` cannot be dispatched or named as an
         # example, but it must still be BINNED rather than skipped: the
         # renderer joins the non-zero reasons, so a backlog of these would
@@ -144,6 +173,12 @@ def classify_backlog_reachability(
         # always sum to ``open_total``.
         "unidentified": 0,
         "unreachable_examples": {},
+        # Issue #1337: issue_number -> sorted PR numbers that mention it, for
+        # issues binned as ``mention_covered_awaiting_operator``. Carried
+        # separately from ``unreachable_examples`` (which maps reason ->
+        # issue numbers) so the reason names the mentioning PR(s), not just
+        # the exclusion.
+        "mention_covered_prs": {},
     }
 
     issues = gh.issue_list(state="open")
@@ -153,6 +188,8 @@ def classify_backlog_reachability(
         return reachability
 
     claimed = operator_claimed or set()
+    covered = mention_covered or {}
+    covered_prs: dict[int, list[int]] = {}
     ready_seen = 0
     examples: dict[str, list[int]] = {}
     for issue in issues:
@@ -187,6 +224,19 @@ def classify_backlog_reachability(
                 _declared, open_blockers = _get_open_blockers_for_issue(gh, issue)
                 if open_blockers:
                     reason = "blocked_by_open_dependency"
+                elif number in covered:
+                    # Issue #1337: model the merged-PR mention-only dispatch
+                    # exclusion. An issue in ``covered`` is excluded from
+                    # dispatch by _dispatch_impl's merged_pr_issue_numbers
+                    # filter (and has NOT been re-armed by the operator).
+                    # Without this arm it binned as ``dispatchable`` forever
+                    # while dispatch silently dropped it each pass. The map
+                    # is derived from the same helpers dispatch uses, so the
+                    # predicate cannot drift. Placed after the dependency
+                    # gate to mirror dispatch's filter order (label gate ->
+                    # dependency gate -> merged-PR exclusion).
+                    reason = "mention_covered_awaiting_operator"
+                    covered_prs[number] = sorted(covered[number])
                 else:
                     reason = "dispatchable"
         reachability[reason] += 1
@@ -198,6 +248,7 @@ def classify_backlog_reachability(
     reachability["observed"] = True
     reachability["open_total"] = len(issues)
     reachability["unreachable_examples"] = {k: sorted(v) for k, v in sorted(examples.items())}
+    reachability["mention_covered_prs"] = {k: v for k, v in sorted(covered_prs.items())}
     if ready_open_count is not None:
         # The unfiltered list must be a superset of the ready-labelled OPEN
         # issues the caller already fetched. If it is missing some, it cannot

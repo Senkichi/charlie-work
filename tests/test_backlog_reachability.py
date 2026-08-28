@@ -156,6 +156,7 @@ def test_exclusion_arms_bin_independently_in_precedence_order() -> None:
         + result["active_label"]
         + result["operator_claimed"]
         + result["blocked_by_open_dependency"]
+        + result["mention_covered_awaiting_operator"]
         + result["dispatchable"]
         == result["open_total"]
     )
@@ -431,6 +432,7 @@ def test_issue_without_number_is_binned_as_unidentified_not_dropped() -> None:
             "active_label",
             "operator_claimed",
             "blocked_by_open_dependency",
+            "mention_covered_awaiting_operator",
             "unidentified",
             "dispatchable",
         )
@@ -495,6 +497,7 @@ def test_dependency_blocked_issue_bins_as_blocked_not_dispatchable() -> None:
         + result["active_label"]
         + result["operator_claimed"]
         + result["blocked_by_open_dependency"]
+        + result["mention_covered_awaiting_operator"]
         + result["dispatchable"]
         == result["open_total"]
     )
@@ -572,3 +575,148 @@ def test_renderer_names_blocked_by_open_dependency() -> None:
     assert "0 dispatchable" in rendered
     assert "blocked_by_open_dependency=2" in rendered
     assert rendered.isascii()
+
+
+# ---------------------------------------------------------------------------
+# 11. Issue #1337: a merged-PR mention-only exclusion must bin as
+#     ``mention_covered_awaiting_operator``, not ``dispatchable``. Without
+#     this the classifier reported such an issue as dispatchable on every
+#     heartbeat check forever while dispatch silently dropped it each pass --
+#     the exact contradiction that triggered a manual investigation for #1059.
+#     The ``mention_covered`` map is derived from the same
+#     _merged_pr_referenced_issue_numbers + _mention_rearmed_issue_numbers
+#     helpers dispatch uses (computed by the caller, not re-implemented here).
+# ---------------------------------------------------------------------------
+
+
+def test_mention_covered_issue_bins_as_covered_not_dispatchable() -> None:
+    # The exact observed scenario from issue #1337: #1059 is automated-ready,
+    # no agent: label, no open blockers, but a merged PR mentions it in free
+    # text. Dispatch correctly excludes it; reachability must NOT count it as
+    # dispatchable.
+    config = OrchestratorConfig()
+    labels = config.labels
+    issues = [_issue(1059, {labels.ready})]
+    gh = FakeGh(issues)
+
+    result = classify_backlog_reachability(gh, config, mention_covered={1059: [2043]})
+
+    assert result["observed"] is True
+    assert result["open_total"] == 1
+    assert result["dispatchable"] == 0
+    assert result["mention_covered_awaiting_operator"] == 1
+    assert result["unreachable_examples"]["mention_covered_awaiting_operator"] == [1059]
+    # The reason names the mentioning PR(s).
+    assert result["mention_covered_prs"] == {1059: [2043]}
+    # The bins still partition the backlog.
+    assert (
+        result["missing_ready"]
+        + result["terminal_label"]
+        + result["active_label"]
+        + result["operator_claimed"]
+        + result["blocked_by_open_dependency"]
+        + result["mention_covered_awaiting_operator"]
+        + result["dispatchable"]
+        == result["open_total"]
+    )
+
+
+def test_mention_covered_issue_with_exclusion_lifted_classifies_dispatchable() -> None:
+    # Acceptance criterion 3: the same issue with the exclusion lifted (the
+    # operator re-armed it by removing agent:human-needed) classifies as
+    # dispatchable. The caller's _mention_coverage_map excludes re-armed
+    # issues from the map, so the classifier never sees them as covered.
+    config = OrchestratorConfig()
+    labels = config.labels
+    issues = [_issue(1059, {labels.ready})]
+    gh = FakeGh(issues)
+
+    # Empty map -- the exclusion was lifted, so the issue is NOT in the map.
+    result = classify_backlog_reachability(gh, config, mention_covered={})
+
+    assert result["dispatchable"] == 1
+    assert result["mention_covered_awaiting_operator"] == 0
+    assert result["mention_covered_prs"] == {}
+
+
+def test_mention_covered_takes_precedence_after_dependency_gate() -> None:
+    # The mention exclusion is checked AFTER the dependency gate, mirroring
+    # dispatch's filter order (label gate -> dependency gate -> merged-PR
+    # exclusion). An issue that is BOTH blocked by an open dependency AND
+    # mention-covered bins as ``blocked_by_open_dependency`` (the dependency
+    # gate runs first), not ``mention_covered_awaiting_operator``.
+    config = OrchestratorConfig()
+    labels = config.labels
+    issues = [_issue(1059, {labels.ready}, body="Blocked by #886")]
+    gh = FakeGh(issues, open_blockers={886})
+
+    result = classify_backlog_reachability(gh, config, mention_covered={1059: [2043]})
+
+    assert result["blocked_by_open_dependency"] == 1
+    assert result["mention_covered_awaiting_operator"] == 0
+    assert result["dispatchable"] == 0
+
+
+def test_mention_covered_does_not_apply_to_non_ready_issue() -> None:
+    # The mention exclusion only matters for ready-labelled issues that pass
+    # all the label checks and reach the dispatchable else-branch. A
+    # non-ready issue in the map is still binned as ``missing_ready`` (the
+    # label gate runs first and never reaches the mention check).
+    config = OrchestratorConfig()
+    issues = [_issue(1059, set())]
+    gh = FakeGh(issues)
+
+    result = classify_backlog_reachability(gh, config, mention_covered={1059: [2043]})
+
+    assert result["missing_ready"] == 1
+    assert result["mention_covered_awaiting_operator"] == 0
+    assert result["dispatchable"] == 0
+
+
+def test_mention_covered_prs_names_multiple_prs() -> None:
+    # A single issue can be mentioned by multiple merged PRs. The
+    # ``mention_covered_prs`` detail carries all of them, sorted.
+    config = OrchestratorConfig()
+    labels = config.labels
+    issues = [_issue(1059, {labels.ready})]
+    gh = FakeGh(issues)
+
+    result = classify_backlog_reachability(gh, config, mention_covered={1059: [2043, 2040]})
+
+    assert result["mention_covered_awaiting_operator"] == 1
+    assert result["mention_covered_prs"] == {1059: [2040, 2043]}
+
+
+def test_renderer_names_mention_covered_awaiting_operator() -> None:
+    # When all ready issues are mention-covered, dispatchable == 0 and the
+    # renderer fires -- naming ``mention_covered_awaiting_operator`` as the
+    # cause so an operator sees the real reason rather than a
+    # "dispatchable but never dispatched" mystery.
+    config = OrchestratorConfig()
+    labels = config.labels
+    issues = [_issue(1059, {labels.ready})]
+    gh = FakeGh(issues)
+
+    result = classify_backlog_reachability(gh, config, mention_covered={1059: [2043]})
+    rendered = cli._render_backlog_reachability(result)
+
+    assert "0 dispatchable" in rendered
+    assert "mention_covered_awaiting_operator=1" in rendered
+    assert rendered.isascii()
+
+
+def test_mention_covered_none_defaults_to_empty_no_coverage() -> None:
+    # Fail-open: a None map (the default when the caller could not compute
+    # coverage, e.g. merged_pr_list failed) leaves the bin at zero and issues
+    # classify as ``dispatchable`` -- matching the blocker check's fail-open
+    # behaviour. The classifier is advisory and must not raise.
+    config = OrchestratorConfig()
+    labels = config.labels
+    issues = [_issue(1059, {labels.ready})]
+    gh = FakeGh(issues)
+
+    result = classify_backlog_reachability(gh, config)
+
+    assert result["dispatchable"] == 1
+    assert result["mention_covered_awaiting_operator"] == 0
+    assert result["mention_covered_prs"] == {}

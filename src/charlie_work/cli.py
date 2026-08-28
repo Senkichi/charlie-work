@@ -2520,6 +2520,7 @@ def _render_backlog_reachability(reachability: Any) -> str:
                 "active_label",
                 "operator_claimed",
                 "blocked_by_open_dependency",
+                "mention_covered_awaiting_operator",
                 "unidentified",
             )
             if reachability.get(reason)

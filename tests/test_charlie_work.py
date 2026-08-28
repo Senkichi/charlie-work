@@ -38143,6 +38143,11 @@ def test_status_prefetch_uses_batched_graphql_for_blocker_data(
             payload = json.dumps(ready_issues)
         elif args[:2] == ["pr", "list"]:
             payload = json.dumps([])
+        elif args[0] == "api" and len(args) >= 2 and "pulls?state=closed" in args[1]:
+            # Issue #1337: status() now calls merged_pr_list() to compute the
+            # merged-PR coverage exclusion set for the reachability classifier.
+            # No merged PRs in this test -> empty page breaks pagination.
+            payload = json.dumps([])
         elif args[0] == "api" and len(args) >= 2 and args[1] == "graphql":
             payload = json.dumps(
                 {
