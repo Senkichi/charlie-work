@@ -397,9 +397,10 @@ def test_synthetic_plus_one_to_real_workflow_py_trips_check() -> None:
     at-mark position trips the ratchet while the current count holds. This
     exercises the real baseline + real file, not just synthetic data.
 
-    Robust to the baseline being exactly at-mark (mark == live, the state the
-    keystone's auto-lower maintains) or stale-high (mark > live): the +1 is
-    taken past ``max(live, mark)`` so it always crosses the mark.
+    Robust to the baseline being exactly at-mark (mark == live, when the live
+    count sits on a MARK_QUANTUM boundary) or stale-high (mark > live, the
+    normal state for quantized marks): the +1 is taken past ``max(live, mark)``
+    so it always crosses the mark.
     """
     baseline = _load_baseline()
     path = "src/charlie_work/workflow.py"
