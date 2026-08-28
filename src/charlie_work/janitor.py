@@ -13,7 +13,7 @@ calls. The caller (``workflow.review``) already fetches ``pr`` (``gh pr
 view`` JSON) and ``checks`` (``gh pr checks`` JSON) for packet generation, so
 it feeds that same data in here first. The module as a whole is not pure,
 however: `_check_no_op_rework`, `_get_unpushed_commit_info`, and
-`check_operator_containment` shell out to `git` via `subprocess.run` to
+`check_operator_containment` shell out to `git` via `run_captured` to
 compare worktree/branch state against the PR diff.
 """
 
@@ -24,7 +24,6 @@ import builtins
 import fnmatch
 import logging
 import re
-import subprocess
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,11 +37,7 @@ from charlie_work.checks import (
 )
 from charlie_work.github import linked_issue_number
 from charlie_work.safe_ref import require_valid_ref_name, require_valid_sha
-from charlie_work.subprocess_runner import (
-    hidden_console_kwargs,
-    no_console_window_kwargs,
-    run_captured,
-)
+from charlie_work.subprocess_runner import run_captured
 
 if TYPE_CHECKING:
     from charlie_work.config import OrchestratorConfig, TestAdequacyConfig
@@ -925,6 +920,15 @@ def _check_no_op_rework(
         # (which already passed above, so no failure here)
         return False
 
+    # Warning appended on any git-probe failure in the merge-only check below.
+    # Pre-defined so every failure path (ref validation, fetch, rev-list, parse)
+    # appends the identical message without duplicating the f-string.
+    _merge_only_warning = (
+        f"Could not verify whether PR head advance ({reviewed_head_sha} → {current_head_sha}) "
+        f"included non-merge commits; git fetch/rev-list failed. "
+        f"If the advance was only base-update merges, this may be a no-op rework."
+    )
+
     try:
         # Validate ref names before they reach git argv (issue #659): head_ref is
         # passed as a plain positional to ``git fetch origin``, so a flag-like
@@ -936,69 +940,66 @@ def _check_no_op_rework(
             base_ref = require_valid_ref_name(
                 base_ref, context="_check_no_op_rework base_ref (merge-only)"
             )
+    except ValueError as exc:
+        warnings.append(str(exc))
+        warnings.append(_merge_only_warning)
+        return False
 
-        # Fetch both the PR head ref and base ref from origin
-        # We need the base ref to exclude base-reachable commits from the count
-        fetch_refs = [head_ref]
-        if base_ref:
-            fetch_refs.append(base_ref)
-        subprocess.run(
-            ["git", "fetch", "origin"] + fetch_refs,
-            cwd=repo_root,
-            capture_output=True,
-            check=True,
-            text=True,
-            **hidden_console_kwargs(),
-        )
-        # Count non-merge commits since the reviewed head, excluding base-reachable commits
-        # The ^ syntax excludes commits reachable from the given refs
-        # This counts commits that are:
-        # - Not merge commits (--no-merges)
-        # - Not in reviewed_head_sha (^reviewed_head_sha)
-        # - Not in origin/baseRefName (^origin/baseRefName if base_ref exists)
-        # - Reachable from current_head_sha (implicit in the range syntax)
-        rev_list_args = ["git", "rev-list", "--no-merges", "--count", current_head_sha]
-        rev_list_args.append(f"^{reviewed_head_sha}")
-        if base_ref:
-            rev_list_args.append(f"^origin/{base_ref}")
-        result = subprocess.run(
-            rev_list_args,
-            cwd=repo_root,
-            capture_output=True,
-            check=True,
-            text=True,
-            **no_console_window_kwargs(),
-        )
+    # Fetch both the PR head ref and base ref from origin
+    # We need the base ref to exclude base-reachable commits from the count
+    fetch_refs = [head_ref]
+    if base_ref:
+        fetch_refs.append(base_ref)
+    fetch_result = run_captured(
+        ["git", "fetch", "origin"] + fetch_refs,
+        cwd=repo_root,
+        timeout_seconds=60,
+    )
+    if not fetch_result.ok:
+        warnings.append(_merge_only_warning)
+        return False
+    # Count non-merge commits since the reviewed head, excluding base-reachable commits
+    # The ^ syntax excludes commits reachable from the given refs
+    # This counts commits that are:
+    # - Not merge commits (--no-merges)
+    # - Not in reviewed_head_sha (^reviewed_head_sha)
+    # - Not in origin/baseRefName (^origin/baseRefName if base_ref exists)
+    # - Reachable from current_head_sha (implicit in the range syntax)
+    rev_list_args = ["git", "rev-list", "--no-merges", "--count", current_head_sha]
+    rev_list_args.append(f"^{reviewed_head_sha}")
+    if base_ref:
+        rev_list_args.append(f"^origin/{base_ref}")
+    result = run_captured(
+        rev_list_args,
+        cwd=repo_root,
+        timeout_seconds=60,
+    )
+    if not result.ok:
+        warnings.append(_merge_only_warning)
+        return False
+
+    try:
         non_merge_count = int(result.stdout.strip())
+    except ValueError:
+        warnings.append(_merge_only_warning)
+        return False
 
-        if non_merge_count == 0:
-            # Head advanced only by merge commits (base-update) — still a no-op
-            failure_msg = (
-                f"PR head advanced only by merge commits since request_changes verdict ({reviewed_head_sha} → {current_head_sha}) — "
-                f"the rework produced no real work (only base-update merges)"
-            )
-
-            # Enrich with unpushed-commit count if worktree exists
-            unpushed_info = _get_unpushed_commit_info(head_ref, repo_root, base_ref=base_ref)
-            if unpushed_info:
-                failure_msg += f"; {unpushed_info}"
-            else:
-                failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
-
-            failures.append(failure_msg)
-            return True
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as exc:
-        # Git failed (no network, unknown ref, shallow history, parse error) or
-        # a ref/SHA value failed format validation. Fall back to the SHA equality
-        # result and append a warning; include the validation message if that is
-        # what failed so callers can tell the difference.
-        if isinstance(exc, ValueError):
-            warnings.append(str(exc))
-        warnings.append(
-            f"Could not verify whether PR head advance ({reviewed_head_sha} → {current_head_sha}) "
-            f"included non-merge commits; git fetch/rev-list failed. "
-            f"If the advance was only base-update merges, this may be a no-op rework."
+    if non_merge_count == 0:
+        # Head advanced only by merge commits (base-update) — still a no-op
+        failure_msg = (
+            f"PR head advanced only by merge commits since request_changes verdict ({reviewed_head_sha} → {current_head_sha}) — "
+            f"the rework produced no real work (only base-update merges)"
         )
+
+        # Enrich with unpushed-commit count if worktree exists
+        unpushed_info = _get_unpushed_commit_info(head_ref, repo_root, base_ref=base_ref)
+        if unpushed_info:
+            failure_msg += f"; {unpushed_info}"
+        else:
+            failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
+
+        failures.append(failure_msg)
+        return True
     return False
 
 
@@ -1084,61 +1085,58 @@ def _get_unpushed_commit_info(
     only local-not-remote commits are base-update merges).
     """
     # Try to find the worktree for this branch
+    result = run_captured(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repo_root,
+        timeout_seconds=60,
+    )
+    if not result.ok:
+        return None
+
+    # Parse worktree list to find the worktree for this branch
+    worktree_path = None
+    current_worktree = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            current_worktree = Path(line[len("worktree ") :].strip())
+        elif line.startswith("branch ") and current_worktree:
+            branch_line = line[len("branch ") :].strip()
+            # Branch names may have refs/heads/ prefix
+            if branch_line.endswith(f"/{branch}") or branch_line == f"refs/heads/{branch}":
+                worktree_path = current_worktree
+                break
+
+    if not worktree_path or not worktree_path.exists():
+        return None
+
+    # Count non-merge commits since origin/{branch}, excluding base-reachable
+    # commits. Mirrors the merge-only-advance check above: --no-merges drops
+    # base-update merge commits themselves, and ^origin/{base_ref} drops any
+    # commits those merges transitively pulled in that are already on the
+    # base branch (e.g. other PRs' squash-merge commits).
+    rev_list_args = ["git", "rev-list", "--no-merges", "--count", "HEAD"]
+    rev_list_args.append(f"^origin/{branch}")
+    if base_ref:
+        rev_list_args.append(f"^origin/{base_ref}")
+    result = run_captured(
+        rev_list_args,
+        cwd=worktree_path,
+        timeout_seconds=60,
+    )
+    if not result.ok:
+        return None
+
     try:
-        result = subprocess.run(
-            ["git", "worktree", "list", "--porcelain"],
-            cwd=repo_root,
-            capture_output=True,
-            check=True,
-            text=True,
-            **no_console_window_kwargs(),
-        )
-
-        # Parse worktree list to find the worktree for this branch
-        worktree_path = None
-        current_worktree = None
-        for line in result.stdout.splitlines():
-            if line.startswith("worktree "):
-                current_worktree = Path(line[len("worktree ") :].strip())
-            elif line.startswith("branch ") and current_worktree:
-                branch_line = line[len("branch ") :].strip()
-                # Branch names may have refs/heads/ prefix
-                if branch_line.endswith(f"/{branch}") or branch_line == f"refs/heads/{branch}":
-                    worktree_path = current_worktree
-                    break
-
-        if not worktree_path or not worktree_path.exists():
-            return None
-
-        # Count non-merge commits since origin/{branch}, excluding base-reachable
-        # commits. Mirrors the merge-only-advance check above: --no-merges drops
-        # base-update merge commits themselves, and ^origin/{base_ref} drops any
-        # commits those merges transitively pulled in that are already on the
-        # base branch (e.g. other PRs' squash-merge commits).
-        rev_list_args = ["git", "rev-list", "--no-merges", "--count", "HEAD"]
-        rev_list_args.append(f"^origin/{branch}")
-        if base_ref:
-            rev_list_args.append(f"^origin/{base_ref}")
-        result = subprocess.run(
-            rev_list_args,
-            cwd=worktree_path,
-            capture_output=True,
-            check=True,
-            text=True,
-            **no_console_window_kwargs(),
-        )
-
         unpushed_count = int(result.stdout.strip())
-        if unpushed_count > 0:
-            return (
-                f"worktree has {unpushed_count} unpushed commit(s); "
-                f"run 'git push origin {branch}' from the worktree to push them"
-            )
+    except ValueError:
+        return None
+    if unpushed_count > 0:
+        return (
+            f"worktree has {unpushed_count} unpushed commit(s); "
+            f"run 'git push origin {branch}' from the worktree to push them"
+        )
 
-        return None
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
-        # Git failed or worktree not found; skip enrichment
-        return None
+    return None
 
 
 def detect_cross_pr_revert(
@@ -1187,96 +1185,79 @@ def detect_cross_pr_revert(
         # flag-like value would be parsed as an option without this guard.
         head_ref = require_valid_ref_name(head_ref, context="detect_cross_pr_revert head_ref")
         base_ref = require_valid_ref_name(base_ref, context="detect_cross_pr_revert base_ref")
-
-        fetch = subprocess.run(
-            ["git", "fetch", "origin", str(head_ref), str(base_ref)],
-            cwd=repo_root_path,
-            capture_output=True,
-            text=True,
-            check=False,
-            **hidden_console_kwargs(),
-        )
-        if fetch.returncode != 0:
-            return None
-
-        commits = subprocess.run(
-            [
-                "git",
-                "rev-list",
-                "--no-merges",
-                f"origin/{head_ref}",
-                f"^origin/{base_ref}",
-            ],
-            cwd=repo_root_path,
-            capture_output=True,
-            text=True,
-            check=False,
-            **no_console_window_kwargs(),
-        )
-        if commits.returncode != 0:
-            return None
-
-        for sha in commits.stdout.strip().splitlines():
-            if not sha:
-                continue
-            subject_proc = subprocess.run(
-                ["git", "log", "-1", "--format=%s", sha],
-                cwd=repo_root_path,
-                capture_output=True,
-                text=True,
-                check=False,
-                **no_console_window_kwargs(),
-            )
-            if subject_proc.returncode != 0:
-                continue
-            subject = subject_proc.stdout.strip()
-            if subject.startswith('Revert "') and subject.endswith('"'):
-                original = subject[len('Revert "') : -1]
-                match_proc = subprocess.run(
-                    [
-                        "git",
-                        "log",
-                        f"origin/{base_ref}",
-                        "--format=%H",
-                        "--fixed-strings",
-                        "--grep",
-                        original,
-                    ],
-                    cwd=repo_root_path,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    **no_console_window_kwargs(),
-                )
-                if match_proc.returncode != 0:
-                    continue
-                for base_sha in match_proc.stdout.strip().splitlines():
-                    if not base_sha:
-                        continue
-                    base_subject_proc = subprocess.run(
-                        ["git", "log", "-1", "--format=%s", base_sha],
-                        cwd=repo_root_path,
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        **no_console_window_kwargs(),
-                    )
-                    if base_subject_proc.returncode != 0:
-                        continue
-                    if base_subject_proc.stdout.strip() == original:
-                        return (
-                            f"PR branch contains revert commit {sha[:12]} ({subject}) which "
-                            f"would silently undo base commit {base_sha[:12]}; add an explicit "
-                            f"'{allow_marker}: <reason>' line to the PR body to proceed"
-                        )
     except ValueError as exc:
         # Ref validation failed (issue #659). The function returns None for a
         # false negative, so a diagnostic is required to distinguish this from
         # "no revert detected".
         logger.warning("detect_cross_pr_revert ref validation failed: %s", exc)
         return None
-    except OSError:
+
+    fetch = run_captured(
+        ["git", "fetch", "origin", str(head_ref), str(base_ref)],
+        cwd=repo_root_path,
+        timeout_seconds=60,
+    )
+    if not fetch.ok:
         return None
+
+    commits = run_captured(
+        [
+            "git",
+            "rev-list",
+            "--no-merges",
+            f"origin/{head_ref}",
+            f"^origin/{base_ref}",
+        ],
+        cwd=repo_root_path,
+        timeout_seconds=60,
+    )
+    if not commits.ok:
+        return None
+
+    for sha in commits.stdout.strip().splitlines():
+        if not sha:
+            continue
+        subject_proc = run_captured(
+            ["git", "log", "-1", "--format=%s", sha],
+            cwd=repo_root_path,
+            timeout_seconds=60,
+        )
+        if not subject_proc.ok:
+            continue
+        subject = subject_proc.stdout.strip()
+        if subject.startswith('Revert "') and subject.endswith('"'):
+            original = subject[len('Revert "') : -1]
+            match_proc = run_captured(
+                [
+                    "git",
+                    "log",
+                    f"origin/{base_ref}",
+                    "--format=%H",
+                    "--fixed-strings",
+                    "--grep",
+                    original,
+                ],
+                cwd=repo_root_path,
+                timeout_seconds=60,
+            )
+            if not match_proc.ok:
+                continue
+            for base_sha in match_proc.stdout.strip().splitlines():
+                if not base_sha:
+                    continue
+                base_subject_proc = run_captured(
+                    ["git", "log", "-1", "--format=%s", base_sha],
+                    cwd=repo_root_path,
+                    timeout_seconds=60,
+                )
+                if not base_subject_proc.ok:
+                    continue
+                if base_subject_proc.stdout.strip() == original:
+                    return (
+                        f"PR branch contains revert commit {sha[:12]} ({subject}) which "
+                        f"would silently undo base commit {base_sha[:12]}; add an explicit "
+                        f"'{allow_marker}: <reason>' line to the PR body to proceed"
+                    )
 
     return None
 
@@ -1836,34 +1817,24 @@ def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) ->
     warnings: list[str] = []
 
     # Check for uncommitted changes in the operator checkout (excluding untracked files)
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            check=True,
-            **no_console_window_kwargs(),
-        )
-        dirty_output = result.stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    result = run_captured(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=repo_root,
+        timeout_seconds=60,
+    )
+    if not result.ok:
         # If git fails, skip the check rather than blocking
         return ()
+    dirty_output = result.stdout.strip()
 
     # Parse dirty files from git status --porcelain -z (NUL-separated, robust parsing)
     # Also check for untracked files that might be in the PR diff
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain", "-z"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            check=True,
-            **no_console_window_kwargs(),
-        )
-        all_status_output = result.stdout
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        all_status_output = ""
+    result = run_captured(
+        ["git", "status", "--porcelain", "-z"],
+        cwd=repo_root,
+        timeout_seconds=60,
+    )
+    all_status_output = result.stdout if result.ok else ""
 
     if not dirty_output and not all_status_output:
         # Clean tree — no containment issues
@@ -1943,19 +1914,15 @@ def check_operator_containment(repo_root: Path, pr_diff: str, pr_number: int) ->
             continue
 
         # Get the working-tree diff against HEAD for this file
-        try:
-            result = subprocess.run(
-                ["git", "diff", "HEAD", "--", dirty_file],
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-                check=True,
-                **no_console_window_kwargs(),
-            )
-            working_tree_diff = result.stdout
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        result = run_captured(
+            ["git", "diff", "HEAD", "--", dirty_file],
+            cwd=repo_root,
+            timeout_seconds=60,
+        )
+        if not result.ok:
             unrelated_dirty_files.append(dirty_file)
             continue
+        working_tree_diff = result.stdout
 
         # Strip index/hash header lines from both diffs for comparison
         # The header lines vary (hashes, timestamps) but the hunks should match
