@@ -80,6 +80,7 @@ from .github import (
     GitHubNotFoundError,
     GitHubRunResult,
     GraphQLBudgetError,
+    build_branch_issue_validator,
     cancel_superseded_runs,
     defang_closing_keywords,
     detect_prose_only_dependencies,
@@ -248,7 +249,7 @@ from .worker import iter_workers
 from .routing import AdapterChoice, record_adapter_choice, select_adapter
 from .write_gate import WriteGate, require_write_gate
 
-# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# LOAD-BEARING RE-EXPORT â€” NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
 #
 # issue #1283 Phase A: the dispatch-selection free-function family (candidate
@@ -256,7 +257,7 @@ from .write_gate import WriteGate, require_write_gate
 # frozen dataclasses those selectors return) now lives in
 # `charlie_work.dispatch_selection`. Re-exported here, not re-declared, so
 # every existing `charlie_work.workflow.<name>` import and monkeypatch target
-# keeps resolving unchanged — the same pattern `config.py` uses for
+# keeps resolving unchanged â€” the same pattern `config.py` uses for
 # `RunnerAllocationConfig`.
 from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
     LocalReviewCapResult,
@@ -279,7 +280,7 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
     _select_review_dispatch_candidates,
 )
 
-# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# LOAD-BEARING RE-EXPORT â€” NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
 #
 # issue #1283 Phase A: the escalation free-function family (the shared
@@ -287,7 +288,7 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
 # escalate-issue mutator, and the escalated-label repair predicates) now
 # lives in `charlie_work.escalation`. Re-exported here, not re-declared, so
 # every existing `charlie_work.workflow.<name>` import and monkeypatch target
-# keeps resolving unchanged — the same pattern `config.py` uses for
+# keeps resolving unchanged â€” the same pattern `config.py` uses for
 # `RunnerAllocationConfig` and this file's own `.dispatch_selection` block
 # above.
 from .escalation import (  # noqa: F401  (deliberate re-export)
@@ -305,7 +306,7 @@ from .escalation import (  # noqa: F401  (deliberate re-export)
     _MECHANICAL_ESCALATION_EDGES,
 )
 
-# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# LOAD-BEARING RE-EXPORT â€” NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
 #
 # issue #1283 Phase A: the reviewer-verdict-parsing free-function family
@@ -314,7 +315,7 @@ from .escalation import (  # noqa: F401  (deliberate re-export)
 # frozen dataclass the summary function returns, now lives in
 # `charlie_work.verdict_parsing`. Re-exported here, not re-declared, so
 # every existing `charlie_work.workflow.<name>` import and monkeypatch target
-# keeps resolving unchanged — the same pattern `config.py` uses for
+# keeps resolving unchanged â€” the same pattern `config.py` uses for
 # `RunnerAllocationConfig` and this file's own `.dispatch_selection` /
 # `.escalation` blocks above.
 from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
@@ -349,7 +350,7 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     provenance_caveat_for,
 )
 
-# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# LOAD-BEARING RE-EXPORT â€” NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
 #
 # issue #1283 Phase A: the rework-prompt-rendering free-function family (the
@@ -359,7 +360,7 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
 # ``_write_rework_prompt``) now lives in `charlie_work.rework_prompts`.
 # Re-exported here, not re-declared, so every existing
 # `charlie_work.workflow.<name>` import and monkeypatch target keeps
-# resolving unchanged — the same pattern `config.py` uses for
+# resolving unchanged â€” the same pattern `config.py` uses for
 # `RunnerAllocationConfig` and this file's own `.dispatch_selection` /
 # `.escalation` / `.verdict_parsing` blocks above.
 from .rework_prompts import (  # noqa: F401  (deliberate re-export)
@@ -383,7 +384,7 @@ from .rework_prompts import (  # noqa: F401  (deliberate re-export)
     _write_text_atomic,
 )
 
-# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# LOAD-BEARING RE-EXPORT â€” NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
 #
 # issue #1283 Phase A: the CI-checks-findings free-function family (the
@@ -393,7 +394,7 @@ from .rework_prompts import (  # noqa: F401  (deliberate re-export)
 # theme, see the module docstring) now lives in `charlie_work.ci_findings`.
 # Re-exported here, not re-declared, so every existing
 # `charlie_work.workflow.<name>` import and monkeypatch target keeps
-# resolving unchanged — the same pattern `config.py` uses for
+# resolving unchanged â€” the same pattern `config.py` uses for
 # `RunnerAllocationConfig` and this file's own `.dispatch_selection` /
 # `.escalation` / `.verdict_parsing` / `.rework_prompts` blocks above.
 from .ci_findings import (  # noqa: F401  (deliberate re-export)
@@ -407,7 +408,7 @@ from .ci_findings import (  # noqa: F401  (deliberate re-export)
     _required_changes_from_checks,
 )
 
-# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# LOAD-BEARING RE-EXPORT â€” NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
 #
 # issue #1283: the backlog-reachability free-function pair (the shared
@@ -416,7 +417,7 @@ from .ci_findings import (  # noqa: F401  (deliberate re-export)
 # above, extracted as its own standalone standard-shape PR per operator
 # approval -- now lives in `charlie_work.backlog_reachability`. Re-exported
 # here, not re-declared, so every existing `charlie_work.workflow.<name>`
-# import and monkeypatch target keeps resolving unchanged — the same
+# import and monkeypatch target keeps resolving unchanged â€” the same
 # pattern `config.py` uses for `RunnerAllocationConfig` and this file's own
 # `.dispatch_selection` / `.escalation` / `.verdict_parsing` /
 # `.rework_prompts` / `.ci_findings` blocks above.
@@ -425,7 +426,7 @@ from .backlog_reachability import (  # noqa: F401  (deliberate re-export)
     classify_backlog_reachability,
 )
 
-# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# LOAD-BEARING RE-EXPORT â€” NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
 #
 # issue #1283 Phase A, PR 6 of 6 (staged split): the stalled-review-reap
@@ -434,7 +435,7 @@ from .backlog_reachability import (  # noqa: F401  (deliberate re-export)
 # dead-worker/session half is spun off to issue #1317) now lives in
 # `charlie_work.stalled_review_reap`. Re-exported here, not re-declared, so
 # every existing `charlie_work.workflow.<name>` import and monkeypatch
-# target keeps resolving unchanged — the same pattern `config.py` uses for
+# target keeps resolving unchanged â€” the same pattern `config.py` uses for
 # `RunnerAllocationConfig` and this file's own `.dispatch_selection` /
 # `.escalation` / `.verdict_parsing` / `.rework_prompts` / `.ci_findings` /
 # `.backlog_reachability` blocks above.
@@ -461,7 +462,7 @@ from .queue_sync_coverage import (  # noqa: F401  (deliberate re-export)
 )
 
 
-# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# LOAD-BEARING RE-EXPORT â€” NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
 #
 # issue #1317 (spun off from #1283's A6 recon): the dead-worker/session-reap
@@ -471,7 +472,7 @@ from .queue_sync_coverage import (  # noqa: F401  (deliberate re-export)
 # disclosed call-graph judgment calls) now lives in
 # `charlie_work.dead_worker_reap`. Re-exported here, not re-declared, so
 # every existing `charlie_work.workflow.<name>` import and monkeypatch
-# target keeps resolving unchanged — the same pattern `config.py` uses for
+# target keeps resolving unchanged â€” the same pattern `config.py` uses for
 # `RunnerAllocationConfig` and this file's own `.dispatch_selection` /
 # `.escalation` / `.verdict_parsing` / `.rework_prompts` / `.ci_findings` /
 # `.backlog_reachability` / `.stalled_review_reap` blocks above.
@@ -735,7 +736,7 @@ def _diff_size_section(diff: str, threshold: int, diff_path: Path) -> str:
         "## Large diff guidance",
         "",
         f"This diff has {total} changed lines across {len(files)} file(s). "
-        f"Do **not** read the entire diff in one pass — it will waste your "
+        f"Do **not** read the entire diff in one pass â€” it will waste your "
         f"token budget. Instead, read `$diff_path` file-by-file, starting "
         f"with the files that have the most changes.",
         "",
@@ -974,8 +975,8 @@ class CarryForwardCheck:
 
     ``tier`` is ``"patch-id"`` when the live diff's stable patch-id matches
     the recorded ``reviewed_patch_id`` outright (issue #412's fast path),
-    ``"line-content"`` when the patch-ids differed — which happens on every
-    ordinary main advance, since the merge-base moves — but the ordered
+    ``"line-content"`` when the patch-ids differed â€” which happens on every
+    ordinary main advance, since the merge-base moves â€” but the ordered
     ``+``/``-`` line stream and changed-file set are identical to what was
     recorded at review time (issue #414), or ``None`` when neither tier
     establishes content identity: the caller must treat the verdict as
@@ -1081,7 +1082,7 @@ def render_test_adequacy_section(
 ) -> str:
     """Render the $test_adequacy_section packet block from Tier-1 facts.
 
-    Returns "" when facts is None (gate disabled — caller in review() passes
+    Returns "" when facts is None (gate disabled â€” caller in review() passes
     None in that case) or when there is nothing to report. Mirrors the
     _janitor_section pattern: plain function, no I/O, safe to call every pass.
     """
@@ -1224,7 +1225,7 @@ UNAUTHORIZED_MERGE_BASELINE_KEY = "unauthorized_merge_baseline"
 # already-actioned finding stops pinning ok=False on every subsequent pass.
 # Like the baseline it is an explicit set of PR numbers (never a high-water
 # mark) and is only ever populated by an explicit `charlie tripwire ack` action
-# — the tripwire never auto-acknowledges, or it would defeat itself.
+# â€” the tripwire never auto-acknowledges, or it would defeat itself.
 UNAUTHORIZED_MERGE_ACK_KEY = "unauthorized_merge_acknowledged"
 
 # state.json key holding the durable first-detection record for post-arming
@@ -1233,13 +1234,13 @@ UNAUTHORIZED_MERGE_ACK_KEY = "unauthorized_merge_acknowledged"
 # not rewritten while the finding stays open, so the
 # `unauthorized_merge_detected` event fires exactly once per PR instead of once
 # per pass. `ack_unauthorized_merge` deletes the entry, so the map holds
-# *currently-open announced findings* — bounded by the open set, not growing
+# *currently-open announced findings* â€” bounded by the open set, not growing
 # with every PR ever found, and a finding re-detected after its ack is withdrawn
 # announces again instead of returning silently.
 #
 # Once-per-PR is the whole point. The tripwire re-detects the same unacked
-# finding on every pass — that is the 21-pass ok=False streak #933 was filed on
-# — so a per-pass event would be a second unbounded stream restating one fact
+# finding on every pass â€” that is the 21-pass ok=False streak #933 was filed on
+# â€” so a per-pass event would be a second unbounded stream restating one fact
 # indefinitely, which is the "a control that can never go quiet is not a
 # control" failure the baseline and the ack set both exist to prevent.
 #
@@ -1260,7 +1261,7 @@ UNAUTHORIZED_MERGE_DETECTED_KEY = "unauthorized_merge_detected"
 # decision dict so both consumers share one enforcement point.
 #
 # An override that does not name a non-empty SHA or a non-empty reason is not a
-# valid override — it is treated as absent so the control never reads a
+# valid override â€” it is treated as absent so the control never reads a
 # malformed record as authorization. A control that can be silenced with an
 # empty reason is no control, and an authorization that does not name the SHA
 # it authorizes reintroduces the exact hole (#802/#804: rebase moved the head
@@ -1272,9 +1273,9 @@ def _authorized_override_matches(decision: dict[str, Any], live_head_sha: str | 
 
     Shared by ``_detect_unauthorized_merges`` (the post-merge tripwire) and
     ``merge_check`` (the pre-merge preflight) so the two paths cannot drift on
-    what counts as authorization. Both must answer the same question — "is
+    what counts as authorization. Both must answer the same question â€” "is
     there an explicit, SHA-bound, reason-bearing authorization for this head?"
-    — or a merge that passes the preflight still trips the post-merge control.
+    â€” or a merge that passes the preflight still trips the post-merge control.
     """
     override = decision.get("authorized_override")
     if not isinstance(override, dict):
@@ -1291,8 +1292,8 @@ def _authorized_override_matches(decision: dict[str, Any], live_head_sha: str | 
 
 
 # Caps for the error detail carried in the `loop_completed` payload. The
-# loop-body `errors` list is unbounded by construction — one entry per PR that
-# raised — and this payload lands in both the capped 200-entry `events` array in
+# loop-body `errors` list is unbounded by construction â€” one entry per PR that
+# raised â€” and this payload lands in both the capped 200-entry `events` array in
 # state.json and the unlimited events.db, so a single bad pass could otherwise
 # push dozens of full exception strings through both.
 _LOOP_ERROR_MAX_PRS = 20
@@ -1396,20 +1397,20 @@ def summarize_loop_errors(
 
     `loop_completed` previously kept only `error_count`, so a pass that reported
     ``"loop completed with 1 PR error(s)"`` left no stored artifact naming *which*
-    PR — diagnosing a live finding meant reading the detector source and
+    PR â€” diagnosing a live finding meant reading the detector source and
     re-deriving the candidate set by hand (issue #933).
 
     PR numbers are the cheap, high-value half and are emitted first and most
     generously; free-text detail is the expensive half and is truncated hard.
     Both are capped with an explicit ``*_truncated`` count rather than silently
-    dropped, so a reader can always tell a complete list from an elided one — a
+    dropped, so a reader can always tell a complete list from an elided one â€” a
     silent cap would reproduce the same "the record understates the problem"
     failure this function exists to fix.
 
     The two ``*_truncated`` counts are over **different populations**, which the
     similar names hide: ``error_prs_truncated`` counts elided *distinct PRs*
     (deduped), while ``error_details_truncated`` counts elided *error entries*
-    (not deduped — several entries can share one PR). So ``error_prs_truncated:
+    (not deduped â€” several entries can share one PR). So ``error_prs_truncated:
     6`` alongside ``error_details_truncated: 23`` is consistent, not a
     contradiction; they answer "how many more PRs" and "how many more failures".
     """
@@ -1526,43 +1527,14 @@ def _build_branch_issue_validator(
 ) -> Callable[[int], bool] | None:
     """Build a validator for branch-name-derived issue numbers (issue #1229).
 
-    This is the single-point-of-enforcement constructor for the
-    ``branch_issue_validator`` callable consumed by ``linked_issue_number``.
-    Both the ``OrchestratorApp._make_branch_issue_validator`` method (used by
-    the rework-routing call sites) and the module-level sweeps
-    (``_detect_and_handle_orphaned_workers``,
-    ``_classify_dead_sessions_and_update_throttle_state``) route through here
-    so the open-issue fetch, failure handling, and ``_LIST_LIMIT`` tradeoff
-    cannot diverge between the two call surfaces.
-
-    Returns a callable that returns True iff the given number corresponds to
-    a real *open* issue in this repo, or None when the open-issue list cannot
-    be fetched (API outage). Callers that receive None should pass None to
-    ``linked_issue_number``'s ``branch_issue_validator`` — the function then
-    trusts the branch-name binding unconditionally, preserving the pre-#1229
-    behavior rather than blocking the sweep during a transient GitHub
-    failure.
-
-    ``issue_list(state="open")`` is cached within a pass on the real
-    ``GitHub`` client, so repeated calls to this helper in the same pass
-    share a single GitHub API call. The list is capped at ``_LIST_LIMIT``
-    (500); a repo with more open issues than the cap could see a false
-    negative (a genuinely open issue treated as absent), which is the safe
-    direction — refusing a branch-name binding never corrupts state, it only
-    defers an issue-adjacent operation until the issue is confirmed by a
-    closing keyword.
+    Thin delegate to ``github.build_branch_issue_validator`` -- the
+    single-point-of-enforcement constructor lives there so the open-number
+    extraction is shared with ``build_branch_issue_validator_from_issues``
+    (used by ``reconcile.detect_drift``'s snapshot-derived validator). See
+    that function's docstring for the full rationale (fail-open on API
+    outage, ``_LIST_LIMIT`` tradeoff, per-pass caching).
     """
-    try:
-        open_issues = gh.issue_list(state="open")
-    except Exception:
-        # GitHubError (API outage), AttributeError (test fakes without
-        # issue_list), or any other transient failure — the safe direction
-        # is to skip validation (return None) so callers preserve the
-        # pre-#1229 branch-name trust behavior rather than crashing or
-        # blocking the sweep.
-        return None
-    open_numbers = frozenset(int(i["number"]) for i in open_issues if i.get("number") is not None)
-    return lambda n: n in open_numbers
+    return build_branch_issue_validator(gh)
 
 
 def _detect_and_handle_orphaned_workers(
@@ -1646,7 +1618,7 @@ def _detect_and_handle_orphaned_workers(
     prs = gh.pr_list()
     pr_by_issue: dict[int, dict[str, Any]] = {}
     # Issue #1229: validate branch-name-derived issue numbers against the
-    # open-issue set so a stale branch name (e.g. agent/issue-709-… left over
+    # open-issue set so a stale branch name (e.g. agent/issue-709-â€¦ left over
     # from a merged PR #709, reused by an unrelated issue-less PR) cannot bind
     # the PR to a non-existent or closed issue here. Without this, a stale
     # binding would populate pr_by_issue[<wrong n>] and either mask a real
@@ -1715,7 +1687,7 @@ def _detect_and_handle_orphaned_workers(
             if number is not None:
                 issues_by_number[int(number)] = issue
         # Issue #1244: pre-compute the fleet's managed repo names and the
-        # dispatching repo name once for the whole loop — the fleet registry
+        # dispatching repo name once for the whole loop â€” the fleet registry
         # is read from disk and gh.name_with_owner() is a network call.
         sweep_repo_root = repo_root
         sweep_fleet_repos = managed_repo_names(fleet_dir_override)
@@ -2305,7 +2277,7 @@ def _detect_and_handle_orphaned_workers(
                             entry["dispatched_at"] = None
                             # Issue #1134: record this as a worker death, not
                             # a no-op.  A death redispatch must not count
-                            # against the no-op rework cap — the worker may
+                            # against the no-op rework cap â€” the worker may
                             # have completed its work but died before pushing
                             # (salvageable stranded commits).  A separate
                             # death counter with its own escalation reason
@@ -2737,7 +2709,7 @@ def _detect_and_handle_orphaned_workers(
                 # Issue #1244: check whether this issue was escalated to
                 # ``agent:human-needed`` by the cross-repo scope tripwire
                 # (computed above, outside the state lock). If so, record the
-                # escalation in state and emit a visible event — do NOT fall
+                # escalation in state and emit a visible event â€” do NOT fall
                 # through to the reclaim path (which would re-add
                 # ``automated-ready`` and trigger another fruitless
                 # redispatch that hops to the sibling repo again).
@@ -3582,1159 +3554,6 @@ def _is_readiness_no_ci_stall(
     return _is_pr_updated_at_older_than(pr, now, no_ci_minutes)
 
 
-def _route_dead_worker_to_pre_review_rework(
-    state_file: Path,
-    gh: GitHubLike,
-    config: OrchestratorConfig,
-    pr: dict[str, Any],
-    issue_number: int,
-    reason: str,
-    *,
-    failure_kind: str | None = None,
-    write_gate: WriteGate,
-) -> dict[str, Any] | None:
-    """Route a dead worker's stuck pre-review PR to the rework pipeline.
-
-    Writes a rebase-onto-main brief, transitions the issue to ``needs_rework``,
-    and updates state.json to ``rework_requested``. Idempotent: if the issue is
-    already ``rework_requested`` or ``escalated``, this is a no-op.
-
-    Enforces ``watchdog.max_auto_redispatch`` and escalates deterministic
-    failures immediately, mirroring the existing redispatch-escalation logic.
-    """
-    write_gate = require_write_gate(write_gate)
-    pr_number = int(pr["number"])
-    if reason == "merge_conflict":
-        summary = (
-            "The PR branch has a merge conflict with the base branch. "
-            "Rebase the branch onto the current base branch, resolve the conflicts, "
-            "and push. The code changes are already approved; do not re-litigate the review."
-        )
-    elif reason == "rework_branch_conflict":
-        summary = (
-            "The rework branch conflicts with the current base branch; GitHub cannot "
-            "build the merge ref, so no pull_request CI will run. Resolve the conflicts "
-            "manually and push."
-        )
-        if failure_kind is None:
-            failure_kind = "rework_branch_conflict"
-    else:
-        summary = (
-            "The PR was opened but no CI checks have been created after the stale threshold. "
-            "Rebase the branch onto the current base branch and push to trigger a fresh CI run. "
-            "The existing changes are pre-approved; do not re-litigate the review."
-        )
-
-    with state_lock(state_file):
-        state = load_state(state_file)
-        state.setdefault("issues", {})
-        state.setdefault("prs", {})
-        entry = state["issues"].get(str(issue_number), {})
-        if not isinstance(entry, dict):
-            entry = {}
-        current_status = entry.get("status")
-        if current_status in ("rework_requested", "escalated"):
-            return None
-
-        redispatch_at = _windowed_redispatch_at(
-            entry, window_minutes=config.watchdog.redispatch_window_minutes
-        ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
-
-        terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-        if terminal_failure or len(redispatch_at) > config.watchdog.max_auto_redispatch:
-            # Issue #783: merge conflict / rework-branch conflict / stale-CI
-            # redispatch cap are all process failures, not judgment calls.
-            state = _escalate_issue(
-                state,
-                issue_number,
-                reason=(failure_kind if terminal_failure else "redispatch_cap_exceeded"),
-                reason_class="mechanical",
-                issue_extra={
-                    "redispatch_at": redispatch_at,
-                    "pre_review_rework_reason": reason,
-                },
-            )
-            write_gate.save_state(state)
-            edge = _escalation_edge("redispatch_escalated", "mechanical")
-            result = write_gate.transition(gh, config.labels, issue_number, edge)
-            if result.outcome != TransitionOutcome.APPLIED:
-                entry = state["issues"].get(str(issue_number), {})
-                if isinstance(entry, dict):
-                    entry = {
-                        **entry,
-                        "label_error": {
-                            "edge": edge,
-                            "outcome": result.outcome.value,
-                            "add_failures": result.add_failures,
-                            "remove_failures": result.remove_failures,
-                        },
-                    }
-                    state["issues"][str(issue_number)] = entry
-                    write_gate.save_state(state)
-            return {
-                "issue_number": issue_number,
-                "pr_number": pr_number,
-                "reason": reason,
-                "escalated": True,
-                "escalation_reason": state["issues"][str(issue_number)]["escalation_reason"],
-            }
-
-        repo_root = getattr(gh, "repo_root", None)
-        _write_rework_prompt(state_file, pr, issue_number, summary, config, repo_root=repo_root)
-        entry = {
-            **entry,
-            "number": issue_number,
-            "status": "rework_requested",
-            "dispatched_at": None,
-            "pre_review_rework_reason": reason,
-        }
-        state["issues"][str(issue_number)] = entry
-        state["prs"][str(pr_number)] = {
-            **state["prs"].get(str(pr_number), {}),
-            "number": pr_number,
-            "issue_number": issue_number,
-            "status": "rework_requested",
-        }
-        state = write_gate.append_event(
-            state,
-            # event-consumer: audit-only -- records a rework routing decision already
-            # applied inline above (status set to rework_requested); no downstream consumer needed
-            "pre_review_rework_routed",
-            {
-                "issue_number": issue_number,
-                "pr_number": pr_number,
-                "reason": reason,
-                "failure_kind": failure_kind,
-            },
-        )
-        write_gate.save_state(state)
-
-    result = write_gate.transition(gh, config.labels, issue_number, "rework_requested")
-    label_error = None
-    if result.outcome != TransitionOutcome.APPLIED:
-        label_error = {
-            "edge": "rework_requested",
-            "outcome": result.outcome.value,
-            "add_failures": result.add_failures,
-            "remove_failures": result.remove_failures,
-        }
-        with state_lock(state_file):
-            state = load_state(state_file)
-            entry = state["issues"].get(str(issue_number), {})
-            if isinstance(entry, dict):
-                entry = {**entry, "label_error": label_error}
-                state["issues"][str(issue_number)] = entry
-                write_gate.save_state(state)
-
-    return {
-        "issue_number": issue_number,
-        "pr_number": pr_number,
-        "reason": reason,
-        "label_error": label_error,
-    }
-
-
-def _classify_dead_sessions_and_update_throttle_state(
-    sessions_dir: Path,
-    state_file: Path,
-    gh: GitHubLike,
-    config: OrchestratorConfig,
-    *,
-    write_gate: WriteGate,
-    persist_inconclusive_probe_counter: bool = True,
-    now: datetime | None = None,
-) -> list[dict[str, Any]]:
-    """Check for dead sessions, classify their failures, and update throttle state.
-
-    This is called from the production loop to detect provider throttling
-    from worker deaths and set the cooldown window in state.json.
-
-    Also reconciles labels for dead sessions with no open PR (issue #118):
-    a dead worker with no open PR is recoverable and should be relabeled
-    as dispatchable (remove active labels, ensure ready label present).
-
-    Issue #252: if a dead worker has a clean worktree with unpushed commits
-    (completed-but-unpublished), push the branch, create a PR, and move the
-    issue to ``pr_open`` instead of re-dispatching.
-
-    Issue #266: launch-failure sidecars (pid=None, error set) are terminal by
-    construction and are reaped immediately, reported in the returned list.
-
-    Issue #295: dead/launch-failed rework sessions with an open PR and a
-    request_changes verdict (or a rework prompt on disk) are restored to
-    ``rework_requested`` so ``dispatch_rework`` can re-select them.
-
-    ``persist_inconclusive_probe_counter`` (issue #343 Finding 2): controls
-    whether this lane persists Signal-1's inconclusive-probe deferral counter
-    for a not-alive, pid-bearing worker. Defaults to True so this function
-    remains fully self-sufficient when called on its own (as every existing
-    unit test does, and as any future standalone caller would expect).
-    ``loop()`` is the one caller that always runs the sibling stall lane
-    (``_detect_and_handle_stalled_sessions``, the sole writer of this counter
-    for an ALIVE-but-stalled worker, and -- unconditionally, regardless of
-    liveness -- the first lane to see every worker each pass) immediately
-    before this one, in the same pass; it passes False there so this lane
-    does not ALSO increment the same counter on top of what the stall lane
-    just wrote a moment earlier -- that double counting (0->1 in the stall
-    lane, then re-read and ->2 here) halved the effective deferral grace
-    period and was the very mechanism that opened Finding 1's pass-2
-    phantom-sidecar window. classify_worker_health's own cap-check always
-    reads whatever value is currently on the sidecar, regardless of which
-    lane -- or how many passes ago -- last wrote it, so suppressing the
-    write here never affects the DEAD-vs-deferred decision made below,
-    only which lane's write ends up on disk for a given pass.
-
-    ``now`` (issue #822) is the injectable clock for this entire pass: it
-    seeds ``now_for_health`` (worker-health/probe timing) and is forwarded
-    to every throttle classification call below, so a single instant is used
-    consistently for the whole pass instead of each call independently
-    racing the wall clock. Defaults to ``datetime.now(UTC)`` when omitted,
-    so production behavior is byte-identical; tests can freeze it and assert
-    exact equality on the resulting ``throttled_until`` instead of a
-    wall-clock-tolerance proximity check.
-    """
-    write_gate = require_write_gate(write_gate)
-    from .claude_code import update_worker_record_with_failure_classification
-    from .devin_shell import update_session_record_with_failure_classification
-    from .post_mortem import classify_and_record
-    from .state import load_state, set_throttled_until, state_lock
-    from .worker import (
-        is_worker_confirmed_dead,
-        iter_workers,
-    )
-    from .worktree import WorktreeState
-
-    now_for_health = now if now is not None else datetime.now(UTC)
-
-    # Fetch open PRs for the "no open PR" guard
-    prs = gh.pr_list()
-    open_prs_by_issue: dict[int, list[dict[str, Any]]] = {}
-    # Issue #1229: validate branch-name-derived issue numbers against the
-    # open-issue set so a stale branch name (e.g. agent/issue-709-… left over
-    # from a merged PR #709, reused by an unrelated issue-less PR) cannot
-    # populate open_prs_by_issue[<wrong n>]. That map feeds the
-    # escalation/salvage-skip guard below (``w.issue_number not in
-    # open_prs_by_issue``): a stale binding to a dead worker's issue number
-    # would make the guard see a phantom open PR for that issue and skip
-    # escalation/salvage for a session that has no real open PR — the same
-    # "act on the wrong subject" failure class as the rework-episode
-    # collision the issue was filed for.
-    branch_validator = _build_branch_issue_validator(gh)
-    for pr in prs:
-        pr_state = str(pr.get("state") or "").upper()
-        if pr_state != "OPEN":
-            continue
-        issue_number = linked_issue_number(
-            pr,
-            is_cross_repository=pr.get("isCrossRepository"),
-            branch_prefix=config.dispatch.branch_prefix,
-            branch_issue_validator=branch_validator,
-        )
-        if issue_number is not None:
-            open_prs_by_issue.setdefault(issue_number, []).append(pr)
-
-    repo_root = getattr(gh, "repo_root", None)
-
-    reaped: list[dict[str, Any]] = []
-
-    for w in iter_workers(sessions_dir):
-        if w.pid is None and w.error is not None:
-            # Launch-failure sidecar: terminal by construction (issue #266).
-            # The process never launched, so it can never transition to live.
-            failure_kind = "launch_failed"
-            throttled_until = None
-            if w.adapter_kind == "devin":
-                failure_kind, throttled_until = update_session_record_with_failure_classification(
-                    sessions_dir,
-                    w.issue_number,
-                    fallback_kind=failure_kind,
-                    config=config,
-                    now=now_for_health,
-                )
-            elif w.adapter_kind == "claude-code":
-                failure_kind, throttled_until = update_worker_record_with_failure_classification(
-                    sessions_dir,
-                    w.issue_number,
-                    fallback_kind=failure_kind,
-                    config=config,
-                    now=now_for_health,
-                )
-            elif w.adapter_kind == "api":
-                failure_kind, throttled_until = update_worker_record_with_failure_classification(
-                    sessions_dir,
-                    w.issue_number,
-                    fallback_kind=failure_kind,
-                    config=config,
-                    adapter_kind="api",
-                    now=now_for_health,
-                )
-            if failure_kind and throttled_until:
-                # A throttle-caused launch failure must persist its window just
-                # like the dead-session branch below — otherwise the governor
-                # relaunches straight into the same throttled provider.
-                with state_lock(state_file):
-                    state = load_state(state_file)
-                    state = set_throttled_until(
-                        state,
-                        throttled_until,
-                        reason=failure_kind,
-                        adapter_kind=w.adapter_kind,
-                    )
-                    write_gate.save_state(state)
-
-            if (
-                failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-                and w.issue_number not in open_prs_by_issue
-            ):
-                try:
-                    issue = gh.issue_view(w.issue_number)
-                except Exception:
-                    issue = None
-                issue_labels = label_names(issue) if issue else set()
-                active_labels = issue_labels & config.labels.active
-
-                # Issue #1130: before escalating a ``worktree_unsafe`` launch
-                # failure, attempt salvage. A ``worktree_unsafe`` failure means
-                # redispatch found the worktree holding unpushed commits — that
-                # is exactly the work salvage exists to recover. Escalating to
-                # a human without attempting the cheap safe action (push the
-                # branch + open a PR) inverts the priority: salvage-the-commit
-                # first, human adjudication only when salvage fails.
-                salvaged_from_unsafe = False
-                if (
-                    failure_kind == "worktree_unsafe"
-                    and repo_root is not None
-                    and w.branch
-                    and active_labels
-                ):
-                    worktrees_dir = resolved_layout(config, repo_root).worktrees
-                    wt_path = worktree_path_for_branch(repo_root, w.branch, worktrees_dir)
-                    unsafe_inspection = inspect_worktree_state(
-                        wt_path,
-                        config.dispatch.base_ref,
-                        config.dispatch.injected_paths,
-                        config.dispatch.materialize_dirs,
-                    )
-                    if unsafe_inspection.ahead_count > 0:
-                        salvaged_from_unsafe, _ = _attempt_salvage(
-                            gh=gh,
-                            config=config,
-                            repo_root=repo_root,
-                            worktree_path=wt_path if wt_path.is_dir() else repo_root,
-                            branch=w.branch,
-                            base_ref=unsafe_inspection.resolved_base_ref
-                            or config.dispatch.base_ref,
-                            issue_number=w.issue_number,
-                            active_labels=active_labels,
-                            issue_labels=issue_labels,
-                            state_file=state_file,
-                            failure_kind=failure_kind,
-                            issue_title=issue.get("title") if issue else None,
-                            write_gate=write_gate,
-                        )
-
-                if not salvaged_from_unsafe:
-                    with state_lock(state_file):
-                        state = load_state(state_file)
-                        entry = state["issues"].get(str(w.issue_number), {})
-                        now = datetime.now(UTC)
-                        redispatch_at = _windowed_redispatch_at(
-                            entry, window_minutes=config.watchdog.redispatch_window_minutes
-                        ) + [now.isoformat().replace("+00:00", "Z")]
-                        # Issue #783: a deterministic launch failure kind is a
-                        # process failure, not a judgment call -- mechanical.
-                        state = _escalate_issue(
-                            state,
-                            w.issue_number,
-                            reason=failure_kind,
-                            reason_class="mechanical",
-                            issue_extra={"redispatch_at": redispatch_at},
-                        )
-                        state["issues"][str(w.issue_number)].pop("worker_pid", None)
-                        state["issues"][str(w.issue_number)].pop("worker_process_start_time", None)
-                        write_gate.save_state(state)
-                        write_gate.transition(
-                            gh,
-                            config.labels,
-                            w.issue_number,
-                            _escalation_edge("redispatch_escalated", "mechanical"),
-                        )
-                        state = write_gate.append_event(
-                            state,
-                            "session_failed_escalated",
-                            {
-                                "issue_number": w.issue_number,
-                                "failure_kind": failure_kind,
-                                "removed_labels": sorted(active_labels),
-                                "redispatch_count": len(redispatch_at),
-                            },
-                        )
-                        write_gate.save_state(state)
-
-            w.reap_sidecar(
-                sessions_dir,
-                api_config=config.api_worker,
-                state_dir=state_file.parent,
-            )
-            reaped.append(
-                {
-                    "issue_number": w.issue_number,
-                    "adapter_kind": w.adapter_kind,
-                    "failure_kind": failure_kind,
-                    "error": w.error,
-                    "pid": w.pid,
-                }
-            )
-            # Issue #295: a launch-failed rework session must still be returned to
-            # rework_requested so its owning lane can re-dispatch it.
-            _reap_restore_rework_requested(
-                state_file,
-                gh,
-                config,
-                open_prs_by_issue,
-                w,
-                failure_kind=failure_kind,
-                write_gate=write_gate,
-            )
-            continue
-        if not w.is_alive():
-            # Issue #755: the confirmed-dead decision (including the
-            # max_inconclusive_probe_deferrals grace period and counter) is now
-            # owned by a single helper shared with reconcile.detect_drift.
-            if not is_worker_confirmed_dead(
-                w,
-                config,
-                now_for_health,
-                sessions_dir,
-                persist_inconclusive_probe_counter=persist_inconclusive_probe_counter,
-            ):
-                continue
-
-            # Inspect the worktree before deciding how to classify and relabel.
-            # This is the single enforcement point for issue #252.
-            worktree_path = Path(w.worktree_path)
-            inspection = inspect_worktree_state(
-                worktree_path,
-                config.dispatch.base_ref,
-                config.dispatch.injected_paths,
-                config.dispatch.materialize_dirs,
-            )
-            is_completed = inspection.state == WorktreeState.COMPLETED
-
-            # Post-mortem extraction (issue #261) is intertwined with log-tail
-            # classification. For a completed-but-unpublished worktree, we want
-            # failure_kind to be "unpublished_work" even if the terminal log
-            # tail would otherwise look like a tool-rejection (worker_blocked).
-            # Call update_* first when completed, then run classify_and_record
-            # for diagnostics (it will no-op on the sidecar because failure_kind
-            # is already set). For non-completed sessions, preserve the original
-            # ordering so worker_blocked still escalates.
-            if is_completed:
-                # session_completed=True (issue #656): the worktree inspection
-                # just above is ground truth that this session produced real,
-                # committable work -- it cannot also have died to a provider
-                # quota/rate-limit/auth failure, so log-tail marker matching
-                # (which would otherwise treat the session's own completion
-                # summary prose as fair game) is skipped entirely.
-                if w.adapter_kind == "devin":
-                    failure_kind, throttled_until = (
-                        update_session_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind="unpublished_work",
-                            config=config,
-                            session_completed=True,
-                            now=now_for_health,
-                        )
-                    )
-                elif w.adapter_kind == "claude-code":
-                    failure_kind, throttled_until = (
-                        update_worker_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind="unpublished_work",
-                            config=config,
-                            session_completed=True,
-                            now=now_for_health,
-                        )
-                    )
-                elif w.adapter_kind == "api":
-                    failure_kind, throttled_until = (
-                        update_worker_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind="unpublished_work",
-                            config=config,
-                            adapter_kind="api",
-                            session_completed=True,
-                            now=now_for_health,
-                        )
-                    )
-                else:
-                    failure_kind, throttled_until = None, None
-                # Diagnostic post-mortem; its worker_blocked verdict is ignored
-                # because the worktree itself proves the work was completed.
-                classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
-            else:
-                classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
-                fallback_kind = "stalled" if inspection.state != WorktreeState.UNKNOWN else None
-                if w.adapter_kind == "devin":
-                    failure_kind, throttled_until = (
-                        update_session_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind=fallback_kind,
-                            config=config,
-                            now=now_for_health,
-                        )
-                    )
-                elif w.adapter_kind == "claude-code":
-                    failure_kind, throttled_until = (
-                        update_worker_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind=fallback_kind,
-                            config=config,
-                            now=now_for_health,
-                        )
-                    )
-                elif w.adapter_kind == "api":
-                    failure_kind, throttled_until = (
-                        update_worker_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind=fallback_kind,
-                            config=config,
-                            adapter_kind="api",
-                            now=now_for_health,
-                        )
-                    )
-                else:
-                    failure_kind, throttled_until = None, None
-
-            if failure_kind and throttled_until:
-                # Update state with throttle window
-                with state_lock(state_file):
-                    state = load_state(state_file)
-                    state = set_throttled_until(
-                        state,
-                        throttled_until,
-                        reason=failure_kind,
-                        adapter_kind=w.adapter_kind,
-                    )
-                    write_gate.save_state(state)
-
-            # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
-            # Delete the sidecar file after the session is detected as dead and classified
-            w.reap_sidecar(
-                sessions_dir,
-                api_config=config.api_worker,
-                state_dir=state_file.parent,
-            )
-            reaped.append(
-                {
-                    "issue_number": w.issue_number,
-                    "adapter_kind": w.adapter_kind,
-                    "failure_kind": failure_kind,
-                    "error": w.error,
-                    "pid": w.pid,
-                }
-            )
-
-            # Issue #118: reconcile labels for dead sessions with no open PR
-            if w.issue_number not in open_prs_by_issue:
-                try:
-                    issue = gh.issue_view(w.issue_number)
-                except Exception:
-                    # Issue may have been deleted or we lack access; skip relabel
-                    continue
-                issue_labels = label_names(issue)
-                active_labels = issue_labels & config.labels.active
-                # Gate the WHOLE reclaim on an active label actually being
-                # present, matching reconcile.py's issue_active_label_no_open_pr
-                # pattern (~536-580) so all three sites agree. An issue with
-                # no active label -- e.g. one carrying only a terminal label
-                # like agent:human-needed/agent:done/agent:blocked -- has
-                # nothing here to reclaim; it must never get `ready` added
-                # back just because it also has a stale
-                # dispatched/dead-worker/no-PR state.json entry. (A prior
-                # revision gated on "not active_labels and not needs_ready" to
-                # also repair a remove-succeeded-but-add-failed partial
-                # failure once the active label was already gone -- but that
-                # made this lane indistinguishable from "issue is legitimately
-                # terminal-only", which is the regression this gate now
-                # avoids. `needs_ready` is still honored below whenever an
-                # active label IS present, so the common
-                # remove-and-add-together case is unaffected.)
-                if not active_labels:
-                    continue
-                needs_ready = config.labels.ready not in issue_labels
-
-                # Issue #252: completed-but-unpublished work takes the salvage
-                # path (push + PR) instead of re-dispatching.
-                # Issue #1130: relax the salvage trigger from ``is_completed``
-                # (clean + ahead) to ``ahead_count > 0`` (ahead, regardless of
-                # working-tree dirt). A worker that dies mid-push leaves a
-                # committed-but-unpushed branch; the worktree may also carry
-                # shim/scaffolding dirt (e.g. ``.devin/`` artifacts) that is
-                # not in ``injected_paths`` and so reads as worker-authored
-                # dirty, classifying the worktree PARTIAL instead of COMPLETED.
-                # Salvage pushes the branch ref (the committed work), not the
-                # working tree — the dirt is irrelevant to the push and survives
-                # in the worktree for later inspection. Without this relaxation
-                # the dead-session lane relabels to ready, the next redispatch
-                # hits the unpushed commits, raises ``worktree_unsafe``, and
-                # escalates to a human without ever attempting the cheap safe
-                # action (salvage-the-commit).
-                salvage_error: str | None = None
-                has_salvageable_commits = inspection.ahead_count > 0
-                if has_salvageable_commits and repo_root is not None:
-                    salvaged, salvage_error = _attempt_salvage(
-                        gh=gh,
-                        config=config,
-                        repo_root=repo_root,
-                        worktree_path=worktree_path,
-                        branch=w.branch,
-                        base_ref=inspection.resolved_base_ref or "",
-                        issue_number=w.issue_number,
-                        active_labels=active_labels,
-                        issue_labels=issue_labels,
-                        state_file=state_file,
-                        failure_kind=failure_kind,
-                        issue_title=issue.get("title") if issue else None,
-                        issue=issue,
-                        write_gate=write_gate,
-                    )
-                    if salvaged:
-                        continue
-                    # Salvage failed: fall through to the normal relabel path below.
-
-                # Track redispatch count for escalation cap (issue #165)
-                # This relabel-to-ready path is a redispatch event
-                with state_lock(state_file):
-                    state = load_state(state_file)
-                    entry = state["issues"].get(str(w.issue_number), {})
-                    now = datetime.now(UTC)
-                    redispatch_at = _windowed_redispatch_at(
-                        entry, window_minutes=config.watchdog.redispatch_window_minutes
-                    ) + [now.isoformat().replace("+00:00", "Z")]
-                    # issue #261: a worker_blocked verdict (extracted from the
-                    # Devin CLI's session store — see post_mortem.classify_and_record)
-                    # means the worker was killed by a push-gate hook, not a
-                    # generic stall/crash. Hot-redispatching it just repeats the
-                    # same block, so it bypasses the redispatch-count cap entirely
-                    # and escalates on the very first occurrence.
-                    terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-                    if (
-                        terminal_failure
-                        or len(redispatch_at) > config.watchdog.max_auto_redispatch
-                    ):
-                        # Escalate to human review instead of relabeling to ready
-                        reason = (
-                            failure_kind
-                            if terminal_failure and failure_kind is not None
-                            else "redispatch_cap_exceeded"
-                        )
-                        # Issue #783: dead worker session / redispatch cap is a
-                        # process failure, not a judgment call -- mechanical.
-                        state = _escalate_issue(
-                            state,
-                            w.issue_number,
-                            reason=reason,
-                            reason_class="mechanical",
-                            issue_extra={"redispatch_at": redispatch_at},
-                        )
-                        # Issue #282: preserve the liveness fingerprint for the
-                        # recovery path. The PID is already verified dead by the
-                        # time we reach this branch, but clearing it removes the
-                        # only signal the recovery probe can cross-check.
-                        write_gate.save_state(state)
-                        write_gate.transition(
-                            gh,
-                            config.labels,
-                            w.issue_number,
-                            _escalation_edge("redispatch_escalated", "mechanical"),
-                        )
-                        state = write_gate.append_event(
-                            state,
-                            "session_failed_escalated",
-                            {
-                                "issue_number": w.issue_number,
-                                "failure_kind": failure_kind,
-                                "removed_labels": sorted(active_labels),
-                                "redispatch_count": len(redispatch_at),
-                            },
-                        )
-                        write_gate.save_state(state)
-                        continue
-                    else:
-                        entry["redispatch_at"] = redispatch_at
-                        state["issues"][str(w.issue_number)] = entry
-                        write_gate.save_state(state)
-                # Remove all active labels and ensure ready label is present.
-                # Issue #417: check (and record) the bool return values instead
-                # of silently discarding them. A False here means this pass's
-                # label swap did not fully land -- the issue remains eligible
-                # for _detect_and_handle_orphaned_workers' no-open-PR sweep to
-                # finish the reclaim on a later pass, since that lane
-                # re-derives "does this still need fixing" from GitHub's live
-                # label state every pass rather than from any flag written
-                # here (and never touches redispatch_at, so a retry there
-                # cannot double-count this as a second redispatch event).
-                label_write_ok = True
-                for label in sorted(active_labels):
-                    if not gh.remove_issue_label(w.issue_number, label):
-                        label_write_ok = False
-                if needs_ready:
-                    if not gh.add_issue_label(w.issue_number, config.labels.ready):
-                        label_write_ok = False
-                # Record the relabel event
-                with state_lock(state_file):
-                    state = load_state(state_file)
-                    # Issue #282: preserve the liveness fingerprint so the
-                    # recovery path can verify the worker is dead before removing
-                    # the worktree, even after the session is classified as dead.
-                    state = _emit_session_failed_relabeled(
-                        state,
-                        issue_number=w.issue_number,
-                        reason="dead_worker_no_open_pr",
-                        failure_kind=failure_kind,
-                        removed_labels=sorted(active_labels),
-                        added_ready=needs_ready,
-                        label_write_ok=label_write_ok,
-                        salvage_failed=has_salvageable_commits,
-                        salvage_error=salvage_error,
-                        state_path=state_file,
-                        write_gate=write_gate,
-                    )
-                    write_gate.save_state(state)
-            else:
-                # Issue #295: open PR with request_changes or rework prompt =>
-                # restore to rework_requested for its owning lane.
-                #
-                # Issue #315 finding 1: a completed worktree (ahead of base and
-                # clean) proves the worker finished its work — even if this
-                # reap pass's PR-list snapshot (fetched once, at line ~889)
-                # hasn't caught up to a fresh push yet. Never roll a worker
-                # that finished (and, per the open-PR guard above, already has
-                # a PR reflecting or about to reflect that work) back to
-                # rework_requested just because a launch-failure classifier
-                # ran on its now-dead sidecar.
-                if not is_completed:
-                    pr_data = _rework_pr_for_worker(open_prs_by_issue, w)
-                    if pr_data is not None:
-                        pr_number = int(pr_data["number"])
-                        try:
-                            pr_view = gh.pr_view(pr_number)
-                        except Exception:
-                            pr_view = None
-                        enriched = pr_view if pr_view else pr_data
-                        is_candidate, reason = _is_pre_review_rework_candidate(
-                            enriched, config, now_for_health
-                        )
-                        if is_candidate:
-                            _route_dead_worker_to_pre_review_rework(
-                                state_file,
-                                gh,
-                                config,
-                                enriched,
-                                w.issue_number,
-                                reason,
-                                failure_kind=failure_kind,
-                                write_gate=write_gate,
-                            )
-                        else:
-                            _reap_restore_rework_requested(
-                                state_file,
-                                gh,
-                                config,
-                                open_prs_by_issue,
-                                w,
-                                failure_kind=failure_kind,
-                                write_gate=write_gate,
-                            )
-                    else:
-                        _reap_restore_rework_requested(
-                            state_file,
-                            gh,
-                            config,
-                            open_prs_by_issue,
-                            w,
-                            failure_kind=failure_kind,
-                            write_gate=write_gate,
-                        )
-
-    return reaped
-
-
-def _safe_repo_slug(gh: GitHubLike) -> str:
-    """Return the ``owner/repo`` slug, or ``"?"`` if the lookup fails.
-
-    ``name_with_owner()`` raises ``GitHubError`` on failure (offline, gh
-    missing, etc.); this is used only to qualify a closing-reference line, so
-    a lookup failure must not stop salvage-PR creation. Mirrors
-    ``reconcile._repo_slug``.
-    """
-    try:
-        return gh.name_with_owner()
-    except Exception:
-        return "?"
-
-
-def _open_salvage_pr(
-    *,
-    gh: GitHubLike,
-    config: OrchestratorConfig,
-    repo_root: Path | None,
-    branch: str,
-    base_ref: str,
-    issue_number: int,
-    active_labels: set[str],
-    issue_labels: set[str],
-    issue_title: str | None = None,
-    source_description: str = "worker branch",
-    state_file: Path | None = None,
-) -> tuple[int | None, str | None, ValidationResult | None]:
-    """Open a PR for a salvaged worker branch and move issue labels toward ``pr_open``.
-
-    Returns ``(pr_number, error, closing_ref)``. ``pr_number`` is the created
-    PR number, or ``None`` when the PR could not be created. ``error`` is
-    ``None`` when both the PR and the label swap succeeded; otherwise it
-    describes the first failure encountered (a missing ``repo_root``, a
-    failed PR create, or a label write failure after the PR was created).
-    ``closing_ref`` is the `~charlie_work.closing_reference.ValidationResult`
-    from canonicalizing the closing-reference line before the PR was
-    created, or ``None`` when PR creation never reached that far (missing
-    ``repo_root``).
-
-    cw#1263: the body's ``Closes #N`` line is validated/canonicalized via
-    `closing_reference.validate_closing_reference` before ``gh.pr_create``
-    ever sees it -- this is the sole point where both salvage/orphan-recovery
-    callers (`_attempt_salvage`, `_open_pr_for_orphaned_branch`) create a PR,
-    so routing the fixed-up body through here covers both without a second
-    call site to keep in sync. After a successful create, GitHub's own
-    ``closingIssuesReferences`` resolution is queried and compared against
-    ``issue_number``; a mismatch is logged (``pr_closing_ref_unlinked``) but
-    never blocks the return -- this is the only verification surface that
-    would catch it, since GitHub's own auto-close resolution can diverge from
-    the text charlie-work wrote even when that text looks correct.
-    """
-    if repo_root is None:
-        return None, "repo_root is required to open a salvage PR", None
-
-    base_branch = resolve_base_branch_name(repo_root, base_ref)
-
-    title = (
-        f"Salvaged work for #{issue_number}: {issue_title}"
-        if issue_title
-        else f"Salvaged work for issue #{issue_number}"
-    )
-    # The body must satisfy the same janitor gate as a worker-authored one
-    # (`review.require_tests_or_rationale`). A fixed boilerplate string cannot:
-    # it carries no rationale token, so every salvage PR failed a gate on text
-    # the orchestrator itself wrote. Derive the rationale from the worker's own
-    # commit log instead of injecting the gate's keywords -- a branch with no
-    # commits still yields no summary, and still correctly fails.
-    body = f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a {source_description}."
-    # Pass the RESOLVED base branch, not the raw ``base_ref``. The orphaned-branch
-    # lane (``_open_pr_for_orphaned_branch``) sources ``base_ref`` straight from
-    # ``config.dispatch.base_ref``, whose default is ``""`` and which the live
-    # config leaves unset -- so production reaches here with the empty sentinel.
-    # ``require_valid_rev("")`` raises, ``summarize_branch_work`` returns "", and
-    # the body falls back to boilerplate that cannot pass the janitor gate: the
-    # exact defect this code exists to fix, on the lane that hits it most.
-    summary = summarize_branch_work(
-        repo_root,
-        branch,
-        base_branch,
-        test_path_globs=config.test_adequacy.test_path_globs,
-    )
-    if summary:
-        body = f"{body}\n\n{summary}"
-
-    closing_ref = validate_closing_reference(body, issue_number, repo=_safe_repo_slug(gh), gh=gh)
-    body = closing_ref.body
-    if closing_ref.changed and state_file is not None:
-        log_event(
-            state_file,
-            "pr_closing_ref_rewritten",
-            {
-                "issue_number": issue_number,
-                "findings": list(closing_ref.findings),
-                "source": source_description,
-            },
-        )
-
-    # cw#1273: every gh.pr_create call site routes through the bounded outer
-    # retry + duplicate-PR guard instead of calling gh.pr_create directly.
-    retry_result = create_pr_with_retry(
-        gh,
-        head=branch,
-        base=base_branch,
-        title=title,
-        body=body,
-        max_retries=config.runtime.pr_create_retry_max_attempts,
-        base_seconds=config.runtime.pr_create_retry_base_seconds,
-    )
-    pr_number = retry_result.pr_number
-    if pr_number is None:
-        return (
-            None,
-            retry_result.error or "gh pr create failed or returned no PR number",
-            closing_ref,
-        )
-
-    # `pr_number` is falsy (0) under `dry_run`, where no real PR was opened and
-    # a `gh pr view 0` call would be both wasted and nonsensical -- only probe
-    # a real, truthy PR number.
-    if pr_number and state_file is not None:
-        query_ok = True
-        try:
-            pr_view = gh.pr_view(pr_number, fields=PR_CLOSING_ISSUES_FIELDS)
-        except Exception:
-            pr_view = {}
-            query_ok = False
-        linked_numbers = closing_issues_referenced_numbers(pr_view)
-        # Only log when the query itself succeeded: a transient `gh` failure
-        # collapses to the same empty result as "GitHub really didn't link
-        # the issue", and this event exists to be acted on -- conflating a
-        # failed probe with a genuine miss would make it noisy and untrustworthy.
-        if query_ok and issue_number not in linked_numbers:
-            log_event(
-                state_file,
-                "pr_closing_ref_unlinked",
-                {
-                    "issue_number": issue_number,
-                    "pr_number": pr_number,
-                    "linked_issue_numbers": sorted(linked_numbers),
-                },
-            )
-
-    label_write_ok = True
-    for label in sorted(active_labels):
-        if not gh.remove_issue_label(issue_number, label):
-            label_write_ok = False
-    if config.labels.pr_open not in issue_labels:
-        if not gh.add_issue_label(issue_number, config.labels.pr_open):
-            label_write_ok = False
-
-    if not label_write_ok:
-        return pr_number, "PR created but label write failed", closing_ref
-
-    return pr_number, None, closing_ref
-
-
-def _salvage_already_landed(
-    *,
-    gh: GitHubLike,
-    config: OrchestratorConfig,
-    repo_root: Path,
-    branch: str,
-    base_ref: str,
-    issue_number: int,
-    issue: dict[str, Any] | None,
-) -> tuple[bool, str | None]:
-    """Return ``(already_landed, reason)`` if salvage should be skipped.
-
-    Issue #1221: a dead session's snapshot (issue, pr_number, branch) can be
-    stale by the time staleness trips and salvage fires -- the linked issue may
-    have been closed and/or its PR merged by an operator or sibling worker
-    inside the staleness threshold window. Re-check LIVE terminal state at fire
-    time instead of trusting the snapshot. Any one of these means a salvage PR
-    would be vestigial (a duplicate of already-landed work):
-
-    1. the linked issue is CLOSED (``issue`` carries ``state`` from the
-       caller's ``gh.issue_view`` -- one call, already made).
-    2. a PR binding to this issue is MERGED (``gh.merged_prs_for_issue`` -- one
-       call). A failed search (``ok=False``) is treated as "unknown", which
-       falls through to opening the PR; a human reviews salvage PRs anyway.
-    3. the salvage branch's tree contributes an empty diff against current main
-       (``salvage_branch_empty_diff`` -- a fetch + two rev-parse calls). This
-       is the belt-and-suspenders for the case where (1)/(2) miss (e.g. a
-       squash-merge that closed the issue but whose PR search lags, or work
-       landed via a sibling branch). Fails safe (returns False) on git error.
-
-    ``reason`` is a short string identifying which check fired, recorded in the
-    ``salvage_skipped_already_landed`` event for diagnosis.
-    """
-    # (1) Issue closed.
-    if issue is not None and str(issue.get("state") or "").upper() == "CLOSED":
-        return True, "issue_closed"
-
-    # (2) A merged PR binds to this issue.
-    merged = gh.merged_prs_for_issue(issue_number, config.dispatch.branch_prefix)
-    if getattr(merged, "ok", True) and len(merged) > 0:
-        return True, "pr_merged"
-
-    # (3) The branch's tree is identical to current main's tree.
-    if salvage_branch_empty_diff(repo_root, branch, base_ref):
-        return True, "empty_diff"
-
-    return False, None
-
-
-def _attempt_salvage(
-    *,
-    gh: GitHubLike,
-    config: OrchestratorConfig,
-    repo_root: Path,
-    worktree_path: Path,
-    branch: str,
-    base_ref: str,
-    issue_number: int,
-    active_labels: set[str],
-    issue_labels: set[str],
-    state_file: Path,
-    failure_kind: str | None,
-    issue_title: str | None = None,
-    issue: dict[str, Any] | None = None,
-    write_gate: WriteGate,
-) -> tuple[bool, str | None]:
-    """Push a completed branch and open a PR, then move labels to ``pr_open``.
-
-    Returns ``(ok, error)``. Errors are recorded as values and never raised.
-    ``ok`` is ``True`` once the PR is created, even if the label swap failed;
-    in that case ``error`` describes the label failure and the
-    ``session_salvaged`` event records ``label_write_ok=False``.
-
-    ``ok`` is also ``True`` (with ``error=None``) when salvage is *skipped*
-    because the work already landed (issue #1221): the dead session's snapshot
-    can be stale, so before opening a PR we re-check live terminal state. A
-    skip emits ``salvage_skipped_already_landed`` instead of opening a vestigial
-    duplicate PR, and the caller treats it as "handled" (no redispatch).
-
-    NOTE (issue #1264, W6 PR3 disclosure): the ``push_branch`` call below is
-    an unconditional, unguarded real ``git push`` -- outside WriteGate's
-    declared 6-primitive surface (state.json/events.db/label-transition/
-    process-kill) and therefore NOT gated by ``write_gate`` here. This is a
-    real dry-run leak (filed separately; see the PR3 handoff) that this PR
-    does not fix -- gating an external git push was never in R6's scope
-    (kill_process was the one sanctioned new primitive) and freelancing a
-    7th WriteGate primitive without design review would repeat exactly the
-    mistake R6b's STOP-and-report exists to prevent.
-    """
-    write_gate = require_write_gate(write_gate)
-    already_landed, skip_reason = _salvage_already_landed(
-        gh=gh,
-        config=config,
-        repo_root=repo_root,
-        branch=branch,
-        base_ref=base_ref,
-        issue_number=issue_number,
-        issue=issue,
-    )
-    if already_landed:
-        with state_lock(state_file):
-            state = load_state(state_file)
-            # Issue #282: preserve the liveness fingerprint so the recovery
-            # path can verify the worker is dead before the worktree is
-            # reclaimed.
-            state = write_gate.append_event(
-                state,
-                "salvage_skipped_already_landed",
-                {
-                    "issue_number": issue_number,
-                    "failure_kind": failure_kind,
-                    "reason": skip_reason,
-                    # The skip path does NOT remove labels -- label cleanup is the
-                    # reconcile lane's job. Record the active labels at skip time
-                    # for diagnosis (what state the issue was in), not as removed.
-                    "active_labels": sorted(active_labels),
-                },
-            )
-            write_gate.save_state(state)
-        return True, None
-
-    push_ok, push_error = push_branch(repo_root, branch, worktree_path=worktree_path)
-    if not push_ok:
-        return False, push_error
-
-    pr_number, pr_error, _closing_ref = _open_salvage_pr(
-        gh=gh,
-        config=config,
-        repo_root=repo_root,
-        branch=branch,
-        base_ref=base_ref,
-        issue_number=issue_number,
-        active_labels=active_labels,
-        issue_labels=issue_labels,
-        issue_title=issue_title,
-        source_description="completed-but-unpublished worker worktree",
-        state_file=state_file,
-    )
-    if pr_number is None:
-        return False, pr_error or "gh pr create failed or returned no PR number"
-
-    with state_lock(state_file):
-        state = load_state(state_file)
-        # Issue #282: preserve the liveness fingerprint so the recovery path
-        # can verify the worker is dead before the worktree is reclaimed.
-        state = write_gate.append_event(
-            state,
-            "session_salvaged",
-            {
-                "issue_number": issue_number,
-                "failure_kind": failure_kind,
-                "removed_labels": sorted(active_labels),
-                "pr_number": pr_number,
-                "label_write_ok": pr_error is None,
-                "label_error": pr_error,
-            },
-        )
-        write_gate.save_state(state)
-    return True, pr_error
-
-
-def _open_pr_for_orphaned_branch(
-    *,
-    gh: GitHubLike,
-    config: OrchestratorConfig,
-    repo_root: Path | None,
-    branch: str,
-    base_ref: str,
-    issue_number: int,
-    active_labels: set[str],
-    issue_labels: set[str],
-    issue_title: str | None = None,
-    state_file: Path | None = None,
-) -> tuple[int | None, str | None, ValidationResult | None]:
-    """Open a PR for a branch that the worker pushed but could not create a PR for.
-
-    Returns ``(pr_number, error, closing_ref)``. Errors are recorded as
-    values and never raised. This is the orchestrator-side recovery for
-    issue #935: workers are unauthenticated in their environment, so after
-    pushing a completed branch they cannot run ``gh pr create``. The
-    orchestrator, which is authenticated, creates the PR and moves the issue
-    labels toward ``pr_open``. See `_open_salvage_pr` for the closing-
-    reference validation and post-create verification this delegates to.
-    """
-    return _open_salvage_pr(
-        gh=gh,
-        config=config,
-        repo_root=repo_root,
-        branch=branch,
-        base_ref=base_ref,
-        issue_number=issue_number,
-        active_labels=active_labels,
-        issue_labels=issue_labels,
-        issue_title=issue_title,
-        source_description="worker branch that could not open a PR",
-        state_file=state_file,
-    )
-
-
-def _issues_with_live_workers(sessions_dir: Path) -> set[int]:
-    """Return the set of issue numbers that have currently alive worker sessions.
-
-    Reads session sidecar files from both devin-shell and claude-code adapters,
-    then checks each record's PID liveness using the adapter-specific liveness
-    probe. Returns the set of issue numbers with alive PIDs.
-    """
-    from .worker import iter_workers
-
-    return {w.issue_number for w in iter_workers(sessions_dir) if w.is_alive()}
-
-
 def _build_attention_digest(
     state_file: Path,
     health_transitions: dict[int, dict[str, Any]],
@@ -4862,13 +3681,13 @@ def _format_merge_attempt_alarm_message(
         buckets.append(f"infra_blocked: {', '.join(summary.infra_blocked)}")
     if summary.unavailable:
         # gh reported no parseable check list at all (see summarize_checks'
-        # `checks is None` branch) — distinct from "all required checks
+        # `checks is None` branch) â€” distinct from "all required checks
         # passed", so it must not fall into the passed-but-unmergeable
         # bucket below.
         buckets.append(f"unavailable: {', '.join(summary.unavailable)}")
     if not buckets:
         # Issue #751: every check-summary bucket above is empty, which means
-        # the checks the bot tracks are not why this PR is stuck — GitHub's
+        # the checks the bot tracks are not why this PR is stuck â€” GitHub's
         # own mergeability signal is (a lagging/absent CONFLICTING reading, a
         # BLOCKED merge state, branch protection, or a merge-base freshness
         # result that isn't one of the explicitly modelled branches above).
@@ -4945,14 +3764,14 @@ def _try_reap_blocked_foreign_writer(
     ``max_auto_redispatch`` cap for a ``worktree_foreign_writer`` failure,
     the default action is to escalate the issue to a human. But a writer that
     was active on earlier passes and has since gone idle is a zombie the fleet
-    itself launched and forgot — escalating it wastes a human's attention on
+    itself launched and forgot â€” escalating it wastes a human's attention on
     a process the stall detector would have reaped if it could see it.
 
     This helper reads the marker from the failed dispatch's worktree path and
     delegates to ``_reap_idle_foreign_writer`` (the same activity probe + kill
     path the marker check uses). When the writer is idle past the threshold,
     it is reaped and the caller resets the counter instead of escalating.
-    When the writer is still active, the caller escalates as before —
+    When the writer is still active, the caller escalates as before â€”
     escalation is reserved for a writer that is alive *and* active.
 
     Returns ``True`` when the writer was reaped, ``False`` otherwise (including
@@ -4991,7 +3810,7 @@ def _has_other_open_pr(
     *only* PR for the issue (issue #1391): when it is, the issue can be
     dropped to baseline in the same call instead of requiring a second
     ``unescalate --issue N`` to take the no-live-PR path. "Open" here means
-    the state.json status is not ``merged`` or ``closed`` — the same
+    the state.json status is not ``merged`` or ``closed`` â€” the same
     predicate the PR resolution at the top of ``unescalate`` uses.
     """
     if issue_number is None:
@@ -5175,7 +3994,7 @@ class OrchestratorApp:
         """Compute pass-level routing inputs shared across all issues (issue #482).
 
         Returns ``(budget, api_key_present, provider_in_cooldown,
-        live_api_sessions)`` — the inputs to ``routing.select_adapter`` for one
+        live_api_sessions)`` â€” the inputs to ``routing.select_adapter`` for one
         dispatch pass. Per-issue inputs (``rework``, ``issue_labels``) are
         supplied by the caller.
 
@@ -5186,7 +4005,7 @@ class OrchestratorApp:
         * ``provider_in_cooldown``: from the existing ``throttled_until`` state
           mechanism (``state.is_throttled``). The dispatch-level throttle gate
           already defers when this is True, so this is defense-in-depth for the
-          future api-specific cooldown (issue ⑦ in the design decomposition).
+          future api-specific cooldown (issue â‘¦ in the design decomposition).
         * ``live_api_sessions``: a **mutable** one-element list ``[count]``
           holding the number of in-flight api workers (alive workers with
           ``adapter_kind == "api"`` counted via ``worker.iter_workers``). The
@@ -5274,7 +4093,7 @@ class OrchestratorApp:
         """Partition requests by ``AdapterChoice.kind`` and dispatch per group (issue #482).
 
         When ``adapter_choices`` is empty (api disabled), dispatches all
-        requests as a single group with the default ``AdapterSettings`` —
+        requests as a single group with the default ``AdapterSettings`` â€”
         byte-identical to the pre-#482 behavior. When non-empty, partitions
         by kind and invokes ``dispatch_sessions`` once per non-empty group
         with that group's ``AdapterSettings`` (built via ``_adapter_settings``
@@ -5290,7 +4109,7 @@ class OrchestratorApp:
         results_path = self._layout.session_results
 
         if not adapter_choices:
-            # No routing (api disabled) — single group, today's behavior.
+            # No routing (api disabled) â€” single group, today's behavior.
             return dispatch_sessions(
                 self.repo_root,
                 manifest_path,
@@ -5333,8 +4152,8 @@ class OrchestratorApp:
         Mirrors the "claude-code" branch of ``_adapter_settings()`` exactly
         (same venv/worker_env/command resolution), but forces
         ``adapter="claude-code"`` regardless of the primary configured
-        ``devin.adapter`` — the rescue tier always uses the claude-code
-        adapter — and overrides ``claude_code.model`` to
+        ``devin.adapter`` â€” the rescue tier always uses the claude-code
+        adapter â€” and overrides ``claude_code.model`` to
         ``rescue.worker_model`` via a one-off config copy. This is the
         "adapter/model overridden from RescueConfig" the rescue rework
         reuses the existing rework-dispatch path with, never a parallel
@@ -5710,10 +4529,10 @@ class OrchestratorApp:
         """Idempotent ensure of every LabelConfig-derived label on the repo.
 
         Creates/updates each label in ``self.config.labels.all`` via
-        ``gh.label_create`` (``--force`` → update-or-create, so colour and
+        ``gh.label_create`` (``--force`` â†’ update-or-create, so colour and
         description drift is repaired on existing labels too), then verifies
         via ``gh.label_list``. The ensure set is derived entirely from
-        ``LabelConfig`` fields — never a hard-coded list — so a new field
+        ``LabelConfig`` fields â€” never a hard-coded list â€” so a new field
         ships its label with no extra wiring (issue #1339).
 
         Returns a ``CommandResult`` and never raises: a ``GitHubError`` from
@@ -5750,7 +4569,7 @@ class OrchestratorApp:
         if missing:
             return CommandResult(
                 False,
-                f"bootstrap incomplete — {len(missing)} label(s) still missing: {missing}",
+                f"bootstrap incomplete â€” {len(missing)} label(s) still missing: {missing}",
                 {"labels": desired, "missing": missing},
             )
         return CommandResult(True, "labels ensured", {"labels": desired, "missing": []})
@@ -5771,7 +4590,7 @@ class OrchestratorApp:
         """
         try:
             result = self._ensure_labels_core()
-        except Exception as exc:  # noqa: BLE001 — ensure must never block startup
+        except Exception as exc:  # noqa: BLE001 â€” ensure must never block startup
             # _ensure_labels_core itself does not raise, but a GitHub
             # implementation that raises from label_create/label_list would
             # otherwise crash the caller. Record and degrade to a failure
@@ -5834,7 +4653,7 @@ class OrchestratorApp:
             issue_dir = self.paths.issues / f"issue-{issue_number}"
             issue_json = issue_dir / "issue.json"
             # Issue #618: in dry-run, skip all file mutations (issue dir,
-            # issue.json, worker-prompt.md) — the preview must not touch disk.
+            # issue.json, worker-prompt.md) â€” the preview must not touch disk.
             if not self.dry_run:
                 issue_dir.mkdir(parents=True, exist_ok=True)
                 self._write_json(issue_json, full_issue)
@@ -5865,7 +4684,7 @@ class OrchestratorApp:
                     "updated_at": full_issue.get("updatedAt"),
                 }
             )
-        # Single lock for all state updates — skipped in dry-run (issue #618)
+        # Single lock for all state updates â€” skipped in dry-run (issue #618)
         if not self.dry_run:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -5985,7 +4804,7 @@ class OrchestratorApp:
                     mention_only_issue_numbers.add(mentioned)
 
         # Mention-only references are advisory; they are not a binding, but
-        # they also must not be stripped as "unmerged" — dispatch() will flag
+        # they also must not be stripped as "unmerged" â€” dispatch() will flag
         # them for a human decision.
         mention_only_issue_numbers -= bound_issue_numbers
 
@@ -6214,8 +5033,8 @@ class OrchestratorApp:
         except GitHubError as exc:
             # A GitHubError from _dispatch_impl means a GitHub API call
             # needed for reliable dispatch failed. The two known sources are
-            # merged_pr_list() (raised on unusable responses — empty stdout,
-            # non-zero exit, unparseable JSON — per #633) and pr_list(); both
+            # merged_pr_list() (raised on unusable responses â€” empty stdout,
+            # non-zero exit, unparseable JSON â€” per #633) and pr_list(); both
             # are fetched before any issue is claimed or worker launched, so
             # deferring here cannot leave a partial claim. Earlier
             # _finalize_externally_merged_issues already recorded its own
@@ -6262,7 +5081,7 @@ class OrchestratorApp:
         # worker_env token is configured, escalate once (not per pass) and
         # either refuse (when dispatch.require_worker_github_token is True) or
         # warn and proceed (the default, so the gate does not take the fleet
-        # down on a config that has not yet been provisioned — see the issue
+        # down on a config that has not yet been provisioned â€” see the issue
         # #1001 sequencing hazard comment in config.py).
         #
         # The once-only guarantee must hold across OrchestratorApp
@@ -6281,13 +5100,13 @@ class OrchestratorApp:
             if not self._worker_token_escalated:
                 self._worker_token_escalated = True
                 # Record the escalation event once. Payload carries only
-                # config_key names and adapter contexts — never a token
+                # config_key names and adapter contexts â€” never a token
                 # value or prefix (issue #1001 acceptance criterion).
                 #
                 # Dry-run never writes: the escalation event and the
                 # durable marker are state mutations (state_lock +
                 # save_state), so they are gated on ``not self.dry_run``
-                # — the same read-only contract documented at the
+                # â€” the same read-only contract documented at the
                 # merge_ready dry-run gate (~line 15452, "Dry-run never
                 # writes") and modelled on this function's own
                 # top-of-body dry-run short-circuit. The in-memory
@@ -6300,12 +5119,12 @@ class OrchestratorApp:
                 #
                 # The durable marker is read inside the lock (not before it)
                 # so the cross-instance once-only guarantee holds without an
-                # unlocked load_state — issue #310's
+                # unlocked load_state â€” issue #310's
                 # test_no_unlocked_load_state_in_production_code lint forbids
                 # any load_state outside a state_lock block. The in-memory
                 # ``_worker_token_escalated`` flag is the first gate
                 # (same-instance), so the lock is entered at most once per
-                # instance lifetime (the flag's False→True transition); the
+                # instance lifetime (the flag's Falseâ†’True transition); the
                 # inner ``if not state.get(...)`` re-check is the
                 # authoritative cross-instance gate and no-ops when a prior
                 # instance already set the marker.
@@ -6355,7 +5174,7 @@ class OrchestratorApp:
         else:
             self._worker_token_escalated = False
             # Condition resolved: clear the durable marker so a future
-            # regression re-escalates. Dry-run never writes — a dry-run pass
+            # regression re-escalates. Dry-run never writes â€” a dry-run pass
             # that observes a now-healthy config must not mutate the marker
             # set by a prior real pass (and cannot have set it itself).
             if not self.dry_run:
@@ -6419,7 +5238,7 @@ class OrchestratorApp:
         # This must run exactly once per pass, not twice (was duplicated in the
         # governor). When the caller already ran the sweep this pass (loop()'s
         # unconditional reaper at the top of its pass), it hands the result down
-        # via ``stalled_entries`` and the sweep is NOT re-run here — see
+        # via ``stalled_entries`` and the sweep is NOT re-run here â€” see
         # dispatch()'s docstring for why re-running it corrupts the Signal-1
         # deferral counter.
         if stalled_entries is None:
@@ -6487,7 +5306,7 @@ class OrchestratorApp:
             # ``except GitHubError`` handler, which defers the pass. This is
             # deliberate: proceeding with [] would re-dispatch issues a merged
             # PR already covered (the silent-empty path #633 closed). The
-            # direct fallback is the COMMON case — it runs whenever there are
+            # direct fallback is the COMMON case â€” it runs whenever there are
             # open ready issues but no closed-ready issues this pass, because
             # _finalize_externally_merged_issues skips the merged_pr_list()
             # fetch entirely when closed_ready is empty (returning an outcome
@@ -6498,7 +5317,7 @@ class OrchestratorApp:
                 raise outcome.error
             return outcome.items if issues else []
 
-        # Dry-run: read-only planning — compute selection and would-be SessionRequests,
+        # Dry-run: read-only planning â€” compute selection and would-be SessionRequests,
         # but skip all state writes, label transitions, and file mutations.
         if self.dry_run:
             selected_issue_numbers: list[int] = []
@@ -6510,7 +5329,7 @@ class OrchestratorApp:
             prs = self.gh.pr_list()
             # No ready issues means _merged_pr_referenced_issue_numbers() would
             # return empty sets regardless of what merged_pr_list() returns
-            # (it intersects against the ready-issue-number set) — skip the
+            # (it intersects against the ready-issue-number set) â€” skip the
             # expensive listing query entirely rather than fetch-and-discard
             # (issue #361).
             resolved_merged_prs = _resolve_merged_prs(merged_prs)
@@ -6523,11 +5342,20 @@ class OrchestratorApp:
                 merged_pr_bound_issue_numbers | merged_pr_mention_only_issue_numbers
             )
             pr_by_issue = {}
+            # Issue #1229: validate branch-name-derived issue numbers against the
+            # real open-issue set so a stale branch name (e.g. agent/issue-709-â€¦
+            # left over from a merged issue/PR #709, reused by an unrelated
+            # issue-less PR) cannot populate pr_by_issue[<wrong n>] and make the
+            # dry-run report wrongly claim a real, dispatchable issue already has
+            # an open PR. Same validator as the real dispatch-claim path below so
+            # the two cannot diverge.
+            branch_validator = self._make_branch_issue_validator()
             for pr in prs:
                 issue_number = linked_issue_number(
                     pr,
                     is_cross_repository=pr.get("isCrossRepository"),
                     branch_prefix=self.config.dispatch.branch_prefix,
+                    branch_issue_validator=branch_validator,
                 )
                 if issue_number is not None:
                     # If multiple PRs link to the same issue, keep the lowest PR number
@@ -6635,9 +5463,9 @@ class OrchestratorApp:
             adapter_choices: dict[int, AdapterChoice] = {}
             api_enabled = self.config.api_worker.enabled
             routing_inputs = self._routing_inputs() if api_enabled else None
-            # Issue #1010: dry-run cross-repo gate — report which issues would
+            # Issue #1010: dry-run cross-repo gate â€” report which issues would
             # be escalated without mutating state or labels.
-            # Issue #1244: dry-run cross-repo *scope* gate — report issues whose
+            # Issue #1244: dry-run cross-repo *scope* gate â€” report issues whose
             # title names another managed repo.
             dry_run_cross_repo_escalated: dict[int, str] = {}
             fleet_repos = managed_repo_names(self.fleet_dir_override)
@@ -6743,7 +5571,7 @@ class OrchestratorApp:
         prs = self.gh.pr_list()
         # No ready issues means _merged_pr_referenced_issue_numbers() would
         # return empty sets regardless of what merged_pr_list() returns (it
-        # intersects against the ready-issue-number set) — skip the expensive
+        # intersects against the ready-issue-number set) â€” skip the expensive
         # listing query entirely rather than fetch-and-discard (issue #361).
         resolved_merged_prs = _resolve_merged_prs(merged_prs)
         (
@@ -6775,11 +5603,24 @@ class OrchestratorApp:
         )[:finalize_limit]
 
         pr_by_issue = {}
+        # Issue #1229: validate branch-name-derived issue numbers against the
+        # real open-issue set so a stale branch name (e.g. agent/issue-709-â€¦
+        # left over from a merged issue/PR #709, reused by an unrelated
+        # issue-less PR) cannot populate pr_by_issue[<wrong n>] and make the
+        # dispatcher believe a real, dispatchable issue already has an open PR,
+        # silently skipping dispatch for it. This is the same phantom-binding
+        # failure class already fixed at the dead-session escalation guard
+        # (_classify_dead_sessions_and_update_throttle_state) and the
+        # orphaned-worker sweep (_detect_and_handle_orphaned_workers); all
+        # route through _make_branch_issue_validator so the open-issue fetch
+        # cannot diverge between call surfaces.
+        branch_validator = self._make_branch_issue_validator()
         for pr in prs:
             issue_number = linked_issue_number(
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
+                branch_issue_validator=branch_validator,
             )
             if issue_number is not None:
                 # If multiple PRs link to the same issue, keep the lowest PR number
@@ -6789,7 +5630,7 @@ class OrchestratorApp:
                     pr_by_issue[issue_number] = pr
 
         # Close ready issues whose merged PR safely binds to them (hijack-safe:
-        # same-repo branch-prefix or closing-action verb — the same trust
+        # same-repo branch-prefix or closing-action verb â€” the same trust
         # level issue #220 uses to close at merge time). This is
         # belt-and-suspenders in case #220's merge-time close hasn't landed
         # yet. These are network calls, so they run outside the state lock;
@@ -6809,14 +5650,14 @@ class OrchestratorApp:
 
         # Issue #203 (redesigned per review): a merged PR that only
         # *mentions* the issue in free text has no hijack-safe binding and
-        # must never authorize a close. Flag it for a human instead — the
+        # must never authorize a close. Flag it for a human instead â€” the
         # issue is excluded from this pass's candidates (via
         # merged_pr_issue_numbers below) and left OPEN for the operator to
         # decide whether to close it, wire up a proper closing reference, or
         # redispatch it. Issue #432: capped to finalize_limit per pass.
         #
         # Issue #564: one-shot flagging. The flag must fire once per issue,
-        # not every pass — otherwise the operator's removal of
+        # not every pass â€” otherwise the operator's removal of
         # agent:human-needed is overridden on the next pass and the event
         # stream is spammed with one dispatch_merged_pr_mention_flagged event
         # per pass while the mention persists. Skip issues whose state entry
@@ -6824,7 +5665,7 @@ class OrchestratorApp:
         # this path flagged them). This follows the emit-on-change dedup
         # pattern established in #556 for dispatch_skip_blocked/janitor_gate.
         #
-        # Re-flag semantics: keyed on the timestamp's absence — once flagged,
+        # Re-flag semantics: keyed on the timestamp's absence â€” once flagged,
         # an issue is never re-flagged, even if a NEW merged PR mentions it.
         # The simplest acceptable semantics per issue #564; pinned by
         # test_dispatch_merged_pr_mention_flag_is_one_shot.
@@ -6846,7 +5687,7 @@ class OrchestratorApp:
         # excluded) is preserved. See ``_mention_rearmed_issue_numbers`` and
         # the re-arm block inside the state lock below.
         # load_state_locked (not raw load_state) so the read holds the
-        # advisory state lock — required by the invariant enforced in
+        # advisory state lock â€” required by the invariant enforced in
         # test_no_unlocked_load_state_in_production_code. The authoritative
         # timestamp write below is a separate locked critical section; this
         # read is best-effort relative to it but must still hold the lock to
@@ -6935,14 +5776,14 @@ class OrchestratorApp:
                 save_state(self.paths.state_file, state)
             # Record a flag timestamp so operators/tooling (e.g. a doctor
             # check) can surface mention-only coverage without re-deriving
-            # the mention scan. "status" is deliberately untouched — the
+            # the mention scan. "status" is deliberately untouched â€” the
             # issue stays open and its normal state machine intact.
             # Issue #564: only record/emit for issues flagged *this* pass
             # (newly_flagged_mention_issues); already-flagged issues are
             # skipped so the event fires once and the operator's label
             # removal is not overridden on the next pass.
             # Only issues whose transition() outcome was not PARTIAL_FAILURE
-            # (stamped_mention_issues, computed above) get the dedup marker —
+            # (stamped_mention_issues, computed above) get the dedup marker â€”
             # a failed label write must leave it unset so the next pass
             # retries instead of silently leaving the wrong labels forever.
             for issue_number in stamped_mention_issues:
@@ -7226,7 +6067,7 @@ class OrchestratorApp:
         # sibling repo's shared checkout.
         # Issue #1244: pre-flight cross-repo *scope* gate. Issues whose title
         # names another managed repo in the fleet (e.g. "other-repo: ...") are
-        # escalated too — their deliverables live in that repo, not this one,
+        # escalated too â€” their deliverables live in that repo, not this one,
         # so the dispatching lane can never finalize them.  The managed-repo
         # set is derived from the fleet registry, never a hardcoded list.
         cross_repo_escalated: dict[int, str] = {}
@@ -7315,7 +6156,7 @@ class OrchestratorApp:
         # can fail closed on an inconclusive real-activity signal (probe_error) or
         # report fresh sessions.db activity even when the recorded wrapper PID is
         # dead/recycled. Verify the PID against the OS (with start-time identity)
-        # at the single point where live worker slots are counted — the same
+        # at the single point where live worker slots are counted â€” the same
         # is_pid_alive + process_start_time check the review lane uses via
         # _reviewer_pid_alive. A session whose recorded PID is dead is a phantom
         # slot and is routed through the dead-session path below (sidecar reap,
@@ -7560,7 +6401,7 @@ class OrchestratorApp:
                             self.config.watchdog.redispatch_window_minutes,
                         )
                         # Deterministic launch failures escalate immediately,
-                        # mirroring dispatch_rework's post-#550 behavior — fresh
+                        # mirroring dispatch_rework's post-#550 behavior â€” fresh
                         # dispatch previously only consulted the redispatch-window
                         # cap, so e.g. a worktree_unsafe failure burned every
                         # capped retry before a human ever heard about it.
@@ -7734,9 +6575,9 @@ class OrchestratorApp:
                         )
                         save_state(self.paths.state_file, state)
                 elif status == "escalated":
-                    # Issue #461: dispatch-failed retry cap exceeded — or a
+                    # Issue #461: dispatch-failed retry cap exceeded â€” or a
                     # deterministic launch failure that retrying cannot fix
-                    # (escalation_reason carries the failure_kind) — escalate to
+                    # (escalation_reason carries the failure_kind) â€” escalate to
                     # human-needed and remove the issue from the dispatch pool.
                     # Issue #807: a deterministic judgment failure uses
                     # ``reason_class="judgment"`` so the label lands on
@@ -7766,7 +6607,7 @@ class OrchestratorApp:
             # gate. Their referenced file paths are all absent from the target
             # repo, so dispatching a worker would send it to a sibling repo's
             # shared checkout. Escalate to human-needed with a cross_repo_target
-            # reason and record the event — the issue stays in the dispatch
+            # reason and record the event â€” the issue stays in the dispatch
             # pool's state as escalated, not dispatch_pending.
             for issue_number, reason in sorted(cross_repo_escalated.items()):
                 prev_entry = state["issues"].get(str(issue_number), {})
@@ -8329,7 +7170,7 @@ class OrchestratorApp:
                     str(pr.get("mergeStateStatus") or "").upper() == "DIRTY"
                 )
                 # Issue #1111: mirror the non-escalated path's stale-CI-verdict
-                # suppression — a request_changes verdict citing only required
+                # suppression â€” a request_changes verdict citing only required
                 # checks that are green now must not burn no_op_rework_attempts
                 # (the predicate itself refuses escalated decisions, so this is
                 # a no-op for verdicts recorded as escalated).
@@ -8414,7 +7255,7 @@ class OrchestratorApp:
 
         # Deterministic janitor gate BEFORE any packet/cross-family spend: an
         # obviously-not-ready PR (draft, conflicting, red CI, no issue link)
-        # must cost zero review tokens. Most failures don't move labels — they
+        # must cost zero review tokens. Most failures don't move labels â€” they
         # are the worker's/CI's to fix. A definitive required-check failure on
         # a linked-issue PR is routed to rework so the worker can push a fix.
         verdict = run_janitor(
@@ -9050,7 +7891,7 @@ class OrchestratorApp:
             # newly routes the PURE no-op-rework case (no co-occurring check
             # failure), which previously had no consumer at all.
             #
-            # Issue #1111: ALSO excluded is the stale-CI-verdict case — the
+            # Issue #1111: ALSO excluded is the stale-CI-verdict case â€” the
             # request_changes verdict's only findings cite required checks
             # that are all green right now (a transient failure the reviewer
             # saw has recovered on the same content). Routing rework there is
@@ -9450,7 +8291,7 @@ class OrchestratorApp:
             enforce_regen_budget=enforce_regen_budget,
         )
         # Issue #1078: when the cross-family review is pending (launched async
-        # but not yet reaped), the review packet must NOT go out — the cross-
+        # but not yet reaped), the review packet must NOT go out â€” the cross-
         # family section is empty and the reviewer would make a verdict without
         # the adversarial findings. Defer the packet write to a later pass when
         # the review is reaped. This returns ok=True (not a failure) with a
@@ -9570,7 +8411,7 @@ class OrchestratorApp:
         # the outside-lock read here may be stale w.r.t. a concurrent
         # record_review, and the reset write must be atomic with the state
         # write). Previously that reset was the only reader, and it ran after
-        # the prompt was already rendered — so a prior round's
+        # the prompt was already rendered â€” so a prior round's
         # verdict/summary/required_changes were on disk at render time but
         # never surfaced to the reviewer.
         existing_decision = self._review_decision(pr_number)
@@ -9635,7 +8476,7 @@ class OrchestratorApp:
         # machinery never services this state (its own internal gate skips
         # it too), so stamping "reviewing"/agent:reviewing here would strand
         # the PR under a label nothing runs to clear. The packet itself is
-        # still written either way — only the state/label transition is
+        # still written either way â€” only the state/label transition is
         # gated, so a human can still read the prompt manually.
         dispatch_disabled = not self.config.review_dispatch.enabled
         with state_lock(self.paths.state_file):
@@ -10049,7 +8890,7 @@ class OrchestratorApp:
         queue: list[dict[str, Any]] = []
 
         # Issue #1229: validate branch-name-derived issue numbers against the
-        # actual open-issue set so a stale branch name (e.g. agent/issue-709-…
+        # actual open-issue set so a stale branch name (e.g. agent/issue-709-â€¦
         # left over from a merged PR #709, reused by an unrelated issue-less
         # PR) cannot bind the PR to a non-existent or closed issue here. This
         # is the same phantom-binding failure class already fixed at the
@@ -10135,7 +8976,7 @@ class OrchestratorApp:
                     ):
                         # Issue #1111: the verdict's only findings cite
                         # required checks that are all green on this same head
-                        # — the failure it describes no longer exists (the
+                        # â€” the failure it describes no longer exists (the
                         # check flipped transiently mid-review, or a rerun
                         # recovered it). Re-driving rework here is a
                         # guaranteed no-op that burns no_op_rework_attempts
@@ -10194,7 +9035,7 @@ class OrchestratorApp:
                     # Issue #1111 (head-advanced variant): the diff content is
                     # unchanged (carry-forward matched), but the verdict's only
                     # findings cite required checks that are all green on the
-                    # live head — e.g. a no-op rework push after a transient CI
+                    # live head â€” e.g. a no-op rework push after a transient CI
                     # failure recovered. Carrying the request_changes verdict
                     # forward would re-apply a failure that no longer exists,
                     # so skip the carry-forward and fall through to the
@@ -10693,7 +9534,7 @@ class OrchestratorApp:
         for a ``decision_path`` pointing to an existing file with a completed
         verdict (``approved``/``request_changes``/``blocked``) that is not
         reflected in ``state.decision``, and ingesting it via
-        ``record_review`` so the normal verdict → rework/merge/blocked route
+        ``record_review`` so the normal verdict â†’ rework/merge/blocked route
         can take over. It runs in ``dispatch_reviews`` ahead of the
         ``review_dispatch.enabled`` gate (issue #868), so it executes even
         when review dispatch is disabled fleet-wide -- the exact condition
@@ -10765,8 +9606,8 @@ class OrchestratorApp:
             #
             # ``allow_stale_head`` is left at its default ``False``. In the
             # actual #736 bug scenario (state write lost, head unchanged),
-            # ``record_review``'s #467/#1072 guard never fires — the packet
-            # head and live head agree — so the flag would be a no-op there.
+            # ``record_review``'s #467/#1072 guard never fires â€” the packet
+            # head and live head agree â€” so the flag would be a no-op there.
             # The flag only changes behavior when the live PR head has
             # advanced past the packet head (new commits landed while the PR
             # sat 'reviewing'), which is exactly the case where the verdict
@@ -11234,7 +10075,7 @@ class OrchestratorApp:
         Issue #370: a deterministic loop stage that turns ``review_queue()```
         into launched, sidecar-tracked reviewer processes. Reviewers are
         ``claude_code.launch_claude_worker`` sessions; there is no provider-
-        rate-limit governor here — only an optional local-only process cap
+        rate-limit governor here â€” only an optional local-only process cap
         (``max_local_review_processes``) to protect the host from too many
         concurrent reviewer worktrees.
 
@@ -11261,12 +10102,12 @@ class OrchestratorApp:
         # Run the verdict-reaper and orphan/stalled sweeps BEFORE the quota
         # gate so dead reviewers are reaped and stale claims are freed even
         # during throttle periods. Without this ordering, a quota deferral
-        # returns early and leaves dead reviewer claims stuck — blocking
+        # returns early and leaves dead reviewer claims stuck â€” blocking
         # re-dispatch after the quota resets. In dry-run mode we skip
         # these sweeps to stay read-only.
         #
         # Issue #868: these sweeps must ALSO run ahead of the
-        # ``review_dispatch.enabled`` gate below, for the same reason —
+        # ``review_dispatch.enabled`` gate below, for the same reason â€”
         # disabling dispatch must not disable the cleanup a *previously*
         # dispatched (or previously stamped-reviewing) claim still needs. A
         # dead reviewer's claim that goes stale while the flag happens to be
@@ -11324,7 +10165,7 @@ class OrchestratorApp:
             # reviewers, but the reaper sweeps above may still have done real
             # work (freeing a stale claim). Carry that through explicitly
             # instead of returning a bare ``ok=True`` that reads identically
-            # to "nothing happened at all" — and mark ``disabled`` so a
+            # to "nothing happened at all" â€” and mark ``disabled`` so a
             # caller doesn't have to string-match the message to tell this
             # apart from a real dispatch pass.
             return CommandResult(
@@ -11392,7 +10233,7 @@ class OrchestratorApp:
             # to _partition_rescue_candidates (which has real side effects:
             # it runs cross-family reviews, records verdicts, and escalates).
             # A rescue-marked PR must never appear in the preview as a normal
-            # dispatch/escalation candidate — the real branch routes it
+            # dispatch/escalation candidate â€” the real branch routes it
             # through _process_rescue_review instead.
             rescue_marked_dry: list[dict[str, Any]] = []
             candidates_dry: list[dict[str, Any]] = []
@@ -11505,7 +10346,7 @@ class OrchestratorApp:
                     # an exhaustion episode that outlives its probe window
                     # stalls the review lane fleet-wide. Alert once per
                     # episode (marker cleared with the quota record on probe
-                    # success). The digest is emitted after the lock releases —
+                    # success). The digest is emitted after the lock releases â€”
                     # sinks may do network I/O.
                     quota = state.get("reviewer_quota") or {}
                     if not quota.get("alerted_at") and self.config.notify.enabled:
@@ -11626,7 +10467,7 @@ class OrchestratorApp:
         # Route merge-conflicting PRs to rework instead of dispatching a
         # reviewer (issue #1497): a CONFLICTING PR sitting in
         # ``agent:reviewing`` with a current packet would otherwise be
-        # dispatched every pass, but the reviewer's verdict cannot merge —
+        # dispatched every pass, but the reviewer's verdict cannot merge â€”
         # and if the PR never reaches the merge lane (e.g. no verdict is
         # ever recorded), ``review()``'s own janitor-gate conflict route
         # never runs either, so the PR sits in ``agent:reviewing`` forever
@@ -11777,7 +10618,7 @@ class OrchestratorApp:
                     # #573): the cap can be reached by attempts that predate
                     # the current launch (e.g. quota deaths whose rollback
                     # decrement was bypassed), and killing the claim
-                    # mid-review orphans the imminent verdict — the reaper
+                    # mid-review orphans the imminent verdict â€” the reaper
                     # only records verdicts for dispatched claims. Let the
                     # review finish: a recorded verdict resets the counter;
                     # a death is dispositioned by the stalled sweep, after
@@ -11890,9 +10731,9 @@ class OrchestratorApp:
         # state lock. ``_route_janitor_gate_failure_to_rework`` acquires its own
         # ``state_lock`` and calls ``transition()`` (GitHub API), so it cannot
         # run inside the critical section above. This mirrors ``review()``'s
-        # janitor-gate merge-conflict path exactly — same ``reason``,
+        # janitor-gate merge-conflict path exactly â€” same ``reason``,
         # same ``attempts_key``, same ``max_attempts`` cap, same escalation to
-        # ``agent:human-needed`` when the cap is exceeded — so a CONFLICTING PR
+        # ``agent:human-needed`` when the cap is exceeded â€” so a CONFLICTING PR
         # discovered by either path converges to the same state. The method is
         # idempotent: if a rework is already pending it returns ``None`` (no-op),
         # and if the lane's own cap already escalated it returns ``None`` too.
@@ -12069,7 +10910,7 @@ class OrchestratorApp:
 
                 prompt_text = prompt_path.read_text(encoding="utf-8")
                 claude_cfg = self.config.claude_code
-                # Reviewers never use worktrees_dir/venv_source — those key
+                # Reviewers never use worktrees_dir/venv_source â€” those key
                 # the worker's branch-slug worktree, which create_review_checkout
                 # (routed to via review=True + head_sha) never touches. Only
                 # repo_root/sessions_dir/env/materialize_dirs/review/head_sha
@@ -12085,7 +10926,7 @@ class OrchestratorApp:
                 # config is omitted, which was silently discarding every
                 # review-only pin (review_effort, review_max_turns, and the
                 # review_effort experiment) at the one real dispatch_reviews()
-                # launch site — the effort/max-turns pins only ever worked in
+                # launch site â€” the effort/max-turns pins only ever worked in
                 # direct launch_claude_worker(config=...) unit tests, never in
                 # an actual dispatch pass. adapters.py's worker-dispatch path
                 # (_run_claude_code_adapter) already forwards config the same
@@ -12197,7 +11038,7 @@ class OrchestratorApp:
                     failed_state["review_dispatch_error"] = fail_info["error"]
                     state["prs"][str(pr_number)] = failed_state
                 else:
-                    # Quota failure (or not reached due to break) — roll back
+                    # Quota failure (or not reached due to break) â€” roll back
                     # the pending claim so the PR stays dispatchable. Also
                     # decrement the attempt counter: no reviewer actually ran,
                     # so this global condition must not consume the per-PR
@@ -12313,11 +11154,11 @@ class OrchestratorApp:
         request_changes) to the legacy escalation path without the two
         rescue artifacts. ``enabled`` only gates NEW rescue entry at the
         three cap sites (record_review / _route_janitor_gate_failure_to_
-        rework) — routing of PRs that already carry the marker is
+        rework) â€” routing of PRs that already carry the marker is
         unconditional.
 
         A rescue-marked PR whose ``pr_state["status"] == "escalated"`` is
-        dropped entirely — not processed again, not returned as a normal
+        dropped entirely â€” not processed again, not returned as a normal
         candidate either. ``_process_rescue_review``'s escalation write does
         not advance the review packet's recorded decision, so
         ``review_queue()`` would otherwise keep requeuing it every pass,
@@ -12345,7 +11186,7 @@ class OrchestratorApp:
 
         Called from ``dispatch_reviews()`` INSTEAD of the normal Claude
         reviewer dispatch for any candidate whose PR record already carries
-        ``rescue_attempted`` — i.e. its rescue rework was already dispatched
+        ``rescue_attempted`` â€” i.e. its rescue rework was already dispatched
         (via the normal rework-dispatch path, just adapter/model-overridden;
         see ``_rescue_adapter_settings``) and has since pushed a new head.
 
@@ -12358,8 +11199,8 @@ class OrchestratorApp:
           path takes over exactly as it would for a normal approval.
         - ``request_changes``/``blocked``/unparseable report -> escalates to
           a human immediately (never loops back into another rework cycle):
-          both artifacts (the rescue PR/diff — this PR's current branch and
-          head SHA, since the rescue worker pushed directly to it — and the
+          both artifacts (the rescue PR/diff â€” this PR's current branch and
+          head SHA, since the rescue worker pushed directly to it â€” and the
           cross-family report path) are attached to the escalation event
           payload and posted as a PR comment.
         """
@@ -12431,7 +11272,7 @@ class OrchestratorApp:
             )
             return CommandResult(
                 True,
-                f"PR #{pr_number} rescue review approved — {result.message}",
+                f"PR #{pr_number} rescue review approved â€” {result.message}",
                 {
                     "rescue_review_decision": "approved",
                     "cross_family_report": str(report_path),
@@ -12504,7 +11345,7 @@ class OrchestratorApp:
             label_error = {**(label_error or {}), "comment_error": str(exc)}
         return CommandResult(
             True,
-            f"PR #{pr_number} rescue review did not approve — escalated to human",
+            f"PR #{pr_number} rescue review did not approve â€” escalated to human",
             {
                 "rescue_review_decision": verdict["decision"] if verdict else "unparseable",
                 "cross_family_report": str(report_path),
@@ -12693,8 +11534,8 @@ class OrchestratorApp:
         # the verdict was pinned to a head that had moved mid-build. The
         # compare-and-swap guard added by #1036 covered only review()'s
         # packet-commit tail exit; the two earlier exits returned through
-        # record_review() and bypassed it. Pushing the guard here — into the
-        # single choke point every verdict write passes through — makes the
+        # record_review() and bypassed it. Pushing the guard here â€” into the
+        # single choke point every verdict write passes through â€” makes the
         # invariant hold by construction for every caller, not just the one
         # exit #1036 happened to guard. The operator CLI (``charlie verdict``)
         # is the one caller that may legitimately pin to a superseded head
@@ -12702,7 +11543,7 @@ class OrchestratorApp:
         # ``allow_stale_head=True``; every automated caller uses the default
         # ``False`` and is refused. The failure direction is toward redundant
         # work (the PR is re-reviewed next pass), never toward authorizing a
-        # merge on the wrong head — ``reviewed_head_sha`` is compared against
+        # merge on the wrong head â€” ``reviewed_head_sha`` is compared against
         # the current head by every downstream consumer.
         if reviewed_head is not None:
             if packet_head_sha is not None and reviewed_head == packet_head_sha:
@@ -12715,7 +11556,7 @@ class OrchestratorApp:
                         False,
                         f"reviewed head ({reviewed_head}) matches packet head "
                         f"({packet_head_sha}) but live PR head has moved to "
-                        f"({live_head_sha}); verdict not recorded — head moved "
+                        f"({live_head_sha}); verdict not recorded â€” head moved "
                         "during build, will re-review next pass",
                         {
                             "pr": pr_number,
@@ -12960,7 +11801,7 @@ class OrchestratorApp:
             rework_summary: str = ""
             escalated = False
             rescue_dispatched = False
-            # Durable per-PR rework counter — NOT derived from the global events
+            # Durable per-PR rework counter â€” NOT derived from the global events
             # log, which append_event truncates to the last 200 entries: on a busy
             # repo that eviction silently reset the count and defeated the cap
             # (a PR could rework forever instead of escalating to a human).
@@ -12973,7 +11814,7 @@ class OrchestratorApp:
                 # issue #208.
                 #
                 # Issue #1210: the head_advanced guard previously protected only
-                # the counter increment below — the escalation check ran
+                # the counter increment below â€” the escalation check ran
                 # unconditionally and fired on an at-cap verdict even when the
                 # head was unchanged. Gate the escalation evaluation (and the
                 # rescue tier, which is itself gated on cap exceedance) on
@@ -12985,14 +11826,14 @@ class OrchestratorApp:
                 if head_advanced:
                     # Rework cap: past max_rework_cycles the evidence says
                     # iteration thrashes (wrong brief or unimplementable
-                    # criteria) — escalate to a human instead of dispatching
+                    # criteria) â€” escalate to a human instead of dispatching
                     # another cycle.
                     escalated = request_changes_count >= self.config.review.max_rework_cycles
                     # Rescue tier (issue #555): a cap exceedance here is one of
                     # the three verdict-driven ("cheap model wasn't good
                     # enough") causes the rescue tier is gated on. If enabled
                     # and this PR has not already spent its one rescue attempt,
-                    # route to a bounded Opus rework instead of escalating —
+                    # route to a bounded Opus rework instead of escalating â€”
                     # never a second rescue for the same PR (rescue_attempted
                     # is durable, cleared only by `charlie unescalate`).
                     if (
@@ -13414,12 +12255,12 @@ class OrchestratorApp:
         source_note = f"head from {reviewed_head_source}"
         if rescue_dispatched:
             message = (
-                f"review recorded — rework cap ({self.config.review.max_rework_cycles}) "
+                f"review recorded â€” rework cap ({self.config.review.max_rework_cycles}) "
                 f"reached, rescue tier dispatched instead of escalating ({source_note})"
             )
         elif escalated:
             message = (
-                f"review recorded — rework cap ({self.config.review.max_rework_cycles}) reached, "
+                f"review recorded â€” rework cap ({self.config.review.max_rework_cycles}) reached, "
                 f"escalated to human ({source_note})"
             )
         else:
@@ -13458,8 +12299,8 @@ class OrchestratorApp:
         reset, or ``None`` if the worktree is safe (or does not exist). Used
         by both de-escalation paths (``unescalate`` and
         ``_deescalate_mechanical_issue``) to refuse clearing a
-        ``worktree_unsafe`` escalation while the underlying cause — a set of
-        bytes on disk — still persists. Without this check, clearing the
+        ``worktree_unsafe`` escalation while the underlying cause â€” a set of
+        bytes on disk â€” still persists. Without this check, clearing the
         label reports success for an operation that changed nothing causal,
         and the next rework dispatch reproduces the escalation deterministically.
 
@@ -13475,7 +12316,7 @@ class OrchestratorApp:
             return None
         wt_path = worktree_path_for_branch(self.repo_root, branch, self._layout.worktrees)
         if not wt_path.is_dir():
-            # No worktree on disk — the blocker is gone (or was never this
+            # No worktree on disk â€” the blocker is gone (or was never this
             # issue's worktree). Clearing is safe.
             return None
         try:
@@ -13612,7 +12453,7 @@ class OrchestratorApp:
         # Issue #849: a ``worktree_unsafe`` escalation is caused by bytes on
         # disk, not by a label or a PR state. Clearing the label without
         # inspecting the worktree reports success for an operation that
-        # changed nothing causal — the next rework dispatch reproduces the
+        # changed nothing causal â€” the next rework dispatch reproduces the
         # escalation deterministically. Re-run the safety check and refuse to
         # clear while the worktree still fails it.
         # Issue #807: ``worktree_unsafe`` is split into
@@ -13629,7 +12470,7 @@ class OrchestratorApp:
                 return CommandResult(
                     True,
                     f"issue #{issue_number} escalated as worktree_unsafe; "
-                    f"worktree is still unsafe ({unsafe_reason}) — clearing "
+                    f"worktree is still unsafe ({unsafe_reason}) â€” clearing "
                     f"the label would change nothing causal. Remove or "
                     f"commit the worktree work before re-arming.",
                     {
@@ -13687,7 +12528,7 @@ class OrchestratorApp:
             elif live_pr_state in ("MERGED", "CLOSED"):
                 # Terminal PR on GitHub. If the issue is still escalated and
                 # no other open PR references it, drop the issue to baseline
-                # in the same call — reconcile deliberately never rewrites an
+                # in the same call â€” reconcile deliberately never rewrites an
                 # open escalated issue's status (D-2), so leaving it would
                 # require a second identical ``unescalate --issue N`` call to
                 # take the no-live-PR path (issue #1391). When another open PR
@@ -13699,7 +12540,7 @@ class OrchestratorApp:
                 else:
                     label_edge = None
             elif issue_stuck:
-                # No live PR at all — back to the never-dispatched baseline
+                # No live PR at all â€” back to the never-dispatched baseline
                 # (a status literal no dispatch selector reads would just
                 # recreate the orphan gap reconcile now repairs).
                 issue_status_action = "drop"
@@ -13808,7 +12649,7 @@ class OrchestratorApp:
 
     # Deliberately NOT @_guard_state_lock: merge_check takes no state lock, and
     # the guard's contract is to return a *successful* skip (ok=True) when the
-    # lock is held. On an authorization preflight that would be fail-open —
+    # lock is held. On an authorization preflight that would be fail-open â€”
     # "cannot tell" rendered as "yes". Keep this method lock-free and pure.
     def merge_check(self, pr_number: int) -> CommandResult:
         """Answer "is this PR merge-authorized *right now*?" without merging it.
@@ -13845,13 +12686,13 @@ class OrchestratorApp:
         if not isinstance(pr, dict) or not pr:
             return CommandResult(
                 False,
-                f"PR #{pr_number}: cannot read PR from GitHub — refusing to authorize",
+                f"PR #{pr_number}: cannot read PR from GitHub â€” refusing to authorize",
                 {"pr": pr_number, "authorized": False, "reason": "pr_unreadable"},
             )
         if str(pr.get("state", "")).upper() == "MERGED":
             return CommandResult(
                 False,
-                f"PR #{pr_number} is already merged — nothing to authorize",
+                f"PR #{pr_number} is already merged â€” nothing to authorize",
                 {"pr": pr_number, "authorized": False, "reason": "already_merged"},
             )
 
@@ -13869,14 +12710,14 @@ class OrchestratorApp:
         if not live_head_sha:
             return CommandResult(
                 False,
-                f"PR #{pr_number}: no live head sha — refusing to authorize",
+                f"PR #{pr_number}: no live head sha â€” refusing to authorize",
                 {**base, "authorized": False, "reason": "no_live_head"},
             )
         # Issue #934: an explicit operator authorization recorded via
         # ``merge_authorize`` is as authoritative as an approved review
         # decision. Checked before the missing/invalid/not-approved/head-moved
         # gates so a valid override authorizes regardless of the recorded
-        # review verdict — that is the whole point, since the override exists
+        # review verdict â€” that is the whole point, since the override exists
         # for PRs whose verdict is stale, absent, or pending. A malformed or
         # SHA-mismatched override falls through to the existing fail-closed
         # checks below, so this adds a way to record authorization without
@@ -13905,7 +12746,7 @@ class OrchestratorApp:
             # covers what used to be two.
             return CommandResult(
                 False,
-                f"PR #{pr_number}: no readable review-decision.json — not authorized",
+                f"PR #{pr_number}: no readable review-decision.json â€” not authorized",
                 {**base, "authorized": False, "reason": "no_decision"},
             )
         if decision_value != "approved":
@@ -13919,7 +12760,7 @@ class OrchestratorApp:
                 False,
                 (
                     f"PR #{pr_number}: approved at {reviewed_head_sha} but head is now "
-                    f"{live_head_sha} — re-review required"
+                    f"{live_head_sha} â€” re-review required"
                 ),
                 {**base, "authorized": False, "reason": "head_moved"},
             )
@@ -13942,8 +12783,8 @@ class OrchestratorApp:
         The unauthorized-merge tripwire (#673) and the ``merge-check`` preflight
         (#894) both infer authorization from ``decision == "approved"`` and
         ``reviewed_head_sha == live_head_sha``. An operator who legitimately
-        adjudicates a PR whose recorded decision is stale, absent, or pending —
-        and merges it — has no way to record that adjudication, so every
+        adjudicates a PR whose recorded decision is stale, absent, or pending â€”
+        and merges it â€” has no way to record that adjudication, so every
         legitimate operator merge becomes a tripwire finding that pins
         ``ok=False`` on every subsequent pass until someone writes a
         retrospective ack. The authorized path and the unauthorized path are
@@ -13961,10 +12802,10 @@ class OrchestratorApp:
         - **Does not weaken the control.** This adds a way to *record*
           authorization; it must not add a way to *skip* the check. An
           unrecorded merge is still a finding. The override is a field in the
-          decision record, not a bypass — both ``_detect_unauthorized_merges``
+          decision record, not a bypass â€” both ``_detect_unauthorized_merges``
           and ``merge_check`` still run their full logic; they just gain an
           additional authorization source.
-        - **The reason stays mandatory**, matching ``tripwire ack`` — "a
+        - **The reason stays mandatory**, matching ``tripwire ack`` â€” "a
           tripwire that can be silenced silently is no control" applies at
           least as strongly before the merge as after it.
         - **Bind to the SHA.** Two of the four Class B cases (#802, #804) were
@@ -13977,7 +12818,7 @@ class OrchestratorApp:
         The override is merge-updated into the existing decision record (not a
         fresh file), so the reviewer's original verdict is preserved alongside
         the operator's authorization. If no decision file exists, one is
-        created with just the override — the reviewer verdict is absent, and
+        created with just the override â€” the reviewer verdict is absent, and
         the override is the authorization.
         """
         if not reason.strip():
@@ -13992,7 +12833,7 @@ class OrchestratorApp:
         if not isinstance(pr, dict) or not pr:
             return CommandResult(
                 False,
-                f"PR #{pr_number}: cannot read PR from GitHub — refusing to authorize",
+                f"PR #{pr_number}: cannot read PR from GitHub â€” refusing to authorize",
                 {"pr": pr_number, "authorized": False, "reason": "pr_unreadable"},
             )
 
@@ -14001,7 +12842,7 @@ class OrchestratorApp:
             return CommandResult(
                 False,
                 f"PR #{pr_number}: no head SHA to bind the authorization to "
-                "— refusing to record an unbound override",
+                "â€” refusing to record an unbound override",
                 {"pr": pr_number, "authorized": False, "reason": "no_head_sha"},
             )
 
@@ -14015,11 +12856,11 @@ class OrchestratorApp:
 
         with state_lock(self.paths.state_file):
             # Merge-update the override into the existing decision record. If
-            # the file is absent or unparseable, start from an empty base — the
+            # the file is absent or unparseable, start from an empty base â€” the
             # override is the authorization, and the reviewer verdict (if any)
             # is preserved when it exists. The read is inside the ``state_lock``
             # (which ``record_review`` also holds) so the read-modify-write is
-            # genuinely atomic against concurrent writers — a TOCTOU where
+            # genuinely atomic against concurrent writers â€” a TOCTOU where
             # ``record_review`` overwrites the file between this read and the
             # write below would silently discard the override (issue #934
             # review finding).
@@ -14086,13 +12927,13 @@ class OrchestratorApp:
         # Issue #614: dry-run short-circuit. Under --dry-run the GitHub
         # client's synthetic stubs make ``merge_pr`` / ``add_pr_label`` appear
         # to succeed without raising, which the real path below interprets as
-        # proof of a merge and durably records to state.json — stranding the PR
+        # proof of a merge and durably records to state.json â€” stranding the PR
         # in a terminal "merged" or "mergequeue" status that never actually
         # happened. The gate must sit above the ``state_lock`` (the idempotency
         # short-circuit below conditionally writes) and return the computed
         # readiness verdict without persisting, mirroring ``_dispatch_impl``'s
-        # dry-run gate. Gating lower — after the idempotency block but before
-        # the merge — would drop into the shared failed-attempt-alarm block
+        # dry-run gate. Gating lower â€” after the idempotency block but before
+        # the merge â€” would drop into the shared failed-attempt-alarm block
         # and increment ``consecutive_failed_merge_attempts``, advancing the
         # state machine instead of merely previewing it.
         if self.dry_run:
@@ -14102,7 +12943,7 @@ class OrchestratorApp:
         # Idempotence: if state already records this PR as merged, short-circuit
         # to a success no-op. Re-running `ship-it` on a completed PR must not
         # re-attempt `gh pr merge` (which fails on an already-merged PR and
-        # propagates GitHubError → exit 2).
+        # propagates GitHubError â†’ exit 2).
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             existing_pr_state = state["prs"].get(str(pr_number), {})
@@ -14225,7 +13066,7 @@ class OrchestratorApp:
                         save_state(self.paths.state_file, state)
                     carried_forward = True
             if head_moved and not carried_forward:
-                message = "PR head moved since approval — re-review required"
+                message = "PR head moved since approval â€” re-review required"
                 label_error: dict[str, Any] | None = None
                 # Escalation gate (issue #833). merge_ready()'s escalation
                 # handling is per-route by design, not a single top-of-function
@@ -14261,7 +13102,7 @@ class OrchestratorApp:
                 )
                 escalated = pr_escalated or issue_escalated
                 # Issue #868: a second, independent call site that stamps
-                # "reviewing"/agent:reviewing — separate from review()'s own
+                # "reviewing"/agent:reviewing â€” separate from review()'s own
                 # packet-generation path, which gates the same way. Disabled
                 # dispatch means nothing services "reviewing" here either, so
                 # the state/label stamp is gated on the same flag. The
@@ -14474,7 +13315,7 @@ class OrchestratorApp:
                 # "mergequeue" from a prior merge_ready pass), Aviator owns
                 # rebasing it. Calling pr_update_branch here on every
                 # subsequent poll would race Aviator's own rebase as a second
-                # writer on the same ref — this repo's live config is
+                # writer on the same ref â€” this repo's live config is
                 # broadcast, so every poll would otherwise attempt it. The
                 # base-freshness *read* above still runs (it only feeds the
                 # deferral gate below); only the write is skipped. See the
@@ -14713,7 +13554,7 @@ class OrchestratorApp:
                 # (issue_number may be None for cross-repo PRs) and idempotent.
                 # State records status="mergequeue" (never "merged"), so the
                 # idempotency short-circuit at the top of this method does not
-                # fire — a re-run of `ship-it` while the queue merge is still
+                # fire â€” a re-run of `ship-it` while the queue merge is still
                 # pending safely re-applies the (no-op) label. Aviator does
                 # its own queue rebase (replacing _update_open_agent_prs) and
                 # GitHub auto-closes the linked issue via the PR's "Closes #N"
@@ -14722,14 +13563,14 @@ class OrchestratorApp:
                 # PR description). Once GitHub reports the PR merged,
                 # reconcile.py's merged_outside_orchestrator drift path
                 # reconciles status to "merged" and runs the "merged" label
-                # transition — no new post-merge bookkeeping is added here.
+                # transition â€” no new post-merge bookkeeping is added here.
                 #
                 # Issue #496: an operator can park an approved PR by adding the
                 # configured merge-hold label to the PR or its linked issue.
                 # When the hold is present, skip the mergequeue re-add entirely.
                 # Scope note: this hold check runs only in mergequeue mode
                 # (when ``mergequeue_label`` is set). In direct-merge mode the
-                # hold label has no effect — the issue title scopes this to
+                # hold label has no effect â€” the issue title scopes this to
                 # "the mergequeue re-add," so the self-merge branch is unchanged.
                 merge_hold = self.config.labels.merge_hold in label_names(pr)
                 if not merge_hold and issue_number is not None:
@@ -14788,7 +13629,7 @@ class OrchestratorApp:
                             state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
                         save_state(self.paths.state_file, state)
                 # else: add_pr_label failed. The label IS the handoff, so a
-                # failure here must not advance status to "mergequeue" —
+                # failure here must not advance status to "mergequeue" â€”
                 # treating a failed label add as success would silently
                 # orphan the PR (never self-merged, never picked up by
                 # Aviator, and nothing would ever look wrong to state). Leave
@@ -14797,11 +13638,11 @@ class OrchestratorApp:
                 # consecutive_failed_merge_attempts on every retry and can
                 # escalate exactly like an unmergeable approved PR.
             else:
-                # Merge, then labels, then best-effort branch deletion — in that
+                # Merge, then labels, then best-effort branch deletion â€” in that
                 # order. merge_pr is the irreversible step: persist status="merged"
                 # to state IMMEDIATELY after it succeeds and BEFORE the label
                 # transition, so a transition failure or Ctrl+C can't leave GitHub
-                # merged while state.json still shows "reviewing" — which made
+                # merged while state.json still shows "reviewing" â€” which made
                 # reconcile false-positive on every clean auto-merge and lost the
                 # merged fact entirely on a crash between merge and save.
                 merge_output = self.gh.merge_pr(
@@ -14812,7 +13653,7 @@ class OrchestratorApp:
                 )
                 # Issue #747: stamp ``merged_at`` at the irreversible step so
                 # merge throughput/latency are computable from state.json.
-                # Existing merged entries are not back-dated — this only fires
+                # Existing merged entries are not back-dated â€” this only fires
                 # on a genuine non-merged -> merged transition (merge_pr just
                 # succeeded), so the timestamp is the real merge time.
                 _merged_at = utc_now()
@@ -14844,7 +13685,7 @@ class OrchestratorApp:
                             "add_failures": result.add_failures,
                             "remove_failures": result.remove_failures,
                         }
-                    # Close the linked issue explicitly — idempotent if already closed
+                    # Close the linked issue explicitly â€” idempotent if already closed
                     # via GitHub's keyword automation. This ensures the dependency gate
                     # sees the closure immediately, avoiding the agent:done+OPEN state.
                     self.gh.close_issue(issue_number)
@@ -14865,7 +13706,7 @@ class OrchestratorApp:
                         self.config.runners.workflow_name,
                     )
         # Aviator MergeQueue handoff (task #10): the label add IS the handoff
-        # — a failed add_pr_label must be treated as a genuine unmergeable
+        # â€” a failed add_pr_label must be treated as a genuine unmergeable
         # pass (like an unmet check or a merge conflict), not silently
         # swallowed as best-effort cleanup. can_merge is True here (checks
         # green, approved), so the "approved and not can_merge" alarm gate
@@ -15070,7 +13911,7 @@ class OrchestratorApp:
                             conflict_detail = "rework not routed"
                         merge_attempt_warning = (
                             f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
-                            f"merge conflict — {conflict_detail}"
+                            f"merge conflict â€” {conflict_detail}"
                         )
                     elif cross_pr_revert_detected:
                         pass_str = "pass" if new_attempts == 1 else "passes"
@@ -15090,14 +13931,14 @@ class OrchestratorApp:
                             revert_detail = "rework not routed"
                         merge_attempt_warning = (
                             f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
-                            f"cross-PR revert — {revert_detail}"
+                            f"cross-PR revert â€” {revert_detail}"
                         )
                     elif mergequeue_handoff_failed:
                         pass_str = "pass" if new_attempts == 1 else "passes"
                         merge_attempt_warning = (
                             f"PR #{pr_number} approved and checks green but the mergequeue "
                             f"label {self.config.auto_merge.mergequeue_label!r} failed to "
-                            f"apply for {new_attempts} {pass_str} — never handed off to "
+                            f"apply for {new_attempts} {pass_str} â€” never handed off to "
                             "Aviator"
                         )
                     elif bool(summary.failed):
@@ -15119,7 +13960,7 @@ class OrchestratorApp:
                         failed_str = ", ".join(summary.failed)
                         merge_attempt_warning = (
                             f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
-                            f"required check(s) failed ({failed_str}) — {check_detail}"
+                            f"required check(s) failed ({failed_str}) â€” {check_detail}"
                         )
                     else:
                         merge_attempt_warning = _format_merge_attempt_alarm_message(
@@ -15142,7 +13983,7 @@ class OrchestratorApp:
                             # alongside checks_summary so the event is
                             # diagnosable without re-deriving state that has
                             # since changed (mergeable/mergeStateStatus are
-                            # already fetched by pr_view — see field list at
+                            # already fetched by pr_view â€” see field list at
                             # _PR_SLIM_FIELDS).
                             "mergeable": pr.get("mergeable"),
                             "merge_state_status": pr.get("mergeStateStatus"),
@@ -15172,7 +14013,7 @@ class OrchestratorApp:
                 # degradation can re-fire the digest (last_health == current_health
                 # dedup would otherwise drop it). Excluded when the mergequeue
                 # handoff itself failed or the merge-hold issue check was
-                # unavailable — both are genuine problems, not benign
+                # unavailable â€” both are genuine problems, not benign
                 # evaluation-only passes, and must not be masked as OK.
                 if issue_number is not None:
                     _issue_key = str(issue_number)
@@ -15238,7 +14079,7 @@ class OrchestratorApp:
             # when ``merge_pr`` actually ran and succeeded (it stays None for
             # mergequeue handoffs, deferrals, conflicts, and skipped/deferred
             # passes), so this fires exactly once per real fleet merge and is
-            # silent on every other outcome — the negative control the issue
+            # silent on every other outcome â€” the negative control the issue
             # requires. ``actor="fleet"`` distinguishes these from
             # externally-merged PRs, which are recorded by
             # ``finalize_externally_merged`` / ``merged_outside_orchestrator``
@@ -15293,17 +14134,17 @@ class OrchestratorApp:
         elif checks_unavailable:
             message = "checks unavailable (gh failure)"
         elif escalated_merge_hold:
-            message += " (escalated — merge held while agent:human-needed is up)"
+            message += " (escalated â€” merge held while agent:human-needed is up)"
         elif merge_hold_check_unavailable:
-            message += f" (merge-hold check unavailable for issue #{issue_number} — not handed off to Aviator)"
+            message += f" (merge-hold check unavailable for issue #{issue_number} â€” not handed off to Aviator)"
         elif merge_hold:
             message += (
-                f" (merge-hold label {self.config.labels.merge_hold!r} present — left alone)"
+                f" (merge-hold label {self.config.labels.merge_hold!r} present â€” left alone)"
             )
         elif mergequeue_label_applied is False:
             message += (
                 f" (mergequeue label {self.config.auto_merge.mergequeue_label!r} FAILED to "
-                f"apply — not handed off to Aviator; will retry, attempt {new_attempts})"
+                f"apply â€” not handed off to Aviator; will retry, attempt {new_attempts})"
             )
         elif mergequeue_label_applied is True:
             message += (
@@ -15326,8 +14167,8 @@ class OrchestratorApp:
     ) -> CommandResult:
         """Dry-run readiness evaluation for ``merge_ready`` (issue #614).
 
-        Mirrors the read-only prefix of :meth:`merge_ready` — fetching the PR,
-        review decision, checks, diff, and computing ``can_merge`` — but skips
+        Mirrors the read-only prefix of :meth:`merge_ready` â€” fetching the PR,
+        review decision, checks, diff, and computing ``can_merge`` â€” but skips
         every state write, label transition, branch update, merge, and
         mergequeue label add.  Returns the computed readiness verdict so a
         preview can report what *would* happen without fabricating a merge or
@@ -15393,7 +14234,7 @@ class OrchestratorApp:
                     # verdict without persisting.
                     return CommandResult(
                         False,
-                        "PR head moved since approval — re-review required",
+                        "PR head moved since approval â€” re-review required",
                         {
                             "pr": pr_number,
                             "issue": issue_number,
@@ -15408,7 +14249,7 @@ class OrchestratorApp:
                     )
                 # Carry-forward would apply; continue with read-only checks.
                 # The approval-head write (_update_approval_head) is skipped
-                # under dry-run, so reviewed_head_sha stays stale — but
+                # under dry-run, so reviewed_head_sha stays stale â€” but
                 # ``approved`` is still True and ``can_merge`` depends on
                 # checks/sync_failed, not on the head SHA directly.
 
@@ -15565,14 +14406,14 @@ class OrchestratorApp:
             else:
                 message += " (would merge)"
         elif escalated_merge_hold:
-            message += " (escalated — would hold merge while agent:human-needed is up)"
+            message += " (escalated â€” would hold merge while agent:human-needed is up)"
         elif merge_hold:
             message += (
                 f" (merge-hold label {self.config.labels.merge_hold!r} present"
-                f" — would be left alone)"
+                f" â€” would be left alone)"
             )
         elif merge_conflict:
-            message += " (merge conflict — would route to rework on threshold)"
+            message += " (merge conflict â€” would route to rework on threshold)"
         elif cross_pr_revert_detected:
             message += f" (cross-PR revert: {cross_pr_revert_reason})"
         elif checks_unavailable:
@@ -15632,7 +14473,7 @@ class OrchestratorApp:
         artifact_text = path.read_text(encoding="utf-8")
         cfg = self.config.cross_family
         reviews_dir = self.paths.cross_family
-        # Issue #618: skip directory creation in dry-run — the cross-family
+        # Issue #618: skip directory creation in dry-run â€” the cross-family
         # model is not invoked (dry_run=True below), so no prompt/report is
         # written into this directory.
         if not self.dry_run:
@@ -15652,7 +14493,7 @@ class OrchestratorApp:
             timeout_seconds=cfg.timeout_seconds,
             dry_run=self.dry_run,
         )
-        # Issue #618: gate the state write — dry-run must not record events
+        # Issue #618: gate the state write â€” dry-run must not record events
         # or mutate state.json.
         if not self.dry_run:
             with state_lock(self.paths.state_file):
@@ -15709,12 +14550,12 @@ class OrchestratorApp:
         # pass may have launched a review via ``launch_cross_family_review``
         # (Popen, non-blocking) and left a ``.pending.json`` marker. Reap it
         # before deciding whether to launch a new one. This is the single
-        # collection point — the same PR's pending review is reaped here or not
+        # collection point â€” the same PR's pending review is reaped here or not
         # at all.
         reaped = reap_cross_family_review(report_path=report_path)
         if reaped is not None:
             if reaped.pending:
-                # Still running — the review packet must NOT go out yet. Return
+                # Still running â€” the review packet must NOT go out yet. Return
                 # a pending result so ``review()`` defers the packet write; the
                 # next pass will reap again. This is what prevents one repo's
                 # reviewer latency from blocking the other repo's lane: the
@@ -15737,12 +14578,12 @@ class OrchestratorApp:
                 if report_is_reusable(reaped_text, pr.get("headRefOid")):
                     return self._cross_family_section(report_path), reaped
                 # Stale: the head moved while the review was in flight. Do
-                # NOT serve it — fall through to the idempotent reuse check
+                # NOT serve it â€” fall through to the idempotent reuse check
                 # below, which reaches the same "unusable" conclusion via the
                 # same predicate and continues on to budget claim + relaunch,
                 # exactly as a failed/unusable report would.
             else:
-                # Reaped a failure — the failure stub is already written.
+                # Reaped a failure â€” the failure stub is already written.
                 # Check exhaustion for the attempt that just completed, then
                 # fall through to the budget claim + relaunch path below.
                 if enforce_regen_budget:
@@ -15755,7 +14596,7 @@ class OrchestratorApp:
         # Idempotent: a non-empty, semantically valid SUCCESS report is reused,
         # so repeated review()/loop() passes don't re-burn the cross-family model
         # on the same PR. Failure stubs (headed "(UNAVAILABLE)") and exit-zero
-        # but empty/blocked reports must NOT satisfy this check — reusing them
+        # but empty/blocked reports must NOT satisfy this check â€” reusing them
         # turned one codex timeout and one blocked refusal into a permanent
         # silent skip on every subsequent pass.
         # Additionally, reports are invalidated when the PR head SHA changes
@@ -15764,7 +14605,7 @@ class OrchestratorApp:
         if report_path.exists() and report_path.stat().st_size > 0:
             text = report_path.read_text(encoding="utf-8")
             # The wrapper text itself contains bold markdown ("**leads, not
-            # verdicts**"), so validation runs against the model body only —
+            # verdicts**"), so validation runs against the model body only â€”
             # see report_is_reusable, which is also what loop()'s same-head
             # packet skip consults so the two cannot disagree (issue #1081).
             if report_is_reusable(text, pr.get("headRefOid")):
@@ -15836,7 +14677,7 @@ class OrchestratorApp:
             dry_run=self.dry_run,
             head_ref_oid=pr.get("headRefOid"),
         )
-        # If the launch succeeded, the result is pending — the review packet
+        # If the launch succeeded, the result is pending â€” the review packet
         # must not go out yet. If the launch failed immediately (e.g. OSError),
         # the failure stub is already written; check exhaustion and return the
         # section so the packet goes out without a cross-family section (same
@@ -16163,7 +15004,7 @@ class OrchestratorApp:
         dry_run: bool | None = None,
     ) -> CommandResult:
         """Detect (and optionally repair) drift between GitHub reality and the
-        orchestrator's labels/state — e.g. a PR merged by hand outside
+        orchestrator's labels/state â€” e.g. a PR merged by hand outside
         merge-ready leaving `agent:in-progress` stale forever. Read-only unless
         ``fix`` is passed.
 
@@ -16176,7 +15017,7 @@ class OrchestratorApp:
         This is the public entry point: acquire ``supervisor.lock`` (only
         when ``fix``, matching today's behavior), then delegate everything
         else to ``_reconcile_locked``, which requires the lock already be
-        held. Do not inline the body back here — the periodic in-loop caller
+        held. Do not inline the body back here â€” the periodic in-loop caller
         (``_maybe_reconcile_drift``) already holds ``supervisor.lock`` via
         its own caller (``loop()``) and must call ``_reconcile_locked``
         directly; re-entering this method would always fail to reacquire the
@@ -16214,17 +15055,17 @@ class OrchestratorApp:
     ) -> CommandResult:
         """Run drift detection (and optional repair) against GitHub/state.
 
-        Precondition: the caller MUST already hold ``supervisor.lock`` — this
+        Precondition: the caller MUST already hold ``supervisor.lock`` â€” this
         method never acquires it itself. ``reconcile()`` is the only method
         that acquires the lock (and only when ``fix``); it delegates here
         immediately afterward. The periodic in-loop caller
         (``_maybe_reconcile_drift``) calls this directly, bypassing
         ``reconcile()``'s lock-acquisition entirely, because ``loop()``'s own
-        caller already holds ``supervisor.lock`` for the whole pass —
+        caller already holds ``supervisor.lock`` for the whole pass â€”
         acquiring it a second time on the same non-reentrant byte-range lock
         would always fail and silently no-op (merge-lane-recovery D-8a).
 
-        Extracted verbatim from ``reconcile()``'s former body — logic here is
+        Extracted verbatim from ``reconcile()``'s former body â€” logic here is
         unchanged from before the split, including the GraphQL rate-limit
         deferral, so ``charlie mop-up --fix`` (which still goes through
         ``reconcile()``) is byte-for-byte unchanged in behaviour.
@@ -16347,12 +15188,12 @@ class OrchestratorApp:
                     )
             message = f"found {len(drift)} drift item(s)"
             if fixed:
-                message += " — fixed"
+                message += " â€” fixed"
             elif drift:
                 if dry_run and fix:
                     message += " (dry-run; no changes applied)"
                 elif fix and post_fix_drift:
-                    message += f" — partially fixed — {len(post_fix_drift)} item(s) remain"
+                    message += f" â€” partially fixed â€” {len(post_fix_drift)} item(s) remain"
                 else:
                     message += " (read-only; pass --fix to repair)"
             # ok=False when drift is present and not fixed: scripts and CI can gate
@@ -16377,7 +15218,7 @@ class OrchestratorApp:
         return (
             "\n## Cross-family adversarial pass\n\n"
             f"An automated non-Claude adversarial review is at `{report_path}`. Read it, but "
-            "treat its findings as **leads, not verdicts** — that model over-escalates severity. "
+            "treat its findings as **leads, not verdicts** â€” that model over-escalates severity. "
             "Verify each against live code before folding it in, reject over-escalations with a "
             "reason, and never let it gate the merge on its own.\n"
         )
@@ -16474,7 +15315,7 @@ class OrchestratorApp:
             # report success for a carry-forward write that was refused
             # (e.g. _update_approval_head's identity guard rejected a
             # concurrent verdict change). The branch WAS updated, but the
-            # approval verdict was not carried forward to the new head —
+            # approval verdict was not carried forward to the new head â€”
             # the PR will need re-review. Telemetry-only, no state impact.
             approval_carried = self._update_approval_head(
                 pr_number,
@@ -16522,7 +15363,7 @@ class OrchestratorApp:
 
             # Derive eligibility from the recorded review decision. Never
             # update-branch a PR whose current decision is request_changes,
-            # escalated, or blocked — rework or human intervention will replace
+            # escalated, or blocked â€” rework or human intervention will replace
             # the head, so the CI run would be guaranteed-wasted time.
             decision = self._review_decision(pr_number)
             decision_value = decision.get("decision")
@@ -16544,7 +15385,7 @@ class OrchestratorApp:
                 reviewed_head_sha = decision.get("reviewed_head_sha")
                 live_head_sha = pr.get("headRefOid")
                 if reviewed_head_sha is not None and live_head_sha == reviewed_head_sha:
-                    # PR is approved and head hasn't moved since approval — skip update
+                    # PR is approved and head hasn't moved since approval â€” skip update
                     results.append(
                         {
                             "pr_number": pr_number,
@@ -16787,7 +15628,7 @@ class OrchestratorApp:
 
     def _rework_candidate_conflict_blocked(self, pr_data: dict[str, Any], pr_number: int) -> bool:
         """Issue #1349: a patch-id-advanced head on a CONFLICTING/DIRTY PR is
-        still a legitimate launch candidate — the head advance did not resolve
+        still a legitimate launch candidate â€” the head advance did not resolve
         the conflict the rework was requested for. Routing such a PR to
         review() just bounces off the janitor gate's conflict check back to
         rework_requested, deadlocking the issue between dispatch_rework and
@@ -16806,7 +15647,7 @@ class OrchestratorApp:
         ``pr_view`` before routing to review so a persistently-conflicting PR
         is not misrouted back into the deadlock. A failed ``pr_view`` returns
         ``{}`` (production) which ``_is_merge_conflict`` reads as
-        not-conflicting, falling through to the review lane — the same
+        not-conflicting, falling through to the review lane â€” the same
         fail-closed behavior review() itself uses (issue #1349).
         """
         if self._is_merge_conflict(pr_data):
@@ -17550,17 +16391,17 @@ class OrchestratorApp:
                 return None
         # Issue #1106: if the previous rework session died at CLI startup
         # (before the worker's first tool action), this is NOT a no-op/conflict
-        # rework attempt — requeue without touching the caps.  The cap counters
+        # rework attempt â€” requeue without touching the caps.  The cap counters
         # should only count sessions that *ran* and produced no useful change.
         #
         # ``head_settled`` is True only when ``rework_pending`` is True at this
-        # point — the only ``rework_pending = True`` path that reaches here is
+        # point â€” the only ``rework_pending = True`` path that reaches here is
         # ``settled_new_conflicted_head = True`` (the head moved off the
         # recorded baseline), which means the worker DID push real content
         # before dying.  A startup death with no content change never reaches
         # here via the ``rework_pending = True`` branch (it returns None at the
         # stall check above), so the flag only matters on the
-        # ``rework_pending = False`` path — the first detection or a re-detection
+        # ``rework_pending = False`` path â€” the first detection or a re-detection
         # after the issue status left the pending set.
         head_settled = rework_pending
         if existing_pr_state.get("last_rework_was_startup_death") and not head_settled:
@@ -17598,19 +16439,19 @@ class OrchestratorApp:
             # are both eligible ("cheap model wasn't good enough") causes.
             # Route to a bounded Opus rework via the SAME router this
             # function already uses for the non-cap-exceeded routing path
-            # below, instead of escalating — never a second rescue for the
+            # below, instead of escalating â€” never a second rescue for the
             # same PR (rescue_attempted is durable, cleared only by
             # `charlie unescalate`).
             #
             # Ordering note (reviewed, deliberate): the marker is committed
             # under this lock BEFORE `router(...)` runs its own separate
             # state_lock write below. A crash in that narrow window leaves
-            # `rescue_attempted=True` with no rework actually dispatched —
+            # `rescue_attempted=True` with no rework actually dispatched â€”
             # the PR's one rescue slot is spent for nothing and the NEXT cap
             # exceedance escalates straight to a human instead of retrying
             # the rescue. This is intentional, not an oversight: the
             # alternative (write the marker AFTER `router()` succeeds) fails
-            # the other way — a crash between a successful `router()` write
+            # the other way â€” a crash between a successful `router()` write
             # and the marker write leaves the PR eligible for a SECOND
             # rescue attempt on the next cap exceedance, violating the "one
             # rescue per PR" invariant the whole feature is built around
@@ -17620,7 +16461,7 @@ class OrchestratorApp:
             # kept. This mirrors this same function's pre-existing,
             # explicitly-accepted two-lock deviation for `attempts_key`
             # itself (see the docstring above and the comment at the
-            # `snapshot = load_state_locked(...)` read a few lines up) —
+            # `snapshot = load_state_locked(...)` read a few lines up) â€”
             # not a new risk introduced by the rescue tier, the same
             # "self-corrects, at worst delays by one cycle" tradeoff this
             # function already makes elsewhere. Making this fully atomic
@@ -17755,7 +16596,7 @@ class OrchestratorApp:
                     # from a timestamp accumulated during unrelated history.
                     stall_since_key: None,
                     stall_head_key: None,
-                    # Issue #1106: clear startup-death flags — the head
+                    # Issue #1106: clear startup-death flags â€” the head
                     # settled, so the previous session's death (if any) is
                     # now accounted for by this attempt.
                     "last_rework_failure_kind": None,
@@ -17785,7 +16626,7 @@ class OrchestratorApp:
         route_extra_state: dict[str, Any] = {attempts_key: attempts}
         if head_sha:
             route_extra_state[last_head_key] = head_sha
-        # Issue #1106: clear startup-death flags — this attempt is being
+        # Issue #1106: clear startup-death flags â€” this attempt is being
         # counted, so the previous session's death is now accounted for.
         route_extra_state["last_rework_failure_kind"] = None
         route_extra_state["last_rework_was_startup_death"] = False
@@ -18262,7 +17103,7 @@ class OrchestratorApp:
         branch_prefix = self.config.dispatch.branch_prefix
         # Aviator MergeQueue handoff (task #10): a PR already parked in
         # Aviator's queue (state status "mergequeue") must never occupy
-        # charlie's merge-train head — Aviator now owns serialization for it.
+        # charlie's merge-train head â€” Aviator now owns serialization for it.
         # Without this exclusion the parked PR keeps winning "earliest
         # reviewed" on every poll until GitHub reports it merged, so under
         # front_of_train no other approved PR is ever attempted while Aviator
@@ -18306,7 +17147,7 @@ class OrchestratorApp:
         The pure text-shape check (``required_check_citation_names``) runs
         first so ``gh pr checks`` is only fetched for the small set of
         verdicts that could possibly be stale. Checks-unavailable (``None``)
-        fails closed to False — the verdict keeps its normal lifecycle.
+        fails closed to False â€” the verdict keeps its normal lifecycle.
         """
         required = self.config.auto_merge.required_checks
         if not required:
@@ -18326,14 +17167,14 @@ class OrchestratorApp:
         recorded ``reviewed_patch_id``. Issue #1187: ``git patch-id --stable``
         strips leading whitespace from ``+``/``-`` content lines, so two
         diffs that differ ONLY in indentation depth produce the identical
-        patch-id — and in an indentation-sensitive language (Python) an
+        patch-id â€” and in an indentation-sensitive language (Python) an
         indentation-only change can alter control flow (e.g. moving a
         ``return`` into or out of an ``if`` block). A tier-1 patch-id match
         alone is therefore NOT sufficient to carry forward a verdict: when
         a tier-2 line-content signature (which preserves whitespace verbatim)
         was recorded at review time, it is also validated and must match.
-        If the tier-2 signatures differ — a whitespace-only change that
-        patch-id collapsed — the check fails closed to stale rather than
+        If the tier-2 signatures differ â€” a whitespace-only change that
+        patch-id collapsed â€” the check fails closed to stale rather than
         carrying forward an approved verdict across a semantically
         different, unreviewed head. Decisions that predate tier-2 (no
         signature stored) have no tier-2 baseline to consult and preserve
@@ -18342,15 +17183,15 @@ class OrchestratorApp:
         proved binary content identity, and tier-2 is consulted only for
         its text-line view, which is unaffected by binary payloads.
 
-        Tier 2 (line-content, issue #414): patch-ids differ — which happens
+        Tier 2 (line-content, issue #414): patch-ids differ â€” which happens
         on every ordinary main advance, since ``git patch-id --stable``
         hashes hunk-boundary context and the merge-base moves whenever main
-        does — but the ordered ``+``/``-`` line stream and changed-file set
+        does â€” but the ordered ``+``/``-`` line stream and changed-file set
         recorded at review time are identical to the live diff's. Reordered,
         added, removed, or altered lines, or a changed file set, are real
         content changes and do NOT carry forward. Tier 2 is INELIGIBLE
         whenever either side's diff touched a binary file: a binary payload
-        emits no ``+``/``-`` lines, so the signature is blind to it — two
+        emits no ``+``/``-`` lines, so the signature is blind to it â€” two
         diffs with genuinely different binary content at the same path
         would otherwise compare equal (review follow-up on issue #414).
 
@@ -18358,9 +17199,9 @@ class OrchestratorApp:
         failure, or binary content: a decision recorded before tier-2
         existed (no signature stored), a PR whose diff cannot be fetched,
         a binary file on either side, or a genuine content difference all
-        report "cannot carry forward" — never carry forward on
+        report "cannot carry forward" â€” never carry forward on
         uncertainty. Tier 2 is pure string parsing of the diff text already
-        fetched for tier 1 — it needs no additional git/gh calls and so has
+        fetched for tier 1 â€” it needs no additional git/gh calls and so has
         no failure mode of its own beyond that shared fetch.
 
         Eligibility for BOTH tiers is gated on ``reviewed_patch_id`` being
@@ -18368,7 +17209,7 @@ class OrchestratorApp:
         "blocked" verdict, or any other decision that never computed one,
         has no baseline to compare against, full stop. A pure-rename or
         mode-only diff also has an empty ``reviewed_patch_id`` (no ``@@``
-        hunk) despite having a valid tier-2 signature on file — that
+        hunk) despite having a valid tier-2 signature on file â€” that
         specific case is intentionally left conservative (stays stale)
         rather than gating on the signature fields' presence instead, which
         was tried and reverted: ``record_review`` unconditionally records a
@@ -18389,7 +17230,7 @@ class OrchestratorApp:
         reviewed_patch_id = decision.get("reviewed_patch_id") or ""
         if not reviewed_patch_id:
             # No baseline recorded at all (e.g. a "blocked" verdict never
-            # computes a patch-id) — nothing to compare against.
+            # computes a patch-id) â€” nothing to compare against.
             return CarryForwardCheck(None, live_patch_id, live_signature)
 
         if live_patch_id and live_patch_id == reviewed_patch_id:
@@ -18401,12 +17242,12 @@ class OrchestratorApp:
             # match alone must not carry forward a verdict: validate the
             # tier-2 line-content signature (which preserves whitespace
             # verbatim) when one was recorded. The tier-2 binary gate does
-            # NOT apply here — patch-id already proved binary content
+            # NOT apply here â€” patch-id already proved binary content
             # identity, and tier-2 is consulted only for its text-line view.
             reviewed_changed_lines = decision.get("reviewed_changed_lines")
             reviewed_changed_files = decision.get("reviewed_changed_files")
             if reviewed_changed_lines is None or reviewed_changed_files is None:
-                # Decision predates tier-2 (no signature recorded) —
+                # Decision predates tier-2 (no signature recorded) â€”
                 # patch-id is the only available signal; preserve #412's
                 # original carry-forward behavior for legacy decisions.
                 return CarryForwardCheck("patch-id", live_patch_id, live_signature)
@@ -18414,7 +17255,7 @@ class OrchestratorApp:
             files_match = frozenset(reviewed_changed_files) == live_signature.changed_files
             if lines_match and files_match:
                 return CarryForwardCheck("patch-id", live_patch_id, live_signature)
-            # Patch-id matched but tier-2 signatures differ — a
+            # Patch-id matched but tier-2 signatures differ â€” a
             # whitespace-only change that patch-id collapsed (issue #1187).
             # Fail closed to stale rather than carrying forward an approved
             # verdict across a semantically different, unreviewed head.
@@ -18423,13 +17264,13 @@ class OrchestratorApp:
         reviewed_changed_lines = decision.get("reviewed_changed_lines")
         reviewed_changed_files = decision.get("reviewed_changed_files")
         if reviewed_changed_lines is None or reviewed_changed_files is None:
-            # Decision predates tier-2 (no signature recorded) — cannot
+            # Decision predates tier-2 (no signature recorded) â€” cannot
             # establish content identity; fail closed to stale.
             return CarryForwardCheck(None, live_patch_id, live_signature)
 
         if decision.get("reviewed_has_binary") or live_signature.has_binary:
             # A binary payload emits no +/- content lines, so the signature
-            # cannot see it — never rely on its silence for content it
+            # cannot see it â€” never rely on its silence for content it
             # never observed (issue #414 review follow-up).
             return CarryForwardCheck(None, live_patch_id, live_signature)
 
@@ -18464,8 +17305,8 @@ class OrchestratorApp:
         structurally-verified (``_verify_synced_head``) front-of-train/
         broadcast sync callers, which never compared patch-ids at all.
 
-        When ``new_patch_id``/``new_signature`` are supplied — they are
-        already computed as part of the tier check that led here — they
+        When ``new_patch_id``/``new_signature`` are supplied â€” they are
+        already computed as part of the tier check that led here â€” they
         replace the stored baseline so ``reviewed_head_sha`` and the
         patch-id/content-signature fields always describe the SAME head
         consistently. Leaving a patch-id recorded against a stale head would
@@ -18475,7 +17316,7 @@ class OrchestratorApp:
 
         A carry-forward event is recorded here, inside the locked section
         that already persists the transition, so every call site is
-        instrumented by construction — a new caller cannot forget it
+        instrumented by construction â€” a new caller cannot forget it
         (issue #638). The event kind is tier-dependent so the three
         mechanisms (``verdict_carried_forward_clean_rebase`` for patch-id,
         ``verdict_carried_forward_line_content`` for line-content, and
@@ -18491,21 +17332,21 @@ class OrchestratorApp:
         of ``review-decision.json`` from that copy, outside any lock, so a
         verdict recorded on disk during the round-trips (e.g. an operator's
         ``record_review`` landing a fresh ``request_changes``) was silently
-        replaced by the stale copy and re-pinned to the new head — an
+        replaced by the stale copy and re-pinned to the new head â€” an
         approval could be resurrected over a contemporaneous rejection,
         authorizing a merge that should not happen.
 
         Now the on-disk decision is re-read inside the same ``state_lock``
         that guards the ``state.json`` half of this transition (previously
         the decision-file write sat entirely outside that lock), and the
-        write is refused unless the on-disk verdict's identity — its
+        write is refused unless the on-disk verdict's identity â€” its
         ``decision`` value, plus ``reviewed_head_sha`` matching ``old_head``
-        when the caller supplied one — still matches what the caller
+        when the caller supplied one â€” still matches what the caller
         observed. Only the fields this function owns (``reviewed_head_sha``,
         ``carry_forward_tier``, the patch-id/signature fields,
         ``carried_forward_from``) are patched onto the on-disk copy;
         ``decision``, ``summary``, and ``required_changes`` always come from
-        disk, never from the caller's stale parameter — this is a
+        disk, never from the caller's stale parameter â€” this is a
         read-modify-write, never a whole-dict replace.
 
         Returns True if the carry-forward was applied, False if it was
@@ -18964,7 +17805,7 @@ class OrchestratorApp:
             )
 
         # merge=False runs the full pass (intake, dispatch, reviews, readiness
-        # evaluation + labels) but skips the actual `gh pr merge` — for
+        # evaluation + labels) but skips the actual `gh pr merge` â€” for
         # operators sequencing same-surface PR cascades by hand, where the
         # pr_list (newest-first) merge order would land PRs in the wrong order.
         loop_start = time.monotonic()
@@ -19060,7 +17901,7 @@ class OrchestratorApp:
                     "elapsed_seconds": round(elapsed, 2),
                     "error_count": len(result.data.get("errors", [])),
                     # Issue #933: the count alone made "loop completed with 1 PR
-                    # error(s)" undiagnosable — two independent sessions misread a
+                    # error(s)" undiagnosable â€” two independent sessions misread a
                     # 21-pass ok=False streak as healthy because no stored artifact
                     # named the PR. Bounded; see summarize_loop_errors.
                     **summarize_loop_errors(result.data.get("errors", [])),
@@ -19321,7 +18162,7 @@ class OrchestratorApp:
     def _maybe_reconcile_drift(self, *, now: datetime | None = None) -> None:
         """Periodic in-loop repair of GitHub label / state.json divergence.
 
-        merge-lane-recovery plan §6-B / D-8. ``OrchestratorApp.reconcile()``
+        merge-lane-recovery plan Â§6-B / D-8. ``OrchestratorApp.reconcile()``
         (``detect_drift`` + ``apply_fixes``) was previously reachable only
         via the operator-invoked ``charlie mop-up --fix`` CLI command
         (``cli.py``'s ``mop-up`` handler) -- the fleet has never run its own
@@ -19769,7 +18610,7 @@ class OrchestratorApp:
         # Issue #849: a ``worktree_unsafe`` escalation is caused by bytes on
         # disk. Clearing it based on PR-level health (OPEN, not CONFLICTING,
         # janitor_ok) without inspecting the worktree reports success for an
-        # operation that changed nothing causal — the next rework dispatch
+        # operation that changed nothing causal â€” the next rework dispatch
         # reproduces the escalation deterministically. Re-run the safety
         # check and skip clearing while the worktree still fails it.
         # Issue #807: ``worktree_unsafe`` is split into
@@ -20233,7 +19074,7 @@ class OrchestratorApp:
         # Unconditional sweep: reap stalled/orphaned sessions even when this pass
         # has zero ready/rework candidates and never reaches dispatch()'s reaper call.
         # The result is handed down to dispatch_rework()/dispatch() below so the
-        # sweep runs exactly once per pass — it is the sole writer of Signal-1's
+        # sweep runs exactly once per pass â€” it is the sole writer of Signal-1's
         # inconclusive-probe deferral counter, and re-running it inside each
         # dispatch lane advanced the counter up to 3x per pass, collapsing the
         # max_inconclusive_probe_deferrals "N passes of grace" into a single pass
@@ -20284,7 +19125,7 @@ class OrchestratorApp:
         # the rest of this pass instead of independently racing wall clock.
         self._maybe_probe_quota_recovery(now=now)
 
-        # Periodic in-loop reconcile (merge-lane-recovery §6-B): repairs
+        # Periodic in-loop reconcile (merge-lane-recovery Â§6-B): repairs
         # GitHub label / state.json divergence on a fixed cadence instead of
         # only when an operator runs `charlie mop-up --fix`. Placed before
         # the dispatch calls below so labels it repairs (e.g. a stale
@@ -20415,14 +19256,14 @@ class OrchestratorApp:
         # Reuse the merged PR list already fetched by dispatch() to avoid a
         # redundant fetch per loop pass. dispatch() returns an empty list (not
         # the fetched merged PRs) when there are no ready issues, so coerce an
-        # empty reuse list back to None — the tripwire must then fetch its own
+        # empty reuse list back to None â€” the tripwire must then fetch its own
         # list to stay armed even when the queue is idle (a worker self-merge can
         # land regardless of whether issues are ready).
         #
         # Deliberate trade-off: because empty-means-unknown is indistinguishable
         # from empty-means-no-merged-PRs, an idle queue costs one extra
         # merged_pr_list() call per pass. That is a paginated REST fetch, not a
-        # GraphQL check-run walk (merged_pr_list is REST-only by construction —
+        # GraphQL check-run walk (merged_pr_list is REST-only by construction â€”
         # issue #361), so the cost is bounded and does not risk the gateway 502s
         # that motivated #361. Staying armed while idle is worth it: the whole
         # point of the tripwire is to catch merges the orchestrator did not
@@ -20472,7 +19313,7 @@ class OrchestratorApp:
             else None
         )
         # Issue #1229: validate branch-name-derived issue numbers against the
-        # actual open-issue set so a stale branch name (e.g. agent/issue-709-…
+        # actual open-issue set so a stale branch name (e.g. agent/issue-709-â€¦
         # left over from a merged PR #709, reused by an unrelated issue-less
         # PR) cannot bind the PR to a non-existent or closed issue and corrupt
         # state["issues"][<n>] with an unrelated rework episode.
@@ -20553,7 +19394,7 @@ class OrchestratorApp:
                         # Issue #1078: if the cross-family review is pending,
                         # review() returned without writing a packet or resetting
                         # the decision. The old head's "approved" decision must
-                        # NOT trigger a merge for the new head — skip to the next
+                        # NOT trigger a merge for the new head â€” skip to the next
                         # PR and let a later pass reap the review and rebuild.
                         if review.data.get("cross_family_pending"):
                             continue
@@ -20576,7 +19417,7 @@ class OrchestratorApp:
                     # supervised passes from re-firing review_started transitions
                     # and regenerating packets every poll cycle while the operator
                     # is still reading. The packet remains current; verdict file
-                    # appearance triggers a delta → the merge lane fires normally.
+                    # appearance triggers a delta â†’ the merge lane fires normally.
                     #
                     # Issue #592: the prompt template is as load-bearing an
                     # input to the packet as the head SHA. A template edit
@@ -20614,7 +19455,7 @@ class OrchestratorApp:
                         pr=pr, pr_number=pr_number
                     )
                     if head_current and template_current and cross_family_current:
-                        # Packet is current — skip regenerating it. The
+                        # Packet is current â€” skip regenerating it. The
                         # already_approved branch above is evaluated earlier
                         # in this same pass and may not see a decision file an
                         # operator wrote after that check ran, so the verdict
@@ -20717,8 +19558,8 @@ class OrchestratorApp:
                             # and no attempt was charged, the regenerator was
                             # never reached (issue #1099). The
                             # ``cross_family_pending`` guard (#1078) excludes
-                            # the case where the regenerator WAS reached — it
-                            # launched the async review — but the report is not
+                            # the case where the regenerator WAS reached â€” it
+                            # launched the async review â€” but the report is not
                             # yet written because the subprocess is still running.
                             # Suppressed while escalated (#1338): review()'s
                             # own entry gate no-ops the regen, so charging a
@@ -20733,7 +19574,7 @@ class OrchestratorApp:
                         if self._record_review_or_error(review, errors, reviews):
                             continue
                         # Issue #1078: same guard as the already_approved branch
-                        # above — a pending cross-family review means no packet
+                        # above â€” a pending cross-family review means no packet
                         # was written, so any existing decision is stale.
                         if review.data.get("cross_family_pending"):
                             continue
@@ -20747,7 +19588,7 @@ class OrchestratorApp:
                 # Permanent: the PR's claimed issue (or another object it
                 # references) does not exist in this repo. Park it durably and
                 # alert once instead of failing the pass every 5 minutes
-                # forever — retrying can never succeed.
+                # forever â€” retrying can never succeed.
                 log_event(
                     self.paths.state_file,
                     # event-consumer: audit-only -- handled inline via _mark_foreign_issue_ref
@@ -20900,7 +19741,7 @@ class OrchestratorApp:
 
         ``stalled_entries``: pass the result of an already-completed
         ``_detect_and_handle_stalled_sessions`` sweep to skip re-running the
-        sweep inside this call — same contract as ``dispatch()`` (issue #343
+        sweep inside this call â€” same contract as ``dispatch()`` (issue #343
         Finding 2: the sweep writes Signal-1's inconclusive-probe deferral
         counter, so it must run at most once per pass). Standalone callers
         leave this as None and the sweep runs inside this call as before.
@@ -20961,10 +19802,10 @@ class OrchestratorApp:
         # interrupted atomic writes (e.g. a watchdog kill during a launch-
         # refusal write) before this pass writes new ones.
         cleanup_stale_session_tmp_files(sessions_dir)
-        # Unconditional stall reaper call, matching dispatch()'s — previously this
+        # Unconditional stall reaper call, matching dispatch()'s â€” previously this
         # only ran when max_concurrent_sessions > 0 via the governor. Skipped
         # only when the caller (loop()) already ran the sweep this pass and
-        # handed its result down — see dispatch_rework()'s docstring.
+        # handed its result down â€” see dispatch_rework()'s docstring.
         if stalled_entries is None:
             _detect_and_handle_stalled_sessions(
                 sessions_dir,
@@ -21102,14 +19943,14 @@ class OrchestratorApp:
                     data,
                 )
 
-        # Dry-run: read-only planning — compute selection and would-be
+        # Dry-run: read-only planning â€” compute selection and would-be
         # SessionRequests, but skip all state writes, label transitions,
         # escalations, review routing, and worker launches. Mirrors
         # _dispatch_impl's dry-run branch. Without this, the fabricated
         # _dry_run_result objects (adapters.py, ok=True for every request)
         # are consumed as ground truth: issues marked "dispatched" with real
         # dispatched_at, redispatch_at counters advanced, orphan flags
-        # cleared, and auto-escalation at the redispatch cap — all on zero
+        # cleared, and auto-escalation at the redispatch cap â€” all on zero
         # actual work (issue #616). The no-op-rework and worker-death
         # escalation paths also write state + transition GitHub labels, and
         # the review-routing path calls self.review() which writes state;
@@ -21121,7 +19962,7 @@ class OrchestratorApp:
 
             # Head-check filtering (read-only): identify candidates that
             # would be routed to review or escalated, but do NOT perform the
-            # routing or escalation — both write state and transition GitHub
+            # routing or escalation â€” both write state and transition GitHub
             # labels.
             dry_head_check_state = load_state_locked(self.paths.state_file)
             dry_routed_to_review: list[int] = []
@@ -21312,11 +20153,11 @@ class OrchestratorApp:
 
         # Issue #339: a rework worker relaunched onto a PR whose rework was
         # already pushed (PR head moved past the last request_changes verdict)
-        # finds nothing to do, idles, and is watchdog-reaped — burning a
+        # finds nothing to do, idles, and is watchdog-reaped â€” burning a
         # session and a concurrency slot. Filter those candidates out here,
         # before any dispatch_pending claim, and route them to the review
         # lane instead. A sync-merge-only head advance (patch-id unchanged)
-        # is NOT treated as "already reworked" — the same patch still needs a
+        # is NOT treated as "already reworked" â€” the same patch still needs a
         # genuine rework cycle, so it remains a legitimate launch candidate.
         head_check_state = load_state_locked(self.paths.state_file)
         routed_to_review: list[int] = []
@@ -21427,12 +20268,12 @@ class OrchestratorApp:
                     continue
 
             if not reviewed_head_sha:
-                # No recorded request_changes head to compare against —
+                # No recorded request_changes head to compare against â€”
                 # nothing to disambiguate; proceed as a legitimate candidate.
                 filtered_candidates.append(issue)
                 continue
             if not live_head_sha:
-                # Live head cannot be determined — fail closed against a
+                # Live head cannot be determined â€” fail closed against a
                 # wasted launch, but don't strand the issue: status is left
                 # untouched so the next pass retries with fresh PR data.
                 head_indeterminate.append(issue_number)
@@ -21440,14 +20281,14 @@ class OrchestratorApp:
             if live_head_sha == reviewed_head_sha:
                 # Head hasn't moved since request_changes. Check if previous
                 # rework attempts for this head already exhausted the
-                # redispatch cap — if so, escalate immediately instead of
+                # redispatch cap â€” if so, escalate immediately instead of
                 # dispatching another worker that will also produce no
                 # changes. This is a safety net for cases where the restore
                 # path's escalation didn't stick (race/crash between the
                 # restore and the state write).
                 #
                 # Issue #1134: a worker that died before pushing leaves the
-                # PR head unchanged, but that is NOT a no-op — the worker
+                # PR head unchanged, but that is NOT a no-op â€” the worker
                 # may have completed its work and died mid-push with
                 # salvageable stranded commits.  The orphan sweep records
                 # each death in ``worker_death_at``; here we subtract death
@@ -21473,7 +20314,7 @@ class OrchestratorApp:
                     if len(prior_deaths) >= self.config.watchdog.max_auto_redispatch:
                         # Issue #1239: before escalating a death-loop, attempt
                         # to salvage-push stranded commits from the dead
-                        # worker's worktree — the same sanctioned-git path the
+                        # worker's worktree â€” the same sanctioned-git path the
                         # fresh-dispatch lane uses (#1248).  A successful push
                         # means the worker completed the rework and died at the
                         # final push step; the PR head moves past the
@@ -21483,7 +20324,7 @@ class OrchestratorApp:
                         # cap.  Only a death that produced NO pushable commit
                         # escalates.  ``salvage_push_stranded_commits`` runs
                         # ls-remote before pushing, never force-pushes, and is
-                        # fast-forward only — never trust the sidecar's
+                        # fast-forward only â€” never trust the sidecar's
                         # ``push_succeeded`` as proof of a push.
                         if self._salvage_rework_stranded_commits(
                             issue_number, pr_data, issue_entry
@@ -21504,7 +20345,7 @@ class OrchestratorApp:
             live_patch_id = _calculate_patch_id(diff) if diff else ""
             if not reviewed_patch_id or not live_patch_id:
                 # Can't establish content identity (no recorded baseline, or
-                # the diff fetch itself failed) — fail closed rather than
+                # the diff fetch itself failed) â€” fail closed rather than
                 # guess; retry next pass instead of stranding the issue.
                 head_indeterminate.append(issue_number)
                 continue
@@ -21538,10 +20379,10 @@ class OrchestratorApp:
         candidates = filtered_candidates
         # A content change was detected above, but review() may itself fail to
         # produce a packet (deterministic janitor gate: conflicting/draft/red
-        # CI — see review()'s early-return before any packet/label write).
+        # CI â€” see review()'s early-return before any packet/label write).
         # Only issues review() actually routed get reported as routed_to_review;
         # the rest keep their rework_requested status and are retried next pass
-        # (issue #339 finding 1: never report a routing that didn't happen —
+        # (issue #339 finding 1: never report a routing that didn't happen â€”
         # doing so desyncs state.json from GitHub labels/PR state with no
         # automated recovery path).
         confirmed_routed_to_review: list[int] = []
@@ -21565,7 +20406,7 @@ class OrchestratorApp:
         # Issue #1239: route salvaged death-loop issues to review.  The
         # salvage push already advanced the PR head past the request_changes
         # verdict, so review() generates a fresh packet that supersedes the
-        # stale verdict — the same machinery the head-moved branch above uses.
+        # stale verdict â€” the same machinery the head-moved branch above uses.
         # A salvage that review() blocks (deterministic janitor gate) stays
         # rework_requested for the next pass, same as a blocked head-moved
         # routing; the death was NOT counted, so the death-loop cap is not
@@ -21640,7 +20481,7 @@ class OrchestratorApp:
 
         # Issue #1134: escalate worker-death loops separately from no-op
         # rework loops.  A death loop means the worker keeps dying before
-        # pushing — the work may be complete but stranded in the worktree.
+        # pushing â€” the work may be complete but stranded in the worktree.
         # The operator triage for ``worker_death_loop`` is "check the
         # worktree for stranded commits," not "worker is spinning."
         # Pre-compute stranded-commits counts outside the state lock because
@@ -21902,7 +20743,7 @@ class OrchestratorApp:
         # rework) already stamped `rescue_attempted` on its PR record instead
         # of escalating. Those issues must launch via the claude-code adapter
         # pinned to `rescue.worker_model`, regardless of the primary
-        # configured `devin.adapter` — tracked separately here so the SAME
+        # configured `devin.adapter` â€” tracked separately here so the SAME
         # candidate-selection/session-request/state-bookkeeping code below
         # handles them, only the final dispatch_sessions() call differs.
         #
@@ -21925,7 +20766,7 @@ class OrchestratorApp:
             # Use the rework prompt from the PR directory
             rework_prompt_path = self.paths.prs / f"pr-{pr_number}" / "rework-prompt.md"
             if not rework_prompt_path.exists():
-                # Skip if rework prompt doesn't exist — record as rework_requested
+                # Skip if rework prompt doesn't exist â€” record as rework_requested
                 # to release the claim and allow retry (issue #116)
                 skipped_issue_numbers.append(issue_number)
                 missing_prompt_failures[issue_number] = (
@@ -21936,10 +20777,10 @@ class OrchestratorApp:
             # verbatim, so it must be checked for staleness before dispatch.
             # It can go stale along two independent axes:
             #
-            #   1. The verdict content changed under it — an operator
+            #   1. The verdict content changed under it â€” an operator
             #      hand-editing review-decision.json is the #510 case, and
             #      issue #632 added the mtime comparison that catches it.
-            #   2. The *renderer* changed under an untouched verdict — issue
+            #   2. The *renderer* changed under an untouched verdict â€” issue
             #      #800. No timestamp moves, so axis 1's check cannot see it.
             #
             # Axis 2 subsumes axis 1 wherever the dispatch note can be
@@ -21961,12 +20802,12 @@ class OrchestratorApp:
             # Tier 3 "REVIEWER FINDINGS UNAVAILABLE" placeholder and overwrite
             # a brief that still has real findings in it. Without the verdict
             # there is no way to produce a *better* brief, only a worse one,
-            # so leave it alone — same failure direction as the sidecar guard.
+            # so leave it alone â€” same failure direction as the sidecar guard.
             if dispatch_note is not None and decision_path.exists():
                 # Issue #800: the mtime comparison above only sees one of the
                 # two ways a brief goes stale. It catches *verdict content*
                 # drift, but a brief also goes stale when the **renderer**
-                # changes underneath an untouched verdict — 35c072d adding
+                # changes underneath an untouched verdict â€” 35c072d adding
                 # tier-2/3 fallbacks to _render_required_changes_section, or
                 # #883 rewriting rework.md's fences. Nothing about that makes
                 # the verdict newer, so every brief already on disk kept
@@ -21974,7 +20815,7 @@ class OrchestratorApp:
                 #
                 # A template/renderer digest (the #592 approach) would not fix
                 # this: #800's own trigger was a change to Python, not to a
-                # template. So re-render unconditionally and diff instead —
+                # template. So re-render unconditionally and diff instead â€”
                 # that is axis-agnostic by construction and cannot miss a
                 # staleness source nobody has enumerated yet.
                 #
@@ -21984,7 +20825,7 @@ class OrchestratorApp:
                 #
                 # Reading the brief is new failure surface on a path that
                 # previously never opened it, and this loop body has no
-                # per-issue exception handling — an unreadable brief would
+                # per-issue exception handling â€” an unreadable brief would
                 # abort the whole pass for every *other* issue too. Treat it
                 # as "differs": the note is in hand, so regenerating is both
                 # safe and the right repair for an unreadable file.
@@ -22027,7 +20868,7 @@ class OrchestratorApp:
                 # than the lost prose.
                 self._write_rework_prompt(pr, issue_number, "")
             # Rescue tier (issue #555): rescue-marked PRs bypass per-issue
-            # adapter routing — they always launch via the claude-code adapter
+            # adapter routing â€” they always launch via the claude-code adapter
             # pinned to rescue.worker_model, regardless of the primary
             # configured devin.adapter or api_worker routing preflight.
             pr_state_for_rescue = rescue_state_snapshot.get("prs", {}).get(str(pr_number), {})
@@ -22138,7 +20979,7 @@ class OrchestratorApp:
         # pinned to rescue.worker_model (see _rescue_adapter_settings),
         # while every other candidate is dispatched via the per-issue routing
         # partition (_dispatch_partitioned). Rescue issues bypass routing
-        # entirely — they always use the rescue adapter/model. Reuses the
+        # entirely â€” they always use the rescue adapter/model. Reuses the
         # same dispatch_sessions()/launch_claude_worker() path for both; the
         # only difference is which AdapterSettings/config is passed in.
         normal_requests = [
@@ -22166,7 +21007,7 @@ class OrchestratorApp:
         # only its subset. Rewrite once with the combined batch so the on-disk
         # observability files reflect the full pass. The adapter label is
         # derived from the actual partition (normal routing kinds + the rescue
-        # kind "claude-code") via manifest_adapter_label — a homogeneous batch
+        # kind "claude-code") via manifest_adapter_label â€” a homogeneous batch
         # is labeled with its single kind, not the default adapter name
         # (issue #626). When only one tier ran, its sub-call already wrote the
         # correct manifest, so the combined manifest write is skipped (it was
@@ -22244,7 +21085,7 @@ class OrchestratorApp:
                     entry.pop("orphan_drift_fingerprint", None)
                     entry.pop("orphan_drift_at", None)
                     # Issue #1106: a new rework dispatch supersedes any
-                    # prior startup-death classification — the new session
+                    # prior startup-death classification â€” the new session
                     # is the one whose outcome the next janitor pass will
                     # attribute, so the stale flag must not survive.
                     dispatched_pr = pr_by_issue.get(request.issue_number)
@@ -22642,10 +21483,10 @@ class OrchestratorApp:
         published); ``False`` for any non-push outcome (no stranded commits,
         divergence, remote-head-not-local, missing worktree/branch, or git
         error).  The caller treats a ``True`` result as "the death produced
-        completed work — do NOT count it toward ``worker_death_loop``" and
+        completed work â€” do NOT count it toward ``worker_death_loop``" and
         routes the issue to review instead of escalating.
 
-        Reuses ``salvage_push_stranded_commits`` — the same sanctioned-git
+        Reuses ``salvage_push_stranded_commits`` â€” the same sanctioned-git
         primitive the fresh-dispatch salvage lane uses (#1248): ls-remote
         before pushing (never trust the sidecar's ``push_succeeded``), never
         force-push, fast-forward only.  Records a state event so the salvage
@@ -22663,7 +21504,7 @@ class OrchestratorApp:
         # this call the issue's status may have already moved off
         # ``rework_requested`` (e.g. a concurrent loop pass dispatched it,
         # escalated it, or the issue was closed).  Re-check under the state
-        # lock BEFORE any network push — a salvage push to the shared origin
+        # lock BEFORE any network push â€” a salvage push to the shared origin
         # remote for an issue that is no longer rework_requested would be an
         # unaudited side effect with no event trail if it succeeded.  Mirrors
         # the precondition added to ``_reap_restore_rework_requested`` (which
@@ -22722,14 +21563,14 @@ class OrchestratorApp:
         so the previous worker's output is already live and a relaunch would
         find nothing to do, idle, and get watchdog-reaped.
 
-        Reuses ``review()`` — the review lane's own packet-regeneration entry
-        point — instead of duplicating its janitor/test-adequacy gating and
+        Reuses ``review()`` â€” the review lane's own packet-regeneration entry
+        point â€” instead of duplicating its janitor/test-adequacy gating and
         label-transition logic here.
 
         Returns a ``(routed, review_result)`` pair. ``routed`` is True only
         when ``review()`` actually produced a fresh, undecided packet against
         the new head. ``review()`` has its own early-returns that leave
-        GitHub/labels untouched — most notably the deterministic janitor gate
+        GitHub/labels untouched â€” most notably the deterministic janitor gate
         (conflicting/draft/red-CI), which returns ``ok=False`` *before*
         writing any packet or firing the ``review_started`` transition, and
         without touching ``reviewed_head_sha``. Flipping the issue's status
@@ -22741,12 +21582,12 @@ class OrchestratorApp:
         of the pre-existing "no fresh decision recorded" check: ``review()``
         can itself invoke ``record_review`` (the test-adequacy hard gate
         re-failing on the new head), which already reconciles the issue's
-        status and ``reviewed_head_sha`` — that path returns ``ok=True`` but
+        status and ``reviewed_head_sha`` â€” that path returns ``ok=True`` but
         must not be re-flipped here either, so both checks are required.
 
         When ``routed`` is False, the issue's status is left untouched
         (``rework_requested``), so the next dispatch_rework pass naturally
-        retries — the block is often transient (e.g. a merge-train branch
+        retries â€” the block is often transient (e.g. a merge-train branch
         sync resolving a conflict).
         """
         review_result = self.review(pr_number)
@@ -22774,7 +21615,7 @@ class OrchestratorApp:
         # handling (closed_unmerged_pr_active_labels) finalizes it.
         closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
         # Issue #1078: a pending cross-family review means no packet was written.
-        # The issue must NOT be flipped to "reviewing" — it stays
+        # The issue must NOT be flipped to "reviewing" â€” it stays
         # "rework_requested" for the next pass, same as the routed/blocked cases.
         cross_family_pending = bool(review_result.data.get("cross_family_pending"))
         with state_lock(self.paths.state_file):
@@ -22816,22 +21657,22 @@ class OrchestratorApp:
 
         Returns a ``(bound, mention_only, bound_pr_numbers)`` triple:
 
-        * ``bound`` — ``linked_issue_number`` binds the PR to the issue by a
+        * ``bound`` â€” ``linked_issue_number`` binds the PR to the issue by a
           hijack-safe signal (same-repo branch-prefix or closing-action verb).
           This is the same trust level issue #220 uses to close issues at
           merge time, so callers MAY treat a bound issue as safe to close here
           too (belt-and-suspenders in case #220's merge-time close hasn't
           landed, e.g. a crash between merge and label transition).
-        * ``mention_only`` — the PR merely contains an ``issue #N`` /
-          ``issues #N`` text reference (same-repo PRs only — cross-repo
+        * ``mention_only`` â€” the PR merely contains an ``issue #N`` /
+          ``issues #N`` text reference (same-repo PRs only â€” cross-repo
           provenance is never trusted here, and ``isCrossRepository`` only
           describes head-branch provenance, not which repo the *text* refers
           to, so it cannot resolve a cross-repo mention collision either).
           This is advisory only per ``issue_numbers_mentioned_by_pr``'s
           contract: issue #203 never authorized closing an issue on a bare
           mention. Callers MUST exclude these from dispatch and flag them for
-          a human — never close the issue or transition it toward "merged".
-        * ``bound_pr_numbers`` — the PR numbers that bound to a managed issue.
+          a human â€” never close the issue or transition it toward "merged".
+        * ``bound_pr_numbers`` â€” the PR numbers that bound to a managed issue.
           Used to finalize state.json ``prs`` entries for externally-merged PRs
           (issue #427: Aviator mergequeue handoff).
 
@@ -23035,7 +21876,7 @@ class OrchestratorApp:
         # path (_attempt_salvage). Reaping the sidecar here would destroy the
         # key the reaper lane iterates over, making salvage impossible.
         # Issue #1130: relax the preserve condition from ``COMPLETED`` to
-        # ``ahead_count > 0`` — a worktree with committed-but-unpushed work
+        # ``ahead_count > 0`` â€” a worktree with committed-but-unpushed work
         # that also has shim/scaffolding dirt (not in ``injected_paths``)
         # classifies as PARTIAL, not COMPLETED, but the committed work is
         # still salvageable. The reaper lane's salvage condition was relaxed
@@ -23396,7 +22237,7 @@ class OrchestratorApp:
         the rework-routing call sites and the module-level sweeps
         (``_detect_and_handle_orphaned_workers``,
         ``_classify_dead_sessions_and_update_throttle_state``) share one
-        construction path — see that function for the open-issue fetch,
+        construction path â€” see that function for the open-issue fetch,
         failure handling, and ``_LIST_LIMIT`` tradeoff.
         """
         return _build_branch_issue_validator(self.gh)
@@ -23559,10 +22400,10 @@ class OrchestratorApp:
         )
         # Issue #717: enforce the execution-contract escalation trigger on the
         # *rendered output* so a repo-local flat override that drops
-        # $section_execution_contract — leaving a blanket "never run the full
+        # $section_execution_contract â€” leaving a blanket "never run the full
         # local suite" prohibition with no carve-out for contract-changing diffs
         # (public function signature/return shape, exception type/message
-        # consumed elsewhere, DB schema, or module re-export) — is caught at the
+        # consumed elsewhere, DB schema, or module re-export) â€” is caught at the
         # dispatch boundary rather than shipping a worker who can change a
         # contract surface and push without ever exercising the wider suite.
         assert_execution_contract(prompt, context=f"worker prompt for issue #{issue_number}")
@@ -23574,13 +22415,13 @@ class OrchestratorApp:
         # against editing a sibling repo's checkout.
         assert_containment(prompt, context=f"worker prompt for issue #{issue_number}")
         # Issue #618: the dry-run dispatch branch promises "skip all state
-        # writes, label transitions, and file mutations" — mkdir + write_text
+        # writes, label transitions, and file mutations" â€” mkdir + write_text
         # here would violate that, and for a dead-worker recovery candidate
         # (previous status "dispatched", same branch) would silently overwrite
         # the prompt a crashed worker was launched with, destroying the
         # forensic record the preview was meant to inspect. The assertions
         # above are validation on the rendered text, not file mutations, so
-        # they stay — a broken template should fail the preview too.
+        # they stay â€” a broken template should fail the preview too.
         if not dry_run:
             issue_dir.mkdir(parents=True, exist_ok=True)
             prompt_path.write_text(prompt, encoding="utf-8")
@@ -23672,7 +22513,7 @@ class OrchestratorApp:
         fleet pass.
 
         Findings are bounded to merges this control could actually have governed
-        — see ``_apply_unauthorized_merge_baseline``, which every return path
+        â€” see ``_apply_unauthorized_merge_baseline``, which every return path
         goes through so the bound cannot be bypassed by a future caller.
         """
         candidates: list[dict[str, Any]] = []
@@ -23691,14 +22532,14 @@ class OrchestratorApp:
             try:
                 merged_prs = self.gh.merged_pr_list()
             except GitHubError as exc:
-                # No list means nothing observed, not "nothing wrong" — return
+                # No list means nothing observed, not "nothing wrong" â€” return
                 # empty without arming, so a transient gh failure on the very
                 # first pass cannot bake an empty baseline and permanently
                 # exempt the real history it never saw.
                 #
                 # This covers every raising failure in merged_pr_list(): gh
                 # missing, unparseable JSON, non-zero exit, AND gh exiting 0
-                # with empty stdout (the silent-empty case #633 closed —
+                # with empty stdout (the silent-empty case #633 closed â€”
                 # merged_pr_list() now raises GitHubError on a non-list result
                 # instead of coercing None to []). The empty-stdout path no
                 # longer arms an empty baseline silently; it is reported here
@@ -23706,7 +22547,7 @@ class OrchestratorApp:
                 # data.
                 #
                 # Failing open is correct; failing open *silently* is not. Record
-                # that the control did not run (issue #937) — without this the
+                # that the control did not run (issue #937) â€” without this the
                 # pass reports ok=True and is byte-identical in every stored
                 # artifact to a pass where the tripwire ran and found nothing,
                 # discarding the very distinction #633 created upstream when it
@@ -23744,14 +22585,14 @@ class OrchestratorApp:
             # this, every legitimate operator merge of a worker PR (stale
             # decision, absent decision, or pending after rebase) becomes a
             # finding that pins ok=False until someone writes a retrospective
-            # ack. The override is SHA-bound and reason-bearing — see
-            # ``_authorized_override_matches`` — so it does not weaken the
+            # ack. The override is SHA-bound and reason-bearing â€” see
+            # ``_authorized_override_matches`` â€” so it does not weaken the
             # control: an unrecorded merge is still a finding, and a rebase
             # after authorization invalidates the override exactly as it
             # invalidates an approved decision.
             override_authorized = _authorized_override_matches(decision, live_head_sha)
             # Issue #1194: an approved decision whose head moved may be an
-            # Aviator queue sync-merge of the approved head — structurally a
+            # Aviator queue sync-merge of the approved head â€” structurally a
             # false positive. Recognized only under the fail-closed
             # four-condition predicate in _queue_sync_merge_covered, and
             # evaluated lazily: only for approved decisions with a genuine
@@ -23810,8 +22651,8 @@ class OrchestratorApp:
     ) -> list[dict[str, Any]]:
         """Bound the tripwire to merges it could actually have governed.
 
-        The tripwire asserts a policy — every merged worker PR is covered by an
-        ``approved`` decision recorded at its merged head — that this
+        The tripwire asserts a policy â€” every merged worker PR is covered by an
+        ``approved`` decision recorded at its merged head â€” that this
         repository's history predates. ``merged_pr_list()`` returns the last 500
         closed PRs, and many of those merged before the review gate existed,
         under the #597 hollow-verdict bug, or with no decision file at all.
@@ -23819,8 +22660,8 @@ class OrchestratorApp:
         pass yields 48 findings.
 
         Those 48 would append to ``loop()``'s ``errors`` bucket on *every* pass
-        — there is no dedupe and the 500-PR window keeps them in scope for a
-        very long time — pinning ``ok=False`` permanently and burying any real
+        â€” there is no dedupe and the 500-PR window keeps them in scope for a
+        very long time â€” pinning ``ok=False`` permanently and burying any real
         self-merge in constant background noise. That is the same "noise, not
         signal" failure this tripwire exists to prevent, arriving from the other
         direction: a control that can never go quiet is not a control.
@@ -23835,7 +22676,7 @@ class OrchestratorApp:
         #673). The baseline suppresses history once; it cannot suppress a
         genuine bypass that lands after arming, and without an ack mechanism
         such a finding is re-appended to ``errors`` on every single pass for as
-        long as it stays inside ``merged_pr_list()``'s 500-PR window — pinning
+        long as it stays inside ``merged_pr_list()``'s 500-PR window â€” pinning
         ``ok=False`` forever and drowning any new signal in constant noise. That
         is the same "a control that can never go quiet is not a control" failure
         the baseline exists to prevent, arriving from the other direction. So a
@@ -23843,12 +22684,12 @@ class OrchestratorApp:
         ``ack_unauthorized_merge`` (state key ``unauthorized_merge_acknowledged``,
         a ``{pr_number: {acknowledged_at, reason, by}}`` map) is filtered out of
         the reported candidates the same way the baseline filters pre-arming
-        history. Acknowledgment is never automatic — it requires an explicit
-        ``charlie tripwire ack`` action — or the tripwire would defeat itself.
+        history. Acknowledgment is never automatic â€” it requires an explicit
+        ``charlie tripwire ack`` action â€” or the tripwire would defeat itself.
 
         Why an explicit set of PR numbers and not a high-water PR number: a
         number watermark also exempts any PR that was already open when the
-        control armed but merges afterwards. That is not hypothetical here — at
+        control armed but merges afterwards. That is not hypothetical here â€” at
         arming there were three open worker PRs (#510, #585, #630), every one
         numbered below the highest merged PR (#631), so a number watermark would
         have permanently exempted all three, including the PR that adds this
@@ -23900,7 +22741,7 @@ class OrchestratorApp:
 
         if self.dry_run:
             # A preview must not write state (issues #609/#613/#621). Report what
-            # an armed pass would report — nothing — without persisting, so the
+            # an armed pass would report â€” nothing â€” without persisting, so the
             # preview is both write-free and truthful about post-arm behaviour.
             logger.info(
                 "DRY-RUN: unauthorized-merge tripwire would arm with %d pre-existing "
@@ -23947,7 +22788,7 @@ class OrchestratorApp:
         """Record that the unauthorized-merge tripwire did not run this pass (issue #937).
 
         ``_detect_unauthorized_merges`` fails open on a ``GitHubError``: it returns
-        ``[]`` without arming, which is the right call — an unusable response must
+        ``[]`` without arming, which is the right call â€” an unusable response must
         never bake an empty baseline. But returning ``[]`` silently makes a blinded
         pass byte-identical to a clean one in every stored artifact, discarding the
         distinction ``merged_pr_list`` was deliberately changed to create (#633).
@@ -23961,7 +22802,7 @@ class OrchestratorApp:
         gap measurable.
 
         Classified ``warning``, not ``error``: nothing is broken and no finding is
-        being suppressed — a control simply did not run. That matches
+        being suppressed â€” a control simply did not run. That matches
         ``session_rate_limit_deferred`` / ``review_quota_exhausted`` (handled
         degradations) rather than the error tier, which is reserved for things
         needing triage.
@@ -24004,11 +22845,11 @@ class OrchestratorApp:
         The acknowledgement of a finding was durably recorded
         (``unauthorized_merge_acknowledged``); the *finding itself* was not. A
         control whose triage is auditable but whose alarm is not is only half a
-        control — and it is why a live finding took a source-reading session to
+        control â€” and it is why a live finding took a source-reading session to
         identify instead of one query (issue #933).
 
-        Fires on the post-baseline, post-ack set — exactly the candidates that
-        become ``errors`` entries and pin ``ok=False`` — and is keyed durably in
+        Fires on the post-baseline, post-ack set â€” exactly the candidates that
+        become ``errors`` entries and pin ``ok=False`` â€” and is keyed durably in
         ``UNAUTHORIZED_MERGE_DETECTED_KEY`` so a finding that persists for 21
         passes produces one event, not 21. See that constant for why the record
         deliberately does not suppress the finding itself.
@@ -24219,7 +23060,7 @@ class OrchestratorApp:
         suppresses history once. It has no equivalent for *post-arming* findings, so a
         single confirmed, already-actioned bypass is re-detected and re-appended to
         ``loop()``'s ``errors`` bucket on every pass for as long as the merged PR stays
-        inside ``merged_pr_list()``'s 500-PR REST window — pinning ``ok=False`` forever
+        inside ``merged_pr_list()``'s 500-PR REST window â€” pinning ``ok=False`` forever
         and drowning any new signal (issue #673).
 
         This records an explicit acknowledgment in ``state.json`` under
@@ -24229,7 +23070,7 @@ class OrchestratorApp:
         bite until acked and then goes quiet, freeing ``ok=False`` / ``errors`` to mean
         "there is something new to look at" again.
 
-        Acknowledgment is never automatic — that would defeat the tripwire. It requires
+        Acknowledgment is never automatic â€” that would defeat the tripwire. It requires
         this explicit action (exposed as ``charlie tripwire ack``), mirroring how
         ``agent:human-needed`` requires explicit human action to clear. A non-empty
         ``reason`` is mandatory: a tripwire that can be silenced silently is no control.
@@ -24260,8 +23101,8 @@ class OrchestratorApp:
             # instead of once per pass; an ack ends the finding, so the entry has
             # no remaining job. Clearing it here is what makes the map mean
             # "announced findings still open" rather than "every PR ever found",
-            # which keeps it bounded and — the reason this is code and not a
-            # comment — makes re-detection after an ack is *withdrawn* announce
+            # which keeps it bounded and â€” the reason this is code and not a
+            # comment â€” makes re-detection after an ack is *withdrawn* announce
             # again. There is no revoke command today; the one revocation on
             # record (2026-08-02, the #895 misrouted acks) was an operator edit.
             # Were the entry left behind, whoever adds that command would inherit

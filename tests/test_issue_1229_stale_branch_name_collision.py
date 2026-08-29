@@ -348,7 +348,12 @@ def test_classify_dead_session_stale_branch_does_not_mask_escalation(
         started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
         error="worktree creation failed: worktree contains local work",
-        failure_kind="worktree_unsafe",
+        # Issue #807 (#1395) split the blanket ``worktree_unsafe`` kind into
+        # ``worktree_unsafe_shim_dirt`` (mechanical, in
+        # DETERMINISTIC_ESCALATION_FAILURE_KINDS) and
+        # ``worktree_unsafe_local_commits`` (judgment). Use the mechanical kind
+        # so the deterministic-escalation guard fires.
+        failure_kind="worktree_unsafe_shim_dirt",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
@@ -360,7 +365,7 @@ def test_classify_dead_session_stale_branch_does_not_mask_escalation(
     entry = state["issues"]["709"]
     # The guard fired and escalated the dead session.
     assert entry["status"] == "escalated"
-    assert entry["escalation_reason"] == "worktree_unsafe"
+    assert entry["escalation_reason"] == "worktree_unsafe_shim_dirt"
     # Mechanical escalation lands on operator_queue (issue #1266).
     assert (709, config.labels.operator_queue) in fake_gh.labels_added
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 709]
