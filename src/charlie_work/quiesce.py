@@ -295,11 +295,11 @@ def list_processes() -> tuple[Sequence[ProcessInfo], str | None]:
                 "-NoProfile",
                 "-Command",
                 # No `-AsArray`: that switch is PowerShell 6+. Windows PowerShell
-                # 5.1 -- the edition this host and the self-hosted runners ship --
-                # fails the whole command with a ParameterBindingException, which
-                # made every quiescence check on 5.1 fail closed and report
-                # "not quiescent" regardless of what was actually running. The
-                # single-result normalization below is what makes dropping it safe.
+                # 5.1 -- the edition this host ships -- fails the whole command
+                # with a ParameterBindingException, which made every quiescence
+                # check on 5.1 fail closed and report "not quiescent" regardless
+                # of what was actually running. The single-result normalization
+                # below is what makes dropping it safe.
                 "Get-CimInstance Win32_Process | "
                 "Select-Object ProcessId, ParentProcessId, Name, CommandLine | "
                 "ConvertTo-Json",
