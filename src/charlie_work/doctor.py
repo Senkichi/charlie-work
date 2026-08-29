@@ -84,19 +84,33 @@ def workflow_job_names(repo_root: Path) -> set[str]:
     return names
 
 
-def workflow_has_matrix(repo_root: Path) -> bool:
-    """Return whether any GitHub Actions workflow job uses ``strategy.matrix``.
+def workflow_job_matrix_flags(repo_root: Path) -> dict[str, bool]:
+    """Map each workflow job display name to whether that job uses ``strategy.matrix``.
 
     Derives matrix-ness from the parsed workflow YAML rather than a hardcoded
-    job-name list, so the required-check verifier (issue #1508) can decide
-    whether matrix-suffix tolerance (``Name (suffix)`` matching job ``Name``)
-    is justified by an actual matrix expansion -- or is matching a stale
-    suffixed required-check entry that the exact-match merge gate
-    (``checks.py``) would report ``missing`` forever.
+    job-name list, scoped PER JOB (not repo-wide), so the required-check
+    verifier (issue #1508) can decide whether matrix-suffix tolerance
+    (``Name (suffix)`` matching job ``Name``) is justified by an actual matrix
+    expansion ON THE MATCHED JOB -- or is matching a stale suffixed
+    required-check entry that the exact-match merge gate (``checks.py``) would
+    report ``missing`` forever.
+
+    The previous repo-wide ``workflow_has_matrix`` boolean could justify a
+    tolerance match against a non-matrix job in workflow B merely because an
+    unrelated job in workflow A had a matrix -- silently reintroducing the
+    exact false-pass hazard #1508 closed once any workflow in a multi-workflow
+    repo gained a matrix job. Scoping to the matched job's own matrix flag is
+    the single point of enforcement.
+
+    A display name shared by several jobs is matrix-backed if ANY job reporting
+    under that name has a matrix (OR-combined), so a tolerance match on that
+    name is justified whenever at least one underlying job would actually
+    expand it.
     """
+    flags: dict[str, bool] = {}
     workflows_dir = repo_root / ".github" / "workflows"
     if not workflows_dir.is_dir():
-        return False
+        return flags
     for candidate in sorted(workflows_dir.glob("*.y*ml")):
         try:
             raw = yaml.safe_load(candidate.read_text(encoding="utf-8"))
@@ -105,13 +119,48 @@ def workflow_has_matrix(repo_root: Path) -> bool:
         jobs = raw.get("jobs") if isinstance(raw, dict) else None
         if not isinstance(jobs, dict):
             continue
-        for job in jobs.values():
+        for job_id, job in jobs.items():
             if not isinstance(job, dict):
                 continue
+            # Mirror workflow_job_names' name resolution exactly so the keys
+            # here align with the names a tolerance match is computed against.
+            name = str(job["name"]) if job.get("name") else str(job_id)
             strategy = job.get("strategy")
-            if isinstance(strategy, dict) and isinstance(strategy.get("matrix"), dict):
-                return True
-    return False
+            has_matrix = isinstance(strategy, dict) and isinstance(strategy.get("matrix"), dict)
+            flags[name] = flags.get(name, False) or has_matrix
+    return flags
+
+
+def workflow_has_matrix(repo_root: Path) -> bool:
+    """Return whether any GitHub Actions workflow job uses ``strategy.matrix``.
+
+    Thin convenience wrapper over :func:`workflow_job_matrix_flags` so the
+    repo-wide predicate and the per-job verifier share one matrix-detection
+    implementation and cannot drift.
+    """
+    return any(workflow_job_matrix_flags(repo_root).values())
+
+
+def _tolerance_match_base_names(required: str, job_names: set[str]) -> list[str]:
+    """Return the workflow job display names a required check matches via tolerance.
+
+    A tolerance match is a matrix-suffix or reusable-workflow-delimiter match
+    (``Name (suffix)`` / ``caller / callee``). The returned names are the
+    workflow job display names (the ``name``/``id`` from
+    :func:`workflow_job_names`) that the suffix/delimiter expands from -- i.e.
+    the jobs whose own ``strategy.matrix`` flag decides whether the tolerance
+    is justified. A bare prefix never counts (job "Test" is not the check
+    "Tests passed").
+    """
+    bases: list[str] = []
+    for name in job_names:
+        if not name:
+            continue
+        if required.startswith(f"{name} (") or required.startswith(f"{name} / "):
+            bases.append(name)
+        elif name.startswith(f"{required} (") or name.startswith(f"{required} / "):
+            bases.append(name)
+    return bases
 
 
 def _check_name_match_kind(required: str, job_names: set[str]) -> str | None:
@@ -122,23 +171,17 @@ def _check_name_match_kind(required: str, job_names: set[str]) -> str | None:
     (``Name (suffix)`` / ``caller / callee``), or ``None`` for no match.
 
     The merge gate in ``checks.py`` uses EXACT match only, so a
-    ``"tolerance"``-only match is a stale-required-check-entry hazard when no
-    ``strategy.matrix`` exists in the workflow (issue #1508): doctor would
-    pass a ``Tests (windows-latest)`` required-check entry that the merge gate
-    reports ``missing`` forever.
+    ``"tolerance"``-only match is a stale-required-check-entry hazard when the
+    matched job has no ``strategy.matrix`` (issue #1508): doctor would pass a
+    ``Tests (windows-latest)`` required-check entry that the merge gate
+    reports ``missing`` forever. Whether the tolerance is justified is decided
+    by the caller, scoped to the matched job via
+    :func:`workflow_job_matrix_flags` + :func:`_tolerance_match_base_names`.
     """
     if required in job_names:
         return "exact"
-    # Matrix jobs report as "<name> (<matrix values>)"; reusable workflows as
-    # "<caller> / <callee>". Only these delimited expansions count as a match —
-    # a bare prefix must not (job "Test" is not the check "Tests passed").
-    for name in job_names:
-        if not name:
-            continue
-        if required.startswith(f"{name} (") or required.startswith(f"{name} / "):
-            return "tolerance"
-        if name.startswith(f"{required} (") or name.startswith(f"{required} / "):
-            return "tolerance"
+    if _tolerance_match_base_names(required, job_names):
+        return "tolerance"
     return None
 
 
@@ -1231,7 +1274,12 @@ def run_doctor(
 
     # -- required checks vs live workflow files ------------------------------
     job_names = workflow_job_names(repo_root)
-    has_matrix = workflow_has_matrix(repo_root)
+    # Per-job matrix flags (issue #1508): a tolerance match is justified only
+    # when the SPECIFIC job it expands from has strategy.matrix, not when any
+    # unrelated workflow in the repo has one. The repo-wide boolean this
+    # replaced could pass a stale suffixed required-check entry against a
+    # non-matrix job merely because a sibling workflow gained a matrix job.
+    job_matrix_flags = workflow_job_matrix_flags(repo_root)
     if config.auto_merge.required_checks:
         if job_names:
             for required in config.auto_merge.required_checks:
@@ -1245,12 +1293,16 @@ def run_doctor(
                 elif kind == "exact":
                     add(f"check name: {required}", True, "matches a workflow job")
                 else:  # tolerance -- matrix-suffix or reusable-workflow delimiter
-                    if has_matrix:
+                    # Scope the matrix justification to the job(s) that produced
+                    # the tolerance match, not the whole repo.
+                    bases = _tolerance_match_base_names(required, job_names)
+                    matched_has_matrix = any(job_matrix_flags.get(base, False) for base in bases)
+                    if matched_has_matrix:
                         add(
                             f"check name: {required}",
                             True,
                             "matches a workflow job via matrix-suffix tolerance "
-                            "(workflow has strategy.matrix)",
+                            "(matched job has strategy.matrix)",
                         )
                     else:
                         # The merge gate (checks.py) uses EXACT match only, so a
@@ -1259,12 +1311,14 @@ def run_doctor(
                         # same stale-required-check trap #1507 corrected in the
                         # README. Fail rather than warn: doctor's job is to catch
                         # this before a dispatch wave strands an approved PR
-                        # (issue #1508).
+                        # (issue #1508). The matched job has no strategy.matrix,
+                        # so the suffix is a stale entry, not a real expansion --
+                        # even if some OTHER workflow in the repo has a matrix.
                         add(
                             f"check name: {required}",
                             False,
                             "matches a workflow job only via matrix-suffix tolerance, "
-                            "but no strategy.matrix exists in .github/workflows -- "
+                            "but the matched job has no strategy.matrix -- "
                             "the exact-match merge gate (checks.py) would report this "
                             "required check as missing forever",
                         )
