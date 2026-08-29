@@ -14,11 +14,16 @@ invariant.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from charlie_work import cli
 from charlie_work.config import OrchestratorConfig
-from charlie_work.workflow import classify_backlog_reachability
+from charlie_work.workflow import (
+    _MergedPRListOutcome,
+    classify_backlog_reachability,
+    resolve_dispatch_mention_coverage,
+)
 
 
 class FakeGh:
@@ -720,3 +725,246 @@ def test_mention_covered_none_defaults_to_empty_no_coverage() -> None:
     assert result["dispatchable"] == 1
     assert result["mention_covered_awaiting_operator"] == 0
     assert result["mention_covered_prs"] == {}
+
+
+# ---------------------------------------------------------------------------
+# 12. Issue #1337 caller-side wiring: status() real output and
+#     resolve_dispatch_mention_coverage fetch/reuse branches. The classifier
+#     tests above exercise classify_backlog_reachability in isolation; these
+#     exercise the actual call sites that compute the mention_covered map and
+#     pass it through, so a wiring regression (wrong kwarg, missing fetch,
+#     broken reuse) is caught here, not just the classifier logic.
+# ---------------------------------------------------------------------------
+
+
+def test_status_reports_mention_covered_issue_in_backlog_reachability(
+    tmp_path: Path,
+) -> None:
+    """Issue #1337: ``status()`` must populate
+    ``backlog_reachability['mention_covered_awaiting_operator']`` and
+    ``['mention_covered_prs']`` on the real ``status()`` call -- not just the
+    classifier function in isolation.
+
+    A ready issue mentioned by a merged PR (but not bound by branch-prefix or
+    closing keyword) is excluded from dispatch by ``_dispatch_impl``'s
+    merged_pr_issue_numbers filter. Without the mention-coverage wiring in
+    ``status()``, the reachability classifier reported it as ``dispatchable``
+    on every heartbeat check forever while dispatch silently dropped it --
+    the exact contradiction (#1059) this test locks down.
+    """
+    from _fakes_github import FakeGitHub
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import OrchestratorApp
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Issue #1059: automated-ready, OPEN, no blockers -- would be
+    # dispatchable if not for the merged-PR mention exclusion.
+    fake_gh.issues = [
+        {
+            "number": 1059,
+            "title": "Mentioned by a merged PR",
+            "url": "https://example.test/issues/1059",
+            "body": "",
+            "labels": [{"name": config.labels.ready}],
+            "state": "OPEN",
+        }
+    ]
+    # PR #2043: MERGED, same-repo, mentions issue #1059 in free text but
+    # does NOT bind (branch name doesn't match agent/issue- prefix, no
+    # closing keyword in title/body).
+    fake_gh.prs = [
+        {
+            "number": 2043,
+            "title": "Refactor search index",
+            "url": "https://example.test/pull/2043",
+            "headRefName": "feature/search-refactor",
+            "baseRefName": "main",
+            "headRefOid": "sha-2043",
+            "body": "See issue #1059 for the original bug report.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.status()
+
+    assert result.ok is True
+    reachability = result.data["backlog_reachability"]
+    # The issue bins as mention_covered, NOT dispatchable.
+    assert reachability["mention_covered_awaiting_operator"] == 1
+    assert reachability["dispatchable"] == 0
+    # The reason names the mentioning PR(s).
+    assert reachability["mention_covered_prs"] == {1059: [2043]}
+
+
+# ---------------------------------------------------------------------------
+# 13. Issue #1337: resolve_dispatch_mention_coverage fetch/reuse branches.
+#     Three branches mirror the original inline wiring in _dispatch_impl:
+#       1. Reuse of an already-fetched (called=True, no error) outcome.
+#       2. Fresh-fetch path when the outcome was not called (called=False).
+#       3. Fail-open GitHubError path (fresh fetch raises).
+#     Each test asserts both the returned mention_covered map and the
+#     fetched_merged_prs sentinel (None = no fresh fetch / caller must not
+#     rebind; non-None = caller rebinds merged_prs to a called=True outcome).
+# ---------------------------------------------------------------------------
+
+
+class _StubApp:
+    """Minimal stub for the app methods compute_mention_coverage_map calls:
+    ``_merged_pr_referenced_issue_numbers`` and
+    ``_mention_rearmed_issue_numbers``, plus ``paths.state_file``. Avoids
+    constructing a full OrchestratorApp so the fetch/reuse branches are
+    tested in isolation, not through the entire dispatch path."""
+
+    def __init__(self, state_file: Path, mention_only: set[int]) -> None:
+        self.paths = type("Paths", (), {"state_file": state_file})()
+        self._mention_only = mention_only
+
+    def _merged_pr_referenced_issue_numbers(
+        self, issues: list[dict[str, Any]], merged_prs: list[dict[str, Any]]
+    ) -> tuple[set[int], set[int], set[int], dict[int, list[int]]]:
+        # Return the stubbed mention_only set with PR numbers derived from
+        # the merged_prs list. bound is empty so mention_only is not
+        # reduced.
+        mention_pr_numbers_by_issue: dict[int, list[int]] = {}
+        for pr in merged_prs:
+            if str(pr.get("state") or "").upper() != "MERGED":
+                continue
+            pr_number = int(pr["number"])
+            for issue_number in self._mention_only:
+                mention_pr_numbers_by_issue.setdefault(issue_number, []).append(pr_number)
+        mention_pr_numbers_by_issue = {
+            k: sorted(v) for k, v in sorted(mention_pr_numbers_by_issue.items())
+        }
+        return set(), set(self._mention_only), set(), mention_pr_numbers_by_issue
+
+    def _mention_rearmed_issue_numbers(
+        self,
+        mention_only: set[int],
+        issues: list[dict[str, Any]],
+        state: dict[str, Any],
+        already_flagged: set[int],
+    ) -> tuple[set[int], list[int]]:
+        # No re-arming in these tests -- all mention-only issues stay
+        # excluded, matching the common case (issue never flagged).
+        return set(), []
+
+
+def _merged_pr(number: int) -> dict[str, Any]:
+    return {
+        "number": number,
+        "state": "MERGED",
+        "isCrossRepository": False,
+        "headRefName": f"feature/pr-{number}",
+        "title": f"PR {number}",
+        "body": "",
+    }
+
+
+class _FakeGhWithMergedPrs:
+    """Minimal gh stub for resolve_dispatch_mention_coverage: only
+    merged_pr_list() is called (on the fresh-fetch branch)."""
+
+    def __init__(self, merged_prs: list[dict[str, Any]]) -> None:
+        self._merged_prs = merged_prs
+
+    def merged_pr_list(self) -> list[dict[str, Any]]:
+        return list(self._merged_prs)
+
+
+class _FakeGhRaisingOnMergedPrList:
+    """gh stub that raises GitHubError from merged_pr_list() -- the
+    fail-open branch."""
+
+    def merged_pr_list(self) -> list[dict[str, Any]]:
+        from charlie_work.github import GitHubError
+
+        raise GitHubError("simulated transient error")
+
+
+def test_resolve_dispatch_mention_coverage_reuses_already_fetched_outcome(
+    tmp_path: Path,
+) -> None:
+    """Branch 1: ``merged_prs_outcome`` was already fetched (called=True,
+    no error) by ``_finalize_externally_merged_issues``. The function must
+    reuse its items and NOT trigger a fresh fetch (fetched_merged_prs is
+    None)."""
+    issues = [{"number": 1059, "labels": [{"name": "automated-ready"}], "body": ""}]
+    merged_prs = [_merged_pr(2043)]
+    app = _StubApp(tmp_path / "state.json", mention_only={1059})
+    outcome = _MergedPRListOutcome(merged_prs, called=True)
+
+    mention_covered, fetched = resolve_dispatch_mention_coverage(
+        issues, outcome, _FakeGhWithMergedPrs([]), app
+    )
+
+    # Reused the outcome's items -- coverage map is populated.
+    assert mention_covered == {1059: [2043]}
+    # No fresh fetch -- caller must not rebind merged_prs.
+    assert fetched is None
+
+
+def test_resolve_dispatch_mention_coverage_fresh_fetch_when_not_called(
+    tmp_path: Path,
+) -> None:
+    """Branch 2: ``merged_prs_outcome`` was NOT fetched (called=False -- the
+    common case when there are no closed-ready issues). The function must
+    fetch merged_pr_list() itself and return the fetched list so the caller
+    rebinds ``merged_prs`` to a called=True outcome (no second API call
+    later)."""
+    issues = [{"number": 1059, "labels": [{"name": "automated-ready"}], "body": ""}]
+    merged_prs = [_merged_pr(2043)]
+    app = _StubApp(tmp_path / "state.json", mention_only={1059})
+    # called=False -- _finalize_externally_merged_issues did not fetch.
+    outcome = _MergedPRListOutcome(called=False)
+    gh = _FakeGhWithMergedPrs(merged_prs)
+
+    mention_covered, fetched = resolve_dispatch_mention_coverage(issues, outcome, gh, app)
+
+    # Fresh fetch populated the coverage map.
+    assert mention_covered == {1059: [2043]}
+    # The fetched list is returned so the caller can rebind merged_prs.
+    assert fetched == merged_prs
+
+
+def test_resolve_dispatch_mention_coverage_fail_open_on_github_error(
+    tmp_path: Path,
+) -> None:
+    """Branch 3: the fresh fetch raises ``GitHubError``. The function must
+    fail open -- return an empty coverage map (issues classify as
+    ``dispatchable``) and None for the fetched list. The classifier is
+    advisory and must not raise; the later ``_resolve_merged_prs`` re-fetches
+    and RAISES so dispatch defers rather than re-dispatching covered issues."""
+    issues = [{"number": 1059, "labels": [{"name": "automated-ready"}], "body": ""}]
+    app = _StubApp(tmp_path / "state.json", mention_only={1059})
+    outcome = _MergedPRListOutcome(called=False)
+
+    mention_covered, fetched = resolve_dispatch_mention_coverage(
+        issues, outcome, _FakeGhRaisingOnMergedPrList(), app
+    )
+
+    # Fail-open: empty coverage, issues classify as dispatchable.
+    assert mention_covered == {}
+    # No fetched list -- caller must not rebind.
+    assert fetched is None
+
+
+def test_resolve_dispatch_mention_coverage_empty_issues_skips_fetch(
+    tmp_path: Path,
+) -> None:
+    """Edge case: when ``issues`` is empty, the function must skip the fetch
+    entirely (matching ``_resolve_merged_prs``'s issue #361 guard) and return
+    an empty map with no fetched list."""
+    app = _StubApp(tmp_path / "state.json", mention_only=set())
+    outcome = _MergedPRListOutcome(called=False)
+
+    mention_covered, fetched = resolve_dispatch_mention_coverage(
+        [], outcome, _FakeGhWithMergedPrs([_merged_pr(2043)]), app
+    )
+
+    assert mention_covered == {}
+    assert fetched is None
