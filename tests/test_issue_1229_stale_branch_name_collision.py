@@ -664,3 +664,169 @@ def test_review_queue_stale_branch_does_not_bind_unrelated_pr_to_closed_issue(
         f"stale-branch PR #1660 entered the review queue despite the rejected "
         f"binding: queue={queued_prs}"
     )
+
+
+def test_detect_drift_launch_stalled_stale_branch_does_not_mask_relabel(
+    tmp_path: Path,
+) -> None:
+    """Issue #1229: a stale branch name must not populate
+    ``open_prs_by_issue`` for a nonexistent issue and emit a spurious
+    ``pr_linked_issue_not_in_repo`` drift, nor prevent the
+    ``session_failed_relabeled`` drift for the worker's own OPEN issue.
+
+    Mirrors ``test_classify_dead_session_stale_branch_does_not_mask_escalation``
+    but exercises ``reconcile.detect_drift``'s alive/hung launch_stalled
+    relabel path (the ``if w.issue_number not in open_prs_by_issue`` guard
+    at the ``session_failed_relabeled`` drift site).
+
+    Scenario: a launch_stalled worker is keyed under issue #709 (OPEN, with
+    an active ``in_progress`` label). An unrelated issue-less PR #1660
+    carries a stale branch ``agent/issue-999-…`` where #999 does not exist in
+    this repo. Without the validator, ``linked_issue_number`` returns 999,
+    the PR is added to ``open_prs_by_issue[999]`` and
+    ``prs_linking_issue[999]``, and — because ``issues_by_number.get(999)``
+    is None — the PR loop emits a ``pr_linked_issue_not_in_repo`` drift for
+    the nonexistent #999. With the validator, 999 is not in the open-issue
+    set, the binding is rejected, and no spurious drift fires. The worker's
+    own relabel (``session_failed_relabeled`` for #709) fires in both cases
+    because the stale PR binds to 999, not 709 — confirming the stale PR
+    does not mask the relabel.
+
+    Mutation check: removing ``branch_issue_validator=branch_validator`` from
+    either ``linked_issue_number`` call in ``detect_drift`` causes the
+    ``pr_linked_issue_not_in_repo`` assertion to fail (the drift fires for
+    the nonexistent #999).
+    """
+    import json
+    import os
+    from datetime import UTC, datetime, timedelta
+    from unittest.mock import patch
+
+    from _reconcile_fixtures import FakeGitHub as ReconcileFakeGitHub
+    from _reconcile_fixtures import _issue, _pr
+    from _sessions_db_fixtures import make_sessions_db
+    from charlie_work.config import PostMortemConfig
+    from charlie_work.devin_shell import SessionRecord
+    from charlie_work.paths import resolved_layout
+    from charlie_work.reconcile import detect_drift
+    from charlie_work.state import empty_state
+
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "sessions.db"))
+    )
+    # Issue #709 is OPEN with an active label so the launch_stalled relabel
+    # path can fire. The stale PR's branch references #999, which is NOT in
+    # the issues list — the validator must reject 999.
+    gh = ReconcileFakeGitHub(
+        prs=[
+            _pr(
+                1660,
+                state="OPEN",
+                head_ref="agent/issue-999-stale-branch-from-merged-pr",
+                body="Docs maintenance. No issue — issue-less orchestrator rework.",
+            )
+        ],
+        issues=[_issue(709, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    worktree_path = "/tmp/worktree-709"
+    now = datetime.now(UTC)
+
+    db_path = tmp_path / "sessions.db"
+    make_sessions_db(
+        db_path,
+        session_id="sess-709",
+        working_directory=worktree_path,
+        created_at=now.isoformat(),
+        rows=[
+            {
+                "role": "assistant",
+                "content": "still working",
+                # Stale past the launch-stall grace period: conclusive evidence
+                # of a real stall, not the no-match-yet shape.
+                "created_at": (now - timedelta(minutes=20)).isoformat(),
+            }
+        ],
+    )
+
+    # detect_drift resolves the sessions dir through paths.resolved_layout
+    sessions_dir = resolved_layout(config, tmp_path).sessions_dir
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a log with only the shim marker — frozen well past grace period
+    log_path = sessions_dir / "issue-709.log"
+    log_path.write_text("[shim] .devin infra materialized\n", encoding="utf-8")
+    old_time = now - timedelta(minutes=20)
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    # Use a fake PID that passes is_alive() without actually checking the OS.
+    fake_pid = 99999
+    fake_start_time = 1700000000.0
+
+    from charlie_work.devin_shell import _sidecar_path as devin_sidecar_path
+
+    sidecar_path = devin_sidecar_path(sessions_dir, 709)
+    record = SessionRecord(
+        issue_number=709,
+        branch="agent/issue-709-real-work",
+        worktree_path=worktree_path,
+        prompt_path="/tmp/prompt-709.md",
+        command=("devin", "prompt.md"),
+        pid=fake_pid,
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+        process_start_time=fake_start_time,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+    # Ensure no claude-code sidecar interferes
+    (sessions_dir / "issue-709.claude.json").unlink(missing_ok=True)
+
+    kill_calls: list[tuple[int, float | None]] = []
+
+    def fake_kill(pid: int, expected_start_time: float | None = None) -> list[int]:
+        kill_calls.append((pid, expected_start_time))
+        return [pid]
+
+    with (
+        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.reconcile.kill_process_tree", fake_kill),
+    ):
+        drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    # The launch_stalled session was killed regardless of the open_prs guard
+    # (kill happens before the guard).
+    assert len(kill_calls) == 1, (
+        f"Expected kill_process_tree to be called exactly once, got {kill_calls}"
+    )
+
+    # The stale PR #1660 must NOT bind to nonexistent issue #999.
+    # Without the validator this drift fires; with it, the binding is rejected.
+    not_in_repo = [
+        d for d in drift if d.kind == "pr_linked_issue_not_in_repo" and d.pr_number == 1660
+    ]
+    assert not not_in_repo, (
+        f"stale-branch PR #1660 bound to nonexistent issue #999 in detect_drift: "
+        f"{[d.detail for d in not_in_repo]}"
+    )
+
+    # The worker's own relabel fires: #709 is OPEN with an active label and
+    # no open PR (the stale PR binds to 999, not 709). This confirms the
+    # stale PR does not mask the relabel.
+    relabeled = [
+        d
+        for d in drift
+        if d.kind == "session_failed_relabeled"
+        and d.issue_number == 709
+        and d.reason == "launch_stalled_no_open_pr"
+    ]
+    assert relabeled, (
+        f"expected session_failed_relabeled drift for issue #709 with "
+        f"reason=launch_stalled_no_open_pr; drift kinds were: "
+        f"{[(d.kind, d.issue_number, getattr(d, 'reason', None)) for d in drift]}"
+    )
+    assert relabeled[0].pr_number is None, (
+        f"session_failed_relabeled for #709 should have pr_number=None "
+        f"(no open PR for #709), got {relabeled[0].pr_number}"
+    )

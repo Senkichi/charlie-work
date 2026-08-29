@@ -6,7 +6,7 @@ import random
 import re
 import subprocess
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -2238,6 +2238,75 @@ def defang_closing_keywords(text: str) -> str:
     syntax entirely, not to judge intent.
     """
     return _CLOSING_KEYWORD_DEFANG_RE.sub(r"\g<1>\g<2>issue \g<3>", text)
+
+
+def build_branch_issue_validator(
+    gh: GitHubLike,
+) -> Callable[[int], bool] | None:
+    """Build a validator for branch-name-derived issue numbers (issue #1229).
+
+    This is the single-point-of-enforcement constructor for the
+    ``branch_issue_validator`` callable consumed by ``linked_issue_number``.
+    Every call site that resolves a branch-name issue number against the real
+    open-issue set -- the module-level sweeps
+    (``_detect_and_handle_orphaned_workers``,
+    ``_classify_dead_sessions_and_update_throttle_state``), the rework-routing
+    ``OrchestratorApp`` methods, and the dispatch-claim ``pr_by_issue``
+    construction -- routes through here so the open-issue fetch, failure
+    handling, and ``_LIST_LIMIT`` tradeoff cannot diverge between call
+    surfaces.
+
+    Returns a callable that returns True iff the given number corresponds to
+    a real *open* issue in this repo, or None when the open-issue list cannot
+    be fetched (API outage). Callers that receive None should pass None to
+    ``linked_issue_number``'s ``branch_issue_validator`` -- the function then
+    trusts the branch-name binding unconditionally, preserving the pre-#1229
+    behavior rather than blocking the sweep during a transient GitHub
+    failure.
+
+    ``issue_list(state="open")`` is cached within a pass on the real
+    ``GitHub`` client, so repeated calls to this helper in the same pass
+    share a single GitHub API call. The list is capped at ``_LIST_LIMIT``
+    (500); a repo with more open issues than the cap could see a false
+    negative (a genuinely open issue treated as absent), which is the safe
+    direction -- refusing a branch-name binding never corrupts state, it
+    only defers an issue-adjacent operation until the issue is confirmed by
+    a closing keyword.
+    """
+    try:
+        open_issues = gh.issue_list(state="open")
+    except Exception:
+        # GitHubError (API outage), AttributeError (test fakes without
+        # issue_list), or any other transient failure -- the safe direction
+        # is to skip validation (return None) so callers preserve the
+        # pre-#1229 branch-name trust behavior rather than crashing or
+        # blocking the sweep.
+        return None
+    return build_branch_issue_validator_from_issues(open_issues)
+
+
+def build_branch_issue_validator_from_issues(
+    open_issues: Iterable[dict[str, Any]],
+) -> Callable[[int], bool]:
+    """Build a branch-issue validator from a pre-fetched OPEN issue snapshot.
+
+    This is the single construction path for the open-number set that
+    ``build_branch_issue_validator`` (which fetches via
+    ``issue_list(state="open")``) and any caller that already holds an
+    open-issue snapshot share, so the ``int(number)`` extraction and the
+    ``frozenset`` shape cannot diverge between call surfaces.
+
+    Use this instead of ``build_branch_issue_validator`` when the caller has
+    already fetched the issue list in the same pass (e.g. ``reconcile.detect_drift``
+    fetches ``issues?state=all`` as one of its two ``gh.run`` list queries and
+    must not issue a third). Unlike ``build_branch_issue_validator``, this
+    never returns None: the snapshot is already in hand, so there is no
+    fetch-outage fail-open path -- validation always runs. ``open_issues``
+    must already be filtered to OPEN state by the caller (this helper only
+    extracts numbers, it does not re-filter by state).
+    """
+    open_numbers = frozenset(int(i["number"]) for i in open_issues if i.get("number") is not None)
+    return lambda n: n in open_numbers
 
 
 def linked_issue_number(

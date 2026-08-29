@@ -875,6 +875,19 @@ def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult
         )
     commit_messages = [str((c.get("commit") or {}).get("message") or "") for c in commits]
 
+    # Issue #1229 scoping decision: this call site is deliberately NOT
+    # threaded through branch_issue_validator. ``intended`` is the single
+    # issue number ``find_unexpected_closing_references`` exempts from its
+    # unexpected-closing-reference scan; it is a diagnostic/reporting value
+    # (surfaced as ``intended_issue_number`` in the command's JSON output),
+    # not a key for any issue-label transition or state write. A stale
+    # branch-name binding would set ``intended`` to the wrong number, causing
+    # the real intended issue's closing keyword to be flagged as an
+    # unexpected reference -- a conservative false-positive failure direction
+    # (the check blocks rather than corrupts), and one an operator can
+    # resolve by rewording the PR body. Threading the validator would also
+    # add an ``issue_list(state="open")`` call to a one-shot CLI command that
+    # otherwise makes only the two ``pr_view``/``pr_commits`` calls above.
     intended = linked_issue_number(
         pr,
         is_cross_repository=pr.get("isCrossRepository"),
