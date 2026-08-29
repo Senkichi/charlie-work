@@ -20,7 +20,7 @@ Invoke it against a consumer repo by running charlie-work's own uv project with
 the consumer as the `--repo` target:
 
 ```powershell
-uv run --project ..\charlie-work --directory ..\job-cannon charlie --repo ..\job-cannon --help
+uv run --project ..\charlie-work --directory ..\your-repo charlie --repo ..\your-repo --help
 ```
 
 - `--project` selects charlie-work's environment

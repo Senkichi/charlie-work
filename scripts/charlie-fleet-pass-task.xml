@@ -4,9 +4,11 @@
     <Description>charlie-work fleet supervisor: long-running `charlie fleet supervise` daemon. The 5-minute trigger acts as a watchdog — MultipleInstancesPolicy=IgnoreNew prevents double-launch while the daemon is alive; if it crashes, the next tick restarts it. Aviator handles merges via the mergequeue label.</Description>
     <URI>\charlie-fleet-pass</URI>
   </RegistrationInfo>
+  <!-- Template: UserId (below) and the script path in Actions/Exec/Arguments must be
+       filled in per-machine before registering this task. See scripts/README.md. -->
   <Principals>
     <Principal id="Author">
-      <UserId>S-1-5-21-1471300100-2012532696-3981612733-1001</UserId>
+      <UserId>S-1-5-21-REPLACE-WITH-YOUR-USER-SID</UserId>
       <LogonType>InteractiveToken</LogonType>
     </Principal>
   </Principals>
@@ -37,7 +39,7 @@
   <Actions Context="Author">
     <Exec>
       <Command>C:\Windows\System32\wscript.exe</Command>
-      <Arguments>//B //NoLogo "C:\Users\senki\repos\charlie-work\scripts\fleet-pass-hidden.vbs"</Arguments>
+      <Arguments>//B //NoLogo "C:\Users\YOUR_USERNAME\repos\charlie-work\scripts\fleet-pass-hidden.vbs"</Arguments>
     </Exec>
   </Actions>
 </Task>

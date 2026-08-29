@@ -6,7 +6,7 @@ stall) with plain data collection + threshold comparison. An LLM only ever
 sees this script's stdout.
 
 Run via:
-    cd /c/Users/senki/repos/charlie-work
+    cd /path/to/charlie-work
     env -u VIRTUAL_ENV uv run --active --no-sync python scripts/heartbeat_check.py
 
 Output contract (stdout): one line per check, either
@@ -98,7 +98,7 @@ LOG_FRESHNESS_STALE_MINUTES = 30
 # `loop_started` is logged per repo (workflow.py's `_loop_impl`, into that
 # repo's own events.db), and the supervisor processes repos sequentially in
 # one pass, so a single repo's gap is gated by how long its SIBLING repos
-# take, not by supervisor health -- job-cannon's reconcile alone walks
+# take, not by supervisor health -- a sibling registered repo's reconcile alone walks
 # ~690 issues / ~877 PRs and can push charlie-work's gap past 50 minutes on
 # a perfectly healthy fleet.
 #
@@ -242,7 +242,7 @@ class SuppressionEntry:
 
     `check` is the *base* check name as emitted, with no repo suffix (e.g.
     ``"stale-open-issue-mentions"``, never ``"stale-open-issue-mentions
-    Senkichi/charlie-work"``). Per-repo checks build their emitted check
+    owner/charlie-work"``). Per-repo checks build their emitted check
     string as ``f"{base} {repo.slug}"`` (the convention already used by every
     per-repo check in this file); `Report._match` reconstructs that same
     convention to test a candidate entry against an emitted check string, so

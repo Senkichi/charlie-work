@@ -2,18 +2,19 @@
 
 charlie-work's whole purpose is that PRs reach `MERGED` without a human at
 the keyboard. Measuring that sounds trivial -- "who merged it?" -- but the
-obvious fields all lie: the orchestrator authenticates AS the human account
-`Senkichi` (a `gh` token, not a bot identity) so it can act on issues and
-PRs the same way a person would. PR author, committer, and `mergedBy` in the
-common case are therefore IDENTICAL whether a human clicked "Merge" or the
-orchestrator's dispatched worker did every bit of the work and the PR simply
-got merged by hand at the end. `mergedBy.login == "Senkichi"` is consistent
-with both stories and proves neither.
+obvious fields all lie: the orchestrator authenticates AS the operator's
+human GitHub account (a `gh` token, not a bot identity) so it can act on
+issues and PRs the same way a person would. PR author, committer, and
+`mergedBy` in the common case are therefore IDENTICAL whether a human
+clicked "Merge" or the orchestrator's dispatched worker did every bit of the
+work and the PR simply got merged by hand at the end. `mergedBy.login`
+matching the operator's account is consistent with both stories and proves
+neither.
 
 The one field that is not authenticated as the human account is `mergedBy`
 when the merge went through the Aviator merge queue: those merges are
-performed by the `app/aviator-app` GitHub App, a distinct actor from
-`Senkichi`. `mergedBy.login == "app/aviator-app"` is therefore the only
+performed by the `app/aviator-app` GitHub App, a distinct actor from the
+operator's account. `mergedBy.login == "app/aviator-app"` is therefore the only
 honest signal that a merge happened autonomously. See
 docs/plans/STATUS-AND-EXECUTION-PLAN-2026-08-06.md (AC-7) and
 docs/plans/merge-lane-recovery.md for the history of this discriminator, and
@@ -60,8 +61,8 @@ page of the window, not proof the window is fully covered.
 
 Usage::
 
-    python scripts/merge_autonomy_ratio.py
-    python scripts/merge_autonomy_ratio.py --repo Senkichi/job-cannon \\
+    python scripts/merge_autonomy_ratio.py --repo owner/repo
+    python scripts/merge_autonomy_ratio.py --repo owner/repo-a --repo owner/repo-b \\
         --since 2026-08-01T00:00:00Z --json
 """
 
@@ -78,7 +79,6 @@ from typing import Any
 #: The only honest autonomous-merge discriminator (see module docstring).
 AVIATOR_LOGIN = "app/aviator-app"
 
-DEFAULT_REPOS = ("Senkichi/charlie-work", "Senkichi/job-cannon")
 DEFAULT_LIMIT = 200
 DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_WINDOW_DAYS = 7
@@ -403,7 +403,8 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         dest="repos",
         metavar="OWNER/NAME",
-        help="repo to report on (repeatable; default: both charlie-work and job-cannon)",
+        required=True,
+        help="repo to report on, as owner/name (repeatable; at least one required)",
     )
     parser.add_argument(
         "--since",
@@ -423,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    repos = tuple(args.repos) if args.repos else DEFAULT_REPOS
+    repos = tuple(args.repos)
     since = (
         args.since
         if args.since is not None

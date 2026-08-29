@@ -696,9 +696,9 @@ def cross_repo_scope_gate(
     The gate checks the issue **title** for a ``<repo-name>:`` prefix that
     names a managed repo other than the dispatching one.  This is the
     clearest signal that the issue's scope is that repo — the #709 case
-    study had the title ``job-cannon: docs/devin-orchestration/ ... stale``
-    in the charlie-work tracker, but every deliverable was a job-cannon
-    file.
+    study had the title ``other-repo: docs/devin-orchestration/ ... stale``
+    in the charlie-work tracker, but every deliverable was in that other
+    repo.
 
     The managed-repo set **must** derive from the fleet registry (see
     :func:`charlie_work.fleet_registry.managed_repo_names`), never a
@@ -717,7 +717,7 @@ def cross_repo_scope_gate(
     - Only a title that starts with ``<repo-name>:`` for a managed repo
       *other than* the dispatching one is blocked.  The body is not
       scanned for repo-name mentions because a passing reference
-      (``coordinate with job-cannon on this``) is not evidence of a
+      (``coordinate with the other repo on this``) is not evidence of a
       cross-repo scope.
 
     Args:
@@ -746,7 +746,7 @@ def cross_repo_scope_gate(
     title_lower = issue_title.lower().lstrip()
     for repo_name in sorted(other_repos):
         # Match "repo-name:" at the start of the title (case-insensitive).
-        # This is the "job-cannon: docs/..." pattern from #709 — the
+        # This is the "other-repo: docs/..." pattern from #709 — the
         # clearest signal that the issue's scope is that repo, not this
         # one.  A colon immediately after the repo name is the convention
         # for scope-prefixed issue titles in this fleet.

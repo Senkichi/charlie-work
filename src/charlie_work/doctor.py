@@ -1002,7 +1002,7 @@ def _check_state_dir_split_brain(add: Any, repo_root: Path, paths: RuntimePaths)
     overrides ``state_dir``, those are two different directories: cleanup
     enumerates an empty tree while dispatch keeps writing to the default one,
     and nothing ever looks at the default tree again. That is exactly how
-    job-cannon accumulated 74 uncollected worktrees under a 0-byte
+    a sibling repo accumulated 74 uncollected worktrees under a 0-byte
     ``events.db`` — a state nobody noticed because nothing diagnosed it.
 
     This check does not fix the divergence (that is A2's job) — it turns the

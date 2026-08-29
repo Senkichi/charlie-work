@@ -303,7 +303,7 @@ def unsupplied_placeholders(
     return means the template is safe to render.
 
     This is the *subset* direction the issue specifies: an override legitimately
-    uses fewer placeholders than the writer supplies (job-cannon's ``worker.md``
+    uses fewer placeholders than the writer supplies (a sibling repo's ``worker.md``
     uses 6 of the writer's 8 keys), so the check fails only when the template
     reaches for a placeholder the writer never provides -- the exact shape of
     the #713 crash, where a flat ``rework.md`` override kept referencing

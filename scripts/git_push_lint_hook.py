@@ -2,8 +2,8 @@
 """PreToolUse hook: lint before ``git push`` leaves the machine (#1309).
 
 The W2 design's second surface -- deferred from the shipped Stop-gate PRs
-(cw #1305, jc Senkichi/job-cannon#1730) and confirmed unimplemented in both
-repos by the jc port's adversarial review. The Stop gate lints the
+(cw #1305, a sibling repo's #1730) and confirmed unimplemented in both
+repos by that repo's port's adversarial review. The Stop gate lints the
 committed-diff-vs-merge-base union at session end, so a push mid-session
 gets caught at the next Stop; the remaining gap is a session that pushes
 and then dies/aborts before any Stop fires (exactly the population the

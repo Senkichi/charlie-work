@@ -808,7 +808,7 @@ def test_body_has_crash_signature_real_captured_specimen_with_crlf() -> None:
         "---\r\n"
         "\r\n"
         'SessionEnd hook ["C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
-        '-NoProfile -File "C:\\Users\\senki\\repos\\llibrary\\hooks\\session-end.ps1"] '
+        '-NoProfile -File "C:\\Users\\operator\\hooks\\session-end.ps1"] '
         "failed: Hook cancelled\r\n"
         "\r\n"
         "---\r\n"

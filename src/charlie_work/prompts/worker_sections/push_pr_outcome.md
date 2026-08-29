@@ -20,7 +20,7 @@ If the push itself failed, do **not** write this file; report the push failure i
 If you deliberately conclude that you **cannot** do the task (the issue is structurally impossible for a contained worker — e.g. the fix belongs in a different repo, a required dependency is missing, or the issue scope is ambiguous beyond what you can resolve), write a file named `.worker-outcome.json` in the repository root with this exact shape:
 
 ```json
-{"outcome": "blocked", "reason_kind": "cross_repo_scope", "detail": "The fix targets job-cannon, not this repo. The component lives in src/job_cannon/foo.py."}
+{"outcome": "blocked", "reason_kind": "cross_repo_scope", "detail": "The fix targets a different managed repo, not this one. The component lives in src/other_repo/foo.py."}
 ```
 
 Then exit cleanly without pushing a branch or opening a PR. The orchestrator reads this file on the first orphan-sweep pass and routes the issue directly to the operator queue — no redispatch, no cap burn. Another worker will not be dispatched for the same structural wall.
