@@ -11,11 +11,11 @@ name: Reclaim superseded main CI runs
 # queueing is rare but not impossible) or PENDING (waiting for its own
 # concurrency group, which GitHub only auto-replaces for a run superseded by
 # a *second* still-pending run, never once it reaches "queued") is never
-# reclaimed by ci.yml on its own. It sits there competing with real PR
-# checks for the only two runners the repo has, testing a commit that is no
-# longer main's tip. See #810 for the live evidence (two main runs both
-# `queued` simultaneously, up to ~31 minutes of 2-runner capacity spent on a
-# superseded commit) and the full option analysis.
+# reclaimed by ci.yml on its own. It sits there testing a commit that is no
+# longer main's tip (and, in the self-hosted era, competing with real PR
+# checks for the repo's only two runners). See #810 for the live evidence
+# (two main runs both `queued` simultaneously, up to ~31 minutes of 2-runner
+# capacity spent on a superseded commit) and the full option analysis.
 #
 # This workflow is a separate file, with its own trigger and its own
 # concurrency group, specifically so it is never itself blocked by ci.yml's
