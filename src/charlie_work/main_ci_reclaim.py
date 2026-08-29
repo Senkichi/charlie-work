@@ -3,38 +3,43 @@
 ## Why this exists
 
 ``.github/workflows/reclaim-main-ci.yml`` cancels ``main`` CI runs that were
-superseded by a later push but never got past ``queued``/``pending`` -- runs
-that would otherwise sit occupying one of this repo's 2 registered
-self-hosted runners (#799) testing a commit that can no longer appear in any
-PR's check set. That workflow deadlocks under load (#863): it requires
-``runs-on: self-hosted`` -- the exact scarce resource it exists to free -- and
-combined with ``concurrency: cancel-in-progress: true`` on a shared group,
-every queued reaper instance is killed by the *next* push's reaper before it
-ever acquires a runner. #863's own evidence shows a manually-issued
-``POST actions/runs/{id}/cancel`` succeeding while the workflow-based reaper
-starved.
+superseded by a later push but never got past ``queued``/``pending``. In the
+self-hosted era (through 2026-08-28) such a run sat occupying one of the
+repo's 2 registered self-hosted runners (#799) testing a commit that could no
+longer appear in any PR's check set, and the workflow deadlocked under load
+(#863): it required ``runs-on: self-hosted`` -- the exact scarce resource it
+existed to free -- and combined with ``concurrency: cancel-in-progress:
+true`` on a shared group, every queued reaper instance was killed by the
+*next* push's reaper before it ever acquired a runner. #863's own evidence
+shows a manually-issued ``POST actions/runs/{id}/cancel`` succeeding while
+the workflow-based reaper starved. Since the hosted-CI return (2026-08-28,
+#1500) the workflow runs on ``ubuntu-latest`` and that starvation mechanism
+cannot recur -- it was a property of the shared 2-runner pool, and every
+hosted job gets its own VM -- but a superseded queued run is still noise and
+wasted compute, so both reclaim paths keep their jobs.
 
 This module ports the same cancellation logic into the Python orchestrator,
 which runs every fleet pass with local ``gh`` CLI access and needs no runner
-at all -- so it cannot lose the race for the capacity it is trying to
-reclaim. The workflow file is kept, not deleted (see its own header comment
-and the PR that introduced this module): pushes to ``main`` also arrive from
-Aviator's MergeQueue and direct human/operator merges, entirely independent
-of whether the local supervisor is running, so the workflow remains the
-fallback for the window when this pass cannot run at all. Its
-``cancel-in-progress`` was flipped from ``true`` to ``false`` in the same
-change, so an accumulating queue of reapers (bounded by push volume during
-supervisor downtime, not by steady-state merge traffic) no longer
-self-cannibalizes.
+at all -- so it could never lose the race for the capacity it was trying to
+reclaim, and it remains the primary reclaim path today. The workflow file is
+kept, not deleted (see its own header comment and the PR that introduced
+this module): pushes to ``main`` also arrive from Aviator's MergeQueue and
+direct human/operator merges, entirely independent of whether the local
+supervisor is running, so the workflow remains the fallback for the window
+when this pass cannot run at all. Its ``cancel-in-progress`` was flipped
+from ``true`` to ``false`` in the same change, so an accumulating queue of
+reapers (bounded by push volume during supervisor downtime, not by
+steady-state merge traffic) no longer self-cannibalizes.
 
-This also closes #815 (the reaper gets only one scheduling chance per main
-push and can permanently lose the race to the stale run starting first): a
-scheduled retry of the *workflow* would still compete for the starved
-runners and gain nothing. Running this function on every fleet pass gives
-repeated, runner-free attempts at the same still-superseded, still-not-started
-run across passes -- exactly the repeated-chances property #815 asked for,
-without the capacity problem that made its own proposed fix (adding a
-``schedule:`` trigger to the workflow) ineffective.
+This also closes #815 (the reaper got only one scheduling chance per main
+push and could permanently lose the race to the stale run starting first): a
+scheduled retry of the *workflow* would, in the self-hosted era, still have
+competed for the starved runners and gained nothing. Running this function
+on every fleet pass gives repeated, runner-free attempts at the same
+still-superseded, still-not-started run across passes -- exactly the
+repeated-chances property #815 asked for, without the capacity problem that
+made its own proposed fix (adding a ``schedule:`` trigger to the workflow)
+ineffective at the time.
 
 ## Safety invariant
 

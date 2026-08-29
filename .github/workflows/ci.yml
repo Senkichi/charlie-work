@@ -27,15 +27,17 @@ concurrency:
 # and fails only in CI, or -- worse -- passes in CI while silently mangling,
 # because a mojibaked string is still a string and most assertions never look.
 #
-# Set BOTH, and keep the ':surrogateescape' suffix. This mirrors
-# scripts/fleet-pass.ps1 (lines 62-63), which sets exactly these two variables
-# for the live supervisor for the same reason.
+# Set BOTH, and keep the ':surrogateescape' suffix. This mirrors the
+# $env:PYTHONUTF8 / $env:PYTHONIOENCODING assignments in
+# scripts/fleet-pass.ps1, which set exactly these two variables for the live
+# supervisor for the same reason.
 #   - PYTHONUTF8=1 also fixes the open() default, which PYTHONIOENCODING does
 #     not touch -- the two are not redundant.
 #   - A BARE 'utf-8' is actively harmful: it overrides the surrogateescape
 #     handlers that UTF-8 mode installs and resets stdin/stdout to 'strict',
 #     turning graceful degradation into a hard crash on any not-quite-clean
-#     byte off a pipe. Do not shorten. See fleet-pass.ps1:53-60 for the full
+#     byte off a pipe. Do not shorten. See the "Set BOTH, and keep the
+#     ':surrogateescape' suffix" block in scripts/fleet-pass.ps1 for the full
 #     warning.
 env:
   PYTHONUTF8: "1"
@@ -131,15 +133,19 @@ jobs:
         # box-sharing discipline -- CI shared 8 physical cores with a second
         # runner and the orchestrator's own dispatch tree (issue 646: ~36
         # uncapped workers took a 6.4-min suite to ~145 min). A hosted VM is
-        # dedicated, so auto -- the VM's CPU count, 4 on standard
-        # windows-latest -- is the right default. (pytest-xdist honors
-        # PYTEST_XDIST_AUTO_NUM_WORKERS when set; nothing in this workflow
-        # sets it. env_sanitize.py's =2 governs only the orchestrator's own
-        # dispatched sessions, not CI.)
+        # dedicated, so auto is the right default. Note auto resolves to the
+        # VM's PHYSICAL core count, not vCPUs (xdist's psutil branch passes
+        # logical=False; `-n logical` is the spelling for the logical count);
+        # the resolved number on these images is unmeasured, because addopts'
+        # -q suppresses xdist's worker-count header -- add -v to a run to
+        # observe it. (pytest-xdist honors PYTEST_XDIST_AUTO_NUM_WORKERS when
+        # set; nothing in this workflow sets it. env_sanitize.py's =2 governs
+        # only the orchestrator's own dispatched sessions, not CI.)
         # --dist=load (xdist's default, spelled out for clarity) rather than
-        # loadfile: tests/test_worktree.py alone is ~150 of ~3100 tests and
-        # the heaviest file by wall time (real git.exe subprocesses), so
-        # pinning it to a single worker would floor the achievable speedup.
+        # loadfile: tests/test_worktree.py alone is ~240 of the suite's
+        # ~6,000 tests and the heaviest file by wall time (real git.exe
+        # subprocesses), so pinning it to a single worker would floor the
+        # achievable speedup.
         # -q deliberately absent (pyproject.toml addopts already sets it):
         # stacking a second -q silently drops pytest's final "N passed"
         # summary line -- exit code unaffected, but CI logs become

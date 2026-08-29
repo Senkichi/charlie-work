@@ -265,9 +265,14 @@ holds, so a reader can tell "still starved" from "signal stopped working". A
 repo that recovers is dropped from the tracking sidecar so the next episode
 starts a fresh window.
 
-**This repo's own CI check names** (for `auto_merge.required_checks`): `Tests (ubuntu-latest)`,
-`Tests (windows-latest)`, and `Lint`. These correspond to the job `name:` fields in
-`.github/workflows/ci.yml` and are verified by `charlie doctor`.
+**This repo's own CI check names** (for `auto_merge.required_checks`): `Tests` and
+`Lint` — single hosted jobs since the 2026-08-28 hosted-CI return (#1500), no OS
+matrix. These must match the job `name:` fields in `.github/workflows/ci.yml`
+exactly: the merge gate (`checks.py`) compares live check names verbatim, so a
+stale matrix-suffixed entry like `Tests (windows-latest)` would count as
+`missing` forever. Do not rely on `charlie doctor` to catch that case — its
+matrix-suffix tolerance deliberately accepts `Name (suffix)` against a job
+named `Name`, so it fails open when a matrix has been collapsed.
 
 **Worker adapters** (`devin.adapter`): `manual` writes a session manifest for
 the operator to paste; `command` runs a blocking per-issue launcher;
