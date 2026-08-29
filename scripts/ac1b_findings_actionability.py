@@ -34,7 +34,7 @@ worktree-discipline memory on inherited VIRTUAL_ENV silently testing the
 wrong checkout):
 
     VIRTUAL_ENV= PYTHONPATH="$PWD/src" uv run --no-sync python \
-        scripts/ac1b_findings_actionability.py --repo C:/Users/senki/repos/charlie-work
+        scripts/ac1b_findings_actionability.py --repo /path/to/charlie-work
 
 ``--repo`` points at wherever ``.var/charlie-work/prs`` (the runtime corpus)
 lives -- this is normally the long-running main checkout, not whatever

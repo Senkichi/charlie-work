@@ -28,6 +28,18 @@ from ci_fleet.config import (  # noqa: F401  (deliberate re-export)
     RunnerScalingConfig,
 )
 
+# Re-exported from the domain module (issue #763) for the same reason
+# ``RunnerAllocationConfig`` is re-exported from ``ci_fleet.config`` above:
+# the dataclass lives in its own module so new code does not land in this
+# over-cap monolith (file-size ratchet, issue #1442), and ``config.py`` wires
+# it into ``OrchestratorConfig`` and delegates parsing to the module that owns
+# the validation. ``tests/test_ci_fleet_seams.py`` guards the ci_fleet seam;
+# the capacity-starvation seam is guarded by ``test_capacity_starvation_escalation.py``.
+from .capacity_starvation_escalation import (  # noqa: F401  (deliberate re-export)
+    RunnerCapacityEscalationConfig,
+    parse_runner_capacity_escalation,
+)
+
 from . import layout
 from .issue_comments import DEFAULT_INCLUDED_ASSOCIATIONS as DEFAULT_COMMENT_ASSOCIATIONS
 
@@ -828,7 +840,7 @@ class AutoMergeConfig:
     # preserves current behavior. Takes precedence over the legacy `admin` field.
     merge_flags: tuple[str, ...] = ()
     # Post-merge branch deletion is best-effort and can never abort the
-    # merge/label sequence (the empericus local-worktree failure mode).
+    # merge/label sequence (the local-worktree failure mode seen on one operator host).
     delete_branch: bool = True
     require_approved_review: bool = True
     required_checks: tuple[str, ...] = ()
@@ -1032,7 +1044,7 @@ class RuntimeConfig:
         # failure's marker match and every downstream reap path: reviewer
         # workers that died on this message got no throttled_until cooldown
         # and were relaunched straight into the same limit every stale-claim
-        # interval (job-cannon PRs #1342/#1343/#1344/#1346 stuck 5.5-20+
+        # interval (a sibling repo's PRs #1342/#1343/#1344/#1346 stuck 5.5-20+
         # hours in a redispatch loop before this was added).
         "hit your session limit",
     )
@@ -1098,7 +1110,7 @@ class RuntimeConfig:
     # against GitHub in a single pass. The bound is mandatory, not defensive.
     # Every subject whose ``label_error`` key is absent costs one live
     # ``issue_view`` call, and measured at the time of the fix *every* escalated
-    # subject was in that arm -- 8 in charlie-work and 49 in job-cannon. Sweeping
+    # subject was in that arm -- 8 in charlie-work and 49 in the sibling repo. Sweeping
     # all 57 in one pass would add ~57 sequential ``gh`` subprocess calls to a
     # loop pass that is shared sequentially between both repos, which is the
     # starvation mechanism of #1078. Bounding converges over a handful of passes
@@ -1896,6 +1908,9 @@ class OrchestratorConfig:
     main_ci_reclaim: MainCiReclaimConfig = field(default_factory=MainCiReclaimConfig)
     runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
     runner_allocation: RunnerAllocationConfig = field(default_factory=RunnerAllocationConfig)
+    runner_capacity_escalation: RunnerCapacityEscalationConfig = field(
+        default_factory=RunnerCapacityEscalationConfig
+    )
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
 
@@ -3442,6 +3457,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "provisions; raise runner_scaling.min_runners to at least the "
             "allocation floor."
         )
+    runner_capacity_escalation = parse_runner_capacity_escalation(data)
     supervisor_data = _section(data, "supervisor")
     for int_key in (
         "poll_interval_seconds",
@@ -3556,6 +3572,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         main_ci_reclaim=main_ci_reclaim,
         runner_scaling=runner_scaling,
         runner_allocation=runner_allocation,
+        runner_capacity_escalation=runner_capacity_escalation,
         supervisor=supervisor,
         post_mortem=post_mortem,
         # ``sources`` is left at its dataclass default here -- this function

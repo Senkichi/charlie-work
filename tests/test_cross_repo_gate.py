@@ -47,7 +47,7 @@ def test_all_referenced_paths_missing_blocks(tmp_path: Path) -> None:
     """
     body = (
         "`suite_coverage.py` is at "
-        "`C:/Users/senki/repos/ci_runners/src/ci_fleet/suite_coverage.py`; "
+        "`C:/Users/operator/repos/ci_runners/src/ci_fleet/suite_coverage.py`; "
         "there is no `src/charlie_work/suite_coverage.py`."
     )
     result = cross_repo_gate(body, tmp_path)
@@ -84,7 +84,7 @@ def test_absolute_path_inside_repo_passes(tmp_path: Path) -> None:
 
 def test_absolute_path_outside_repo_blocks(tmp_path: Path) -> None:
     """An absolute path to a different repo blocks the gate."""
-    body = "The file is at `C:/Users/senki/repos/ci_runners/src/ci_fleet/suite_coverage.py`."
+    body = "The file is at `C:/Users/operator/repos/ci_runners/src/ci_fleet/suite_coverage.py`."
     result = cross_repo_gate(body, tmp_path)
     assert not result.passed
 
@@ -98,7 +98,7 @@ def test_posix_style_absolute_path_outside_repo_blocks(tmp_path: Path) -> None:
     it fall through to the single-ambiguous-candidate abstain path instead
     of escalating. This is a regression test for that specific misfire.
     """
-    body = "The bug is in /home/senki/other-repo/foo.py."
+    body = "The bug is in /home/operator/other-repo/foo.py."
     result = cross_repo_gate(body, tmp_path)
     assert not result.passed
 
@@ -129,7 +129,7 @@ def test_backtick_quoted_relative_path_extracted() -> None:
 def test_backtick_quoted_absolute_path_extracted() -> None:
     """Backtick-quoted absolute paths are extracted."""
     paths = extract_referenced_paths(
-        "The file is at `C:/Users/senki/repos/ci_runners/src/ci_fleet/suite_coverage.py`."
+        "The file is at `C:/Users/operator/repos/ci_runners/src/ci_fleet/suite_coverage.py`."
     )
     assert any("suite_coverage.py" in p for p in paths)
 
@@ -231,10 +231,10 @@ def test_issue_953_scenario_blocks(tmp_path: Path) -> None:
     in the target repo."""
     body = (
         "But **#953's code does not live in this repo.** `suite_coverage.py` is at "
-        "`C:/Users/senki/repos/ci_runners/src/ci_fleet/suite_coverage.py`; there is no "
+        "`C:/Users/operator/repos/ci_runners/src/ci_fleet/suite_coverage.py`; there is no "
         "`src/charlie_work/suite_coverage.py`. The worker, handed an isolated checkout "
         "of a repo that does not contain the file it was asked to change, went to "
-        "`C:\\Users\\senki\\repos\\ci_runners` — the **shared main checkout** — and worked there."
+        "`C:\\Users\\operator\\repos\\ci_runners` — the **shared main checkout** — and worked there."
     )
     result = cross_repo_gate(body, tmp_path)
     assert not result.passed

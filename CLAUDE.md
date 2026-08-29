@@ -97,11 +97,10 @@ adapter:
   itself right.** `discover_runner_instances` walks exactly the configured root,
   non-recursively, and then enforces containment on each entry's *resolved* path
   (enforced at `ci_fleet/runner_slots.py` via `contains()`, implemented in
-  `ci_fleet/_vendor/safe_path.py` → resolve both sides, then equality or
-  `is_relative_to`). That defeats a junction, which a non-recursive walk alone does
-  not: a junction under `managed_root` hands back a tree somewhere else entirely.
-  This host has an unrelated runner *service* at `C:\actions-runner` that must never
-  be touched.
+  `ci_fleet/_vendor/safe_path.py`) — resolving both sides before the containment
+  check is what defeats a junction, which a non-recursive walk alone would not
+  catch. There is an unrelated runner service outside `managed_root` on the
+  operator's host that must never be touched.
 
   Do not restate this as "safety comes from the traversal's shape" — the code
   deliberately rejects that, and said so before this file did. Shape bounds how
@@ -111,7 +110,7 @@ adapter:
   entry names.** Name filtering is the wrong fix — it is what the resolved-path check
   exists instead of, because a name tells you nothing about where a reparse point
   actually lands. The check at `runner_slots.py` is the thing standing between
-  reallocation and `C:\actions-runner`.
+  reallocation and that unrelated runner service.
 
   What the containment check does **not** do is validate its own anchor.
   `managed_root` is config-derived (`allocation.managed_root or

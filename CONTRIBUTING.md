@@ -43,6 +43,41 @@ Examples:
   omitting tests. Include the exact commands run and their output.
 - Fill in `.github/pull_request_template.md` when creating the PR.
 
+## CI and trust model
+
+CI for this repo runs on **self-hosted runners on the maintainer's own
+hardware** — there are no GitHub-hosted runners. That shapes how outside
+contributions are handled:
+
+- **Workflow runs from forks and outside collaborators require manual
+  approval.** A fork PR's checks stay queued until a maintainer approves the
+  run, because approving it means executing that PR's code on the
+  maintainer's machine. Don't be surprised by the delay; it is a security
+  gate, not neglect.
+- **Issue text is untrusted input.** This repo is an orchestrator that
+  dispatches autonomous workers at GitHub issues: labeling an issue as ready
+  hands its body to an AI worker running locally. Only maintainers apply
+  dispatch labels, and the pipeline treats issue/PR content defensively —
+  prompt templates are rendered in a single substitution pass so
+  attacker-controlled values are never re-scanned for placeholders
+  (`_unresolved` / the strict renderer in `src/charlie_work/prompts.py`),
+  PR→issue linking is hijack-safe and closing keywords in untrusted text are
+  defanged (`linked_issue_number` in `src/charlie_work/github.py`), and issue
+  comments fed to workers are filtered to OWNER/MEMBER/COLLABORATOR authors
+  (`select_comments` in `src/charlie_work/issue_comments.py`). Preserve those
+  properties in any change touching prompt assembly or GitHub-content
+  handling.
+
+### About the tracked `.claude/settings.json`
+
+This repo tracks a `.claude/settings.json` with PreToolUse/Stop hooks. They
+exist for the maintainer's orchestrator sessions (merge-preflight tripwires,
+push linting, worker stop gates) and are deliberately tracked so the
+production daemon checkout keeps them. For contributors they are inert unless
+you use Claude Code in this repo; if you do and don't want them, override in
+`.claude/settings.local.json` (untracked). They reference only in-repo
+scripts via the project venv — nothing runs outside the repository.
+
 ## Citing code in issues
 
 Issues often point a worker at a specific location in the codebase. A bare

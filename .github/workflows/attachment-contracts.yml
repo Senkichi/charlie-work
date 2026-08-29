@@ -6,27 +6,33 @@ on:
     branches:
       - main
 
-# Same rationale as ci.yml's concurrency block: charlie-work has only 2
-# registered self-hosted runners, so a superseded run must not keep one
-# occupied testing a SHA that can no longer appear in any PR's check set.
+# Same rationale as ci.yml's concurrency block: a superseded run tests a SHA
+# that can no longer appear in any PR's check set, so cancelling it is pure
+# hygiene; main runs are exempt as historical records.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# See ci.yml for the full UTF-8 rationale (self-hosted runner resolves its
-# text layer from the Windows ANSI codepage, not UTF-8, without this).
+# See ci.yml for the full UTF-8 rationale (the hosted Windows image resolves
+# Python's text layer from the ANSI codepage, not UTF-8, without this).
 env:
   PYTHONUTF8: "1"
   PYTHONIOENCODING: "utf-8:surrogateescape"
 
+# Least-privilege default (same rationale as ci.yml): checkout needs
+# contents: read and nothing here needs more.
+permissions:
+  contents: read
+
 jobs:
   AttachmentContracts:
     name: Attachment Contracts (shadow)
-    # `light`: this job is a single fast tree scan, not the pytest suite, so
-    # it belongs on the label every cw listener carries rather than the
-    # 2-slot `suite` semaphore ci.yml's Tests job depends on (see that job's
-    # header for why `suite` exists and why Lint-weight jobs stay off it).
-    runs-on: [self-hosted, Windows, X64, light]
+    # windows-latest, matching ci.yml's jobs (see the Lint job's runs-on
+    # comment there: the hosted move keeps everything on the platform the
+    # toolchain is proven on; per-job image experiments come after).
+    # The self-hosted era's `light` label routing is gone with the shared
+    # box -- hosted jobs never queue behind each other.
+    runs-on: windows-latest
     timeout-minutes: 15
     steps:
       # fetch-depth: 0 (full history) is required so `--base-ref` below can
@@ -37,62 +43,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      # setup-uv@v7 replaced with a PATH-append (#1115): the action's runner
-      # Node process crashed twice in 12 min with a libuv assertion
-      # (async.c:94, upstream flake class) on this box, and on a self-hosted
-      # runner the action's only real job -- downloading uv -- is unnecessary:
-      # the tool cache and the host both already have it. Resolution order:
-      # newest uv in the runner tool cache (what setup-uv itself installed),
-      # else host uv on PATH, else fail loudly -- never silently download.
-      - name: Add uv to PATH (self-hosted, no setup-uv)
-        shell: bash
-        run: |
-          set -e
-          cache="$RUNNER_TOOL_CACHE/uv"
-          dir=""
-          if [ -d "$cache" ]; then
-            ver=$(ls "$cache" | grep -E '^[0-9]+[.][0-9]+[.][0-9]+$' | sort -V | tail -1)
-            [ -n "$ver" ] && dir="$cache/$ver/x64"
-          fi
-          if [ -n "$dir" ] && [ -x "$dir/uv.exe" ]; then
-            echo "$dir" >> "$GITHUB_PATH"
-            "$dir/uv.exe" --version
-          elif command -v uv >/dev/null; then
-            uv --version
-          else
-            echo "::error::uv not found in tool cache ($cache) or host PATH; install uv on the host"
-            exit 1
-          fi
-      # ci_fleet is consumed as an editable path dependency at ../ci_runners
-      # ([tool.uv.sources] in pyproject.toml), so the sibling checkout has to
-      # exist BEFORE uv sync runs -- see ci.yml's identical step for the full
-      # idempotency and provenance rationale (unchanged here).
-      - name: Check out ci_runners as a sibling
-        shell: powershell
-        env:
-          CI_RUNNERS_PAT: ${{ secrets.CI_RUNNERS_PAT }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $dest = Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) 'ci_runners'
-          $pair = "x-access-token:$env:CI_RUNNERS_PAT"
-          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
-          $auth = "AUTHORIZATION: basic $b64"
-          Write-Host "::add-mask::$b64"
-          if (Test-Path (Join-Path $dest '.git')) {
-            git -C $dest -c http.extraheader="$auth" fetch --depth 1 origin main
-            if ($LASTEXITCODE -ne 0) { throw "fetch of ci_runners failed" }
-            git -C $dest reset --hard FETCH_HEAD
-            if ($LASTEXITCODE -ne 0) { throw "reset of ci_runners failed" }
-          } elseif (Test-Path $dest) {
-            throw "$dest exists but is not a git checkout -- refusing to touch it"
-          } else {
-            git -c http.extraheader="$auth" clone --depth 1 --branch main `
-              https://github.com/Senkichi/ci_runners.git $dest
-            if ($LASTEXITCODE -ne 0) { throw "clone of ci_runners failed" }
-          }
-          if (-not (Test-Path (Join-Path $dest 'pyproject.toml'))) {
-            throw "ci_runners checkout at $dest has no pyproject.toml"
-          }
+      # setup-uv restored 2026-08-28 -- see ci.yml's Tests job step comment
+      # for why both #1115 removal reasons were self-hosted-specific, why
+      # the SHA pin, and why enable-cache stays at its `auto` default.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      # ci-fleet resolves from PyPI (versioned wheel in uv.lock) since
+      # 2026-08-28 -- see ci.yml for the note on the removed
+      # sibling-checkout step.
       - name: Install dependencies
         run: uv sync --frozen --all-extras
       # Week-1 SHADOW mode: --report-only makes check-tree exit 0

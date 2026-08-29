@@ -37,7 +37,7 @@ Retry fix: the three ``gh`` API calls this makes (two ``commit()`` lookups,
 one ``compare()``) used to fail the whole four-condition check closed on ANY
 failure of any one of them -- including a purely transient failure (rate
 limit, TLS blip, timeout) that says nothing about whether the shape is
-actually covered. Evidence: job-cannon PRs #1888, #1916, #1904, #1895 each
+actually covered. Evidence: a sibling repo's PRs #1888, #1916, #1904, #1895 each
 logged 326-376 ``unauthorized_merge_queue_sync_covered`` events against
 exactly one ``unauthorized_merge_detected`` -- overwhelmingly a covered
 shape, with one pass where some leg's ``gh api`` call failed transiently
@@ -59,7 +59,7 @@ from .github import GitHubRunResult
 # (commit() x2, compare() x1). A single flaky `gh api` call on any leg used
 # to fail the whole four-condition check closed indistinguishably from a
 # genuinely-uncovered shape, misreporting a transient GitHub API blip as an
-# unauthorized_merge_detected finding (evidence: job-cannon PRs #1888, #1916,
+# unauthorized_merge_detected finding (evidence: a sibling repo's PRs #1888, #1916,
 # #1904, #1895 each logged 326-376 unauthorized_merge_queue_sync_covered
 # events against exactly one unauthorized_merge_detected -- overwhelmingly a
 # covered shape, with one pass where some leg's gh api call failed

@@ -888,6 +888,14 @@ _RATCHET_BASELINE: dict[str, int] = {
     # kill_orphan_pid is a process-kill primitive, not a state write. The
     # ratchet holds at the new count until worktree.py's conversion wave.
     "worktree.py": 3,
+    # Issue #763: +1 raw log_event call in detect_capacity_starvation_escalation
+    # (the sustained-window capacity-starvation escalation event). This is a
+    # standalone function in capacity_starvation_escalation.py, not an
+    # OrchestratorApp method, so it has no self.write_gate receiver and cannot
+    # use Convention A without a write_gate parameter threaded through every
+    # caller — the same out-of-wave pattern as the #1423 worktree.py sites.
+    # The ratchet holds at the new count until this module's conversion wave.
+    "capacity_starvation_escalation.py": 1,
 }
 
 

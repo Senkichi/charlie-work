@@ -662,7 +662,7 @@ def test_evaluate_excludes_untracked_py_from_ruff_scope(gate, repo, monkeypatch)
     debris that predates the session, since ``git status`` cannot tell the
     two apart -- must never reach ruff. A would-reformat failure on it must
     not block the stop. This is the core case the #1259 scoping did not
-    close: the live checkout at C:\\Users\\senki\\repos\\charlie-work has
+    close: the operator's live checkout has
     untracked ``scripts/ac3_*.py`` files that ``ruff format --check`` fails
     on, and the scoped gate still included them because they are untracked.
     """
