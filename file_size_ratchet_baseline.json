@@ -1,5 +1,5 @@
 {
-  "scripts/backfill_stale_rework_briefs.py": 860,
+  "scripts/backfill_stale_rework_briefs.py": 859,
   "scripts/heartbeat_check.py": 2975,
   "src/charlie_work/claude_code.py": 1788,
   "src/charlie_work/cli.py": 2874,
@@ -11,7 +11,7 @@
   "src/charlie_work/fleet_dispatch.py": 3378,
   "src/charlie_work/github.py": 3061,
   "src/charlie_work/instrumentation.py": 1391,
-  "src/charlie_work/janitor.py": 2011,
+  "src/charlie_work/janitor.py": 1978,
   "src/charlie_work/post_mortem.py": 1516,
   "src/charlie_work/reconcile.py": 3275,
   "src/charlie_work/rework_prompts.py": 921,
