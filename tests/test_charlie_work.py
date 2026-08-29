@@ -12868,7 +12868,12 @@ def test_loop_parks_foreign_issue_ref_pr(monkeypatch, tmp_path: Path) -> None:
     ``foreign_issue_ref`` instead of failing the pass every 5 minutes
     forever. GitHubNotFoundError from issue_view is caught before the
     general GitHubError handler, so it never lands in result.data["errors"]
-    and does not flip result.ok to False."""
+    and does not flip result.ok to False.
+
+    Issue #1132: parking now requires ``confirm_passes`` (default 2)
+    consecutive not-found passes before the marker is confirmed and the
+    one-shot digest is emitted. A transient window (minutes) clears before
+    two 5-minute passes complete."""
     from charlie_work.config import NotifyConfig
     from charlie_work.github import GitHubNotFoundError
 
@@ -12913,26 +12918,43 @@ def test_loop_parks_foreign_issue_ref_pr(monkeypatch, tmp_path: Path) -> None:
         lambda notify_config, digest: captured.append(digest),
     )
 
+    # Pass 1: first not-found — marker written with confirmations=1, but
+    # not yet confirmed (1 < 2), so no digest and the PR is still tracked.
     result = app.loop(limit=0)
 
     assert result.ok is True
     assert result.data["errors"] == []
     assert fake_gh.issue_view_calls == 1
+    assert len(captured) == 0  # not yet confirmed
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["789"]["foreign_issue_ref"]["issue"] == 4242
+    assert state["prs"]["789"]["foreign_issue_ref"]["confirmations"] == 1
+
+    # Pass 2: second not-found — confirmations reaches 2, marker confirmed,
+    # one-shot digest emitted.
+    result2 = app.loop(limit=0)
+
+    assert result2.ok is True
+    assert result2.data["errors"] == []
+    assert fake_gh.issue_view_calls == 2
     assert len(captured) == 1
     assert captured[0].transitions[0].health == "FOREIGN_ISSUE_REF"
     assert captured[0].transitions[0].issue_number == 789
 
     state = load_state(app.paths.state_file)
-    assert state["prs"]["789"]["foreign_issue_ref"]["issue"] == 4242
+    assert state["prs"]["789"]["foreign_issue_ref"]["confirmations"] == 2
 
-    # Second pass: the durable marker skips all per-PR work with zero GitHub
+    # Pass 3: the confirmed marker skips all per-PR work with zero GitHub
     # calls and no repeat digest.
-    result2 = app.loop(limit=0)
+    result3 = app.loop(limit=0)
 
-    assert result2.ok is True
-    assert result2.data["open_tracked_prs"] == 0
-    assert fake_gh.issue_view_calls == 1
+    assert result3.ok is True
+    assert result3.data["open_tracked_prs"] == 0
+    assert fake_gh.issue_view_calls == 2
     assert len(captured) == 1
+    # Issue #1132: parked PRs are now visible in the loop_completed payload.
+    assert result3.data["parked_prs"] == [789]
 
 
 def test_loop_dead_session_notifies_when_watchdog_disabled(

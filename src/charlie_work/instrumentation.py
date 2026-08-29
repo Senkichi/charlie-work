@@ -501,6 +501,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "draft_pr_ready_triggered": "info",
         "escalated_label_repaired": "info",
         "finalize_externally_merged": "info",
+        # Issue #1132: a parked foreign_issue_ref marker was cleared after a
+        # re-probe resolved the issue (the linked issue now exists in this repo,
+        # or a transient repo-resolution failure cleared). Info, not warning:
+        # this is the self-heal recovery doing its job -- the PR resumes per-PR
+        # processing instead of skipping forever. Sibling to the info-level
+        # recovery events (e.g. deescalation_cleared, runner_capacity_recovered).
+        "foreign_issue_ref_cleared": "info",
         "flake_rerun_triggered": "info",
         "fleet_canary": "info",
         "fleet_job_observations": "info",

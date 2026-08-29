@@ -1024,6 +1024,155 @@ def test_load_config_stale_checks_max_retriggers_accepts_valid_int(tmp_path: Pat
     assert config.review.stale_checks_max_retriggers == 5
 
 
+# ---------------------------------------------------------------------------
+# Issue #1132: foreign_issue_ref_confirm_passes / foreign_issue_ref_reprobe_hours
+# validation-branch unit tests (per-knob quartet, mirroring the
+# stale_checks_max_retriggers precedent above).
+# ---------------------------------------------------------------------------
+
+
+def test_load_config_foreign_issue_ref_confirm_passes_rejects_bool_true(
+    tmp_path: Path,
+) -> None:
+    """YAML boolean true is not a valid integer confirmation count."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_confirm_passes: true
+""",
+    )
+    with pytest.raises(ConfigError, match="foreign_issue_ref_confirm_passes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_foreign_issue_ref_confirm_passes_rejects_bool_false(
+    tmp_path: Path,
+) -> None:
+    """YAML boolean false silently means 0 if treated as int; reject it."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_confirm_passes: false
+""",
+    )
+    with pytest.raises(ConfigError, match="foreign_issue_ref_confirm_passes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_foreign_issue_ref_confirm_passes_rejects_below_one(
+    tmp_path: Path,
+) -> None:
+    """A confirmation count below 1 disables the confirmation gate (parking on
+    the first not-found), which defeats the transient-failure bound the knob
+    exists to provide."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_confirm_passes: 0
+""",
+    )
+    with pytest.raises(ConfigError, match="foreign_issue_ref_confirm_passes.*must be >= 1"):
+        load_config(config_file)
+
+
+def test_load_config_foreign_issue_ref_confirm_passes_accepts_valid_int(
+    tmp_path: Path,
+) -> None:
+    """1 (one-pass park, original behavior) and >=2 (confirmation gate) are
+    both accepted."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_confirm_passes: 1
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.foreign_issue_ref_confirm_passes == 1
+
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_confirm_passes: 3
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.foreign_issue_ref_confirm_passes == 3
+
+
+def test_load_config_foreign_issue_ref_reprobe_hours_rejects_bool_true(
+    tmp_path: Path,
+) -> None:
+    """YAML boolean true is not a valid integer re-probe cadence."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_reprobe_hours: true
+""",
+    )
+    with pytest.raises(ConfigError, match="foreign_issue_ref_reprobe_hours.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_foreign_issue_ref_reprobe_hours_rejects_bool_false(
+    tmp_path: Path,
+) -> None:
+    """YAML boolean false silently means 0 if treated as int; reject it."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_reprobe_hours: false
+""",
+    )
+    with pytest.raises(ConfigError, match="foreign_issue_ref_reprobe_hours.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_foreign_issue_ref_reprobe_hours_rejects_negative(
+    tmp_path: Path,
+) -> None:
+    """A negative re-probe cadence is semantically meaningless."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_reprobe_hours: -1
+""",
+    )
+    with pytest.raises(ConfigError, match="foreign_issue_ref_reprobe_hours.*must not be negative"):
+        load_config(config_file)
+
+
+def test_load_config_foreign_issue_ref_reprobe_hours_accepts_valid_int(
+    tmp_path: Path,
+) -> None:
+    """0 (self-heal disabled, operator-only remedy) and positive cadences are
+    both accepted."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_reprobe_hours: 0
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.foreign_issue_ref_reprobe_hours == 0
+
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_reprobe_hours: 48
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.foreign_issue_ref_reprobe_hours == 48
+
+
 def test_load_config_stale_checks_defaults_when_absent(tmp_path: Path) -> None:
     """Issue #1274 (W17): an absent `review` section (or absent keys within an
     otherwise-present one) falls back to ReviewConfig's documented defaults --
