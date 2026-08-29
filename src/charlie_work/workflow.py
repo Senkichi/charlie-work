@@ -7630,15 +7630,18 @@ class OrchestratorApp:
                     )
 
             # Infra-failure auto-rerun + escalation (issue #841): a job-level
-            # `timeout-minutes` kill on this repo's self-hosted runners reports
-            # CANCELLED (not TIMED_OUT), which summarize_checks correctly
-            # buckets into infra_failed (blocks merge via CheckSummary.ready),
-            # but nothing before this retried or escalated it --
-            # classify_check_failures only iterates summary.failed (a code push
-            # can't fix an infra kill), so an infra-failed PR sat blocked
-            # forever behind only a diagnostic merge_failed_attempt_alarm
-            # event. `gh run rerun RUN_ID` is dispatched WITHOUT --failed: the
-            # job never completed (cancelled/timed out, not failed), so
+            # `timeout-minutes` kill is an infra failure (CANCELLED on the
+            # self-hosted-era runners, possibly TIMED_OUT on hosted runners),
+            # which summarize_checks correctly buckets into infra_failed
+            # (blocks merge via CheckSummary.ready) via _classify_check_run --
+            # both conclusions route to the infra bucket, so the rerun path
+            # matches regardless of which runner reports. But nothing before
+            # this retried or escalated it -- classify_check_failures only
+            # iterates summary.failed (a code push can't fix an infra kill), so
+            # an infra-failed PR sat blocked forever behind only a diagnostic
+            # merge_failed_attempt_alarm event. `gh run rerun RUN_ID` is
+            # dispatched WITHOUT --failed: the job never completed
+            # (cancelled/timed out, not failed), so
             # --failed's "rerun the failed jobs in this run" semantics do not
             # apply -- omitting it reruns the whole run, which is the correct
             # behavior for a run that never produced a completed job to target.
@@ -13287,8 +13290,7 @@ class OrchestratorApp:
             # protection.strict` -- protection may raise the requirement, never
             # lower it below what the operator configured (issue #875). Issue
             # #812 made this purely protection-derived, which meant a repo
-            # running `strict: false` (as this one does, deliberately: two
-            # self-hosted runners cannot sustain strict mode) disabled its own
+            # running `strict: false` (as this one does) disabled its own
             # merge gate and merged stale-base PRs whose merged tree was never
             # tested. The broadcast sweep still uses the protection-only
             # `_is_base_freshness_required` -- that write costs N CI cycles
@@ -17583,13 +17585,25 @@ class OrchestratorApp:
         which writes to *N* open PRs per merge.
 
         Applying it to the merge gate too was the defect. This repo runs
-        ``strict: false`` (a deliberate capacity decision -- two self-hosted
-        runners cannot sustain strict mode), so the gate derived "currency not
-        required" and disabled *itself*. ``_is_base_current`` was still correct
-        and still failed closed; it was simply never reached. An approved PR
-        whose base had advanced merged without its merged tree ever being
-        tested, which is how ``main`` went red (both parents green, merge
-        untested -- the same class as #853 x #865).
+        ``strict: false``, so the gate derived "currency not required" and
+        disabled *itself*. ``_is_base_current`` was still correct and still
+        failed closed; it was simply never reached. An approved PR whose base
+        had advanced merged without its merged tree ever being tested, which
+        is how ``main`` went red (both parents green, merge untested -- the
+        same class as #853 x #865).
+
+        The ``strict: false`` setting itself predates the hosted-CI migration
+        (#1500): it was a capacity decision on the two-runner self-hosted pool
+        (strict mode re-tests every open PR on every base advance, which that
+        pool could not absorb). On hosted runners the capacity constraint is
+        void, but ``strict: false`` is retained because the #875 merge gate
+        (``require_current_base=True``, the default) already enforces
+        base-freshness at merge time regardless of ``strict`` -- so
+        ``strict: false`` no longer trades away safety, it only avoids the
+        broadcast re-test cost. Whether to flip protection to ``strict: true``
+        and let GitHub enforce base-freshness natively (redundant with this
+        gate, and Aviator's queue already rebases) is an operator decision on
+        a setting that lives outside this repo.
 
         So protection may *raise* the requirement, never *lower* it below what
         the operator asked for:

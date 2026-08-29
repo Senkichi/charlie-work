@@ -517,12 +517,19 @@ def classify_infra_failures(
 ) -> InfraRerunResult:
     """Classify required-check infrastructure failures for bounded auto-rerun.
 
-    A job-level `timeout-minutes` kill on this repo's self-hosted runners
-    reports CANCELLED, not TIMED_OUT (verified across the REST Jobs API, REST
-    Checks API, and GraphQL statusCheckRollup). `summarize_checks` already
-    buckets that into `infra_failed`, which correctly blocks merge
-    (`CheckSummary.ready`) -- but until this function, nothing ever retried
-    or escalated it: `classify_check_failures` only iterates `summary.failed`
+    A job-level `timeout-minutes` kill is an infrastructure failure, not a
+    code failure. On the self-hosted-era runners it reported CANCELLED
+    (verified across the REST Jobs API, REST Checks API, and GraphQL
+    statusCheckRollup); on hosted runners it may instead report TIMED_OUT.
+    Both conclusions are routed to `infra_failed` by `_classify_check_run`
+    (CANCELLED -> `_CheckClassification.CANCELLED`; INFRA_FAILURE/TIMED_OUT ->
+    `_CheckClassification.INFRA`), so the infra-rerun path matches a
+    timeout-minutes kill regardless of which conclusion the runner reports --
+    the "silently stops matching" hazard is closed at the classifier, not at
+    this call site. `summarize_checks` already buckets that into
+    `infra_failed`, which correctly blocks merge (`CheckSummary.ready`) -- but
+    until this function, nothing ever retried or escalated it:
+    `classify_check_failures` only iterates `summary.failed`
     (a code push can't fix an infra kill), so an infra-failed PR sat blocked
     forever with only a diagnostic `merge_failed_attempt_alarm` event
     (issue #841).
