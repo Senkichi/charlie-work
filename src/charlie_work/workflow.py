@@ -114,13 +114,16 @@ from .attachment_budget_prompt import (  # noqa: F401  (deliberate re-export)
     ATTACHMENT_BUDGET_CLAUSE as _ATTACHMENT_BUDGET_CLAUSE,
     render_attachment_budget_section,
 )
+from .cross_pr_revert import (  # noqa: F401  (deliberate re-export)
+    CrossPrRevertResult,
+    CrossPrRevertStatus,
+    detect_cross_pr_revert,
+)
 from .janitor import (
     _calculate_patch_id,
     _diff_content_signature,
     check_operator_containment,
     check_test_adequacy,
-    detect_cross_pr_revert,
-    CrossPrRevertStatus,
     is_stale_ci_verdict,
     iter_diff_files,
     required_check_citation_names,

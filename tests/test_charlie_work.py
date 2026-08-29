@@ -30176,7 +30176,7 @@ def test_merge_ready_cross_pr_revert_undetermined_blocks_merge_without_rework(
     """
     from charlie_work.config import AutoMergeConfig, DevinConfig
     from charlie_work import workflow as workflow_module
-    from charlie_work.janitor import CrossPrRevertResult, CrossPrRevertStatus
+    from charlie_work.cross_pr_revert import CrossPrRevertResult, CrossPrRevertStatus
 
     _base_sha, _feature_sha, agent_sha = _init_cross_pr_revert_repo(tmp_path)
 
