@@ -55,7 +55,7 @@ from .config import (
 from .env_sanitize import worker_github_token_findings
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, managed_repo_names, try_acquire_fleet_lock
-from . import layout
+from . import layout, status_snapshot
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from . import rescue as rescue_helpers
@@ -328,6 +328,7 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     _REVIEW_FALLBACK_MTIME_SLACK_S,
     _REVIEW_FALLBACK_MAX_CANDIDATES,
     _DEFAULT_REVIEW_SESSION_LIMIT_MARKERS,
+    _EXTRACTED_VERDICT_SOURCES,
     _REVIEW_THROTTLE_TAIL_CHARS,
     _RESULT_EVENT_CAUSE_FIELDS,
     _validate_review_verdict,
@@ -343,6 +344,8 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     REVIEW_SESSION_FAILED_HEADING,
     REVIEW_SESSION_SUMMARY_HEADING,
     body_has_crash_signature,
+    is_extracted_verdict_source,
+    provenance_caveat_for,
 )
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -367,6 +370,7 @@ from .rework_prompts import (  # noqa: F401  (deliberate re-export)
     _finish_required_changes_section,
     _is_verdict_newer_than_brief,
     _next_round_number,
+    _provenance_caveat_from_decision,
     _read_review_decision,
     _render_external_findings_section,
     _render_required_changes_section,
@@ -2885,7 +2889,7 @@ def _detect_and_handle_orphaned_workers(
                 # because ``orphan_drift_at`` was never set.  Backfill from
                 # ``orphan_flagged_at`` so the grace period is measured from
                 # when the drift was first observed -- an already-wedged entry
-                # (e.g. jc #1421, flagged 4+ days ago) converges on the very
+                # (e.g. a sibling repo's #1421, flagged 4+ days ago) converges on the very
                 # next sweep pass instead of waiting another full grace window.
                 # The reclaim-success branch above deliberately does NOT set
                 # ``orphan_drift_at`` -- that path leaves the issue ``ready``
@@ -3031,7 +3035,7 @@ def _detect_and_handle_orphaned_workers(
 # ``check_prompt_template_drift`` to fail fast -- at supervisor startup and
 # in CI -- when a repo-local flat whole-file override references a
 # placeholder the writer no longer provides. This is the durable,
-# structural fix for the bug class where job-cannon's flat ``rework.md``
+# structural fix for the bug class where a sibling repo's flat ``rework.md``
 # override kept ``$review_summary`` after commit 5844c34 (PR #661) renamed
 # the writer's slot to ``$dispatch_note`` / ``$required_changes_section``:
 # ``render_prompt``'s strict mode catches the crash at dispatch time, but
@@ -3039,7 +3043,7 @@ def _detect_and_handle_orphaned_workers(
 # process until the next rework dispatch actually fired.
 #
 # The subset direction is deliberate: an override legitimately uses fewer
-# placeholders than the writer supplies (job-cannon's ``worker.md`` uses 6
+# placeholders than the writer supplies (a sibling repo's ``worker.md`` uses 6
 # of these 8 worker keys), so the check fails only when the template reaches
 # for a placeholder the writer never provides -- never when it merely
 # ignores one the writer does. The reverse direction (every supplied key
@@ -4255,7 +4259,9 @@ class OrchestratorApp:
         )
 
     @_guard_state_lock
-    def status(self) -> CommandResult:
+    def status(self, *, use_cache: bool = True) -> CommandResult:
+        if use_cache and (cached := status_snapshot.read_status_snapshot(self)) is not None:
+            return cached
         issues = self.gh.issue_list(self.config.labels.ready)
         prs = self.gh.pr_list()
         state = load_state_locked(self.paths.state_file)
@@ -4386,6 +4392,8 @@ class OrchestratorApp:
                     _status_merged_prs,
                 ),
             ),
+            "snapshot_written_at": None,
+            "cache_age_seconds": None,
         }
 
         # Add runners section if feature is enabled and observation succeeded
@@ -6069,7 +6077,7 @@ class OrchestratorApp:
         # human-needed instead of dispatching a worker that will wander to a
         # sibling repo's shared checkout.
         # Issue #1244: pre-flight cross-repo *scope* gate. Issues whose title
-        # names another managed repo in the fleet (e.g. "job-cannon: ...") are
+        # names another managed repo in the fleet (e.g. "other-repo: ...") are
         # escalated too — their deliverables live in that repo, not this one,
         # so the dispatching lane can never finalize them.  The managed-repo
         # set is derived from the fleet registry, never a hardcoded list.
@@ -7031,7 +7039,7 @@ class OrchestratorApp:
                 else f"PR #{pr_number} is escalated; review skipped"
             )
             # Refresh (but never act on) janitor diagnostics while escalated.
-            # PRs #1397/#1443 (job-cannon, 2026-07-27) sat with janitor_ok/
+            # PRs #1397/#1443 (a sibling repo, 2026-07-27) sat with janitor_ok/
             # janitor_failures frozen at hours-stale values because this early
             # return prevented run_janitor from ever re-running once the
             # LINKED ISSUE escalated -- caused there by an unrelated dead
@@ -7087,7 +7095,7 @@ class OrchestratorApp:
                         )
                     save_state(self.paths.state_file, fresh_state)
 
-            # job-cannon 2026-08-06/07: GitHub Actions silently created no
+            # A sibling repo, 2026-08-06/07: GitHub Actions silently created no
             # workflow run for pushed heads; detection added so the janitor
             # gate distinguishes "CI never started" from "CI failed". An
             # escalated PR returns from this early branch before the
@@ -8047,7 +8055,7 @@ class OrchestratorApp:
                 )
 
             # See _detect_ci_run_never_created for why this check exists
-            # (job-cannon measured 11 PRs stuck 4+ days behind an ambiguous
+            # (a sibling repo measured 11 PRs stuck 4+ days behind an ambiguous
             # "Required check(s) missing" janitor failure). Detection lives
             # entirely in that method; the retrigger policy below (issue
             # #1274, W17) is this method's follow-up.
@@ -9893,7 +9901,7 @@ class OrchestratorApp:
         return, and both deployed fleets run that flag false -- so the set is
         empty and the loop a no-op for as long as the flag stays off, which at
         the time of the fix was ~8 days and counting. It is not dead code in the
-        absolute sense: it fired once (job-cannon 2026-07-28) and repaired 10
+        absolute sense: it fired once (a sibling repo, 2026-07-28) and repaired 10
         issues, which is exactly why the inertness matters.
         Deriving the subjects from ``state`` (see
         ``_collect_escalated_label_subjects``) is what makes the guarantee real,
@@ -9908,7 +9916,7 @@ class OrchestratorApp:
         - **The per-pass cap is mandatory, not defensive.** Every subject in the
           absent-key arm costs a live ``issue_view``, and when this was written
           *every* escalated subject was in that arm (8 in charlie-work, 49 in
-          job-cannon). Sweeping all 57 in one pass would add that many sequential
+          the other repo). Sweeping all 57 in one pass would add that many sequential
           ``gh`` calls to a loop shared sequentially between both repos, which is
           #1078's starvation mechanism. The cap converges over a few passes
           instead; subjects are visited in issue order so progress is monotonic
@@ -11740,6 +11748,22 @@ class OrchestratorApp:
         # it absent (no parser was involved).
         if verdict_source is not None:
             decision_payload["verdict_source"] = verdict_source
+        # Issue #1485: when a verdict was extracted from a dead reviewer's
+        # session artifacts (verdict_source = "log"/"events"/"file:*") rather
+        # than emitted as a clean structured completion, it may be incomplete
+        # or contain objectively wrong factual claims (e.g. "already merged",
+        # "duplicate"). Persist a provenance caveat into the decision file so
+        # every downstream surface (PR comment, rework brief, round-history)
+        # can render it and a human knows to re-verify before acting on a
+        # destructive-adjacent action like closing a PR. Only applies to
+        # ``blocked``/``request_changes`` -- an ``approved`` verdict has no
+        # required_changes to caveat, and the issue scopes to verdicts that
+        # route to operator instructions.
+        provenance_caveat: str | None = None
+        if decision in {"request_changes", "blocked"}:
+            provenance_caveat = provenance_caveat_for(verdict_source)
+            if provenance_caveat is not None:
+                decision_payload["provenance_caveat"] = provenance_caveat
         decision_path = pr_dir / "review-decision.json"
         # Issue #1268 (W11): per-round archive directory. ``round_number`` is
         # declared here (rather than inside the lock below) so it survives
@@ -12187,6 +12211,14 @@ class OrchestratorApp:
             body_parts = [header]
             if summary_text:
                 body_parts.append(summary_text)
+            # Issue #1485: surface the provenance caveat in the PR comment
+            # before the required-changes section so an operator reading it
+            # knows to re-verify factual claims before acting. ``provenance_
+            # caveat`` is computed above (near the decision_payload build)
+            # and is only set for log-extracted blocked/request_changes
+            # verdicts.
+            if provenance_caveat is not None:
+                body_parts.append(provenance_caveat)
             # Issue #792's `findings_channel == "derived"` marker (set above,
             # ~15326) means `effective_required_changes` is not a real
             # structured list -- it is `[summary_text.strip()]`, the exact
@@ -16127,7 +16159,7 @@ class OrchestratorApp:
 
         A "Required check(s) missing" janitor failure is ambiguous between
         "still pending" and "GitHub never created a workflow run for this
-        head at all" -- job-cannon measured 11 PRs stuck behind this exact
+        head at all" -- a sibling repo measured 11 PRs stuck behind this exact
         failure for 4+ days: the webhook delivered (other check-suite apps
         registered) but no github-actions run object ever appeared, and
         nothing distinguished that from ordinary CI latency. This queries
@@ -17894,6 +17926,8 @@ class OrchestratorApp:
                 sink_arrivals=sink_arrivals,
                 sink_clears=sink_clears,
             )
+            if not self.dry_run:
+                status_snapshot.write_status_snapshot(self)
             return result
 
     def _maybe_probe_quota_recovery(self, *, now: datetime | None = None) -> None:
@@ -19142,7 +19176,7 @@ class OrchestratorApp:
         # digest. ``_detect_stalled_sessions`` is gated on
         # ``watchdog.enabled`` (it returns ``[]`` immediately when watchdog is
         # off), so a deployment that disables watchdog -- e.g. to work around
-        # a shim log-mtime blindness, as job-cannon does -- gets zero stalled
+        # a shim log-mtime blindness, as a sibling repo does -- gets zero stalled
         # entries and the notify sink never fires, even though dead workers
         # ARE reaped by ``_classify_dead_sessions_and_update_throttle_state``
         # above (which is NOT watchdog-gated; see issue #1122). Without this,
@@ -19448,7 +19482,7 @@ class OrchestratorApp:
                         # merge-conflict/no-op-rework remediation for
                         # judgment-class escalations (PRs #1397/#1443). Skipping
                         # it entirely would reintroduce the exact frozen-
-                        # diagnostics staleness class the job-cannon fix
+                        # diagnostics staleness class the sibling-repo fix
                         # addressed, just via a different trigger. A
                         # non-escalated stale-template PR still regenerates
                         # exactly as today (#592 preserved).
@@ -22485,7 +22519,7 @@ class OrchestratorApp:
         """Thin delegate to ``queue_sync_coverage._queue_sync_merge_covered``.
 
         See that function's docstring for the full four-condition predicate
-        (issue #1194) and the retry/indeterminate contract (job-cannon PRs
+        (issue #1194) and the retry/indeterminate contract (sibling-repo PRs
         #1888, #1916, #1904, #1895).
 
         ``queue_sync_coverage.py`` is deliberately pure (issue #1264's
@@ -23369,7 +23403,7 @@ class OrchestratorApp:
         # excluded from the automatic de-escalation sweep and needs a human. So
         # a wrong park costs some extra cheap passes until the head moves, while
         # a wrong escalation costs a human. The measured cost of getting that
-        # backwards is 36 escalated job-cannon issues.
+        # backwards is 36 escalated issues in a sibling repo.
         record = self._cross_family_regen_record(
             pr_number=pr_number, head_sha=pr.get("headRefOid")
         )
@@ -23581,7 +23615,7 @@ class OrchestratorApp:
         required checks ``review()`` returns at the janitor gate long before the
         regenerator, so the budget was spent, and this escalation fired, against
         a PR whose model had never been invoked once. 36 of 54 escalated
-        job-cannon issues carried the resulting ``cross_family_report_unusable``
+        issues in a sibling repo carried the resulting ``cross_family_report_unusable``
         for a report that was never actually retried.
 
         Usability is re-read from disk with ``report_is_reusable`` -- the same

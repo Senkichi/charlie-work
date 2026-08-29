@@ -53,6 +53,13 @@ from .fleet_paths import fleet_dir
 DEFAULT_STATE_DIR = ".var/charlie-work"
 
 STATE_FILENAME = "state.json"
+# Issue #1463: per-repo cache of the last loop pass's ``status()`` result.
+# ``fleet status --json`` reads this snapshot (lock-free, no GitHub API calls)
+# when it is fresher than ``runtime.status_snapshot_ttl_seconds``; the loop
+# pass writes it at the end of every pass. This turns a ~50s serial API walk
+# into a sub-second file read on an idle host and eliminates state-lock
+# contention during concurrent passes.
+STATUS_SNAPSHOT_FILENAME = "status-snapshot.json"
 SUPERVISOR_LOCK_FILENAME = "supervisor.lock"
 PENDING_SYNC_FILENAME = "pending-sync.json"
 SELF_DEPLOY_FAILURE_STATE_FILENAME = "self-deploy-failures.json"
@@ -122,6 +129,17 @@ def default_state_root(repo_root: Path) -> Path:
 def state_file_path(state_root: Path) -> Path:
     """Return the ``state.json`` path under ``state_root``."""
     return state_root / STATE_FILENAME
+
+
+def status_snapshot_path(state_root: Path) -> Path:
+    """Return the per-repo status-snapshot cache path under ``state_root``.
+
+    Issue #1463: the loop pass writes ``status()``'s result here at the end of
+    every pass (atomic temp-file + ``replace``). ``fleet status --json`` reads
+    it lock-free when fresh, avoiding the ~50s serial GitHub API walk and the
+    state-lock contention that pushed wall time past the heartbeat's 60s cap.
+    """
+    return state_root / STATUS_SNAPSHOT_FILENAME
 
 
 def supervisor_lock_path(state_root: Path) -> Path:
@@ -274,6 +292,7 @@ FLEET_REGISTRY_FILENAME = "fleet.json"
 FLEET_LOCK_FILENAME = "fleet.lock"
 FLEET_SUPERVISOR_LOCK_FILENAME = "fleet-supervisor.lock"
 NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
+CAPACITY_STARVATION_STATE_FILENAME = "capacity_starvation_state.json"
 
 # The fleet heartbeat state file (``heartbeat-state.json``) also lives in the
 # fleet dir, but is deliberately NOT centralised here. Its sole owner is
@@ -344,3 +363,16 @@ def fleet_supervisor_lock_path(override: str | None = None) -> Path:
 def notify_health_state_path(override: str | None = None) -> Path:
     """Return the fleet health-notification baseline sidecar path."""
     return fleet_dir(override=override) / NOTIFY_HEALTH_STATE_FILENAME
+
+
+def capacity_starvation_state_path(override: str | None = None) -> Path:
+    """Return the fleet capacity-starvation escalation sidecar path (issue #763).
+
+    Persists per-repo starvation episode start timestamps and an ``escalated``
+    flag so the sustained-window escalation is edge-triggered across supervisor
+    respawns: the escalation fires once per episode when the starvation has
+    persisted for ``runner_capacity_escalation.starvation_escalation_minutes``,
+    not every pass. Lives in the fleet dir alongside the other fleet-level
+    sidecars (``notify_health_state.json``, ``runner-allocation.json``).
+    """
+    return fleet_dir(override=override) / CAPACITY_STARVATION_STATE_FILENAME

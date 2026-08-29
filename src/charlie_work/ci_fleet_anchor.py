@@ -69,11 +69,12 @@ Raising rather than returning ``None``
 
 Structural failures are deliberately left to propagate. ``check_provenance``
 wraps the anchor call and reports the exception type and message as the
-``no_anchor`` detail, so a missing ``pyproject.toml`` or a renamed table
-surfaces as ``provenance anchor raised KeyError: 'uv'`` rather than as an
-undifferentiated "could not determine". ``None`` is reserved for the two cases
-that are real answers rather than breakage: ci-fleet not being declared as a
-local path dependency at all, and the resolved root not existing.
+``no_anchor`` detail, so a missing ``pyproject.toml`` surfaces with its real
+exception rather than as an undifferentiated "could not determine". ``None``
+is reserved for the cases that are real answers rather than breakage: ci-fleet
+not being declared as a local path dependency at all (the normal state since
+the 2026-08-28 switch to the published PyPI wheel -- no ``[tool.uv.sources]``
+table, module loads from site-packages), and the resolved root not existing.
 """
 
 from __future__ import annotations
@@ -129,7 +130,16 @@ def declared_ci_fleet_root() -> Path | None:
     root = repo_root()
     with (root / "pyproject.toml").open("rb") as handle:
         pyproject = tomllib.load(handle)
-    source = pyproject["tool"]["uv"]["sources"][_SOURCE_NAME]
+    # Since 2026-08-28 ci-fleet is a published PyPI dependency and the
+    # [tool.uv.sources] path override is gone from pyproject entirely. An
+    # absent table (or absent entry) IS the "not declared as a local path
+    # dependency" abstention the docstring reserves None for -- the module
+    # loads from site-packages and there is no sibling tree to compare
+    # against. Only a present-but-malformed entry should still raise.
+    sources = pyproject.get("tool", {}).get("uv", {}).get("sources", {})
+    source = sources.get(_SOURCE_NAME)
+    if source is None:
+        return None
     declared = source.get("path")
     if declared is None:
         return None

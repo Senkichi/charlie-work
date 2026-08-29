@@ -395,6 +395,8 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "runner_allocation_refused": "warning",
         "runner_allocation_skipped": "warning",
         "runner_capacity_starved": "warning",
+        # Error: sustained-window escalation of runner_capacity_starved (#763).
+        "runner_capacity_starvation_escalation": "error",
         # Warning, not info: the deploy went on to succeed, but the checkout
         # was in a state that needed repairing to get there. Logged at info it
         # would vanish into the pass-by-pass noise, and the recurrence of the

@@ -381,8 +381,8 @@ incidents actually happened — not scattered as defensive checks:
   self-heals on the next push; `reason_class="judgment"` is excluded from the
   automatic de-escalation sweep and needs a human. Escalating a PR whose model
   was never invoked asserts "unusable *and unfixable*" on evidence for only the
-  first half — the #1099 defect, which put 36 of 54 escalated job-cannon issues
-  into a sink that refilled as fast as it was drained. A parked PR is not
+  first half — the #1099 defect, which put 36 of 54 escalated issues in one
+  consumer repo into a sink that refilled as fast as it was drained. A parked PR is not
   silent: the janitor gate reports its actual blocker on its own channel every
   pass, and `cross_family_regen_not_reached` records the decline.
 

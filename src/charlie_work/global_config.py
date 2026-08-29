@@ -192,6 +192,17 @@ def load_layered_config(
             f"appear in a per-repo config ({repo_config_path}); declare it in "
             "the global fleet layer (<fleet_dir>/config.yaml) instead"
         )
+    # ``runner_capacity_escalation`` is the same shape of host-wide concern as
+    # ``runner_allocation``: it escalates a starvation condition measured across
+    # the whole host's budget, so a per-repo override would be three repos
+    # holding three opinions about one machine's capacity signal. Reject it for
+    # the same reason and with the same remedy (issue #763).
+    if "runner_capacity_escalation" in repo_data:
+        raise ConfigError(
+            "config section 'runner_capacity_escalation' is host-wide only and "
+            f"must not appear in a per-repo config ({repo_config_path}); declare "
+            "it in the global fleet layer (<fleet_dir>/config.yaml) instead"
+        )
 
     # Merge: global as base, per-repo as override (section-by-section, deep)
     merged_data: dict[str, Any] = {}

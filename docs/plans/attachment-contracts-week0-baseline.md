@@ -2,7 +2,7 @@
 
 Generated: 2026-08-24. Source: `.attachment-budgets.json` (repo root, generated via
 `uv run python -m charlie_work.attachment_contracts baseline`, mode defaults to `advise`)
-and the llibrary god-object-scan harness run against `charlie-work` main.
+and an external god-object-scan harness run against `charlie-work` main.
 
 ## Acceptance checks
 
@@ -54,12 +54,12 @@ Sorted: 6, 6, 6, 6, 6, 6, 7, 7, 9, 9, 10, 10, 12, 26, 41, 42, 45, 47, 47, 48, 49
 below `tests/test_charlie_work.py` at 1059, which is the extreme outlier driving
 the distribution's tail.)
 
-## llibrary god-object-scan harness (charlie-work, main, window since 2026-08-24)
+## God-object-scan harness (charlie-work, main, window since 2026-08-24)
 
 Command run:
 ```
-uv run --active python scripts/god_object_scan.py --repo C:/Users/senki/repos/charlie-work \
-  --out-dir C:/Users/senki/repos/llibrary/raw/analyses/2026-08-god-object/week0 \
+uv run --active python scripts/god_object_scan.py --repo . \
+  --out-dir <analysis-notes-checkout>/raw/analyses/2026-08-god-object/week0 \
   --window-since 2026-08-24 \
   --pin-files "tests/test_charlie_work.py,src/charlie_work/workflow.py,tests/test_worktree.py"
 ```
@@ -84,7 +84,7 @@ Headline metrics (from `charlie-work.metrics.json`):
 
 These are the Week-0 reference points; Week-1/Week-2 measurements should be diffed
 against this file, not re-derived, per the idempotency contract in
-`llibrary/docs/specs/2026-05-11-plan-b-safety-rails.md`.
+an external analysis-notes doc (plan-b safety rails, 2026-05-11).
 
 ## Backtest (G1, Deliverable 0 gate)
 

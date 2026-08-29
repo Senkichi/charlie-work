@@ -204,7 +204,7 @@ silently forgotten.
 3. **Fleet-wide enablement:** governed by a **tracked rollout issue filed at
    decomposition time** (not automated-ready — requires human judgment on trial
    results) with checklist: review calibration sessions → set session cap →
-   enable in jc / jobcannon / empericus configs → raise/remove `lifetime_usd`
+   enable in each registered consumer repo's config → raise/remove `lifetime_usd`
    → update runbook. Ambient reminder: the `enabled N/M repos` fleet-report
    fragment (§8) nags until rollout completes.
 

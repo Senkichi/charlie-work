@@ -55,13 +55,13 @@ if TYPE_CHECKING:
 
 # Issue #646: box-wide dispatch parallelism cap. A consuming repo's own
 # pyproject.toml commonly ships `addopts = "... -n auto --dist loadscope"`
-# (e.g. job-cannon), so a bare `pytest` invoked inside a worker claims every
+# (e.g. a sibling repo), so a bare `pytest` invoked inside a worker claims every
 # physical core on the shared box. With several worker tracks dispatched
 # concurrently, each spawning its own uncapped `-n auto` suite, a handful of
 # sessions can spawn dozens of xdist workers on an 8-core box (measured
 # incident 2026-07-26: 5 stacked local suites, ~36 xdist workers on 8 physical
 # cores, CI runtime 6.4min -> ~145min). This mirrors the manual operator
-# recipe already used by job-cannon's scripts/orchestrator/launch_devin_worker.sh,
+# recipe already used by a sibling repo's scripts/orchestrator/launch_devin_worker.sh,
 # which exports this same variable ("3 concurrent tracks x 2 xdist workers ~= 8
 # physical cores") — this constant is that same value, applied automatically
 # instead of requiring every dispatch path to remember to set it. Cited by

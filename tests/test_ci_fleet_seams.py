@@ -330,13 +330,20 @@ def test_the_anchor_reads_the_declaration_not_the_install_artifacts() -> None:
 
     root = repo_root()
     with (root / "pyproject.toml").open("rb") as handle:
-        declared = tomllib.load(handle)["tool"]["uv"]["sources"]["ci-fleet"]["path"]
+        sources = tomllib.load(handle).get("tool", {}).get("uv", {}).get("sources", {})
+    declared = sources.get("ci-fleet", {}).get("path")
 
-    expected = (root / declared / "src").resolve()
-    # Not asserted unconditionally: this suite also runs from worktrees, where
-    # the relative declaration resolves to a directory that does not exist and
-    # the anchor correctly abstains. See the abstention test below.
-    assert declared_ci_fleet_root() == (expected if expected.is_dir() else None)
+    if declared is None:
+        # Since 2026-08-28 ci-fleet is a published PyPI dependency and pyproject
+        # declares no path source at all: the anchor must abstain, because the
+        # module loads from site-packages and there is no sibling tree to name.
+        assert declared_ci_fleet_root() is None
+    else:
+        expected = (root / declared / "src").resolve()
+        # Not asserted unconditionally: this suite also runs from worktrees,
+        # where the relative declaration resolves to a directory that does not
+        # exist and the anchor correctly abstains. See the abstention test below.
+        assert declared_ci_fleet_root() == (expected if expected.is_dir() else None)
 
 
 def test_an_unresolvable_declaration_abstains_instead_of_blocking(
