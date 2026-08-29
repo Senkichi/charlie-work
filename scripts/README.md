@@ -29,7 +29,7 @@ stdlib-only; see the notes below before "fixing" one.
   own `WScript.ScriptFullName`); keep both files in the same directory.
 - **`charlie-fleet-pass-task.xml`** — the Windows Task Scheduler definition
   for `charlie-fleet-pass`, exported via `schtasks /query /xml`. **It contains
-  absolute paths** (`C:\Users\senki\repos\charlie-work\scripts\...`) that are
+  absolute paths** (`C:\Users\YOUR_USERNAME\repos\charlie-work\scripts\...`) that are
   baked into the *registered* task, not read from this file at run time.
   Editing this XML does **not** update the live task — if the repo is ever
   moved or checked out under a different user profile, re-import it with

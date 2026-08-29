@@ -4,9 +4,9 @@ Deterministic GitHub-issue orchestration for AI worker fleets. One labeled
 issue → one worker session → one PR → adversarial review → gated auto-merge.
 Devin workers by default; Claude Code workers first-class.
 
-Extracted from the battle-tested orchestrators that ran inside
-[job-cannon](../job-cannon) and [empericus](../empericus) — this repo is the
-union of both forks plus the fixes each learned separately.
+Extracted from the battle-tested orchestrators that ran inside two sibling
+repos — this repo is the union of both forks plus the fixes each learned
+separately.
 
 > The name is a nod to *It's Always Sunny in Philadelphia*: "charlie work" is
 > the thankless, unglamorous grunt labor nobody else wants to do. Which is
@@ -67,10 +67,10 @@ uv sync
 
 # operate on a consumer repo by running charlie-work's own uv project against it:
 #   --project selects charlie-work's env · --directory sets cwd · --repo is the target
-uv run --project ../charlie-work --directory ../job-cannon charlie --repo ../job-cannon roll-call
+uv run --project ../charlie-work --directory ../your-repo charlie --repo ../your-repo roll-call
 
 # copy an example config to the CONSUMER repo's root and adjust it there
-cp examples/orchestrator.config.devin.yaml ../job-cannon/orchestrator.config.yaml
+cp examples/orchestrator.config.devin.yaml ../your-repo/orchestrator.config.yaml
 ```
 
 Most consumers wrap that invocation in a one-line script, so day-to-day use is
@@ -199,7 +199,8 @@ test-adequacy gate), `watchdog.*` (supervisor tripwires: stall/wall-clock/
 loop/cost-token budgets, WARN-first by default), `fleet.*`
 (`global_max_concurrent_sessions` — cross-repo worker-count budget),
 `notify.*` (opt-in needs-attention sink: webhook | desktop | shell | file), and
-`runner_allocation.*` (host-wide elastic CI-runner slots — see below).
+`runner_allocation.*` (host-wide elastic CI-runner slots — see below), and
+`runner_capacity_escalation.*` (sustained-window starvation escalation — see below).
 
 ### Self-hosted runner allocation
 
@@ -213,68 +214,56 @@ Two independent, opt-in features govern self-hosted runners:
 Without allocation, each repo's CI parallelism is pinned to however many
 runners were registered to it: a repo with a deep queue waits behind its own
 cap while another repo's runners idle on the same machine. Allocation removes
-that by making the *running listener* the unit that moves. A configured runner
-whose listener is stopped goes `offline` and keeps its registration, so *moving*
-a slot costs about a second — no registration token, no GitHub write, no package
-extraction. End-to-end responsiveness is bounded by how often the decision runs,
-not by the move: a repo that starts queuing waits until the next fleet pass (up
-to `full_pass_interval_seconds`, 5 min) to be granted a slot.
+that by making the *running listener* the unit that moves — a configured
+runner whose listener is stopped goes `offline` and keeps its registration, so
+moving a slot costs about a second with no registration token, GitHub write,
+or package extraction involved. A running job is never interrupted (only idle
+listeners are parked), every repo keeps at least one live listener, and
+capacity can never exceed however many runners a repo actually has
+registered.
 
-Because it governs one physical host, this section belongs in the **global**
-fleet layer (`%LOCALAPPDATA%\charlie-work\config.yaml` on Windows), not in a
-per-repo `orchestrator.config.yaml` — three repos must not hold three different
-opinions about one machine's capacity:
+Because it governs one physical host's shared capacity, allocation is
+configured once at the global fleet layer rather than per repo, under a
+`runner_allocation` section (`enabled`, `managed_root`, `max_running_runners`,
+`min_running_per_repo`, `demand_idle_samples`). Only `charlie runners
+allocate` is meant to decide which listeners run — an operator script that
+unconditionally starts every listener will have its choice undone on the next
+allocation pass. Preview any config change with `charlie runners allocate
+--dry-run` before applying it.
+
+### Capacity-starvation escalation
+
+`runner_allocation` can only move *already-registered* listeners — it never
+mints a registration. So a repo whose live demand exceeds its registered
+runner capacity while the host-wide budget has idle slots is permanently
+unsatisfiable by allocation alone: the allocator correctly identifies it and
+correctly declines to act, but before #763 that conclusion lived only in a
+log line and a per-pass `notes` entry the operator digest deliberately drops.
+The next starvation was discovered by an operator reading queue times, not
+surfaced by the fleet.
+
+`runner_capacity_escalation.*` arms the durable half: when the same repo stays
+starved for a sustained window, the fleet prologue raises a structured
+`runner_capacity_starvation_escalation` event that surfaces in the operator
+attention digest (not just `events.db`). Scope is detection + event only;
+provisioning/registration stays operator-gated (issue #826 is the
+manual-trigger actuator). It is host-wide (declare it in the global fleet
+layer, not a per-repo config) and inert on any host where `runner_allocation`
+is disabled, since the prologue returns before reaching it:
 
 ```yaml
-runner_allocation:
-  enabled: true
-  managed_root: C:/actions-runners   # defaults to runner_scaling.managed_root
-  max_running_runners: 8             # host's concurrent-CI-job budget; 0 = cores // 2
-  min_running_per_repo: 1            # keep one listener alive per repo
-  demand_idle_samples: 3             # slack passes before parking a surplus slot
+runner_capacity_escalation:
+  enabled: true                       # default; pure observability, no actuation
+  starvation_escalation_minutes: 15   # sustained window before escalating (default 15)
 ```
 
-Behavior worth knowing:
-
-- **A running job is never interrupted.** Only listeners GitHub reports as
-  not-busy *and* with no local `Runner.Worker` child are parked. A repo that is
-  over-allocated but fully working keeps its slots, and the plan says so.
-- **`min_running_per_repo: 1` is load-bearing.** A repo whose every runner is
-  offline has queued jobs sit unclaimed (GitHub fails them after 24h). One live
-  listener keeps pickup latency at zero.
-- **Promotion is immediate, demotion is not.** A repo gains slots on the first
-  pass that shows demand; a surplus slot is only parked after
-  `demand_idle_samples` consecutive slack passes — unless another repo is
-  actively waiting for it, in which case it moves at once.
-- **Capacity is a hard ceiling.** A repo can never run more listeners than it
-  has runners registered. When demand exceeds that, the plan says so — use
-  `runner_scaling` (or `config.cmd`) to register more directories.
-- **A repo whose demand cannot be read is pinned, not parked.** An API failure
-  holds that repo at its current slot count, since parking could strand work
-  that simply was not visible. Pins are the one way the host can sit *above*
-  `max_running_runners`; when that happens the plan says so explicitly.
-- **`max_running_runners` is a budget you assert, not one that is measured.**
-  The `cores // 2` default cannot see Devin workers or reviewers competing for
-  the same host, and a CI job here is a full pytest matrix entry — 8 concurrent
-  jobs on 16 cores is a deliberate choice about memory and cache pressure, not
-  a derived fact. Set it explicitly and preview with
-  `charlie runners allocate --dry-run` before raising it.
-- **Parking uses process termination, not a graceful drain.** A parked listener
-  is not-busy at the moment it is stopped, but GitHub can take tens of seconds
-  to mark it offline; a job assigned inside that window is re-queued and picked
-  up by another runner rather than lost. Listeners this code started are in
-  their own process group, so a `CTRL_BREAK_EVENT` drain is available if that
-  window ever proves costly.
-
-The fleet pass runs allocation as a prologue *before* autoscale: moving an idle
-slot to a starved repo is free, so it is tried before deciding the host needs
-more runners registered.
-
-**Only one thing may decide which listeners run.** The host's post-reboot script
-(`C:\actions-runners\start-runners.ps1`) delegates to `charlie runners allocate`
-and only falls back to starting every runner when allocation is unavailable.
-Anything that unconditionally starts all listeners while allocation is enabled
-gets undone on the next pass, at the cost of a full hysteresis window of churn.
+The window is measured wall-clock from the first starved pass, not by counting
+passes, so it is robust to the supervisor's respawn cadence and to a pass that
+was skipped. The escalation is edge-triggered per episode: it fires once when
+the window is crossed, then stays silent every subsequent pass the starvation
+holds, so a reader can tell "still starved" from "signal stopped working". A
+repo that recovers is dropped from the tracking sidecar so the next episode
+starts a fresh window.
 
 **This repo's own CI check names** (for `auto_merge.required_checks`): `Tests (ubuntu-latest)`,
 `Tests (windows-latest)`, and `Lint`. These correspond to the job `name:` fields in
@@ -311,7 +300,8 @@ session dispatch manifest/results. All JSON writes are atomic
 
 ## Provenance
 
-Unioned from two production forks (June–July 2026): job-cannon contributed
-cross-family review and `why-charlie-hate-spec`; empericus contributed `--issues` wave
-dispatch, the `gh pr merge` stdout fix, and the worktree/branch-deletion
-failure report that drove the decoupled merge sequence.
+Unioned from two production forks (June–July 2026) of sibling repos: one
+contributed cross-family review and `why-charlie-hate-spec`; the other
+contributed `--issues` wave dispatch, the `gh pr merge` stdout fix, and the
+worktree/branch-deletion failure report that drove the decoupled merge
+sequence.

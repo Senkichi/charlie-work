@@ -4,7 +4,7 @@ Why this exists
 ----------------
 A repo's orchestrator state can live in two places at once: the canonical
 location derived from ``runtime.state_dir`` (default ``.var/charlie-work``,
-see ``layout.py``), and a legacy override pointing somewhere else (job-cannon's
+see ``layout.py``), and a legacy override pointing somewhere else (a sibling repo's
 ``.var/devin-orchestrator``). Merging the legacy tree into the canonical one
 was originally written as imperative PowerShell prose in a plan doc, and that
 prose accumulated roughly a dozen defects because shell prose has no

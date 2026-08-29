@@ -55,7 +55,7 @@ no signal that anything went wrong. --apply therefore refuses to run unless
 --require-commit proves the renderer fix is an ancestor of the RENDERER
 checkout's live HEAD -- the checkout whose code actually performs
 dispatch_rework's render. In the live fleet topology that is the daemon
-deployment (C:\\Users\\senki\\srv\\charlie-work-daemon), NOT the state root
+deployment checkout, NOT the state root
 selected by --repo: the fleet daemon runs all lane code (including the brief
 renderer) from there for every fleet, so the gate must anchor there
 regardless of which state root is being backfilled. Point --renderer-repo at
@@ -102,12 +102,12 @@ Usage:
         --require-commit <sha>
 
     # Fleet topology: the state root (--repo) and the renderer checkout
-    # (the daemon deployment) are different checkouts, and for the
-    # job-cannon lane they are different repos entirely. The gate must
+    # (the daemon deployment) are different checkouts, and for some
+    # registered repos they are different repos entirely. The gate must
     # anchor to the renderer checkout, where the renderer-fix SHA lives:
     python scripts/backfill_stale_rework_briefs.py \\
-        --repo C:/Users/senki/repos/job-cannon \\
-        --renderer-repo C:/Users/senki/srv/charlie-work-daemon \\
+        --repo /path/to/other-repo \\
+        --renderer-repo /path/to/charlie-work-daemon \\
         --require-commit <charlie-work-fix-sha> --apply
 """
 
@@ -444,7 +444,7 @@ def check_deployment_gate(
 
     *renderer_repo* is the checkout whose code actually performs
     ``dispatch_rework``'s render -- in the live fleet topology that is the
-    daemon deployment (``C:\\Users\\senki\\srv\\charlie-work-daemon``), NOT
+    daemon deployment checkout, NOT
     the state root selected by ``--repo``. The gate exists to prove the
     renderer fix is deployed in the checkout that will regenerate the brief,
     so the anchor must be that checkout's HEAD, independent of which state
@@ -463,7 +463,7 @@ def check_deployment_gate(
     renderer_repo's HEAD" is always true. --require-commit must always be a
     fixed, specific commit SHA that exists in *renderer_repo*'s object
     store. A SHA from a *different* repository (e.g. a charlie-work fix SHA
-    evaluated against a job-cannon checkout) is NOT supported: the renderer
+    evaluated against a sibling repo's checkout) is NOT supported: the renderer
     checkout cannot resolve it and git exits 128 ("Not a valid commit
     name"). This is exactly why the gate anchors to the renderer checkout
     rather than to ``--repo`` -- the renderer fix SHA lives in
@@ -680,11 +680,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Path to the git checkout whose code actually performs the "
             "rework-brief render -- the checkout the deployment gate "
             "evaluates --require-commit against. In the live fleet topology "
-            "this is the daemon deployment "
-            "(C:/Users/senki/srv/charlie-work-daemon), NOT the state root "
+            "this is the daemon deployment checkout, NOT the state root "
             "selected by --repo: the gate must prove the renderer fix is "
             "deployed in the checkout that will regenerate the brief, and "
-            "for the job-cannon lane that checkout is a different repo than "
+            "for some registered repos that checkout is a different repo than "
             "the state root (issue #1332). Default: same as --repo (correct "
             "for a single-checkout layout where the state repo IS the "
             "renderer)."
@@ -752,7 +751,7 @@ def main(argv: list[str] | None = None) -> int:
     # whose code performs dispatch_rework's render -- not the state root
     # selected by --repo. In the live fleet topology these are different
     # checkouts (the renderer is the daemon deployment; --repo may be a
-    # different repo's state root, e.g. job-cannon). Default to repo_root
+    # different registered repo's state root). Default to repo_root
     # for the single-checkout layout where the state repo IS the renderer
     # (issue #1332).
     if args.renderer_repo is not None:
