@@ -3565,9 +3565,9 @@ def test_detect_cross_pr_revert_skips_invalid_head_ref(
     pr = _green_pr(headRefName="--upload-pack=evil")
 
     def _fail_if_called(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("subprocess.run should not be called with invalid refs")
+        raise AssertionError("run_captured should not be called with invalid refs")
 
-    monkeypatch.setattr(janitor_module.subprocess, "run", _fail_if_called)
+    monkeypatch.setattr(janitor_module, "run_captured", _fail_if_called)
 
     result = detect_cross_pr_revert(pr, repo_root)
     assert result is None
@@ -3586,9 +3586,9 @@ def test_detect_cross_pr_revert_skips_invalid_base_ref(
     pr = _green_pr(headRefName="agent/issue-1-fix", baseRefName="--upload-pack=evil")
 
     def _fail_if_called(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("subprocess.run should not be called with invalid refs")
+        raise AssertionError("run_captured should not be called with invalid refs")
 
-    monkeypatch.setattr(janitor_module.subprocess, "run", _fail_if_called)
+    monkeypatch.setattr(janitor_module, "run_captured", _fail_if_called)
 
     result = detect_cross_pr_revert(pr, repo_root)
     assert result is None
