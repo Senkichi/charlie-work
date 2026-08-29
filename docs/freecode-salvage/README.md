@@ -1,6 +1,6 @@
 # freecode salvage — specs, plans, and frozen reference code
 
-**freecode** (github.com/Senkichi/freecode) was archived 2026-07-09 after a two-round,
+**freecode** (a private, now-archived sibling repo) was archived 2026-07-09 after a two-round,
 fact-checked evaluation concluded both of its theses were dead: free-tier API arbitrage
 priced out at ~$20/month against a $0.10/M-token paid floor, and its compliance-first
 architecture was the structural negation of fleet-worker requirements. Full evidence:

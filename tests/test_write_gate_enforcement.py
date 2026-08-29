@@ -838,7 +838,14 @@ _RATCHET_BASELINE: dict[str, int] = {
     # class as the pre-existing 8 — the ratchet holds at the new count.
     "fleet_dispatch.py": 11,
     "fleet_registry.py": 1,
-    "reconcile.py": 5,
+    # Issue #1241: +1 raw log_event call in the reconcile salvage lane's new
+    # pre-open supersession check (the salvage_skipped_* event emitted when the
+    # shared check_salvage_superseded finds the work already landed). This is
+    # out-of-wave raw territory -- the salvage lane has not been converted to
+    # WriteGate (it predates #1264's wave and uses log_event directly, matching
+    # the existing pr_closing_ref_rewritten / pr_closing_ref_unlinked calls in
+    # the same block). The ratchet holds at the new count.
+    "reconcile.py": 6,
     "state_migration.py": 1,
     "supervise.py": 11,
     "supervisor_lifecycle.py": 3,
@@ -861,6 +868,15 @@ _RATCHET_BASELINE: dict[str, int] = {
     # Combined baseline after merging #1131 (+2), #1393 (+11), and #1314 (+2)
     # onto the pre-existing 270: 285.
     "workflow.py": 285,
+    # Issue #1317: verbatim extraction of the dead-worker/session-reap
+    # family out of workflow.py into dead_worker_reap.py (byte-identical
+    # move, no write-path changes). These 11 raw sites are the same
+    # pre-existing calls that were already counted inside workflow.py's
+    # baseline above -- relocated, not new. workflow.py's own actual count
+    # drops accordingly (285 -> 266 at this PR), which the shrink-only
+    # ratchet accepts without a baseline edit; only the newly-introduced
+    # module needs its own entry.
+    "dead_worker_reap.py": 11,
     # Issue #1423: +2 raw primitives in _reap_idle_foreign_writer (log_event
     # for the foreign_writer_reaped instrumentation event, and kill_orphan_pid
     # for sweeping the reaped writer's orphan processes). This is a standalone
@@ -872,6 +888,14 @@ _RATCHET_BASELINE: dict[str, int] = {
     # kill_orphan_pid is a process-kill primitive, not a state write. The
     # ratchet holds at the new count until worktree.py's conversion wave.
     "worktree.py": 3,
+    # Issue #763: +1 raw log_event call in detect_capacity_starvation_escalation
+    # (the sustained-window capacity-starvation escalation event). This is a
+    # standalone function in capacity_starvation_escalation.py, not an
+    # OrchestratorApp method, so it has no self.write_gate receiver and cannot
+    # use Convention A without a write_gate parameter threaded through every
+    # caller — the same out-of-wave pattern as the #1423 worktree.py sites.
+    # The ratchet holds at the new count until this module's conversion wave.
+    "capacity_starvation_escalation.py": 1,
 }
 
 

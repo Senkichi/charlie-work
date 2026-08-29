@@ -6,7 +6,7 @@ stall) with plain data collection + threshold comparison. An LLM only ever
 sees this script's stdout.
 
 Run via:
-    cd /c/Users/senki/repos/charlie-work
+    cd /path/to/charlie-work
     env -u VIRTUAL_ENV uv run --active --no-sync python scripts/heartbeat_check.py
 
 Output contract (stdout): one line per check, either
@@ -98,7 +98,7 @@ LOG_FRESHNESS_STALE_MINUTES = 30
 # `loop_started` is logged per repo (workflow.py's `_loop_impl`, into that
 # repo's own events.db), and the supervisor processes repos sequentially in
 # one pass, so a single repo's gap is gated by how long its SIBLING repos
-# take, not by supervisor health -- job-cannon's reconcile alone walks
+# take, not by supervisor health -- a sibling registered repo's reconcile alone walks
 # ~690 issues / ~877 PRs and can push charlie-work's gap past 50 minutes on
 # a perfectly healthy fleet.
 #
@@ -131,6 +131,11 @@ MIN_BEAT_INTERVAL_MINUTES = 10
 # loop) and threaded into every consumer, so this timeout is paid at most once
 # per beat, not once per consumer per repo.
 CHARLIE_STATUS_TIMEOUT_SECONDS = 120
+# Issue #1463: ``fleet status --json`` serves from the status-snapshot cache
+# by default. A cache older than this threshold means the blocked set may not
+# reflect the current state — surface a staleness warning so downstream checks
+# annotate their output as degraded rather than silently trusting stale data.
+STATUS_CACHE_STALE_SECONDS = 600
 
 # in-progress-stale worktree mtime threshold (issue #1379). The events-based
 # check flags an issue when its GitHub updatedAt hasn't moved across 2 beats,
@@ -237,7 +242,7 @@ class SuppressionEntry:
 
     `check` is the *base* check name as emitted, with no repo suffix (e.g.
     ``"stale-open-issue-mentions"``, never ``"stale-open-issue-mentions
-    Senkichi/charlie-work"``). Per-repo checks build their emitted check
+    owner/charlie-work"``). Per-repo checks build their emitted check
     string as ``f"{base} {repo.slug}"`` (the convention already used by every
     per-repo check in this file); `Report._match` reconstructs that same
     convention to test a candidate entry against an emitted check string, so
@@ -552,6 +557,17 @@ def get_blocked_issue_numbers(any_repo_root: Path) -> tuple[dict[str, set[int]],
         }
     except (KeyError, TypeError) as exc:
         return {}, f"charlie fleet status --json unexpected payload shape: {exc}"
+    # Issue #1463: surface stale-cache degradation. ``fleet status --json``
+    # serves from the status-snapshot cache by default; a very stale cache
+    # means the blocked set may not reflect the current state. The blocked
+    # data is still returned (it is the best available), but a staleness
+    # warning is returned so downstream checks annotate their output.
+    ages = [a for r in repos.values() if isinstance(a := r.get("cache_age_seconds"), (int, float))]
+    if ages and max(ages) > STATUS_CACHE_STALE_SECONDS:
+        return blocked_by_repo, (
+            f"status snapshot cache {max(ages):.0f}s old "
+            f"(>{STATUS_CACHE_STALE_SECONDS}s); blocked set may be stale"
+        )
     return blocked_by_repo, ""
 
 
@@ -2230,6 +2246,146 @@ def check_infra_blocked_events(report: Report, repo: RepoInfo, baseline: datetim
         report.ok(check, facts)
 
 
+def check_draft_pr_blocked_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
+    """Surface ``draft_pr_blocked`` events periodically (issue #1366).
+
+    A PR parked as draft-only-blocked (``workflow.py``'s ``failures_changed``
+    arm) emits one ``draft_pr_blocked`` warning event per park. The event is
+    the durable record that the park happened; this check is its first
+    automated reader, surfacing new parks since the last beat so an operator
+    sees draft-blocked PRs alongside the other stuck-state detectors in the
+    same heartbeat output rather than only via a manual
+    ``query_events(kind="draft_pr_blocked")`` grep.
+
+    Deliberately a ``report.warn`` (passive, periodic surfacing), not
+    ``report.anom``: a draft-blocked PR is a state to surface periodically,
+    not a fleet emergency -- the operator comment on issue #1366 placed this
+    kind on the periodic-surfacing path rather than the real-alert path
+    reserved for ``venv_editable_anchor_violation`` (see
+    ``check_supervisor_venv_refusal``). The db-availability guards stay
+    ``report.anom``, matching ``check_infra_blocked_events``: an unreadable
+    events.db means this check cannot vouch for the repo at all, which is a
+    genuine anomaly independent of whether any park fired.
+
+    Same db-availability posture and ISO-vs-SQLite comparison convention as
+    ``check_infra_blocked_events``: timestamps are compared in Python against
+    ``baseline`` (never in SQL) so an unparseable ``ts`` fails toward
+    visibility, not silence.
+    """
+    check = f"draft-pr-blocked-events {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.anom(check, f"cannot check: no events.db at {db_path}")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"cannot check: events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.anom(check, "cannot check: events.db has no events table")
+                return
+            rows = conn.execute(
+                "SELECT ts FROM events WHERE kind = ?",
+                ("draft_pr_blocked",),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            report.anom(check, f"cannot check: events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    new_blocked: list[str] = []
+    for (ts,) in rows:
+        ts_dt = parse_iso(ts)
+        if ts_dt is None or ts_dt > baseline:
+            new_blocked.append(ts)
+
+    facts = f"blocked_rows={len(rows)} new_since_last_beat={len(new_blocked)}"
+    if new_blocked:
+        report.warn(
+            check,
+            f"draft_pr_blocked since last beat: {len(new_blocked)} event(s) ({facts})",
+        )
+    else:
+        report.ok(check, facts)
+
+
+def check_supervisor_venv_refusal(
+    report: Report, repos: list[RepoInfo], baseline: datetime
+) -> None:
+    """Surface ``venv_editable_anchor_violation`` as a real alert (issue #1366).
+
+    The supervisor's startup guard (issue #974) refuses to run when an
+    editable ``.pth`` in the interpreter's venv points outside the
+    interpreter-derived checkout -- everything below that refusal would run
+    unreviewed code. The refusal returns before the supervisor writes its
+    heartbeat, so ``check_supervisor_heartbeat``'s freshness check only
+    catches the *indirect* symptom (a stale or absent heartbeat); the
+    violation event is the only direct evidence of *why* the supervisor is
+    not running. Before this check that event had no automated reader beyond
+    the log line written at the refusal -- a silent refusal could stall the
+    whole supervisor with nothing but a log line as evidence.
+
+    This is the real-alert path the operator comment on issue #1366 reserved
+    for this kind: a new ``venv_editable_anchor_violation`` event since the
+    last beat is an ANOMALY (flips the exit code), not a passive WARN -- the
+    cost of an unnoticed supervisor refusal is much higher than the cost of
+    an unnoticed draft PR. It runs alongside ``check_supervisor_heartbeat``
+    in the same supervisor-health section of the heartbeat output.
+
+    The event is logged to a per-repo ``events.db`` (``run_fleet_supervise``
+    logs to the orchestrator repo's own state dir; ``run_supervised`` logs to
+    the supervised repo's), so this check scans every registered repo's
+    ``events.db`` and aggregates the findings into one fleet-level alert. A
+    repo with no ``events.db`` (or one with no ``events`` table) is skipped,
+    not flagged: this check looks for an actual refusal event, and a repo
+    that has never been supervised has none to find -- the
+    ``check_supervisor_heartbeat`` freshness check separately vouches for
+    supervisor liveness.
+    """
+    check = "supervisor-venv-refusal"
+    offending: list[str] = []
+    for repo in repos:
+        db_path = repo.state_dir / "events.db"
+        if not db_path.exists():
+            continue
+        try:
+            conn = sqlite3.connect(str(db_path))
+        except sqlite3.Error:
+            continue
+        try:
+            rows = conn.execute(
+                "SELECT ts FROM events WHERE kind = ?",
+                ("venv_editable_anchor_violation",),
+            ).fetchall()
+        except sqlite3.Error:
+            conn.close()
+            continue
+        conn.close()
+        for (ts,) in rows:
+            ts_dt = parse_iso(ts)
+            if ts_dt is None or ts_dt > baseline:
+                offending.append(f"{repo.slug}@{ts}")
+
+    if offending:
+        report.anom(
+            check,
+            f"venv_editable_anchor_violation since last beat: {offending} "
+            "(supervisor refused to start -- editable .pth anchor violated, "
+            "issue #974)",
+        )
+    else:
+        report.ok(check, f"refusals_since_last_beat=0 repos_scanned={len(repos)}")
+
+
 def check_merge_flow(
     report: Report,
     repo: RepoInfo,
@@ -2788,6 +2944,7 @@ def main() -> int:
         check_error_events(report, repo, baseline)
         check_warning_events(report, repo, baseline)
         check_infra_blocked_events(report, repo, baseline)
+        check_draft_pr_blocked_events(report, repo, baseline)
         check_log_freshness(report, repo, now=now)
         check_loop_pass_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)
@@ -2801,6 +2958,7 @@ def main() -> int:
 
     check_disk_space(report, repos)
     check_runners(report)
+    check_supervisor_venv_refusal(report, repos, baseline)
     check_supervisor_heartbeat(report)
 
     save_state(new_state)

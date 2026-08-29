@@ -312,7 +312,7 @@ runner_scaling:
   enabled: true
   managed_root: "C:\\\\actions-runners"
   runner_dir_prefix: "jc-"
-  runner_name_template: "jc-9800x3d-{n}"
+  runner_name_template: "jc-selfhost-{n}"
   package_zip: "C:\\\\packages\\\\runner.zip"
   min_runners: 2
   max_runners: 20
@@ -327,7 +327,7 @@ runner_scaling:
     assert config.runner_scaling.enabled is True
     assert config.runner_scaling.managed_root == "C:\\actions-runners"
     assert config.runner_scaling.runner_dir_prefix == "jc-"
-    assert config.runner_scaling.runner_name_template == "jc-9800x3d-{n}"
+    assert config.runner_scaling.runner_name_template == "jc-selfhost-{n}"
     assert config.runner_scaling.package_zip == "C:\\packages\\runner.zip"
     assert config.runner_scaling.min_runners == 2
     assert config.runner_scaling.max_runners == 20
@@ -11494,7 +11494,7 @@ def test_ack_unauthorized_merge_records_ack_and_event(tmp_path: Path) -> None:
     paths.ensure()
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
 
-    result = app.ack_unauthorized_merge(1408, "root cause fixed in #672", by="senki")
+    result = app.ack_unauthorized_merge(1408, "root cause fixed in #672", by="operator")
 
     assert result.ok is True
     state = load_state(paths.state_file)
@@ -11503,14 +11503,14 @@ def test_ack_unauthorized_merge_records_ack_and_event(tmp_path: Path) -> None:
     entry = acks["1408"]
     assert entry["reason"] == "root cause fixed in #672"
     assert entry["acknowledged_at"]
-    assert entry["by"] == "senki"
+    assert entry["by"] == "operator"
 
     # The ack must be auditable: an event carries who/why/when.
     acked = [e for e in state["events"] if e["kind"] == "unauthorized_merge_acknowledged"]
     assert len(acked) == 1
     assert acked[0]["payload"]["pr"] == 1408
     assert acked[0]["payload"]["reason"] == "root cause fixed in #672"
-    assert acked[0]["payload"]["by"] == "senki"
+    assert acked[0]["payload"]["by"] == "operator"
 
 
 def test_ack_unauthorized_merge_requires_reason(tmp_path: Path) -> None:
@@ -11570,13 +11570,13 @@ def test_cli_tripwire_ack_writes_state(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "build_app", lambda args: app)
 
     exit_code = cli.main(
-        ["tripwire", "ack", "1408", "--reason", "root cause fixed in #672", "--by", "senki"]
+        ["tripwire", "ack", "1408", "--reason", "root cause fixed in #672", "--by", "operator"]
     )
     assert exit_code == 0
 
     acks = load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]
     assert acks["1408"]["reason"] == "root cause fixed in #672"
-    assert acks["1408"]["by"] == "senki"
+    assert acks["1408"]["by"] == "operator"
 
 
 def test_cli_tripwire_ack_requires_reason(monkeypatch, capsys, tmp_path: Path) -> None:
@@ -23911,12 +23911,12 @@ def test_worker_rework_reply_is_not_ingested_as_external_finding(
     fake_gh.pr_external_issue_comments[456] = [
         {
             "body": human_finding,
-            "user": {"login": "Senkichi", "type": "User"},
+            "user": {"login": "operator", "type": "User"},
             "created_at": "2026-08-09T12:00:00Z",
         },
         {
             "body": worker_reply,
-            "user": {"login": "Senkichi", "type": "User"},
+            "user": {"login": "operator", "type": "User"},
             "created_at": "2026-08-10T10:05:00Z",
         },
     ]
@@ -24010,7 +24010,7 @@ def test_human_comment_in_before_to_reviewed_at_gap_surfaces_next_round(
     fake_gh.pr_external_issue_comments[456] = [
         {
             "body": gap_finding,
-            "user": {"login": "Senkichi", "type": "User"},
+            "user": {"login": "operator", "type": "User"},
             "created_at": gap_comment_dt.isoformat(),
         },
     ]
@@ -24113,7 +24113,7 @@ def test_record_review_does_not_ingest_an_unstamped_crash_summary(tmp_path: Path
     fake_gh.pr_external_issue_comments[456] = [
         {
             "body": crash_body,
-            "user": {"login": "Senkichi", "type": "User"},
+            "user": {"login": "operator", "type": "User"},
             "created_at": "2026-08-09T12:00:00Z",
         },
         {
@@ -24164,7 +24164,7 @@ def test_record_review_does_not_ingest_a_synthetic_launch_failed_crash_summary(
     fake_gh.pr_external_issue_comments[456] = [
         {
             "body": crash_body,
-            "user": {"login": "Senkichi", "type": "User"},
+            "user": {"login": "operator", "type": "User"},
             "created_at": "2026-08-09T12:00:00Z",
         }
     ]
@@ -38811,7 +38811,7 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch(
-            "charlie_work.workflow.sweep_orphan_processes",
+            "charlie_work.dead_worker_reap.sweep_orphan_processes",
             return_value=[{"pid": 3492, "name": "python.exe", "command_line": "python worker.py"}],
         ),  # Fixed mock return
         patch(
@@ -38927,7 +38927,7 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -39003,7 +39003,7 @@ def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path:
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -39057,7 +39057,7 @@ def test_stall_reap_falls_back_to_stalled_when_no_throttle_signature(tmp_path: P
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -39113,7 +39113,7 @@ def test_dispatch_defers_after_stall_reap_sets_throttled_until(tmp_path: Path) -
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -39229,7 +39229,9 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
         patch("charlie_work.claude_code.read_worker_records", return_value=[dead_worker]),
         patch("charlie_work.devin_shell.is_session_alive", side_effect=lambda r: r.pid != 1000),
         patch("charlie_work.claude_code.is_worker_alive", side_effect=lambda r: r.pid != 1002),
-        patch("charlie_work.workflow.sweep_orphan_processes", side_effect=mock_sweep_orphan),
+        patch(
+            "charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=mock_sweep_orphan
+        ),
         patch("charlie_work.workflow.os.name", "nt"),  # Force Windows path
         patch("subprocess.run", side_effect=mock_subprocess_run),
     ):
@@ -41381,9 +41383,12 @@ def test_redispatch_timestamps_pruned_outside_window(tmp_path: Path) -> None:
 def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     """Test that redispatch_at is only written by known call sites."""
     # This test verifies by code inspection that redispatch_at is only written in:
-    # 1. dispatch_rework normal paths (success + failure + no-op rework pre-dispatch).
-    # 2. _classify_dead_sessions_and_update_throttle_state normal paths.
-    # 3. _reap_restore_rework_requested (issue #315 review finding 2).
+    # 1. dispatch_rework normal paths (success + no-op rework pre-dispatch) --
+    #    workflow.py, OrchestratorApp.dispatch_rework.
+    # 2. _classify_dead_sessions_and_update_throttle_state normal paths --
+    #    dead_worker_reap.py (issue #1317: moved verbatim from workflow.py).
+    # 3. _reap_restore_rework_requested (issue #315 review finding 2) --
+    #    dead_worker_reap.py (issue #1317: moved verbatim from workflow.py).
     # Escalated paths now consolidate on _escalate_issue and pass redispatch_at
     # through issue_extra, so direct entry["redispatch_at"] assignments only
     # remain in the non-escalated branches below.
@@ -41400,15 +41405,27 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     # dispatch_selection.py dropped the naive count to 4 with zero change to
     # any real write site -- a false regression signal, the opposite failure
     # mode from AC7's hazard test but the same root cause (name/text search
-    # over source that doesn't distinguish code from prose). Both files are
-    # scanned and summed via real ast.Assign nodes so neither a docstring
+    # over source that doesn't distinguish code from prose). All three files
+    # are scanned and summed via real ast.Assign nodes so neither a docstring
     # quote nor a future extraction of one of the three named call sites can
     # produce a false pass or a false failure here.
+    #
+    # issue #1317: the dead-worker/session-reap extraction moved call sites 2
+    # and 3 above out of workflow.py into dead_worker_reap.py verbatim -- the
+    # writers still exist, only their module changed (confirmed real split:
+    # workflow.py=2, dispatch_selection.py=0, dead_worker_reap.py=2, total
+    # unchanged at 4). dead_worker_reap.py is added to the scan so this guard
+    # keeps failing if a genuinely NEW, unknown writer appears in any of the
+    # three files, rather than going blind to two known call sites because
+    # they changed address.
     import ast
 
     workflow_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
     dispatch_selection_path = (
         Path(__file__).parents[1] / "src" / "charlie_work" / "dispatch_selection.py"
+    )
+    dead_worker_reap_path = (
+        Path(__file__).parents[1] / "src" / "charlie_work" / "dead_worker_reap.py"
     )
 
     def _count_redispatch_at_assignments(path: Path) -> int:
@@ -41429,12 +41446,15 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
         return count
 
     # Any unexpected increase means a new call site is writing redispatch_at.
-    redispatch_assignments = _count_redispatch_at_assignments(
-        workflow_path
-    ) + _count_redispatch_at_assignments(dispatch_selection_path)
+    redispatch_assignments = (
+        _count_redispatch_at_assignments(workflow_path)
+        + _count_redispatch_at_assignments(dispatch_selection_path)
+        + _count_redispatch_at_assignments(dead_worker_reap_path)
+    )
     assert redispatch_assignments == 4, (
         'Expected 4 real entry["redispatch_at"] assignment statements across '
-        f"workflow.py and dispatch_selection.py, found {redispatch_assignments}"
+        "workflow.py, dispatch_selection.py, and dead_worker_reap.py, found "
+        f"{redispatch_assignments}"
     )
 
 
@@ -45873,7 +45893,12 @@ def test_classify_dead_sessions_no_commits_relabels_to_ready(tmp_path: Path) -> 
 
 def test_classify_dead_sessions_salvage_push_failure_fallback(tmp_path: Path) -> None:
     """Issue #252: a failed salvage push records failure and falls back to relabel."""
-    from charlie_work import workflow as workflow_module
+    # Issue #1317: push_branch is called bare-name from inside _attempt_salvage,
+    # which moved (verbatim) to dead_worker_reap.py -- so the bare-name lookup
+    # now resolves via dead_worker_reap.py's own globals, not workflow.py's.
+    # Patch it there, not on the (still-valid) workflow.py facade re-export of
+    # _classify_dead_sessions_and_update_throttle_state itself.
+    from charlie_work import dead_worker_reap as workflow_module
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
@@ -46100,7 +46125,7 @@ def test_stall_lane_api_budget_kill_over_cap(tmp_path: Path) -> None:
             "charlie_work.write_gate.kill_process_tree",
             side_effect=lambda pid, *_a, **_kw: killed_pids.extend([pid]) or [pid],
         ),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -46170,7 +46195,7 @@ def test_stall_lane_api_provider_auth_classification(tmp_path: Path) -> None:
     with (
         patch("charlie_work.worker.is_worker_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99998]),
-        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -47089,10 +47114,10 @@ def _cross_repo_issue_body() -> str:
     """
     return (
         "But **#953's code does not live in this repo.** `suite_coverage.py` is at "
-        "`C:/Users/senki/repos/ci_runners/src/ci_fleet/suite_coverage.py`; there is no "
+        "`C:/Users/operator/repos/ci_runners/src/ci_fleet/suite_coverage.py`; there is no "
         "`src/charlie_work/suite_coverage.py`. The worker, handed an isolated checkout "
         "of a repo that does not contain the file it was asked to change, went to "
-        "`C:\\Users\\senki\\repos\\ci_runners` — the **shared main checkout** — and worked there."
+        "`C:\\Users\\operator\\repos\\ci_runners` — the **shared main checkout** — and worked there."
     )
 
 

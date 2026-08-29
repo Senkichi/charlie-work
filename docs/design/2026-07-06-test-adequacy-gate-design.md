@@ -82,7 +82,7 @@ write the tests" stage, for these reasons:
 - Deterministic detection of *assertionless* test additions on repos whose assertion style is not
   configured — that case downgrades to a Tier-2 warning by default (§5.1 step 5; resolves R1↔step-5).
 - Requiring coverage tooling in consumer repos. `charlie-work` is repo-agnostic (`--repo` targets
-  job-cannon, empericus, itself); its own `pyproject.toml` ships no coverage tooling
+  any consumer repo, itself); its own `pyproject.toml` ships no coverage tooling
   (`dev = [pytest, ruff]`, verified). The gate must not hard-require `pytest-cov`.
 - Changing worker prompts or adding a new worker type.
 

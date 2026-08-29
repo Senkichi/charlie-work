@@ -13,7 +13,18 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import ApiWorkerConfig, ConfigError, OrchestratorConfig, SupervisorConfig
+from .config import (
+    ApiWorkerConfig,
+    ConfigError,
+    OrchestratorConfig,
+    RunnerCapacityEscalationConfig,
+    SupervisorConfig,
+)
+from .capacity_starvation_escalation import (
+    CAPACITY_STARVATION_ESCALATION_KIND,
+    build_capacity_starvation_attention_entry,
+    detect_capacity_starvation_escalation,
+)
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .fleet_registry import _load_registry, count_fleet_runners
 from . import layout
@@ -750,6 +761,33 @@ def _run_fleet_allocation_prologue(
                     "message": slot.message,
                 }
             )
+
+    # Issue #763: surface sustained capacity starvation as an operator-visible
+    # escalation. The allocator correctly declines to mint registrations (it
+    # can only move already-configured listeners), so a repo pinned at its
+    # registered capacity while budget sits idle is permanently unsatisfiable
+    # by allocation alone -- and before this, that conclusion lived only in a
+    # log line and a per-pass ``notes`` entry the digest deliberately drops.
+    # This runs on the plan the pass just computed (``result.plan`` is present
+    # here: the error and skipped branches above returned early), is gated on
+    # ``not dry_run`` inside the detector for the same side-effect reason the
+    # allocation pass's hysteresis persist is, and is inert when the section is
+    # disabled or the config object predates the field.
+    escalation_config = getattr(global_config, "runner_capacity_escalation", None)
+    if (
+        escalation_config is not None
+        and isinstance(escalation_config, RunnerCapacityEscalationConfig)
+        and result.plan is not None
+    ):
+        events.extend(
+            detect_capacity_starvation_escalation(
+                result.plan,
+                fleet_dir_override=fleet_dir_override,
+                fleet_state_path=fleet_state_path,
+                escalation_config=escalation_config,
+                dry_run=dry_run,
+            )
+        )
 
     return events
 
@@ -1603,6 +1641,18 @@ def _build_fleet_attention_digest(
             # The event stays in events.db and the prologue logs its inputs at INFO,
             # which is where standing conditions belong.
             continue
+        elif event_type == CAPACITY_STARVATION_ESCALATION_KIND:
+            # Issue #763: the sustained-window capacity-starvation
+            # escalation. This is occurrence-style, not persistent-health: the
+            # detector is edge-triggered per episode (its sidecar's
+            # ``escalated`` flag suppresses re-firing), so the event only
+            # reaches this list on the single pass the window is crossed --
+            # it must not be deduped by ``_filter_fleet_health_transitions``,
+            # which would collapse the one real rising edge into silence.
+            # ``adapter_kind`` carries the starved repo so an operator can see
+            # *which* repo is starving, not just "fleet".
+            entries.append(build_capacity_starvation_attention_entry(event))
+            persistent_mask.append(False)
         else:
             # Visible by default. This chain used to end here, so any event type
             # without an explicit branch was dropped silently — which is how the
