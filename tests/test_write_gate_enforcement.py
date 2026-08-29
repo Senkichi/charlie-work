@@ -853,7 +853,17 @@ _RATCHET_BASELINE: dict[str, int] = {
     # after the extraction), which the shrink-only ratchet accepts without a
     # further baseline edit; only the newly-introduced module needs its own
     # entry.
-    "workflow.py": 196,
+    #
+    # Issue #1132: +4 raw primitives for the foreign_issue_ref self-heal path
+    # (2 save_state calls in the module-level _clear_foreign_issue_ref_marker
+    # and _touch_foreign_issue_ref_marker helpers, and 2 log_event calls in
+    # _loop_body's reprobe/clear and transient-classification branches). These
+    # are out-of-wave raw sites in unconverted territory -- _loop_body already
+    # has ~190 raw calls and the helpers are module-level free functions with
+    # no self.write_gate receiver, matching the existing raw pattern in this
+    # area. The ratchet holds at the new count until _loop_body's full
+    # conversion wave.
+    "workflow.py": 198,
     "dead_worker_reap.py": 11,
     # Issue #1423: +2 raw primitives in _reap_idle_foreign_writer (log_event
     # for the foreign_writer_reaped instrumentation event, and kill_orphan_pid
