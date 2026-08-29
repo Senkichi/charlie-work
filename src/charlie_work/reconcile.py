@@ -29,8 +29,17 @@ from pathlib import Path
 from typing import Any
 
 from .closing_reference import closing_issues_referenced_numbers, validate_closing_reference
-from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
-from .escalation import _escalation_edge, _escalation_label, _repair_reason_class
+from .config import (
+    DETERMINISTIC_ESCALATION_FAILURE_KINDS,
+    DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
+    OrchestratorConfig,
+)
+from .escalation import (
+    _escalate_issue,
+    _escalation_edge,
+    _escalation_label,
+    _repair_reason_class,
+)
 from .github import (
     GitHubError,
     GitHubLike,
@@ -41,7 +50,7 @@ from .github import (
     linked_issue_number,
 )
 from .instrumentation import log_event, query_events
-from .labels import TransitionOutcome, transition
+from .labels import TransitionOutcome, _edges, transition
 from .paths import resolved_layout, runtime_paths
 from .pr_create_retry import create_pr_with_retry
 from .process_utils import kill_process_tree
@@ -49,6 +58,7 @@ from .review_decision import review_decision as _resolve_review_decision
 from .state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     ESCALATION_REASON_CLASS_BY_EVENT_KIND,
+    ESCALATION_REASON_CLASSES,
     ORCHESTRATOR_OWNED_ISSUE_STATUSES,
     PASSIVE_OPEN_STATUS,
     append_event,
@@ -65,6 +75,7 @@ from .worktree import (
     resolve_base_branch_name,
     summarize_branch_work,
 )
+from .salvage_superseded import check_salvage_superseded, salvage_skip_event_kind
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +112,16 @@ class DriftItem:
     # Unused by every other kind.
     reason: str | None = None
     failure_kind: str | None = None
+    # Issue #1402: structured "why" for ``mergequeue_revoked`` drift items, so
+    # ``merge_ready`` can distinguish reconcile's own cooperative self-revocation
+    # (stale-head approval, pending carry-forward re-validation -- the #819 gap
+    # fix) from Aviator's silent #823 rejection. ``"stale_head_pending_carry_forward"``
+    # means the recorded decision IS ``"approved"`` but at an older head a rebase
+    # has since moved past; ``"not_approved"`` covers every other cause (missing
+    # decision file, ``request_changes``/never-reviewed verdict). Written to
+    # ``state["prs"][n]["mergequeue_revoked_reason"]`` by ``apply_fixes`` so
+    # ``merge_ready`` can read it cross-pass. Unused by every other kind.
+    mergequeue_revoked_reason: str | None = None
 
 
 # State-machine statuses that mean "this issue is in the orchestrator's pipeline".
@@ -172,7 +193,7 @@ DORMANT_CONVERGENCE_EXCLUDED_STATUSES: frozenset[str] = frozenset({"escalated"})
 # next pass. Reverting it there is not a repair, it is one half of a loop --
 # reconcile clears the label and resets status to PASSIVE_OPEN_STATUS, the
 # router re-sets both, forever, at whatever the reconcile cadence happens to be.
-# Measured in job-cannon at a ~29-minute period across 26 issues with zero
+# Measured in a sibling repo at a ~29-minute period across 26 issues with zero
 # forward progress, because _dispatch_rework_impl selects on
 # status == "rework_requested" (workflow.py) and the revert removes the issue
 # from that scan entirely.
@@ -304,6 +325,13 @@ def _normalize_reconcile_pr(pr: dict[str, Any]) -> dict[str, Any]:
             "labels": pr.get("labels", []),
             "isCrossRepository": is_cross_repository,
             "headRefOid": head.get("sha"),
+            # Issue #1398: the REST ``pulls`` endpoint names this ``closed_at``
+            # (snake_case); normalize to the ``gh pr list --json`` camelCase
+            # ``closedAt`` so the closed-unmerged convergence rules can ask
+            # whether the issue's active session postdates the PR close (the
+            # redispatch shape the un-gate sweep produces). ``None`` for
+            # OPEN/merged-by-state PRs and for any payload that omits it.
+            "closedAt": pr.get("closed_at"),
         }
 
     return pr
@@ -418,9 +446,9 @@ def _fetch_issues(gh: GitHubLike) -> list[dict[str, Any]]:
     return all_issues
 
 
-# Aviator (job-cannon/charlie-work's merge-queue bot) owns these strings; they
+# Aviator (this fleet's merge-queue bot, shared across registered repos) owns these strings; they
 # are not orchestrator LabelConfig values. Verified live against real Aviator
-# check-run output (job-cannon PR #1400, 2026-07-27): conclusion == "failure",
+# check-run output (a sibling repo's PR #1400, 2026-07-27): conclusion == "failure",
 # output.summary starts with "This PR is not ready to merge (currently in
 # state blocked): PR has a blocked label, remove to re-queue."
 AVIATOR_CHECK_NAME = "aviator/checks"
@@ -435,7 +463,7 @@ def _pr_review_approved_at_head(
     Re-adding the Aviator ``mergequeue`` label must never be safer than the
     normal ship_it path, which only queues a PR when its review decision
     resolves to ``decision == "approved"`` at the PR's *current* head.
-    Without this check, ``detect_aviator_stale_blocked`` re-queued job-cannon
+    Without this check, ``detect_aviator_stale_blocked`` re-queued a sibling repo's
     PR #1408 (issue #1404) and PR #1392 (issue #1268) for Aviator merge while
     their recorded decisions were ``request_changes``/never-reviewed --
     Aviator then merged both unreviewed once CI was green, since Aviator's
@@ -464,7 +492,7 @@ def detect_aviator_stale_blocked(
     Aviator sometimes blocks a PR (setting ``blocked`` and stripping
     ``mergequeue``) on a real CI failure, then never re-evaluates once the
     underlying cause clears (a stale branch update, a flaky test passing on
-    rerun, ...) -- confirmed live on job-cannon #1387/#1400/#1398/#1392
+    rerun, ...) -- confirmed live on a sibling repo's #1387/#1400/#1398/#1392
     (2026-07-27), each stuck for hours with every real CI check green.
 
     Deliberately NOT folded into ``detect_drift``: that function's contract
@@ -508,15 +536,10 @@ def detect_aviator_stale_blocked(
 
         # Multiple check-run entries can exist per name after a rerun; the
         # highest numeric "id" is the most recent (GitHub assigns check-run
-        # ids monotonically per repo) -- never trust list order.
-        latest_by_name: dict[str, dict[str, Any]] = {}
-        for run in check_runs:
-            name = run.get("name")
-            if not name:
-                continue
-            current = latest_by_name.get(name)
-            if current is None or int(run.get("id") or 0) > int(current.get("id") or 0):
-                latest_by_name[name] = run
+        # ids monotonically per repo) -- never trust list order. Shared with
+        # detect_mergequeue_wedged so the two detectors cannot disagree about
+        # which run is current for a given name.
+        latest_by_name = _latest_check_runs_by_name(check_runs)
 
         aviator_run = latest_by_name.get(AVIATOR_CHECK_NAME)
         if aviator_run is None or aviator_run.get("conclusion") != "failure":
@@ -576,8 +599,8 @@ def _mergequeue_revocation_detail(
     pr_number: int,
     head_sha: str,
     mergequeue_label: str,
-) -> str:
-    """Human-readable explanation for why ``mergequeue`` is being revoked.
+) -> tuple[str, str]:
+    """Human-readable explanation and structured reason for a ``mergequeue`` revocation.
 
     Distinguishes "genuinely not approved" (missing/unreadable decision
     file, or a recorded ``request_changes``/never-reviewed verdict -- the
@@ -589,20 +612,34 @@ def _mergequeue_revocation_detail(
     stale-head case alone is not safe either), but the emitted detail/event
     payload makes the distinction explicit rather than collapsing both into
     one indistinguishable string.
+
+    Returns ``(detail, reason)`` where ``detail`` is the human-readable
+    explanation and ``reason`` is the structured path identifier
+    (``"stale_head_pending_carry_forward"`` or ``"not_approved"``) that
+    ``apply_fixes`` writes to ``state["prs"][n]["mergequeue_revoked_reason"]``
+    so ``merge_ready`` can distinguish reconcile's own cooperative
+    self-revocation from Aviator's #823 silent rejection (issue #1402).
     """
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     resolved = _resolve_review_decision(paths.prs / f"pr-{pr_number}", None, head_sha)
     if resolved.missing:
-        return f"no readable review-decision.json for PR #{pr_number}"
+        return (
+            f"no readable review-decision.json for PR #{pr_number}",
+            "not_approved",
+        )
     verdict = resolved.decision
     if verdict != "approved":
-        return f"recorded decision is {verdict!r}, not 'approved'"
+        return (
+            f"recorded decision is {verdict!r}, not 'approved'",
+            "not_approved",
+        )
     reviewed_head = resolved.reviewed_head_sha
     reviewed_head_display = str(reviewed_head)[:12] if reviewed_head else repr(reviewed_head)
     return (
         f"approved at stale head {reviewed_head_display} but current head is "
         f"{head_sha[:12]} -- deferring re-validation to merge_ready's carry-forward "
-        f"check rather than {mergequeue_label!r} staying authorized on an unvalidated head"
+        f"check rather than {mergequeue_label!r} staying authorized on an unvalidated head",
+        "stale_head_pending_carry_forward",
     )
 
 
@@ -725,7 +762,7 @@ def detect_mergequeue_not_approved(
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=config.dispatch.branch_prefix,
         )
-        reason = _mergequeue_revocation_detail(
+        reason_detail, revoked_reason = _mergequeue_revocation_detail(
             config, repo_root, pr_number, head_sha, mergequeue_label
         )
         drift.append(
@@ -735,14 +772,283 @@ def detect_mergequeue_not_approved(
                 pr_number=pr_number,
                 detail=(
                     f"PR #{pr_number} carries {mergequeue_label!r} but is not approved "
-                    f"at its current head {head_sha[:12]} ({reason}); revoking to close "
+                    f"at its current head {head_sha[:12]} ({reason_detail}); revoking to close "
                     "the irrevocable-mergequeue gap (issue #819)"
                 ),
                 fix_actions=(f"remove label {mergequeue_label!r} from PR #{pr_number}",),
                 remove_labels=(mergequeue_label,),
+                mergequeue_revoked_reason=revoked_reason,
             )
         )
     return drift
+
+
+def _latest_check_runs_by_name(
+    check_runs: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Reduce a ``commit_check_runs`` list to the most recent run per name.
+
+    Multiple check-run entries can exist per name after a rerun; the highest
+    numeric ``id`` is the most recent (GitHub assigns check-run ids
+    monotonically per repo) -- never trust list order. Mirrors the inline
+    reduction in ``detect_aviator_stale_blocked``; extracted here so the wedge
+    watchdog and the stale-blocked detector cannot disagree about which run is
+    current for a given name.
+    """
+    latest_by_name: dict[str, dict[str, Any]] = {}
+    for run in check_runs:
+        name = run.get("name")
+        if not name:
+            continue
+        current = latest_by_name.get(name)
+        if current is None or int(run.get("id") or 0) > int(current.get("id") or 0):
+            latest_by_name[name] = run
+    return latest_by_name
+
+
+def detect_mergequeue_wedged(
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    state: dict[str, Any],
+    *,
+    repo_root: Path | None = None,  # noqa: ARG001 -- signature parity with siblings
+) -> list[DriftItem]:
+    """Detect PRs wedged in Aviator's merge queue and route them to escalation.
+
+    Issue #1401: a PR handed to Aviator (carrying the ``mergequeue`` label) can
+    sit in the queue indefinitely with no progress, yet stay invisible after
+    its first ``merge_failed_attempt_alarm``. That alarm is one-shot at
+    ``consecutive_failed_merge_attempts == threshold`` and the counter resets
+    to 0 on any ``can_merge`` pass, so a PR alternating can_merge true/false --
+    or one Aviator itself keeps failing -- never re-crosses the threshold.
+    Live case: a sibling repo's PR #1751 carried ``mergequeue`` for 28+ hours with
+    Aviator's own ``blocked`` label and a completed ``aviator/checks`` FAILURE,
+    ``merge_ready`` firing ~280 times without merging, exactly one alarm ever.
+
+    Two independent triggers, OR'd:
+
+    1. **Aviator definitive failure** (the #1751 shape): the PR carries
+       ``mergequeue`` AND Aviator's own ``blocked`` label while
+       ``aviator/checks`` is a completed ``FAILURE``. This is a terminal
+       "Aviator will not merge this" signal, not a heuristic, so it has no
+       time floor. Deliberately gated on NOT all-other-checks-green: when every
+       non-aviator check is green the ``blocked`` label is STALE (Aviator just
+       has not re-evaluated), which is ``detect_aviator_stale_blocked``'s
+       recovery case (remove ``blocked``, re-queue) -- escalating there too
+       would re-queue AND escalate the same PR in one pass. The genuine-failure
+       case (a real non-aviator check is red) is the one with no recovery path,
+       which is exactly what this trigger is for. ``detect_aviator_stale_blocked``
+       correctly does not fire on #1751 because its ``other_checks_green``
+       gate fails; this function is the missing escalation route for that gap.
+
+    2. **Time-in-queue with no head movement**: the PR has carried
+       ``mergequeue`` for more than ``auto_merge.mergequeue_wedge_hours`` hours
+       with no head movement (Aviator never rebased it) and no merge. Dwell is
+       measured from the ``mergequeue_since``/``mergequeue_head_sha`` fields
+       ``merge_ready`` stamps in ``state["prs"][n]`` when a PR enters the queue
+       at a given head; a head advance (Aviator rebase) resets both, so the
+       timer measures true no-progress dwell, not wall time since the first
+       handoff. ``mergequeue_wedge_hours == 0`` disables this trigger only;
+       trigger 1 stays armed.
+
+    Both triggers route to the same escalation: strip ``mergequeue`` from the
+    PR and, when a linked issue is resolvable, transition the issue to
+    ``human_needed`` (the canonical "escalated" edge). ``apply_fixes`` clears
+    the dwell-tracking fields so the post-fix re-detect does not re-fire
+    trigger 2 for the same window.
+
+    Like ``detect_aviator_stale_blocked``/``detect_mergequeue_not_approved``,
+    deliberately NOT folded into ``detect_drift``: that function's contract
+    pins it to exactly two ``gh.run`` list calls, and the Aviator-failure
+    trigger needs a per-PR ``commit_check_runs`` walk gated on the (rare)
+    ``blocked`` label. The cost scales with how many PRs are actually stuck,
+    not the full open-PR count.
+    """
+    mergequeue_label = config.auto_merge.mergequeue_label
+    if not mergequeue_label:
+        return []
+    wedge_hours = config.auto_merge.mergequeue_wedge_hours
+    drift: list[DriftItem] = []
+    prs_state = state.get("prs", {})
+    now = datetime.now(UTC)
+    for pr in _fetch_prs(gh):
+        if str(pr.get("state") or "").upper() != "OPEN":
+            continue
+        names = label_names(pr)
+        if mergequeue_label not in names:
+            continue
+        pr_number = pr.get("number")
+        head_sha = pr.get("headRefOid")
+        if pr_number is None or not head_sha:
+            continue
+        pr_number = int(pr_number)
+        head_sha = str(head_sha)
+
+        wedge_reason: str | None = None
+        # Trigger 1: Aviator definitive failure. Only walk check runs when the
+        # PR also carries Aviator's ``blocked`` label (rare in steady state),
+        # matching detect_aviator_stale_blocked's cost discipline.
+        if "blocked" in names:
+            check_runs = gh.commit_check_runs(head_sha)
+            if check_runs:
+                latest_by_name = _latest_check_runs_by_name(check_runs)
+                aviator_run = latest_by_name.get(AVIATOR_CHECK_NAME)
+                if aviator_run is not None and aviator_run.get("conclusion") == "failure":
+                    other_checks_green = all(
+                        run.get("conclusion") == "success"
+                        for name, run in latest_by_name.items()
+                        if name != AVIATOR_CHECK_NAME
+                    )
+                    if not other_checks_green:
+                        wedge_reason = "aviator_failure"
+
+        # Trigger 2: time-in-queue with no head movement.
+        if wedge_reason is None and wedge_hours > 0:
+            pr_entry = prs_state.get(str(pr_number), {})
+            mq_since = pr_entry.get("mergequeue_since")
+            mq_head = pr_entry.get("mergequeue_head_sha")
+            if mq_since and mq_head == head_sha:
+                try:
+                    since_dt = datetime.fromisoformat(str(mq_since))
+                except (ValueError, TypeError):
+                    since_dt = None
+                if since_dt is not None:
+                    if since_dt.tzinfo is None:
+                        since_dt = since_dt.replace(tzinfo=UTC)
+                    dwell_hours = (now - since_dt).total_seconds() / 3600.0
+                    if dwell_hours > wedge_hours:
+                        wedge_reason = "time_in_queue"
+
+        if wedge_reason is None:
+            continue
+
+        issue_number = linked_issue_number(
+            pr,
+            is_cross_repository=pr.get("isCrossRepository"),
+            branch_prefix=config.dispatch.branch_prefix,
+        )
+        fix_actions: list[str] = [f"remove label {mergequeue_label!r} from PR #{pr_number}"]
+        add_labels: tuple[str, ...] = ()
+        if issue_number is not None:
+            fix_actions.append(f"escalate issue #{issue_number} to {config.labels.human_needed!r}")
+            add_labels = (config.labels.human_needed,)
+        if wedge_reason == "aviator_failure":
+            detail = (
+                f"PR #{pr_number} is wedged in Aviator's merge queue: it carries both "
+                f"{mergequeue_label!r} and Aviator's 'blocked' label with "
+                f"{AVIATOR_CHECK_NAME} completed FAILURE and a genuinely failing "
+                "non-aviator check; escalating to a human (issue #1401)"
+            )
+        else:
+            detail = (
+                f"PR #{pr_number} has carried {mergequeue_label!r} for more than "
+                f"{wedge_hours}h with no head movement and no merge; escalating to a "
+                "human (issue #1401)"
+            )
+        drift.append(
+            DriftItem(
+                kind="mergequeue_wedged",
+                issue_number=issue_number,
+                pr_number=pr_number,
+                detail=detail,
+                fix_actions=tuple(fix_actions),
+                remove_labels=(mergequeue_label,),
+                add_labels=add_labels,
+            )
+        )
+    return drift
+
+
+def _parse_iso_utc(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 timestamp (``Z`` or ``+00:00`` suffix) to a UTC datetime.
+
+    Returns ``None`` for missing or malformed input. This is the established
+    idiom in this codebase (state.py, worker.py, wedge_watchdog.py); it is
+    duplicated here as a module-local helper so the closed-unmerged convergence
+    rules stay in this module without a cross-module import for one parse.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _closed_pr_superseded_by_newer_session(
+    issue_entry: dict[str, Any] | None,
+    pr_number: int,
+    pr_closed_at: str | None,
+    *,
+    linked_pr_numbers: set[int] | None = None,
+) -> bool:
+    """Return True when a CLOSED-unmerged PR is NOT the issue's current PR
+    because the issue's active session postdates the PR close -- the
+    redispatch shape the un-gate sweep produces (issue #1398).
+
+    The closed-unmerged convergence rules (``closed_unmerged_pr_active_labels``
+    and ``closed_unmerged_pr_issue_state_converged``) key only on "issue is
+    OPEN and has an active status / active label" and "this PR is CLOSED
+    unmerged". They never asked whether the issue's *current* active state
+    belongs to a newer session than the closed PR. After an un-escalate +
+    re-dispatch (close the dirty salvage PR, re-arm the issue), the stale
+    closed PR stays linked to the issue forever, so every reconcile pass
+    stripped the new session's state -- detaching a still-live worker from
+    the orchestrator's tracking and re-selecting it as a fresh dispatch
+    candidate every pass (burning a concurrency-governor slot each time).
+
+    Two independent signals, either of which proves the closed PR is stale:
+
+    1. The issue's recorded ``pr_number`` points to a *different* PR than the
+       closed one AND that referenced PR actually appears among the issue's
+       linked/fetched PRs (``linked_pr_numbers``) -- the issue has moved on
+       to a newer, real PR.
+    2. The issue's ``dispatched_at`` (the current dispatch session's start)
+       postdates the PR's ``closedAt`` -- the active session began after this
+       PR died, i.e. a redispatch the un-gate sweep intended.
+
+    Signal 1 requires corroboration: a bare ``pr_number`` mismatch is NOT
+    proof of a newer session, because ``state.json``'s ``pr_number`` can be
+    stale or wrong for reasons unrelated to a legitimate newer PR (a botched
+    salvage, a hand edit, a race that left a dangling reference). Treating a
+    stale reference as proof would permanently skip both issue-side
+    closed-unmerged convergence rules with no other rule able to reconverge
+    the issue -- the same #558/#1066 permanent-stuck failure class this
+    codebase has repeatedly had to fix. Requiring the referenced number to
+    appear among the fetched PRs (or falling through to the dispatched_at
+    signal) keeps the skip gated on positive evidence, so a stale reference
+    lets convergence fire and the issue still reaches a terminal state.
+
+    Returns False when there is no positive evidence of a newer session, so
+    the rule fires exactly as before for a closed PR that genuinely is the
+    issue's current (dead) PR -- this guard never weakens the existing
+    convergence for the case #558/#1066 exist to handle.
+    """
+    if not isinstance(issue_entry, dict):
+        return False
+    current_pr = issue_entry.get("pr_number")
+    if current_pr is not None:
+        try:
+            current_pr_int = int(current_pr)
+        except (TypeError, ValueError):
+            current_pr_int = None
+        if (
+            current_pr_int is not None
+            and current_pr_int != pr_number
+            and linked_pr_numbers is not None
+            and current_pr_int in linked_pr_numbers
+        ):
+            return True
+    dispatched_at = issue_entry.get("dispatched_at")
+    if dispatched_at and pr_closed_at:
+        session_start = _parse_iso_utc(dispatched_at)
+        closed_at = _parse_iso_utc(pr_closed_at)
+        if session_start is not None and closed_at is not None and session_start > closed_at:
+            return True
+    return False
 
 
 def detect_drift(
@@ -805,9 +1111,19 @@ def detect_drift(
     # _escalation_label) rather than a second hardcoded label pair, so the
     # label-repair consumers below and the staleness alert further down can
     # never drift out of sync about what "escalated and parked" looks like.
+    # Issue #1314 item 4: iterate ``ESCALATION_REASON_CLASSES`` instead of a
+    # hand-picked ``"mechanical"`` literal so a future third reason_class is
+    # automatically included here -- this is the one site that would silently
+    # under-enumerate instead of failing closed if the enum grew and this set
+    # stayed literal. ``_escalation_edge`` resolves each reason_class to its
+    # edge (mechanical -> operator_queued, judgment -> escalated), and
+    # ``_escalation_label`` resolves that edge to the label it adds; the set
+    # deduplicates, so two reason_classes that park on the same label (e.g.
+    # any future class that passes through unchanged to "escalated") produce
+    # a one-element set, not a duplicate.
     escalation_parked_labels = {
-        _escalation_label(labels_cfg, "escalated"),
-        _escalation_label(labels_cfg, _escalation_edge("escalated", "mechanical")),
+        _escalation_label(labels_cfg, _escalation_edge("escalated", reason_class))
+        for reason_class in ESCALATION_REASON_CLASSES
     }
     prs = _fetch_prs(gh)
     issues = _fetch_issues(gh)
@@ -830,6 +1146,25 @@ def detect_drift(
     drift: list[DriftItem] = []
     prs_linking_issue: dict[int, list[dict[str, Any]]] = {}
     open_prs_by_issue: dict[int, list[dict[str, Any]]] = {}
+    # Issue #1398 rework: pre-compute the set of PR numbers linking each issue
+    # from the *complete* fetched snapshot. ``prs_linking_issue`` above is
+    # populated incrementally during the PR loop below, so it is only partial
+    # when the CLOSED branch (which runs inside that loop) consults it. This
+    # full map lets ``_closed_pr_superseded_by_newer_session`` corroborate a
+    # ``pr_number`` mismatch against real linked PRs rather than trusting a
+    # stale ``state.json`` reference (see the function's signal-1 docstring).
+    linked_pr_numbers_by_issue: dict[int, set[int]] = {}
+    for _pr in prs:
+        _pr_num = _pr.get("number")
+        if _pr_num is None:
+            continue
+        _issue_num = linked_issue_number(
+            _pr,
+            is_cross_repository=_pr.get("isCrossRepository"),
+            branch_prefix=config.dispatch.branch_prefix,
+        )
+        if _issue_num is not None:
+            linked_pr_numbers_by_issue.setdefault(_issue_num, set()).add(int(_pr_num))
     # Track issues already handled by session relabel to avoid double-emission
     # with issue_active_label_no_open_pr (both fire for dead-session-with-no-PR-ever)
     issues_handled_by_session_relabel: set[int] = set()
@@ -891,7 +1226,32 @@ def detect_drift(
         elif gh_state == "CLOSED":
             issue = issues_by_number.get(issue_number) if issue_number is not None else None
             issue_active_labels = label_names(issue) & labels_cfg.active if issue else set()
-            if issue is not None and issue_active_labels:
+            # Issue #1398: fetch the issue's state entry and the PR's close
+            # time once for both issue-side closed-unmerged rules. A closed
+            # PR that is NOT the issue's current PR (the issue's active
+            # session postdates the PR close, or its pr_number points
+            # elsewhere) is a stale salvage PR left linked after an
+            # un-escalate + re-dispatch -- the new session's labels/status
+            # must not be stripped. See _closed_pr_superseded_by_newer_session.
+            issue_entry = (
+                state.get("issues", {}).get(str(issue_number))
+                if issue_number is not None
+                else None
+            )
+            pr_closed_at = pr.get("closedAt")
+            if (
+                issue is not None
+                and issue_active_labels
+                and not (
+                    issue_number is not None
+                    and _closed_pr_superseded_by_newer_session(
+                        issue_entry if isinstance(issue_entry, dict) else None,
+                        pr_number,
+                        pr_closed_at,
+                        linked_pr_numbers=linked_pr_numbers_by_issue.get(issue_number),
+                    )
+                )
+            ):
                 drift.append(
                     DriftItem(
                         kind="closed_unmerged_pr_active_labels",
@@ -983,9 +1343,18 @@ def detect_drift(
             # general ACTIVE_STATE_STATUSES membership), so this exclusion
             # does not reintroduce that path's per-pass gh.issue_view() cost.
             if issue is not None and _issue_state(issue) == "OPEN" and issue_number is not None:
-                issue_entry = state.get("issues", {}).get(str(issue_number))
                 issue_status = issue_entry.get("status") if isinstance(issue_entry, dict) else None
-                if issue_status in ACTIVE_STATE_STATUSES - DORMANT_CONVERGENCE_EXCLUDED_STATUSES:
+                if (
+                    issue_status in ACTIVE_STATE_STATUSES - DORMANT_CONVERGENCE_EXCLUDED_STATUSES
+                    and not (
+                        _closed_pr_superseded_by_newer_session(
+                            issue_entry if isinstance(issue_entry, dict) else None,
+                            pr_number,
+                            pr_closed_at,
+                            linked_pr_numbers=linked_pr_numbers_by_issue.get(issue_number),
+                        )
+                    )
+                ):
                     drift.append(
                         DriftItem(
                             kind="closed_unmerged_pr_issue_state_converged",
@@ -1374,9 +1743,9 @@ def detect_drift(
                         if issue and _issue_state(issue) == "OPEN":
                             issue_labels = label_names(issue)
                             active_labels = issue_labels & labels_cfg.active
-                            if (
-                                active_labels
-                                and failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                            if active_labels and (
+                                failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                                or failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
                             ):
                                 drift.append(
                                     DriftItem(
@@ -1392,6 +1761,14 @@ def detect_drift(
                                             f"transition issue #{w.issue_number} labels via "
                                             "'redispatch_escalated' event",
                                         ),
+                                        # Issue #807: carry the failure_kind so
+                                        # apply_fixes can derive reason_class
+                                        # (judgment vs mechanical) instead of
+                                        # hardcoding "mechanical" -- a
+                                        # worktree_unsafe_local_commits death
+                                        # is a judgment call and must land
+                                        # human_needed, not operator_queue.
+                                        failure_kind=failure_kind,
                                     )
                                 )
                                 # Mark this issue as handled to avoid double-emission with
@@ -2401,7 +2778,94 @@ def apply_fixes(
                         fix_actions=tuple(fix_actions),
                         remove_labels=item.remove_labels,
                         add_labels=item.add_labels,
+                        mergequeue_revoked_reason=item.mergequeue_revoked_reason,
                     )
+                # Issue #1402: record *why* reconcile revoked ``mergequeue``
+                # so ``merge_ready`` can distinguish its own cooperative
+                # self-revocation (stale-head, pending carry-forward
+                # re-validation) from Aviator's #823 silent rejection. Only
+                # written for ``mergequeue_revoked`` items that carry a
+                # structured reason; ``aviator_stale_blocked`` leaves the
+                # field untouched.
+                if (
+                    item.kind == "mergequeue_revoked"
+                    and item.mergequeue_revoked_reason is not None
+                ):
+                    pr_key = str(item.pr_number)
+                    existing_pr = new_prs.get(pr_key, {})
+                    new_prs[pr_key] = {
+                        **existing_pr,
+                        "mergequeue_revoked_reason": item.mergequeue_revoked_reason,
+                    }
+
+        elif item.kind == "mergequeue_wedged":
+            # Issue #1401: a PR wedged in Aviator's merge queue is pulled out
+            # of the queue (strip the PR-level mergequeue label) and, when a
+            # linked issue is resolvable, escalated to a human. The issue
+            # state write goes through ``_escalate_issue`` (the single helper
+            # that owns the ``status="escalated"`` literal + the paired
+            # ``escalation_reason``/``reason_class``/``terminal_since``
+            # fields), and the issue label changes go through
+            # ``gh.add_issue_label``/``gh.remove_issue_label`` directly rather
+            # than ``transition()`` -- ``transition`` is a WriteGate-gated
+            # primitive (issue #1264 R9 ratchet) and ``apply_fixes`` is not a
+            # WriteGate consumer. The add/remove sets are still derived from
+            # the same ``_edges(config.labels)`` table ``transition`` uses, so
+            # the label disposition is identical; only the call path differs.
+            # The dwell-tracking fields (mergequeue_since/mergequeue_head_sha)
+            # are cleared so the post-fix re-detect does not re-fire the
+            # time-in-queue trigger for the same window.
+            fix_actions = list(item.fix_actions)
+            if item.pr_number is not None:
+                label_ok = True
+                for label in item.remove_labels:
+                    if not gh.remove_pr_label(item.pr_number, label):
+                        label_ok = False
+                if not label_ok:
+                    fix_actions.append("label_write_failed: true")
+                pr_key = str(item.pr_number)
+                existing_pr = new_prs.get(pr_key, {})
+                if existing_pr:
+                    new_prs[pr_key] = {
+                        k: v
+                        for k, v in existing_pr.items()
+                        if k not in ("mergequeue_since", "mergequeue_head_sha")
+                    }
+            if item.issue_number is not None:
+                # Escalate the issue state through the canonical helper.
+                # ``pr_number=None`` so the helper does not overwrite the PR
+                # state -- the PR keeps its current status with only the
+                # dwell-tracking fields cleared above; the issue is what gets
+                # escalated.
+                _escalate_issue(
+                    new_state,
+                    item.issue_number,
+                    reason="mergequeue_wedged",
+                    reason_class="judgment",
+                )
+                # Apply the "escalated" edge's label changes directly (add
+                # human_needed, remove all other workflow labels) without
+                # calling the gated ``transition`` primitive.
+                edge = _escalation_edge("escalated", "judgment")
+                add_set, remove_set = _edges(config.labels)[edge]
+                label_ok = True
+                for label in add_set:
+                    if not gh.add_issue_label(item.issue_number, label):
+                        label_ok = False
+                for label in remove_set:
+                    if not gh.remove_issue_label(item.issue_number, label):
+                        label_ok = False
+                if not label_ok:
+                    fix_actions.append("label_write_failed: true")
+            item = DriftItem(
+                kind=item.kind,
+                issue_number=item.issue_number,
+                pr_number=item.pr_number,
+                detail=item.detail,
+                fix_actions=tuple(fix_actions),
+                remove_labels=item.remove_labels,
+                add_labels=item.add_labels,
+            )
 
         elif item.kind == "stale_dispatch_pending_claim":
             if item.issue_number is not None:
@@ -2511,17 +2975,27 @@ def apply_fixes(
             # via the same "redispatch_escalated" label edge workflow.py's
             # reaper uses, instead of relabeling to ready.
             # Issue #1266: this DriftItem is only ever raised when
-            # failure_kind is in DETERMINISTIC_ESCALATION_FAILURE_KINDS (see
+            # failure_kind is in DETERMINISTIC_ESCALATION_FAILURE_KINDS or
+            # DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS (see
             # detect_drift) -- the exact gate workflow.py's own dead-session
-            # reapers use to set reason_class="mechanical" unconditionally.
-            # This is a first-escalation path (reconcile.py detected a dead
-            # worker before any workflow.py sweep did), not a label-repair
-            # path, so it must independently resolve the mechanical edge
-            # rather than hardcoding "redispatch_escalated" -- otherwise the
-            # same dead-worker condition lands on a different label purely
+            # reapers use to resolve reason_class. This is a first-escalation
+            # path (reconcile.py detected a dead worker before any
+            # workflow.py sweep did), not a label-repair path, so it must
+            # independently resolve the reason_class from the carried
+            # failure_kind rather than hardcoding it -- otherwise the same
+            # dead-worker condition lands on a different label purely
             # because reconcile.py's drift pass caught it first.
+            # Issue #807: a worktree_unsafe_local_commits death is a judgment
+            # call (reason_class="judgment", lands human_needed), not a
+            # mechanical one (reason_class="mechanical", lands
+            # operator_queue). Hardcoding "mechanical" here reproduced the
+            # #807 bug through the reconcile.py path.
             if item.issue_number is not None:
-                edge = _escalation_edge("redispatch_escalated", "mechanical")
+                deterministic_judgment = (
+                    item.failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                )
+                reason_class = "judgment" if deterministic_judgment else "mechanical"
+                edge = _escalation_edge("redispatch_escalated", reason_class)
                 result = transition(gh, config.labels, item.issue_number, edge)
                 fix_actions = list(item.fix_actions)
                 if result.outcome != TransitionOutcome.APPLIED:
@@ -2549,97 +3023,152 @@ def apply_fixes(
                 salvage_error = "repo_root not available"
                 pr_number = None
                 if repo_root is not None:
-                    push_ok, push_error = push_branch(repo_root, item.branch)
-                    if push_ok:
-                        has_pr_create = getattr(gh, "pr_create", None) is not None
-                        if has_pr_create:
-                            # Same janitor body gate as a worker-authored PR --
-                            # boilerplate alone can never satisfy it. Derive the
-                            # rationale from the worker's own commit log rather
-                            # than injecting the gate's keywords.
-                            salvage_body = (
-                                f"Closes #{item.issue_number}\n\n"
-                                "Salvaged by the orchestrator from a completed-but-unpublished "
-                                "worker worktree."
+                    # Issue #1241: before pushing/opening a PR, re-check LIVE
+                    # terminal state through the shared single enforcement
+                    # point (``check_salvage_superseded``). This salvage lane
+                    # is the second of the two salvage paths (the workflow
+                    # lane is the other) and previously had NO supersession
+                    # check -- it opened a vestigial duplicate PR whenever the
+                    # work had already landed through a sibling merge while
+                    # the dead session's snapshot still looked stranded. On a
+                    # skip, do NOT push, do NOT open a PR, and do NOT relabel
+                    # to ready (the work already landed -- redispatching would
+                    # loop). Label convergence is left to the closed-issue /
+                    # merged-PR drift kinds that fire alongside this one. The
+                    # skip is recorded as an observable event plus a
+                    # fix_action on the reconcile event.
+                    superseded, skip_reason = check_salvage_superseded(
+                        gh=gh,
+                        config=config,
+                        repo_root=repo_root,
+                        branch=item.branch,
+                        base_ref=item.base_branch,
+                        issue_number=item.issue_number,
+                    )
+                    if superseded:
+                        if state_path is not None:
+                            log_event(
+                                state_path,
+                                salvage_skip_event_kind(
+                                    skip_reason
+                                ),  # event-consumer: audit-only -- kind resolves to one of two registered literals (salvage_skipped_already_landed / salvage_skipped_superseded), both in _LEVEL_BY_KIND; the actionable label convergence happens in the sibling closed-issue / merged-PR drift kinds, this event is the observable skip record (issue #1241)
+                                {
+                                    "issue_number": item.issue_number,
+                                    "reason": skip_reason,
+                                    "branch": item.branch,
+                                },
                             )
-                            branch_summary = summarize_branch_work(
-                                repo_root,
-                                item.branch,
-                                item.base_branch,
-                                test_path_globs=config.test_adequacy.test_path_globs,
-                            )
-                            if branch_summary:
-                                salvage_body = f"{salvage_body}\n\n{branch_summary}"
-                            # cw#1263: canonicalize/validate the closing-reference
-                            # line the same way workflow.py's `_open_salvage_pr`
-                            # does, via the shared `closing_reference` module.
-                            # `workflow.py` imports `reconcile.py` (for
-                            # `apply_fixes`/`detect_drift`), so importing
-                            # `workflow._open_salvage_pr` back into this module
-                            # would cycle -- the standalone third module is what
-                            # lets both salvage-body builders share one
-                            # implementation without either importing the other.
-                            closing_ref = validate_closing_reference(
-                                salvage_body, item.issue_number, repo=_repo_slug(gh), gh=gh
-                            )
-                            salvage_body = closing_ref.body
-                            if closing_ref.changed and state_path is not None:
-                                log_event(
-                                    state_path,
-                                    "pr_closing_ref_rewritten",
-                                    {
-                                        "issue_number": item.issue_number,
-                                        "findings": list(closing_ref.findings),
-                                        "source": "session_unpublished_work_salvaged",
-                                    },
+                        item = DriftItem(
+                            kind=item.kind,
+                            issue_number=item.issue_number,
+                            pr_number=item.pr_number,
+                            detail=item.detail,
+                            fix_actions=item.fix_actions + (f"salvage_skipped: {skip_reason}",),
+                            remove_labels=(),
+                            add_labels=(),
+                            branch=item.branch,
+                            base_branch=item.base_branch,
+                        )
+                        # Skip the push/PR/relabel block: mark salvage_ok True
+                        # with no PR so the ``if salvage_ok`` label-swap block
+                        # below runs against empty remove/add label sets (a
+                        # no-op) rather than falling through to the
+                        # relabel-to-ready fallback. The work already landed;
+                        # redispatch is wrong.
+                        salvage_ok = True
+                        salvage_error = None
+                    else:
+                        push_ok, push_error = push_branch(repo_root, item.branch)
+                        if push_ok:
+                            has_pr_create = getattr(gh, "pr_create", None) is not None
+                            if has_pr_create:
+                                # Same janitor body gate as a worker-authored PR --
+                                # boilerplate alone can never satisfy it. Derive the
+                                # rationale from the worker's own commit log rather
+                                # than injecting the gate's keywords.
+                                salvage_body = (
+                                    f"Closes #{item.issue_number}\n\n"
+                                    "Salvaged by the orchestrator from a completed-but-unpublished "
+                                    "worker worktree."
                                 )
-                            # cw#1273: route through the bounded outer retry
-                            # + duplicate-PR guard instead of calling
-                            # gh.pr_create directly, matching workflow.py's
-                            # _open_salvage_pr (the other pr_create call site).
-                            retry_result = create_pr_with_retry(
-                                gh,
-                                head=item.branch,
-                                base=item.base_branch,
-                                title=f"Salvaged work for issue #{item.issue_number}",
-                                body=salvage_body,
-                                max_retries=config.runtime.pr_create_retry_max_attempts,
-                                base_seconds=config.runtime.pr_create_retry_base_seconds,
-                            )
-                            pr_number = retry_result.pr_number
-                        if pr_number is not None:
-                            salvage_ok = True
-                            # `pr_number` is falsy (0) under `dry_run`, where no
-                            # real PR was opened -- only probe a real, truthy PR
-                            # number (mirrors workflow.py::_open_salvage_pr).
-                            if pr_number and state_path is not None:
-                                query_ok = True
-                                try:
-                                    pr_view = gh.pr_view(
-                                        pr_number, fields=PR_CLOSING_ISSUES_FIELDS
-                                    )
-                                except Exception:
-                                    pr_view = {}
-                                    query_ok = False
-                                linked_numbers = closing_issues_referenced_numbers(pr_view)
-                                # Only log when the query itself succeeded --
-                                # a transient `gh` failure must not be conflated
-                                # with a genuine unlinked-PR miss (see
-                                # workflow.py::_open_salvage_pr for rationale).
-                                if query_ok and item.issue_number not in linked_numbers:
+                                branch_summary = summarize_branch_work(
+                                    repo_root,
+                                    item.branch,
+                                    item.base_branch,
+                                    test_path_globs=config.test_adequacy.test_path_globs,
+                                )
+                                if branch_summary:
+                                    salvage_body = f"{salvage_body}\n\n{branch_summary}"
+                                # cw#1263: canonicalize/validate the closing-reference
+                                # line the same way workflow.py's `_open_salvage_pr`
+                                # does, via the shared `closing_reference` module.
+                                # `workflow.py` imports `reconcile.py` (for
+                                # `apply_fixes`/`detect_drift`), so importing
+                                # `workflow._open_salvage_pr` back into this module
+                                # would cycle -- the standalone third module is what
+                                # lets both salvage-body builders share one
+                                # implementation without either importing the other.
+                                closing_ref = validate_closing_reference(
+                                    salvage_body, item.issue_number, repo=_repo_slug(gh), gh=gh
+                                )
+                                salvage_body = closing_ref.body
+                                if closing_ref.changed and state_path is not None:
                                     log_event(
                                         state_path,
-                                        "pr_closing_ref_unlinked",
+                                        "pr_closing_ref_rewritten",
                                         {
                                             "issue_number": item.issue_number,
-                                            "pr_number": pr_number,
-                                            "linked_issue_numbers": sorted(linked_numbers),
+                                            "findings": list(closing_ref.findings),
+                                            "source": "session_unpublished_work_salvaged",
                                         },
                                     )
+                                # cw#1273: route through the bounded outer retry
+                                # + duplicate-PR guard instead of calling
+                                # gh.pr_create directly, matching workflow.py's
+                                # _open_salvage_pr (the other pr_create call site).
+                                retry_result = create_pr_with_retry(
+                                    gh,
+                                    head=item.branch,
+                                    base=item.base_branch,
+                                    title=f"Salvaged work for issue #{item.issue_number}",
+                                    body=salvage_body,
+                                    max_retries=config.runtime.pr_create_retry_max_attempts,
+                                    base_seconds=config.runtime.pr_create_retry_base_seconds,
+                                )
+                                pr_number = retry_result.pr_number
+                            if pr_number is not None:
+                                salvage_ok = True
+                                # `pr_number` is falsy (0) under `dry_run`, where no
+                                # real PR was opened -- only probe a real, truthy PR
+                                # number (mirrors workflow.py::_open_salvage_pr).
+                                if pr_number and state_path is not None:
+                                    query_ok = True
+                                    try:
+                                        pr_view = gh.pr_view(
+                                            pr_number, fields=PR_CLOSING_ISSUES_FIELDS
+                                        )
+                                    except Exception:
+                                        pr_view = {}
+                                        query_ok = False
+                                    linked_numbers = closing_issues_referenced_numbers(pr_view)
+                                    # Only log when the query itself succeeded --
+                                    # a transient `gh` failure must not be conflated
+                                    # with a genuine unlinked-PR miss (see
+                                    # workflow.py::_open_salvage_pr for rationale).
+                                    if query_ok and item.issue_number not in linked_numbers:
+                                        log_event(
+                                            state_path,
+                                            "pr_closing_ref_unlinked",
+                                            {
+                                                "issue_number": item.issue_number,
+                                                "pr_number": pr_number,
+                                                "linked_issue_numbers": sorted(linked_numbers),
+                                            },
+                                        )
+                            else:
+                                salvage_error = "gh pr create failed or returned no PR number"
                         else:
-                            salvage_error = "gh pr create failed or returned no PR number"
-                    else:
-                        salvage_error = push_error or "git push failed"
+                            salvage_error = push_error or "git push failed"
 
                 if salvage_ok:
                     label_ok = True
@@ -2734,6 +3263,8 @@ def apply_fixes(
             reconcile_payload["reason"] = item.reason
         if item.failure_kind is not None:
             reconcile_payload["failure_kind"] = item.failure_kind
+        if item.mergequeue_revoked_reason is not None:
+            reconcile_payload["mergequeue_revoked_reason"] = item.mergequeue_revoked_reason
         new_state = append_event(
             new_state,
             "reconcile",

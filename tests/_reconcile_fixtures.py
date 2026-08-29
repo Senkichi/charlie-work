@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from _worktree_fixtures import _git
+from charlie_work import github as github_module
+from charlie_work.github import linked_issue_number
 from charlie_work.reconcile import _LIST_LIMIT as reconcile_list_limit
 from charlie_work.worktree import create_worktree
 
@@ -127,6 +129,40 @@ class FakeGitHub:
     def name_with_owner(self) -> str:
         return "owner/test-repo"
 
+    def issue_view(self, number: int):
+        # Issue #1241: the salvage lane's pre-open supersession check calls
+        # ``gh.issue_view`` to re-check live issue state. Return the configured
+        # issue so the closed-issue check can fire in tests that plant a CLOSED
+        # issue; raise like the real client when no issue matches.
+        for issue in self._issues:
+            if issue["number"] == number:
+                return issue
+        raise ValueError(f"Issue {number} not found")
+
+    def merged_prs_for_issue(self, issue_number: int, branch_prefix: str):
+        # Issue #1241: mirror ``_fakes_github.FakeGitHub.merged_prs_for_issue``
+        # so the salvage supersession check's merged-PR probe works against this
+        # narrower double too. Returns the typed ``MergedPRSearchResult`` so
+        # ``.ok`` reads agree with production.
+        matched = []
+        for pr in self._prs:
+            if pr.get("state", "OPEN").upper() != "MERGED":
+                continue
+            bound = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=branch_prefix,
+            )
+            if bound == issue_number:
+                matched.append(pr)
+        return github_module.MergedPRSearchResult(matched, ok=True)
+
+    def pr_view(self, number: int, *, fields: str = ""):
+        for pr in self._prs:
+            if pr["number"] == number:
+                return dict(pr)
+        raise ValueError(f"PR {number} not found")
+
 
 def _pr(
     number: int,
@@ -136,6 +172,7 @@ def _pr(
     body: str = "",
     title: str = "",
     is_cross_repository: bool = False,
+    closed_at: str | None = None,
 ) -> dict[str, Any]:
     return {
         "number": number,
@@ -147,6 +184,10 @@ def _pr(
         "state": state,
         "labels": [],
         "isCrossRepository": is_cross_repository,
+        # Issue #1398: closedAt is part of RECONCILE_PR_FIELDS so the
+        # closed-unmerged convergence rules can compare the PR's close time
+        # against the issue's active-session start. None for OPEN PRs.
+        "closedAt": closed_at,
     }
 
 

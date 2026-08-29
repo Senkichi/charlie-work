@@ -22,6 +22,15 @@ _LOCK_TIMEOUT_SECONDS = 30
 _LOAD_RETRY_ATTEMPTS = 3
 _LOAD_RETRY_DELAY_SECONDS = 0.1
 
+# Retry for transient write errors on the atomic replace (issue #1062). On
+# Windows, ``os.replace()`` onto a target another process currently holds open
+# (a lock-free ``load_state`` reader, ``charlie doctor``, a dashboard render)
+# raises ``PermissionError`` [WinError 5]. The failure is transient and
+# non-destructive -- the previous valid file is intact -- so retry with backoff
+# before surfacing, mirroring the reader-side knobs above.
+_SAVE_RETRY_ATTEMPTS = 3
+_SAVE_RETRY_DELAY_SECONDS = 0.1
+
 # Stale claim timeout (minutes) — claims older than this are re-dispatchable
 # to prevent crashed phase-2 from wedging issues
 _STALE_CLAIM_TIMEOUT_MINUTES = 30
@@ -228,6 +237,13 @@ DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS: frozenset[str] = frozenset(
         # which never sets status "escalated". The kind alone never
         # identifies an escalation transition.
         "ci_run_never_created",
+        # Issue #1131: a rework-label skip diagnostic, not an escalation
+        # transition. Emitted inside ``record_review`` (which does perform
+        # escalation elsewhere), so the AST-based discovery in
+        # ``test_deescalation.py`` picks it up -- but the kind alone never
+        # identifies an escalation: it fires when rework routing is
+        # suppressed for a CLOSED issue, the opposite of an escalation.
+        "rework_label_skipped_issue_closed",
     }
 )
 
@@ -252,9 +268,16 @@ def clear_escalation(entry: dict[str, Any]) -> dict[str, Any]:
     single-point inverse of the escalation write path and must be used on
     every code path that clears an escalation, so ``reason_class`` can never
     survive after its ``escalation_reason`` is removed.
+
+    Issue #1461: also clears ``escalation_reasons_seen`` so a de-escalated
+    issue gets a genuinely fresh escalation history on re-escalation --
+    without this, a per-lane dedup guard that checks membership in the list
+    would permanently suppress the lane that previously escalated, even
+    after the operator or auto-sweep cleared the escalation.
     """
     entry.pop("escalation_reason", None)
     entry.pop("reason_class", None)
+    entry.pop("escalation_reasons_seen", None)
     return entry
 
 
@@ -262,14 +285,15 @@ def clear_escalation_on_issue_prs(state: dict[str, Any], issue_number: int) -> b
     """Mirror-clear escalation fields on every PR record linked to an issue.
 
     The escalation write path (``_escalate_issue``) writes
-    ``escalation_reason`` to *both* the issue record and the PR record.
-    Before this helper existed, every ``clear_escalation`` call site cleared
-    the issue-side fields only, leaving a stale ``escalation_reason`` on the
-    PR record.  The downstream rework router
-    (``_route_janitor_gate_failure_to_rework``) short-circuits on
-    ``existing_pr_state.get("escalation_reason")``, so an issue whose
-    escalation was "cleared" still routed nowhere -- a visible stuck state
-    converted into silence (issue #1093).
+    ``escalation_reason`` and ``escalation_reasons_seen`` to *both* the issue
+    record and the PR record.  Before this helper existed, every
+    ``clear_escalation`` call site cleared the issue-side fields only, leaving
+    a stale ``escalation_reason`` on the PR record.  The downstream rework
+    router (``_route_janitor_gate_failure_to_rework``) short-circuits on
+    ``existing_pr_state.get("escalation_reasons_seen")`` (issue #1461: was
+    ``escalation_reason``), so an issue whose escalation was "cleared" still
+    routed nowhere -- a visible stuck state converted into silence (issue
+    #1093).
 
     This helper is the single-point mirror-clear: call it at every
     ``clear_escalation`` site that has a resolved issue number, and the PR
@@ -746,7 +770,28 @@ def save_state(path: Path, data: dict[str, Any]) -> dict[str, Any]:
     with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(to_save, handle, indent=2, sort_keys=True)
         handle.write("\n")
-    tmp_path.replace(path)
+    # On Windows, ``replace()`` onto a target another process currently holds
+    # open (a lock-free ``load_state`` reader, ``charlie doctor``, a dashboard
+    # render) raises ``PermissionError`` [WinError 5]. The failure is transient
+    # and non-destructive -- the previous valid file is intact -- so retry with
+    # backoff before surfacing, mirroring ``load_state``'s reader-side retry.
+    # ``PermissionError`` is caught specifically so the final message can name
+    # the condition; a bare "Access is denied" sends an operator hunting for an
+    # admin shell (issue #1062).
+    for attempt in range(_SAVE_RETRY_ATTEMPTS):
+        try:
+            tmp_path.replace(path)
+            break
+        except PermissionError as exc:
+            if attempt < _SAVE_RETRY_ATTEMPTS - 1:
+                time.sleep(_SAVE_RETRY_DELAY_SECONDS)
+                continue
+            raise PermissionError(
+                f"atomic replace of {path} failed after {_SAVE_RETRY_ATTEMPTS} "
+                f"attempts: {exc}. This is usually a transient Windows sharing "
+                f"violation (another process holds the file open); the previous "
+                f"state file is intact."
+            ) from exc
     return to_save
 
 
@@ -1199,6 +1244,36 @@ def arm_deescalation_pass(data: dict[str, Any], next_deescalation_at: str) -> di
     """
     section = _deescalation_pass(data)
     section["next_deescalation_at"] = next_deescalation_at
+    return {**data, "deescalation_pass": section}
+
+
+def is_operator_queue_review_due(data: dict[str, Any]) -> bool:
+    """True when the operator-queue depth gauge should run (issue #1314 item 2).
+
+    Same "absent schedule is due immediately" semantics as
+    ``is_deescalation_due`` -- a fresh deploy or a 0-interval config (the
+    default, meaning "every pass") is always due, and a malformed timestamp
+    is treated as due rather than wedging the gauge off forever.
+    """
+    next_at = _deescalation_pass(data).get("next_operator_queue_review_at")
+    if not next_at:
+        return True
+    try:
+        next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
+        return datetime.now(UTC) >= next_time
+    except (ValueError, TypeError):
+        return True
+
+
+def arm_operator_queue_review(
+    data: dict[str, Any], next_operator_queue_review_at: str
+) -> dict[str, Any]:
+    """Schedule the next operator-queue depth gauge check (issue #1314 item 2).
+
+    Returns a new state dict; does not mutate ``data``.
+    """
+    section = _deescalation_pass(data)
+    section["next_operator_queue_review_at"] = next_operator_queue_review_at
     return {**data, "deescalation_pass": section}
 
 

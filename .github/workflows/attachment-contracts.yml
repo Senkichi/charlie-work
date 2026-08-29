@@ -1,0 +1,73 @@
+name: Attachment Contracts
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# Same rationale as ci.yml's concurrency block: a superseded run tests a SHA
+# that can no longer appear in any PR's check set, so cancelling it is pure
+# hygiene; main runs are exempt as historical records.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# See ci.yml for the full UTF-8 rationale (the hosted Windows image resolves
+# Python's text layer from the ANSI codepage, not UTF-8, without this).
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8:surrogateescape"
+
+# Least-privilege default (same rationale as ci.yml): checkout needs
+# contents: read and nothing here needs more.
+permissions:
+  contents: read
+
+jobs:
+  AttachmentContracts:
+    name: Attachment Contracts (shadow)
+    # windows-latest, matching ci.yml's jobs (see the Lint job's runs-on
+    # comment there: the hosted move keeps everything on the platform the
+    # toolchain is proven on; per-job image experiments come after).
+    # The self-hosted era's `light` label routing is gone with the shared
+    # box -- hosted jobs never queue behind each other.
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      # fetch-depth: 0 (full history) is required so `--base-ref` below can
+      # `git show <base>:.attachment-budgets.json` -- the diff-based
+      # ratchet-tamper guard (round-1 review finding #1: raise-to-match
+      # laundering) needs the PREVIOUS commit's baseline as an independent
+      # reference point, which a shallow clone would not have.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      # setup-uv restored 2026-08-28 -- see ci.yml's Tests job step comment
+      # for why both #1115 removal reasons were self-hosted-specific, why
+      # the SHA pin, and why enable-cache stays at its `auto` default.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      # ci-fleet resolves from PyPI (versioned wheel in uv.lock) since
+      # 2026-08-28 -- see ci.yml for the note on the removed
+      # sibling-checkout step.
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+      # Week-1 SHADOW mode: --report-only makes check-tree exit 0
+      # unconditionally regardless of findings, so this step can never fail
+      # the job -- it only surfaces annotations + a step summary for humans
+      # to read while the baseline settles.
+      # WEEK-2: flip to enforcement by deleting `--report-only` below (the
+      # exit-code logic in check.py / __main__.py already supports it
+      # unconditionally: `return 1 if blocking else 0`). No other change is
+      # required -- the job stops being informational and starts blocking
+      # merges the moment that flag is removed.
+      - name: Check tree (report-only)
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base_ref="${{ github.event.pull_request.base.sha }}"
+          else
+            base_ref="${{ github.event.before }}"
+          fi
+          uv run python -m charlie_work.attachment_contracts check-tree \
+            --report-only --github-annotations --base-ref "$base_ref"

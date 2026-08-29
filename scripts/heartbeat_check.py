@@ -6,7 +6,7 @@ stall) with plain data collection + threshold comparison. An LLM only ever
 sees this script's stdout.
 
 Run via:
-    cd /c/Users/senki/repos/charlie-work
+    cd /path/to/charlie-work
     env -u VIRTUAL_ENV uv run --active --no-sync python scripts/heartbeat_check.py
 
 Output contract (stdout): one line per check, either
@@ -78,6 +78,19 @@ ISSUE_LIST_LIMIT = 200
 MERGED_PR_LOOKBACK_LIMIT = 5
 
 QUEUED_STALE_MINUTES = 20
+
+# armable-backlog (2026-08-23): "plenty to work on" = one full wave of armed,
+# unclaimed issues (dispatch.max_concurrent_sessions); fallback when the cap
+# is unreadable. Gating labels mark an open issue as *triaged but deliberately
+# not armed*, so it leaves the un-triaged "armable" pool; keep this set in step
+# with the label taxonomy both repos share (`needs-design`, `human-action`,
+# `blocked`) plus GitHub's default terminal labels.
+ARMABLE_RUNWAY_FLOOR_DEFAULT = 3
+ARMED_LABEL = "automated-ready"
+ARMABLE_GATING_LABELS: frozenset[str] = frozenset(
+    {"blocked", "needs-design", "human-action", "question", "wontfix", "duplicate", "invalid"}
+)
+ARMABLE_PREVIEW_LIMIT = 8
 REVIEW_CLAIM_STALE_MINUTES = 45
 LOG_FRESHNESS_STALE_MINUTES = 30
 # Measured production cadence (charlie-work `loop_started` gaps, last 39
@@ -85,7 +98,7 @@ LOG_FRESHNESS_STALE_MINUTES = 30
 # `loop_started` is logged per repo (workflow.py's `_loop_impl`, into that
 # repo's own events.db), and the supervisor processes repos sequentially in
 # one pass, so a single repo's gap is gated by how long its SIBLING repos
-# take, not by supervisor health -- job-cannon's reconcile alone walks
+# take, not by supervisor health -- a sibling registered repo's reconcile alone walks
 # ~690 issues / ~877 PRs and can push charlie-work's gap past 50 minutes on
 # a perfectly healthy fleet.
 #
@@ -109,7 +122,20 @@ MERGEQUEUE_STALL_BEATS = 2
 GRAPHQL_RATE_LIMIT_MIN_REMAINING = 500
 DISPATCH_THROTTLE_MAX_MINUTES = 30
 MIN_BEAT_INTERVAL_MINUTES = 10
-CHARLIE_STATUS_TIMEOUT_SECONDS = 60
+# Issue #1438: `charlie fleet status --json` wall time is ~60s on this host
+# (dominated by remote API calls). A timeout equal to the typical runtime is a
+# coin flip, not a bound -- the lookup degraded on any beat that landed a hair
+# past the line (reproduced at 59.955s against a 60s timeout). 120s makes the
+# bound a real outlier detector (2x the median) instead of the median itself.
+# The result is fetched ONCE per heartbeat run (in main(), before the per-repo
+# loop) and threaded into every consumer, so this timeout is paid at most once
+# per beat, not once per consumer per repo.
+CHARLIE_STATUS_TIMEOUT_SECONDS = 120
+# Issue #1463: ``fleet status --json`` serves from the status-snapshot cache
+# by default. A cache older than this threshold means the blocked set may not
+# reflect the current state — surface a staleness warning so downstream checks
+# annotate their output as degraded rather than silently trusting stale data.
+STATUS_CACHE_STALE_SECONDS = 600
 
 # in-progress-stale worktree mtime threshold (issue #1379). The events-based
 # check flags an issue when its GitHub updatedAt hasn't moved across 2 beats,
@@ -216,7 +242,7 @@ class SuppressionEntry:
 
     `check` is the *base* check name as emitted, with no repo suffix (e.g.
     ``"stale-open-issue-mentions"``, never ``"stale-open-issue-mentions
-    Senkichi/charlie-work"``). Per-repo checks build their emitted check
+    owner/charlie-work"``). Per-repo checks build their emitted check
     string as ``f"{base} {repo.slug}"`` (the convention already used by every
     per-repo check in this file); `Report._match` reconstructs that same
     convention to test a candidate entry against an emitted check string, so
@@ -531,6 +557,17 @@ def get_blocked_issue_numbers(any_repo_root: Path) -> tuple[dict[str, set[int]],
         }
     except (KeyError, TypeError) as exc:
         return {}, f"charlie fleet status --json unexpected payload shape: {exc}"
+    # Issue #1463: surface stale-cache degradation. ``fleet status --json``
+    # serves from the status-snapshot cache by default; a very stale cache
+    # means the blocked set may not reflect the current state. The blocked
+    # data is still returned (it is the best available), but a staleness
+    # warning is returned so downstream checks annotate their output.
+    ages = [a for r in repos.values() if isinstance(a := r.get("cache_age_seconds"), (int, float))]
+    if ages and max(ages) > STATUS_CACHE_STALE_SECONDS:
+        return blocked_by_repo, (
+            f"status snapshot cache {max(ages):.0f}s old "
+            f"(>{STATUS_CACHE_STALE_SECONDS}s); blocked set may be stale"
+        )
     return blocked_by_repo, ""
 
 
@@ -770,6 +807,107 @@ def get_dispatch_cap(config_path: Path) -> int | None:
     config, _error = load_orchestrator_config(config_path)
     cap = config.get("dispatch", {}).get("max_concurrent_sessions")
     return cap if isinstance(cap, int) else None
+
+
+def _last_dispatch_drain_signal(state_dir: Path) -> dict[str, Any] | None:
+    """Read the last ``dispatch`` event's concurrency governor from events.db.
+
+    Returns the parsed payload dict of the most recent ``dispatch`` event in
+    ``state_dir/events.db`` (which carries ``concurrency_governor`` and
+    ``deferred_by_concurrency_count``), or ``None`` when no events.db exists,
+    the events table is absent, no ``dispatch`` row is recorded, or the
+    payload is unparseable. Mirrors the stdlib-only events.db access pattern
+    in ``check_loop_pass_freshness`` / ``check_error_events`` rather than
+    importing ``charlie_work.instrumentation`` -- this script stays importable
+    when ``ci_fleet`` is not installed (see the module header).
+
+    The ``concurrency_governor`` sub-payload is written by
+    ``workflow.py``'s dispatch path and carries ``dispatch_limit``,
+    ``fleet_concurrency_limit`` / ``fleet_live_session_count`` (present only
+    when the fleet governor is enabled), and the per-repo
+    ``concurrency_limit`` / ``live_session_count`` / ``available_slots``.
+    ``deferred_by_concurrency_count`` is a sibling top-level field counting
+    every ordered candidate the cap turned away this pass.
+    """
+    db_path = state_dir / "events.db"
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error:
+        return None
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                return None
+            # ORDER BY id DESC: id is AUTOINCREMENT, so the highest id is the
+            # most recent insert. This avoids the ISO-T/Z-vs-SQLite-space
+            # timestamp-format trap documented on check_loop_pass_freshness
+            # (lexicographic ts ordering happens to work for ISO-8601, but id
+            # is the insertion order and is unambiguously monotonic).
+            row = conn.execute(
+                "SELECT payload FROM events WHERE kind = 'dispatch' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _governor_drain_note(
+    persisting_count: int,
+    governor: dict[str, Any],
+    deferred_by_concurrency_count: int | None,
+) -> str | None:
+    """Build the ``draining at cap`` note from a dispatch event's governor.
+
+    Returns a human-readable drain note when the governor shows the backlog
+    is draining at the allowed rate (fleet-wide cap saturated, or the
+    effective dispatch limit was at or below the deferred backlog), or
+    ``None`` when the governor shows free slots -- the caller keeps the
+    anomaly in that case (issue #1424: the #1398 head-of-line case is real).
+
+    The condition mirrors the one stated in issue #1424:
+    ``fleet_live_session_count >= fleet_concurrency_limit`` (when the fleet
+    governor is enabled) OR ``dispatch_limit <= deferred_by_concurrency_count``.
+    """
+    cg = governor.get("concurrency_governor") if isinstance(governor, dict) else None
+    if not isinstance(cg, dict):
+        return None
+    fleet_cap = cg.get("fleet_concurrency_limit")
+    fleet_live = cg.get("fleet_live_session_count")
+    dispatch_limit = cg.get("dispatch_limit")
+
+    fleet_at_cap = (
+        isinstance(fleet_cap, int) and isinstance(fleet_live, int) and fleet_live >= fleet_cap
+    )
+    deferred_at_cap = (
+        isinstance(dispatch_limit, int)
+        and isinstance(deferred_by_concurrency_count, int)
+        and dispatch_limit <= deferred_by_concurrency_count
+    )
+
+    if not (fleet_at_cap or deferred_at_cap):
+        return None
+
+    parts = [f"backlog={persisting_count} draining at cap"]
+    if fleet_at_cap:
+        parts.append(f"fleet_live={fleet_live}/fleet_cap={fleet_cap}")
+    if deferred_at_cap and isinstance(dispatch_limit, int):
+        parts.append(f"dispatch_limit={dispatch_limit}")
+    return " ".join(parts)
 
 
 def check_orchestrator_config(report: Report, repo: RepoInfo) -> None:
@@ -1060,9 +1198,30 @@ def check_dispatch_coverage(
         cur_dispatchable = set(dispatchable)
         persisting = sorted(prev_dispatchable & cur_dispatchable)
         if persisting:
-            if cap is not None and len(in_progress) >= cap:
-                # Backlog exceeding the drain rate while every dispatch slot is
-                # occupied is designed behavior, not a dispatch failure.
+            # Issue #1424: the governor that actually bounds dispatch is
+            # fleet-wide (fleet_live_session_count vs fleet_concurrency_limit
+            # across all repos), not the per-repo cap. A repo at 2/5 with the
+            # sibling repo holding the other slots reads as a dispatch failure
+            # under the per-repo denominator when it is designed behaviour.
+            # Derive the drain condition from the last dispatch event's
+            # concurrency_governor payload in this repo's events.db; fall back
+            # to the per-repo cap check only when no governor data is
+            # available (fresh install with no dispatch events yet).
+            last_dispatch = _last_dispatch_drain_signal(repo.state_dir)
+            if last_dispatch is not None:
+                deferred_count = last_dispatch.get("deferred_by_concurrency_count")
+                drain_note = _governor_drain_note(len(persisting), last_dispatch, deferred_count)
+                if drain_note is None:
+                    # The governor shows free slots and the issues still
+                    # persist -- the #1398 head-of-line case, which is real.
+                    reasons.append(
+                        f"issue(s) {persisting} dispatchable across 2 consecutive beats "
+                        "(threshold: must clear within 1 beat)"
+                    )
+            elif cap is not None and len(in_progress) >= cap:
+                # Fallback: no dispatch event in events.db yet (fresh install).
+                # Backlog exceeding the drain rate while every dispatch slot
+                # is occupied is designed behavior, not a dispatch failure.
                 drain_note = (
                     f"backlog={len(persisting)} draining at cap "
                     f"(in_progress={len(in_progress)}/cap={cap})"
@@ -1118,6 +1277,111 @@ def check_dispatch_coverage(
     check_in_progress_staleness(
         report, repo, in_progress, prev_repo_state, new_repo_state, skip_delta, now=now
     )
+
+
+def check_armable_backlog(
+    report: Report,
+    repo: RepoInfo,
+    blocked_numbers: set[int] | None,
+    blocked_err: str,
+) -> None:
+    """Is the armed runway thin while un-triaged, armable issues sit idle?
+
+    ``dispatch-coverage`` asks "did the fleet pick up what is armed?"; this
+    check asks the question upstream of it: "is there enough armed work for
+    the fleet to pick up, and if not, is that because the backlog is
+    genuinely empty or because nobody has triaged it?" (2026-08-23: both
+    lanes were about to idle with 12 + 39 open issues carrying no label at
+    all -- neither ``automated-ready`` nor any gating label -- so the fleet
+    starved with work available.)
+
+    Three buckets over the open issues:
+
+    * ``runway``  -- ``automated-ready``, no ``agent:*`` label, not blocked:
+      what dispatch can take next. Healthy when ``>= floor``.
+    * ``active``  -- carries an ``agent:*`` label (in flight / terminal).
+    * ``armable`` -- no ``agent:*`` label, not ``automated-ready``, and no
+      *gating* label (``ARMABLE_GATING_LABELS``) or blocked-by-dependency
+      entry. This is the un-triaged pool: every issue here is either a
+      missed arm or a missed gate, and a triage pass drives it to zero.
+
+    Verdict:
+
+    * runway ``>= floor``                      -> OK (plenty to work on)
+    * runway ``< floor`` and armable is empty  -> OK (genuinely empty)
+    * runway ``< floor`` and armable non-empty -> ANOMALY: triage needed
+
+    ``floor`` is the repo's ``dispatch.max_concurrent_sessions`` cap (one
+    full wave of work), falling back to ``ARMABLE_RUNWAY_FLOOR_DEFAULT``.
+
+    Degraded blocked-issue lookup (``blocked_err``) can only *inflate* both
+    ``runway`` and ``armable``: an inflated runway can turn an anomaly into
+    a false OK, an inflated armable can turn an OK into a false anomaly. The
+    caveat is surfaced on whichever verdict is emitted rather than guessed
+    around.
+    """
+    check = f"armable-backlog {repo.slug}"
+    args = [
+        "issue",
+        "list",
+        "-R",
+        repo.slug,
+        "--state",
+        "open",
+        "--json",
+        "number,labels",
+        "--limit",
+        str(ISSUE_LIST_LIMIT),
+    ]
+    ok, data, err = run_gh_json(args, repo.repo_root)
+    if not ok:
+        report.anom(check, err)
+        return
+
+    runway: list[int] = []
+    active = 0
+    gated = 0
+    armable: list[int] = []
+    for issue in data:
+        number = issue["number"]
+        names = {label["name"] for label in issue.get("labels", [])}
+        if any(n.startswith("agent:") for n in names):
+            active += 1
+            continue
+        is_blocked = blocked_numbers is not None and number in blocked_numbers
+        if is_blocked or names & ARMABLE_GATING_LABELS:
+            gated += 1
+            continue
+        if ARMED_LABEL in names:
+            runway.append(number)
+        else:
+            armable.append(number)
+
+    cap = get_dispatch_cap(repo.config_path) if repo.config_path else None
+    floor = cap if cap is not None else ARMABLE_RUNWAY_FLOOR_DEFAULT
+    facts = (
+        f"runway={len(runway)} floor={floor} armable={len(armable)} "
+        f"active={active} gated={gated} open={len(data)}"
+    )
+    caveat = f" (blocked-issue lookup degraded: {blocked_err})" if blocked_err else ""
+
+    if len(runway) >= floor:
+        report.ok(check, f"plenty armed; {facts}{caveat}")
+    elif not armable:
+        report.ok(
+            check, f"runway thin but backlog genuinely empty of armable issues; {facts}{caveat}"
+        )
+    else:
+        preview = sorted(armable)[:ARMABLE_PREVIEW_LIMIT]
+        more = len(armable) - len(preview)
+        suffix = f" (+{more} more)" if more > 0 else ""
+        report.anom(
+            check,
+            f"runway thin ({len(runway)} < floor {floor}) while {len(armable)} "
+            f"un-triaged armable issue(s) sit idle: {preview}{suffix} -- triage: "
+            f"label each `{ARMED_LABEL}` or one of {sorted(ARMABLE_GATING_LABELS)}"
+            f"; {facts}{caveat}",
+        )
 
 
 def check_in_progress_staleness(
@@ -1230,6 +1494,26 @@ def check_in_progress_staleness(
         report.ok(check, facts)
 
 
+def _read_review_decision_payload(decision_path: Path) -> dict[str, Any] | None:
+    """Read and parse a packet's ``review-decision.json``.
+
+    Returns the parsed dict, or ``None`` when the file is missing, unreadable,
+    or not a JSON object. A missing/unreadable file is treated as an open
+    claim by :func:`_claim_is_open` (the placeholder has not been overwritten
+    with a terminal verdict), so ``None`` here means "open, but no payload to
+    inspect" rather than "definitely closed".
+    """
+    if not decision_path.exists():
+        return None
+    try:
+        data = json.loads(decision_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
 def _claim_is_open(decision_path: Path) -> bool:
     """A review claim is OPEN until a non-pending decision is recorded.
 
@@ -1238,13 +1522,8 @@ def _claim_is_open(decision_path: Path) -> bool:
     missing file, a still-"pending" file, or an unparseable file all mean the
     claim has not been resolved yet.
     """
-    if not decision_path.exists():
-        return True
-    try:
-        data = json.loads(decision_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return True
-    if not isinstance(data, dict):
+    data = _read_review_decision_payload(decision_path)
+    if data is None:
         return True
     return data.get("decision") == "pending"
 
@@ -1294,7 +1573,12 @@ def _reviewer_pid_alive(entry: dict[str, Any]) -> bool | None:
     return abs(current_start_time - expected) <= 1.0
 
 
-def _review_claim_timestamp(pr_state: dict[str, Any]) -> str | None:
+def _review_claim_timestamp(
+    pr_state: dict[str, Any],
+    *,
+    pr_dir: Path | None = None,
+    decision: dict[str, Any] | None = None,
+) -> str | None:
     """Return the most relevant claim timestamp for an open review.
 
     The orchestrator's ground truth is ``state.json``:
@@ -1306,6 +1590,41 @@ def _review_claim_timestamp(pr_state: dict[str, Any]) -> str | None:
     For unknown/missing status, fall back to the newest present timestamp.  This
     replaces the packet-directory ``st_mtime`` that never updates across redispatch
     retries (issue #517).
+
+    Issue #1403: ``review_dispatch_completed`` is a special case.  After a review
+    cycle finishes, ``record_review`` stamps ``review_dispatch_status`` to
+    ``review_dispatch_completed`` and never touches ``review_dispatched_at``.
+    When the rework cycle rebuilds the packet for a new head, the on-disk
+    ``review-decision.json`` is back to ``pending`` (so the claim is open again)
+    but state.json still carries the PRIOR cycle's ``review_dispatched_at`` --
+    ``dispatch_reviews()`` only refreshes it when it actually launches the next
+    reviewer, which may be waiting on a CI check.  The newest-timestamp fallback
+    below would date the claim by that stale prior dispatch and overcount the
+    age by the full inter-cycle gap (a false 138m ANOMALY observed on pr-1395).
+
+    Detect this case structurally: a pending on-disk decision while status is
+    ``review_dispatch_completed`` is ALREADY the contradiction that proves a
+    packet rebuild (``record_review`` writes a terminal decision; only a packet
+    build resets it to ``pending``).  Anchor on the packet-rebuild evidence --
+    the ``review-prompt.md`` mtime, rewritten on every ``review()`` packet
+    build -- instead of the stale state.json dispatch timestamp.  ``pr_dir``
+    and ``decision`` are optional so direct unit callers (and the pre-fix
+    tests) keep the original state.json-only behavior.
+
+    Issue #1436: the #1403 fix gated the rebuild anchor on the on-disk
+    decision's ``reviewed_head_sha`` DIFFERING from state.json's.  That misses
+    a packet rebuilt for the SAME head (conflict-path re-review,
+    verdict-missed retry, manual re-request): the SHA equality lets the guard
+    fall through and the newest-timestamp fallback dates the claim by the
+    prior cycle's ``review_dispatched_at`` (false 467m ANOMALY on pr-1432).
+    The SHA comparison is now only a tiebreak for the missing-prompt-file
+    case; the primary gate is ``status == completed and decision == pending``.
+
+    The prompt mtime is guarded against being OLDER than the prior cycle's
+    ``review_dispatched_at`` (clock skew / a packet that was not actually
+    rebuilt): the newer of the two is used, so this can only shrink a false
+    age and never hide a genuinely stale claim from before the completed
+    cycle.
     """
     status = pr_state.get("review_dispatch_status")
     if status == "review_dispatch_dispatched":
@@ -1314,6 +1633,34 @@ def _review_claim_timestamp(pr_state: dict[str, Any]) -> str | None:
         return pr_state.get("review_dispatch_pending_at")
     if status == "review_dispatch_failed":
         return pr_state.get("review_dispatch_failed_at")
+
+    # Issue #1403/#1436: completed prior cycle whose packet was rebuilt.  See
+    # the docstring for why state.json's dispatch timestamps are stale here.
+    # A pending on-disk decision while status is completed is the structural
+    # contradiction that proves a rebuild -- regardless of whether the head
+    # advanced (#1403, differing SHA) or stayed put (#1436, same SHA).
+    if (
+        status == "review_dispatch_completed"
+        and pr_dir is not None
+        and isinstance(decision, dict)
+        and decision.get("decision") == "pending"
+    ):
+        prompt_path = pr_dir / "review-prompt.md"
+        if prompt_path.exists():
+            prompt_dt = datetime.fromtimestamp(prompt_path.stat().st_mtime, tz=timezone.utc)
+            # Guard against the prompt mtime being OLDER than the prior
+            # cycle's dispatch (clock skew / unrebuilt packet): use the newer
+            # of the two, so this can only shrink a false age and never hide a
+            # genuinely stale claim from before the completed cycle.
+            dispatch_raw = pr_state.get("review_dispatched_at")
+            dispatch_dt = parse_iso(dispatch_raw) if dispatch_raw else None
+            if dispatch_dt is not None and dispatch_dt > prompt_dt:
+                return dispatch_raw
+            return prompt_dt.isoformat().replace("+00:00", "Z")
+        # Prompt file missing: the SHA comparison survives only as a tiebreak
+        # here.  A differing SHA still indicates a rebuilt packet, but without
+        # the prompt mtime we have no rebuild timestamp; fall back to current
+        # behavior (the newest-timestamp fallback below) either way.
 
     newest: str | None = None
     newest_dt: datetime | None = None
@@ -1384,7 +1731,16 @@ def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | Non
             # PR already resolved (merged/closed); claim dir is stale history
             # from before reap, not evidence of a live stuck review.
             continue
-        if not _claim_is_open(entry / "review-decision.json"):
+        # Read the on-disk decision once (issue #1403): _claim_is_open and the
+        # completed-cycle-rebuilt-packet detection in _review_claim_timestamp
+        # both need it, and re-reading races with a concurrent record_review.
+        decision_payload = _read_review_decision_payload(entry / "review-decision.json")
+        if decision_payload is None:
+            # Missing/unreadable file: open claim, no payload to inspect.
+            is_open = True
+        else:
+            is_open = decision_payload.get("decision") == "pending"
+        if not is_open:
             continue
 
         pr_state = prs_state.get(str(pr_number), {}) if isinstance(prs_state, dict) else {}
@@ -1411,7 +1767,7 @@ def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | Non
 
         open_claims += 1
 
-        timestamp = _review_claim_timestamp(pr_state)
+        timestamp = _review_claim_timestamp(pr_state, pr_dir=entry, decision=decision_payload)
         claim_time = parse_iso(timestamp)
         if claim_time is None:
             # Last resort: the packet directory's mtime.  This is a fallback for
@@ -1805,6 +2161,229 @@ def check_warning_events(report: Report, repo: RepoInfo, baseline: datetime) -> 
         )
     if not new_warnings_detail and not expected_operational_counts:
         report.ok(check, facts)
+
+
+def check_infra_blocked_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
+    """Surface ``check_infra_blocked`` events and their persisted escalation
+    (issue #1383, AC4).
+
+    ``check_infra_blocked`` is a warning-level event emitted per affected PR
+    when a required check fails due to a fleet-wide infrastructure condition
+    (Actions budget/runner outage) rather than the PR's code. The
+    operator-facing ``infra_blocked_escalated`` error event is emitted at
+    most once per configured window when the condition persists across N
+    passes. Both kinds already appear in the generic
+    ``check_warning_events`` / ``check_error_events`` listings, but those
+    are flat ``kind@ts`` lines with no correlation to the affected PRs or
+    the persistence state. This dedicated check gives the operator a
+    structured view: how many PRs are currently infra-blocked, which
+    checks, and whether the persistence escalation has fired.
+
+    Same db-availability posture as ``check_error_events``: a missing or
+    unreadable events.db is an anomaly (this check cannot vouch for a repo
+    it cannot read), not a silent OK. Timestamps are compared in Python
+    against ``baseline`` for the same ISO-vs-SQLite reason documented on
+    ``check_loop_pass_freshness``.
+    """
+    check = f"infra-blocked-events {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.anom(check, f"cannot check: no events.db at {db_path}")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"cannot check: events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.anom(check, "cannot check: events.db has no events table")
+                return
+            blocked_rows = conn.execute(
+                "SELECT ts, kind FROM events WHERE kind = ?",
+                ("check_infra_blocked",),
+            ).fetchall()
+            escalated_rows = conn.execute(
+                "SELECT ts FROM events WHERE kind = ?",
+                ("infra_blocked_escalated",),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            report.anom(check, f"cannot check: events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    new_blocked: list[str] = []
+    for ts, _kind in blocked_rows:
+        ts_dt = parse_iso(ts)
+        if ts_dt is None or ts_dt > baseline:
+            new_blocked.append(ts)
+
+    new_escalated: list[str] = []
+    for (ts,) in escalated_rows:
+        ts_dt = parse_iso(ts)
+        if ts_dt is None or ts_dt > baseline:
+            new_escalated.append(ts)
+
+    facts = f"blocked_rows={len(blocked_rows)} escalated_rows={len(escalated_rows)}"
+    if new_escalated:
+        report.anom(
+            check,
+            f"infra_blocked_escalated since last beat: {new_escalated} ({facts})",
+        )
+    elif new_blocked:
+        report.warn(
+            check,
+            f"check_infra_blocked since last beat: {len(new_blocked)} event(s) ({facts})",
+        )
+    else:
+        report.ok(check, facts)
+
+
+def check_draft_pr_blocked_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
+    """Surface ``draft_pr_blocked`` events periodically (issue #1366).
+
+    A PR parked as draft-only-blocked (``workflow.py``'s ``failures_changed``
+    arm) emits one ``draft_pr_blocked`` warning event per park. The event is
+    the durable record that the park happened; this check is its first
+    automated reader, surfacing new parks since the last beat so an operator
+    sees draft-blocked PRs alongside the other stuck-state detectors in the
+    same heartbeat output rather than only via a manual
+    ``query_events(kind="draft_pr_blocked")`` grep.
+
+    Deliberately a ``report.warn`` (passive, periodic surfacing), not
+    ``report.anom``: a draft-blocked PR is a state to surface periodically,
+    not a fleet emergency -- the operator comment on issue #1366 placed this
+    kind on the periodic-surfacing path rather than the real-alert path
+    reserved for ``venv_editable_anchor_violation`` (see
+    ``check_supervisor_venv_refusal``). The db-availability guards stay
+    ``report.anom``, matching ``check_infra_blocked_events``: an unreadable
+    events.db means this check cannot vouch for the repo at all, which is a
+    genuine anomaly independent of whether any park fired.
+
+    Same db-availability posture and ISO-vs-SQLite comparison convention as
+    ``check_infra_blocked_events``: timestamps are compared in Python against
+    ``baseline`` (never in SQL) so an unparseable ``ts`` fails toward
+    visibility, not silence.
+    """
+    check = f"draft-pr-blocked-events {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.anom(check, f"cannot check: no events.db at {db_path}")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"cannot check: events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.anom(check, "cannot check: events.db has no events table")
+                return
+            rows = conn.execute(
+                "SELECT ts FROM events WHERE kind = ?",
+                ("draft_pr_blocked",),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            report.anom(check, f"cannot check: events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    new_blocked: list[str] = []
+    for (ts,) in rows:
+        ts_dt = parse_iso(ts)
+        if ts_dt is None or ts_dt > baseline:
+            new_blocked.append(ts)
+
+    facts = f"blocked_rows={len(rows)} new_since_last_beat={len(new_blocked)}"
+    if new_blocked:
+        report.warn(
+            check,
+            f"draft_pr_blocked since last beat: {len(new_blocked)} event(s) ({facts})",
+        )
+    else:
+        report.ok(check, facts)
+
+
+def check_supervisor_venv_refusal(
+    report: Report, repos: list[RepoInfo], baseline: datetime
+) -> None:
+    """Surface ``venv_editable_anchor_violation`` as a real alert (issue #1366).
+
+    The supervisor's startup guard (issue #974) refuses to run when an
+    editable ``.pth`` in the interpreter's venv points outside the
+    interpreter-derived checkout -- everything below that refusal would run
+    unreviewed code. The refusal returns before the supervisor writes its
+    heartbeat, so ``check_supervisor_heartbeat``'s freshness check only
+    catches the *indirect* symptom (a stale or absent heartbeat); the
+    violation event is the only direct evidence of *why* the supervisor is
+    not running. Before this check that event had no automated reader beyond
+    the log line written at the refusal -- a silent refusal could stall the
+    whole supervisor with nothing but a log line as evidence.
+
+    This is the real-alert path the operator comment on issue #1366 reserved
+    for this kind: a new ``venv_editable_anchor_violation`` event since the
+    last beat is an ANOMALY (flips the exit code), not a passive WARN -- the
+    cost of an unnoticed supervisor refusal is much higher than the cost of
+    an unnoticed draft PR. It runs alongside ``check_supervisor_heartbeat``
+    in the same supervisor-health section of the heartbeat output.
+
+    The event is logged to a per-repo ``events.db`` (``run_fleet_supervise``
+    logs to the orchestrator repo's own state dir; ``run_supervised`` logs to
+    the supervised repo's), so this check scans every registered repo's
+    ``events.db`` and aggregates the findings into one fleet-level alert. A
+    repo with no ``events.db`` (or one with no ``events`` table) is skipped,
+    not flagged: this check looks for an actual refusal event, and a repo
+    that has never been supervised has none to find -- the
+    ``check_supervisor_heartbeat`` freshness check separately vouches for
+    supervisor liveness.
+    """
+    check = "supervisor-venv-refusal"
+    offending: list[str] = []
+    for repo in repos:
+        db_path = repo.state_dir / "events.db"
+        if not db_path.exists():
+            continue
+        try:
+            conn = sqlite3.connect(str(db_path))
+        except sqlite3.Error:
+            continue
+        try:
+            rows = conn.execute(
+                "SELECT ts FROM events WHERE kind = ?",
+                ("venv_editable_anchor_violation",),
+            ).fetchall()
+        except sqlite3.Error:
+            conn.close()
+            continue
+        conn.close()
+        for (ts,) in rows:
+            ts_dt = parse_iso(ts)
+            if ts_dt is None or ts_dt > baseline:
+                offending.append(f"{repo.slug}@{ts}")
+
+    if offending:
+        report.anom(
+            check,
+            f"venv_editable_anchor_violation since last beat: {offending} "
+            "(supervisor refused to start -- editable .pth anchor violated, "
+            "issue #974)",
+        )
+    else:
+        report.ok(check, f"refusals_since_last_beat=0 repos_scanned={len(repos)}")
 
 
 def check_merge_flow(
@@ -2359,10 +2938,13 @@ def main() -> int:
             blocked_err,
             now=now,
         )
+        check_armable_backlog(report, repo, blocked_by_repo.get(repo.slug), blocked_err)
         check_review_liveness(report, repo, now=now)
         check_dispatch_failures(report, repo, baseline)
         check_error_events(report, repo, baseline)
         check_warning_events(report, repo, baseline)
+        check_infra_blocked_events(report, repo, baseline)
+        check_draft_pr_blocked_events(report, repo, baseline)
         check_log_freshness(report, repo, now=now)
         check_loop_pass_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)
@@ -2376,6 +2958,7 @@ def main() -> int:
 
     check_disk_space(report, repos)
     check_runners(report)
+    check_supervisor_venv_refusal(report, repos, baseline)
     check_supervisor_heartbeat(report)
 
     save_state(new_state)

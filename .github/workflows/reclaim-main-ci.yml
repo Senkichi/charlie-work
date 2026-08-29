@@ -6,8 +6,9 @@ name: Reclaim superseded main CI runs
 # superseded draft, and killing it would leave a gap in that history.
 #
 # The exemption is unconditional, though, so a main run that is only QUEUED
-# (waiting for one of this repo's 2 registered self-hosted runners -- #799,
-# a hard registration-bound ceiling) or PENDING (waiting for its own
+# (in the self-hosted era: waiting for one of the repo's 2 registered
+# runners -- #799, a hard registration-bound ceiling; on hosted runners
+# queueing is rare but not impossible) or PENDING (waiting for its own
 # concurrency group, which GitHub only auto-replaces for a run superseded by
 # a *second* still-pending run, never once it reaches "queued") is never
 # reclaimed by ci.yml on its own. It sits there competing with real PR
@@ -26,11 +27,17 @@ name: Reclaim superseded main CI runs
 # running, and the tip of main is always eventually certified -- is
 # unchanged. This is additive only; ci.yml is not modified.
 #
-# Runs on self-hosted, matching ci.yml: hosted-runner minutes are suspended
-# for this repo as of 2026-07 (see ci.yml's own comment) and there is no
-# hosted fallback available today (unverified-unless-proven: the billing
-# endpoint needed to confirm hosted-minute availability returns a
-# token-scope error on this account).
+# Runs on ubuntu-latest (2026-08-28, hosted-CI return): this job is a single
+# github-script step with no checkout and no toolchain, so the cheapest,
+# fastest-provisioning standard hosted image is the right target. On hosted
+# runners it also no longer competes with the CI it reclaims -- the #863
+# starvation mechanism below was a property of the shared 2-runner pool and
+# cannot recur when every job gets its own VM (the CORRECTED paragraph is
+# kept as history: it explains why cancel-in-progress is false). The
+# workflow itself stays because its job is still real: a queued/pending main
+# run for a superseded commit is noise and wasted compute even when the
+# capacity it occupies is free, and the orchestrator-down window it covers
+# is unchanged.
 #
 # CORRECTED (#863): the previous version of this comment claimed waiting in
 # the runner queue "only bounds how quickly a superseded run gets reclaimed,
@@ -71,7 +78,7 @@ concurrency:
 jobs:
   reclaim:
     name: Cancel superseded queued/pending main CI runs
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       actions: write

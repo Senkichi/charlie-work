@@ -200,3 +200,80 @@ def test_dispatch_flags_stale_prefix_citation_with_comment_and_event(
     assert len(cited) == 1
     assert cited[0]["citation"] == "old_dir/workflow.py:10"
     assert cited[0]["status"] == "stale_prefix"
+
+
+def test_dispatch_flags_ambiguous_basename_with_candidates(tmp_path: Path) -> None:
+    # Issue #1452: a bare basename matching more than one tracked file is a
+    # real citation defect. The dispatch path must flag it with a comment
+    # (visible to the worker) and a ``dispatch_citation_drift_flagged`` event
+    # whose payload carries the candidate list so the author can disambiguate.
+    _write(tmp_path, "job_finder/db/_jobs.py", ["db jobs"])
+    _write(tmp_path, "job_finder/web/scheduler/_jobs.py", ["web jobs"])
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["body"] = "The defect is at _jobs.py:1 in the loop."
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = _make_app(tmp_path, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    posted = getattr(fake_gh, "issue_comments_posted", [])
+    assert len(posted) == 1
+    issue_number, body = posted[0]
+    assert issue_number == 123
+    assert "Citation drift detected" in body
+    assert "_jobs.py:1" in body
+    assert "ambiguous_basename" in body
+    # Both candidates are surfaced in the comment.
+    assert "job_finder/db/_jobs.py" in body
+    assert "job_finder/web/scheduler/_jobs.py" in body
+    state = json.loads(
+        (tmp_path / ".var" / "charlie-work" / "state.json").read_text(encoding="utf-8")
+    )
+    entry = state["issues"]["123"]
+    assert entry["citation_drift_fingerprint"]
+    assert "citation_drift_flagged_at" in entry
+    drift_events = [
+        e for e in state.get("events", []) if e.get("kind") == "dispatch_citation_drift_flagged"
+    ]
+    assert len(drift_events) == 1
+    payload = drift_events[0]["payload"]
+    cited = payload["drifted_citations"]
+    assert len(cited) == 1
+    assert cited[0]["citation"] == "_jobs.py:1"
+    assert cited[0]["status"] == "ambiguous_basename"
+    assert cited[0]["candidates"] == [
+        "job_finder/db/_jobs.py",
+        "job_finder/web/scheduler/_jobs.py",
+    ]
+
+
+def test_dispatch_does_not_flag_resolved_by_basename(tmp_path: Path) -> None:
+    # Issue #1452: a bare basename that resolves uniquely to a valid line is
+    # info-level ``RESOLVED_BY_BASENAME`` -- NOT drift. The dispatch path must
+    # NOT post a flag comment or emit a drift event for it (the prior behavior
+    # reported ``file_missing``, a false alarm). This is the core fix: the
+    # three unique cases from the issue stop generating noise.
+    _write(tmp_path, "job_finder/web/ats_prober.py", ["x", "def f():", "    pass"])
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["body"] = "The defect is at ats_prober.py:2 in the loop."
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = _make_app(tmp_path, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    # No drift comment posted -- RESOLVED_BY_BASENAME is info, not drift.
+    assert getattr(fake_gh, "issue_comments_posted", []) == []
+    state = json.loads(
+        (tmp_path / ".var" / "charlie-work" / "state.json").read_text(encoding="utf-8")
+    )
+    entry = state["issues"]["123"]
+    assert entry.get("citation_drift_fingerprint") in (None, "")
+    assert "citation_drift_flagged_at" not in entry
+    drift_events = [
+        e for e in state.get("events", []) if e.get("kind") == "dispatch_citation_drift_flagged"
+    ]
+    assert drift_events == []

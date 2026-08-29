@@ -108,6 +108,16 @@ def _add_dry_run(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
 
 
+def _add_no_cache_arg(parser: argparse.ArgumentParser) -> None:
+    """Add ``--no-cache`` (issue #1463) to ``fleet status`` and ``roll-call``."""
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=False,
+        help="Bypass the status-snapshot cache (#1463); compute live status.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=CLI_NAME)
     parser.add_argument("--config", type=Path, default=None)
@@ -120,7 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("roll-call")
+    roll_call = subparsers.add_parser("roll-call")
+    _add_no_cache_arg(roll_call)
     doctor = subparsers.add_parser("doctor")
     doctor.add_argument(
         "--adapter-probe",
@@ -164,6 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("review-queue")
+    subparsers.add_parser("operator-queue")
 
     dispatch = subparsers.add_parser("work")
     dispatch.add_argument("--limit", type=int, default=None)
@@ -290,8 +302,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     fleet = subparsers.add_parser("fleet")
     fleet_sub = fleet.add_subparsers(dest="fleet_command", required=True)
-    fleet_sub.add_parser("status")
+    fleet_status_parser = fleet_sub.add_parser("status")
+    _add_no_cache_arg(fleet_status_parser)
     fleet_sub.add_parser("review-queue")
+    fleet_sub.add_parser("operator-queue")
 
     fleet_work = fleet_sub.add_parser("work")
     fleet_work.add_argument("--limit", type=int, default=None)
@@ -571,9 +585,9 @@ def _assert_config_repo_matches(config_arg: Path | None, repo_root: Path) -> Non
     ``--config`` selects the *config*; it never selected the *state*. ``repo_root``
     comes from ``--repo`` (defaulting to cwd), and ``runtime_paths`` resolves a
     **relative** ``state_dir`` against it. Every managed repo uses a relative
-    ``state_dir``, so ``charlie --config <job-cannon> tripwire ack 1392`` run from
-    a charlie-work cwd loaded job-cannon's settings and wrote job-cannon's ack into
-    *charlie-work's* state file — exit 0, no warning, and job-cannon's finding
+    ``state_dir``, so ``charlie --config <sibling-repo> tripwire ack 1392`` run from
+    a charlie-work cwd loaded the sibling repo's settings and wrote its ack into
+    *charlie-work's* state file — exit 0, no warning, and the sibling repo's finding
     still pinned ``ok=False``.
 
     That silence is the danger, not the misroute: a misdirected write into a keyed
@@ -1411,7 +1425,7 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
             paths = runtime_paths(repo_root, config.runtime.state_dir)
             gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=True)
             app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
-            result = app.status()
+            result = app.status(use_cache=not getattr(args, "no_cache", False))
             per_repo[repo_key] = result.data
         except (RepoNotFoundError, ConfigError, GitHubError, OSError) as exc:
             errors.append({"repo_key": repo_key, "error": str(exc)})
@@ -1465,6 +1479,42 @@ def run_fleet_review_queue(args: argparse.Namespace) -> CommandResult:
     return CommandResult(
         ok=not errors,
         message=f"fleet review queue: {len(per_repo)} repo(s), {len(errors)} error(s)",
+        data={"repos": per_repo, "errors": errors},
+    )
+
+
+def run_fleet_operator_queue(args: argparse.Namespace) -> CommandResult:
+    """Run fleet operator-queue aggregation across all registered repos.
+
+    Issue #1314 item 1. This is a read-only command that mirrors
+    ``run_fleet_review_queue``: for each registered repo, calls
+    ``OrchestratorApp.operator_queue()`` with ``dry_run=True``, aggregates
+    per-repo queue entries keyed by repo_key (nameWithOwner), and isolates
+    per-repo errors without aborting aggregation.
+    """
+    fleet_json_path = layout.fleet_registry_path()
+    registry = _load_registry(fleet_json_path)
+    per_repo: dict[str, Any] = {}
+    errors: list[dict[str, str]] = []
+
+    for repo_key, entry in sorted(registry.get("repos", {}).items()):
+        try:
+            repo_root = Path(entry.get("repo_root"))
+            if not repo_root.exists():
+                raise RepoNotFoundError(f"Repo root does not exist: {repo_root}")
+
+            config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
+            paths = runtime_paths(repo_root, config.runtime.state_dir)
+            gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=True)
+            app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
+            result = app.operator_queue()
+            per_repo[repo_key] = result.data
+        except (RepoNotFoundError, ConfigError, GitHubError, OSError) as exc:
+            errors.append({"repo_key": repo_key, "error": str(exc)})
+
+    return CommandResult(
+        ok=not errors,
+        message=f"fleet operator queue: {len(per_repo)} repo(s), {len(errors)} error(s)",
         data={"repos": per_repo, "errors": errors},
     )
 
@@ -2346,7 +2396,7 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
 
 def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult:
     if args.command == "roll-call":
-        return app.status()
+        return app.status(use_cache=not getattr(args, "no_cache", False))
     if args.command == "bootstrap-labels":
         return app.bootstrap_labels()
     if args.command == "intake":
@@ -2359,6 +2409,8 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
         return app.dispatch(args.limit, only_issues=args.issues)
     if args.command == "review-queue":
         return app.review_queue()
+    if args.command == "operator-queue":
+        return app.operator_queue()
     if args.command == "why-charlie-hate":
         # The operator's manual re-run is deliberately exempt from the per-head
         # cross-family regeneration budget (issue #1099): a human typing a
@@ -2531,6 +2583,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = run_fleet_status(args)
             elif args.fleet_command == "review-queue":
                 result = run_fleet_review_queue(args)
+            elif args.fleet_command == "operator-queue":
+                result = run_fleet_operator_queue(args)
             elif args.fleet_command == "work":
                 result = run_fleet_work(args)
             elif args.fleet_command == "bash-rats":
@@ -2614,6 +2668,9 @@ def main(argv: list[str] | None = None) -> int:
                 # which one it is.
                 suffix = _render_backlog_reachability(repo_data.get("backlog_reachability"))
                 print(line + suffix)
+                cache_age = repo_data.get("cache_age_seconds")
+                if cache_age is not None:
+                    print(f"    (cached, {cache_age:.0f}s old)")
             errors = result.data.get("errors", [])
             if errors:
                 print("Errors:")

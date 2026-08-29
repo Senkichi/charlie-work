@@ -24,7 +24,7 @@ VIRTUAL_ENV= PYTHONPATH="$PWD/src" uv run --no-sync python \
     `docs/plans/rework-findings-channel.md` section 13).
   - F5 = `9b1f637` (PR #768), refined by `395aab1` and `bbcc132`.
   All three are confirmed ancestors of the pinned SHA.
-- **Corpus:** `C:\Users\senki\repos\charlie-work\.var\charlie-work\prs`
+- **Corpus:** `.var/charlie-work/prs` (repo-local state dir)
 - **Corpus size found:** 19 `request_changes` verdicts
 
 ## Results by category (never a single aggregate)

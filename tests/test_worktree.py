@@ -24,6 +24,9 @@ from charlie_work.worktree import (
     OPERATOR_MARKER_SESSION_ID,
     RESCUE_REF_PREFIX,
     RescueCapture,
+    WORKTREE_UNSAFE_KINDS,
+    WORKTREE_UNSAFE_KIND_LOCAL_COMMITS,
+    WORKTREE_UNSAFE_KIND_SHIM_DIRT,
     WorktreeCleanResult,
     WorktreeCleanGH,
     WorktreeInfo,
@@ -47,6 +50,7 @@ from charlie_work.worktree import (
     _restore_declared_scaffolding_modifications,
     _worker_authored_dirty,
     _worktree_refuse_to_reset_reason,
+    _worktree_unsafe_kind_from_reason,
     clean_worktrees,
     create_review_checkout,
     create_worktree,
@@ -4401,16 +4405,21 @@ def test_worker_authored_dirty_detects_sibling_in_collapsed_untracked_dir(
     dir/`` line in the first place — every file, including a worker-authored
     sibling living next to a nested injected path, gets its own record. There
     is no collapsed line left to special-case or re-probe.
+
+    Uses a non-launcher-owned directory (``.custom/``) because ``.devin/`` is
+    now entirely launcher-owned (issue #1391) — a sibling under ``.devin/``
+    is correctly ignored, so it cannot serve as the "should be detected"
+    case here.
     """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
-    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected = repo_root / ".custom" / "prompts" / "worker.md"
     injected.parent.mkdir(parents=True)
     injected.write_text("injected prompt", encoding="utf-8")
-    sibling = repo_root / ".devin" / "worker-output.txt"
+    sibling = repo_root / ".custom" / "worker-output.txt"
     sibling.write_text("real worker output", encoding="utf-8")
 
-    assert _worker_authored_dirty(repo_root, (".devin/prompts/worker.md",)) is True
+    assert _worker_authored_dirty(repo_root, (".custom/prompts/worker.md",)) is True
 
 
 def test_worker_authored_dirty_untracked_dir_with_only_injected_stays_clean(
@@ -4579,6 +4588,137 @@ def test_worker_authored_dirty_detects_changes_outside_materialize_and_injected(
     (repo_root / "worker-output.txt").write_text("worker result\n", encoding="utf-8")
 
     assert _worker_authored_dirty(repo_root, (), (".devin",)) is True
+
+
+# --- issue #1391: launcher-owned shim dirt is not worker output ---------------
+
+
+def test_worker_authored_dirty_ignores_devin_shim_residue(tmp_path: Path) -> None:
+    """Issue #1391: untracked ``.devin/`` launcher residue (AGENTS.md,
+    hooks.v1.json, hooks/*.py, skills/, worker.md, orchestrator.md) is shim
+    dirt, not worker output. The dirty check must ignore it so a worktree
+    whose only dirt is launcher residue is not refused re-arm."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    # Simulate the full set of shim residue observed in the field.
+    devin = repo_root / ".devin"
+    devin.mkdir(parents=True)
+    (devin / "AGENTS.md").write_text("agents\n", encoding="utf-8")
+    (devin / "worker.md").write_text("worker\n", encoding="utf-8")
+    (devin / "orchestrator.md").write_text("orch\n", encoding="utf-8")
+    (devin / "hooks.v1.json").write_text("{}", encoding="utf-8")
+    hooks_dir = devin / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "pre_tool.py").write_text("# hook\n", encoding="utf-8")
+    skills_dir = devin / "skills"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "foo.py").write_text("# skill\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_devin_prompts_modifications(
+    tmp_path: Path,
+) -> None:
+    """Issue #1391: modified ``.devin/prompts/rework.md`` / ``worker.md`` are
+    shim rewrites, not worker output. Even when tracked, modifications under
+    ``.devin/`` must be ignored by the launcher-owned matcher (independent of
+    ``injected_paths`` / ``materialize_dirs`` config)."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    prompts_dir = repo_root / ".devin" / "prompts"
+    prompts_dir.mkdir(parents=True)
+    for name in ("worker.md", "rework.md"):
+        p = prompts_dir / name
+        p.write_text("original\n", encoding="utf-8")
+        _git(repo_root, "add", str(p))
+    _git(repo_root, "commit", "-m", "track devin prompts")
+    # Simulate the shim rewriting them.
+    (prompts_dir / "worker.md").write_text("rewritten\n", encoding="utf-8")
+    (prompts_dir / "rework.md").write_text("rewritten\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_pr_body_scratch_files(tmp_path: Path) -> None:
+    """Issue #1391: PR body scratch files (``PR_BODY.md``, ``PR_BODY_42.md``,
+    ``.worker-pr-body.md``, ``_pr_body.md``) are launcher/protocol residue,
+    not worker output. The dirty check must ignore all variants."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    for name in ("PR_BODY.md", "PR_BODY_42.md", ".worker-pr-body.md", "_pr_body.md"):
+        (repo_root / name).write_text("# PR body draft\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_git_worktree_dir(tmp_path: Path) -> None:
+    """Issue #1391: untracked ``.git_worktree_dir/`` is launcher residue."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    wt_dir = repo_root / ".git_worktree_dir"
+    wt_dir.mkdir(parents=True)
+    (wt_dir / "cache.json").write_text("{}", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_charlie_writer_deletion(tmp_path: Path) -> None:
+    """Issue #1391: a deleted ``.charlie-writer.json`` marker is protocol
+    residue, not worker output. The writer marker is already in the default
+    ``injected_paths``, so a deletion is excluded by the declared-scaffolding
+    matcher — this test pins that the default config covers the deletion
+    case (not just creation/modification)."""
+    from charlie_work.config import DispatchConfig
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    marker = repo_root / ".charlie-writer.json"
+    marker.write_text('{"pid": 1}\n', encoding="utf-8")
+    _git(repo_root, "add", str(marker))
+    _git(repo_root, "commit", "-m", "track writer marker")
+    # Delete it (simulating a worker or shim removing the marker).
+    marker.unlink()
+
+    assert _worker_authored_dirty(repo_root, DispatchConfig().injected_paths) is False
+
+
+def test_worker_authored_dirty_still_flags_real_work_alongside_shim_dirt(
+    tmp_path: Path,
+) -> None:
+    """Issue #1391 negative control: ignoring launcher residue must NOT excuse
+    genuine worker-authored modifications mixed in with the junk. This is the
+    jc #1514 scenario — two real modified source files alongside shim dirt
+    that were lost when the worktree was force-removed."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    # Shim residue.
+    devin = repo_root / ".devin"
+    devin.mkdir(parents=True)
+    (devin / "AGENTS.md").write_text("agents\n", encoding="utf-8")
+    (repo_root / "PR_BODY.md").write_text("# draft\n", encoding="utf-8")
+    # Real worker output — a tracked source file modification.
+    src = repo_root / "src" / "app.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("original\n", encoding="utf-8")
+    _git(repo_root, "add", str(src))
+    _git(repo_root, "commit", "-m", "add app")
+    src.write_text("modified by worker\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is True
+
+
+def test_worker_authored_dirty_devin_prefix_does_not_collide(tmp_path: Path) -> None:
+    """Issue #1391: a directory that merely shares a string prefix with a
+    launcher-owned dir (``.devin-cache`` vs ``.devin``) must not match —
+    path-segment comparison, not substring matching."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    cache_dir = repo_root / ".devin-cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "marker.txt").write_text("not launcher\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is True
 
 
 def test_inspect_worktree_state_no_commits(tmp_path: Path) -> None:
@@ -5590,7 +5730,10 @@ def test_verify_shared_venv_catches_pth_pointing_outside_main_checkout(tmp_path:
     ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
 
     assert not ok
-    assert "points outside all configured checkouts" in message
+    # charlie_work's package root is derivable, so the per-package message names
+    # the expected root rather than the generic "outside all roots" fallback.
+    assert "_editable_impl_charlie_work.pth" in message
+    assert "expected its package root" in message
     assert "uv sync --all-extras" in message
 
 
@@ -5656,7 +5799,9 @@ def test_verify_shared_venv_detects_poisoned_foreign_editable(tmp_path: Path) ->
 
     assert not ok
     assert "_editable_impl_ci_fleet.pth" in message
-    assert "points outside all configured checkouts" in message
+    # ci_fleet's package root is derivable, so the per-package message names the
+    # expected peer root rather than the generic "outside all roots" fallback.
+    assert "expected its package root" in message
 
 
 def test_verify_shared_venv_approves_healthy_foreign_editable(tmp_path: Path) -> None:
@@ -5728,6 +5873,70 @@ def test_verify_shared_venv_ignores_non_path_pth_lines(tmp_path: Path) -> None:
 
     assert ok
     assert "configured checkouts" in message
+
+
+def test_verify_shared_venv_catches_foreign_editable_repointed_at_wrong_root(
+    tmp_path: Path,
+) -> None:
+    """Cross-root false-green (fast-follow #1180): a foreign editable repointed at a
+    *different* configured root must be caught, not accepted.
+
+    ``_editable_impl_ci_fleet.pth`` repointed at ``charlie-work/src`` would pass
+    the old "any configured root" check because ``charlie-work/src`` IS a
+    configured root -- yet import as a silent ``ImportError`` (no ``ci_fleet``
+    package lives there).  The per-package detection validates the line against
+    *the* root inferred from the ``.pth``'s package (``ci_runners/src``), so the
+    wrong-root line is flagged.
+    """
+    repo_root, peer_src = _setup_repo_with_peer_dep(tmp_path)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    # Foreign editable repointed at the WRONG configured root (charlie-work/src
+    # instead of ci_runners/src).  This is the next vector after #969.
+    (site_packages / "_editable_impl_ci_fleet.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert not ok
+    assert "_editable_impl_ci_fleet.pth" in message
+    assert "expected its package root" in message
+    # The expected root (peer_src) must be named, not the wrong root.
+    assert str(peer_src.resolve()) in message
+
+
+def test_verify_shared_venv_unknown_package_falls_back_to_any_root(
+    tmp_path: Path,
+) -> None:
+    """When no per-package root is derivable, the "any configured root" fallback holds.
+
+    A ``.pth`` whose filename matches no known package (so ``_match_pth_to_root``
+    returns ``None``) is still checked: a line outside *all* configured roots is
+    poisoned and surfaces the generic "outside all configured checkouts" message.
+    This preserves the #969 gap-2 behaviour for unknown packages.
+    """
+    repo_root, _peer_src = _setup_repo_with_peer_dep(tmp_path)
+    scratch = tmp_path / "scratch" / "src"
+    scratch.mkdir(parents=True)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    # Unknown package name -> _match_pth_to_root returns None -> fallback path.
+    (site_packages / "_editable_impl_mystery_pkg.pth").write_text(
+        str(scratch.resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert not ok
+    assert "_editable_impl_mystery_pkg.pth" in message
+    assert "points outside all configured checkouts" in message
 
 
 def test_clean_worktrees_removes_merged_worktree_and_verifies_shared_venv(
@@ -6347,7 +6556,9 @@ def test_clean_worktrees_surfaces_poisoned_venv_after_removal(tmp_path: Path) ->
     assert result.ok is False
     assert len(result.data["removed"]) == 1
     assert result.data["venv_ok"] is False
-    assert "points outside all configured checkouts" in result.data["venv_message"]
+    # charlie_work's package root is derivable, so the per-package message names
+    # the expected root rather than the generic "outside all roots" fallback.
+    assert "expected its package root" in result.data["venv_message"]
 
 
 def test_clean_worktrees_skips_open_pr(tmp_path: Path) -> None:
@@ -7593,6 +7804,99 @@ def test_worktree_unsafe_still_escalates_when_writer_marker_is_dead(
     remove_worktree(repo, info.path, branch=branch_name)
 
 
+# --- Issue #807: worktree_unsafe kind split at detection time ---
+
+
+def test_worktree_unsafe_error_classifies_shim_dirt_from_uncommitted_modifications() -> None:
+    """Issue #807: a ``WorktreeUnsafeError`` raised for uncommitted modifications
+    (launch-shim dirt / adapter shim materialization) must carry
+    ``kind="worktree_unsafe_shim_dirt"`` — the mechanical kind that stays in
+    ``DETERMINISTIC_ESCALATION_FAILURE_KINDS`` and is eligible for auto-de-escalation.
+    """
+    exc = WorktreeUnsafeError("worktree has uncommitted modifications")
+    assert exc.kind == "worktree_unsafe_shim_dirt"
+
+
+def test_worktree_unsafe_error_classifies_local_commits_from_unpushed_commits() -> None:
+    """Issue #807: a ``WorktreeUnsafeError`` raised for local commits not on the
+    remote branch (genuine divergence) must carry
+    ``kind="worktree_unsafe_local_commits"`` — the judgment kind that escalates
+    immediately but is NOT eligible for auto-de-escalation.
+    """
+    exc = WorktreeUnsafeError("worktree has 1 local commit(s) not on remote branch")
+    assert exc.kind == "worktree_unsafe_local_commits"
+
+
+def test_worktree_unsafe_error_explicit_kind_overrides_reason_derivation() -> None:
+    """Issue #807: an explicit ``kind`` argument takes precedence over the
+    auto-derived kind from the reason string, so callers that already know the
+    discriminator can pass it directly."""
+    exc = WorktreeUnsafeError(
+        "worktree has uncommitted modifications",
+        kind="worktree_unsafe_local_commits",
+    )
+    assert exc.kind == "worktree_unsafe_local_commits"
+
+
+def test_worktree_unsafe_error_rejects_unrecognized_explicit_kind() -> None:
+    """Issue #807: an explicit ``kind`` that isn't one of ``WORKTREE_UNSAFE_KINDS``
+    must fail closed with ``ValueError`` rather than being accepted silently. A
+    stray/unrecognized kind would match neither
+    ``DETERMINISTIC_ESCALATION_FAILURE_KINDS`` nor
+    ``DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS``, so it would silently
+    degrade to the ordinary redispatch-cap path instead of escalating.
+    """
+    with pytest.raises(ValueError):
+        WorktreeUnsafeError(
+            "worktree has uncommitted modifications",
+            kind="worktree_unsafe_bogus",
+        )
+
+
+def test_worktree_unsafe_error_derived_kind_is_always_a_known_kind() -> None:
+    """Issue #807: a reason string that matches neither known discriminator
+    pattern must still derive a kind from ``WORKTREE_UNSAFE_KINDS`` (the
+    fail-closed fallback), never an unrecognized or empty kind."""
+    exc = WorktreeUnsafeError("worktree is in an unexpected state")
+    assert exc.kind in WORKTREE_UNSAFE_KINDS
+
+
+def test_worktree_unsafe_kind_fallback_is_local_commits_not_shim_dirt() -> None:
+    """Issue #807 rework: a reason string that matches neither known pattern
+    must fail closed toward ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`` (judgment /
+    human-needed), NOT ``WORKTREE_UNSAFE_KIND_SHIM_DIRT`` (mechanical /
+    auto-clearable). Defaulting an unrecognized reason to the mechanical kind
+    inverts this codebase's fail-closed convention and could silently reproduce
+    the #807 bug for any future reason string that doesn't match the
+    'local commit' or 'uncommitted modifications' substring checks — the
+    de-escalation sweep would auto-clear it and return the issue to dispatch
+    instead of escalating to a human.
+    """
+    # Direct function-level assertion on the fallback path.
+    assert (
+        _worktree_unsafe_kind_from_reason("worktree is in an unexpected state")
+        == WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+    )
+    # End-to-end through WorktreeUnsafeError construction.
+    exc = WorktreeUnsafeError("worktree is in an unexpected state")
+    assert exc.kind == WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+
+
+def test_worktree_unsafe_kind_shim_dirt_reason_classifies_as_shim_dirt() -> None:
+    """Issue #807 rework: the 'uncommitted modifications' reason string (shim /
+    adapter dirt) must still classify as ``WORKTREE_UNSAFE_KIND_SHIM_DIRT``
+    after the fallback was flipped to ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS``.
+    This guards against the fallback-flip silently misclassifying shim dirt as
+    a judgment call, which would make every shim-dirt escalation
+    non-auto-clearable."""
+    assert (
+        _worktree_unsafe_kind_from_reason("worktree has uncommitted modifications")
+        == WORKTREE_UNSAFE_KIND_SHIM_DIRT
+    )
+    exc = WorktreeUnsafeError("worktree has uncommitted modifications")
+    assert exc.kind == WORKTREE_UNSAFE_KIND_SHIM_DIRT
+
+
 # --- Issue #849: rescue capture makes worktree_unsafe refusal recoverable ---
 
 
@@ -7716,6 +8020,91 @@ def test_rescue_capture_excludes_scaffolding(
 
     # Clean up.
     remove_worktree(repo, info2.path, branch=branch_name)
+
+
+def test_rescue_capture_excludes_launcher_owned_shim_dirt(
+    tmp_path: Path,
+) -> None:
+    """Issue #1391: launcher-owned shim dirt (``.devin/``, ``.git_worktree_dir/``,
+    and a ``PR_BODY*.md`` scratch file) mixed with real tracked worker edits is
+    excluded from the captured rescue tree, while the real worker edits are
+    preserved.
+
+    Calls ``_capture_worktree_work_to_rescue_ref`` directly so the exclusion
+    pathspecs in the capture function are the only thing under test -- the
+    ``_worker_authored_dirty`` matcher that also ignores launcher-owned dirt
+    is not on this code path, so a regression in the capture exclusions cannot
+    be masked by the dirty check refusing to trigger.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    branch_name = "agent/issue-1391-rescue-shim-dirt"
+    info = create_worktree(repo, branch_name, base_ref="origin/main")
+
+    # Real worker edits: a tracked modification + an untracked worker file.
+    # These MUST appear in the rescue tree.
+    worker_readme = "modified by worker\n"
+    (info.path / "README.md").write_text(worker_readme, encoding="utf-8")
+    worker_new = "real worker edit\n"
+    (info.path / "worker_real_edit.txt").write_text(worker_new, encoding="utf-8")
+
+    # Launcher-owned shim dirt. These MUST NOT appear in the rescue tree.
+    (info.path / ".devin").mkdir(exist_ok=True)
+    (info.path / ".devin" / "config.json").write_text('{"shim": true}\n', encoding="utf-8")
+    (info.path / ".git_worktree_dir").mkdir(exist_ok=True)
+    (info.path / ".git_worktree_dir" / "marker").write_text("shim marker\n", encoding="utf-8")
+    # A PR_BODY*.md variant -- the glob exclusion must catch it.
+    pr_body = "draft PR body\n"
+    (info.path / "PR_BODY_1391.md").write_text(pr_body, encoding="utf-8")
+
+    capture = worktree_module._capture_worktree_work_to_rescue_ref(
+        repo, info.path, issue_number=1391
+    )
+
+    assert capture.error is None, f"capture failed: {capture.error}"
+    assert capture.ref_name is not None
+    assert capture.ref_name.startswith(RESCUE_REF_PREFIX)
+    rescue_ref = capture.ref_name
+
+    # Real worker edits ARE present in the rescue tree, byte-for-byte.
+    assert _git(repo, "show", f"{rescue_ref}:README.md").stdout == worker_readme
+    assert _git(repo, "show", f"{rescue_ref}:worker_real_edit.txt").stdout == worker_new
+
+    # Launcher-owned shim paths are EXCLUDED from the rescue tree: ``git show``
+    # for each shim path fails (non-zero exit) because the path does not exist
+    # in the captured tree.
+    for shim_path in (
+        ".devin/config.json",
+        ".git_worktree_dir/marker",
+        "PR_BODY_1391.md",
+    ):
+        show_result = subprocess.run(
+            ["git", "show", f"{rescue_ref}:{shim_path}"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        assert show_result.returncode != 0, (
+            f"shim path {shim_path!r} leaked into the rescue tree; "
+            f"git show returned {show_result.returncode} with stdout="
+            f"{show_result.stdout!r}"
+        )
+
+    # Sanity: no path under a launcher-owned directory or matching the PR body
+    # family appears anywhere in the captured tree.
+    tree_paths = _git(repo, "ls-tree", "-r", "--name-only", rescue_ref).stdout.splitlines()
+    leaked = [
+        p
+        for p in tree_paths
+        if p.startswith(".devin/")
+        or p.startswith(".git_worktree_dir/")
+        or p.startswith("PR_BODY")
+        or p in (".worker-pr-body.md", "_pr_body.md")
+    ]
+    assert leaked == [], f"launcher-owned shim paths leaked into rescue tree: {leaked}"
+
+    # Clean up.
+    remove_worktree(repo, info.path, branch=branch_name)
 
 
 def test_rescue_capture_emits_event_retrievable_via_query_events(
@@ -8095,5 +8484,82 @@ def test_salvage_push_operator_claimed_marker_skips(tmp_path: Path) -> None:
 
     assert result.pushed is False
     assert result.skip_reason == "operator_claimed"
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
+
+
+# ---------------------------------------------------------------------------
+# Issue #1326: dry_run gate for push_branch / salvage_push_stranded_commits
+# ---------------------------------------------------------------------------
+#
+# Under dry_run=True, push_branch must short-circuit before the ``git push``
+# subprocess call -- no real push reaches origin. salvage_push_stranded_commits
+# threads dry_run through to push_branch. Both tests use real local git repos
+# (bare "origin" remote + clone with linked worktrees) and verify the remote
+# branch tip is unchanged after the call.
+
+
+def test_push_branch_dry_run_does_not_push(tmp_path: Path) -> None:
+    """dry_run=True short-circuits before ``git push``; origin is untouched."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1326-push-dry"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit, never pushed")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    # The branch must NOT exist on origin before the call.
+    show_ref_before = _git(remote, "show-ref")
+    assert branch not in show_ref_before.stdout
+
+    ok, error = push_branch(repo, branch, worktree_path=info.path, dry_run=True)
+
+    # Dry-run returns the natural "nothing happened" success shape.
+    assert ok is True
+    assert error is None
+
+    # The branch must STILL NOT exist on origin -- no real push happened.
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
+    # And the local tip is unchanged (the commit is still only local).
+    assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == local_tip
+
+
+def test_salvage_push_stranded_commits_dry_run_does_not_push(tmp_path: Path) -> None:
+    """dry_run=True threads through to push_branch; origin is untouched.
+
+    The read-only probing (rev-parse, ls-remote, merge-base, rev-list) still
+    runs, but the mutating ``git push`` is suppressed. The salvage returns
+    pushed=True (the "nothing happened" success shape that lets downstream
+    classification proceed under dry-run), but the remote branch tip is
+    unchanged.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1326-salvage-dry"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    # Make a commit that would be stranded (never pushed).
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "stranded commit, never pushed")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    # The branch must NOT exist on origin before the call.
+    show_ref_before = _git(remote, "show-ref")
+    assert branch not in show_ref_before.stdout
+
+    result = salvage_push_stranded_commits(repo, branch, info.path, dry_run=True)
+
+    assert isinstance(result, SalvagePushResult)
+    # Dry-run: push_branch returned (True, None), so salvage reports pushed=True
+    # with the local tip as the would-be new remote SHA -- but no real push
+    # reached origin.
+    assert result.pushed is True
+    assert result.error is None
+    assert result.new_remote_sha == local_tip
+
+    # The branch must STILL NOT exist on origin -- no real push happened.
     show_ref_after = _git(remote, "show-ref")
     assert branch not in show_ref_after.stdout

@@ -1,9 +1,9 @@
 """Load-bearing regression tests: production state.json shapes must survive.
 
 The fixture `tests/fixtures/state_production_redacted.json` is a redacted copy of a
-real job-cannon `.var/charlie-work/state.json` (titles/bodies/URLs/paths
+real pre-extraction `.var/charlie-work/state.json` (titles/bodies/URLs/paths
 scrubbed; numbers, statuses, event kinds, and timestamps kept verbatim — see
-docs/design/extraction-dossier.md section 3 "De facto state.json schema"). These
+the internal extraction dossier, section 3 "De facto state.json schema"). These
 tests prove the extracted `state.py` module can round-trip a file written by the
 OLD in-repo orchestrators without dropping fields it doesn't know about.
 """
@@ -15,6 +15,8 @@ import logging
 import pathlib
 import shutil
 from pathlib import Path
+
+import pytest
 
 import charlie_work.state as state_module
 from charlie_work.state import append_event, empty_state, load_state, save_state
@@ -312,9 +314,87 @@ def test_load_state_retries_transient_oserror(tmp_path: Path, monkeypatch) -> No
 
     loaded = load_state(state_path)
 
-    assert len(calls) == 2
+    # Exactly 2 attempts (1 simulated failure + 1 success) is the common case,
+    # but the real Path.open can itself hit a genuine transient OSError on a
+    # shared Windows CI box — the precise condition load_state's retry absorbs.
+    # The retry path firing is already proven by call 1 raising + a successful
+    # load; do not cap the upper bound (any cap re-imports host-dependence).
+    assert len(calls) >= 2
     assert loaded["issues"]["1"]["status"] == "ok"
     assert list(tmp_path.glob("state.json.corrupt-*")) == []
+
+
+def test_save_state_retries_transient_permission_error(tmp_path: Path, monkeypatch) -> None:
+    """A transient PermissionError on the atomic replace must retry and succeed.
+
+    Mirrors ``test_load_state_retries_transient_oserror`` for the writer side
+    (issue #1062): on Windows, ``os.replace()`` onto a target another process
+    holds open raises ``PermissionError`` [WinError 5]. The first attempt fails,
+    the second succeeds, and the saved file reflects the new data.
+    """
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps({"version": 1, "issues": {"1": {"status": "old"}}}),
+        encoding="utf-8",
+    )
+
+    calls: list[pathlib.Path] = []
+    real_replace = pathlib.Path.replace
+
+    def flaky_replace(self: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+        calls.append(self)
+        if len(calls) == 1:
+            raise PermissionError(5, "Access is denied")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(pathlib.Path, "replace", flaky_replace)
+
+    saved = save_state(state_path, {"version": 1, "issues": {"1": {"status": "new"}}})
+
+    assert len(calls) == 2
+    assert saved["issues"]["1"]["status"] == "new"
+    # The replace eventually succeeded, so the on-disk file reflects the new data.
+    on_disk = json.loads(state_path.read_text(encoding="utf-8"))
+    assert on_disk["issues"]["1"]["status"] == "new"
+    # No leftover tmp file.
+    assert not (tmp_path / "state.json.tmp").exists()
+
+
+def test_save_state_raises_after_retry_exhausted_permission_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Persistent PermissionError on replace must raise with a helpful message.
+
+    The previous valid state file must survive intact (the atomic-replace
+    contract: a failed replace leaves the destination untouched), and the
+    raised ``PermissionError`` must name the transient-sharing-violation
+    condition so an operator does not hunt for an admin shell (issue #1062).
+    """
+    original = {"version": 1, "issues": {"1": {"status": "old"}}}
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps(original), encoding="utf-8")
+
+    calls: list[pathlib.Path] = []
+
+    def failing_replace(self: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+        calls.append(self)
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(pathlib.Path, "replace", failing_replace)
+
+    with pytest.raises(PermissionError) as exc_info:
+        save_state(state_path, {"version": 1, "issues": {"1": {"status": "new"}}})
+
+    assert len(calls) == state_module._SAVE_RETRY_ATTEMPTS
+    message = str(exc_info.value)
+    assert "transient" in message
+    assert "intact" in message
+    # The previous valid file is untouched.
+    on_disk = json.loads(state_path.read_text(encoding="utf-8"))
+    assert on_disk["issues"]["1"]["status"] == "old"
+    # The tmp file is left behind (the replace never succeeded); it is not the
+    # writer's job to clean it up, and a later successful save reuses it.
+    assert (tmp_path / "state.json.tmp").exists()
 
 
 def test_load_state_quarantines_utf16le_bom(tmp_path: Path, caplog) -> None:

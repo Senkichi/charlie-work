@@ -241,7 +241,9 @@ def test_changed_files_parses_deleted_and_untracked_entries(gate, repo):
     by_path = {cf.path: cf for cf in changed}
 
     assert by_path["keep.py"].deleted is True
+    assert by_path["keep.py"].untracked is False  # tracked file, now deleted
     assert by_path["new_untracked.py"].deleted is False
+    assert by_path["new_untracked.py"].untracked is True  # ?? entry
 
 
 def test_changed_files_reports_non_ascii_filename_unquoted(gate, repo):
@@ -487,6 +489,10 @@ def test_evaluate_blocks_on_ruff_check_failure(gate, repo, monkeypatch):
     # fix, review round, #1259), a non-.py dirty file would never even
     # reach a ruff invocation -- that emptiness path is covered separately
     # by test_evaluate_skips_ruff_subprocess_when_changed_set_has_no_py_files.
+    # Uses a tracked-modified (`` M``) file, not ``??``: #1306 excludes
+    # untracked files from ruff's scope, so an untracked dirty.py would
+    # never reach ruff and this test would silently stop exercising the
+    # ruff-check-failure path.
     (repo / "dirty.py").write_text("x", encoding="utf-8")
 
     def _fake_run(cmd, *, cwd, timeout):
@@ -497,7 +503,7 @@ def test_evaluate_blocks_on_ruff_check_failure(gate, repo, monkeypatch):
             # the committed-diff union (review round, #1259, blocker B).
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
         if "status" in cmd:
-            return subprocess.CompletedProcess(cmd, 0, stdout="?? dirty.py\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout=" M dirty.py\n", stderr="")
         if "check" in cmd:
             return subprocess.CompletedProcess(cmd, 1, stdout="E501 line too long\n", stderr="")
         raise AssertionError(f"unexpected command {cmd}")
@@ -511,6 +517,8 @@ def test_evaluate_blocks_on_ruff_check_failure(gate, repo, monkeypatch):
 
 
 def test_evaluate_blocks_on_ruff_format_failure(gate, repo, monkeypatch):
+    # Tracked-modified (`` M``), not ``??``: #1306 excludes untracked files
+    # from ruff's scope -- see test_evaluate_blocks_on_ruff_check_failure.
     (repo / "dirty.py").write_text("x", encoding="utf-8")
 
     def _fake_run(cmd, *, cwd, timeout):
@@ -518,7 +526,7 @@ def test_evaluate_blocks_on_ruff_format_failure(gate, repo, monkeypatch):
         if cmd[:2] == ["git", "symbolic-ref"]:
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
         if "status" in cmd:
-            return subprocess.CompletedProcess(cmd, 0, stdout="?? dirty.py\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout=" M dirty.py\n", stderr="")
         if "check" in cmd:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if "format" in cmd:
@@ -611,12 +619,14 @@ def test_evaluate_scopes_ruff_to_explicit_changed_files_not_whole_tree(gate, rep
     """Merge-blocker A fix (review round, #1259): ruff must be invoked with
     an explicit file list derived from the changed-set, never a bare "."
     that would rescan the whole tree, including files this session never
-    touched. (The real, unmocked empirical proof that this actually stops a
-    spurious block -- a pre-existing lint/format issue outside the diff not
-    blocking, while a real whole-tree scan on the same repo does fail -- was
-    run as a standalone smoke test against the live script, not via a
-    mocked unit test; #1306 tracks the one case this scoping still does not
-    close: an untracked file that predates the session.)"""
+    touched. Uses a tracked-modified (`` M``) file because #1306 excludes
+    untracked ``??`` files from ruff's scope -- an untracked file would
+    never reach ruff and this test would silently stop exercising the
+    scoping path. (The real, unmocked empirical proof that this actually
+    stops a spurious block -- a pre-existing lint/format issue outside the
+    diff not blocking, while a real whole-tree scan on the same repo does
+    fail -- was run as a standalone smoke test against the live script, not
+    via a mocked unit test.)"""
     (repo / "session_file.py").write_text("x = 1\n", encoding="utf-8")
     captured: list[list[str]] = []
 
@@ -625,7 +635,7 @@ def test_evaluate_scopes_ruff_to_explicit_changed_files_not_whole_tree(gate, rep
         if cmd[:2] == ["git", "symbolic-ref"]:
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
         if "status" in cmd:
-            return subprocess.CompletedProcess(cmd, 0, stdout="?? session_file.py\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout=" M session_file.py\n", stderr="")
         if "ruff" in cmd:
             captured.append(cmd)
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -636,10 +646,171 @@ def test_evaluate_scopes_ruff_to_explicit_changed_files_not_whole_tree(gate, rep
     result = gate._evaluate(repo)
 
     assert result.block is False
-    assert captured, "ruff must still run when there is a .py file in scope"
+    assert captured, "ruff must still run when there is a tracked-modified .py file in scope"
     for cmd in captured:
         assert "." not in cmd, f"ruff invoked with whole-tree scope: {cmd}"
         assert "session_file.py" in cmd
+
+
+# ---------------------------------------------------------------------------
+# #1306: untracked debris must not gate ruff, but still gates tests/W4.
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_excludes_untracked_py_from_ruff_scope(gate, repo, monkeypatch):
+    """#1306: an untracked (``??``) ``.py`` file -- which may be pre-existing
+    debris that predates the session, since ``git status`` cannot tell the
+    two apart -- must never reach ruff. A would-reformat failure on it must
+    not block the stop. This is the core case the #1259 scoping did not
+    close: the operator's live checkout has
+    untracked ``scripts/ac3_*.py`` files that ``ruff format --check`` fails
+    on, and the scoped gate still included them because they are untracked.
+    """
+    (repo / "debris.py").write_text("x  =  1\n", encoding="utf-8")
+
+    def _fake_run(cmd, *, cwd, timeout):
+        del cwd, timeout
+        if cmd[:2] == ["git", "symbolic-ref"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+        if "status" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="?? debris.py\n", stderr="")
+        if "ruff" in cmd:
+            raise AssertionError(f"ruff must not run on untracked debris.py (#1306), got: {cmd}")
+        raise AssertionError(f"unexpected command {cmd}")
+
+    monkeypatch.setattr(gate, "_run", _fake_run)
+
+    result = gate._evaluate(repo)
+
+    assert result.block is False
+
+
+def test_evaluate_excludes_untracked_py_from_ruff_but_keeps_tracked_modified(
+    gate, repo, monkeypatch
+):
+    """#1306 mixed case: an untracked debris file and a tracked-modified
+    session file coexist. Ruff must run on the tracked-modified file only
+    and must not be invoked with the untracked file's path. If the
+    tracked-modified file has a real ruff failure, the gate still blocks on
+    *that* -- the untracked exclusion narrows scope, it does not disarm the
+    gate.
+    """
+    (repo / "debris.py").write_text("x  =  1\n", encoding="utf-8")
+    (repo / "session.py").write_text("x = 1\n", encoding="utf-8")
+    captured: list[list[str]] = []
+
+    def _fake_run(cmd, *, cwd, timeout):
+        del cwd, timeout
+        if cmd[:2] == ["git", "symbolic-ref"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+        if "status" in cmd:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="?? debris.py\n M session.py\n",
+                stderr="",
+            )
+        if "ruff" in cmd:
+            captured.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected command {cmd}")
+
+    monkeypatch.setattr(gate, "_run", _fake_run)
+
+    result = gate._evaluate(repo)
+
+    assert result.block is False
+    assert captured, "ruff must run on the tracked-modified session.py"
+    for cmd in captured:
+        assert "session.py" in cmd
+        assert "debris.py" not in cmd, f"ruff must not include untracked debris.py: {cmd}"
+
+
+def test_evaluate_still_targets_untracked_test_files(gate, repo, monkeypatch):
+    """#1306: untracked files are excluded from *ruff* only, not from test
+    targeting. A brand-new untracked ``tests/*.py`` file legitimately needs
+    coverage -- the gate must still run pytest on it even though ruff skips
+    it. (If ruff ran on it, a format issue in the new test file would block
+    before pytest even gets to run it -- the #1306 trade-off.)
+
+    The pytest command list is captured and asserted to contain
+    ``tests/test_new.py`` so the test fails if untracked test-file
+    targeting regresses -- not just if pytest happens to not be invoked
+    at all (which would leave ``result.block is False`` true regardless).
+    """
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_new.py").write_text(
+        "def test_x():\n    assert True\n", encoding="utf-8"
+    )
+    captured_pytest: list[list[str]] = []
+
+    def _fake_run(cmd, *, cwd, timeout):
+        del cwd, timeout
+        if cmd[:2] == ["git", "symbolic-ref"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+        if "status" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="?? tests/test_new.py\n", stderr="")
+        if "ruff" in cmd:
+            raise AssertionError("ruff must not run on untracked test file (#1306)")
+        if "pytest" in cmd:
+            captured_pytest.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="1 passed\n", stderr="")
+        raise AssertionError(f"unexpected command {cmd}")
+
+    monkeypatch.setattr(gate, "_run", _fake_run)
+
+    result = gate._evaluate(repo)
+
+    assert result.block is False
+    assert captured_pytest, (
+        "pytest must be invoked on the untracked test file -- a passing "
+        "result with no pytest call means targeting silently regressed"
+    )
+    assert any("tests/test_new.py" in cmd for cmd in captured_pytest), (
+        f"pytest must target tests/test_new.py; got {captured_pytest}"
+    )
+
+
+def test_evaluate_untracked_src_with_emit_site_still_triggers_w4(gate, repo, monkeypatch):
+    """#1306: untracked files are excluded from *ruff* only, not from the W4
+    emit-site rule. A brand-new untracked ``src/*.py`` file that calls
+    ``log_event``/``append_event``/``_record_event`` must still pull
+    ``tests/test_instrumentation.py`` into the targeted-test set -- a new
+    event-emit site legitimately needs registry-exhaustiveness coverage
+    even before the file is staged.
+    """
+    src_dir = repo / "src" / "charlie_work"
+    src_dir.mkdir(parents=True)
+    (src_dir / "new_emit.py").write_text(
+        "def f():\n    log_event(state_path, 'k', {})\n", encoding="utf-8"
+    )
+
+    def _fake_run(cmd, *, cwd, timeout):
+        del cwd, timeout
+        if cmd[:2] == ["git", "symbolic-ref"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+        if "status" in cmd:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="?? src/charlie_work/new_emit.py\n",
+                stderr="",
+            )
+        if "ruff" in cmd:
+            raise AssertionError("ruff must not run on untracked src file (#1306)")
+        if "pytest" in cmd:
+            # The W4 rule must have pulled in the instrumentation test path.
+            assert gate.INSTRUMENTATION_TEST_PATH in cmd, (
+                f"W4 must target {gate.INSTRUMENTATION_TEST_PATH} for untracked emit-site file: {cmd}"
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout="1 passed\n", stderr="")
+        raise AssertionError(f"unexpected command {cmd}")
+
+    monkeypatch.setattr(gate, "_run", _fake_run)
+
+    result = gate._evaluate(repo)
+
+    assert result.block is False
 
 
 def test_evaluate_fast_path_when_only_change_predates_the_branch_base(gate, repo, monkeypatch):

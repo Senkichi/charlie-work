@@ -263,6 +263,41 @@ def test_required_check_infra_failed_is_not_check_failure_block() -> None:
     assert any("infrastructure" in f.lower() for f in verdict.failures)
 
 
+def test_infra_blocked_block_holds_when_non_required_check_also_fails() -> None:
+    """Round-2 #1383 guard: a fleet-wide outage typically fails non-required
+    jobs too (e.g. an optional docs/lint job that also never started). The
+    janitor gate must still classify the PR as ``is_infra_blocked_block`` so
+    the protection is not silently disqualified.
+
+    This locks in the structural reason the disqualification does NOT happen:
+    ``summarize_checks`` only iterates the ``required`` tuple, so a
+    non-required check's FAILURE never enters the janitor ``failures`` list
+    and therefore never inflates ``non_required_checks_failures`` (which
+    counts failures NOT contributed by ``_check_required_checks`` -- draft,
+    state, mergeable, linked-issue, body, no-op-rework -- not literally
+    "non-required check failures"). The required check is shown here in its
+    post-enrichment ``INFRA_BLOCKED`` marker state, exactly as
+    ``_enrich_checks_infra_blocked`` would rewrite it before ``run_janitor``
+    sees it.
+    """
+    checks = [
+        {"name": "Tests passed", "state": "INFRA_BLOCKED"},
+        {"name": "Lint & Format", "bucket": "pass"},
+        # A non-required job that also failed with a zero-step / infra
+        # signature during the same fleet-wide outage.
+        {"name": "Optional Docs Build", "state": "FAILURE"},
+    ]
+
+    verdict = run_janitor(_green_pr(), checks, _config(), repo_root=Path.cwd())
+
+    assert verdict.is_infra_blocked_block is True
+    assert verdict.failed_required_checks == ()
+    # The only recorded failure is the infra-blocked required check -- the
+    # non-required FAILURE contributed nothing to ``failures``.
+    assert len(verdict.failures) == 1
+    assert "infra-blocked" in verdict.failures[0].lower()
+
+
 def test_no_required_checks_configured_skips_check_gate() -> None:
     verdict = run_janitor(_green_pr(), [], _config(required_checks=()))
 

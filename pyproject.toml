@@ -9,7 +9,7 @@ dependencies = [
     "pyyaml>=6.0",
     "psutil>=5.9",
     "tzdata>=2026.3",
-    "ci-fleet",
+    "ci-fleet>=0.1.0",
 ]
 
 [project.scripts]
@@ -44,7 +44,5 @@ markers = [
 line-length = 99
 src = ["src", "tests"]
 # Frozen reference copies from the archived freecode repo — docs, not live code.
-extend-exclude = ["docs/freecode-salvage/reference"]
-
-[tool.uv.sources]
-ci-fleet = { path = "../ci_runners", editable = true }
+# scratchpad/ is untracked ad-hoc investigation scratch, not source.
+extend-exclude = ["docs/freecode-salvage/reference", "scratchpad"]

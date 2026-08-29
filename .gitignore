@@ -46,3 +46,12 @@ test_marker*.txt
 # #1197 committed PR_BODY_1010.md to main this way (issue #1204). The glob
 # closes the class: any issue number, present or future, is covered.
 PR_BODY_*.md
+
+# Session planning/handoff documents are machine-local working notes, often
+# containing host paths and operational detail that must not ship in the
+# public tree. Anything meant to be published belongs in docs/ proper, not
+# docs/plans/. (A few legacy files remain tracked; the rule prevents new ones
+# from being swept in by a broad `git add`.)
+docs/plans/
+# Ad-hoc acceptance-check probe scripts from observation-window sessions.
+scripts/ac3_*.py

@@ -35,6 +35,27 @@ from .review_decision import resolve_decision_payload
 from .verdict_parsing import body_has_crash_signature
 
 
+def _provenance_caveat_from_decision(decision: dict[str, Any] | None) -> str:
+    """Return the provenance caveat stored in a decision dict, or ``""``.
+
+    Issue #1485: ``record_review`` persists a ``provenance_caveat`` field
+    into ``review-decision.json`` when a verdict was extracted from a dead
+    reviewer's session artifacts (``verdict_source`` = ``"log"``/
+    ``"events"``/``"file:*"``) rather than emitted as a clean structured
+    completion. This reads that field back so renderers can prepend it to
+    the findings section, warning a human to re-verify factual claims
+    before acting.
+
+    Returns ``""`` when the field is absent (a non-extracted verdict, or
+    a pre-#1485 record) so callers can unconditionally prepend without a
+    separate existence check.
+    """
+    if not isinstance(decision, dict):
+        return ""
+    caveat = decision.get("provenance_caveat")
+    return caveat.strip() if isinstance(caveat, str) and caveat.strip() else ""
+
+
 def _rework_prompt_search_dirs(
     config: OrchestratorConfig, repo_root: Path | None = None
 ) -> tuple[Path, ...]:
@@ -257,6 +278,20 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     ``dispatch_rework``'s #800 drift reconciler re-renders and diffs against
     it every pass), so a guard here reaches every persisted record without
     needing the one-off backfill script to run against it.
+
+    Issue #1310: the tier-2 (summary-verbatim) emit sites -- the
+    ``"derived"`` marker branch and the marker-less ``summary`` fallback --
+    render the verdict's ``summary`` verbatim. They are now guarded by the
+    same ``body_has_crash_signature`` and ``LEGACY_VACUOUS_SUMMARY`` checks
+    W12 applied to ``external_findings``/``required_changes``, degrading to
+    tier 3 when the summary is a crash body or the vacuous placeholder.
+    Production-unreachable today (crash bodies are posted as PR comments
+    and folded into ``external_findings``/``required_changes``, never
+    written into a verdict ``summary``), but the suppression contract W12
+    established is "crash noise cannot reach prompt content through any
+    render path" -- enforcing it at N-1 of N emit sites is the
+    signal-without-full-coverage shape a future ``summary`` writer or a
+    hand-edit of an archived decision file re-opens with no test failing.
     """
     if not isinstance(decision, dict):
         return ""
@@ -307,7 +342,7 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     # Issue #1269 (W12): filtered for the same crash-signature content
     # unconditionally (not gated on `findings_channel`) -- a new-shape record
     # can carry a crash comment too, since the collector-side fix only stops
-    # *future* ingestion; jc#1386 and jc#1394 both had crash comments already
+    # *future* ingestion; a sibling repo's #1386 and #1394 both had crash comments already
     # persisted in this field from before it shipped. Computed here, ABOVE
     # the vacuous-old-shape guard below, so that guard can check it directly
     # rather than assuming (unasserted) that an "external"-channel record
@@ -367,6 +402,44 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
         # the "both empty" tier below when they are not, in fact, empty.
         summary_text = ""
 
+    # Issue #1310: tier-2 (summary-verbatim) crash/vacuous guard. Both
+    # tier-2 emit sites below -- the `"derived"` marker branch and the
+    # marker-less `summary_text` fallback -- render `summary_text`
+    # verbatim. Neither applied `body_has_crash_signature` nor the
+    # `LEGACY_VACUOUS_SUMMARY` check, so a crash-signature body arriving
+    # as a verdict `summary` would pass straight into the rework brief --
+    # the exact content class W12 (#1269) suppressed at the collection
+    # and render boundaries for `required_changes`/`external_findings`.
+    # The neighboring tiers are already guarded: `_render_round_findings`'s
+    # `summary_is_usable` covers the summary-fallback and tier-1 re-append
+    # paths; only this tier-2 verbatim emit was bare. Degrade exactly as
+    # the other tiers do: treat a crash or vacuous summary as absent,
+    # routing to tier 3 (the "findings unavailable" escape hatch) when
+    # `changes` is also empty. Production-unreachable today (crash bodies
+    # are posted as PR comments and folded into `external_findings`/
+    # `required_changes`, never written into a verdict `summary`), but a
+    # future `summary` writer or a hand-edit of an archived decision file
+    # re-opens the leak with no test failing.
+    #
+    # Gated on `not new_shape` for the same reason the old-shape
+    # vacuous-neutralization guard above carries `and not external_findings`:
+    # when `external_findings` is populated, the tier-2 summary-fallback
+    # branch is what reaches `_render_external_findings_section` to render
+    # them. Neutralizing `summary_text` here would drop those genuine
+    # findings into tier 3, which returns without ever consulting
+    # `external_findings` -- the exact regression
+    # `test_render_required_changes_section_vacuous_guard_does_not_drop_populated_external_findings`
+    # pins down. The `new_shape`-True + crash/vacuous-summary case (crash
+    # text rendered alongside the external findings) is a separate, wider
+    # gap outside this issue's scope; the issue's acceptance test is the
+    # empty-findings-list case (`new_shape` False).
+    if (
+        not new_shape
+        and summary_text
+        and (summary_text == LEGACY_VACUOUS_SUMMARY or body_has_crash_signature(summary_text))
+    ):
+        summary_text = ""
+
     # issue #792: a verdict recorded by the current record_review carries an
     # explicit marker for exactly this distinction -- handle it before the
     # shape-based tiers below, which exist only to infer the same thing for
@@ -385,7 +458,14 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
         ]
         return "\n".join(lines)
 
-    if verdict == "request_changes" and findings_channel == "derived":
+    # Issue #1310: `and summary_text` -- the crash/vacuous guard above
+    # can neutralize `summary_text` to "" for a `"derived"` record (a
+    # hand-edited archived decision file, or a hypothetical future writer
+    # that stamps `derived` on a crash body). Without this guard the
+    # branch would render `defang_closing_keywords("")` -- an empty
+    # verbatim summary -- instead of degrading to tier 1 (if `changes`
+    # survived) or tier 3 (if not), exactly as the other tiers do.
+    if verdict == "request_changes" and findings_channel == "derived" and summary_text:
         lines = [
             "## Required changes",
             "",
@@ -663,6 +743,11 @@ def _render_round_findings(decision: dict[str, Any]) -> str:
             rendered = rendered.replace(_EXTERNAL_FINDINGS_POINTER, "").rstrip("\n") + "\n"
         if summary_is_usable and _REQUIRED_CHANGES_TIER1_INTRO in rendered:
             rendered = f"{rendered.rstrip()}\n\nSummary: {defang_closing_keywords(summary_text)}\n"
+        # Issue #1485: prepend the provenance caveat so a reviewer reading
+        # round history knows a prior round's verdict was log-extracted.
+        caveat = _provenance_caveat_from_decision(decision)
+        if caveat:
+            rendered = f"{caveat}\n\n{rendered}"
         return rendered
 
     # `_render_required_changes_section` declined to render anything for
@@ -687,7 +772,19 @@ def _render_round_findings(decision: dict[str, Any]) -> str:
         parts.append("\n".join(f"- {defang_closing_keywords(item)}" for item in safe_changes))
     if summary_is_usable:
         parts.append(f"Summary: {defang_closing_keywords(summary_text)}")
-    return "\n\n".join(parts)
+    rendered = "\n\n".join(parts)
+    # Issue #1485: prepend the provenance caveat on this fallback path too.
+    # This branch is reached when ``_render_required_changes_section`` declined
+    # to render anything -- approved (always) or ``blocked``-with-content
+    # (intentionally suppressed there). A ``blocked`` log-extracted verdict
+    # asserting "already merged" is exactly the population this caveat exists
+    # to flag: dropping it here reproduces the issue's motivating risk in a
+    # later review round, the precise surface the reviewer flagged. The
+    # delegated-render path above already prepends; this path must too.
+    caveat = _provenance_caveat_from_decision(decision)
+    if caveat:
+        rendered = f"{caveat}\n\n{rendered}" if rendered else caveat
+    return rendered
 
 
 def _render_rework_prompt(
@@ -712,6 +809,20 @@ def _render_rework_prompt(
     pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
     decision = resolve_decision_payload(pr_dir)
     required_changes_section = _render_required_changes_section(decision)
+    # Issue #1485: prepend the provenance caveat so a worker reading the
+    # rework brief knows the verdict was log-extracted and may be incomplete
+    # or incorrect -- re-verify factual claims before acting. Prepended even
+    # when ``required_changes_section`` is empty: a ``blocked``-with-content
+    # verdict is suppressed to ``""`` by ``_render_required_changes_section``
+    # (by design, for the worker-brief framing), so gating the caveat on a
+    # non-empty section would silently drop it for exactly the ``blocked``
+    # log-extracted verdicts the caveat exists to flag -- the same
+    # caveat-drop-on-empty-section gap the round-history fallback path closes.
+    caveat = _provenance_caveat_from_decision(decision)
+    if caveat:
+        required_changes_section = (
+            f"{caveat}\n\n{required_changes_section}" if required_changes_section else caveat
+        )
     return render_prompt(
         config.dispatch.rework_template,
         {

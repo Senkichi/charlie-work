@@ -1,7 +1,7 @@
 """Headless Devin CLI dispatch — non-blocking session launch with a durable
 sidecar so the orchestrator and ``doctor`` can see what is in flight.
 
-There is no Devin session-creation API (see docs/design/extraction-dossier.md,
+There is no Devin session-creation API (per the internal extraction dossier,
 "headless"/"--prompt-file"). Production reality is spawning the ``devin`` CLI
 in print mode: ``devin --prompt-file <path> --print --permission-mode
 dangerous``. Sessions run for many minutes, so dispatch must return immediately
@@ -438,7 +438,11 @@ def launch_devin_session(
             # takes the ordinary redispatch-cap path (issue #288 follow-up, PR #314).
             failure_kind = "worktree_probe_failed"
         elif isinstance(exc, WorktreeUnsafeError):
-            failure_kind = "worktree_unsafe"
+            # Issue #807: the discriminator (shim dirt vs local commits) is
+            # computed at detection time and carried on the exception, so the
+            # launch shim emits a distinct failure_kind without classifying
+            # after the fact.
+            failure_kind = exc.kind
         elif isinstance(exc, ReworkBranchConflictError):
             failure_kind = "rework_branch_conflict"
         elif isinstance(exc, WorktreeForeignWriterError):
@@ -583,7 +587,9 @@ def launch_devin_session(
         # Write the worktree writer marker so this process is recorded as the
         # legitimate occupant of the worktree (issue #400).
         try:
-            write_worktree_marker(worktree.path, pid, session_id)
+            write_worktree_marker(
+                worktree.path, pid, session_id, process_start_time=process_start_time
+            )
         except OSError:
             # Best-effort marker write must not derail a successful launch.
             pass
