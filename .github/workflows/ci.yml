@@ -39,6 +39,13 @@ env:
   PYTHONUTF8: "1"
   PYTHONIOENCODING: "utf-8:surrogateescape"
 
+# Least-privilege default for every job. The Lint job overrides this with its
+# own block (it needs pull-requests: read for the closing-keyword gate); a
+# job-level permissions key REPLACES the workflow-level one entirely, which is
+# why Lint's block lists contents: read again rather than inheriting it.
+permissions:
+  contents: read
+
 # SELF-HOSTED (2026-07): hosted-runner minutes exhausted mid-month; all jobs
 # run on the repo-registered self-hosted runners (a local Windows box). The
 # hosted ubuntu+windows matrix is suspended — restore it from git history

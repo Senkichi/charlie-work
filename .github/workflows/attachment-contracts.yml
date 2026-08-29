@@ -19,6 +19,11 @@ env:
   PYTHONUTF8: "1"
   PYTHONIOENCODING: "utf-8:surrogateescape"
 
+# Least-privilege default (same rationale as ci.yml): checkout needs
+# contents: read and nothing here needs more.
+permissions:
+  contents: read
+
 jobs:
   AttachmentContracts:
     name: Attachment Contracts (shadow)
