@@ -95,12 +95,12 @@ def workflow_job_matrix_flags(repo_root: Path) -> dict[str, bool]:
     required-check entry that the exact-match merge gate (``checks.py``) would
     report ``missing`` forever.
 
-    The previous repo-wide ``workflow_has_matrix`` boolean could justify a
-    tolerance match against a non-matrix job in workflow B merely because an
-    unrelated job in workflow A had a matrix -- silently reintroducing the
-    exact false-pass hazard #1508 closed once any workflow in a multi-workflow
-    repo gained a matrix job. Scoping to the matched job's own matrix flag is
-    the single point of enforcement.
+    A previous repo-wide boolean could justify a tolerance match against a
+    non-matrix job in workflow B merely because an unrelated job in workflow A
+    had a matrix -- silently reintroducing the exact false-pass hazard #1508
+    closed once any workflow in a multi-workflow repo gained a matrix job.
+    Scoping to the matched job's own matrix flag is the single point of
+    enforcement.
 
     A display name shared by several jobs is matrix-backed if ANY job reporting
     under that name has a matrix (OR-combined), so a tolerance match on that
@@ -129,16 +129,6 @@ def workflow_job_matrix_flags(repo_root: Path) -> dict[str, bool]:
             has_matrix = isinstance(strategy, dict) and isinstance(strategy.get("matrix"), dict)
             flags[name] = flags.get(name, False) or has_matrix
     return flags
-
-
-def workflow_has_matrix(repo_root: Path) -> bool:
-    """Return whether any GitHub Actions workflow job uses ``strategy.matrix``.
-
-    Thin convenience wrapper over :func:`workflow_job_matrix_flags` so the
-    repo-wide predicate and the per-job verifier share one matrix-detection
-    implementation and cannot drift.
-    """
-    return any(workflow_job_matrix_flags(repo_root).values())
 
 
 def _tolerance_match_base_names(required: str, job_names: set[str]) -> list[str]:
@@ -183,10 +173,6 @@ def _check_name_match_kind(required: str, job_names: set[str]) -> str | None:
     if _tolerance_match_base_names(required, job_names):
         return "tolerance"
     return None
-
-
-def _check_name_matches(required: str, job_names: set[str]) -> bool:
-    return _check_name_match_kind(required, job_names) is not None
 
 
 def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> None:

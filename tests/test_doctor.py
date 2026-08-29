@@ -20,10 +20,8 @@ from charlie_work.config import (
 from charlie_work.config import ApiProviderConfig, ApiWorkerConfig
 from charlie_work.doctor import (
     _check_name_match_kind,
-    _check_name_matches,
     _tolerance_match_base_names,
     run_doctor,
-    workflow_has_matrix,
     workflow_job_matrix_flags,
     workflow_job_names,
 )
@@ -78,14 +76,6 @@ def test_workflow_job_names_empty_without_workflows(tmp_path: Path) -> None:
     assert workflow_job_names(tmp_path) == set()
 
 
-def test_check_name_matches_exact_and_matrix_prefix() -> None:
-    assert _check_name_matches("Tests passed", {"Tests passed"}) is True
-    # Matrix job configured as "Test"; check runs report "Test (windows-latest)".
-    assert _check_name_matches("Test (windows-latest)", {"Test"}) is True
-    assert _check_name_matches("Test", {"Test (windows-latest)"}) is True
-    assert _check_name_matches("Pre-commit", {"Tests passed", "lint"}) is False
-
-
 def test_check_name_match_kind_classifies_exact_tolerance_and_none() -> None:
     # Issue #1508: the doctor verifier needs to distinguish an exact match
     # (which the merge gate in checks.py also accepts) from a tolerance-only
@@ -99,36 +89,14 @@ def test_check_name_match_kind_classifies_exact_tolerance_and_none() -> None:
     assert _check_name_match_kind("Pre-commit", {"Tests passed", "lint"}) is None
 
 
-def test_workflow_has_matrix_detects_strategy_matrix(tmp_path: Path) -> None:
-    _write_workflow(
-        tmp_path,
-        "name: CI\njobs:\n  test:\n    name: Tests\n    runs-on: ubuntu-latest\n"
-        "    strategy:\n"
-        "      matrix:\n"
-        "        os: [ubuntu-latest, windows-latest]\n",
-    )
-    assert workflow_has_matrix(tmp_path) is True
-
-
-def test_workflow_has_matrix_false_without_matrix(tmp_path: Path) -> None:
-    _write_workflow(
-        tmp_path,
-        "name: CI\njobs:\n  test:\n    name: Tests\n    runs-on: ubuntu-latest\n",
-    )
-    assert workflow_has_matrix(tmp_path) is False
-
-
-def test_workflow_has_matrix_false_without_workflows(tmp_path: Path) -> None:
-    assert workflow_has_matrix(tmp_path) is False
-
-
 def test_workflow_job_matrix_flags_scoped_per_job(tmp_path: Path) -> None:
     # Issue #1508: matrix-ness is a PER-JOB property, not repo-wide. Two
     # workflows in one repo -- only the second job has strategy.matrix -- so
     # the flags dict must mark "Matrix job" True and "Plain job" False
-    # independently. The repo-wide workflow_has_matrix() stays True (some job
-    # has a matrix), which is exactly the combination the old global-boolean
-    # verifier misused to justify a tolerance match against the plain job.
+    # independently. The repo-wide predicate (any flag True) stays True (some
+    # job has a matrix), which is exactly the combination the old
+    # global-boolean verifier misused to justify a tolerance match against the
+    # plain job.
     _write_workflow_named(
         tmp_path,
         "plain.yml",
@@ -146,7 +114,7 @@ def test_workflow_job_matrix_flags_scoped_per_job(tmp_path: Path) -> None:
     assert flags == {"Plain job": False, "Matrix job": True}
     # The repo-wide predicate is still True (some job has a matrix) -- this is
     # the trap: a global boolean cannot distinguish which job justified it.
-    assert workflow_has_matrix(tmp_path) is True
+    assert any(flags.values()) is True
 
 
 def test_workflow_job_matrix_flags_empty_without_workflows(tmp_path: Path) -> None:
