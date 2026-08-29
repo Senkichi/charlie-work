@@ -11,7 +11,7 @@
   "src/charlie_work/fleet_dispatch.py": 3378,
   "src/charlie_work/github.py": 3083,
   "src/charlie_work/instrumentation.py": 1391,
-  "src/charlie_work/janitor.py": 2011,
+  "src/charlie_work/janitor.py": 1978,
   "src/charlie_work/post_mortem.py": 1516,
   "src/charlie_work/reconcile.py": 3275,
   "src/charlie_work/rework_prompts.py": 921,

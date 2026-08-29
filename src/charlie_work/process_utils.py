@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .subprocess_runner import hidden_console_kwargs, no_console_window_kwargs
+from .subprocess_runner import hidden_console_kwargs, no_console_window_kwargs, run_captured
 
 
 def parse_proc_stat_starttime(stat_text: str) -> int | None:
@@ -586,11 +586,10 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
     try:
         if os.name == "nt":
             # Windows: use taskkill to terminate the process tree
-            result = subprocess.run(
+            result = run_captured(
                 ["taskkill", "/T", "/F", "/PID", str(pid)],
-                capture_output=True,
-                text=True,
-                **no_console_window_kwargs(),
+                cwd=Path.cwd(),
+                timeout_seconds=10,
             )
             # taskkill returns 0 for success, 1 for "process not found" (which
             # is fine). But the return code is not a reliable kill signal under
@@ -755,11 +754,10 @@ def kill_orphan_pid(pid: int) -> None:
     """
     try:
         if os.name == "nt":
-            subprocess.run(
+            run_captured(
                 ["taskkill", "/F", "/PID", str(pid)],
-                capture_output=True,
-                text=True,
-                **no_console_window_kwargs(),
+                cwd=Path.cwd(),
+                timeout_seconds=10,
             )
         else:
             os.kill(pid, signal.SIGKILL)
