@@ -644,12 +644,23 @@ def test_mention_covered_issue_with_exclusion_lifted_classifies_dispatchable() -
     assert result["mention_covered_prs"] == {}
 
 
-def test_mention_covered_takes_precedence_after_dependency_gate() -> None:
-    # The mention exclusion is checked AFTER the dependency gate, mirroring
-    # dispatch's filter order (label gate -> dependency gate -> merged-PR
-    # exclusion). An issue that is BOTH blocked by an open dependency AND
-    # mention-covered bins as ``blocked_by_open_dependency`` (the dependency
-    # gate runs first), not ``mention_covered_awaiting_operator``.
+def test_mention_covered_takes_precedence_over_dependency_gate() -> None:
+    # The mention exclusion is checked BEFORE the dependency gate, mirroring
+    # dispatch's filter order (label gate -> merged-PR exclusion -> dependency
+    # gate). Both the dry-run and real _dispatch_impl paths apply the
+    # merged_pr_issue_numbers exclusion in the candidate list comprehension
+    # and only run _filter_blocked_issues on the already-filtered list, so an
+    # issue that is BOTH blocked by an open dependency AND mention-covered is
+    # dropped by the mention exclusion and never reaches the dependency gate.
+    # The classifier bins it the same way -- ``mention_covered_awaiting_operator``
+    # -- so the reason names the still-active exclusion rather than the
+    # dependency gate the issue never reached.
+    #
+    # The planted open blocker (#886) is the mutation sentinel: under the
+    # pre-fix order (dependency gate first) this issue binned as
+    # ``blocked_by_open_dependency``; under the corrected order it bins as
+    # ``mention_covered_awaiting_operator`` because the mention exclusion
+    # fires first and the dependency-gate check never runs.
     config = OrchestratorConfig()
     labels = config.labels
     issues = [_issue(1059, {labels.ready}, body="Blocked by #886")]
@@ -657,9 +668,22 @@ def test_mention_covered_takes_precedence_after_dependency_gate() -> None:
 
     result = classify_backlog_reachability(gh, config, mention_covered={1059: [2043]})
 
-    assert result["blocked_by_open_dependency"] == 1
-    assert result["mention_covered_awaiting_operator"] == 0
+    assert result["mention_covered_awaiting_operator"] == 1
+    assert result["blocked_by_open_dependency"] == 0
     assert result["dispatchable"] == 0
+    # The reason names the mentioning PR(s).
+    assert result["mention_covered_prs"] == {1059: [2043]}
+    # The bins still partition the backlog.
+    assert (
+        result["missing_ready"]
+        + result["terminal_label"]
+        + result["active_label"]
+        + result["operator_claimed"]
+        + result["blocked_by_open_dependency"]
+        + result["mention_covered_awaiting_operator"]
+        + result["dispatchable"]
+        == result["open_total"]
+    )
 
 
 def test_mention_covered_does_not_apply_to_non_ready_issue() -> None:

@@ -164,9 +164,11 @@ def classify_backlog_reachability(
         # this bin those issues were counted ``dispatchable`` by reachability
         # while being unselectable, producing false dispatch_stale alarms for
         # a deliberately sequenced cohort tail. ``dispatchable`` now counts
-        # only issues that pass BOTH the label gate and the dependency gate;
-        # this bin holds the issues the dependency gate rejects. The bins
-        # still partition -- every fetched issue lands in exactly one.
+        # only issues that pass the label gate, the merged-PR mention
+        # exclusion, AND the dependency gate; this bin holds the issues the
+        # dependency gate rejects (after the mention exclusion has already
+        # passed). The bins still partition -- every fetched issue lands in
+        # exactly one.
         "blocked_by_open_dependency": 0,
         # Issue #1337: an automated-ready issue that a merged PR mentions in
         # free text (and whose mention-only exclusion has not been lifted by
@@ -178,7 +180,12 @@ def classify_backlog_reachability(
         # that triggered a manual investigation for #1059. The map is derived
         # from the same _merged_pr_referenced_issue_numbers +
         # _mention_rearmed_issue_numbers helpers dispatch uses, so the
-        # exclusion semantics cannot drift between the two paths.
+        # exclusion semantics cannot drift between the two paths. Checked
+        # BEFORE the dependency gate to mirror dispatch's filter order (label
+        # gate -> merged-PR exclusion -> dependency gate): an issue that is
+        # both mention-covered and blocked by an open dependency bins here,
+        # because dispatch drops it at the merged_pr_issue_numbers exclusion
+        # and it never reaches _filter_blocked_issues.
         "mention_covered_awaiting_operator": 0,
         # An issue with no ``number`` cannot be dispatched or named as an
         # example, but it must still be BINNED rather than skipped: the
@@ -225,35 +232,48 @@ def classify_backlog_reachability(
             elif number in claimed:
                 reason = "operator_claimed"
             else:
-                # Issue #1110: the label-only checks above mirror
-                # _is_dispatchable, but the dispatch path applies a further
-                # dependency gate (_filter_blocked_issues) that this function
-                # never modeled. Run the same blocker check the dispatch
-                # candidate filter runs and bin dependency-blocked issues
-                # distinctly, so dispatch_staleness can key off the
-                # post-dependency-gate candidate count instead of the
-                # label-only count. Fail-open: a transient API error resolves
-                # to no open blockers (matching dispatch -- a failed lookup
-                # does not filter a candidate out), so the issue bins as
-                # ``dispatchable`` rather than ``blocked_by_open_dependency``.
-                _declared, open_blockers = _get_open_blockers_for_issue(gh, issue)
-                if open_blockers:
-                    reason = "blocked_by_open_dependency"
-                elif number in covered:
-                    # Issue #1337: model the merged-PR mention-only dispatch
-                    # exclusion. An issue in ``covered`` is excluded from
-                    # dispatch by _dispatch_impl's merged_pr_issue_numbers
-                    # filter (and has NOT been re-armed by the operator).
-                    # Without this arm it binned as ``dispatchable`` forever
-                    # while dispatch silently dropped it each pass. The map
-                    # is derived from the same helpers dispatch uses, so the
-                    # predicate cannot drift. Placed after the dependency
-                    # gate to mirror dispatch's filter order (label gate ->
-                    # dependency gate -> merged-PR exclusion).
+                # Issue #1337: model the merged-PR mention-only dispatch
+                # exclusion. An issue in ``covered`` is excluded from
+                # dispatch by _dispatch_impl's merged_pr_issue_numbers
+                # filter (and has NOT been re-armed by the operator).
+                # Without this arm it binned as ``dispatchable`` forever
+                # while dispatch silently dropped it each pass. The map
+                # is derived from the same helpers dispatch uses, so the
+                # predicate cannot drift. Placed BEFORE the dependency
+                # gate to mirror dispatch's filter order (label gate ->
+                # merged-PR exclusion -> dependency gate): both the dry-run
+                # and real _dispatch_impl paths apply the
+                # merged_pr_issue_numbers exclusion in the candidate list
+                # comprehension and only run _filter_blocked_issues on the
+                # already-filtered list, so an issue that is BOTH
+                # mention-covered and blocked by an open dependency is
+                # dropped by the mention exclusion and never reaches the
+                # dependency gate. The classifier bins it the same way --
+                # ``mention_covered_awaiting_operator`` -- so the reason
+                # names the still-active exclusion rather than the
+                # dependency gate the issue never reached.
+                if number in covered:
                     reason = "mention_covered_awaiting_operator"
                     covered_prs[number] = sorted(covered[number])
                 else:
-                    reason = "dispatchable"
+                    # Issue #1110: the label-only checks above mirror
+                    # _is_dispatchable, but the dispatch path applies a
+                    # further dependency gate (_filter_blocked_issues) that
+                    # this function never modeled. Run the same blocker
+                    # check the dispatch candidate filter runs and bin
+                    # dependency-blocked issues distinctly, so
+                    # dispatch_staleness can key off the
+                    # post-dependency-gate candidate count instead of the
+                    # label-only count. Fail-open: a transient API error
+                    # resolves to no open blockers (matching dispatch -- a
+                    # failed lookup does not filter a candidate out), so
+                    # the issue bins as ``dispatchable`` rather than
+                    # ``blocked_by_open_dependency``.
+                    _declared, open_blockers = _get_open_blockers_for_issue(gh, issue)
+                    if open_blockers:
+                        reason = "blocked_by_open_dependency"
+                    else:
+                        reason = "dispatchable"
         reachability[reason] += 1
         if reason != "dispatchable":
             bucket = examples.setdefault(reason, [])
