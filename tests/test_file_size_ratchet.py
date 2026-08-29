@@ -17,6 +17,25 @@ leaves an over-cap file with MORE physical lines than its recorded mark. The
 mark may only be lowered -- never raised except via an explicit reviewed edit
 to the baseline file.
 
+## Quantized marks (MARK_QUANTUM)
+
+Marks are multiples of ``MARK_QUANTUM`` (200), derived as
+``ceil(lines / 200) * 200`` from the live count by the baseline's sole writer,
+``scripts/refresh_file_size_ratchet.py``. Exact-count marks made the baseline
+the repo's hottest merge-conflict site: any two concurrent PRs changing a
+monolith's line count wrote different values on the same JSON line, and the
+flat one-key-per-line layout put even different keys within diff3's context
+window. Quantized marks mean growth within a bucket needs no baseline edit at
+all, and two PRs bumping the same file into the same bucket write the
+identical line (clean merge). A reviewed hand-raise must follow the same
+rule -- next multiple of 200, never the exact line count. If a baseline line
+still conflicts on merge, take the larger value.
+
+The cost is bounded slack: a mark can sit up to 199 lines above the live
+count. The stale-low guard below is unaffected (quantizing rounds UP), and
+``test_synthetic_plus_one_to_real_workflow_py_trips_check`` takes its +1 past
+``max(live, mark)`` so it is stale-high-proof.
+
 ## Derivation, not enumeration (issue #1375)
 
 The covered file set is derived from the baseline file's own keys UNION a live
@@ -31,30 +50,32 @@ direction:
   fail-closed shape ``_ratchet_violations`` in
   ``tests/test_write_gate_enforcement.py`` uses for a brand-new module.
 * A file in the baseline that has since shrunk below the cap (or been deleted)
-  is auto-dropped from the baseline -- a future regrowth over the cap is
-  fail-closed again (no entry -> implicit 0).
+  simply holds (actual <= mark -> no violation) until a refresh-script run
+  drops its entry -- after which a future regrowth over the cap is fail-closed
+  again (no entry -> implicit 0).
 
 ## Counting
 
 Physical lines of the blob at the PR head (``len(text.splitlines())``), not
 diff arithmetic. A byte-identical extraction like #1317's passes trivially:
-the source file shrinks (fewer lines -> under its mark -> green, and the mark
-auto-lowers to tighten), and the extracted module is a separate path whose own
-mark is established by the reviewed baseline edit that lands it. Rename/move
-does not inflate the count because the blob is read at its current path.
+the source file shrinks (fewer lines -> under its mark -> green), and the
+extracted module is a separate path whose own mark is established by the
+reviewed baseline edit that lands it. Rename/move does not inflate the count
+because the blob is read at its current path.
 
-## Auto-lowering
+## The test suite never writes the baseline
 
-When a PR shrinks an over-cap file below its recorded mark, the keystone test
-PASSES (green on shrink, per AC2) and auto-lowers the mark in the baseline
-file to the new line count (atomic temp-file + ``replace`` write, per the
-project's JSON-write invariant). This is the "auto-lowered when a PR shrinks
-the file" behavior issue #1442 specifies -- the ratchet tightens on every
-shrink so extraction converges rather than racing a stale high mark. In CI the
-write is discarded (fresh checkout); locally the developer commits the
-auto-lowered baseline as part of the PR. ``scripts/refresh_file_size_ratchet.py``
-is the manual maintainer (one-time ``--init`` and lower-only refresh) for the
-same operation outside the test.
+This module is a pure assertion: a pytest run leaves the tree clean. An
+earlier revision auto-lowered the baseline on shrink as a test side effect;
+workers then committed that dirtied file per the preflight guidance
+("commit anything it fixes"), which put an exact line count into nearly every
+monolith-touching PR and made the baseline the fleet's dominant
+merge-conflict source. Lowering is now the job of
+``scripts/refresh_file_size_ratchet.py`` -- the SOLE baseline writer -- run
+deliberately: a shrink PR (e.g. an extraction) carries the script-produced
+quantized lowering as a reviewed edit, symmetric with a growth PR carrying a
+quantized raise. A stale-HIGH mark between refreshes is a passing state, not
+an error (the stale-low guard only fires on marks below the live count).
 
 ## Failure message
 
@@ -67,9 +88,16 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+# Marks in the baseline are multiples of this quantum (rounded UP from the
+# live count) -- see "Quantized marks" in the module docstring. Authoritative
+# declaration is in scripts/refresh_file_size_ratchet.py (the sole baseline
+# writer); tests/test_refresh_file_size_ratchet.py asserts the two agree.
+from _ratchet_constants import MARK_QUANTUM as MARK_QUANTUM
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _BASELINE_PATH = _REPO_ROOT / "file_size_ratchet_baseline.json"
@@ -93,7 +121,11 @@ _EXTRACTION_REMEDY = (
     "byte-identical extraction shrinks the source file and passes this ratchet "
     "trivially. To record a deliberate, reviewed exception (e.g. a new "
     "extraction that is itself over the cap), edit "
-    "file_size_ratchet_baseline.json directly as a reviewed change in the PR."
+    "file_size_ratchet_baseline.json directly as a reviewed change in the PR. "
+    "When raising a mark, raise it to the NEXT MULTIPLE OF 200 (MARK_QUANTUM) "
+    "above the new line count -- never the exact count -- so concurrent PRs "
+    "bumping the same file write the identical value. If the baseline line "
+    "still conflicts on merge, take the larger value."
 )
 
 
@@ -159,37 +191,6 @@ def _file_size_violations(
         if actual > mark:
             violations.append((path, mark, actual))
     return sorted(violations)
-
-
-def _auto_lower(
-    actual_counts: dict[str, int], baseline: dict[str, int], cap: int
-) -> dict[str, int]:
-    """Compute the auto-lowered baseline: for each covered path, if the file
-    shrank below its mark, lower the mark to the new count; if it dropped to
-    or below the cap (or was deleted), drop the entry entirely. Never raises.
-    Returns the updated baseline dict (a new dict; ``baseline`` is not
-    mutated)."""
-    covered = set(baseline) | {p for p, n in actual_counts.items() if n > cap}
-    updated = dict(baseline)
-    for path in covered:
-        actual = actual_counts.get(path, 0)
-        mark = baseline.get(path, 0)
-        if actual < mark:
-            if actual <= cap:
-                updated.pop(path, None)
-            else:
-                updated[path] = actual
-    return updated
-
-
-def _write_baseline_atomic(path: Path, marks: dict[str, int]) -> None:
-    """Atomic write (temp-file + ``replace``) per the project's JSON-write
-    invariant (CLAUDE.md). Sorted keys for stable diffs."""
-    payload = json.dumps(dict(sorted(marks.items())), indent=2, ensure_ascii=False)
-    payload += "\n"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(path)
 
 
 # ---------------------------------------------------------------------------
@@ -270,33 +271,6 @@ def test_synthetic_plus_one_line_to_at_mark_file_trips_check() -> None:
     )
 
 
-def test_auto_lower_never_raises_and_drops_under_cap_entries() -> None:
-    """The auto-lower helper only lowers (never raises) and drops entries for
-    files that fell to or below the cap."""
-    baseline = {
-        "src/charlie_work/workflow.py": 25442,  # shrinks -> lower
-        "src/charlie_work/reconcile.py": 2952,  # holds -> unchanged
-        "src/charlie_work/small.py": 850,  # shrinks below cap -> drop
-    }
-    actual = {
-        "src/charlie_work/workflow.py": 25400,
-        "src/charlie_work/reconcile.py": 2952,
-        "src/charlie_work/small.py": 790,
-    }
-    lowered = _auto_lower(actual, baseline, FILE_SIZE_CAP)
-
-    assert lowered == {
-        "src/charlie_work/workflow.py": 25400,
-        "src/charlie_work/reconcile.py": 2952,
-        # small.py dropped (fell under the cap).
-    }
-    # A growth is NOT silently raised by the auto-lowerer.
-    grown_actual = {"src/charlie_work/workflow.py": 25500}
-    assert (
-        _auto_lower(grown_actual, baseline, FILE_SIZE_CAP)["src/charlie_work/workflow.py"] == 25442
-    )
-
-
 # ---------------------------------------------------------------------------
 # Real-tree keystone: the CI gate itself.
 # ---------------------------------------------------------------------------
@@ -345,8 +319,10 @@ def test_baseline_marks_are_at_or_above_the_live_tree() -> None:
     assert not stale_low, (
         "file_size_ratchet_baseline.json has mark(s) BELOW the live line count "
         "-- a stale-low baseline that false-trips the ratchet. Either the file "
-        "grew (run the orchestrator's review lane) or the mark was hand-lowered "
-        "without the file shrinking:\n"
+        "grew past its mark (the keystone reports that separately) or the mark "
+        "was lowered without the file shrinking; re-run "
+        "`python scripts/refresh_file_size_ratchet.py` from a clean tree and "
+        "raise any still-low mark to the next multiple of 200 (MARK_QUANTUM):\n"
         + "\n".join(f"  {p}: mark={m}, live={n}" for p, m, n in stale_low)
     )
 
@@ -354,8 +330,13 @@ def test_baseline_marks_are_at_or_above_the_live_tree() -> None:
 def test_over_cap_files_do_not_exceed_high_water_mark() -> None:
     """The keystone CI gate (issue #1442 AC2). Loads the baseline, live-scans
     every tracked ``*.py`` file, and fails if any covered file grew past its
-    recorded high-water mark. On shrink, auto-lowers the baseline (tightening
-    the ratchet) and passes -- green on shrink, red on growth.
+    recorded high-water mark -- green on hold or shrink, red on growth.
+
+    Pure assertion: this test never writes the baseline (see the module
+    docstring -- the write-on-shrink side effect was the mechanism that put an
+    exact-count baseline diff into nearly every monolith-touching PR and made
+    the file the fleet's dominant merge-conflict source). Lowering is done
+    deliberately via scripts/refresh_file_size_ratchet.py.
 
     The covered set is derived (baseline keys UNION live over-cap files), never
     hardcoded. The failure message names the facade/extraction remedy so a
@@ -378,12 +359,37 @@ def test_over_cap_files_do_not_exceed_high_water_mark() -> None:
             f"{_EXTRACTION_REMEDY}"
         )
 
-    # Green on growth-fail path is unreachable here; on shrink, auto-lower the
-    # baseline so the ratchet tightens toward convergence (issue #1442's goal:
-    # extraction can converge only if shrinks bind). Atomic write per CLAUDE.md.
-    lowered = _auto_lower(live, baseline, FILE_SIZE_CAP)
-    if lowered != baseline:
-        _write_baseline_atomic(_BASELINE_PATH, lowered)
+
+def test_keystone_never_writes_the_baseline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression guard for the conflict-storm mechanism: running the keystone
+    against a tree whose files SHRANK below their marks must leave the
+    baseline file byte-identical (and leave no temp file behind). The old
+    write-on-shrink side effect dirtied the baseline on every local pytest
+    run; workers committed the dirt per the preflight guidance, and those
+    exact-count edits collided in merge after merge."""
+    mod = sys.modules[__name__]
+
+    baseline_file = tmp_path / "file_size_ratchet_baseline.json"
+    original = json.dumps({"src/charlie_work/big.py": 1000}, indent=2) + "\n"
+    baseline_file.write_text(original, encoding="utf-8")
+
+    monkeypatch.setattr(mod, "_BASELINE_PATH", baseline_file)
+    monkeypatch.setattr(
+        mod,
+        "_tracked_py_line_counts",
+        lambda repo_root: {"src/charlie_work/big.py": 900},  # shrunk below mark
+    )
+
+    mod.test_over_cap_files_do_not_exceed_high_water_mark()
+
+    assert baseline_file.read_text(encoding="utf-8") == original, (
+        "the keystone wrote the baseline on shrink -- the test suite must be a "
+        "pure assertion; only scripts/refresh_file_size_ratchet.py writes"
+    )
+    leftovers = [p.name for p in tmp_path.iterdir() if p != baseline_file]
+    assert not leftovers, f"keystone left stray file(s) behind: {leftovers}"
 
 
 def test_synthetic_plus_one_to_real_workflow_py_trips_check() -> None:
@@ -392,9 +398,10 @@ def test_synthetic_plus_one_to_real_workflow_py_trips_check() -> None:
     at-mark position trips the ratchet while the current count holds. This
     exercises the real baseline + real file, not just synthetic data.
 
-    Robust to the baseline being exactly at-mark (mark == live, the state the
-    keystone's auto-lower maintains) or stale-high (mark > live): the +1 is
-    taken past ``max(live, mark)`` so it always crosses the mark.
+    Robust to the baseline being exactly at-mark (mark == live, when the live
+    count sits on a MARK_QUANTUM boundary) or stale-high (mark > live, the
+    normal state for quantized marks): the +1 is taken past ``max(live, mark)``
+    so it always crosses the mark.
     """
     baseline = _load_baseline()
     path = "src/charlie_work/workflow.py"
