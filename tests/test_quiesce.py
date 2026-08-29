@@ -285,14 +285,14 @@ def test_all_invalid_patterns_are_not_quiescent() -> None:
     live_process = _proc(42, 1, "charlie.exe", "charlie.exe fleet supervise --repo charlie-work")
 
     report = assert_quiescent(
-        patterns=[r"\Users\senki\repos\charlie-work"],
+        patterns=[r"\Users\operator\repos\charlie-work"],
         processes=[live_process],
         self_pid=999,
     )
 
     assert report.ok is False
     assert report.matched == ()
-    assert report.invalid_patterns == (r"\Users\senki\repos\charlie-work",)
+    assert report.invalid_patterns == (r"\Users\operator\repos\charlie-work",)
     assert "no usable pattern" in report.summary
 
 
@@ -310,7 +310,7 @@ def test_check_quiescence_all_invalid_patterns_are_not_quiescent() -> None:
         return [live_process], None
 
     report = check_quiescence(
-        patterns=[r"\Users\senki\repos\charlie-work"], self_pid=999, lister=_fake_lister
+        patterns=[r"\Users\operator\repos\charlie-work"], self_pid=999, lister=_fake_lister
     )
 
     assert report.ok is False

@@ -109,8 +109,8 @@ class PreflightPaths:
     #: from and the target of self-deploy's ``git pull``/``uv sync``.
     #:
     #: Deliberately distinct from ``repo_root``: ``repo_root`` is the
-    #: *target* repo a given pass is processing (jc, charlie-work, whatever
-    #: is registered in the fleet), which varies per ``OrchestratorApp``
+    #: *target* repo a given pass is processing (charlie-work, another
+    #: sibling repo, whatever is registered in the fleet), which varies per ``OrchestratorApp``
     #: instance even though every one of those instances runs from the same
     #: single orchestrator install. venv_identity's whole job is asking "is
     #: THIS PROCESS running the correct orchestrator code and venv" -- a

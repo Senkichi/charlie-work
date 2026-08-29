@@ -6,24 +6,26 @@ on:
     branches:
       - main
 
-# Cancel superseded in-progress runs for the same branch. charlie-work has
-# only 2 registered self-hosted runners; without this, a run left in-progress
-# by a since-superseded push keeps occupying one of them to test a SHA that
-# can no longer appear in any PR's check set (checks are computed against the
-# head SHA). Push-to-main runs are exempt from cancellation: a main run is a
-# historical record that also feeds deployment, not a superseded draft.
+# Cancel superseded in-progress runs for the same branch. A run left
+# in-progress by a since-superseded push is testing a SHA that can no longer
+# appear in any PR's check set (checks are computed against the head SHA), so
+# it is pure noise. The self-hosted era added a capacity argument on top (2
+# registered runners); on hosted runners capacity is not scarce, but the
+# hygiene argument stands on its own. Push-to-main runs are exempt from
+# cancellation: a main run is a historical record that also feeds deployment,
+# not a superseded draft.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# Force UTF-8 on every Python process CI spawns. The self-hosted runner is a
-# Windows box where Python resolves its text layer from the ANSI codepage
-# (cp1252 on the GitHub runner image), not UTF-8 -- so any test that touches a
-# non-ASCII path, fixture, event payload, or subprocess pipe is decoded with
-# the wrong codec without this. That asymmetry with the dev box (which sets
-# both machine-wide) is the failure mode: a test passes locally and fails only
-# in CI, or -- worse -- passes in CI while silently mangling, because a
-# mojibaked string is still a string and most assertions never look.
+# Force UTF-8 on every Python process CI spawns. The hosted windows-latest
+# image is a Windows box where Python resolves its text layer from the ANSI
+# codepage (cp1252 on the GitHub runner image), not UTF-8 -- so any test that
+# touches a non-ASCII path, fixture, event payload, or subprocess pipe is
+# decoded with the wrong codec without this. That asymmetry with the dev box
+# (which sets both machine-wide) is the failure mode: a test passes locally
+# and fails only in CI, or -- worse -- passes in CI while silently mangling,
+# because a mojibaked string is still a string and most assertions never look.
 #
 # Set BOTH, and keep the ':surrogateescape' suffix. This mirrors
 # scripts/fleet-pass.ps1 (lines 62-63), which sets exactly these two variables
@@ -34,242 +36,131 @@ concurrency:
 #     handlers that UTF-8 mode installs and resets stdin/stdout to 'strict',
 #     turning graceful degradation into a hard crash on any not-quite-clean
 #     byte off a pipe. Do not shorten. See fleet-pass.ps1:53-60 for the full
-#     warning and ~/.claude/docs/utf8-hardening.md for the rationale.
+#     warning.
 env:
   PYTHONUTF8: "1"
   PYTHONIOENCODING: "utf-8:surrogateescape"
 
-# SELF-HOSTED (2026-07): hosted-runner minutes exhausted mid-month; all jobs
-# run on the repo-registered self-hosted runner (cw-9800x3d-1, local Windows
-# box). The hosted ubuntu+windows matrix is suspended — restore it from git
-# history when returning to GitHub-hosted runners. Check names changed from
-# "Tests (ubuntu-latest)"/"Tests (windows-latest)" to "Tests"; the local
-# orchestrator.config.yaml auto_merge.required_checks list must match.
-#
-# setup-uv was removed entirely on 2026-08-11 (#1115) in favor of a
-# PATH-append step -- see the comment on that step. If it is ever restored,
-# enable-cache must stay OFF on self-hosted: its GitHub-cache mode runs a
-# post-job `uv cache prune --ci` that destroys sibling jobs' in-flight cache
-# extractions when runners share a box (observed 2026-07-08 on job-cannon).
-# The persistent local disk cache is already warm.
+# Least-privilege default for every job. The Lint job overrides this with its
+# own block (it needs pull-requests: read for the closing-keyword gate); a
+# job-level permissions key REPLACES the workflow-level one entirely, which is
+# why Lint's block lists contents: read again rather than inheriting it.
+permissions:
+  contents: read
+
+# HOSTED (2026-08-28): back on GitHub-hosted runners. The 2026-07 move to
+# self-hosted was a private-repo billing decision; standard hosted runners
+# are free and unmetered on PUBLIC repos, which this repo now is. Two
+# standing constraints:
+#   * STANDARD images only (windows-latest, ubuntu-latest). Larger-runner
+#     labels (*-8-cores etc.) bill even on public repos -- never use them.
+#   * Check names stay exactly "Tests" and "Lint": single jobs, NO matrix.
+#     Restoring the pre-2026-07 ubuntu+windows matrix would rename the
+#     checks to "Tests (windows-latest)" etc. and silently break BOTH
+#     required-check lists at once -- .aviator/config.yml's required_checks
+#     and the deployed orchestrator.config.yaml's auto_merge.required_checks.
+#     Reintroducing a matrix is a coordinated three-place change, never a
+#     workflow-only edit.
 jobs:
   Tests:
     name: Tests
-    # `suite` is the capacity semaphore for this job (the #1254 follow-up the
-    # comment below promised). Only cw-9800x3d-1/-2 carry the custom `suite`
-    # label (added 2026-08-22; job-cannon's pool uses the identical split), so
-    # at most TWO Tests jobs run at once and the rest QUEUE -- GitHub enforces
-    # this by label matching and never cancels a queued job for it. Measured
-    # the same day, right after the group below was removed: four Tests jobs
-    # landed at once (one per listener) on top of job-cannon's two suite legs
-    # and the dispatch tree, and a suite that runs 7:38 solo at -n 2 took 43.7
-    # min, with three siblings at the 45m timeout. Light jobs (Lint) stay on
-    # `light`, which every cw listener carries, so they are never queued
-    # behind a suite. Labels are registration-side metadata: the allocator
-    # starts/parks listeners and never re-registers, so the split survives
-    # parking; re-provisioning a runner must re-apply them (ci_fleet #96).
-    runs-on: [self-hosted, Windows, X64, suite]
-    # NO job-level concurrency group here -- deliberately. PR #1388 (#1254)
+    # windows-latest: the suite is Windows-oriented (real git.exe
+    # subprocesses, Windows path semantics, the cp1252 asymmetry above) and
+    # the orchestrator it certifies runs on Windows. The self-hosted era's
+    # `suite` runner-label capacity semaphore is gone with the shared box:
+    # every hosted job gets a dedicated single-use VM, so there is no
+    # box-sharing footprint to ration and nothing to queue behind.
+    runs-on: windows-latest
+    # NO job-level concurrency group here -- deliberately (#1399). PR #1388
     # added `concurrency: {group: cw-tests-self-hosted, cancel-in-progress:
     # false}` to serialize Tests across branches, on the premise that excess
     # jobs would queue. They do not: GitHub keeps at most ONE pending job per
-    # concurrency group and CANCELS the older pending job whenever a newer one
-    # enters the same group, regardless of cancel-in-progress (that flag only
-    # protects the RUNNING job). With a constant group key, every Tests job
-    # that was still queued when any other branch's run was created got
-    # cancelled with runner_name="" / steps=[] -- 2026-08-22 21:19Z-23:37Z,
-    # ~10 PR runs killed, #1389/#1397/#1377 stranded approved-but-unmergeable
-    # (issue #1399). job-cannon's ci.yml header documents the same trap and
-    # the correct primitive: a runner LABEL as the capacity semaphore
-    # (`runs-on: [self-hosted, ..., suite]` on only N provisioned runners),
-    # which the GitHub scheduler enforces by queueing, never cancelling. That
-    # is what the `suite` runs-on above now does; the 75m timeout below is the
-    # backstop for residual contention, not the bound.
-    # 75 min: raised from 45 (#1434). The 45 min value was itself raised
-    # from 30 (#1254). 30 was derived from 28 successful runs
-    # (2026-07-28/29) with per-job execution time median 11.5 min,
-    # range 3.85-23.72 min, and cleared the 23.72 max by ~26%. But on
-    # 2026-08-15 four PRs' Tests jobs ran concurrently on the shared
-    # self-hosted box alongside other repos' CI and the dispatch tree's
-    # pytest sessions; CPU contention stretched a suite that normally
-    # finishes in ~8m (-n 2) to 29:43, and the 30m job timeout killed each
-    # at the finish line -- the suites PASSED ("4140 passed, 4 skipped in
-    # 1783.10s") but the job was cancelled during cleanup, producing false
-    # reds. 45 min was ~1.9x the uncontended max (23.72m) and ~1.5x the
-    # observed contended runtime (30m) -- enough headroom for residual
-    # contention without returning to the 60m budget that let the
-    # 2026-08-08 cross-repo incident wedge runners for ~10h.
+    # concurrency group and CANCELS the older pending job whenever a newer
+    # one enters the same group, regardless of cancel-in-progress (that flag
+    # only protects the RUNNING job). With a constant group key, every Tests
+    # job still queued when any other branch's run was created got cancelled
+    # with runner_name="" / steps=[] -- ~10 PR runs killed in one evening,
+    # #1389/#1397/#1377 stranded approved-but-unmergeable (issue #1399).
+    # That is GitHub semantics, not a self-hosted artifact: it applies
+    # unchanged on hosted runners, where there is also no capacity shortage
+    # for a group to "solve".
     #
-    # 45 -> 75 (#1434): the `suite` runner-label semaphore (#1404) bounds
-    # cw Tests to 2 concurrent, but the host also carries job-cannon's two
-    # `suite` legs plus dispatch-tree pytest sessions. The semaphore
-    # comment above records the measured effect: a suite that runs 7:38
-    # solo at -n 2 took 43.7 min with three siblings. Healthy runs now
-    # take 38-40m (PR #1426: 38m25s pass; PR #1416: 39m58s real failure),
-    # so 45m left ~12% headroom and any sustained overlap pushed runs past
-    # the cap -- overnight 2026-08-23/24, 9 of 16 completed Tests runs were
-    # cap-killed at 45m, each cycling through merge_failed_attempt_alarm.
-    # 75 min clears the worst measured contended runtime (43.7m) by ~70%
-    # while still catching genuine hangs. Do NOT re-add a job-level
-    # concurrency group (see #1399/#1404 header above) or touch the
-    # runs-on labels. Sibling: job-cannon PR #1443.
+    # 75 min: carried over from the self-hosted era as a first-runs backstop,
+    # NOT a hosted-derived bound. The old number was contention-derived
+    # (shared box: a suite that ran 7:38 solo took 43.7 min under full
+    # overlap, and 45 min cap-killed 9 of 16 overnight runs -- #1434).
+    # Hosted VMs have no cross-job contention, but a standard 4-core
+    # windows-latest VM is much slower hardware than the old host and there
+    # is zero hosted timing data for this suite yet. Recalibrate from real
+    # runs once a few weeks of data exist (follow-up issue); do not tighten
+    # speculatively -- the #1434 failure mode was suites that PASSED being
+    # killed during cleanup by an optimistic cap, cycling
+    # merge_failed_attempt_alarm.
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v5
-      # setup-uv@v7 replaced with a PATH-append (#1115): the action's runner
-      # Node process crashed twice in 12 min with a libuv assertion
-      # (async.c:94, upstream flake class) on this box, and on a self-hosted
-      # runner the action's only real job -- downloading uv -- is unnecessary:
-      # the tool cache and the host both already have it. Resolution order:
-      # newest uv in the runner tool cache (what setup-uv itself installed),
-      # else host uv on PATH, else fail loudly -- never silently download.
-      - name: Add uv to PATH (self-hosted, no setup-uv)
-        shell: bash
-        run: |
-          set -e
-          cache="$RUNNER_TOOL_CACHE/uv"
-          dir=""
-          if [ -d "$cache" ]; then
-            ver=$(ls "$cache" | grep -E '^[0-9]+[.][0-9]+[.][0-9]+$' | sort -V | tail -1)
-            [ -n "$ver" ] && dir="$cache/$ver/x64"
-          fi
-          if [ -n "$dir" ] && [ -x "$dir/uv.exe" ]; then
-            echo "$dir" >> "$GITHUB_PATH"
-            "$dir/uv.exe" --version
-          elif command -v uv >/dev/null; then
-            uv --version
-          else
-            echo "::error::uv not found in tool cache ($cache) or host PATH; install uv on the host"
-            exit 1
-          fi
-      # ci_fleet is consumed as an editable path dependency at ../ci_runners
-      # ([tool.uv.sources] in pyproject.toml), so the sibling checkout has to
-      # exist BEFORE uv sync runs -- without it, sync exits 2 with
-      # "Distribution not found" and both required checks wedge every PR.
+      # setup-uv restored (2026-08-28). It was replaced by a PATH-append step
+      # in #1115, for two reasons that were both properties of the shared
+      # self-hosted box, not of the action: the runner Node process's libuv
+      # crash (async.c:94) was observed on that box, and enable-cache was
+      # banned because its post-job `uv cache prune --ci` raced sibling
+      # jobs' in-flight cache extractions on a shared disk (observed
+      # 2026-07-08 on a sibling repo's pool). Hosted VMs are single-job and
+      # isolated: the prune races nothing, and the GitHub cache replaces
+      # the warm local disk the old box provided.
       #
-      # Idempotent by necessity: $GITHUB_WORKSPACE/.. is outside the directory
-      # actions/checkout manages, so it is neither created for us nor cleaned
-      # between runs. A plain clone would succeed once per runner and fail on
-      # every run after that. actions/checkout cannot do this itself -- it
-      # refuses a path: outside the workspace, and the location is fixed by the
-      # relative path recorded in uv.lock.
-      #
-      # Tracks ci_runners' main rather than a pinned SHA. Deliberate, but NOT
-      # for the reason this comment used to give -- it claimed the lock would
-      # disagree with a pin, and uv.lock records
-      # `source = { editable = "../ci_runners" }` with no revision anywhere in
-      # the entry, so there is nothing here for a pin to contradict (see #954).
-      #
-      # The real reason: production does not run a revision. The live
-      # supervisor imports ci_fleet through an editable .pth that prepends
-      # ..\ci_runners\src to sys.path, so it executes whatever is SAVED in that
-      # working tree -- committed or not. Pinning a SHA here would buy a
-      # reproducible CI at the cost of validating a ci_fleet that production
-      # demonstrably does not run, which is the more expensive of the two.
-      #
-      # Revisit when ci_fleet ships as a versioned dependency: at that point CI
-      # and the supervisor resolve the same artifact and a pin costs nothing.
-      - name: Check out ci_runners as a sibling
-        shell: powershell
-        env:
-          CI_RUNNERS_PAT: ${{ secrets.CI_RUNNERS_PAT }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $dest = Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) 'ci_runners'
-          # Credential passed per-command, never written to disk. `git -c`
-          # applies to the single invocation and is not copied into the new
-          # repo's config, unlike embedding a token in the remote URL -- which
-          # would persist in .git/config on the runner between runs.
-          $pair = "x-access-token:$env:CI_RUNNERS_PAT"
-          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
-          $auth = "AUTHORIZATION: basic $b64"
-          # Actions masks the *literal* secret string; the base64 of it is a
-          # different string and is NOT masked automatically. Basic-auth base64
-          # is encoding, not encryption -- anything that echoed $b64 or $auth
-          # would print a trivially reversible credential in the clear. Register
-          # it so the masker covers this form too.
-          Write-Host "::add-mask::$b64"
-          if (Test-Path (Join-Path $dest '.git')) {
-            git -C $dest -c http.extraheader="$auth" fetch --depth 1 origin main
-            if ($LASTEXITCODE -ne 0) { throw "fetch of ci_runners failed" }
-            git -C $dest reset --hard FETCH_HEAD
-            if ($LASTEXITCODE -ne 0) { throw "reset of ci_runners failed" }
-          } elseif (Test-Path $dest) {
-            # Something is there that is not a git checkout. Fail rather than
-            # remove it: this step has no business deleting an unexplained
-            # directory on the host, and on Windows a junction would be
-            # followed by a recursive delete (R-15).
-            throw "$dest exists but is not a git checkout -- refusing to touch it"
-          } else {
-            git -c http.extraheader="$auth" clone --depth 1 --branch main `
-              https://github.com/Senkichi/ci_runners.git $dest
-            if ($LASTEXITCODE -ne 0) { throw "clone of ci_runners failed" }
-          }
-          if (-not (Test-Path (Join-Path $dest 'pyproject.toml'))) {
-            throw "ci_runners checkout at $dest has no pyproject.toml"
-          }
+      # SHA-pinned (third-party action on a public repo): upstream stopped
+      # publishing floating major tags after v7 and its README recommends
+      # the commit pin. Verified via git ls-remote 2026-08-28:
+      # refs/tags/v10.0.1 = 20cfd1bf945f4377ade1205e4dbc17946fc9a30d.
+      # enable-cache is deliberately left at its `auto` default: auto is ON
+      # for GitHub-hosted runners on this workflow's events (pull_request,
+      # push) and auto-disables for cache-poisoning-prone events
+      # (pull_request_target, workflow_run, release) if such a trigger is
+      # ever added -- an explicit `true` would override that protection.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      # ci-fleet resolves from PyPI (versioned wheel in uv.lock) since
+      # 2026-08-28; the sibling-checkout step that used to live here -- with
+      # its PAT, per-run fetch, and "CI validates what production runs"
+      # rationale -- is gone because CI and the supervisor now install the
+      # same published artifact.
       - name: Install dependencies
         run: uv sync --frozen --all-extras
       - name: Run tests
-        # -n 2 (pytest-xdist, fixed count -- deliberately not "auto"): this
-        # box runs 2 self-hosted runners, so 2 Tests jobs can already execute
-        # concurrently, and charlie-work's own worker-dispatch tree can add
-        # more pytest sessions on the same shared box independent of CI. That
-        # tree's default worker count for its own dispatched sessions is
-        # PYTEST_XDIST_AUTO_NUM_WORKERS=2 (src/charlie_work/env_sanitize.py),
-        # itself chosen after a 2026-07-26 incident (issue 646) where ~36
-        # uncapped xdist workers stacked on this box's 8 physical cores took
-        # a 6.4min suite to ~145min. That constant only governs the
-        # dispatch tree's own "-n auto" resolution and has no enforcement
-        # reach into this workflow file -- but matching its number here
-        # keeps this job's box footprint consistent with the rest of the
-        # system's box-sharing discipline rather than picking an unrelated,
-        # uncoordinated worker count for the one job that also runs
-        # concurrently (x2 runners) on the same shared hardware.
-        # --dist=load (pytest-xdist's default, spelled out for clarity)
-        # rather than loadfile: tests/test_worktree.py alone is ~150 of
-        # ~3100 tests and the heaviest file by wall time (real git.exe
-        # subprocesses), so pinning it to a single worker would floor the
-        # achievable speedup.
-        #
-        # Measured full-suite, full local run, ambient box load 35-70% (other
-        # CI jobs and fleet worktree processes concurrently active -- not an
-        # idealized clean-room benchmark) (2026-07-31, this box, all runs
-        # identical pass/skip count -- 3092 passed, 2 skipped):
-        #   serial:    1593.55s (26:33)
-        #   -n 2:       458.86s ( 7:38)  3.47x
-        #   -n 4:       457.45s ( 7:37)  3.48x  (measured for comparison,
-        #                                        not used -- ties -n 2)
-        #   -n 6:       369.76s ( 6:10)  4.31x  (measured for comparison,
-        #                                        not used -- see below)
-        # -n 2 ties -n 4 and -n 6 is only moderately faster than both; given
-        # ambient load varied 35-70% CPU across these runs (uncontrolled,
-        # shared box), this spread is consistent with ambient-load noise
-        # rather than a clean worker-count scaling curve, so it is not being
-        # read as proof the suite is IO-bound past 2 workers. The choice of
-        # -n 2 rests on the box-sharing argument above, not on a claimed
-        # throughput advantage -- and the data at minimum rules out a large
-        # speed cost to the safer, convention-matching count.
-        # -q dropped here (pyproject.toml addopts already sets it): stacking
-        # an explicit -q on top of addopts' -q silently drops pytest's final
-        # "N passed" summary line -- verified locally, exit code is
-        # unaffected either way but CI logs become unreadable for a human
-        # skimming a pass without failures. Pre-existing on this line before
-        # this change; fixed in the same edit rather than left in place.
-        run: uv run pytest --tb=short -n 2 --dist=load
+        # -n auto (pytest-xdist): the self-hosted era pinned -n 2 purely as
+        # box-sharing discipline -- CI shared 8 physical cores with a second
+        # runner and the orchestrator's own dispatch tree (issue 646: ~36
+        # uncapped workers took a 6.4-min suite to ~145 min). A hosted VM is
+        # dedicated, so auto -- the VM's CPU count, 4 on standard
+        # windows-latest -- is the right default. (pytest-xdist honors
+        # PYTEST_XDIST_AUTO_NUM_WORKERS when set; nothing in this workflow
+        # sets it. env_sanitize.py's =2 governs only the orchestrator's own
+        # dispatched sessions, not CI.)
+        # --dist=load (xdist's default, spelled out for clarity) rather than
+        # loadfile: tests/test_worktree.py alone is ~150 of ~3100 tests and
+        # the heaviest file by wall time (real git.exe subprocesses), so
+        # pinning it to a single worker would floor the achievable speedup.
+        # -q deliberately absent (pyproject.toml addopts already sets it):
+        # stacking a second -q silently drops pytest's final "N passed"
+        # summary line -- exit code unaffected, but CI logs become
+        # unreadable for a human skimming a pass.
+        run: uv run pytest --tb=short -n auto --dist=load
 
   Lint:
     name: Lint
-    # `light`: every cw listener carries it, so Lint never waits behind the
-    # two-slot `suite` semaphore that bounds Tests (see that job's header).
-    runs-on: [self-hosted, Windows, X64, light]
-    # 15 min: derived from 28 successful runs (2026-07-28/29). Per-job
-    # execution: median 0.37 min (22s), max 0.55 min (33s) -- checkout,
-    # setup-uv, uv sync, and both ruff steps combined. Lint is a required
-    # status check and trivial work, so a very wide margin (27x median)
-    # prevents a spurious timeout from wedging merges while still catching
-    # a true wedge vs GitHub's 360-min default. Sibling: job-cannon PR #1443
-    # set 10 min on its required aggregate gate (13s healthy).
+    # windows-latest, matching Tests. Everything in this job is
+    # platform-flexible in principle (ruff, uv, the two charlie gates), but
+    # the dependency set and toolchain have only ever been validated on
+    # Windows, and Lint is a required check -- moving it to ubuntu-latest is
+    # a cheap follow-up experiment AFTER the hosted move is proven, not a
+    # second variable to bundle into the same change that swaps the runner
+    # fleet.
+    runs-on: windows-latest
+    # 15 min: derived from 28 successful self-hosted runs (median 22s, max
+    # 33s of execution). Hosted adds VM provisioning and download variance
+    # but stays far under this; Lint is a required check, so a wide margin
+    # prevents a spurious timeout from wedging merges while still catching a
+    # true wedge vs GitHub's 360-min default.
     timeout-minutes: 15
     # Explicit permissions block, required by the closing-keyword gate step
     # below: repo default_workflow_permissions is "read", but that does not
@@ -301,111 +192,17 @@ jobs:
       pull-requests: read
     steps:
       - uses: actions/checkout@v5
-      # setup-uv@v7 replaced with a PATH-append (#1115): the action's runner
-      # Node process crashed twice in 12 min with a libuv assertion
-      # (async.c:94, upstream flake class) on this box, and on a self-hosted
-      # runner the action's only real job -- downloading uv -- is unnecessary:
-      # the tool cache and the host both already have it. Resolution order:
-      # newest uv in the runner tool cache (what setup-uv itself installed),
-      # else host uv on PATH, else fail loudly -- never silently download.
-      - name: Add uv to PATH (self-hosted, no setup-uv)
-        shell: bash
-        run: |
-          set -e
-          cache="$RUNNER_TOOL_CACHE/uv"
-          dir=""
-          if [ -d "$cache" ]; then
-            ver=$(ls "$cache" | grep -E '^[0-9]+[.][0-9]+[.][0-9]+$' | sort -V | tail -1)
-            [ -n "$ver" ] && dir="$cache/$ver/x64"
-          fi
-          if [ -n "$dir" ] && [ -x "$dir/uv.exe" ]; then
-            echo "$dir" >> "$GITHUB_PATH"
-            "$dir/uv.exe" --version
-          elif command -v uv >/dev/null; then
-            uv --version
-          else
-            echo "::error::uv not found in tool cache ($cache) or host PATH; install uv on the host"
-            exit 1
-          fi
-      # ci_fleet is consumed as an editable path dependency at ../ci_runners
-      # ([tool.uv.sources] in pyproject.toml), so the sibling checkout has to
-      # exist BEFORE uv sync runs -- without it, sync exits 2 with
-      # "Distribution not found" and both required checks wedge every PR.
-      #
-      # Idempotent by necessity: $GITHUB_WORKSPACE/.. is outside the directory
-      # actions/checkout manages, so it is neither created for us nor cleaned
-      # between runs. A plain clone would succeed once per runner and fail on
-      # every run after that. actions/checkout cannot do this itself -- it
-      # refuses a path: outside the workspace, and the location is fixed by the
-      # relative path recorded in uv.lock.
-      #
-      # Tracks ci_runners' main rather than a pinned SHA. Deliberate, but NOT
-      # for the reason this comment used to give -- it claimed the lock would
-      # disagree with a pin, and uv.lock records
-      # `source = { editable = "../ci_runners" }` with no revision anywhere in
-      # the entry, so there is nothing here for a pin to contradict (see #954).
-      #
-      # The real reason: production does not run a revision. The live
-      # supervisor imports ci_fleet through an editable .pth that prepends
-      # ..\ci_runners\src to sys.path, so it executes whatever is SAVED in that
-      # working tree -- committed or not. Pinning a SHA here would buy a
-      # reproducible CI at the cost of validating a ci_fleet that production
-      # demonstrably does not run, which is the more expensive of the two.
-      #
-      # Revisit when ci_fleet ships as a versioned dependency: at that point CI
-      # and the supervisor resolve the same artifact and a pin costs nothing.
-      - name: Check out ci_runners as a sibling
-        shell: powershell
-        env:
-          CI_RUNNERS_PAT: ${{ secrets.CI_RUNNERS_PAT }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $dest = Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) 'ci_runners'
-          # Credential passed per-command, never written to disk. `git -c`
-          # applies to the single invocation and is not copied into the new
-          # repo's config, unlike embedding a token in the remote URL -- which
-          # would persist in .git/config on the runner between runs.
-          $pair = "x-access-token:$env:CI_RUNNERS_PAT"
-          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
-          $auth = "AUTHORIZATION: basic $b64"
-          # Actions masks the *literal* secret string; the base64 of it is a
-          # different string and is NOT masked automatically. Basic-auth base64
-          # is encoding, not encryption -- anything that echoed $b64 or $auth
-          # would print a trivially reversible credential in the clear. Register
-          # it so the masker covers this form too.
-          Write-Host "::add-mask::$b64"
-          if (Test-Path (Join-Path $dest '.git')) {
-            git -C $dest -c http.extraheader="$auth" fetch --depth 1 origin main
-            if ($LASTEXITCODE -ne 0) { throw "fetch of ci_runners failed" }
-            git -C $dest reset --hard FETCH_HEAD
-            if ($LASTEXITCODE -ne 0) { throw "reset of ci_runners failed" }
-          } elseif (Test-Path $dest) {
-            # Something is there that is not a git checkout. Fail rather than
-            # remove it: this step has no business deleting an unexplained
-            # directory on the host, and on Windows a junction would be
-            # followed by a recursive delete (R-15).
-            throw "$dest exists but is not a git checkout -- refusing to touch it"
-          } else {
-            git -c http.extraheader="$auth" clone --depth 1 --branch main `
-              https://github.com/Senkichi/ci_runners.git $dest
-            if ($LASTEXITCODE -ne 0) { throw "clone of ci_runners failed" }
-          }
-          if (-not (Test-Path (Join-Path $dest 'pyproject.toml'))) {
-            throw "ci_runners checkout at $dest has no pyproject.toml"
-          }
+      # setup-uv restored 2026-08-28 -- see the Tests job's step comment for
+      # why both #1115 removal reasons were self-hosted-specific, why the
+      # SHA pin, and why enable-cache stays at its `auto` default.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Lock currency gate (issue 889)
         # `uv sync --frozen` below consumes uv.lock as-is and deliberately
         # SKIPS the "is this lock still current with pyproject.toml?"
-        # assertion. That skip is the hole this closes.
-        #
-        # uv.lock carries a [package.metadata.requires-dev] snapshot of
-        # ../ci_runners' dev dependency-group, because ci-fleet is an
-        # editable path dependency. A change to that group in the sibling
-        # repo silently staleness the lock committed here. The drift is
-        # metadata-only -- no [[package]] entry moves, the resolved
-        # dependency set is unchanged, the build cannot break -- which is
-        # precisely why nothing caught it until the regenerated line nearly
-        # rode into an unrelated PR as an unexplained diff hunk.
+        # assertion. That skip is the hole this closes: a pyproject edit
+        # (dependency added, bound changed) without a matching `uv lock`
+        # would otherwise ride green through CI and surface later as an
+        # unexplained regenerated-lock hunk in an unrelated PR.
         #
         # Deliberately a step of the existing "Lint" job, and deliberately
         # NOT a `--frozen` -> `--locked` swap on the step below:
@@ -446,6 +243,10 @@ jobs:
         # (close(s/d)/fix(es/ed)/resolve(s/d)) bound to an issue number other
         # than this PR's own declared target -- the surface GitHub's native
         # auto-close-on-merge scans, which has no negation awareness at all.
+        #
+        # Shells out to `gh` via github.py: gh is preinstalled on hosted
+        # runner images and reads GH_TOKEN from the environment -- no gh
+        # auth state is assumed from the host.
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -488,8 +289,14 @@ jobs:
         # lines, which is safe for a corruption gate -- a false positive
         # would mean the base branch itself has mojibake, which is a real
         # problem worth surfacing.
+        #
+        # shell: bash is explicit (with `set -e` so a failed fetch fails the
+        # step): the previous version used PowerShell syntax and relied on
+        # the self-hosted Windows runner's default shell -- an implicit
+        # runner-OS dependency this step no longer carries.
         if: github.event_name == 'pull_request'
+        shell: bash
         run: |
+          set -e
           git fetch --depth 1 origin ${{ github.event.pull_request.base.sha }}
-          if ($LASTEXITCODE -ne 0) { throw "git fetch of base SHA failed" }
           uv run charlie mojibake-check --base ${{ github.event.pull_request.base.sha }}

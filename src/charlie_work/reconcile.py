@@ -193,7 +193,7 @@ DORMANT_CONVERGENCE_EXCLUDED_STATUSES: frozenset[str] = frozenset({"escalated"})
 # next pass. Reverting it there is not a repair, it is one half of a loop --
 # reconcile clears the label and resets status to PASSIVE_OPEN_STATUS, the
 # router re-sets both, forever, at whatever the reconcile cadence happens to be.
-# Measured in job-cannon at a ~29-minute period across 26 issues with zero
+# Measured in a sibling repo at a ~29-minute period across 26 issues with zero
 # forward progress, because _dispatch_rework_impl selects on
 # status == "rework_requested" (workflow.py) and the revert removes the issue
 # from that scan entirely.
@@ -446,9 +446,9 @@ def _fetch_issues(gh: GitHubLike) -> list[dict[str, Any]]:
     return all_issues
 
 
-# Aviator (job-cannon/charlie-work's merge-queue bot) owns these strings; they
+# Aviator (this fleet's merge-queue bot, shared across registered repos) owns these strings; they
 # are not orchestrator LabelConfig values. Verified live against real Aviator
-# check-run output (job-cannon PR #1400, 2026-07-27): conclusion == "failure",
+# check-run output (a sibling repo's PR #1400, 2026-07-27): conclusion == "failure",
 # output.summary starts with "This PR is not ready to merge (currently in
 # state blocked): PR has a blocked label, remove to re-queue."
 AVIATOR_CHECK_NAME = "aviator/checks"
@@ -463,7 +463,7 @@ def _pr_review_approved_at_head(
     Re-adding the Aviator ``mergequeue`` label must never be safer than the
     normal ship_it path, which only queues a PR when its review decision
     resolves to ``decision == "approved"`` at the PR's *current* head.
-    Without this check, ``detect_aviator_stale_blocked`` re-queued job-cannon
+    Without this check, ``detect_aviator_stale_blocked`` re-queued a sibling repo's
     PR #1408 (issue #1404) and PR #1392 (issue #1268) for Aviator merge while
     their recorded decisions were ``request_changes``/never-reviewed --
     Aviator then merged both unreviewed once CI was green, since Aviator's
@@ -492,7 +492,7 @@ def detect_aviator_stale_blocked(
     Aviator sometimes blocks a PR (setting ``blocked`` and stripping
     ``mergequeue``) on a real CI failure, then never re-evaluates once the
     underlying cause clears (a stale branch update, a flaky test passing on
-    rerun, ...) -- confirmed live on job-cannon #1387/#1400/#1398/#1392
+    rerun, ...) -- confirmed live on a sibling repo's #1387/#1400/#1398/#1392
     (2026-07-27), each stuck for hours with every real CI check green.
 
     Deliberately NOT folded into ``detect_drift``: that function's contract
@@ -821,7 +821,7 @@ def detect_mergequeue_wedged(
     ``consecutive_failed_merge_attempts == threshold`` and the counter resets
     to 0 on any ``can_merge`` pass, so a PR alternating can_merge true/false --
     or one Aviator itself keeps failing -- never re-crosses the threshold.
-    Live case: job-cannon PR #1751 carried ``mergequeue`` for 28+ hours with
+    Live case: a sibling repo's PR #1751 carried ``mergequeue`` for 28+ hours with
     Aviator's own ``blocked`` label and a completed ``aviator/checks`` FAILURE,
     ``merge_ready`` firing ~280 times without merging, exactly one alarm ever.
 

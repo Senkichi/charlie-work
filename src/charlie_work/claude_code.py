@@ -1,7 +1,7 @@
 """Claude Code worker adapter.
 
-Codifies the emergent "empericus" Claude Code worker pattern described in
-``docs/design/extraction-dossier.md`` (search "Claude Code worker loop"): in
+Codifies the emergent manual Claude Code worker pattern recorded in the
+internal extraction dossier ("Claude Code worker loop"): in
 production practice, no adapter code ever spawned a worker process — a human
 created a git worktree, copied a junctioned venv in by hand, and pasted a
 rendered prompt into an interactive ``claude`` session running in that

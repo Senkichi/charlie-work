@@ -1,7 +1,7 @@
 # Provenance
 
 Frozen verbatim copies from the archived **freecode** repository
-(github.com/Senkichi/freecode, archived 2026-07-09), taken at commit
+(a private, now-archived sibling repo, archived 2026-07-09), taken at commit
 `c1beaef` ("fix(codex): drift cleanup vs locked ADR-006D (D1+D2+D3) (#132)",
 2026-05-29 — the final pre-archive code commit).
 
