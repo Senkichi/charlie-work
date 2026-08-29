@@ -3974,22 +3974,18 @@ class OrchestratorApp:
         """Append an event to state.json and the unlimited events.db log.
 
         This is the single instrumentation entry point for OrchestratorApp
-        methods. It wraps ``append_event`` with ``self.paths.state_file`` and
-        the repo name so every event is dual-written: once to the bounded
-        convenience cache in ``state.json`` (``EVENT_RING_SIZE``, default 2000)
-        and once to the append-only ``events.db`` audit log.
-
-        ``level`` is forwarded to ``append_event`` so the emit site can declare
-        the level explicitly instead of relying on the central registry.
+        methods. It forwards to ``self.write_gate.record_event`` (issue #1324)
+        so every one of its ~70 call sites is dry-run-gated by construction:
+        under ``dry_run=True`` the gate returns ``state`` unchanged with zero
+        writes to ``events.db`` and zero mutation of the in-memory event ring
+        (the WriteGate invariant -- "no event at all under dry-run"). Under
+        ``dry_run=False`` the gate is a pure passthrough to ``append_event``
+        with ``self.paths.state_file`` and the repo name auto-bound, dual-writing
+        each event to ``state.json``'s bounded ring (``EVENT_RING_SIZE``, default
+        2000) and the append-only ``events.db`` audit log. ``level`` is forwarded
+        to ``append_event`` so the emit site can declare it explicitly.
         """
-        return append_event(
-            state,
-            kind,
-            payload,
-            state_path=self.paths.state_file,
-            repo=self.repo_root.name,
-            level=level,
-        )
+        return self.write_gate.record_event(state, kind, payload, level=level)
 
     def _resolve(self, value: str) -> Path:
         # pathlib keeps an absolute right-hand side as-is, so this handles
@@ -18111,9 +18107,10 @@ class OrchestratorApp:
 
         ``dry_run`` is threaded honestly: a ``--dry-run`` fleet pass runs the
         sweep in preview mode, which removes nothing (the preview-vs-act class
-        tracked in #614-#619). A ``worktrees_reclaimed`` event is always emitted
-        when the sweep runs, so a maintenance action that left no trace is
-        indistinguishable from one that never ran (lesson from #595/#621).
+        tracked in #614-#619). Under live mode a ``worktrees_reclaimed`` event
+        is emitted so a maintenance action that left no trace is
+        indistinguishable from one that never ran (lesson from #595/#621);
+        under ``dry_run`` the event is suppressed per #1324 (WriteGate).
         The event payload carries a bounded ``skipped_examples`` list (each
         entry's own ``reason`` string) alongside the exact ``skipped_count``,
         plus ``worktrees_registered``/``worktrees_out_of_scope`` -- so a
@@ -18350,7 +18347,7 @@ class OrchestratorApp:
                     "reconcile_pass_failed",
                     {"error": f"{type(exc).__name__}: {exc}"},
                 )
-                save_state(state_file, state)
+                self.write_gate.save_state(state)
             return
 
         with state_lock(state_file):
@@ -18388,7 +18385,7 @@ class OrchestratorApp:
                         "drift_remaining": drift_after,
                     },
                 )
-            save_state(state_file, state)
+            self.write_gate.save_state(state)
 
     def _maybe_reclaim_superseded_main_ci(self) -> None:
         """Cancel superseded, not-yet-started ``main`` CI runs every pass (#863, #815).
@@ -18461,7 +18458,7 @@ class OrchestratorApp:
                     "main_ci_reclaim_failed",
                     {"error": f"{type(exc).__name__}: {exc}"},
                 )
-                save_state(state_file, state)
+                self.write_gate.save_state(state)
             logger.warning("main_ci_reclaim pass raised an exception", exc_info=True)
             return
 
@@ -18471,7 +18468,7 @@ class OrchestratorApp:
                 state = self._record_event(
                     state, "main_ci_reclaim_failed", {"error": result.error}
                 )
-                save_state(state_file, state)
+                self.write_gate.save_state(state)
             logger.warning("main_ci_reclaim pass failed: %s", result.error)
             return
 
@@ -18498,7 +18495,7 @@ class OrchestratorApp:
                     "cancel_errors": list(result.cancel_errors),
                 },
             )
-            save_state(state_file, state)
+            self.write_gate.save_state(state)
         for run in result.cancelled:
             logger.info(
                 "main_ci_reclaim: cancelled superseded main CI run %s "

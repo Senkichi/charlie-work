@@ -36940,6 +36940,76 @@ def test_loop_calls_maybe_reclaim_superseded_main_ci(
     assert calls["count"] == 1
 
 
+def test_maybe_reclaim_superseded_main_ci_dry_run_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Issue #1324: under dry_run=True, _maybe_reclaim_superseded_main_ci must
+    not write any main_ci_reclaim_* event to state.json or events.db, and
+    state.json must stay byte-identical to the pre-pass seed. Before the fix,
+    _record_event called append_event directly (bypassing self.write_gate) and
+    the paired save_state was also raw, so a dry-run pass that found a
+    cancellation wrote a real main_ci_reclaim_cancelled event + state.json
+    mutation even though nothing was actually cancelled GitHub-side."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.config import MainCiReclaimConfig
+    from charlie_work.instrumentation import event_counts_by_kind
+    from charlie_work.main_ci_reclaim import MainCiReclaimResult, ReclaimedRun
+    from charlie_work.state import empty_state, save_state
+
+    config = OrchestratorConfig(
+        main_ci_reclaim=MainCiReclaimConfig(enabled=True, workflow_filename="ci.yml")
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    save_state(paths.state_file, empty_state())
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
+
+    canned = MainCiReclaimResult(
+        ok=True,
+        tip_sha="tip-sha",
+        candidates_checked=2,
+        cancelled=(
+            ReclaimedRun(
+                run_id=42,
+                head_sha="old-sha",
+                status_before_cancel="queued",
+                created_at="t1",
+            ),
+        ),
+        skipped_not_ancestor=1,
+        skipped_started_before_cancel=0,
+        cancel_errors=(),
+    )
+
+    before_bytes = paths.state_file.read_bytes()
+    events_before = sum(event_counts_by_kind(paths.state_file).values())
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "reclaim_superseded_main_ci_runs", lambda *a, **k: canned)
+    try:
+        app._maybe_reclaim_superseded_main_ci()
+    finally:
+        monkeypatch.undo()
+
+    assert paths.state_file.read_bytes() == before_bytes, (
+        "dry-run main_ci_reclaim pass must leave state.json byte-identical "
+        "(issue #1324 WriteGate invariant)"
+    )
+    events_after = sum(event_counts_by_kind(paths.state_file).values())
+    assert events_after == events_before, (
+        f"dry-run main_ci_reclaim pass must not write any events.db row "
+        f"(before={events_before}, after={events_after})"
+    )
+    state = load_state(paths.state_file)
+    reclaim_events = [
+        e for e in state.get("events", []) if str(e.get("kind", "")).startswith("main_ci_reclaim")
+    ]
+    assert reclaim_events == [], (
+        f"dry-run main_ci_reclaim pass must not append any main_ci_reclaim_* "
+        f"event to the state.json ring, found: {reclaim_events}"
+    )
+
+
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
     """_count_live_sessions should count sessions from both devin-shell and claude-code adapters."""
     from charlie_work.workflow import _count_live_sessions

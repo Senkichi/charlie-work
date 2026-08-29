@@ -32,9 +32,7 @@ primitives into exactly one of four buckets:
   (d) on the explicit, comment-justified allow-list below (the four
       deliberately-unconditional ``log_event`` observability sites in
       ``stalled_review_reap.py`` that issue #708/#734 require to stay raw --
-      issue #1264's R4 disposition -- plus the permanent legacy-forwarding-
-      wrapper exemption for ``_record_event``'s own body, see the comment on
-      ``_LEGACY_FORWARDING_WRAPPER_SCOPES`` below).
+      issue #1264's R4 disposition).
 
 Anything else in buckets (a)-(d) is accounted for; everything that remains
 is scoped by issue #1264's R9 ruling (comment 5324595347 on #1264), which
@@ -101,18 +99,23 @@ scope-rebinding-on-``FunctionDef`` traversal and prevents a closure's raw
 call from being laundered into (or a real violation from being hidden by)
 its parent's predicate membership.
 
-## R10: ``_record_event``'s forwarding body
+## R10: ``_record_event`` centralized onto WriteGate (issue #1324)
 
-``OrchestratorApp._record_event`` (workflow.py) is the pre-migration
-forwarding wrapper ``WriteGate.record_event`` replaces. Its own body does
-exactly what ``WriteGate.record_event``'s body does -- a bare
-``append_event`` call for the same forwarding reason bucket (b) already
-exempts inside ``write_gate.py``. Per R10, this exemption is PERMANENT, not
-a mid-wave convenience: PR4 does not delete or convert ``_record_event`` --
-that is issue #1324's post-wave, single-point-of-enforcement-at-the-sink
-work. ``test_legacy_forwarding_wrapper_scopes_are_not_stale`` below keeps
-the exemption honest: it must always cover a real, presently-raw call site,
-or the entry (and/or the #1324 follow-up) has gone stale.
+``OrchestratorApp._record_event`` (workflow.py) was the pre-migration
+forwarding wrapper ``WriteGate.record_event`` replaces. Issue #1324
+centralized the dry-run guard inside ``_record_event`` itself: its body now
+calls ``self.write_gate.record_event(...)`` instead of a bare
+``append_event``, so every one of its ~70 call sites is gated by
+construction with no per-site opt-in required (operator decision on #1324:
+single point of enforcement per CLAUDE.md rule 5/6). With the forwarding
+body gate-routed, ``_record_event`` is no longer a gated primitive name in
+this scanner's vocabulary -- calls to ``self._record_event(...)`` are
+gate-covered by construction (transitively through the gate), so they are
+not tracked as raw sites. The R9 predicate still catches a future
+regression: if someone adds a raw ``append_event`` call to
+``_record_event``'s body, the function is in-predicate (it calls
+``self.write_gate.record_event``) and the raw call is a zero-tolerance
+violation.
 
 ## R11: kill-primitive vocabulary and its limits
 
@@ -181,9 +184,8 @@ every site with that shape, not the single site it names.
 
 ``test_write_gate_allowlist_entries_are_not_stale`` enforces the same
 symmetric direction ``test_event_kind_registry_exhaustive`` does for its own
-allow-list: an allow-list entry (or the legacy-forwarding-wrapper exemption)
-that no longer matches a real site is a silent hole and must fail the build
-too, not just accumulate as dead weight.
+allow-list: an allow-list entry that no longer matches a real site is a
+silent hole and must fail the build too, not just accumulate as dead weight.
 """
 
 from __future__ import annotations
@@ -215,7 +217,6 @@ _SRC_ROOT = Path(__file__).parents[1] / "src" / "charlie_work"
 _GATED_PRIMITIVE_NAMES = {
     "save_state",
     "append_event",
-    "_record_event",
     "record_event",
     "log_event",
     "transition",
@@ -239,28 +240,6 @@ _PRIMITIVE_DEFINING_MODULES = {"state.py", "instrumentation.py", "labels.py", "p
 # method-level one are equivalent in practice and the module-level check is
 # simpler to state and verify.
 _WRITE_GATE_MODULE = "write_gate.py"
-
-# Extra bucket-(b)-shaped exemption, kept separate from bucket (d)'s
-# explicit allow-list below because it exempts a *scope's own body*
-# (structurally identical to why write_gate.py's wrappers are exempt), not
-# an individual deliberately-raw call site.
-#
-# `OrchestratorApp._record_event` (workflow.py) is the PRE-migration
-# forwarding wrapper `WriteGate.record_event` replaces -- see write_gate.py's
-# own docstring: "the `_record_event`-shaped forwarding wrapper
-# (`record_event` here)". Its own body does exactly what
-# `WriteGate.record_event`'s body does: `return append_event(state, kind,
-# payload, state_path=self.paths.state_file, repo=self.repo_root.name,
-# level=level)` -- a bare `append_event` call for the same forwarding
-# reason bucket (b) already exempts inside write_gate.py.
-#
-# PERMANENT per issue #1264 R10 (comment 5324595347): PR4 does NOT delete or
-# convert `_record_event` -- that is issue #1324's post-wave,
-# single-point-of-enforcement-at-the-sink work, and folding it into PR4
-# would breach the wave's scope discipline. This is not a mid-wave
-# convenience with an expiration; `test_legacy_forwarding_wrapper_scopes_are_not_stale`
-# below is what keeps it honest for as long as `_record_event` exists.
-_LEGACY_FORWARDING_WRAPPER_SCOPES = {("workflow.py", "_record_event")}
 
 
 def _is_exempt_module(rel_path: str) -> bool:
@@ -517,7 +496,7 @@ class _RawPrimitiveSite:
 
 
 def _scan_module_for_raw_primitive_calls(
-    tree: ast.Module | ast.AST, rel_path: str, *, apply_legacy_exemption: bool = True
+    tree: ast.Module | ast.AST, rel_path: str
 ) -> list[_RawPrimitiveSite]:
     """Full-tree walk (not just direct children) for one already-parsed
     module. Exposed separately from the tree-wide scan so the seeded-
@@ -527,13 +506,6 @@ def _scan_module_for_raw_primitive_calls(
     frames of nesting below the function's top level, e.g. inside an
     `if`/`for`/`with` block; only a full walk, not direct children, finds
     it -- issue #619's limit 3).
-
-    `apply_legacy_exemption` defaults on (matches `_scan_gated_mutator_layer`'s
-    real usage). It exists so `test_legacy_forwarding_wrapper_scopes_are_not_stale`
-    can re-scan a module WITHOUT the exemption applied and check that a real
-    site still exists underneath it -- the same "would this entry ever fail"
-    discipline `test_write_gate_allowlist_entries_are_not_stale` applies to
-    `_ALLOWED_RAW_PRIMITIVE_SITES`, applied here to the other exemption set.
 
     Each site's `in_predicate` (R9) is resolved from its innermost enclosing
     FunctionDef/AsyncFunctionDef's own body (see
@@ -597,30 +569,21 @@ def _scan_module_for_raw_primitive_calls(
         if isinstance(node, ast.Call):
             primitive = _resolve_call_primitive(node, scope_name)
             if primitive is not None and not _is_gate_covered_call(node):
-                exempt = (
-                    apply_legacy_exemption
-                    and (
-                        rel_path,
-                        scope_name,
+                call_source = ast.unparse(node)
+                shape_key = (scope_name, primitive, call_source)
+                occurrence = occurrence_counts.get(shape_key, 0)
+                occurrence_counts[shape_key] = occurrence + 1
+                sites.append(
+                    _RawPrimitiveSite(
+                        path=rel_path,
+                        scope=scope_name,
+                        primitive=primitive,
+                        call_source=call_source,
+                        occurrence=occurrence,
+                        lineno=node.lineno,
+                        in_predicate=scope_uses_write_gate.get(scope_name, False),
                     )
-                    in _LEGACY_FORWARDING_WRAPPER_SCOPES
                 )
-                if not exempt:
-                    call_source = ast.unparse(node)
-                    shape_key = (scope_name, primitive, call_source)
-                    occurrence = occurrence_counts.get(shape_key, 0)
-                    occurrence_counts[shape_key] = occurrence + 1
-                    sites.append(
-                        _RawPrimitiveSite(
-                            path=rel_path,
-                            scope=scope_name,
-                            primitive=primitive,
-                            call_source=call_source,
-                            occurrence=occurrence,
-                            lineno=node.lineno,
-                            in_predicate=scope_uses_write_gate.get(scope_name, False),
-                        )
-                    )
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             # Entering a new function scope: unqualified enclosing
             # function/method name, no class-qualification (two methods on
@@ -827,9 +790,11 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
 # conversion removed from this ratchet's scope entirely (they are now
 # in-predicate, gate-routed, or on the allow-list). See this PR's commit
 # body for the full per-module breakdown and the follow-up issue that owns
-# each module's remaining backlog (#1324/#1325/#1326/#1327 for the named
-# workflow.py lanes; reconcile.py and fleet_registry.py are pre-existing,
-# out-of-wave raw sites with no #1264 sub-issue yet).
+# each module's remaining backlog (#1325/#1326/#1327 for the named
+# workflow.py lanes; #1324 closed the _record_event forwarding-wrapper
+# exemption by centralizing it onto WriteGate; reconcile.py and
+# fleet_registry.py are pre-existing, out-of-wave raw sites with no #1264
+# sub-issue yet).
 # ---------------------------------------------------------------------------
 _RATCHET_BASELINE: dict[str, int] = {
     # Issue #1372: +3 log_event calls in fleet_loop's stale-entry handling
@@ -867,15 +832,28 @@ _RATCHET_BASELINE: dict[str, int] = {
     # 281 — the ratchet holds at the new count.
     # Combined baseline after merging #1131 (+2), #1393 (+11), and #1314 (+2)
     # onto the pre-existing 270: 285.
-    "workflow.py": 285,
-    # Issue #1317: verbatim extraction of the dead-worker/session-reap
-    # family out of workflow.py into dead_worker_reap.py (byte-identical
-    # move, no write-path changes). These 11 raw sites are the same
-    # pre-existing calls that were already counted inside workflow.py's
-    # baseline above -- relocated, not new. workflow.py's own actual count
-    # drops accordingly (285 -> 266 at this PR), which the shrink-only
-    # ratchet accepts without a baseline edit; only the newly-introduced
-    # module needs its own entry.
+    # Issue #1324: _record_event centralized onto WriteGate (its body now
+    # calls self.write_gate.record_event instead of a bare append_event), so
+    # _record_event is no longer a gated primitive name in this scanner's
+    # vocabulary -- all ~70 self._record_event(...) call sites are
+    # gate-covered by construction and no longer tracked as raw sites.
+    # Additionally, the paired save_state calls in _maybe_reconcile_drift (2)
+    # and _maybe_reclaim_superseded_main_ci (3) were routed through
+    # self.write_gate.save_state, moving both functions into the R9
+    # in-predicate bucket. Net decrease: 285 -> 196.
+    #
+    # Issue #1317 (merged on main after this PR's original base): verbatim
+    # extraction of the dead-worker/session-reap family out of workflow.py
+    # into dead_worker_reap.py (byte-identical move, no write-path changes).
+    # The 11 raw sites in that family relocated to the new module; they are
+    # not _record_event calls (the family uses write_gate.append_event
+    # directly for its gated writes, with log_event / _api_write_json_atomic
+    # as the raw primitives), so #1324's centralization does not change their
+    # raw count. workflow.py's actual count drops accordingly (196 -> 185
+    # after the extraction), which the shrink-only ratchet accepts without a
+    # further baseline edit; only the newly-introduced module needs its own
+    # entry.
+    "workflow.py": 196,
     "dead_worker_reap.py": 11,
     # Issue #1423: +2 raw primitives in _reap_idle_foreign_writer (log_event
     # for the foreign_writer_reaped instrumentation event, and kill_orphan_pid
@@ -1531,65 +1509,6 @@ def test_real_pr2_pr3_converted_sites_are_not_flagged() -> None:
         f"expected zero unaccounted raw sites in stalled_review_reap.py post-PR3, "
         f"found: {non_allowlisted}"
     )
-
-
-def test_legacy_forwarding_wrapper_exemption_toggle_is_reversible() -> None:
-    """Positive control for the staleness check below: with the exemption
-    OFF, `_record_event`'s own bare `append_event` call must be visible;
-    with it ON (the default `_scan_gated_mutator_layer` uses), it must be
-    exempt. Proves the `apply_legacy_exemption` toggle -- and by extension
-    the staleness check that relies on it -- can actually distinguish
-    'still matches' from 'stopped matching', using a synthetic module so it
-    doesn't depend on workflow.py's real current shape staying byte-for-byte
-    stable."""
-    source = textwrap.dedent(
-        """
-        class OrchestratorApp:
-            def _record_event(self, state, kind, payload):
-                return append_event(state, kind, payload, state_path=self.paths.state_file)
-        """
-    )
-    tree = ast.parse(source)
-
-    exempted = [
-        s
-        for s in _scan_module_for_raw_primitive_calls(tree, "workflow.py")
-        if s.scope == "_record_event"
-    ]
-    assert exempted == [], f"legacy wrapper exemption did not apply by default: {exempted}"
-
-    unexempted = [
-        s
-        for s in _scan_module_for_raw_primitive_calls(
-            tree, "workflow.py", apply_legacy_exemption=False
-        )
-        if s.scope == "_record_event"
-    ]
-    assert len(unexempted) == 1, f"expected exactly one un-exempted site, got: {unexempted}"
-    assert unexempted[0].primitive == "append_event"
-
-
-def test_legacy_forwarding_wrapper_scopes_are_not_stale() -> None:
-    """Same discipline as `test_write_gate_allowlist_entries_are_not_stale`,
-    applied to `_LEGACY_FORWARDING_WRAPPER_SCOPES`: an unmaintained
-    exemption is a silent hole, and per R10 this exemption is permanent for
-    as long as `_record_event` exists -- so it must always cover a real
-    site. Re-scan each named module WITHOUT the exemption (relies on
-    `test_legacy_forwarding_wrapper_exemption_toggle_is_reversible` above
-    having already proven the toggle can distinguish match from no-match)
-    and assert at least one real, currently-un-gated call remains inside
-    that exact (path, scope) -- proving the entry is presently covering a
-    real site, not a mistyped or already-deleted one."""
-    for rel_path, scope in _LEGACY_FORWARDING_WRAPPER_SCOPES:
-        module_path = _SRC_ROOT / rel_path
-        tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
-        sites = _scan_module_for_raw_primitive_calls(tree, rel_path, apply_legacy_exemption=False)
-        matching = [s for s in sites if s.scope == scope]
-        assert matching, (
-            f"_LEGACY_FORWARDING_WRAPPER_SCOPES entry ({rel_path!r}, {scope!r}) no longer "
-            "matches any raw call site -- remove it (and/or force _record_event's deletion, "
-            "issue #1324) rather than leaving a stale exemption"
-        )
 
 
 def test_write_gate_allowlist_entries_are_not_stale() -> None:
