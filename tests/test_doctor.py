@@ -18,7 +18,13 @@ from charlie_work.config import (
     RuntimeConfig,
 )
 from charlie_work.config import ApiProviderConfig, ApiWorkerConfig
-from charlie_work.doctor import _check_name_matches, run_doctor, workflow_job_names
+from charlie_work.doctor import (
+    _check_name_match_kind,
+    _check_name_matches,
+    run_doctor,
+    workflow_has_matrix,
+    workflow_job_names,
+)
 from charlie_work.instrumentation import log_event
 from charlie_work.paths import runtime_paths
 from charlie_work.subprocess_runner import RunResult
@@ -65,6 +71,42 @@ def test_check_name_matches_exact_and_matrix_prefix() -> None:
     assert _check_name_matches("Pre-commit", {"Tests passed", "lint"}) is False
 
 
+def test_check_name_match_kind_classifies_exact_tolerance_and_none() -> None:
+    # Issue #1508: the doctor verifier needs to distinguish an exact match
+    # (which the merge gate in checks.py also accepts) from a tolerance-only
+    # match (which the merge gate rejects) so it can flag stale suffixed
+    # required-check entries when no strategy.matrix exists.
+    assert _check_name_match_kind("Tests passed", {"Tests passed"}) == "exact"
+    assert _check_name_match_kind("Test (windows-latest)", {"Test"}) == "tolerance"
+    assert _check_name_match_kind("Test", {"Test (windows-latest)"}) == "tolerance"
+    # Reusable workflow reports as "<caller> / <callee>"; required is the caller.
+    assert _check_name_match_kind("caller", {"caller / callee"}) == "tolerance"
+    assert _check_name_match_kind("Pre-commit", {"Tests passed", "lint"}) is None
+
+
+def test_workflow_has_matrix_detects_strategy_matrix(tmp_path: Path) -> None:
+    _write_workflow(
+        tmp_path,
+        "name: CI\njobs:\n  test:\n    name: Tests\n    runs-on: ubuntu-latest\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        os: [ubuntu-latest, windows-latest]\n",
+    )
+    assert workflow_has_matrix(tmp_path) is True
+
+
+def test_workflow_has_matrix_false_without_matrix(tmp_path: Path) -> None:
+    _write_workflow(
+        tmp_path,
+        "name: CI\njobs:\n  test:\n    name: Tests\n    runs-on: ubuntu-latest\n",
+    )
+    assert workflow_has_matrix(tmp_path) is False
+
+
+def test_workflow_has_matrix_false_without_workflows(tmp_path: Path) -> None:
+    assert workflow_has_matrix(tmp_path) is False
+
+
 def _config(**kwargs) -> OrchestratorConfig:
     # The real default (review_dispatch.enabled=False, cross_family.auto_verdict=
     # False) is exactly the "no automated review-to-verdict path" gap the new
@@ -89,6 +131,51 @@ def test_doctor_flags_mismatched_required_check(tmp_path: Path) -> None:
     assert by_name["check name: Test"].ok is True
     assert by_name["check name: Tests passed"].ok is False
     assert ok is False
+
+
+def test_doctor_flags_tolerance_only_match_when_no_matrix(tmp_path: Path) -> None:
+    # Issue #1508: a suffixed required-check entry ("Tests (windows-latest)")
+    # that matches a non-matrix job ("Tests") only via tolerance is a stale
+    # entry the exact-match merge gate (checks.py) would report `missing`
+    # forever. Doctor must FAIL it, not pass it -- the same trap #1507
+    # corrected in the README.
+    _write_workflow(tmp_path, "jobs:\n  test:\n    name: Tests\n    runs-on: ubuntu-latest\n")
+    config = _config(auto_merge=AutoMergeConfig(required_checks=("Tests (windows-latest)",)))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    check = by_name["check name: Tests (windows-latest)"]
+    assert check.ok is False
+    assert "matrix-suffix tolerance" in check.detail
+    assert "no strategy.matrix" in check.detail
+    assert ok is False
+
+
+def test_doctor_passes_tolerance_match_when_matrix_exists(tmp_path: Path) -> None:
+    # When the workflow actually has a strategy.matrix, the suffix tolerance
+    # is justified by a real matrix expansion, so doctor passes the suffixed
+    # required-check entry.
+    _write_workflow(
+        tmp_path,
+        "jobs:\n  test:\n    name: Tests\n    runs-on: ubuntu-latest\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        os: [ubuntu-latest, windows-latest]\n",
+    )
+    config = _config(auto_merge=AutoMergeConfig(required_checks=("Tests (windows-latest)",)))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    check = by_name["check name: Tests (windows-latest)"]
+    assert check.ok is True
+    assert "matrix-suffix tolerance" in check.detail
+    assert "strategy.matrix" in check.detail
 
 
 def test_doctor_flags_empty_required_checks_with_auto_merge(tmp_path: Path) -> None:

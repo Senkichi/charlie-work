@@ -84,9 +84,51 @@ def workflow_job_names(repo_root: Path) -> set[str]:
     return names
 
 
-def _check_name_matches(required: str, job_names: set[str]) -> bool:
+def workflow_has_matrix(repo_root: Path) -> bool:
+    """Return whether any GitHub Actions workflow job uses ``strategy.matrix``.
+
+    Derives matrix-ness from the parsed workflow YAML rather than a hardcoded
+    job-name list, so the required-check verifier (issue #1508) can decide
+    whether matrix-suffix tolerance (``Name (suffix)`` matching job ``Name``)
+    is justified by an actual matrix expansion -- or is matching a stale
+    suffixed required-check entry that the exact-match merge gate
+    (``checks.py``) would report ``missing`` forever.
+    """
+    workflows_dir = repo_root / ".github" / "workflows"
+    if not workflows_dir.is_dir():
+        return False
+    for candidate in sorted(workflows_dir.glob("*.y*ml")):
+        try:
+            raw = yaml.safe_load(candidate.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        jobs = raw.get("jobs") if isinstance(raw, dict) else None
+        if not isinstance(jobs, dict):
+            continue
+        for job in jobs.values():
+            if not isinstance(job, dict):
+                continue
+            strategy = job.get("strategy")
+            if isinstance(strategy, dict) and isinstance(strategy.get("matrix"), dict):
+                return True
+    return False
+
+
+def _check_name_match_kind(required: str, job_names: set[str]) -> str | None:
+    """Classify how a required check matches workflow job names.
+
+    Returns ``"exact"`` for a direct name match, ``"tolerance"`` for a
+    matrix-suffix or reusable-workflow-delimiter match
+    (``Name (suffix)`` / ``caller / callee``), or ``None`` for no match.
+
+    The merge gate in ``checks.py`` uses EXACT match only, so a
+    ``"tolerance"``-only match is a stale-required-check-entry hazard when no
+    ``strategy.matrix`` exists in the workflow (issue #1508): doctor would
+    pass a ``Tests (windows-latest)`` required-check entry that the merge gate
+    reports ``missing`` forever.
+    """
     if required in job_names:
-        return True
+        return "exact"
     # Matrix jobs report as "<name> (<matrix values>)"; reusable workflows as
     # "<caller> / <callee>". Only these delimited expansions count as a match —
     # a bare prefix must not (job "Test" is not the check "Tests passed").
@@ -94,10 +136,14 @@ def _check_name_matches(required: str, job_names: set[str]) -> bool:
         if not name:
             continue
         if required.startswith(f"{name} (") or required.startswith(f"{name} / "):
-            return True
+            return "tolerance"
         if name.startswith(f"{required} (") or name.startswith(f"{required} / "):
-            return True
-    return False
+            return "tolerance"
+    return None
+
+
+def _check_name_matches(required: str, job_names: set[str]) -> bool:
+    return _check_name_match_kind(required, job_names) is not None
 
 
 def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> None:
@@ -1185,17 +1231,43 @@ def run_doctor(
 
     # -- required checks vs live workflow files ------------------------------
     job_names = workflow_job_names(repo_root)
+    has_matrix = workflow_has_matrix(repo_root)
     if config.auto_merge.required_checks:
         if job_names:
             for required in config.auto_merge.required_checks:
-                matched = _check_name_matches(required, job_names)
-                add(
-                    f"check name: {required}",
-                    matched,
-                    "matches a workflow job"
-                    if matched
-                    else f"no job in .github/workflows/ reports this name; found: {sorted(job_names)}",
-                )
+                kind = _check_name_match_kind(required, job_names)
+                if kind is None:
+                    add(
+                        f"check name: {required}",
+                        False,
+                        f"no job in .github/workflows/ reports this name; found: {sorted(job_names)}",
+                    )
+                elif kind == "exact":
+                    add(f"check name: {required}", True, "matches a workflow job")
+                else:  # tolerance -- matrix-suffix or reusable-workflow delimiter
+                    if has_matrix:
+                        add(
+                            f"check name: {required}",
+                            True,
+                            "matches a workflow job via matrix-suffix tolerance "
+                            "(workflow has strategy.matrix)",
+                        )
+                    else:
+                        # The merge gate (checks.py) uses EXACT match only, so a
+                        # suffixed required-check entry that matches only via
+                        # tolerance would be reported `missing` forever -- the
+                        # same stale-required-check trap #1507 corrected in the
+                        # README. Fail rather than warn: doctor's job is to catch
+                        # this before a dispatch wave strands an approved PR
+                        # (issue #1508).
+                        add(
+                            f"check name: {required}",
+                            False,
+                            "matches a workflow job only via matrix-suffix tolerance, "
+                            "but no strategy.matrix exists in .github/workflows -- "
+                            "the exact-match merge gate (checks.py) would report this "
+                            "required check as missing forever",
+                        )
         else:
             add(
                 "workflow files",

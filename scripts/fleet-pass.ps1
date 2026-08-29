@@ -61,10 +61,9 @@ $env:PYTHONUNBUFFERED = '1'
 #   - A BARE 'utf-8' is actively harmful: it overrides the surrogateescape handlers
 #     that UTF-8 mode supplies and resets stdin/stdout to 'strict', turning graceful
 #     degradation into a hard crash on any not-quite-clean byte off a pipe. This line
-#     assigns unconditionally, so it overwrites the machine-wide hardening in
-#     ~/.claude/settings.json and the User-scope environment -- on the highest-frequency
-#     Python process on this box (the charlie-fleet-pass scheduled task). Do not shorten.
-# Rationale: ~/.claude/docs/utf8-hardening.md
+#     assigns unconditionally, so it overwrites any machine-wide or User-scope
+#     hardening on the highest-frequency Python process on this box (the
+#     charlie-fleet-pass scheduled task). Do not shorten.
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8:surrogateescape'
 
