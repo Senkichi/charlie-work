@@ -3,22 +3,43 @@
 The ratchet itself is enforced by ``tests/test_file_size_ratchet.py``, which
 runs in CI on every push and fails any PR that leaves an over-cap tracked
 ``*.py`` file with MORE physical lines than its recorded high-water mark. This
-script is the maintenance tool for the checked-in baseline file
+script is the SOLE writer of the checked-in baseline file
 (``file_size_ratchet_baseline.json`` at the repo root): it can create the
 baseline from the live tree (one-time ``--init``) and lower existing marks
-after a shrink (the default). It NEVER raises a mark -- raising requires an
-explicit, reviewed edit to the baseline file, by design (issue #1442).
+after a shrink (the default). The test suite never writes the baseline -- a
+pytest run must leave the tree clean, so a PR only ever changes the baseline
+as a deliberate, reviewed edit. This script NEVER raises a mark -- raising
+requires an explicit, reviewed edit to the baseline file, by design (#1442).
+
+## Quantized marks
+
+Marks are quantized to multiples of ``MARK_QUANTUM`` (200): every mark this
+script writes is ``ceil(lines / 200) * 200``. Two reasons:
+
+* **Merge-conflict damping.** Exact-count marks made the baseline the repo's
+  hottest conflict site: any two concurrent PRs changing a monolith's line
+  count wrote different values on the same JSON line. With quantized marks,
+  growth within a bucket needs no baseline edit at all, and two PRs bumping
+  the same file into the same bucket write the identical line (clean merge).
+* **Deterministic convergence.** Every writer (this script, and a PR raising
+  a mark by hand) uses the same rule -- next multiple of 200 -- so
+  independent edits agree byte-for-byte.
+
+A hand-raise in a growth PR must follow the same rule: raise to the next
+multiple of 200, never to the exact line count. If a baseline line still
+conflicts on merge, take the larger value.
 
 Usage::
 
     # One-time initial generation (sets each over-cap file's mark to its
-    # current line count). Run once when adopting the ratchet.
+    # current line count quantized up to a multiple of MARK_QUANTUM).
     python scripts/refresh_file_size_ratchet.py --init
 
-    # Lower-only maintenance: after a PR shrinks an over-cap file, lower its
-    # mark to the new (smaller) line count and drop entries for files that
-    # fell back under the cap. Marks are never raised; new over-cap files are
-    # NOT added (those require an explicit reviewed baseline edit).
+    # Lower-only maintenance: after shrinks, lower each mark to the current
+    # line count quantized up (only when that is strictly lower than the
+    # recorded mark) and drop entries for files that fell back under the cap.
+    # Marks are never raised; new over-cap files are NOT added (those require
+    # an explicit reviewed baseline edit).
     python scripts/refresh_file_size_ratchet.py
 
     # Dry run: print what would change without writing.
@@ -44,7 +65,25 @@ from pathlib import Path
 # [1308, 1391] band in tests/test_stalled_review_reap_split.py).
 FILE_SIZE_CAP = 800
 
+# Marks are recorded as multiples of this quantum (rounded UP from the live
+# line count). Growth within a bucket needs no baseline edit; concurrent PRs
+# bumping a file into the same bucket write the identical value and merge
+# cleanly. tests/_ratchet_constants.py declares the same constant for the test
+# side; tests/test_refresh_file_size_ratchet.py asserts the two stay equal.
+MARK_QUANTUM = 200
+
 _BASELINE_NAME = "file_size_ratchet_baseline.json"
+
+
+def _quantize_mark(lines: int) -> int:
+    """Round ``lines`` up to the next multiple of ``MARK_QUANTUM``.
+
+    An exact multiple is preserved (26400 -> 26400); anything else rounds up
+    (26401 -> 26600). This is the single mark-derivation rule every baseline
+    writer -- this script, or a reviewed hand-raise in a growth PR -- must use,
+    so independent edits produce byte-identical lines.
+    """
+    return -(-lines // MARK_QUANTUM) * MARK_QUANTUM
 
 
 def _repo_root() -> Path:
@@ -132,8 +171,9 @@ def _write_baseline(path: Path, marks: dict[str, int]) -> None:
 
 
 def _init(repo_root: Path, baseline_path: Path, dry_run: bool) -> int:
-    """One-time baseline generation: mark = current line count for every
-    over-cap tracked ``*.py`` file."""
+    """One-time baseline generation: mark = current line count quantized up
+    to a multiple of ``MARK_QUANTUM``, for every over-cap tracked ``*.py``
+    file."""
     existing = _load_baseline(baseline_path)
     if existing and not dry_run:
         print(
@@ -144,20 +184,22 @@ def _init(repo_root: Path, baseline_path: Path, dry_run: bool) -> int:
             file=sys.stderr,
         )
         return 1
-    over = _scan_over_cap(repo_root)
+    marks = {path: _quantize_mark(lines) for path, lines in _scan_over_cap(repo_root).items()}
     if dry_run:
-        print(f"[dry-run] would write {len(over)} entries to {baseline_path}")
+        print(f"[dry-run] would write {len(marks)} entries to {baseline_path}")
         return 0
-    _write_baseline(baseline_path, over)
-    print(f"wrote {len(over)} high-water marks to {baseline_path}")
+    _write_baseline(baseline_path, marks)
+    print(f"wrote {len(marks)} high-water marks to {baseline_path}")
     return 0
 
 
 def _lower(repo_root: Path, baseline_path: Path, dry_run: bool) -> int:
-    """Lower-only maintenance: lower marks to current line counts (never
-    raise), drop entries for files that fell under the cap or were deleted.
-    Never adds new entries -- a new over-cap file requires an explicit
-    reviewed baseline edit."""
+    """Lower-only maintenance: lower each mark to the current line count
+    quantized up to a multiple of ``MARK_QUANTUM`` -- and only when that
+    quantized value is strictly BELOW the recorded mark (never raise). Drop
+    entries for files that fell under the cap or were deleted. Never adds new
+    entries -- a new over-cap file requires an explicit reviewed baseline
+    edit."""
     baseline = _load_baseline(baseline_path)
     if not baseline:
         print(
@@ -178,13 +220,17 @@ def _lower(repo_root: Path, baseline_path: Path, dry_run: bool) -> int:
             del updated[path]
             changes.append(f"  - {path}: dropped (no longer over cap)")
             continue
-        if current < mark:
-            updated[path] = current
-            changes.append(f"  ~ {path}: {mark} -> {current} (lowered)")
+        target = _quantize_mark(current)
+        if target < mark:
+            updated[path] = target
+            changes.append(f"  ~ {path}: {mark} -> {target} (lowered; live={current})")
         elif current > mark:
             # A growth past the mark is a ratchet violation the CI test catches.
             # This maintainer never raises, so leave the mark and report it.
-            changes.append(f"  ! {path}: {mark} -> {current} (GROWTH -- not raised; CI will fail)")
+            changes.append(
+                f"  ! {path}: {mark} -> live={current} (GROWTH -- not raised; CI will "
+                f"fail; a reviewed raise must use {target})"
+            )
     if not changes:
         print(f"no changes; baseline at {baseline_path} is current")
         return 0
