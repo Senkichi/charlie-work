@@ -44,10 +44,9 @@ jobs:
         with:
           fetch-depth: 0
       # setup-uv restored 2026-08-28 -- see ci.yml's Tests job step comment
-      # for why both #1115 removal reasons were self-hosted-specific.
-      - uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
+      # for why both #1115 removal reasons were self-hosted-specific, why
+      # the SHA pin, and why enable-cache stays at its `auto` default.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       # ci-fleet resolves from PyPI (versioned wheel in uv.lock) since
       # 2026-08-28 -- see ci.yml for the note on the removed
       # sibling-checkout step.

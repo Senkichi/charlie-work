@@ -106,11 +106,19 @@ jobs:
       # banned because its post-job `uv cache prune --ci` raced sibling
       # jobs' in-flight cache extractions on a shared disk (observed
       # 2026-07-08 on a sibling repo's pool). Hosted VMs are single-job and
-      # isolated: the prune races nothing, and the GitHub cache (keyed on
-      # uv.lock) replaces the warm local disk the old box provided.
-      - uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
+      # isolated: the prune races nothing, and the GitHub cache replaces
+      # the warm local disk the old box provided.
+      #
+      # SHA-pinned (third-party action on a public repo): upstream stopped
+      # publishing floating major tags after v7 and its README recommends
+      # the commit pin. Verified via git ls-remote 2026-08-28:
+      # refs/tags/v10.0.1 = 20cfd1bf945f4377ade1205e4dbc17946fc9a30d.
+      # enable-cache is deliberately left at its `auto` default: auto is ON
+      # for GitHub-hosted runners on this workflow's events (pull_request,
+      # push) and auto-disables for cache-poisoning-prone events
+      # (pull_request_target, workflow_run, release) if such a trigger is
+      # ever added -- an explicit `true` would override that protection.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       # ci-fleet resolves from PyPI (versioned wheel in uv.lock) since
       # 2026-08-28; the sibling-checkout step that used to live here -- with
       # its PAT, per-run fetch, and "CI validates what production runs"
@@ -185,10 +193,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       # setup-uv restored 2026-08-28 -- see the Tests job's step comment for
-      # why both #1115 removal reasons were self-hosted-specific.
-      - uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
+      # why both #1115 removal reasons were self-hosted-specific, why the
+      # SHA pin, and why enable-cache stays at its `auto` default.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Lock currency gate (issue 889)
         # `uv sync --frozen` below consumes uv.lock as-is and deliberately
         # SKIPS the "is this lock still current with pyproject.toml?"
