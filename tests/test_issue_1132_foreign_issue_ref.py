@@ -34,7 +34,11 @@ from charlie_work.config import (
     OrchestratorConfig,
     ReviewConfig,
 )
-from charlie_work.github import GitHubNotFoundError, is_transient_repo_resolution_failure
+from charlie_work.github import (
+    GitHubError,
+    GitHubNotFoundError,
+    is_transient_repo_resolution_failure,
+)
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
@@ -439,6 +443,94 @@ def test_self_heal_transient_failure_during_reprobe_leaves_clock_untouched(
         app.gh = _RepoResolutionFailureOnViewGitHub()
 
         # Pass 2: reprobe fires, hits a transient repo-resolution failure.
+        result2 = app.loop(limit=0)
+        state = load_state(app.paths.state_file)
+        # Marker still present.
+        assert "foreign_issue_ref" in state["prs"]["1586"]
+        # The re-probe clock was NOT reset — a transient failure is not
+        # evidence the issue is absent, so the next cadence window retries
+        # from the same anchor (detected_at), not from now.
+        assert "last_reprobe_at" not in state["prs"]["1586"]["foreign_issue_ref"]
+        # detected_at is preserved untouched.
+        assert state["prs"]["1586"]["foreign_issue_ref"]["detected_at"] == old_ts
+
+        # The PR is still parked.
+        assert 1586 in result2.data.get("parked_prs", [])
+    finally:
+        wf_mod.emit_digest = original_emit
+
+
+class _PlainGitHubErrorOnViewGitHub(FakeGitHub):
+    """``issue_view`` raises a plain ``GitHubError`` (not
+    ``GitHubNotFoundError``) — e.g. a network timeout, gh-not-installed, or
+    any non-not-found gh failure.
+
+    Used to exercise the reprobe path's ``except GitHubError:`` branch: a
+    parked marker is re-probed, and the reprobe itself hits a transient
+    non-not-found failure. This must NOT clear the marker and must NOT reset
+    the re-probe clock — a transient failure is neither evidence the issue is
+    absent nor present, so the next cadence window retries from the same
+    anchor.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.issues = []
+        self.prs = [_foreign_pr()]
+        self.issue_view_calls = 0
+
+    def issue_view(self, number: int):
+        if number == 1576:
+            self.issue_view_calls += 1
+            raise GitHubError("GraphQL: network timeout contacting api.github.com")
+        return super().issue_view(number)
+
+
+def test_self_heal_plain_github_error_during_reprobe_leaves_marker_and_clock_untouched(
+    tmp_path: Path,
+) -> None:
+    """A plain ``GitHubError`` (not ``GitHubNotFoundError``) occurring *during*
+    reprobe must leave the marker and the re-probe clock untouched, matching
+    the ``GitHubNotFoundError`` transient-failure handler's discipline.
+
+    The reprobe block's ``except GitHubError:`` branch is the catch-all for
+    non-not-found gh failures (network timeouts, gh-not-installed, etc.). A
+    regression there — e.g. clearing the marker or resetting the clock — would
+    reintroduce the #1132 bug: a transient failure during reprobe would either
+    resume per-PR processing against a still-foreign issue (clearing the
+    marker) or push the next reprobe out by a full cadence window (resetting
+    the clock) even though the issue's absence was never confirmed.
+    """
+    from charlie_work.state import state_lock
+
+    config = _foreign_pr_config(
+        foreign_issue_ref_confirm_passes=1,
+        foreign_issue_ref_reprobe_hours=24,
+    )
+    # Park with a permanent issue-level 404 first.
+    fake_gh = _PermanentIssueNotFoundGitHub()
+    app = _make_app(tmp_path, fake_gh, config)
+
+    import charlie_work.workflow as wf_mod
+
+    original_emit = wf_mod.emit_digest
+    wf_mod.emit_digest = lambda notify_config, digest: None
+    try:
+        # Park the PR (confirm_passes=1, permanent issue-level 404).
+        app.loop(limit=0)
+
+        # Plant an old detected_at so the reprobe cadence has elapsed.
+        old_ts = (datetime.now(UTC) - timedelta(hours=25)).isoformat().replace("+00:00", "Z")
+        with state_lock(app.paths.state_file):
+            state = load_state(app.paths.state_file)
+            state["prs"]["1586"]["foreign_issue_ref"]["detected_at"] = old_ts
+            save_state(app.paths.state_file, state)
+
+        # Swap in a fake that raises a plain GitHubError on issue_view — the
+        # reprobe itself hits a transient non-not-found failure.
+        app.gh = _PlainGitHubErrorOnViewGitHub()
+
+        # Pass 2: reprobe fires, hits a plain GitHubError.
         result2 = app.loop(limit=0)
         state = load_state(app.paths.state_file)
         # Marker still present.

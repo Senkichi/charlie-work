@@ -1,5 +1,5 @@
 {
-  "scripts/backfill_stale_rework_briefs.py": 860,
+  "scripts/backfill_stale_rework_briefs.py": 859,
   "scripts/heartbeat_check.py": 2975,
   "src/charlie_work/claude_code.py": 1788,
   "src/charlie_work/cli.py": 2874,
