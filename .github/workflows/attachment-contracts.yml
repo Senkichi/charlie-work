@@ -63,36 +63,9 @@ jobs:
             echo "::error::uv not found in tool cache ($cache) or host PATH; install uv on the host"
             exit 1
           fi
-      # ci_fleet is consumed as an editable path dependency at ../ci_runners
-      # ([tool.uv.sources] in pyproject.toml), so the sibling checkout has to
-      # exist BEFORE uv sync runs -- see ci.yml's identical step for the full
-      # idempotency and provenance rationale (unchanged here).
-      - name: Check out ci_runners as a sibling
-        shell: powershell
-        env:
-          CI_RUNNERS_PAT: ${{ secrets.CI_RUNNERS_PAT }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $dest = Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) 'ci_runners'
-          $pair = "x-access-token:$env:CI_RUNNERS_PAT"
-          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
-          $auth = "AUTHORIZATION: basic $b64"
-          Write-Host "::add-mask::$b64"
-          if (Test-Path (Join-Path $dest '.git')) {
-            git -C $dest -c http.extraheader="$auth" fetch --depth 1 origin main
-            if ($LASTEXITCODE -ne 0) { throw "fetch of ci_runners failed" }
-            git -C $dest reset --hard FETCH_HEAD
-            if ($LASTEXITCODE -ne 0) { throw "reset of ci_runners failed" }
-          } elseif (Test-Path $dest) {
-            throw "$dest exists but is not a git checkout -- refusing to touch it"
-          } else {
-            git -c http.extraheader="$auth" clone --depth 1 --branch main `
-              https://github.com/Senkichi/ci_runners.git $dest
-            if ($LASTEXITCODE -ne 0) { throw "clone of ci_runners failed" }
-          }
-          if (-not (Test-Path (Join-Path $dest 'pyproject.toml'))) {
-            throw "ci_runners checkout at $dest has no pyproject.toml"
-          }
+      # ci-fleet resolves from PyPI (versioned wheel in uv.lock) since
+      # 2026-08-28 -- see ci.yml for the note on the removed sibling-checkout
+      # step.
       - name: Install dependencies
         run: uv sync --frozen --all-extras
       # Week-1 SHADOW mode: --report-only makes check-tree exit 0

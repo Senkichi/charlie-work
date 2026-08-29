@@ -23,7 +23,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ci-fleet", editable = "../ci_runners" },
+    { name = "ci-fleet", specifier = ">=0.1.0" },
     { name = "psutil", specifier = ">=5.9" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.4.0" },
@@ -37,28 +37,14 @@ provides-extras = ["dev"]
 [[package]]
 name = "ci-fleet"
 version = "0.1.0"
-source = { editable = "../ci_runners" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
     { name = "psutil" },
     { name = "pyyaml" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "filelock", specifier = ">=3.13,<4" },
-    { name = "psutil", specifier = ">=5.9" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
-    { name = "pyyaml", specifier = ">=6.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
-]
-provides-extras = ["dev"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8" },
-    { name = "pytest-cov", specifier = ">=5" },
-    { name = "ruff", specifier = ">=0.6" },
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5b/46/32eeca990bee46f92e64bcf9aebe55225bf02baf362c3089e1450a947591/ci_fleet-0.1.0-py3-none-any.whl", hash = "sha256:7a085f5f704f328e7df39b1878c286799aa3faeae2cea261cc44f58188e0a6b4", size = 175360, upload-time = "2026-08-29T00:03:40.846Z" },
 ]
 
 [[package]]
