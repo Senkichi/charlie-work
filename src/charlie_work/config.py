@@ -480,6 +480,25 @@ class ReviewConfig:
     # spinning indefinitely on a PR where retriggering mechanically cannot
     # help (e.g. a workflow file itself is broken).
     stale_checks_max_retriggers: int = 3
+    # Issue #1132: a transient GraphQL repo-resolution failure (e.g. during a
+    # ~7-minute network/ISP dip) was classified as a permanent
+    # ``foreign_issue_ref`` park because ``GitHubNotFoundError`` conflates
+    # repository-level resolution failures with issue-level 404s. Two knobs
+    # bound the damage so a wrong park costs hours, not forever:
+    #
+    # ``foreign_issue_ref_confirm_passes``: require this many consecutive
+    # not-found passes before parking durably. A transient window (minutes)
+    # clears before 2 typical 5-minute passes complete. 1 preserves the
+    # original one-pass park behavior (use only if the classification guard
+    # alone is trusted). Legacy markers without a ``confirmations`` field are
+    # treated as already-confirmed so existing parks are not re-processed.
+    foreign_issue_ref_confirm_passes: int = 2
+    # ``foreign_issue_ref_reprobe_hours``: re-probe a parked marker via REST
+    # ``issue_view`` on this cadence; if the issue now resolves, clear the
+    # marker, emit an event, and resume per-PR processing. A wrong park
+    # self-heals in hours instead of sitting forever. 0 disables self-heal
+    # (operator-only remedy via ``charlie unescalate --pr``).
+    foreign_issue_ref_reprobe_hours: int = 24
 
 
 @dataclass(frozen=True)
@@ -2179,6 +2198,28 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         if stale_checks_max_retriggers < 0:
             raise ConfigError(
                 "config section 'review' key 'stale_checks_max_retriggers' must not be negative"
+            )
+    fir_confirm = review_data.get("foreign_issue_ref_confirm_passes")
+    if fir_confirm is not None:
+        if isinstance(fir_confirm, bool) or not isinstance(fir_confirm, int):
+            raise ConfigError(
+                "config section 'review' key 'foreign_issue_ref_confirm_passes' must be an "
+                f"int, got {type(fir_confirm).__name__}"
+            )
+        if fir_confirm < 1:
+            raise ConfigError(
+                "config section 'review' key 'foreign_issue_ref_confirm_passes' must be >= 1"
+            )
+    fir_reprobe = review_data.get("foreign_issue_ref_reprobe_hours")
+    if fir_reprobe is not None:
+        if isinstance(fir_reprobe, bool) or not isinstance(fir_reprobe, int):
+            raise ConfigError(
+                "config section 'review' key 'foreign_issue_ref_reprobe_hours' must be an "
+                f"int, got {type(fir_reprobe).__name__}"
+            )
+        if fir_reprobe < 0:
+            raise ConfigError(
+                "config section 'review' key 'foreign_issue_ref_reprobe_hours' must not be negative"
             )
     review = _build_section(ReviewConfig, "review", review_data)
     review_dispatch_data = _section(data, "review_dispatch")
