@@ -18,11 +18,13 @@ from charlie_work.process_utils import (
     is_session_stalled,
     kill_process_tree,
     popen_worker,
+    run_captured,
     start_terminal_status_watcher,
     sweep_orphan_processes,
     worker_terminal_status_path,
     write_worker_terminal_status,
 )
+from charlie_work.subprocess_runner import RunResult
 
 
 def test_is_session_stalled_with_old_mtime(tmp_path: Path) -> None:
@@ -337,21 +339,19 @@ def test_kill_process_tree_records_kill_when_taskkill_returncode_unexpected() ->
             pytest.skip("could not read fixture process start time")
 
         # Simulate taskkill returning an unexpected exit code (e.g. 128)
-        # while the process is actually dead. We patch subprocess.run to
+        # while the process is actually dead. We patch run_captured to
         # first kill the process for real (so is_pid_alive returns False),
         # then report a non-(0,1) return code.
-        def fake_run(*args: Any, **kwargs: Any) -> Any:
+        def fake_run_captured(*args: Any, **kwargs: Any) -> RunResult:
             # Only intercept the taskkill call; let everything else through.
             if args and isinstance(args[0], list) and "taskkill" in args[0]:
                 # Kill the process for real so is_pid_alive sees it dead.
                 proc.terminate()
                 proc.wait()
-                return subprocess.CompletedProcess(
-                    args=args[0], returncode=128, stdout="", stderr=""
-                )
-            return subprocess.run(*args, **kwargs)
+                return RunResult(returncode=128, stdout="", stderr="", error="command exited 128")
+            return run_captured(*args, **kwargs)
 
-        with patch("charlie_work.process_utils.subprocess.run", side_effect=fake_run):
+        with patch("charlie_work.process_utils.run_captured", side_effect=fake_run_captured):
             with patch("charlie_work.process_utils._enumerate_child_pids", return_value=[]):
                 killed = kill_process_tree(proc.pid, actual_start_time)
 

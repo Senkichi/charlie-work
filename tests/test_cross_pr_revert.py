@@ -5,9 +5,15 @@ over-cap ``src/charlie_work/janitor.py`` monolith into
 ``src/charlie_work/cross_pr_revert.py`` so the fail-closed rework did not
 land new code in an over-cap monolith (file-size ratchet, issue #1442).
 These are the gate's behavioral unit tests, moved with the function so the
-monkeypatch target (``cross_pr_revert.subprocess``) and the warning-log
+monkeypatch target (``cross_pr_revert.run_captured``) and the warning-log
 logger name (``charlie_work.cross_pr_revert``) resolve against the module
 that actually owns the code.
+
+The gate routes its git calls through ``run_captured`` (issue #1059:
+unbounded ``subprocess.run`` -> bounded ``run_captured`` with
+``timeout_seconds``), so the tests monkeypatch ``run_captured`` on the
+owning module and return ``RunResult`` values rather than patching
+``subprocess.run`` and returning ``CompletedProcess``-like objects.
 
 The merge-ready integration coverage for the ``UNDETERMINED`` fail-closed
 path lives in ``tests/test_charlie_work.py`` alongside the other
@@ -27,6 +33,7 @@ from charlie_work.cross_pr_revert import (
     CrossPrRevertStatus,
     detect_cross_pr_revert,
 )
+from charlie_work.subprocess_runner import RunResult
 
 
 def _green_pr(**overrides) -> dict:
@@ -54,11 +61,19 @@ def _green_pr(**overrides) -> dict:
     return base
 
 
-class _FakeCompleted:
-    def __init__(self, returncode: int = 0, stdout: str = "") -> None:
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = ""
+def _ok(stdout: str = "") -> RunResult:
+    """A successful ``RunResult`` with the given stdout."""
+    return RunResult(returncode=0, stdout=stdout, stderr="", error=None)
+
+
+def _fail(returncode: int = 1) -> RunResult:
+    """A failed ``RunResult`` with a non-zero exit code."""
+    return RunResult(
+        returncode=returncode,
+        stdout="",
+        stderr="err",
+        error=f"command exited {returncode}",
+    )
 
 
 def _make_repo_root(tmp_path: Path) -> Path:
@@ -91,9 +106,9 @@ def test_detect_cross_pr_revert_skips_invalid_head_ref(
     pr = _green_pr(headRefName="--upload-pack=evil")
 
     def _fail_if_called(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("subprocess.run should not be called with invalid refs")
+        raise AssertionError("run_captured should not be called with invalid refs")
 
-    monkeypatch.setattr(cross_pr_revert_module.subprocess, "run", _fail_if_called)
+    monkeypatch.setattr(cross_pr_revert_module, "run_captured", _fail_if_called)
 
     result = detect_cross_pr_revert(pr, repo_root)
     assert result.status is CrossPrRevertStatus.UNDETERMINED
@@ -117,9 +132,9 @@ def test_detect_cross_pr_revert_skips_invalid_base_ref(
     pr = _green_pr(headRefName="agent/issue-1-fix", baseRefName="--upload-pack=evil")
 
     def _fail_if_called(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("subprocess.run should not be called with invalid refs")
+        raise AssertionError("run_captured should not be called with invalid refs")
 
-    monkeypatch.setattr(cross_pr_revert_module.subprocess, "run", _fail_if_called)
+    monkeypatch.setattr(cross_pr_revert_module, "run_captured", _fail_if_called)
 
     result = detect_cross_pr_revert(pr, repo_root)
     assert result.status is CrossPrRevertStatus.UNDETERMINED
@@ -174,12 +189,12 @@ def test_detect_cross_pr_revert_fetch_failure_is_undetermined(
     repo_root = _make_repo_root(tmp_path)
     pr = _green_pr()
 
-    def _fake_run(argv: list[str], **_kwargs: object) -> _FakeCompleted:
+    def _fake_run_captured(argv: list[str], **_kwargs: object) -> RunResult:
         if argv[1] == "fetch":
-            return _FakeCompleted(returncode=1)
+            return _fail(returncode=1)
         raise AssertionError(f"unexpected git call after fetch failure: {argv}")
 
-    monkeypatch.setattr(cross_pr_revert_module.subprocess, "run", _fake_run)
+    monkeypatch.setattr(cross_pr_revert_module, "run_captured", _fake_run_captured)
 
     result = detect_cross_pr_revert(pr, repo_root)
     assert result.status is CrossPrRevertStatus.UNDETERMINED
@@ -197,14 +212,14 @@ def test_detect_cross_pr_revert_rev_list_failure_is_undetermined(
     repo_root = _make_repo_root(tmp_path)
     pr = _green_pr()
 
-    def _fake_run(argv: list[str], **_kwargs: object) -> _FakeCompleted:
+    def _fake_run_captured(argv: list[str], **_kwargs: object) -> RunResult:
         if argv[1] == "fetch":
-            return _FakeCompleted(returncode=0)
+            return _ok()
         if argv[1] == "rev-list":
-            return _FakeCompleted(returncode=1)
+            return _fail(returncode=1)
         raise AssertionError(f"unexpected git call: {argv}")
 
-    monkeypatch.setattr(cross_pr_revert_module.subprocess, "run", _fake_run)
+    monkeypatch.setattr(cross_pr_revert_module, "run_captured", _fake_run_captured)
 
     result = detect_cross_pr_revert(pr, repo_root)
     assert result.status is CrossPrRevertStatus.UNDETERMINED
@@ -228,17 +243,17 @@ def test_detect_cross_pr_revert_per_commit_log_failure_is_undetermined(
     repo_root = _make_repo_root(tmp_path)
     pr = _green_pr()
 
-    def _fake_run(argv: list[str], **_kwargs: object) -> _FakeCompleted:
+    def _fake_run_captured(argv: list[str], **_kwargs: object) -> RunResult:
         if argv[1] == "fetch":
-            return _FakeCompleted(returncode=0)
+            return _ok()
         if argv[1] == "rev-list":
-            return _FakeCompleted(returncode=0, stdout="deadbeef\n")
+            return _ok(stdout="deadbeef\n")
         if argv[1] == "log" and argv[2] == "-1":
             # Per-commit subject fetch fails.
-            return _FakeCompleted(returncode=1)
+            return _fail(returncode=1)
         raise AssertionError(f"unexpected git call: {argv}")
 
-    monkeypatch.setattr(cross_pr_revert_module.subprocess, "run", _fake_run)
+    monkeypatch.setattr(cross_pr_revert_module, "run_captured", _fake_run_captured)
 
     result = detect_cross_pr_revert(pr, repo_root)
     assert result.status is CrossPrRevertStatus.UNDETERMINED
@@ -254,16 +269,22 @@ def test_detect_cross_pr_revert_oserror_is_undetermined_and_logged(
 
     The OSError branch previously returned None with no logging at all, making
     a disk/IO failure indistinguishable from "verified clean" (issue #1068).
+    With ``run_captured`` (issue #1059), an OSError inside a subprocess call is
+    caught by ``run_captured`` and returned as a ``RunResult`` with ``.error``
+    set — the gate sees ``not .ok`` and returns UNDETERMINED. The test patches
+    ``run_captured`` to raise ``OSError`` directly to exercise the module's own
+    ``except OSError`` defense-in-depth handler (for non-subprocess OS errors
+    that bypass ``run_captured``, e.g. from ``Path`` operations).
     """
     from charlie_work import cross_pr_revert as cross_pr_revert_module
 
     repo_root = _make_repo_root(tmp_path)
     pr = _green_pr()
 
-    def _fake_run(argv: list[str], **_kwargs: object) -> _FakeCompleted:
+    def _raise_oserror(*_args: object, **_kwargs: object) -> RunResult:
         raise OSError("disk hiccup")
 
-    monkeypatch.setattr(cross_pr_revert_module.subprocess, "run", _fake_run)
+    monkeypatch.setattr(cross_pr_revert_module, "run_captured", _raise_oserror)
 
     with caplog.at_level(logging.WARNING, logger="charlie_work.cross_pr_revert"):
         result = detect_cross_pr_revert(pr, repo_root)
@@ -321,14 +342,14 @@ def test_detect_cross_pr_revert_clean_when_no_branch_commits(
     repo_root = _make_repo_root(tmp_path)
     pr = _green_pr()
 
-    def _fake_run(argv: list[str], **_kwargs: object) -> _FakeCompleted:
+    def _fake_run_captured(argv: list[str], **_kwargs: object) -> RunResult:
         if argv[1] == "fetch":
-            return _FakeCompleted(returncode=0)
+            return _ok()
         if argv[1] == "rev-list":
-            return _FakeCompleted(returncode=0, stdout="")
+            return _ok(stdout="")
         raise AssertionError(f"unexpected git call: {argv}")
 
-    monkeypatch.setattr(cross_pr_revert_module.subprocess, "run", _fake_run)
+    monkeypatch.setattr(cross_pr_revert_module, "run_captured", _fake_run_captured)
 
     result = detect_cross_pr_revert(pr, repo_root)
     assert result.status is CrossPrRevertStatus.CLEAN
@@ -357,26 +378,26 @@ def test_detect_cross_pr_revert_detected_returns_reason(
     revert_sha = "cafebabe1234567890"
     base_sha = "feedface1234567890"
 
-    def _fake_run(argv: list[str], **_kwargs: object) -> _FakeCompleted:
+    def _fake_run_captured(argv: list[str], **_kwargs: object) -> RunResult:
         if argv[1] == "fetch":
-            return _FakeCompleted(returncode=0)
+            return _ok()
         if argv[1] == "rev-list":
-            return _FakeCompleted(returncode=0, stdout=f"{revert_sha}\n")
+            return _ok(stdout=f"{revert_sha}\n")
         if (
             argv[1] == "log"
             and argv[2] == "-1"
             and argv[3] == "--format=%s"
             and argv[4] == revert_sha
         ):
-            return _FakeCompleted(returncode=0, stdout='Revert "feature C"')
+            return _ok(stdout='Revert "feature C"')
         if argv[1] == "log" and argv[3] == "--format=%H":
             # base-commit grep match
-            return _FakeCompleted(returncode=0, stdout=f"{base_sha}\n")
+            return _ok(stdout=f"{base_sha}\n")
         if argv[1] == "log" and argv[2] == "-1" and argv[4] == base_sha:
-            return _FakeCompleted(returncode=0, stdout="feature C")
+            return _ok(stdout="feature C")
         raise AssertionError(f"unexpected git call: {argv}")
 
-    monkeypatch.setattr(cross_pr_revert_module.subprocess, "run", _fake_run)
+    monkeypatch.setattr(cross_pr_revert_module, "run_captured", _fake_run_captured)
 
     result = detect_cross_pr_revert(pr, repo_root)
     assert result.status is CrossPrRevertStatus.REVERT_DETECTED

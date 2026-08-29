@@ -31,17 +31,13 @@ from __future__ import annotations
 
 import logging
 import re
-import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from charlie_work.safe_ref import require_valid_ref_name
-from charlie_work.subprocess_runner import (
-    hidden_console_kwargs,
-    no_console_window_kwargs,
-)
+from charlie_work.subprocess_runner import run_captured
 
 logger = logging.getLogger(__name__)
 
@@ -156,21 +152,19 @@ def detect_cross_pr_revert(
         head_ref = require_valid_ref_name(head_ref, context="detect_cross_pr_revert head_ref")
         base_ref = require_valid_ref_name(base_ref, context="detect_cross_pr_revert base_ref")
 
-        fetch = subprocess.run(
+        fetch = run_captured(
             ["git", "fetch", "origin", str(head_ref), str(base_ref)],
             cwd=repo_root_path,
-            capture_output=True,
-            text=True,
-            check=False,
-            **hidden_console_kwargs(),
+            timeout_seconds=60,
         )
-        if fetch.returncode != 0:
+        if not fetch.ok:
             return CrossPrRevertResult(
                 CrossPrRevertStatus.UNDETERMINED,
-                f"git fetch origin {head_ref} {base_ref} failed (exit {fetch.returncode})",
+                f"git fetch origin {head_ref} {base_ref} failed "
+                f"({fetch.error or f'exit {fetch.returncode}'})",
             )
 
-        commits = subprocess.run(
+        commits = run_captured(
             [
                 "git",
                 "rev-list",
@@ -179,16 +173,13 @@ def detect_cross_pr_revert(
                 f"^origin/{base_ref}",
             ],
             cwd=repo_root_path,
-            capture_output=True,
-            text=True,
-            check=False,
-            **no_console_window_kwargs(),
+            timeout_seconds=60,
         )
-        if commits.returncode != 0:
+        if not commits.ok:
             return CrossPrRevertResult(
                 CrossPrRevertStatus.UNDETERMINED,
                 f"git rev-list origin/{head_ref} ^origin/{base_ref} failed "
-                f"(exit {commits.returncode})",
+                f"({commits.error or f'exit {commits.returncode}'})",
             )
 
         # Track whether every branch commit could be inspected. A non-zero
@@ -202,21 +193,18 @@ def detect_cross_pr_revert(
         for sha in commits.stdout.strip().splitlines():
             if not sha:
                 continue
-            subject_proc = subprocess.run(
+            subject_proc = run_captured(
                 ["git", "log", "-1", "--format=%s", sha],
                 cwd=repo_root_path,
-                capture_output=True,
-                text=True,
-                check=False,
-                **no_console_window_kwargs(),
+                timeout_seconds=60,
             )
-            if subject_proc.returncode != 0:
+            if not subject_proc.ok:
                 verification_incomplete = True
                 continue
             subject = subject_proc.stdout.strip()
             if subject.startswith('Revert "') and subject.endswith('"'):
                 original = subject[len('Revert "') : -1]
-                match_proc = subprocess.run(
+                match_proc = run_captured(
                     [
                         "git",
                         "log",
@@ -227,26 +215,20 @@ def detect_cross_pr_revert(
                         original,
                     ],
                     cwd=repo_root_path,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    **no_console_window_kwargs(),
+                    timeout_seconds=60,
                 )
-                if match_proc.returncode != 0:
+                if not match_proc.ok:
                     verification_incomplete = True
                     continue
                 for base_sha in match_proc.stdout.strip().splitlines():
                     if not base_sha:
                         continue
-                    base_subject_proc = subprocess.run(
+                    base_subject_proc = run_captured(
                         ["git", "log", "-1", "--format=%s", base_sha],
                         cwd=repo_root_path,
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        **no_console_window_kwargs(),
+                        timeout_seconds=60,
                     )
-                    if base_subject_proc.returncode != 0:
+                    if not base_subject_proc.ok:
                         verification_incomplete = True
                         continue
                     if base_subject_proc.stdout.strip() == original:
