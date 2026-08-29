@@ -52,6 +52,10 @@ _WORKFLOW_PATH = _REPO_ROOT / "src" / "charlie_work" / "workflow.py"
 _MOVED_NAMES = (
     "_get_open_blockers_for_issue",
     "classify_backlog_reachability",
+    "compute_mention_coverage_map",
+    "fetch_merged_prs_fail_open",
+    "resolve_dispatch_mention_coverage",
+    "scan_merged_pr_references",
 )
 
 
@@ -222,7 +226,7 @@ def test_all_backlog_reachability_names_are_reexported_by_identity() -> None:
 
     names = _module_level_defined_names(_BACKLOG_REACHABILITY_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 2, f"expected 2 moved units, found {len(names)}: {sorted(names)}"
+    assert len(names) == 6, f"expected 6 moved units, found {len(names)}: {sorted(names)}"
     assert set(names) == set(_MOVED_NAMES), (
         f"AST-derived names {sorted(names)} do not match the expected moved set "
         f"{sorted(_MOVED_NAMES)}"
@@ -376,6 +380,11 @@ def test_consumer_reference_scan_finds_the_known_anchor() -> None:
     assert "classify_backlog_reachability" in referenced
     assert referenced["classify_backlog_reachability"] == "tests/test_backlog_reachability.py"
 
+    # Issue #1337: resolve_dispatch_mention_coverage is imported by
+    # tests/test_backlog_reachability.py's caller-side wiring tests.
+    assert "resolve_dispatch_mention_coverage" in referenced
+    assert referenced["resolve_dispatch_mention_coverage"] == "tests/test_backlog_reachability.py"
+
     assert "_get_open_blockers_for_issue" not in referenced, (
         "_get_open_blockers_for_issue unexpectedly has a tests/-only anchor"
     )
@@ -383,8 +392,14 @@ def test_consumer_reference_scan_finds_the_known_anchor() -> None:
         "_get_open_blockers_for_issue unexpectedly has an anchor even with scripts/src"
     )
 
+    # The remaining 4 names (compute_mention_coverage_map,
+    # fetch_merged_prs_fail_open, scan_merged_pr_references) have no
+    # tests/-only anchor -- they are reached only through workflow.py's
+    # facade re-export and the thin wrapper methods on OrchestratorApp.
     assert (
-        set(referenced.keys()) == set(referenced_all.keys()) == {"classify_backlog_reachability"}
+        set(referenced.keys())
+        == set(referenced_all.keys())
+        == {"classify_backlog_reachability", "resolve_dispatch_mention_coverage"}
     )
 
 
