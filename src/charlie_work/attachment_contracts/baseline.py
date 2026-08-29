@@ -171,7 +171,7 @@ def entries_of(document: dict[str, object]) -> tuple[BaselineEntry, ...]:
 # Finding #10 (at minimum: validate ack SHAPE, not just non-emptiness).
 # Accepts an http(s) URL, a bare or "owner/repo"-qualified issue/PR reference
 # (`#123`, `owner/repo#123`), or an explicit "source:id" handle (dispatch-
-# prompt id / human handle, e.g. "dispatch:abc123" or "handle:senkichi").
+# prompt id / human handle, e.g. "dispatch:abc123" or "handle:operator").
 # A one-character junk ack like "ack: 'x'" (round-2 review's example) does
 # not match any of these and is now rejected instead of merely non-empty.
 #
@@ -200,7 +200,7 @@ def validate_bump(bump: Bump) -> str | None:
     comparison-only validator can bind a self-declared field to the actual
     execution context from the JSON alone); "interactive bumps self-ack"
     now means an interactive actor's own handle satisfies the same shape
-    check (e.g. "handle:senkichi"), not that the ack requirement is waived.
+    check (e.g. "handle:operator"), not that the ack requirement is waived.
     """
     if not bump.reason.strip():
         return "bump.reason must be non-empty"

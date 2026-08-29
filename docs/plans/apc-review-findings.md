@@ -6,7 +6,7 @@
 `.attachment-budgets.json`, `.github/workflows/attachment-contracts.yml`,
 `docs/specs/attachment-point-contracts-spec.md`,
 `docs/plans/attachment-contracts-backtest-report.md`,
-decision doc `llibrary/docs/plans/2026-08-24-god-object-mitigation-DECISION.md` §1.1–1.4.
+decision doc an external decision doc (god-object mitigation, 2026-08-24) §1.1–1.4.
 
 ## Verdict
 

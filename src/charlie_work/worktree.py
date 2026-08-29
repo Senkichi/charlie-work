@@ -1,6 +1,6 @@
 """Git worktree lifecycle for isolated per-branch worker environments.
 
-Ports the battle-tested job-cannon shell scripts (``setup_worker.sh`` /
+Ports the battle-tested shell scripts from a sibling repo (``setup_worker.sh`` /
 ``finish_worker.sh``) into library code. The critical invariant this module
 exists to enforce: worktrees may share ONE dev+eval virtualenv via a Windows
 junction (or a symlink elsewhere) at ``<worktree>/.venv``, and naive removal
@@ -1758,7 +1758,7 @@ def _modified_paths_overwritten_by_ref(worktree_path: Path, ref: str) -> tuple[s
     :mod:`charlie_work.git_pull_blockers`.
 
     Live example this exists for: the devin shim rewrites ``.devin/prompts/*``
-    in the worktree, and job-cannon's ``15dacbb6`` *deleted* those paths from
+    in the worktree, and a sibling repo's commit ``15dacbb6`` *deleted* those paths from
     the base. Merging then wants to remove a locally modified file, which git
     refuses. Every branch forked before that commit hits it.
     """

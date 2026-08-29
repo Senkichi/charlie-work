@@ -11,7 +11,7 @@ Three design points that look arbitrary and are not:
 **Why ``authorAssociation`` and not ``viewerDidAuthor``.** The obvious way to
 drop bot chatter is to exclude comments the authenticated user wrote. That
 inverts the filter here. The orchestrator authenticates as the *operator's own
-account* (``gh api user`` -> ``Senkichi``), so ``viewerDidAuthor`` is ``true``
+account* (``gh api user`` -> the operator's login), so ``viewerDidAuthor`` is ``true``
 for exactly the human corrections this module exists to deliver, and ``false``
 for real bots like ``aviator-app``. The GraphQL comment payload carries no
 ``is_bot`` field, so association is the discriminator that actually separates

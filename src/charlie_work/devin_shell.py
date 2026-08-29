@@ -1,7 +1,7 @@
 """Headless Devin CLI dispatch — non-blocking session launch with a durable
 sidecar so the orchestrator and ``doctor`` can see what is in flight.
 
-There is no Devin session-creation API (see docs/design/extraction-dossier.md,
+There is no Devin session-creation API (per the internal extraction dossier,
 "headless"/"--prompt-file"). Production reality is spawning the ``devin`` CLI
 in print mode: ``devin --prompt-file <path> --print --permission-mode
 dangerous``. Sessions run for many minutes, so dispatch must return immediately

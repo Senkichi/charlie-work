@@ -342,7 +342,7 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     # Issue #1269 (W12): filtered for the same crash-signature content
     # unconditionally (not gated on `findings_channel`) -- a new-shape record
     # can carry a crash comment too, since the collector-side fix only stops
-    # *future* ingestion; jc#1386 and jc#1394 both had crash comments already
+    # *future* ingestion; a sibling repo's #1386 and #1394 both had crash comments already
     # persisted in this field from before it shipped. Computed here, ABOVE
     # the vacuous-old-shape guard below, so that guard can check it directly
     # rather than assuming (unasserted) that an "external"-channel record

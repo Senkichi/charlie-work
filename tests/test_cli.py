@@ -3464,7 +3464,7 @@ def test_run_runners_provision_invokes_provision_runner_on_scale_up(
     )
 
     provision_mock = MagicMock(
-        return_value=MagicMock(ok=True, runner_name="cw-9800x3d-5", runner_dir=tmp_path / "cw-5")
+        return_value=MagicMock(ok=True, runner_name="cw-selfhost-5", runner_dir=tmp_path / "cw-5")
     )
     monkeypatch.setattr("ci_fleet.charlie_work_adapter.provision_runner", provision_mock)
     record_mock = MagicMock()

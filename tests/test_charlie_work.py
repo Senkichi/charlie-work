@@ -312,7 +312,7 @@ runner_scaling:
   enabled: true
   managed_root: "C:\\\\actions-runners"
   runner_dir_prefix: "jc-"
-  runner_name_template: "jc-9800x3d-{n}"
+  runner_name_template: "jc-selfhost-{n}"
   package_zip: "C:\\\\packages\\\\runner.zip"
   min_runners: 2
   max_runners: 20
@@ -327,7 +327,7 @@ runner_scaling:
     assert config.runner_scaling.enabled is True
     assert config.runner_scaling.managed_root == "C:\\actions-runners"
     assert config.runner_scaling.runner_dir_prefix == "jc-"
-    assert config.runner_scaling.runner_name_template == "jc-9800x3d-{n}"
+    assert config.runner_scaling.runner_name_template == "jc-selfhost-{n}"
     assert config.runner_scaling.package_zip == "C:\\packages\\runner.zip"
     assert config.runner_scaling.min_runners == 2
     assert config.runner_scaling.max_runners == 20
@@ -11494,7 +11494,7 @@ def test_ack_unauthorized_merge_records_ack_and_event(tmp_path: Path) -> None:
     paths.ensure()
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
 
-    result = app.ack_unauthorized_merge(1408, "root cause fixed in #672", by="senki")
+    result = app.ack_unauthorized_merge(1408, "root cause fixed in #672", by="operator")
 
     assert result.ok is True
     state = load_state(paths.state_file)
@@ -11503,14 +11503,14 @@ def test_ack_unauthorized_merge_records_ack_and_event(tmp_path: Path) -> None:
     entry = acks["1408"]
     assert entry["reason"] == "root cause fixed in #672"
     assert entry["acknowledged_at"]
-    assert entry["by"] == "senki"
+    assert entry["by"] == "operator"
 
     # The ack must be auditable: an event carries who/why/when.
     acked = [e for e in state["events"] if e["kind"] == "unauthorized_merge_acknowledged"]
     assert len(acked) == 1
     assert acked[0]["payload"]["pr"] == 1408
     assert acked[0]["payload"]["reason"] == "root cause fixed in #672"
-    assert acked[0]["payload"]["by"] == "senki"
+    assert acked[0]["payload"]["by"] == "operator"
 
 
 def test_ack_unauthorized_merge_requires_reason(tmp_path: Path) -> None:
@@ -11570,13 +11570,13 @@ def test_cli_tripwire_ack_writes_state(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "build_app", lambda args: app)
 
     exit_code = cli.main(
-        ["tripwire", "ack", "1408", "--reason", "root cause fixed in #672", "--by", "senki"]
+        ["tripwire", "ack", "1408", "--reason", "root cause fixed in #672", "--by", "operator"]
     )
     assert exit_code == 0
 
     acks = load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]
     assert acks["1408"]["reason"] == "root cause fixed in #672"
-    assert acks["1408"]["by"] == "senki"
+    assert acks["1408"]["by"] == "operator"
 
 
 def test_cli_tripwire_ack_requires_reason(monkeypatch, capsys, tmp_path: Path) -> None:
@@ -23933,12 +23933,12 @@ def test_worker_rework_reply_is_not_ingested_as_external_finding(
     fake_gh.pr_external_issue_comments[456] = [
         {
             "body": human_finding,
-            "user": {"login": "Senkichi", "type": "User"},
+            "user": {"login": "operator", "type": "User"},
             "created_at": "2026-08-09T12:00:00Z",
         },
         {
             "body": worker_reply,
-            "user": {"login": "Senkichi", "type": "User"},
+            "user": {"login": "operator", "type": "User"},
             "created_at": "2026-08-10T10:05:00Z",
         },
     ]
@@ -24032,7 +24032,7 @@ def test_human_comment_in_before_to_reviewed_at_gap_surfaces_next_round(
     fake_gh.pr_external_issue_comments[456] = [
         {
             "body": gap_finding,
-            "user": {"login": "Senkichi", "type": "User"},
+            "user": {"login": "operator", "type": "User"},
             "created_at": gap_comment_dt.isoformat(),
         },
     ]
@@ -24135,7 +24135,7 @@ def test_record_review_does_not_ingest_an_unstamped_crash_summary(tmp_path: Path
     fake_gh.pr_external_issue_comments[456] = [
         {
             "body": crash_body,
-            "user": {"login": "Senkichi", "type": "User"},
+            "user": {"login": "operator", "type": "User"},
             "created_at": "2026-08-09T12:00:00Z",
         },
         {
@@ -24186,7 +24186,7 @@ def test_record_review_does_not_ingest_a_synthetic_launch_failed_crash_summary(
     fake_gh.pr_external_issue_comments[456] = [
         {
             "body": crash_body,
-            "user": {"login": "Senkichi", "type": "User"},
+            "user": {"login": "operator", "type": "User"},
             "created_at": "2026-08-09T12:00:00Z",
         }
     ]
@@ -47136,10 +47136,10 @@ def _cross_repo_issue_body() -> str:
     """
     return (
         "But **#953's code does not live in this repo.** `suite_coverage.py` is at "
-        "`C:/Users/senki/repos/ci_runners/src/ci_fleet/suite_coverage.py`; there is no "
+        "`C:/Users/operator/repos/ci_runners/src/ci_fleet/suite_coverage.py`; there is no "
         "`src/charlie_work/suite_coverage.py`. The worker, handed an isolated checkout "
         "of a repo that does not contain the file it was asked to change, went to "
-        "`C:\\Users\\senki\\repos\\ci_runners` — the **shared main checkout** — and worked there."
+        "`C:\\Users\\operator\\repos\\ci_runners` — the **shared main checkout** — and worked there."
     )
 
 

@@ -11,7 +11,7 @@ then reads a correct result as a failure.
 
 Usage::
 
-    python scripts/predict_auto_verdict.py --repo ../job-cannon --gh-repo Senkichi/job-cannon
+    python scripts/predict_auto_verdict.py --repo ../other-repo --gh-repo owner/other-repo
 
 Live PR heads are fetched with ``gh``; pass ``--heads-json`` to reuse a saved
 ``gh pr list --json number,headRefOid`` payload instead.
@@ -114,13 +114,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--repo",
-        default="../job-cannon",
-        help="path to the target repo checkout (default: ../job-cannon)",
+        required=True,
+        help="path to the target repo checkout",
     )
     ap.add_argument(
         "--gh-repo",
-        default="Senkichi/job-cannon",
-        help="owner/name for the gh query (default: Senkichi/job-cannon)",
+        required=True,
+        help="owner/name for the gh query",
     )
     ap.add_argument(
         "--heads-json",
