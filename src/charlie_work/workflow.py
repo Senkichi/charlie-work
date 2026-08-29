@@ -302,6 +302,7 @@ from .escalation import (  # noqa: F401  (deliberate re-export)
     _repair_reason_class,
     _worker_launched_before_cap_escalation,
     _cap_escalation_pr_extra,
+    _reset_linked_pr_status_to_passive_open,
     _MECHANICAL_ESCALATION_EDGES,
 )
 
@@ -18785,6 +18786,7 @@ class OrchestratorApp:
             # gating counter untouched, so the router re-escalated on the next
             # detection.  See ``_REWORK_BUDGET_RESET_BY_ESCALATION_REASON``.
             clear_escalation_on_issue_prs(fresh_state, issue_number)
+            _reset_linked_pr_status_to_passive_open(fresh_state, pr_number)
             if budget_reset_needed:
                 fresh_pr = fresh_state["prs"].get(str(pr_number))
                 if isinstance(fresh_pr, dict):
