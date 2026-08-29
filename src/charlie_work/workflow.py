@@ -424,6 +424,10 @@ from .ci_findings import (  # noqa: F401  (deliberate re-export)
 from .backlog_reachability import (  # noqa: F401  (deliberate re-export)
     _get_open_blockers_for_issue,
     classify_backlog_reachability,
+    compute_mention_coverage_map,
+    fetch_merged_prs_fail_open,
+    resolve_dispatch_mention_coverage,
+    scan_merged_pr_references,
 )
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -4441,6 +4445,17 @@ class OrchestratorApp:
                 self.config,
                 operator_claimed,
                 ready_open_count=len(issues),
+                # Issue #1337: model the merged-PR mention-only dispatch
+                # exclusion so a mention-covered issue bins as
+                # ``mention_covered_awaiting_operator`` instead of
+                # ``dispatchable``. Fail-open fetch via
+                # fetch_merged_prs_fail_open (a merged_pr_list failure
+                # leaves the map empty -- the classifier is advisory).
+                mention_covered=compute_mention_coverage_map(
+                    issues,
+                    fetch_merged_prs_fail_open(self.gh),
+                    self,
+                ),
             ),
             "snapshot_written_at": None,
             "cache_age_seconds": None,
@@ -5265,6 +5280,17 @@ class OrchestratorApp:
         # must not change dispatch behaviour -- it exists so that a zero
         # dispatch count carries a reason. Done here, outside the state lock,
         # because it is network I/O.
+        # Issue #1337: resolve the mention-coverage map, reusing an
+        # already-fetched merged-PR outcome when available and fetching
+        # (fail-open) otherwise. See resolve_dispatch_mention_coverage's
+        # docstring for the three-branch logic. A fresh fetch rebinds
+        # ``merged_prs`` so the later _resolve_merged_prs calls and the
+        # tripwire reuse the same list -- no second API call.
+        mention_covered, _fetched_merged_prs = resolve_dispatch_mention_coverage(
+            issues, merged_prs, self.gh, self
+        )
+        if _fetched_merged_prs is not None:
+            merged_prs = _MergedPRListOutcome(_fetched_merged_prs, called=True)
         backlog_reachability = classify_backlog_reachability(
             self.gh,
             self.config,
@@ -5272,6 +5298,7 @@ class OrchestratorApp:
             ready_open_count=sum(
                 1 for issue in issues if str(issue.get("state") or "OPEN").upper() == "OPEN"
             ),
+            mention_covered=mention_covered,
         )
 
         # Gather sessions_dir for stall detection and live worker counting
@@ -5382,6 +5409,7 @@ class OrchestratorApp:
             (
                 merged_pr_bound_issue_numbers,
                 merged_pr_mention_only_issue_numbers,
+                _,
                 _,
             ) = self._merged_pr_referenced_issue_numbers(issues, resolved_merged_prs)
             merged_pr_issue_numbers = (
@@ -5615,6 +5643,7 @@ class OrchestratorApp:
             merged_pr_bound_issue_numbers,
             merged_pr_mention_only_issue_numbers,
             merged_pr_bound_pr_numbers,
+            _,
         ) = self._merged_pr_referenced_issue_numbers(issues, resolved_merged_prs)
         merged_pr_issue_numbers = (
             merged_pr_bound_issue_numbers | merged_pr_mention_only_issue_numbers
@@ -21813,60 +21842,14 @@ class OrchestratorApp:
         self,
         issues: list[dict[str, Any]],
         merged_prs: list[dict[str, Any]],
-    ) -> tuple[set[int], set[int], set[int]]:
-        """Return ready issues already covered by a merged PR, split by trust level.
-
-        Returns a ``(bound, mention_only, bound_pr_numbers)`` triple:
-
-        * ``bound`` — ``linked_issue_number`` binds the PR to the issue by a
-          hijack-safe signal (same-repo branch-prefix or closing-action verb).
-          This is the same trust level issue #220 uses to close issues at
-          merge time, so callers MAY treat a bound issue as safe to close here
-          too (belt-and-suspenders in case #220's merge-time close hasn't
-          landed, e.g. a crash between merge and label transition).
-        * ``mention_only`` — the PR merely contains an ``issue #N`` /
-          ``issues #N`` text reference (same-repo PRs only — cross-repo
-          provenance is never trusted here, and ``isCrossRepository`` only
-          describes head-branch provenance, not which repo the *text* refers
-          to, so it cannot resolve a cross-repo mention collision either).
-          This is advisory only per ``issue_numbers_mentioned_by_pr``'s
-          contract: issue #203 never authorized closing an issue on a bare
-          mention. Callers MUST exclude these from dispatch and flag them for
-          a human — never close the issue or transition it toward "merged".
-        * ``bound_pr_numbers`` — the PR numbers that bound to a managed issue.
-          Used to finalize state.json ``prs`` entries for externally-merged PRs
-          (issue #427: Aviator mergequeue handoff).
-
-        The bound/mention sets are intersected with the supplied issue set so a
-        stray mention of an issue not in the dispatch queue does not get
-        actioned. ``bound`` takes precedence: an issue bound by one merged PR
-        but only mentioned by another is reported solely in ``bound``.
+    ) -> tuple[set[int], set[int], set[int], dict[int, list[int]]]:
+        """Thin wrapper for ``scan_merged_pr_references`` (issue #1337 moved
+        the implementation to ``backlog_reachability.py`` so the mention-PR
+        tracking it added does not grow the monolith past its ratchet
+        high-water mark). See ``scan_merged_pr_references``'s docstring for
+        the return-tuple semantics.
         """
-        ready_issue_numbers = {int(issue["number"]) for issue in issues}
-        bound: set[int] = set()
-        bound_pr_numbers: set[int] = set()
-        mention_only: set[int] = set()
-        for pr in merged_prs:
-            if str(pr.get("state") or "").upper() != "MERGED":
-                continue
-            issue_number = linked_issue_number(
-                pr,
-                is_cross_repository=pr.get("isCrossRepository"),
-                branch_prefix=self.config.dispatch.branch_prefix,
-            )
-            if issue_number is not None and issue_number in ready_issue_numbers:
-                bound.add(issue_number)
-                bound_pr_numbers.add(int(pr["number"]))
-            # isCrossRepository describes the PR's own head-branch provenance
-            # (fork vs. same-repo), not which repo a free-text "#N" refers to.
-            # It cannot fully guard a cross-repo mention collision, but it does
-            # guard the common case of a fork PR's text being trusted at all.
-            if pr.get("isCrossRepository") is False:
-                for mentioned in issue_numbers_mentioned_by_pr(pr):
-                    if mentioned in ready_issue_numbers:
-                        mention_only.add(mentioned)
-        mention_only -= bound
-        return bound, mention_only, bound_pr_numbers
+        return scan_merged_pr_references(issues, merged_prs, self.config.dispatch.branch_prefix)
 
     def _mention_rearmed_issue_numbers(
         self,
