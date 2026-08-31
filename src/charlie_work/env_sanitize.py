@@ -337,7 +337,7 @@ def worker_github_token_findings(config: OrchestratorConfig) -> list[WorkerToken
     ``sanitize_env``, never logs a token value. Returns presence as a boolean
     and the variable *name* only.
     """
-    adapter = config.devin.adapter
+    adapter = config.worker.harness
     findings: list[WorkerTokenFinding] = []
 
     if adapter == "devin-shell":

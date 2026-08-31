@@ -2786,7 +2786,7 @@ def _worker_kind_from_recovery(recovery: dict[str, Any], config: OrchestratorCon
 
     Returns the most recent ``adapter_history`` entry's ``kind`` (written by
     ``routing.record_adapter_choice`` when api routing is enabled), falling
-    back to ``config.devin.adapter`` when no history is recorded (api routing
+    back to ``config.worker.harness`` when no history is recorded (api routing
     disabled — every worker uses the repo default adapter). Returns ``None``
     only when neither source yields a usable string, which causes
     ``real_activity_for_worker`` to consult all sources as before (issue #639).
@@ -2798,7 +2798,7 @@ def _worker_kind_from_recovery(recovery: dict[str, Any], config: OrchestratorCon
             kind = latest.get("kind")
             if isinstance(kind, str) and kind:
                 return kind
-    default = config.devin.adapter
+    default = config.worker.harness
     if isinstance(default, str) and default:
         return default
     return None
@@ -2876,7 +2876,7 @@ def _probe_recovery_liveness(
     # them would produce permanent "no session found" / "no pid" errors that
     # block recovery forever — "no Devin subject exists" is not "subject
     # exists but could not be read".
-    if resolved_config.devin.adapter == "devin-shell":
+    if resolved_config.worker.harness == "devin-shell":
         started_at = recovery.get("started_at") or recovery.get("dispatched_at") or ""
         pm_config = resolved_config.post_mortem
         now = datetime.now(UTC)

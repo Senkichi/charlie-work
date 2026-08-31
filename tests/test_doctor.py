@@ -394,6 +394,7 @@ def test_doctor_adapter_probe_runs_devin_probe_and_surfaces_sessions(
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -548,6 +549,7 @@ def test_doctor_adapter_probe_reports_failed_devin_binary(tmp_path: Path, monkey
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -570,6 +572,7 @@ def test_doctor_adapter_probe_claude_code_probes_claude(tmp_path: Path, monkeypa
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(adapter="claude-code", sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="claude-code"),
         # Empty venv_source skips the venv-existence check so this test stays
         # scoped to the probe path.
         claude_code=ClaudeCodeConfig(venv_source=""),
@@ -675,6 +678,7 @@ def test_doctor_adapter_probe_uses_configured_devin_binary(tmp_path: Path, monke
             sessions_dir="sessions",
             shell_command=("my-devin-wrapper", "--prompt-file", "{prompt_path}", "--print"),
         ),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -700,6 +704,7 @@ def test_doctor_adapter_probe_uses_configured_claude_binary(tmp_path: Path, monk
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(adapter="claude-code", sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="claude-code"),
         claude_code=ClaudeCodeConfig(
             command=("my-claude-wrapper", "-p", "--permission-mode", "acceptEdits"),
             venv_source="",
@@ -725,6 +730,7 @@ def test_doctor_reports_config_driven_worker_model(tmp_path: Path) -> None:
             sessions_dir="sessions",
             worker_model="claude-sonnet-4-5",
         ),
+        worker=WorkerRoleConfig(harness="devin-shell", model="claude-sonnet-4-5"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -748,6 +754,7 @@ def test_doctor_reports_cli_default_when_worker_model_empty(tmp_path: Path) -> N
             sessions_dir="sessions",
             worker_model="",
         ),
+        worker=WorkerRoleConfig(harness="devin-shell", model=""),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -772,6 +779,7 @@ def test_doctor_omits_worker_model_check_for_non_devin_shell_adapters(tmp_path: 
             sessions_dir="sessions",
             worker_model="claude-sonnet-4-5",
         ),
+        worker=WorkerRoleConfig(harness="claude-code", model="claude-sonnet-4-5"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -798,6 +806,7 @@ def test_worker_github_token_ok_when_configured_devin_shell(tmp_path: Path) -> N
             sessions_dir="sessions",
             worker_env={"GH_TOKEN": "placeholder-not-a-real-token"},
         ),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -820,6 +829,7 @@ def test_worker_github_token_warns_when_missing_devin_shell(tmp_path: Path) -> N
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -840,6 +850,7 @@ def test_worker_github_token_claude_code_adapter_sources_claude_code_worker_env(
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(adapter="claude-code", sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="claude-code"),
         claude_code=ClaudeCodeConfig(worker_env={"GITHUB_TOKEN": "placeholder-not-a-real-token"}),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -900,6 +911,7 @@ def test_worker_github_token_api_routed_check_fires_alongside_default_adapter(
             sessions_dir="sessions",
             worker_env={"GH_TOKEN": "placeholder-not-a-real-token"},
         ),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         api_worker=_api_worker_config(enabled=True),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -936,6 +948,7 @@ def test_worker_github_token_rescue_routed_check_fires_when_api_worker_disabled(
             sessions_dir="sessions",
             worker_env={"GH_TOKEN": "placeholder-not-a-real-token"},
         ),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         rescue=RescueConfig(enabled=True),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -965,6 +978,13 @@ def test_worker_github_token_no_secret_in_output(tmp_path: Path) -> None:
             sessions_dir="sessions",
             worker_env={"GH_TOKEN": secret},
         ),
+        # worker.harness must be set (not just devin.adapter) so the "worker
+        # GitHub token" check actually fires -- doctor.py reads worker.harness
+        # (role-config Phase 1.5), and this test constructs OrchestratorConfig
+        # directly, bypassing the dual-accept sync that build_config_from_data
+        # would otherwise perform. Without this the check is silently absent
+        # and the loop below trivially finds no leak in nothing.
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)

@@ -22,7 +22,13 @@ from pathlib import Path
 
 import pytest
 
-from charlie_work.config import DevinConfig, OrchestratorConfig, RescueConfig, ReviewConfig
+from charlie_work.config import (
+    DevinConfig,
+    OrchestratorConfig,
+    RescueConfig,
+    ReviewConfig,
+    WorkerRoleConfig,
+)
 from charlie_work.rescue_review import CrossFamilyResult
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
@@ -254,6 +260,12 @@ def test_dispatch_rework_routes_rescue_marked_issue_via_rescue_adapter_settings(
 ) -> None:
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="claude-code"),
+        # worker.harness must match devin.adapter (not just default "manual")
+        # -- role-config Phase 1.5: dispatch_rework's manual-adapter skip gate
+        # reads worker.harness, and this test constructs OrchestratorConfig
+        # directly, bypassing the dual-accept sync build_config_from_data
+        # would otherwise perform.
+        worker=WorkerRoleConfig(harness="claude-code"),
         rescue=RescueConfig(enabled=True, worker_model="claude-opus-4-1"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -307,7 +319,7 @@ def test_dispatch_rework_routes_rescue_marked_issue_via_rescue_adapter_settings(
     settings = captured_settings[0]
     assert settings.adapter == "claude-code"
     assert settings.config is not None
-    assert settings.config.claude_code.model == "claude-opus-4-1"
+    assert settings.config.worker.model == "claude-opus-4-1"
 
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "dispatched"
@@ -320,6 +332,7 @@ def test_dispatch_rework_normal_issue_unaffected_by_rescue_config(
     primary configured adapter settings even when rescue.enabled is True."""
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="claude-code"),
+        worker=WorkerRoleConfig(harness="claude-code"),
         rescue=RescueConfig(enabled=True, worker_model="claude-opus-4-1"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -361,7 +374,7 @@ def test_dispatch_rework_normal_issue_unaffected_by_rescue_config(
 
     assert len(captured_settings) == 1
     settings = captured_settings[0]
-    assert settings.config.claude_code.model != "claude-opus-4-1"
+    assert settings.config.worker.model != "claude-opus-4-1"
 
 
 # --- Rescue review exit semantics: _process_rescue_review ---
@@ -782,6 +795,7 @@ def test_rescue_marker_routes_correctly_even_when_rescue_disabled_in_config(
     # configured adapter/model.
     rework_config = OrchestratorConfig(
         devin=DevinConfig(adapter="command"),
+        worker=WorkerRoleConfig(harness="command"),
         rescue=RescueConfig(enabled=False, worker_model="claude-opus-4-1"),
     )
     rework_paths = runtime_paths(tmp_path / "rework", rework_config.runtime.state_dir)
@@ -829,7 +843,7 @@ def test_rescue_marker_routes_correctly_even_when_rescue_disabled_in_config(
     # devin.adapter is "command" and rescue.enabled is False -- but the
     # marker alone must still route this issue through the rescue adapter.
     assert settings.adapter == "claude-code"
-    assert settings.config.claude_code.model == "claude-opus-4-1"
+    assert settings.config.worker.model == "claude-opus-4-1"
 
 
 # --- Issue #618-D: dry-run short-circuit for _process_rescue_review -----------

@@ -487,7 +487,7 @@ def _run_command_adapter(
             request,
             adapter="command",
             ok=False,
-            error="devin.dispatch_command is required when devin.adapter is command",
+            error="devin.dispatch_command is required when worker.harness is command",
         )
     run = run_captured(
         command,

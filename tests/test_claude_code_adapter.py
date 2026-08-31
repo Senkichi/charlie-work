@@ -19,7 +19,9 @@ from charlie_work.config import (
     OrchestratorConfig,
     QuotaProbeConfig,
     ReviewDispatchConfig,
+    ReviewerRoleConfig,
     RuntimeConfig,
+    WorkerRoleConfig,
 )
 from charlie_work.claude_code import (
     ClaudeProgress,
@@ -3092,7 +3094,10 @@ def test_launch_claude_worker_honors_configured_model_override(
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
-    config = OrchestratorConfig(claude_code=ClaudeCodeConfig(model="claude-opus-4-8"))
+    # Role-config Phase 1.5: the model-pin fallback (no model_override passed)
+    # reads worker.model, not claude_code.model -- see claude_code.py's single
+    # enforcement point in launch_claude_worker.
+    config = OrchestratorConfig(worker=WorkerRoleConfig(model="claude-opus-4-8"))
 
     record = launch_claude_worker(
         42,
@@ -3108,18 +3113,20 @@ def test_launch_claude_worker_honors_configured_model_override(
     assert record.command[idx + 1] == "claude-opus-4-8"
 
 
-def test_launch_claude_worker_model_override_wins_over_claude_code_model(
+def test_launch_claude_worker_model_override_wins_over_worker_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Issue #1245: an explicit ``model_override`` is pinned as the ``--model``
-    value instead of ``claude_code.model``. This is the seam the api adapter
-    uses to pin the provider's model. The two values deliberately differ so a
-    regression that ignores the override is caught."""
+    value instead of ``worker.model`` (role-config Phase 1.5; formerly
+    ``claude_code.model``). This is the seam the api adapter uses to pin the
+    provider's model, and the reviewer launch site uses to pin
+    ``reviewer.model``. The two values deliberately differ so a regression
+    that ignores the override is caught."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
-    config = OrchestratorConfig(claude_code=ClaudeCodeConfig(model="claude-sonnet-5"))
+    config = OrchestratorConfig(worker=WorkerRoleConfig(model="claude-sonnet-5"))
 
     record = launch_claude_worker(
         42,
@@ -3135,6 +3142,87 @@ def test_launch_claude_worker_model_override_wins_over_claude_code_model(
     idx = record.command.index("--model")
     assert record.command[idx + 1] == "kimi-k3"
     assert record.command[idx + 1] != "claude-sonnet-5"
+
+
+def test_launch_claude_worker_empty_worker_model_falls_back_to_claude_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Model-pin safety (the 2026-07-22 ambient-model outage class): an empty
+    ``worker.model`` must still resolve to ``_DEFAULT_CLAUDE_MODEL`` at the
+    single command-construction point in ``launch_claude_worker`` -- never an
+    empty ``--model`` value, which would fall through to ambient CLI/global
+    state instead of a config-controlled default.
+
+    Constructs ``OrchestratorConfig`` directly (not via ``load_config``):
+    role-config Phase 1's dual-accept resolver (``_resolve_role_dual_accept``)
+    currently makes an empty ``worker.model`` unreachable through
+    ``load_config`` whenever ``worker.harness == "claude-code"`` (it defaults
+    the effective value to ``_DEFAULT_CLAUDE_MODEL`` before either key is ever
+    seen as absent) -- but the resolver is deleted in role-config Phase 2, so
+    this safety net at the launch boundary must hold on its own, independent
+    of the resolver ever having run. ``claude_code.model`` is set to a
+    DIFFERENT non-empty value so a regression that silently falls back to the
+    old key (instead of the shared _DEFAULT_CLAUDE_MODEL default) is caught.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    config = OrchestratorConfig(
+        worker=WorkerRoleConfig(harness="claude-code", model=""),
+        claude_code=ClaudeCodeConfig(model="claude-should-not-be-read"),
+    )
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        config=config,
+    )
+
+    assert record.command.count("--model") == 1
+    idx = record.command.index("--model")
+    assert record.command[idx + 1] == claude_code._DEFAULT_CLAUDE_MODEL
+    assert record.command[idx + 1] != "claude-should-not-be-read"
+
+
+def test_launch_claude_worker_empty_reviewer_model_override_falls_back_to_claude_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Same model-pin safety net as
+    ``test_launch_claude_worker_empty_worker_model_falls_back_to_claude_default``,
+    but for the reviewer path: an explicitly empty ``model_override`` (as
+    would result from a raw ``config.reviewer.model`` of ``""`` passed
+    through directly, without the ``or None`` guard the real
+    ``dispatch_reviews`` call site applies) must still resolve to
+    ``_DEFAULT_CLAUDE_MODEL`` rather than pinning ``--model`` to an empty
+    string.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    config = OrchestratorConfig(
+        worker=WorkerRoleConfig(model="claude-should-not-be-read-either"),
+        reviewer=ReviewerRoleConfig(model=""),
+    )
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        config=config,
+        model_override=config.reviewer.model,
+    )
+
+    assert record.command.count("--model") == 1
+    idx = record.command.index("--model")
+    assert record.command[idx + 1] == claude_code._DEFAULT_CLAUDE_MODEL
+    assert record.command[idx + 1] != "claude-should-not-be-read-either"
 
 
 def test_launch_claude_worker_review_pins_configured_model_by_default(
