@@ -240,6 +240,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # -----------------------------------------------------------------
         # warning-level kinds: handled-but-notable conditions
         # -----------------------------------------------------------------
+        # Issue #1514: the api-worker launch path refused a launch because the
+        # daily or lifetime budget cap is exhausted (the refusal gate that used
+        # to live in routing.py before its deletion in Phase 2 Track B). Warning,
+        # not error: the issue is not escalated -- it stays queued and retries
+        # on a later pass once spend rolls under the cap -- but the operator must
+        # see that launches are being held by the budget, not silently dropped.
+        "api_budget_refused": "warning",
         "ci_fleet_worktree_dirty": "warning",
         # Issue #1260: the diff-coverage static probe (W3) flagged one or more
         # non-test files whose added branch logic outran the diff's added
