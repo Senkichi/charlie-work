@@ -2399,8 +2399,12 @@ def test_resolve_role_dual_accept_worker_model_devin_shell_old_only() -> None:
     config_module._resolve_role_dual_accept(data)
     assert data["devin"]["worker_model"] == "glm-5-2"
     assert data["worker"]["model"] == "glm-5-2"
-    # claude_code.model is unclaimed by a devin-shell worker -- untouched.
-    assert "model" not in data["claude_code"]
+    # claude_code.model is unclaimed by a devin-shell WORKER, but (as of Task 4)
+    # the reviewer resolution repurposes it as the reviewer's legacy model key
+    # in this branch -- it still gets populated, with the independently
+    # resolved reviewer model (here the shared default, since neither
+    # claude_code.model nor reviewer.model was set).
+    assert data["claude_code"]["model"] == config_module._DEFAULT_CLAUDE_MODEL
 
 
 def test_resolve_role_dual_accept_worker_model_devin_shell_new_only() -> None:
@@ -2462,3 +2466,120 @@ def test_resolve_role_dual_accept_worker_model_claude_code_no_model_defaults_to_
     config_module._resolve_role_dual_accept(data)
     assert data["worker"]["model"] == config_module._DEFAULT_CLAUDE_MODEL
     assert data["claude_code"]["model"] == config_module._DEFAULT_CLAUDE_MODEL
+
+
+def test_resolve_role_dual_accept_reviewer_harness_defaults_claude_code() -> None:
+    data: dict = {}
+    config_module._resolve_role_dual_accept(data)
+    assert data["reviewer"]["harness"] == "claude-code"
+
+
+def test_resolve_role_dual_accept_reviewer_harness_rejects_non_claude_code() -> None:
+    data = {"reviewer": {"harness": "devin"}}
+    with pytest.raises(ConfigError, match="reviewer.*harness.*claude-code.*devin"):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_reviewer_model_inherits_claude_code_model_when_worker_also_claude_code() -> (
+    None
+):
+    # Today's actual behavior: a review launch with no model_override falls
+    # back to claude_code.model. With harness=claude-code and no
+    # reviewer.model set, the reviewer must inherit the SAME resolved value
+    # as the worker.
+    data = {"devin": {"adapter": "claude-code"}, "claude_code": {"model": "claude-opus-4-1"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["worker"]["model"] == "claude-opus-4-1"
+    assert data["reviewer"]["model"] == "claude-opus-4-1"
+
+
+def test_resolve_role_dual_accept_reviewer_model_splits_from_worker_model_no_conflict() -> None:
+    # The primary incremental-migration path: keep claude_code.model driving
+    # the (claude-code) worker, add reviewer.model to decouple the reviewer.
+    # This must NOT raise -- it is not a conflict, it is the intended split.
+    data = {
+        "devin": {"adapter": "claude-code"},
+        "claude_code": {"model": "claude-opus-4-1"},
+        "reviewer": {"model": "claude-sonnet-5"},
+    }
+    config_module._resolve_role_dual_accept(data)
+    assert data["worker"]["model"] == "claude-opus-4-1"
+    assert data["reviewer"]["model"] == "claude-sonnet-5"
+    # claude_code.model stays claimed by the worker -- unaffected by the split.
+    assert data["claude_code"]["model"] == "claude-opus-4-1"
+
+
+def test_resolve_role_dual_accept_reviewer_model_non_claude_code_worker_old_only() -> None:
+    data = {"devin": {"adapter": "devin-shell"}, "claude_code": {"model": "claude-opus-4-1"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["reviewer"]["model"] == "claude-opus-4-1"
+    assert data["claude_code"]["model"] == "claude-opus-4-1"
+
+
+def test_resolve_role_dual_accept_reviewer_model_non_claude_code_worker_conflict_raises() -> None:
+    data = {
+        "devin": {"adapter": "devin-shell"},
+        "claude_code": {"model": "claude-opus-4-1"},
+        "reviewer": {"model": "claude-sonnet-5"},
+    }
+    with pytest.raises(
+        ConfigError,
+        match=r"claude_code\.model \(as reviewer\).*claude-opus-4-1.*reviewer\.model.*claude-sonnet-5",
+    ):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_reviewer_model_no_config_anywhere_defaults_to_shared_constant() -> (
+    None
+):
+    data: dict = {}
+    config_module._resolve_role_dual_accept(data)
+    assert data["reviewer"]["model"] == config_module._DEFAULT_CLAUDE_MODEL
+
+
+def test_resolve_role_dual_accept_reviewer_effort_old_only() -> None:
+    data = {"review_dispatch": {"review_effort": "high"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["review_dispatch"]["review_effort"] == "high"
+    assert data["reviewer"]["effort"] == "high"
+
+
+def test_resolve_role_dual_accept_reviewer_effort_new_only() -> None:
+    data = {"reviewer": {"effort": "high"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["review_dispatch"]["review_effort"] == "high"
+    assert data["reviewer"]["effort"] == "high"
+
+
+def test_resolve_role_dual_accept_reviewer_effort_conflict_raises() -> None:
+    data = {"review_dispatch": {"review_effort": "high"}, "reviewer": {"effort": "low"}}
+    with pytest.raises(
+        ConfigError, match="review_dispatch.review_effort.*high.*reviewer.effort.*low"
+    ):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_reviewer_experiment_fraction_and_salt_dual_accept() -> None:
+    data = {
+        "reviewer": {
+            "effort": "high",
+            "effort_experiment_fraction": 0.5,
+            "effort_experiment_salt": "abc",
+        }
+    }
+    config_module._resolve_role_dual_accept(data)
+    assert data["review_dispatch"]["review_effort_experiment_fraction"] == 0.5
+    assert data["review_dispatch"]["review_effort_experiment_salt"] == "abc"
+
+
+def test_resolve_role_dual_accept_reviewer_experiment_fraction_conflict_raises() -> None:
+    data = {
+        "review_dispatch": {"review_effort_experiment_fraction": 0.5},
+        "reviewer": {"effort_experiment_fraction": 0.75},
+    }
+    with pytest.raises(
+        ConfigError,
+        match="review_dispatch.review_effort_experiment_fraction.*0.5.*"
+        "reviewer.effort_experiment_fraction.*0.75",
+    ):
+        config_module._resolve_role_dual_accept(data)

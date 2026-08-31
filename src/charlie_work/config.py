@@ -2251,6 +2251,141 @@ def _resolve_role_dual_accept(data: dict[str, Any]) -> list[str]:
                 f"(effective value: {effective_worker_model!r})"
             )
 
+    reviewer_raw = _role_section(data, "reviewer")
+    review_dispatch_raw = _role_section(data, "review_dispatch")
+
+    # === reviewer.harness (Phase 1: claude-code only) ===
+    effective_reviewer_harness = reviewer_raw.get("harness", "claude-code")
+    if not isinstance(effective_reviewer_harness, str):
+        raise ConfigError(
+            "config section 'reviewer' key 'harness' must be a string, "
+            f"got {type(effective_reviewer_harness).__name__}"
+        )
+    if effective_reviewer_harness != "claude-code":
+        raise ConfigError(
+            "config section 'reviewer' key 'harness' only supports 'claude-code' "
+            f"in Phase 1 of the role-config refactor; got {effective_reviewer_harness!r}"
+        )
+    reviewer_raw["harness"] = effective_reviewer_harness
+
+    # === reviewer.model <- claude_code.model ===
+    # claude_code.model is fully claimed by the worker above when
+    # effective_harness == "claude-code" (it is now the worker's resolved
+    # value, not an independent reviewer signal) -- so in that branch the
+    # reviewer simply inherits it by default (today's actual behavior: a
+    # review launch with no model_override falls back to claude_code.model)
+    # or is explicitly overridden by reviewer.model. It is never *conflicted*
+    # against claude_code.model in this branch: that is the split-worker-
+    # and-reviewer incremental migration path (old claude_code.model kept
+    # for the worker, new reviewer.model added to decouple the reviewer),
+    # not a contradiction.
+    #
+    # Only when effective_harness != "claude-code" is claude_code.model
+    # unclaimed by the worker (which sources from devin.worker_model
+    # instead) -- there it unambiguously means "old-style reviewer model"
+    # and IS dual-accept/conflict-checked against reviewer.model.
+    if effective_harness == "claude-code":
+        if "model" in reviewer_raw:
+            effective_reviewer_model = reviewer_raw["model"]
+        else:
+            effective_reviewer_model = effective_worker_model
+        reviewer_model_deprecated = False
+    else:
+        effective_reviewer_model, reviewer_model_deprecated = _resolve_dual_accept(
+            old_present="model" in claude_code_raw,
+            old_value=claude_code_raw.get("model"),
+            old_label="claude_code.model (as reviewer)",
+            new_present="model" in reviewer_raw,
+            new_value=reviewer_raw.get("model"),
+            new_label="reviewer.model",
+            default=_DEFAULT_CLAUDE_MODEL,
+        )
+    if not isinstance(effective_reviewer_model, str):
+        raise ConfigError(
+            "config section 'reviewer' key 'model' must be a string, "
+            f"got {type(effective_reviewer_model).__name__}"
+        )
+    reviewer_raw["model"] = effective_reviewer_model
+    if effective_harness != "claude-code":
+        claude_code_raw["model"] = effective_reviewer_model
+    if reviewer_model_deprecated:
+        deprecations.append(
+            "claude_code.model (as reviewer) is deprecated; set reviewer.model "
+            f"instead (effective value: {effective_reviewer_model!r})"
+        )
+
+    # === reviewer.effort / effort_experiment_fraction / effort_experiment_salt
+    # <- review_dispatch.review_effort / .review_effort_experiment_fraction /
+    # .review_effort_experiment_salt ===
+    role_effective_effort, effort_deprecated = _resolve_dual_accept(
+        old_present="review_effort" in review_dispatch_raw,
+        old_value=review_dispatch_raw.get("review_effort"),
+        old_label="review_dispatch.review_effort",
+        new_present="effort" in reviewer_raw,
+        new_value=reviewer_raw.get("effort"),
+        new_label="reviewer.effort",
+        default="",
+    )
+    role_effective_fraction, fraction_deprecated = _resolve_dual_accept(
+        old_present="review_effort_experiment_fraction" in review_dispatch_raw,
+        old_value=review_dispatch_raw.get("review_effort_experiment_fraction"),
+        old_label="review_dispatch.review_effort_experiment_fraction",
+        new_present="effort_experiment_fraction" in reviewer_raw,
+        new_value=reviewer_raw.get("effort_experiment_fraction"),
+        new_label="reviewer.effort_experiment_fraction",
+        default=0.0,
+    )
+    role_effective_salt, salt_deprecated = _resolve_dual_accept(
+        old_present="review_effort_experiment_salt" in review_dispatch_raw,
+        old_value=review_dispatch_raw.get("review_effort_experiment_salt"),
+        old_label="review_dispatch.review_effort_experiment_salt",
+        new_present="effort_experiment_salt" in reviewer_raw,
+        new_value=reviewer_raw.get("effort_experiment_salt"),
+        new_label="reviewer.effort_experiment_salt",
+        default="",
+    )
+    if role_effective_effort is not None and not isinstance(role_effective_effort, str):
+        raise ConfigError(
+            "config section 'reviewer' key 'effort' must be a string, "
+            f"got {type(role_effective_effort).__name__}"
+        )
+    if role_effective_fraction is not None and (
+        isinstance(role_effective_fraction, bool)
+        or not isinstance(role_effective_fraction, (int, float))
+    ):
+        raise ConfigError(
+            "config section 'reviewer' key 'effort_experiment_fraction' must be a "
+            f"number, got {type(role_effective_fraction).__name__}"
+        )
+    if role_effective_salt is not None and not isinstance(role_effective_salt, str):
+        raise ConfigError(
+            "config section 'reviewer' key 'effort_experiment_salt' must be a string, "
+            f"got {type(role_effective_salt).__name__}"
+        )
+    review_dispatch_raw["review_effort"] = role_effective_effort
+    review_dispatch_raw["review_effort_experiment_fraction"] = role_effective_fraction
+    review_dispatch_raw["review_effort_experiment_salt"] = role_effective_salt
+    reviewer_raw["effort"] = role_effective_effort
+    reviewer_raw["effort_experiment_fraction"] = role_effective_fraction
+    reviewer_raw["effort_experiment_salt"] = role_effective_salt
+    if effort_deprecated:
+        deprecations.append(
+            "review_dispatch.review_effort is deprecated; set reviewer.effort "
+            f"instead (effective value: {role_effective_effort!r})"
+        )
+    if fraction_deprecated:
+        deprecations.append(
+            "review_dispatch.review_effort_experiment_fraction is deprecated; set "
+            "reviewer.effort_experiment_fraction instead "
+            f"(effective value: {role_effective_fraction!r})"
+        )
+    if salt_deprecated:
+        deprecations.append(
+            "review_dispatch.review_effort_experiment_salt is deprecated; set "
+            "reviewer.effort_experiment_salt instead "
+            f"(effective value: {role_effective_salt!r})"
+        )
+
     return deprecations
 
 
