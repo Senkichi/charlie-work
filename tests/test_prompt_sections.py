@@ -269,7 +269,7 @@ def test_rework_prompt_includes_push_then_verify_final_step() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
         config = OrchestratorConfig(
-            devin=DevinConfig(adapter="manual"),
+            devin=DevinConfig(),
         )
         paths = runtime_paths(tmp_path, config.runtime.state_dir)
         fake_gh = MinimalFakeGitHub()

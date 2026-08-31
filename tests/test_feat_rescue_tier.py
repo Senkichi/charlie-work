@@ -23,7 +23,6 @@ from pathlib import Path
 import pytest
 
 from charlie_work.config import (
-    DevinConfig,
     OrchestratorConfig,
     RescueConfig,
     ReviewConfig,
@@ -259,12 +258,8 @@ def test_dispatch_rework_routes_rescue_marked_issue_via_rescue_adapter_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="claude-code"),
-        # worker.harness must match devin.adapter (not just default "manual")
-        # -- role-config Phase 1.5: dispatch_rework's manual-adapter skip gate
-        # reads worker.harness, and this test constructs OrchestratorConfig
-        # directly, bypassing the dual-accept sync build_config_from_data
-        # would otherwise perform.
+        # worker.harness must not be the default "manual" -- dispatch_rework's
+        # manual-adapter skip gate reads worker.harness directly.
         worker=WorkerRoleConfig(harness="claude-code"),
         rescue=RescueConfig(enabled=True, worker_model="claude-opus-4-1"),
     )
@@ -331,7 +326,6 @@ def test_dispatch_rework_normal_issue_unaffected_by_rescue_config(
     """A normal (non-rescue-marked) rework candidate must keep using the
     primary configured adapter settings even when rescue.enabled is True."""
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="claude-code"),
         worker=WorkerRoleConfig(harness="claude-code"),
         rescue=RescueConfig(enabled=True, worker_model="claude-opus-4-1"),
     )
@@ -794,7 +788,6 @@ def test_rescue_marker_routes_correctly_even_when_rescue_disabled_in_config(
     # claude-code adapter pinned to rescue.worker_model, never the primary
     # configured adapter/model.
     rework_config = OrchestratorConfig(
-        devin=DevinConfig(adapter="command"),
         worker=WorkerRoleConfig(harness="command"),
         rescue=RescueConfig(enabled=False, worker_model="claude-opus-4-1"),
     )

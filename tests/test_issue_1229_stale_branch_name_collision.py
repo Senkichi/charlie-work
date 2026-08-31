@@ -303,16 +303,16 @@ def test_classify_dead_session_stale_branch_does_not_mask_escalation(
     import json
     from datetime import UTC, datetime
 
-    from charlie_work.config import DevinConfig
+    from charlie_work.config import DevinConfig, WorkerRoleConfig
     from charlie_work.devin_shell import SessionRecord
     from charlie_work.state import load_state, save_state, state_lock
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)

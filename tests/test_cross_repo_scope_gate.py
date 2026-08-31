@@ -27,6 +27,7 @@ from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
     WatchdogConfig,
+    WorkerRoleConfig,
 )
 from charlie_work.cross_repo_gate import (
     CrossRepoGateResult,
@@ -313,7 +314,8 @@ def test_orphan_sweep_escalates_cross_repo_scoped_issue(tmp_path: Path) -> None:
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

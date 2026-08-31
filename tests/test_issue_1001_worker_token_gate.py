@@ -87,15 +87,12 @@ def _config(
     return OrchestratorConfig(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter=adapter,
             sessions_dir="sessions",
             worker_env=devin_worker_env or {},
         ),
         # Role-config Phase 1.5: worker_github_token_findings and the
-        # dispatch gate now read worker.harness, not devin.adapter. This
-        # helper constructs OrchestratorConfig directly, bypassing the
-        # dual-accept sync build_config_from_data would otherwise perform,
-        # so worker.harness must be set explicitly to match `adapter`.
+        # dispatch gate read worker.harness, so it must be set explicitly
+        # to match this helper's `adapter` parameter.
         worker=WorkerRoleConfig(harness=adapter),
         claude_code=ClaudeCodeConfig(
             worker_env=claude_worker_env or {},

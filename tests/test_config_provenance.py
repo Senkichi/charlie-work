@@ -348,7 +348,12 @@ def test_layered_control_known_section_unknown_key_already_consistent(
 
 # --------------------------------------------------------------------------
 # Role-config Phase 1 (issue TBD): layered-merge coverage for the new
-# worker/reviewer sections and their dual-accept legacy counterparts. Note
+# worker/reviewer sections, plus regression pins for what happens when an
+# old-style key that no longer exists in the schema (e.g. ``devin.adapter``
+# / ``claude_code.model``) shows up in the global layer during a staggered
+# cutover. There is no dual-accept resolver left to migrate it -- it is
+# just an unknown-key ``ConfigError`` now, rescued or not depending on
+# whether a per-repo config exists for the #665 fallback to retry with. Note
 # the global/fleet layer file is always ``config.yaml`` (``GLOBAL_CONFIG_
 # FILENAME`` in layout.py) -- distinct from the per-repo
 # ``orchestrator.config.yaml`` that ``_repo_with_config`` writes -- matching
@@ -377,34 +382,46 @@ def test_layered_cross_layer_old_new_conflict_falls_back_to_repo_alone(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # The #665/#623 silent-global-discard shape, reachable during a
-    # staggered global/repo role-config cutover: global sets the OLD key,
-    # repo sets the disagreeing NEW key. The merged dict fails
-    # build_config_from_data's conflict check, so the loader falls back to
-    # the per-repo config alone (with a warning) rather than raising.
+    # staggered global/repo role-config cutover: global still uses the OLD
+    # key. ``devin.adapter`` is now just an unrecognized field on
+    # DevinConfig -- there is no dual-accept resolver left to detect a
+    # role-specific "conflict" -- so the merged dict fails
+    # build_config_from_data's generic unknown-key check instead, and the
+    # #665 rescue (independent of the deleted dual-accept resolver) falls
+    # back to the per-repo config alone with a warning, same as before.
     fleet = tmp_path / "fleet"
     fleet.mkdir()
     (fleet / "config.yaml").write_text("devin:\n  adapter: devin-shell\n", encoding="utf-8")
     repo_root = tmp_path / "repo"
-    _repo_with_config(repo_root, "worker:\n  harness: claude-code\n")
+    repo_path = _repo_with_config(repo_root, "worker:\n  harness: claude-code\n")
 
     with caplog.at_level("WARNING"):
         config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
 
     # Per-repo-alone fallback: only the repo's worker.harness took effect,
-    # the global devin.adapter was discarded.
+    # and provenance follows the rollback -- the discarded global layer is
+    # not listed as a source. (There is no ``config.devin.adapter`` left to
+    # assert on at all -- the field is gone.)
     assert config.worker.harness == "claude-code"
-    assert config.devin.adapter == "claude-code"
+    assert config.sources == (str(repo_path),)
     assert any("global layer was discarded" in record.message for record in caplog.records)
 
 
-def test_layered_mixed_old_worker_new_reviewer_across_layers_merges_cleanly(
+def test_layered_old_keys_in_global_with_no_repo_config_is_fatal(
     tmp_path: pathlib.Path,
 ) -> None:
-    # The claim-asymmetry rule from Task 4 also makes this the OK case, not
-    # a conflict: global keeps the legacy claude_code.model driving a
-    # claude-code worker, repo adds a new reviewer.model to decouple the
-    # reviewer. Confirms the rule holds across the layered-merge boundary,
-    # not just within one file.
+    # Old-style keys (``devin.adapter``, ``claude_code.model``) are pure
+    # errors now -- there is no dual-accept resolver left to migrate them,
+    # so this can no longer "merge cleanly" the way the old dual-write-sync
+    # test of this name once claimed (it asserted ``config.worker.model ==
+    # "claude-opus-4-1"``, which relied on a sync mechanism that is gone;
+    # today the same fixture leaves ``config.worker.model`` at its empty
+    # default). The #665 rescue exercised by the test above only fires when
+    # a per-repo config exists to fall back to (``if not global_exists or
+    # not repo_data: raise`` in ``load_layered_config``). With no per-repo
+    # config at all, that guard has nothing to rescue with, so the old key
+    # is fatal, full stop -- the more useful regression pin for this
+    # scenario now that migratable old keys don't exist.
     fleet = tmp_path / "fleet"
     fleet.mkdir()
     (fleet / "config.yaml").write_text(
@@ -412,9 +429,9 @@ def test_layered_mixed_old_worker_new_reviewer_across_layers_merges_cleanly(
         encoding="utf-8",
     )
     repo_root = tmp_path / "repo"
-    _repo_with_config(repo_root, "reviewer:\n  model: claude-sonnet-5\n")
+    repo_root.mkdir()
 
-    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
-
-    assert config.worker.model == "claude-opus-4-1"
-    assert config.reviewer.model == "claude-sonnet-5"
+    # Don't match on which key names the error -- dict/section iteration
+    # order isn't a contract this test should pin.
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet))

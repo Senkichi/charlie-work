@@ -25,7 +25,7 @@ from typing import Any
 import pytest
 
 from charlie_work.adapters import SessionDispatchResult
-from charlie_work.config import DevinConfig, OrchestratorConfig, ReviewConfig
+from charlie_work.config import DevinConfig, OrchestratorConfig, ReviewConfig, WorkerRoleConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     clear_escalation,
@@ -42,10 +42,8 @@ def _closed_pr_app(tmp_path: Path) -> tuple[OrchestratorApp, FakeGitHub]:
     """A dispatchable ready issue #123, with the default fixture PR #456
     closed so it doesn't trip the open-PR exclusion."""
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
