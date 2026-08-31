@@ -22,6 +22,7 @@ from typing import Any
 
 from .claude_code import ClaudeWorkerRecord, launch_claude_worker
 from .config import ApiWorkerConfig, OrchestratorConfig
+from .paths import runtime_paths
 
 # Provider env injected into the child process. The auth token travels ONLY in
 # the child process env — it is never written to a sidecar, log, prompt, or
@@ -63,6 +64,42 @@ def _provider_env(base_url: str, auth_token: str, model: str) -> dict[str, str]:
     for var in _SMALL_FAST_MODEL_ENV_VARS:
         env[var] = model
     return env
+
+
+def _budget_exhausted_error(api_worker_config: ApiWorkerConfig, *, state_dir: Path) -> str | None:
+    """Return an error message when the api-worker budget is exhausted, else None.
+
+    The refusal gate for the daily/lifetime caps (issue #1514): mirrors the
+    headroom check ``doctor.py`` / ``fleet_dispatch.py`` surface, but as a
+    launch refusal rather than a report. Uses ``budget_status`` +
+    ``load_ledger`` / ``ledger_path`` exactly as those reporting-only
+    consumers do — no re-implementation of the headroom math.
+
+    A missing or corrupt ledger is treated as empty spend (``load_ledger``
+    quarantines a corrupt file and returns an empty ``Ledger``), so a fresh
+    or unreadable ledger never refuses a launch — only real recorded spend
+    against the configured caps does.
+    """
+    from datetime import UTC, datetime
+
+    from .api_budget import budget_status, ledger_path, load_ledger
+
+    ledger = load_ledger(ledger_path(state_dir))
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    status = budget_status(ledger, api_worker_config.budget, today)
+    if status.daily_headroom and status.lifetime_headroom:
+        return None
+    budget = api_worker_config.budget
+    parts: list[str] = []
+    if not status.daily_headroom:
+        parts.append(
+            f"daily ${status.spent_today_usd:.2f}/${budget.max_usd_per_day:.2f} exhausted"
+        )
+    if not status.lifetime_headroom:
+        parts.append(
+            f"lifetime ${status.lifetime_spent_usd:.2f}/${budget.lifetime_usd:.2f} exhausted"
+        )
+    return "api worker budget exhausted: " + "; ".join(parts)
 
 
 def launch_api_worker(
@@ -145,6 +182,46 @@ def launch_api_worker(
             ),
             provider=provider_name,
         )
+
+    # Budget preflight (issue #1514): refuse the launch when the daily or
+    # lifetime cap is exhausted. This is the refusal gate that lived in
+    # routing._api_preflight before routing.py was deleted in Phase 2 Track B
+    # (PR #1517); without it the caps in api_budget.budget_status were computed
+    # and displayed (doctor.py, fleet_dispatch.py) but nothing refused a launch
+    # when they ran out. Uses budget_status + load_ledger/ledger_path exactly as
+    # those reporting-only consumers do. The ledger lives under the runtime
+    # state_dir, resolved from ``config`` (always passed in the production
+    # dispatch path). When ``config`` is absent the preflight is skipped — a
+    # directly-constructed config without a state_dir cannot be located, the
+    # same defensive posture as the enabled/provider/auth-token checks above.
+    if config is not None:
+        state_root = runtime_paths(repo_root, config.runtime.state_dir).root
+        budget_error = _budget_exhausted_error(api_worker_config, state_dir=state_root)
+        if budget_error is not None:
+            # Emit a best-effort event so the operator can see launches are
+            # being held by the budget (log_event is best-effort: any I/O error
+            # is caught and logged, never breaking the launch path).
+            from . import layout as _layout
+            from .instrumentation import log_event
+
+            log_event(
+                _layout.state_file_path(state_root),
+                "api_budget_refused",
+                {
+                    "issue_number": issue_number,
+                    "branch": branch,
+                    "provider": provider_name,
+                    "error": budget_error,
+                },
+                level="warning",
+            )
+            return _error_record(
+                issue_number,
+                branch,
+                sessions_dir,
+                error=budget_error,
+                provider=provider_name,
+            )
 
     provider_env = _provider_env(provider.base_url, auth_token, provider.model)
     # Merge provider env OVER any configured worker env so the provider routing
