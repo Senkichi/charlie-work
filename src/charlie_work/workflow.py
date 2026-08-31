@@ -12925,27 +12925,32 @@ class OrchestratorApp:
             # folding into the same None as "verified clean", which silently
             # disabled the gate and could let a real cross-PR revert merge
             # unflagged. Only CLEAN lets the merge advance.
+            #
+            # ``blocks_merge`` is the single enforcement point for sync_failed
+            # (both REVERT_DETECTED and UNDETERMINED block); the status chain
+            # below is routing/dispatch only — which flag to set and whether to
+            # route to rework — not a second enforcement of the block.
             if not sync_failed:
                 cross_pr_revert_verdict = detect_cross_pr_revert(pr, self.repo_root)
                 cross_pr_revert_reason = cross_pr_revert_verdict.reason
-                if cross_pr_revert_verdict.status is CrossPrRevertStatus.REVERT_DETECTED:
-                    cross_pr_revert_detected = True
+                if cross_pr_revert_verdict.blocks_merge:
                     sync_failed = True
-                    if issue_number is not None:
-                        state = load_state_locked(self.paths.state_file)
-                        issue_state = state["issues"].get(str(issue_number), {})
-                        issue_status = issue_state.get("status")
-                        if issue_status not in _REWORK_ALREADY_ROUTED_STATUSES:
-                            cross_pr_revert_routed = True
-                            rework_label_error = self._request_cross_pr_revert_rework(
-                                pr, issue_number, decision, cross_pr_revert_reason
-                            )
-                elif cross_pr_revert_verdict.status is CrossPrRevertStatus.UNDETERMINED:
-                    # Fail closed: refuse to merge on an unverified gate. This
-                    # is not a detected revert, so no rework routing — the PR
-                    # is simply held until the gate can verify (issue #1068).
-                    cross_pr_revert_undetermined = True
-                    sync_failed = True
+                    if cross_pr_revert_verdict.status is CrossPrRevertStatus.REVERT_DETECTED:
+                        cross_pr_revert_detected = True
+                        if issue_number is not None:
+                            state = load_state_locked(self.paths.state_file)
+                            issue_state = state["issues"].get(str(issue_number), {})
+                            issue_status = issue_state.get("status")
+                            if issue_status not in _REWORK_ALREADY_ROUTED_STATUSES:
+                                cross_pr_revert_routed = True
+                                rework_label_error = self._request_cross_pr_revert_rework(
+                                    pr, issue_number, decision, cross_pr_revert_reason
+                                )
+                    elif cross_pr_revert_verdict.status is CrossPrRevertStatus.UNDETERMINED:
+                        # Fail closed: refuse to merge on an unverified gate. This
+                        # is not a detected revert, so no rework routing — the PR
+                        # is simply held until the gate can verify (issue #1068).
+                        cross_pr_revert_undetermined = True
         checks = self.gh.pr_checks(pr_number)
         checks_unavailable = checks is None
 
@@ -13894,16 +13899,18 @@ class OrchestratorApp:
 
             # Cross-PR revert detection (read-only). The rework routing write
             # is skipped under dry-run. UNDETERMINED fails closed (issue #1068):
-            # the merge is held but no rework is routed.
+            # the merge is held but no rework is routed. ``blocks_merge`` is the
+            # single enforcement point for sync_failed; the status chain is
+            # routing/dispatch only (matches the merge_ready path above).
             if not sync_failed:
                 cross_pr_revert_verdict = detect_cross_pr_revert(pr, self.repo_root)
                 cross_pr_revert_reason = cross_pr_revert_verdict.reason
-                if cross_pr_revert_verdict.status is CrossPrRevertStatus.REVERT_DETECTED:
-                    cross_pr_revert_detected = True
+                if cross_pr_revert_verdict.blocks_merge:
                     sync_failed = True
-                elif cross_pr_revert_verdict.status is CrossPrRevertStatus.UNDETERMINED:
-                    cross_pr_revert_undetermined = True
-                    sync_failed = True
+                    if cross_pr_revert_verdict.status is CrossPrRevertStatus.REVERT_DETECTED:
+                        cross_pr_revert_detected = True
+                    elif cross_pr_revert_verdict.status is CrossPrRevertStatus.UNDETERMINED:
+                        cross_pr_revert_undetermined = True
 
         checks = self.gh.pr_checks(pr_number)
         checks_unavailable = checks is None
