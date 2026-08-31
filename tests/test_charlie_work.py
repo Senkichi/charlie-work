@@ -53112,7 +53112,6 @@ def test_dispatch_rework_pre_filter_own_live_session_not_reaped_escalated(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
         worker=WorkerRoleConfig(harness="command"),
