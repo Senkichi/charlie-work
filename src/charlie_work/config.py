@@ -2076,6 +2076,11 @@ def _build_section(cls: type, name: str, data: dict[str, Any]) -> Any:
     return cls(**data)
 
 
+_VALID_WORKER_HARNESSES: frozenset[str] = frozenset(
+    {"devin-shell", "claude-code", "api", "command", "manual"}
+)
+
+
 def _role_section(data: dict[str, Any], key: str) -> dict[str, Any]:
     """Like ``_section``, but inserts the coerced dict back into ``data`` so a
     later ``_section(data, key)`` call (and ``_build_section``) observes any
@@ -2157,6 +2162,95 @@ def _resolve_role_dual_accept(data: dict[str, Any]) -> list[str]:
     tuple) to ``OrchestratorConfig.deprecations``.
     """
     deprecations: list[str] = []
+
+    devin_raw = _role_section(data, "devin")
+    claude_code_raw = _role_section(data, "claude_code")
+    worker_raw = _role_section(data, "worker")
+
+    # === worker.harness <- devin.adapter ===
+    effective_harness, harness_deprecated = _resolve_dual_accept(
+        old_present="adapter" in devin_raw,
+        old_value=devin_raw.get("adapter"),
+        old_label="devin.adapter",
+        new_present="harness" in worker_raw,
+        new_value=worker_raw.get("harness"),
+        new_label="worker.harness",
+        default="manual",
+    )
+    if not isinstance(effective_harness, str):
+        raise ConfigError(
+            "config section 'worker' key 'harness' must be a string, "
+            f"got {type(effective_harness).__name__}"
+        )
+    if effective_harness not in _VALID_WORKER_HARNESSES:
+        raise ConfigError(
+            "config section 'worker' key 'harness' must be one of "
+            f"{sorted(_VALID_WORKER_HARNESSES)}, got {effective_harness!r}"
+        )
+    devin_raw["adapter"] = effective_harness
+    worker_raw["harness"] = effective_harness
+    if harness_deprecated:
+        deprecations.append(
+            "devin.adapter is deprecated; set worker.harness instead "
+            f"(effective value: {effective_harness!r})"
+        )
+
+    # === worker.model <- devin.worker_model / claude_code.model ===
+    # claude_code.model has historically served two roles at once: the
+    # worker's model (only when devin.adapter == "claude-code") and the
+    # reviewer's model (always -- dispatch_reviews() launches every reviewer
+    # via claude-code regardless of the worker's adapter and, before this
+    # refactor, never passed model_override, so it fell back to
+    # claude_code.model unconditionally -- see claude_code.py:1112-1114).
+    # Here, worker.model's OLD source is harness-conditional: claude_code
+    # .model when the worker's own harness is claude-code (matching today's
+    # actual worker-launch behavior), else devin.worker_model (which has no
+    # other claimant). Task 4 resolves reviewer.model separately and, in the
+    # claude-code branch, treats claude_code.model as already claimed here
+    # rather than re-checking it for conflicts against reviewer.model.
+    if effective_harness == "claude-code":
+        worker_model_old_present = "model" in claude_code_raw
+        worker_model_old_value = claude_code_raw.get("model")
+        worker_model_old_label = "claude_code.model (as worker)"
+        worker_model_default = _DEFAULT_CLAUDE_MODEL
+    else:
+        worker_model_old_present = "worker_model" in devin_raw
+        worker_model_old_value = devin_raw.get("worker_model")
+        worker_model_old_label = "devin.worker_model"
+        worker_model_default = ""
+
+    effective_worker_model, worker_model_deprecated = _resolve_dual_accept(
+        old_present=worker_model_old_present,
+        old_value=worker_model_old_value,
+        old_label=worker_model_old_label,
+        new_present="model" in worker_raw,
+        new_value=worker_raw.get("model"),
+        new_label="worker.model",
+        default=worker_model_default,
+    )
+    if not isinstance(effective_worker_model, str):
+        raise ConfigError(
+            "config section 'worker' key 'model' must be a string, "
+            f"got {type(effective_worker_model).__name__}"
+        )
+    worker_raw["model"] = effective_worker_model
+    if effective_harness == "claude-code":
+        claude_code_raw["model"] = effective_worker_model
+    else:
+        devin_raw["worker_model"] = effective_worker_model
+    if worker_model_deprecated:
+        if effective_harness == "claude-code":
+            deprecations.append(
+                "claude_code.model is deprecated; set worker.model instead "
+                f"(effective worker value: {effective_worker_model!r}) -- and set "
+                "reviewer.model too if the reviewer should use a different model"
+            )
+        else:
+            deprecations.append(
+                f"{worker_model_old_label} is deprecated; set worker.model instead "
+                f"(effective value: {effective_worker_model!r})"
+            )
+
     return deprecations
 
 

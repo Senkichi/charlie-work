@@ -2359,3 +2359,106 @@ def test_role_section_existing_dict_is_returned_as_is() -> None:
 def test_resolve_role_dual_accept_scaffold_returns_empty_list() -> None:
     assert config_module._resolve_role_dual_accept({}) == []
     assert config_module._resolve_role_dual_accept({"unrelated": 1}) == []
+
+
+def test_resolve_role_dual_accept_worker_harness_old_only() -> None:
+    data = {"devin": {"adapter": "devin-shell"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["devin"]["adapter"] == "devin-shell"
+    assert data["worker"]["harness"] == "devin-shell"
+
+
+def test_resolve_role_dual_accept_worker_harness_new_only() -> None:
+    data = {"worker": {"harness": "api"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["devin"]["adapter"] == "api"
+    assert data["worker"]["harness"] == "api"
+
+
+def test_resolve_role_dual_accept_worker_harness_neither_defaults_to_manual() -> None:
+    data: dict = {}
+    config_module._resolve_role_dual_accept(data)
+    assert data["devin"]["adapter"] == "manual"
+    assert data["worker"]["harness"] == "manual"
+
+
+def test_resolve_role_dual_accept_worker_harness_conflict_raises() -> None:
+    data = {"devin": {"adapter": "devin-shell"}, "worker": {"harness": "api"}}
+    with pytest.raises(ConfigError, match="devin.adapter.*devin-shell.*worker.harness.*api"):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_worker_harness_rejects_invalid_value() -> None:
+    data = {"worker": {"harness": "bogus"}}
+    with pytest.raises(ConfigError, match="worker.*harness.*bogus"):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_worker_model_devin_shell_old_only() -> None:
+    data = {"devin": {"adapter": "devin-shell", "worker_model": "glm-5-2"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["devin"]["worker_model"] == "glm-5-2"
+    assert data["worker"]["model"] == "glm-5-2"
+    # claude_code.model is unclaimed by a devin-shell worker -- untouched.
+    assert "model" not in data["claude_code"]
+
+
+def test_resolve_role_dual_accept_worker_model_devin_shell_new_only() -> None:
+    data = {"worker": {"harness": "devin-shell", "model": "glm-5-2"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["devin"]["worker_model"] == "glm-5-2"
+    assert data["worker"]["model"] == "glm-5-2"
+
+
+def test_resolve_role_dual_accept_worker_model_devin_shell_conflict_raises() -> None:
+    data = {
+        "devin": {"adapter": "devin-shell", "worker_model": "glm-5-2"},
+        "worker": {"harness": "devin-shell", "model": "sonnet-5"},
+    }
+    with pytest.raises(ConfigError, match="devin.worker_model.*glm-5-2.*worker.model.*sonnet-5"):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_worker_model_devin_shell_no_model_defaults_empty() -> None:
+    data = {"devin": {"adapter": "devin-shell"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["worker"]["model"] == ""
+    assert data["devin"]["worker_model"] == ""
+
+
+def test_resolve_role_dual_accept_worker_model_claude_code_old_only() -> None:
+    data = {"devin": {"adapter": "claude-code"}, "claude_code": {"model": "claude-opus-4-1"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["worker"]["model"] == "claude-opus-4-1"
+    assert data["claude_code"]["model"] == "claude-opus-4-1"
+
+
+def test_resolve_role_dual_accept_worker_model_claude_code_new_only() -> None:
+    data = {"worker": {"harness": "claude-code", "model": "claude-opus-4-1"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["claude_code"]["model"] == "claude-opus-4-1"
+    assert data["worker"]["model"] == "claude-opus-4-1"
+
+
+def test_resolve_role_dual_accept_worker_model_claude_code_conflict_raises() -> None:
+    data = {
+        "devin": {"adapter": "claude-code"},
+        "claude_code": {"model": "claude-opus-4-1"},
+        "worker": {"model": "sonnet-5"},
+    }
+    with pytest.raises(
+        ConfigError,
+        match=r"claude_code\.model \(as worker\).*claude-opus-4-1.*worker\.model.*sonnet-5",
+    ):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_worker_model_claude_code_no_model_defaults_to_shared_constant() -> (
+    None
+):
+    # This is the regression this task must not reintroduce: an unconfigured
+    # claude-code worker must still get the CLI-pin default, never "".
+    data = {"devin": {"adapter": "claude-code"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["worker"]["model"] == config_module._DEFAULT_CLAUDE_MODEL
+    assert data["claude_code"]["model"] == config_module._DEFAULT_CLAUDE_MODEL
