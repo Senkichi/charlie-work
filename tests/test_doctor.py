@@ -393,7 +393,7 @@ def test_doctor_adapter_probe_runs_devin_probe_and_surfaces_sessions(
 
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
         worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -480,7 +480,8 @@ def test_doctor_surfaces_post_mortem_terminal_cause_and_attempt_ref(
     )
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -527,7 +528,8 @@ def test_doctor_surface_post_mortems_absent_degrades_silently(tmp_path: Path, mo
     )
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -548,7 +550,7 @@ def test_doctor_adapter_probe_reports_failed_devin_binary(tmp_path: Path, monkey
     )
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
         worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -571,7 +573,7 @@ def test_doctor_adapter_probe_claude_code_probes_claude(tmp_path: Path, monkeypa
     )
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="claude-code", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
         worker=WorkerRoleConfig(harness="claude-code"),
         # Empty venv_source skips the venv-existence check so this test stays
         # scoped to the probe path.
@@ -590,7 +592,8 @@ def test_doctor_adapter_probe_claude_code_probes_claude(tmp_path: Path, monkeypa
 def test_doctor_without_adapter_probe_omits_probe_checks(tmp_path: Path) -> None:
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -674,7 +677,6 @@ def test_doctor_adapter_probe_uses_configured_devin_binary(tmp_path: Path, monke
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             shell_command=("my-devin-wrapper", "--prompt-file", "{prompt_path}", "--print"),
         ),
@@ -703,7 +705,7 @@ def test_doctor_adapter_probe_uses_configured_claude_binary(tmp_path: Path, monk
 
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="claude-code", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
         worker=WorkerRoleConfig(harness="claude-code"),
         claude_code=ClaudeCodeConfig(
             command=("my-claude-wrapper", "-p", "--permission-mode", "acceptEdits"),
@@ -726,7 +728,6 @@ def test_doctor_reports_config_driven_worker_model(tmp_path: Path) -> None:
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             worker_model="claude-sonnet-4-5",
         ),
@@ -750,7 +751,6 @@ def test_doctor_reports_cli_default_when_worker_model_empty(tmp_path: Path) -> N
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             worker_model="",
         ),
@@ -775,7 +775,6 @@ def test_doctor_omits_worker_model_check_for_non_devin_shell_adapters(tmp_path: 
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="claude-code",
             sessions_dir="sessions",
             worker_model="claude-sonnet-4-5",
         ),
@@ -802,7 +801,6 @@ def test_worker_github_token_ok_when_configured_devin_shell(tmp_path: Path) -> N
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             worker_env={"GH_TOKEN": "placeholder-not-a-real-token"},
         ),
@@ -828,7 +826,7 @@ def test_worker_github_token_warns_when_missing_devin_shell(tmp_path: Path) -> N
     """
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
         worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -849,7 +847,7 @@ def test_worker_github_token_claude_code_adapter_sources_claude_code_worker_env(
 ) -> None:
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="claude-code", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
         worker=WorkerRoleConfig(harness="claude-code"),
         claude_code=ClaudeCodeConfig(worker_env={"GITHUB_TOKEN": "placeholder-not-a-real-token"}),
     )
@@ -874,7 +872,8 @@ def test_worker_github_token_omitted_for_manual_and_command_adapters(tmp_path: P
     for adapter in ("manual", "command"):
         config = _config(
             auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-            devin=DevinConfig(adapter=adapter, sessions_dir="sessions"),
+            devin=DevinConfig(sessions_dir="sessions"),
+            worker=WorkerRoleConfig(harness=adapter),
         )
         paths = runtime_paths(tmp_path, config.runtime.state_dir)
         gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -907,7 +906,6 @@ def test_worker_github_token_api_routed_check_fires_alongside_default_adapter(
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             worker_env={"GH_TOKEN": "placeholder-not-a-real-token"},
         ),
@@ -944,7 +942,6 @@ def test_worker_github_token_rescue_routed_check_fires_when_api_worker_disabled(
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             worker_env={"GH_TOKEN": "placeholder-not-a-real-token"},
         ),
@@ -974,14 +971,13 @@ def test_worker_github_token_no_secret_in_output(tmp_path: Path) -> None:
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             worker_env={"GH_TOKEN": secret},
         ),
-        # worker.harness must be set (not just devin.adapter) so the "worker
-        # GitHub token" check actually fires -- doctor.py reads worker.harness
-        # (role-config Phase 1.5), and this test constructs OrchestratorConfig
-        # directly, bypassing the dual-accept sync that build_config_from_data
+        # worker.harness must be set explicitly so the "worker GitHub token"
+        # check actually fires -- doctor.py reads worker.harness, and this
+        # test constructs OrchestratorConfig directly in Python, bypassing
+        # whatever load-time defaulting/validation build_config_from_data
         # would otherwise perform. Without this the check is silently absent
         # and the loop below trivially finds no leak in nothing.
         worker=WorkerRoleConfig(harness="devin-shell"),
@@ -2517,7 +2513,8 @@ def test_doctor_surfaces_in_progress_corroboration_alive_but_polling(
     )
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
         post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
     )
@@ -2558,7 +2555,8 @@ def test_doctor_in_progress_corroboration_silent_when_no_workers(
     )
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -2609,32 +2607,3 @@ def test_doctor_role_config_summary_reports_cross_family_yes_when_models_differ(
 
     by_name = {check.name: check for check in checks}
     assert "cross-family: yes" in by_name["role config"].detail
-
-
-def test_doctor_surfaces_deprecated_config_keys_as_warnings(tmp_path: Path) -> None:
-    config = _config(
-        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        deprecations=(
-            "devin.adapter is deprecated; set worker.harness instead (effective value: 'devin-shell')",
-        ),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    gh = FakeDoctorGitHub(labels=config.labels.all)
-
-    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
-
-    dep_checks = [c for c in checks if c.name == "deprecated config key"]
-    assert len(dep_checks) == 1
-    assert dep_checks[0].severity == "warning"
-    assert "devin.adapter is deprecated" in dep_checks[0].detail
-    assert ok is True  # warning-only, never blocking
-
-
-def test_doctor_omits_deprecated_config_key_checks_when_none_present(tmp_path: Path) -> None:
-    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    gh = FakeDoctorGitHub(labels=config.labels.all)
-
-    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
-
-    assert not [c for c in checks if c.name == "deprecated config key"]
