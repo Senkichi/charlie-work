@@ -10,13 +10,15 @@ from __future__ import annotations
 import json
 import sys
 import textwrap
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 from _worker_marker_wait import read_worker_marker
 
-from charlie_work import api_worker, claude_code
+from charlie_work import api_worker, claude_code, instrumentation
+from charlie_work.api_budget import DayBucket, Ledger, ledger_path, save_ledger
 from charlie_work.api_worker import launch_api_worker
 from charlie_work.claude_code import ClaudeWorkerRecord, read_worker_records
 from charlie_work.config import (
@@ -25,6 +27,7 @@ from charlie_work.config import (
     ApiWorkerConfig,
     ClaudeCodeConfig,
     OrchestratorConfig,
+    RuntimeConfig,
 )
 from charlie_work.worktree import WorktreeInfo
 
@@ -888,3 +891,281 @@ def test_dispatch_sessions_api_adapter_without_config_returns_error(
     assert results[0].adapter == "api"
     assert results[0].error is not None
     assert "api_worker_config" in results[0].error
+
+
+# ---------------------------------------------------------------------------
+# Issue #1514: budget-exhausted preflight in launch_api_worker.
+#
+# After routing.py (and its sole budget refusal gate, routing._api_preflight)
+# was deleted in Phase 2 Track B (PR #1517), the daily/lifetime caps in
+# api_budget.budget_status were still computed and displayed (doctor.py,
+# fleet_dispatch.py) but nothing refused a launch when they ran out. The
+# refusal gate now lives in launch_api_worker itself, mirroring the existing
+# enabled/provider/auth-token checks. These tests drive the cap to exhausted
+# and assert no launch (no Popen) happens.
+# ---------------------------------------------------------------------------
+
+
+def _today_utc() -> str:
+    """Today's UTC date key, derived from the real clock so it can never drift
+    stale against budget_status's own ``datetime.now(UTC)`` lookup."""
+    return datetime.now(UTC).strftime("%Y-%m-%d")
+
+
+def _config_with_state_dir(state_dir: Path) -> OrchestratorConfig:
+    """An OrchestratorConfig whose runtime.state_dir points at ``state_dir``
+    (the directory holding the api-budget.json ledger)."""
+    return OrchestratorConfig(runtime=RuntimeConfig(state_dir=str(state_dir)))
+
+
+def _plant_ledger(state_dir: Path, ledger: Ledger) -> None:
+    """Write ``ledger`` to the canonical ledger path under ``state_dir``."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    save_ledger(ledger_path(state_dir), ledger)
+
+
+def test_launch_api_worker_daily_budget_exhausted_refuses_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When today's spend is at the daily cap, launch_api_worker returns an
+    error record and never reaches launch_claude_worker (no Popen). Emits an
+    api_budget_refused event."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
+
+    # Default ApiBudgetConfig: max_usd_per_day=5.0, preflight_reserve_usd=1.0.
+    # spend 5.0 + reserve 1.0 <= 5.0 is False -> daily exhausted.
+    _plant_ledger(
+        state_dir,
+        Ledger(days={_today_utc(): DayBucket(usd=5.0)}, lifetime_usd=0.0),
+    )
+
+    # Sentinel: if launch_claude_worker is reached, the preflight failed to
+    # refuse. Record the call so the assertion can prove it never ran.
+    launch_calls: list[dict[str, Any]] = []
+
+    def must_not_launch(*args, **kwargs):
+        launch_calls.append({"args": args, "kwargs": kwargs})
+        return ClaudeWorkerRecord(
+            issue_number=args[0],
+            branch=args[1],
+            worktree_path="",
+            prompt_path="",
+            command=(),
+            pid=999,
+            started_at="",
+            log_path="",
+            error=None,
+            adapter_kind="api",
+            provider="kimi-k3",
+        )
+
+    monkeypatch.setattr(api_worker, "launch_claude_worker", must_not_launch)
+
+    # Capture the best-effort event emission (api_worker imports log_event
+    # locally from .instrumentation at call time, so patching the module
+    # attribute reaches it).
+    event_calls: list[dict[str, Any]] = []
+
+    def fake_log_event(state_path, kind, payload, *, repo=None, correlation_id=None, level=None):
+        event_calls.append(
+            {
+                "state_path": state_path,
+                "kind": kind,
+                "payload": payload,
+                "level": level,
+            }
+        )
+
+    monkeypatch.setattr(instrumentation, "log_event", fake_log_event)
+
+    record = launch_api_worker(
+        1514,
+        "agent/issue-1514-x",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        api_worker_config=_api_worker_config(),
+        config=_config_with_state_dir(state_dir),
+    )
+
+    # No launch happened (no Popen).
+    assert launch_calls == []
+    assert not record.ok
+    assert record.error is not None
+    assert "budget exhausted" in record.error
+    assert "daily" in record.error
+    assert record.pid is None
+    assert record.adapter_kind == "api"
+    assert record.provider == "kimi-k3"
+
+    # An api_budget_refused warning event was emitted.
+    assert len(event_calls) == 1
+    assert event_calls[0]["kind"] == "api_budget_refused"
+    assert event_calls[0]["level"] == "warning"
+    assert event_calls[0]["payload"]["issue_number"] == 1514
+    assert event_calls[0]["payload"]["provider"] == "kimi-k3"
+    assert "daily" in event_calls[0]["payload"]["error"]
+
+    # The error is durable in the sidecar (no key material).
+    sidecar_path = sessions_dir / "issue-1514.api.json"
+    assert sidecar_path.exists()
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["error"] == record.error
+    assert payload["provider"] == "kimi-k3"
+    assert "sk-test-key-value-1234" not in json.dumps(payload)
+
+
+def test_launch_api_worker_lifetime_budget_exhausted_refuses_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When lifetime spend is at the lifetime cap, launch_api_worker refuses
+    and never reaches launch_claude_worker."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
+
+    # Default ApiBudgetConfig: lifetime_usd=15.0. lifetime_spent 15.0 < 15.0
+    # is False -> lifetime exhausted. Today's spend is 0, so daily has headroom.
+    _plant_ledger(state_dir, Ledger(lifetime_usd=15.0))
+
+    launch_calls: list[dict[str, Any]] = []
+
+    def must_not_launch(*args, **kwargs):
+        launch_calls.append({"args": args, "kwargs": kwargs})
+        return ClaudeWorkerRecord(
+            issue_number=args[0],
+            branch=args[1],
+            worktree_path="",
+            prompt_path="",
+            command=(),
+            pid=999,
+            started_at="",
+            log_path="",
+            error=None,
+            adapter_kind="api",
+            provider="kimi-k3",
+        )
+
+    monkeypatch.setattr(api_worker, "launch_claude_worker", must_not_launch)
+    monkeypatch.setattr(instrumentation, "log_event", lambda *a, **k: None)
+
+    record = launch_api_worker(
+        1514,
+        "agent/issue-1514-lifetime",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        api_worker_config=_api_worker_config(),
+        config=_config_with_state_dir(state_dir),
+    )
+
+    assert launch_calls == []
+    assert not record.ok
+    assert record.error is not None
+    assert "budget exhausted" in record.error
+    assert "lifetime" in record.error
+    # Daily had headroom, so only the lifetime reason is present.
+    assert "daily" not in record.error
+    assert record.pid is None
+    assert record.provider == "kimi-k3"
+
+
+def test_launch_api_worker_budget_headroom_allows_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When spend is under both caps, the preflight allows the launch to
+    proceed (regression guard: the preflight must not refuse healthy launches)."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    state_dir = tmp_path / "state"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
+
+    # Spend well under both caps: today 1.0 / 5.0, lifetime 1.0 / 15.0.
+    _plant_ledger(
+        state_dir,
+        Ledger(days={_today_utc(): DayBucket(usd=1.0)}, lifetime_usd=1.0),
+    )
+
+    record = launch_api_worker(
+        1514,
+        "agent/issue-1514-ok",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        api_worker_config=_api_worker_config(),
+        command_template=_fake_claude_script(tmp_path),
+        config=_config_with_state_dir(state_dir),
+    )
+
+    assert record.ok
+    assert record.error is None
+    assert record.pid is not None
+
+
+def test_launch_api_worker_budget_preflight_skipped_without_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When config is None the budget preflight is skipped (the ledger path
+    cannot be located without a runtime.state_dir). A directly-constructed
+    config without a state_dir is the same defensive posture as the
+    enabled/provider/auth-token re-checks. The launch proceeds even though a
+    ledger under the default state root would be exhausted."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
+
+    record = launch_api_worker(
+        1514,
+        "agent/issue-1514-noconfig",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        api_worker_config=_api_worker_config(),
+        command_template=_fake_claude_script(tmp_path),
+        # config intentionally omitted (None) -> preflight skipped.
+    )
+
+    assert record.ok
+    assert record.error is None
+    assert record.pid is not None
+
+
+def test_launch_api_worker_budget_preflight_missing_ledger_allows_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A missing ledger (no spend yet) is treated as empty and never refuses a
+    launch — only real recorded spend against the caps does."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    state_dir = tmp_path / "state"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
+
+    # No ledger planted; state_dir exists but is empty.
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    record = launch_api_worker(
+        1514,
+        "agent/issue-1514-fresh",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        api_worker_config=_api_worker_config(),
+        command_template=_fake_claude_script(tmp_path),
+        config=_config_with_state_dir(state_dir),
+    )
+
+    assert record.ok
+    assert record.error is None
+    assert record.pid is not None
