@@ -157,7 +157,11 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
     control_runner, control_calls = _run_recorder(real_run)
     with (
         patch("charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=_control_sweep),
-        patch("charlie_work.workflow.os.name", "nt"),
+        # os.name check lives in dead_worker_reap; patching the os module
+        # directly avoids depending on which module happens to `import os`
+        # into its own namespace (workflow.py no longer does, post routing
+        # deletion).
+        patch("os.name", "nt"),
         patch("charlie_work.devin_shell.is_session_alive", return_value=False),
         patch("subprocess.run", side_effect=control_runner),
     ):
@@ -185,7 +189,7 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
     dry_runner, dry_calls = _run_recorder(real_run)
     with (
         patch("charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=_dry_sweep),
-        patch("charlie_work.workflow.os.name", "nt"),
+        patch("os.name", "nt"),
         patch("charlie_work.devin_shell.is_session_alive", return_value=False),
         patch("subprocess.run", side_effect=dry_runner),
     ):
@@ -245,6 +249,19 @@ def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path
         return paths.state_file
 
     class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.issues.append(
+                {
+                    "number": 207,
+                    "title": "Test issue",
+                    "url": "https://example.test/issues/207",
+                    "body": "",
+                    "labels": [],
+                    "state": "OPEN",
+                }
+            )
+
         def pr_list(self):
             return [
                 {

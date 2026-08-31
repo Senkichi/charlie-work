@@ -32,6 +32,7 @@ from charlie_work.config import (
     OrchestratorConfig,
     ReviewDispatchConfig,
     RuntimeConfig,
+    WorkerRoleConfig,
 )
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
@@ -721,9 +722,7 @@ def test_escalated_label_repair_skipped_under_dry_run(tmp_path: Path) -> None:
     """``--dry-run`` must perform no live GitHub calls, label mutations, or
     state.json writes for the repair sweep.
 
-    Carries its own positive control (pattern from
-    test_dry_run_claims_nothing_and_fires_no_label_edit in
-    test_cross_family_regen_reachability.py): "nothing happened" is equally
+    Carries its own positive control: "nothing happened" is equally
     consistent with "the dry-run gate works" and with "the call never reached
     the mutating code", so the identical seed and call is made against a
     live (non-dry-run) app first and asserted to actually write.
@@ -1061,6 +1060,12 @@ def _closed_pr_app(tmp_path: Path) -> tuple[OrchestratorApp, FakeGitHub]:
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        # Role-config Phase 1.5: the manual-adapter manifest-writing branch
+        # in _dispatch_impl reads worker.harness, not devin.adapter. Direct
+        # OrchestratorConfig construction bypasses the dual-accept sync
+        # build_config_from_data would otherwise perform, so worker.harness
+        # must be set to match.
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()

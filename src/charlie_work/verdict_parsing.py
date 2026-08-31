@@ -31,7 +31,7 @@ from .throttle_signatures import match_throttle_tail
 CAUSE_UNKNOWN: dict[str, Any] = {"cause": "unknown"}
 
 # Language-tag group accepts any tag (not just ``json``), mirroring the fix in
-# ``cross_family._VERDICT_FENCE_RE``: a fence opened with an unrecognized tag
+# ``rescue_review._VERDICT_FENCE_RE``: a fence opened with an unrecognized tag
 # (e.g. ```python) previously failed to match as an opening delimiter at all,
 # causing its own closing ``` to be misread as a spurious new opening and
 # desynchronizing every fence pair after it. In practice this path is
@@ -487,7 +487,7 @@ def body_has_crash_signature(text: str) -> bool:
     ``ORCHESTRATOR_COMMENT_MARKER`` provenance stamp existed carries no
     marker to match, ever -- recognizing it is only possible by its
     content, which is exactly what this function does. Precedented by
-    ``cross_family.LEGACY_VACUOUS_SUMMARY``: an exact-string match against a
+    ``rescue_review.LEGACY_VACUOUS_SUMMARY``: an exact-string match against a
     specific, known, historical placeholder, not a general classifier over
     reviewer prose (a general classifier was evaluated and rejected for
     ``_summary_is_vacuous``, per that function's own docstring, because it

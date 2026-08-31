@@ -57,7 +57,6 @@ from charlie_work.config import (
     AutoMergeConfig,
     ClaudeCodeConfig,
     ConfigError,
-    CrossFamilyConfig,
     DevinConfig,
     DispatchConfig,
     FleetConfig,
@@ -73,19 +72,16 @@ from charlie_work.config import (
     SupervisorConfig,
     TestAdequacyConfig,
     WatchdogConfig,
+    WorkerRoleConfig,
     find_config_path,
     load_config,
 )
-from charlie_work.cross_family import (
-    _CAVEAT,
-    CrossFamilyResult,
-    CrossFamilyVerdict,
+from charlie_work.rescue_review import (
     LEGACY_VACUOUS_SUMMARY,
+    _CAVEAT,
     extract_report_body,
-    parse_cross_family_verdict,
     render_command,
     report_body_is_valid,
-    run_cross_family_review,
 )
 from charlie_work.github import issue_numbers_mentioned_by_pr, label_names
 from charlie_work.instrumentation import log_event, query_events
@@ -645,7 +641,6 @@ def test_worker_prompt_renders_issue_values() -> None:
             "issue_body": "Body text",
             "issue_body_block": fenced_block("Body text", "md"),
             "branch_name": "agent/issue-123-fix-search",
-            "worker_model_tier": "capable",
             "issue_comments": "",
             "module_map": "",
             "attachment_budget": "",
@@ -667,7 +662,6 @@ def test_claude_code_worker_prompt_renders_issue_values() -> None:
             "issue_body": "Body text",
             "issue_body_block": fenced_block("Body text", "md"),
             "branch_name": "agent/issue-123-fix-search",
-            "worker_model_tier": "capable",
             "issue_comments": "",
             "module_map": "",
             "attachment_budget": "",
@@ -933,27 +927,6 @@ def test_load_config_rejects_unknown_claude_code_command_placeholder(tmp_path: P
     assert "bad_token" in message
 
 
-def test_load_config_rejects_unknown_cross_family_command_placeholder(tmp_path: Path) -> None:
-    """Issue #4: unknown placeholder in cross_family.command is rejected at load."""
-    from charlie_work.config import ConfigError
-
-    config_path = tmp_path / "orchestrator.config.yaml"
-    config_path.write_text(
-        'cross_family:\n  enabled: true\n  command:\n    - devin\n    - "{invalid}"',
-        encoding="utf-8",
-    )
-
-    try:
-        load_config(config_path)
-    except ConfigError as exc:
-        message = str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("expected ConfigError for unknown placeholder")
-
-    assert "cross_family.command" in message
-    assert "invalid" in message
-
-
 def test_load_config_accepts_valid_placeholders(tmp_path: Path) -> None:
     """Issue #4: valid placeholders in command templates are accepted."""
     config_path = tmp_path / "orchestrator.config.yaml"
@@ -968,12 +941,6 @@ claude_code:
   command:
     - claude
     - "{prompt_path}"
-cross_family:
-  enabled: true
-  command:
-    - devin
-    - "{model}"
-    - "{prompt_path}"
 """,
         encoding="utf-8",
     )
@@ -981,7 +948,6 @@ cross_family:
     config = load_config(config_path)
     assert config.devin.shell_command == ("devin", "{prompt_path}", "{issue_number}", "{branch}")
     assert config.claude_code.command == ("claude", "{prompt_path}")
-    assert config.cross_family.command == ("devin", "{model}", "{prompt_path}")
 
 
 def test_load_config_rejects_bare_brace_in_shell_command(tmp_path: Path) -> None:
@@ -2224,7 +2190,6 @@ def test_adapter_settings_api_branch_carries_api_worker_config(
         max_concurrent_sessions=2,
         providers={"kimi-k3": api_provider},
         budget=ApiBudgetConfig(max_usd_per_session=1.5),
-        fallback_adapter="claude-code",
     )
     claude_cfg = ClaudeCodeConfig(
         venv_source=".venv",
@@ -2233,6 +2198,7 @@ def test_adapter_settings_api_branch_carries_api_worker_config(
     )
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="api"),
+        worker=WorkerRoleConfig(harness="api"),
         claude_code=claude_cfg,
         api_worker=api_cfg,
     )
@@ -2263,7 +2229,9 @@ def test_adapter_settings_non_api_branches_omit_api_worker_config(
     must set api_worker_config=None so a stale config block cannot leak into a
     non-api dispatch lane."""
     for adapter in ("devin-shell", "claude-code", "manual"):
-        config = OrchestratorConfig(devin=DevinConfig(adapter=adapter))
+        config = OrchestratorConfig(
+            devin=DevinConfig(adapter=adapter), worker=WorkerRoleConfig(harness=adapter)
+        )
         paths = runtime_paths(tmp_path, config.runtime.state_dir)
         app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
         settings = app._adapter_settings()
@@ -4836,7 +4804,8 @@ def test_command_dispatch_labels_only_successful_launches(tmp_path: Path) -> Non
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -4860,7 +4829,8 @@ def test_command_dispatch_failure_does_not_label_in_progress(tmp_path: Path) -> 
         devin=DevinConfig(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(7)"),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -8468,6 +8438,61 @@ def test_dispatch_reviews_forwards_orchestrator_config_to_launch(
     assert captured[0].get("config") is app.config
 
 
+def test_dispatch_reviews_threads_reviewer_model_as_model_override(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """dispatch_reviews() must pass config.reviewer.model as model_override so
+    a split worker/reviewer model configuration actually changes which model
+    the reviewer launches with -- launch_claude_worker's own fallback
+    (resolved_config.claude_code.model) is claimed by the WORKER when
+    worker.harness == 'claude-code' (see config._resolve_role_dual_accept),
+    so without an explicit override the reviewer would silently launch with
+    the worker's model whenever the two are configured to differ."""
+    from dataclasses import replace
+
+    from charlie_work.config import ReviewerRoleConfig, WorkerRoleConfig
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    app.config = replace(
+        app.config,
+        worker=WorkerRoleConfig(harness="claude-code", model="claude-opus-4-1"),
+        reviewer=ReviewerRoleConfig(harness="claude-code", model="claude-sonnet-5"),
+    )
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    captured: list[dict[str, Any]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        captured.append(kwargs)
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert len(captured) == 1
+    assert captured[0].get("model_override") == "claude-sonnet-5"
+
+
 def test_dispatch_reviews_records_review_effort_arm_on_state_and_event(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -11703,43 +11728,10 @@ def test_render_command_templates_list_and_string() -> None:
     assert render_command("devin --model {model}", values) == "devin --model codex"
 
 
-def test_devin_example_config_enables_cross_family() -> None:
-    config = load_config(EXAMPLES_DIR / "orchestrator.config.devin.yaml")
-
-    assert config.cross_family.enabled is True
-    assert config.cross_family.model == "codex"
-    assert config.cross_family.command[0] == "devin"
-    assert config.dispatch.worker_template == "worker.md"
-
-
 def test_claude_code_example_config_selects_claude_worker() -> None:
     config = load_config(EXAMPLES_DIR / "orchestrator.config.claude-code.yaml")
 
     assert config.dispatch.worker_template == "worker_claude_code.md"
-    assert config.cross_family.enabled is False
-
-
-def test_config_absent_cross_family_block_defaults_disabled(tmp_path: Path) -> None:
-    path = tmp_path / "c.yaml"
-    path.write_text("labels:\n  ready: automated-ready\n", encoding="utf-8")
-
-    config = load_config(path)
-
-    assert config.cross_family.enabled is False
-
-
-def test_config_parses_cross_family_command_list_to_tuple(tmp_path: Path) -> None:
-    path = tmp_path / "c.yaml"
-    path.write_text(
-        "cross_family:\n  enabled: true\n  model: codex\n"
-        "  command: [devin, --model, '{model}']\n  timeout_seconds: 120\n",
-        encoding="utf-8",
-    )
-
-    config = load_config(path)
-
-    assert config.cross_family.command == ("devin", "--model", "{model}")
-    assert config.cross_family.timeout_seconds == 120
 
 
 def test_claude_code_example_config_sets_bounded_xdist_worker_env() -> None:
@@ -11919,8 +11911,8 @@ def test_config_rejects_non_string_review_effort(tmp_path: Path) -> None:
     except ConfigError as exc:
         message = str(exc)
 
-    assert "review_effort" in message
-    assert "review_dispatch" in message
+    assert "effort" in message
+    assert "reviewer" in message
     assert "must be a string" in message
 
 
@@ -11931,40 +11923,6 @@ def test_config_accepts_string_review_effort(tmp_path: Path) -> None:
     config = load_config(path)
 
     assert config.review_dispatch.review_effort == "high"
-
-
-def test_spec_review_runs_and_writes_report(tmp_path: Path, monkeypatch) -> None:
-    spec = tmp_path / "SPEC.md"
-    spec.write_text("# My spec\nclaims", encoding="utf-8")
-    config = OrchestratorConfig()
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
-
-    VALID_REPORT = "**MAJOR**\nissue\n\nVerdict: safe"
-
-    def _fake_run(**kwargs):
-        assert "My spec" in kwargs["prompt_text"]  # artifact text inlined into the prompt
-        Path(kwargs["report_path"]).write_text(VALID_REPORT, encoding="utf-8")
-        return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
-
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
-
-    result = app.spec_review(spec)
-
-    assert result.ok is True
-    assert Path(result.data["report_path"]).read_text(encoding="utf-8") == VALID_REPORT
-
-
-def test_spec_review_missing_file_propagates_os_error(tmp_path: Path) -> None:
-    """A missing spec file raises naturally from read_text; the CLI boundary converts."""
-    config = OrchestratorConfig()
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
-
-    with pytest.raises(OSError):
-        app.spec_review(tmp_path / "nope.md")
-
-    assert not (tmp_path / ".var" / "charlie-work" / "cross-family").exists()
 
 
 def test_run_cross_family_sanitizes_environment(
@@ -12052,133 +12010,6 @@ def test_extract_report_body_strips_wrapper_but_preserves_model_output() -> None
     wrapped = f"# Cross-family adversarial review — `codex`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     assert extract_report_body(wrapped) == body
     assert extract_report_body(body) == body
-
-
-# --------------------------------------------------------------------------
-# Issue #784 AC-8: review_queue() must never silently re-confirm a
-# content-free recorded verdict via the head-unchanged shortcut -- it is
-# queued as "vacuous" instead, regardless of whether the head moved.
-# --------------------------------------------------------------------------
-
-
-def test_review_queue_flags_content_free_request_changes_as_vacuous(tmp_path: Path) -> None:
-    """The dominant real-world shape: reviewed_head_sha == live head (a
-    label-strip requeue never moves the head). Pre-#784, this would hit the
-    head-unchanged shortcut and be silently excluded from the queue
-    forever, permanently blocking the merge lane."""
-    prs = [
-        {
-            "number": 700,
-            "title": "Fix #70: vacuous verdict on current head",
-            "url": "https://example.test/pull/700",
-            "headRefName": "agent/issue-70-fix",
-            "baseRefName": "main",
-            "headRefOid": "sha-700",
-            "mergeStateStatus": "CLEAN",
-            "body": "Closes #70",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "OPEN",
-        },
-    ]
-    app = _review_queue_app(tmp_path, prs=prs)
-    _write_review_packet(
-        tmp_path,
-        700,
-        "sha-700",
-        {
-            "decision": "request_changes",
-            "reviewed_head_sha": "sha-700",
-            "required_changes": [],
-            "summary": "",
-        },
-    )
-
-    result = app.review_queue()
-
-    assert result.ok is True
-    assert result.data["queue"] == [
-        {
-            "pr": 700,
-            "issue": 70,
-            "packet_head_sha": "sha-700",
-            "decision": "vacuous",
-            "reviewed_head_sha": "sha-700",
-            "mergeable": None,
-            "mergeStateStatus": "CLEAN",
-        },
-    ]
-
-
-def test_review_queue_treats_legacy_placeholder_summary_as_vacuous(tmp_path: Path) -> None:
-    prs = [
-        {
-            "number": 701,
-            "title": "Fix #71: legacy placeholder summary",
-            "url": "https://example.test/pull/701",
-            "headRefName": "agent/issue-71-fix",
-            "baseRefName": "main",
-            "headRefOid": "sha-701",
-            "mergeStateStatus": "CLEAN",
-            "body": "Closes #71",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "OPEN",
-        },
-    ]
-    app = _review_queue_app(tmp_path, prs=prs)
-    _write_review_packet(
-        tmp_path,
-        701,
-        "sha-701",
-        {
-            "decision": "request_changes",
-            "reviewed_head_sha": "sha-701",
-            "required_changes": [],
-            "summary": LEGACY_VACUOUS_SUMMARY,
-        },
-    )
-
-    result = app.review_queue()
-
-    assert result.data["queue"][0]["decision"] == "vacuous"
-
-
-def test_review_queue_stale_packet_excludes_vacuous_verdict(tmp_path: Path) -> None:
-    """A vacuous verdict is only queued when the packet head is current --
-    matching every other review_queue category's contract: a stale packet
-    cannot be re-reviewed from, so it is excluded rather than queued."""
-    prs = [
-        {
-            "number": 702,
-            "title": "Fix #72: vacuous verdict, stale packet",
-            "url": "https://example.test/pull/702",
-            "headRefName": "agent/issue-72-fix",
-            "baseRefName": "main",
-            "headRefOid": "sha-702-new",
-            "mergeStateStatus": "CLEAN",
-            "body": "Closes #72",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "OPEN",
-        },
-    ]
-    app = _review_queue_app(tmp_path, prs=prs)
-    _write_review_packet(
-        tmp_path,
-        702,
-        "sha-702-old",
-        {
-            "decision": "request_changes",
-            "reviewed_head_sha": "sha-702-old",
-            "required_changes": [],
-            "summary": "",
-        },
-    )
-
-    result = app.review_queue()
-
-    assert result.data["queue"] == []
 
 
 # --------------------------------------------------------------------------
@@ -12611,153 +12442,6 @@ def test_review_queue_does_not_reroute_escalated_request_changes(tmp_path: Path)
     assert app.gh.labels_added == []
 
 
-# --------------------------------------------------------------------------
-# Issue #784 AC-8 bound: _handle_malformed_cross_family_verdict /
-# _record_cross_family_verdicts. A malformed verdict never increments
-# request_changes_count or dispatches rework (AC-3); a SEPARATE bounded
-# counter (cross_family_parse_failure_count) caps how many times the
-# content-free-verdict -> forced-regeneration cycle can repeat for one PR,
-# so removing the request_changes-cycle counter from this path does not
-# create an unbounded loop. Past the cap, cross-family review is abandoned
-# via a caveated, non-blocking "approved" verdict -- never
-# agent:human-needed, never a blocking request_changes.
-# --------------------------------------------------------------------------
-
-
-def _cross_family_auto_verdict_app(
-    tmp_path: Path, *, max_parse_failures: int = 2, prs: list[dict[str, Any]] | None = None
-) -> OrchestratorApp:
-    config = OrchestratorConfig(
-        cross_family=CrossFamilyConfig(auto_verdict=True, max_parse_failures=max_parse_failures)
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    paths.root.mkdir(parents=True, exist_ok=True)
-    (paths.root / "state.json").write_text(
-        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
-        encoding="utf-8",
-    )
-    fake_gh = FakeGitHub()
-    if prs is not None:
-        fake_gh.prs = prs
-    return OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-
-def _malformed_cross_family_pr(number: int, head_sha: str) -> dict[str, Any]:
-    return {
-        "number": number,
-        "title": f"Fix #{number}: unparseable cross-family report",
-        "url": f"https://example.test/pull/{number}",
-        "headRefName": f"agent/issue-{number}-fix",
-        "baseRefName": "main",
-        "headRefOid": head_sha,
-        "mergeStateStatus": "CLEAN",
-        "body": f"Closes #{number}",
-        "labels": [],
-        "isCrossRepository": False,
-        "state": "OPEN",
-    }
-
-
-def test_handle_malformed_cross_family_verdict_below_cap_logs_without_recording(
-    tmp_path: Path,
-) -> None:
-    prs = [_malformed_cross_family_pr(800, "sha-800")]
-    app = _cross_family_auto_verdict_app(tmp_path, max_parse_failures=2, prs=prs)
-    _write_review_packet(tmp_path, 800, "sha-800", {"decision": "pending"})
-    pr_dir = app.paths.prs / "pr-800"
-    (pr_dir / "cross-family-review.md").write_text(
-        "# Cross-family adversarial review — `glm-5.2`\n\n"
-        "<!-- PR head SHA: sha-800 -->\n\n"
-        f"{_CAVEAT}\n\n---\n\n"
-        "**BLOCKER** something is wrong, no Verdict line here\n",
-        encoding="utf-8",
-    )
-
-    results = app._record_cross_family_verdicts()
-
-    assert results == [
-        {
-            "pr_number": 800,
-            "decision": "unparseable",
-            "ok": False,
-            "message": (
-                "cross-family verdict unparseable "
-                "(blocker_or_major_with_no_extractable_summary), attempt 1/2"
-            ),
-        }
-    ]
-    decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-    assert decision["decision"] == "pending"
-    state = load_state(app.paths.state_file)
-    assert state["prs"]["800"]["cross_family_parse_failure_count"] == 1
-    # AC-3: never touches the separate request_changes rework-cycle counter.
-    assert state["prs"]["800"].get("request_changes_count", 0) == 0
-
-
-def test_handle_malformed_cross_family_verdict_abandons_after_cap_exceeded(
-    tmp_path: Path,
-) -> None:
-    """The coordinator's required bound: past max_parse_failures, the cycle
-    terminates in a caveated, non-blocking approved verdict -- not
-    agent:human-needed, not an indefinitely-blocking request_changes."""
-    prs = [_malformed_cross_family_pr(801, "sha-801")]
-    app = _cross_family_auto_verdict_app(tmp_path, max_parse_failures=2, prs=prs)
-    _write_review_packet(tmp_path, 801, "sha-801", {"decision": "pending"})
-    pr_dir = app.paths.prs / "pr-801"
-    (pr_dir / "cross-family-review.md").write_text(
-        "# Cross-family adversarial review — `glm-5.2`\n\n"
-        "<!-- PR head SHA: sha-801 -->\n\n"
-        f"{_CAVEAT}\n\n---\n\n"
-        "**BLOCKER** something is wrong, no Verdict line here\n",
-        encoding="utf-8",
-    )
-
-    for expected_attempt in (1, 2):
-        results = app._record_cross_family_verdicts()
-        assert results[0]["decision"] == "unparseable"
-        assert results[0]["ok"] is False
-        decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-        assert decision["decision"] == "pending"
-        state = load_state(app.paths.state_file)
-        assert state["prs"]["801"]["cross_family_parse_failure_count"] == expected_attempt
-
-    results = app._record_cross_family_verdicts()
-
-    assert results[0]["decision"] == "approved"
-    assert results[0]["ok"] is True
-    decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-    assert decision["decision"] == "approved"
-    assert decision["required_changes"] == []
-    assert "784" in decision["summary"]
-    assert "3 attempts" in decision["summary"]
-    state = load_state(app.paths.state_file)
-    # record_review resets the parse-failure budget on any real verdict.
-    assert state["prs"]["801"]["cross_family_parse_failure_count"] == 0
-    assert state["prs"]["801"].get("request_changes_count", 0) == 0
-
-
-def test_record_review_resets_cross_family_parse_failure_count(tmp_path: Path) -> None:
-    """Whenever ANY real verdict is subsequently recorded for a PR --
-    whether a genuine parse succeeds after prior failures, or this is
-    _handle_malformed_cross_family_verdict's own abandon-call -- the budget
-    resets, so a future review cycle (new head, new content) starts fresh
-    rather than inheriting an exhausted one."""
-    config = OrchestratorConfig()
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    with state_lock(paths.state_file):
-        state = load_state(paths.state_file)
-        state["prs"]["456"] = {"number": 456, "cross_family_parse_failure_count": 5}
-        save_state(paths.state_file, state)
-
-    app.record_review(456, "approved", summary="all clear", verdict_provenance="fresh_llm_review")
-
-    state = load_state(paths.state_file)
-    assert state["prs"]["456"]["cross_family_parse_failure_count"] == 0
-
-
 # --- P0 fixes: state safety, label honesty, rework cap, loop isolation --------
 
 
@@ -12797,7 +12481,8 @@ def test_review_preserves_recorded_decision_in_state(tmp_path: Path) -> None:
 
 def test_string_dispatch_command_rejects_issue_title(tmp_path: Path) -> None:
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="command", dispatch_command="echo {issue_title}")
+        devin=DevinConfig(adapter="command", dispatch_command="echo {issue_title}"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -12868,7 +12553,12 @@ def test_loop_parks_foreign_issue_ref_pr(monkeypatch, tmp_path: Path) -> None:
     ``foreign_issue_ref`` instead of failing the pass every 5 minutes
     forever. GitHubNotFoundError from issue_view is caught before the
     general GitHubError handler, so it never lands in result.data["errors"]
-    and does not flip result.ok to False."""
+    and does not flip result.ok to False.
+
+    Issue #1132: parking now requires ``confirm_passes`` (default 2)
+    consecutive not-found passes before the marker is confirmed and the
+    one-shot digest is emitted. A transient window (minutes) clears before
+    two 5-minute passes complete."""
     from charlie_work.config import NotifyConfig
     from charlie_work.github import GitHubNotFoundError
 
@@ -12900,7 +12590,6 @@ def test_loop_parks_foreign_issue_ref_pr(monkeypatch, tmp_path: Path) -> None:
             return super().issue_view(number)
 
     config = OrchestratorConfig(
-        cross_family=CrossFamilyConfig(enabled=False),
         notify=NotifyConfig(enabled=True),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -12913,26 +12602,43 @@ def test_loop_parks_foreign_issue_ref_pr(monkeypatch, tmp_path: Path) -> None:
         lambda notify_config, digest: captured.append(digest),
     )
 
+    # Pass 1: first not-found — marker written with confirmations=1, but
+    # not yet confirmed (1 < 2), so no digest and the PR is still tracked.
     result = app.loop(limit=0)
 
     assert result.ok is True
     assert result.data["errors"] == []
     assert fake_gh.issue_view_calls == 1
+    assert len(captured) == 0  # not yet confirmed
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["789"]["foreign_issue_ref"]["issue"] == 4242
+    assert state["prs"]["789"]["foreign_issue_ref"]["confirmations"] == 1
+
+    # Pass 2: second not-found — confirmations reaches 2, marker confirmed,
+    # one-shot digest emitted.
+    result2 = app.loop(limit=0)
+
+    assert result2.ok is True
+    assert result2.data["errors"] == []
+    assert fake_gh.issue_view_calls == 2
     assert len(captured) == 1
     assert captured[0].transitions[0].health == "FOREIGN_ISSUE_REF"
     assert captured[0].transitions[0].issue_number == 789
 
     state = load_state(app.paths.state_file)
-    assert state["prs"]["789"]["foreign_issue_ref"]["issue"] == 4242
+    assert state["prs"]["789"]["foreign_issue_ref"]["confirmations"] == 2
 
-    # Second pass: the durable marker skips all per-PR work with zero GitHub
+    # Pass 3: the confirmed marker skips all per-PR work with zero GitHub
     # calls and no repeat digest.
-    result2 = app.loop(limit=0)
+    result3 = app.loop(limit=0)
 
-    assert result2.ok is True
-    assert result2.data["open_tracked_prs"] == 0
-    assert fake_gh.issue_view_calls == 1
+    assert result3.ok is True
+    assert result3.data["open_tracked_prs"] == 0
+    assert fake_gh.issue_view_calls == 2
     assert len(captured) == 1
+    # Issue #1132: parked PRs are now visible in the loop_completed payload.
+    assert result3.data["parked_prs"] == [789]
 
 
 def test_loop_dead_session_notifies_when_watchdog_disabled(
@@ -12961,7 +12667,6 @@ def test_loop_dead_session_notifies_when_watchdog_disabled(
             max_inconclusive_probe_deferrals=0,
         ),
         notify=NotifyConfig(enabled=True, sink="file", file_path=""),
-        cross_family=CrossFamilyConfig(enabled=False),
         review_dispatch=ReviewDispatchConfig(enabled=False),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -13854,7 +13559,7 @@ def test_loop_honors_intake_failure_signal(tmp_path: Path) -> None:
                 raise _GitHubError("transient gh issue view failure")
             return super().issue_view(number)
 
-    config = OrchestratorConfig(cross_family=CrossFamilyConfig(enabled=False))
+    config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FlakyIntakeGitHub())
 
@@ -13872,7 +13577,6 @@ def test_loop_corrupt_review_decision_does_not_crash_or_merge(tmp_path: Path) ->
     """A corrupt review-decision.json on the loop path must be treated as a
     non-approval: the loop re-reviews the PR and never attempts to merge."""
     config = OrchestratorConfig(
-        cross_family=CrossFamilyConfig(enabled=False),
         auto_merge=_approved_automerge(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -13922,7 +13626,8 @@ def test_devin_shell_dispatch_launches_and_labels_in_progress(tmp_path: Path, mo
         devin=DevinConfig(
             adapter="devin-shell",
             shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -13960,7 +13665,9 @@ def test_claude_code_dispatch_routes_and_labels(tmp_path: Path, monkeypatch) -> 
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -14017,7 +13724,9 @@ def test_dispatch_with_recovery_passes_record_to_adapter(tmp_path: Path, monkeyp
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     # Override pr_list to return empty list (no open PRs, so recovery is allowed)
@@ -14075,7 +13784,9 @@ def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
     # candidate selection (the issue must be selectable to reach dispatch).
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
     monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -14143,7 +13854,9 @@ def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
     # test's outcome depend on host state, not the code under test.
     monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -14267,7 +13980,9 @@ def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
     # test's outcome depend on host state, not the code under test.
     monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -14412,7 +14127,9 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
     # under test ever runs.
     monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -14539,7 +14256,9 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
     # of the code under test.
     monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -19619,7 +19338,8 @@ def test_dispatch_rework_finds_needs_rework_issues_with_open_prs(tmp_path: Path)
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19670,7 +19390,8 @@ def test_dispatch_rework_transitions_to_rework_dispatched(tmp_path: Path) -> Non
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19721,7 +19442,8 @@ def test_dispatch_rework_transition_failure_recorded(tmp_path: Path) -> None:
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19836,7 +19558,8 @@ def test_dispatch_rework_restores_rework_requested_on_dispatch_failure(tmp_path:
                 "-c",
                 "import sys; sys.exit(1)",  # Simulate dispatch failure
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19891,7 +19614,8 @@ def test_dispatch_rework_restores_rework_requested_on_dispatch_failure(tmp_path:
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
@@ -19919,7 +19643,8 @@ def test_dispatch_rework_failure_reason_in_event_payload(tmp_path: Path) -> None
                 "-c",
                 "import sys; sys.exit(1)",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19981,6 +19706,7 @@ def test_dispatch_rework_event_indexes_pr_number(tmp_path: Path) -> None:
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -20027,6 +19753,7 @@ def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> No
                 "import sys; sys.exit(1)",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
             max_auto_redispatch=2,
             redispatch_window_minutes=240,
@@ -20114,6 +19841,7 @@ def test_dispatch_rework_worktree_unsafe_local_commits_escalates_as_judgment(
                 "import sys; sys.exit(1)",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
             max_auto_redispatch=2,
             redispatch_window_minutes=240,
@@ -20202,6 +19930,7 @@ def test_dry_run_dispatch_rework_leaves_state_unchanged(tmp_path: Path) -> None:
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -20274,6 +20003,7 @@ def test_dry_run_dispatch_rework_no_op_escalation_does_not_escalate(
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
             max_auto_redispatch=2,
             redispatch_window_minutes=240,
@@ -20369,6 +20099,7 @@ def test_dry_run_dispatch_rework_review_routing_does_not_invoke_review(
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -20498,6 +20229,7 @@ def test_dry_run_dispatch_rework_worker_death_escalation_does_not_escalate(
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
             max_auto_redispatch=2,
             redispatch_window_minutes=240,
@@ -21964,7 +21696,8 @@ def test_dispatch_isolates_label_write_failure(tmp_path: Path, monkeypatch) -> N
         devin=DevinConfig(
             adapter="devin-shell",
             shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = LabelFailGitHub()
@@ -22001,7 +21734,8 @@ def test_concurrent_dispatch_claims_prevent_double_launch(tmp_path: Path) -> Non
         devin=DevinConfig(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -22041,7 +21775,8 @@ def test_stale_dispatch_pending_claim_is_redispatchable(tmp_path: Path, monkeypa
         devin=DevinConfig(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -22579,32 +22314,6 @@ def test_dry_run_skips_worker_launch(monkeypatch, tmp_path: Path) -> None:
     assert len(subprocess_calls) == 0  # No subprocess should be invoked
 
 
-def test_dry_run_skips_cross_family_review(monkeypatch, tmp_path: Path) -> None:
-    """Test that --dry-run prevents cross-family model subprocess execution."""
-    subprocess_calls: list[list[str]] = []
-
-    def fake_run(*args, **kwargs):
-        subprocess_calls.append(args[0])
-        raise AssertionError("subprocess.run should not be called in dry-run mode")
-
-    monkeypatch.setattr("charlie_work.cross_family.subprocess.run", fake_run)
-
-    result = run_cross_family_review(
-        model="test-model",
-        command=["echo", "test"],
-        repo_root=tmp_path,
-        prompt_text="test prompt",
-        prompt_path=tmp_path / "prompt.md",
-        report_path=tmp_path / "report.md",
-        timeout_seconds=30,
-        dry_run=True,
-    )
-
-    assert result.ok is False
-    assert result.error == "DRY-RUN: cross-family review not executed"
-    assert len(subprocess_calls) == 0  # No subprocess should be invoked
-
-
 def test_dry_run_dispatch_leaves_state_unchanged(tmp_path: Path) -> None:
     """Test that --dry-run dispatch does not modify state.json or labels."""
     # Setup: create a minimal state file
@@ -22892,50 +22601,6 @@ def test_dry_run_intake_does_not_write_files_or_state(tmp_path: Path) -> None:
     with state_lock(paths.state_file):
         final_state = load_state(paths.state_file)
     assert final_state["issues"] == {}
-    assert final_state["events"] == []
-
-
-def test_dry_run_spec_review_does_not_write_state_or_run_model(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #618-D: ``spec_review`` in dry-run must not invoke the cross-family
-    model subprocess, write the report, create the reviews directory, or record
-    a state event.
-    """
-    spec = tmp_path / "SPEC.md"
-    spec.write_text("# My spec\nclaims", encoding="utf-8")
-    config = OrchestratorConfig()
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    initial_state = {
-        "issues": {},
-        "prs": {},
-        "events": [],
-        "generated_at": "2024-01-01T00:00:00Z",
-    }
-    save_state(paths.state_file, initial_state)
-
-    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
-
-    subprocess_calls: list[Any] = []
-
-    def fake_run(*args, **kwargs):
-        subprocess_calls.append(args[0] if args else kwargs)
-        raise AssertionError("subprocess.run should not be called in dry-run mode")
-
-    monkeypatch.setattr("charlie_work.cross_family.subprocess.run", fake_run)
-
-    result = app.spec_review(spec)
-
-    # Dry-run preview succeeded
-    assert result.ok is True
-    assert "dry-run" in result.message.lower()
-    # No subprocess invoked
-    assert len(subprocess_calls) == 0
-    # No reviews directory created
-    assert not paths.cross_family.exists()
-    # No state event recorded
-    with state_lock(paths.state_file):
-        final_state = load_state(paths.state_file)
     assert final_state["events"] == []
 
 
@@ -24681,6 +24346,7 @@ def test_standard_lifecycle_rework_dispatch_selects_issue(tmp_path: Path) -> Non
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -26498,7 +26164,8 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -29728,6 +29395,7 @@ def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
             failed_attempt_alarm=1,
         ),
         devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -29816,6 +29484,7 @@ def test_merge_ready_check_failure_routes_to_rework(tmp_path: Path) -> None:
             failed_attempt_alarm=1,
         ),
         devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHubWithChecks(
@@ -30810,6 +30479,7 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=3, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -31558,7 +31228,8 @@ def test_dispatch_rework_clears_startup_death_flag_on_new_dispatch(
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -32848,6 +32519,7 @@ def test_concurrency_governor_clamps_rework_dispatch(tmp_path: Path, monkeypatch
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -33192,6 +32864,7 @@ def test_concurrency_governor_clamps_only_issues_rework_dispatch(
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -33362,6 +33035,7 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -33497,6 +33171,7 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     partial_paths = runtime_paths(tmp_path / "partial", partial_config.runtime.state_dir)
     partial_gh = ReworkSaturatedGitHub(8)
@@ -33620,6 +33295,7 @@ def test_concurrency_governor_zero_rework_dry_run_automatic_path(
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -34644,6 +34320,7 @@ def test_dispatch_rework_state_driven_selection(tmp_path: Path) -> None:
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -34697,6 +34374,7 @@ def test_dispatch_rework_state_wins_over_missing_label(tmp_path: Path) -> None:
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -34814,6 +34492,7 @@ def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         # This test intentionally leaves issues in rework_requested with only the
         # needs-rework label. The in-loop reconcile pass would otherwise see open PRs
         # with a stale active label and self-heal the status to open_passive before
@@ -35000,6 +34679,7 @@ def _dispatch_rework_config() -> OrchestratorConfig:
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
 
 
@@ -35147,6 +34827,7 @@ def test_dry_run_dispatch_rework_conflict_bypass_direct_conflicting(
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -35263,6 +34944,7 @@ def test_dry_run_dispatch_rework_conflict_bypass_unknown_mergeable_pr_view_fallb
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -36193,6 +35875,7 @@ def test_dispatch_rework_defers_when_provider_throttled(tmp_path: Path) -> None:
     config = OrchestratorConfig(
         dispatch=DispatchConfig(default_limit=3),
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -36916,6 +36599,76 @@ def test_loop_calls_maybe_reclaim_superseded_main_ci(
     monkeypatch.setattr(OrchestratorApp, "_maybe_reclaim_superseded_main_ci", _record)
     app.loop(limit=0)
     assert calls["count"] == 1
+
+
+def test_maybe_reclaim_superseded_main_ci_dry_run_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """Issue #1324: under dry_run=True, _maybe_reclaim_superseded_main_ci must
+    not write any main_ci_reclaim_* event to state.json or events.db, and
+    state.json must stay byte-identical to the pre-pass seed. Before the fix,
+    _record_event called append_event directly (bypassing self.write_gate) and
+    the paired save_state was also raw, so a dry-run pass that found a
+    cancellation wrote a real main_ci_reclaim_cancelled event + state.json
+    mutation even though nothing was actually cancelled GitHub-side."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.config import MainCiReclaimConfig
+    from charlie_work.instrumentation import event_counts_by_kind
+    from charlie_work.main_ci_reclaim import MainCiReclaimResult, ReclaimedRun
+    from charlie_work.state import empty_state, save_state
+
+    config = OrchestratorConfig(
+        main_ci_reclaim=MainCiReclaimConfig(enabled=True, workflow_filename="ci.yml")
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    save_state(paths.state_file, empty_state())
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
+
+    canned = MainCiReclaimResult(
+        ok=True,
+        tip_sha="tip-sha",
+        candidates_checked=2,
+        cancelled=(
+            ReclaimedRun(
+                run_id=42,
+                head_sha="old-sha",
+                status_before_cancel="queued",
+                created_at="t1",
+            ),
+        ),
+        skipped_not_ancestor=1,
+        skipped_started_before_cancel=0,
+        cancel_errors=(),
+    )
+
+    before_bytes = paths.state_file.read_bytes()
+    events_before = sum(event_counts_by_kind(paths.state_file).values())
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "reclaim_superseded_main_ci_runs", lambda *a, **k: canned)
+    try:
+        app._maybe_reclaim_superseded_main_ci()
+    finally:
+        monkeypatch.undo()
+
+    assert paths.state_file.read_bytes() == before_bytes, (
+        "dry-run main_ci_reclaim pass must leave state.json byte-identical "
+        "(issue #1324 WriteGate invariant)"
+    )
+    events_after = sum(event_counts_by_kind(paths.state_file).values())
+    assert events_after == events_before, (
+        f"dry-run main_ci_reclaim pass must not write any events.db row "
+        f"(before={events_before}, after={events_after})"
+    )
+    state = load_state(paths.state_file)
+    reclaim_events = [
+        e for e in state.get("events", []) if str(e.get("kind", "")).startswith("main_ci_reclaim")
+    ]
+    assert reclaim_events == [], (
+        f"dry-run main_ci_reclaim pass must not append any main_ci_reclaim_* "
+        f"event to the state.json ring, found: {reclaim_events}"
+    )
 
 
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
@@ -38143,6 +37896,11 @@ def test_status_prefetch_uses_batched_graphql_for_blocker_data(
             payload = json.dumps(ready_issues)
         elif args[:2] == ["pr", "list"]:
             payload = json.dumps([])
+        elif args[0] == "api" and len(args) >= 2 and "pulls?state=closed" in args[1]:
+            # Issue #1337: status() now calls merged_pr_list() to compute the
+            # merged-PR coverage exclusion set for the reachability classifier.
+            # No merged PRs in this test -> empty page breaks pagination.
+            payload = json.dumps([])
         elif args[0] == "api" and len(args) >= 2 and args[1] == "graphql":
             payload = json.dumps(
                 {
@@ -39232,7 +38990,9 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
         patch(
             "charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=mock_sweep_orphan
         ),
-        patch("charlie_work.workflow.os.name", "nt"),  # Force Windows path
+        patch("os.name", "nt"),  # Force Windows path (os.name check lives in dead_worker_reap;
+        # patching the os module directly avoids depending on which module happens to
+        # `import os` into its own namespace)
         patch("subprocess.run", side_effect=mock_subprocess_run),
     ):
         from charlie_work.workflow import _sweep_orphan_processes_for_dead_sessions
@@ -41131,6 +40891,7 @@ def test_standalone_dispatch_and_rework_advance_inconclusive_probe_counter_once(
 
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(
             enabled=True, stall_minutes=20, max_inconclusive_probe_deferrals=10
         ),
@@ -41497,6 +41258,16 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     # Mock PID liveness check to return False (dead PID)
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
@@ -41593,6 +41364,16 @@ def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 1108,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1108",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -41659,6 +41440,16 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -41762,6 +41553,16 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    # Issue #1229: the branch-issue validator threaded through
+    # _detect_and_handle_orphaned_workers calls issue_list(state="open") and
+    # rejects branch-name issue numbers absent from the open-issue set. The
+    # default FakeGitHub.issues only carries #123, so #207 must be planted
+    # here or the validator rejects the agent/issue-207 binding and the orphan
+    # sweep cannot match the PR to the issue (pr_number resolves to None,
+    # orphan_drift_at gets overwritten instead of preserved).
+    fake_gh.issues.append(
+        {"number": 207, "title": "test issue 207", "state": "OPEN", "labels": [], "body": ""}
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -42120,6 +41921,17 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    # Issue #1229: the branch-issue validator threaded through
+    # _detect_and_handle_orphaned_workers calls issue_list(state="open") and
+    # rejects branch-name issue numbers absent from the open-issue set. The
+    # default FakeGitHub.issues only carries #123, so #207 must be planted
+    # here or the validator rejects the agent/issue-207 binding, the orphan
+    # sweep cannot match the PR to the issue, and the fingerprint short-circuit
+    # (which requires the PR to be found) never fires — orphan_drift_at gets
+    # overwritten with a fresh timestamp instead of being preserved.
+    fake_gh.issues.append(
+        {"number": 207, "title": "test issue 207", "state": "OPEN", "labels": [], "body": ""}
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -42306,6 +42118,16 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
             return super().issue_list(labels=labels, state=state)
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -42318,8 +42140,10 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
         )
 
     # Issue 207 has a linked open PR (number 100), so no_pr_orphans is empty
-    # and the bulk issue-list sweep must not run.
-    assert fake_gh.issue_list_calls == 0
+    # and the bulk issue-list sweep must not run. The single issue_list call
+    # is the branch-issue validator's own open-issue fetch (issue #1229), not
+    # the bulk reclaim sweep.
+    assert fake_gh.issue_list_calls == 1
 
 
 def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Path) -> None:
@@ -42363,6 +42187,16 @@ def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Pa
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -42452,6 +42286,16 @@ def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) 
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -42538,6 +42382,16 @@ def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     # Mock PID liveness check to return False (dead PID)
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
@@ -42675,6 +42529,16 @@ def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     # Mock the helper to simulate PID recycling (alive check returns False due to start-time mismatch)
     def mock_worker_pid_alive(entry):
@@ -42859,6 +42723,16 @@ def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_pat
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -44589,7 +44463,9 @@ def test_phantom_live_worker_preserves_sidecar_for_dirty_worktree_with_commits(
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -46558,7 +46434,10 @@ def test_state_lock_guard_returns_skip_when_lock_held(
     """
     monkeypatch.setattr(state_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="devin-shell"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
 
@@ -46591,57 +46470,6 @@ def test_state_lock_guard_returns_skip_when_lock_held(
     lock_path = state_path.with_suffix(state_path.suffix + ".lock")
     with _hold_state_lock(lock_path):
         result = getattr(app, method_name)(*args)
-
-    assert result.ok is True
-    reason = result.data.get("reason") or result.data.get("deferred_reason")
-    assert reason in {"state_lock_busy", "supervisor_lock_held", "graphql_rate_limit"}
-    assert result.data.get("pass_skipped") is True or result.data.get("state_lock_busy") is True
-    assert state_path.stat().st_mtime == initial_mtime
-    assert state_path.read_text(encoding="utf-8") == initial_content
-
-
-def test_spec_review_state_lock_guard_returns_skip_when_lock_held(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Issue #398: spec_review is also guarded by the state-lock skip pattern."""
-    from charlie_work.cross_family import CrossFamilyResult
-
-    monkeypatch.setattr(state_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
-
-    config = OrchestratorConfig(devin=DevinConfig(adapter="devin-shell"))
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    # Issue #618: dry_run=False so the state_lock block is reached — in dry-run
-    # the state write is correctly skipped, so the lock guard never fires.
-    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=False)
-
-    spec_path = tmp_path / "spec.md"
-    spec_path.write_text("# spec\n", encoding="utf-8")
-
-    state_path = paths.state_file
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    initial_state = {
-        "version": 1,
-        "generated_at": "2026-01-01T00:00:00Z",
-        "issues": {},
-        "prs": {},
-        "events": [],
-    }
-    state_path.write_text(json.dumps(initial_state), encoding="utf-8")
-    initial_mtime = state_path.stat().st_mtime
-    initial_content = state_path.read_text(encoding="utf-8")
-
-    def fake_run_cross_family_review(*args: object, **kwargs: object) -> CrossFamilyResult:
-        return CrossFamilyResult(ok=True, report_path=str(tmp_path / "report.md"), model="test")
-
-    monkeypatch.setattr(
-        "charlie_work.workflow.run_cross_family_review",
-        fake_run_cross_family_review,
-    )
-
-    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
-    with _hold_state_lock(lock_path):
-        result = app.spec_review(spec_path)
 
     assert result.ok is True
     reason = result.data.get("reason") or result.data.get("deferred_reason")
@@ -46924,7 +46752,8 @@ def test_dispatch_label_error_reason_in_event_payload(tmp_path: Path) -> None:
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -46965,7 +46794,8 @@ def test_dispatch_rework_label_error_reason_in_event_payload(tmp_path: Path) -> 
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -47025,7 +46855,8 @@ def test_dispatch_rework_missing_prompt_reason_in_event_payload(tmp_path: Path) 
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -47072,6 +46903,7 @@ def test_dispatch_failed_retries_are_capped_and_escalate(tmp_path: Path) -> None
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(7)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=1),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -47246,6 +47078,16 @@ def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 457,
+            "title": "Test issue",
+            "url": "https://example.test/issues/457",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     def fake_review(pr_number: int):
         return CommandResult(True, "review packet generated", {"pr_number": pr_number})
@@ -47321,6 +47163,16 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 457,
+            "title": "Test issue",
+            "url": "https://example.test/issues/457",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     def fake_review(pr_number: int):
         return CommandResult(False, "janitor gate blocked review", {"pr_number": pr_number})
@@ -47396,6 +47248,7 @@ def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "approved", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -47410,6 +47263,16 @@ def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 457,
+            "title": "Test issue",
+            "url": "https://example.test/issues/457",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -47481,6 +47344,16 @@ def test_orphaned_worker_approved_rework_dead_worker_auto_resets(tmp_path: Path)
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 1109,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1109",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -47568,6 +47441,16 @@ def test_orphaned_worker_approved_rework_clean_exit_no_op_drift(tmp_path: Path) 
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 1109,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1109",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -47644,6 +47527,7 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: P
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "approved", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -47658,6 +47542,16 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: P
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 1109,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1109",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -47700,11 +47594,29 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self):
+            super().__init__()
+            # Issue #457 must appear in issue_list() (the open-issue snapshot)
+            # as well as issue_view(), so the branch-issue validator added in
+            # issue #1229 accepts agent/issue-457 as a real open issue.
+            self.issues = [
+                *self.issues,
+                {
+                    "number": 457,
+                    "title": "Orphan drift test",
+                    "url": "https://example.test/issues/457",
+                    "body": "",
+                    "labels": [{"name": config.labels.needs_rework}],
+                    "state": "OPEN",
+                },
+            ]
+
         def pr_list(self):
             return [
                 {
@@ -47743,6 +47655,18 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+
+    # Issue #1229: review_decision() reads from the file, not state.json.
+    # Without a review-decision.json file, last_decision is None, which
+    # routes through the #1128 pr-open transition instead of the
+    # dead_worker_unsafe_to_auto_reset drift path this test exercises.
+    # Write the file so last_decision is "approved" as the state entry implies.
+    pr_dir = paths.prs / "pr-100"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "abc123"}),
+        encoding="utf-8",
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -48961,39 +48885,39 @@ def test_record_review_persists_required_changes(tmp_path: Path) -> None:
 def test_cross_family_request_changes_verdict_persists_required_changes(
     tmp_path: Path,
 ) -> None:
-    """End-to-end: a cross-family report's parsed request_changes verdict,
-    recorded the same way ``_record_cross_family_verdicts`` does (workflow.py),
-    ends up with a populated ``required_changes`` in review-decision.json --
-    the exact defect this fix closes (8 of 20 request_changes verdicts had it
-    silently empty)."""
-    body = (
-        "**MAJOR**\nfile.py:10 does the wrong thing\n\n"
-        "Verdict: MAJOR issue blocks merge\n\n"
-        "```json\n"
-        '{"decision": "request_changes", '
-        '"summary": "file.py:10 has a real bug that breaks X", '
-        '"required_changes": ["Fix the off-by-one in file.py:10", '
-        '"Add a regression test for the empty-list case"]}\n'
-        "```\n"
+    """End-to-end: a rescue-tier request_changes verdict's decision/summary/
+    required_changes, recorded the same way the rescue tier's own
+    record_review call site does, ends up with a populated
+    ``required_changes`` in review-decision.json -- the exact defect this fix
+    closes (8 of 20 request_changes verdicts had it silently empty).
+
+    The decision/summary/required_changes below are the literal values a
+    JSON verdict block of
+    ``{"decision": "request_changes", "summary": "file.py:10 has a real bug
+    that breaks X", "required_changes": ["Fix the off-by-one in
+    file.py:10", "Add a regression test for the empty-list case"]}``
+    used to parse to, back when ``parse_cross_family_verdict`` (deleted in
+    the role-config Phase 2 cleanup) extracted them from a report body."""
+    verdict_decision = "request_changes"
+    verdict_summary = "file.py:10 has a real bug that breaks X"
+    verdict_required_changes = (
+        "Fix the off-by-one in file.py:10",
+        "Add a regression test for the empty-list case",
     )
-    report_text = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    parsed = parse_cross_family_verdict(report_text)
-    assert parsed is not None
-    assert parsed.decision == "request_changes"
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    # Mirrors workflow.py's _record_cross_family_verdicts call site exactly.
+    # Mirrors the rescue tier's own record_review call site.
     # PR 456 is FakeGitHub's seeded default PR.
     result = app.record_review(
         456,
-        parsed.decision,
-        summary=parsed.summary,
-        required_changes=parsed.required_changes,
-        verdict_provenance="cross_family_review",
+        verdict_decision,
+        summary=verdict_summary,
+        required_changes=verdict_required_changes,
+        verdict_provenance="rescue_review",
     )
     assert result.ok
 
@@ -49010,45 +48934,48 @@ def test_cross_family_request_changes_verdict_persists_required_changes(
 def test_cross_family_legacy_path_verdict_with_empty_required_changes_gets_derived(
     tmp_path: Path,
 ) -> None:
-    """AC-6 (cross-family producer): the legacy Markdown-only parse path
-    (no JSON verdict block) never itemizes required_changes -- it only ever
-    extracts a summary -- so a request_changes verdict recorded from it
-    always arrives at record_review with required_changes=() and a real,
-    non-vacuous summary. This is the shape record_review's derivation
-    exists for. Contrast with test_handle_malformed_cross_family_verdict_*:
-    a JSON verdict block declaring request_changes with an empty
-    required_changes is diverted to MalformedCrossFamilyVerdict before ever
-    reaching record_review (issue #795) -- this test's report has no JSON
-    block at all, so that defense-in-depth layer does not apply here and
+    """AC-6 (rescue-tier producer): a request_changes verdict with an empty
+    required_changes and a real, non-vacuous summary -- the shape the legacy
+    Markdown-only cross-family parse path (no JSON verdict block, deleted
+    along with ``parse_cross_family_verdict`` in the role-config Phase 2
+    cleanup) used to produce, since it only ever extracted a summary, never
+    itemized findings -- always arrives at record_review as
+    required_changes=(). This is the shape record_review's derivation
+    exists for. Contrast with the (deleted) AC-8 malformed-verdict tests: a
+    JSON verdict block declaring request_changes with an empty
+    required_changes was diverted to MalformedCrossFamilyVerdict before ever
+    reaching record_review (issue #795) -- this scenario has no JSON block
+    at all, so that defense-in-depth layer never applied here and
     record_review's own derivation is what prevents the content-free
-    outcome."""
-    body = "**MAJOR**\nreal bug\n\nVerdict: MAJOR issues block merge"
-    report_text = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    parsed = parse_cross_family_verdict(report_text)
-    assert isinstance(parsed, CrossFamilyVerdict)
-    assert parsed.decision == "request_changes"
-    assert parsed.required_changes == ()
-    assert parsed.summary and not _summary_is_vacuous(parsed.summary)
+    outcome.
+
+    ``verdict_summary`` below is the literal value
+    ``"**MAJOR**\\nreal bug\\n\\nVerdict: MAJOR issues block merge"``
+    used to parse to via the legacy path's verdict-line extraction."""
+    verdict_decision = "request_changes"
+    verdict_summary = "MAJOR issues block merge"
+    verdict_required_changes: tuple[str, ...] = ()
+    assert verdict_summary and not _summary_is_vacuous(verdict_summary)
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    # Mirrors workflow.py's _record_cross_family_verdicts call site exactly.
+    # Mirrors the rescue tier's own record_review call site.
     result = app.record_review(
         456,
-        parsed.decision,
-        summary=parsed.summary,
-        required_changes=parsed.required_changes,
-        verdict_provenance="cross_family_review",
+        verdict_decision,
+        summary=verdict_summary,
+        required_changes=verdict_required_changes,
+        verdict_provenance="rescue_review",
     )
     assert result.ok is True
 
     decision = json.loads(
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
-    assert decision["required_changes"] == [parsed.summary]
+    assert decision["required_changes"] == [verdict_summary]
     assert decision["findings_channel"] == "derived"
 
 
@@ -49140,7 +49067,8 @@ def test_dispatch_rework_regenerates_stale_brief_after_decision_edit(
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -49234,7 +49162,8 @@ def test_dispatch_rework_regenerates_brief_after_renderer_change(
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -50136,7 +50065,8 @@ def test_no_op_rework_repair_note_survives_dispatch_rework_regeneration(tmp_path
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -50442,6 +50372,7 @@ def test_dispatch_rework_deterministic_failure_kind_escalates_immediately(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=3, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -50511,6 +50442,7 @@ def test_dispatch_rework_no_op_rework_cap_escalates(tmp_path: Path) -> None:
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -50569,6 +50501,7 @@ def test_dispatch_rework_worker_deaths_dont_count_as_no_op(tmp_path: Path) -> No
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -50630,6 +50563,7 @@ def test_dispatch_rework_mixed_deaths_and_no_ops_no_op_dominates(tmp_path: Path)
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -50687,6 +50621,7 @@ def test_dispatch_rework_deaths_below_cap_still_dispatched(tmp_path: Path) -> No
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -50789,6 +50724,7 @@ def test_dispatch_rework_worker_death_loop_includes_stranded_commits(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     layout = resolved_layout(config, repo_root)
@@ -50972,6 +50908,7 @@ def test_dispatch_rework_death_loop_salvages_stranded_commits(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     layout = resolved_layout(config, repo_root)
@@ -51096,6 +51033,7 @@ def test_dispatch_rework_death_loop_empty_death_still_escalates(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     layout = resolved_layout(config, repo_root)
@@ -51770,18 +51708,17 @@ def test_stalled_review_throttled_rolls_back_attempt_count(monkeypatch, tmp_path
 
 
 # ---------------------------------------------------------------------------
-# Issue #482: per-issue adapter routing + partitioned dispatch integration
+# Issue #626: rescue-tier combined-manifest adapter labeling
 # ---------------------------------------------------------------------------
 
 
-def _api_worker_config_for_routing(
+def _api_worker_config_for_test(
     *,
     enabled: bool = True,
-    fallback_adapter: str = "devin-shell",
     provider_name: str = "kimi-k3",
     api_key_env: str = "MOONSHOT_API_KEY",
 ) -> Any:
-    """Build an ApiWorkerConfig suitable for routing integration tests."""
+    """Build an ApiWorkerConfig for rescue-tier combined-manifest tests."""
     from charlie_work.config import ApiBudgetConfig, ApiProviderConfig, ApiWorkerConfig
 
     provider = ApiProviderConfig(
@@ -51798,406 +51735,9 @@ def _api_worker_config_for_routing(
         max_concurrent_sessions=1,
         providers={provider_name: provider},
         budget=ApiBudgetConfig(),
-        fallback_adapter=fallback_adapter,
         worker_template="worker_claude_code.md",
         rework_template="rework.md",
     )
-
-
-def test_dispatch_with_api_disabled_routes_all_to_default_adapter(tmp_path: Path) -> None:
-    """Issue #482: when api_worker is disabled, all issues route to the default
-    adapter and _dispatch_partitioned falls back to single-group dispatch
-    byte-identical to the pre-#482 behavior."""
-    from charlie_work import devin_shell
-    from charlie_work.worktree import WorktreeInfo
-
-    wt_path = tmp_path / "worktrees" / "agent-issue-123-fix-search"
-    wt_path.mkdir(parents=True, exist_ok=True)
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        return WorktreeInfo(path=wt_path, branch=branch, venv_junction=None)
-
-    monkeypatch_local = pytest.MonkeyPatch()
-    monkeypatch_local.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        api_worker=_api_worker_config_for_routing(enabled=False),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=1)
-
-    assert result.ok is True
-    assert result.data["dispatch_results"][0]["adapter"] == "devin-shell"
-    # No adapter_history should be recorded when api is disabled.
-    state = load_state(paths.state_file)
-    assert "adapter_history" not in state["issues"].get("123", {})
-    monkeypatch_local.undo()
-
-
-def test_dispatch_routes_complexity_high_to_api_adapter(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482: an issue with the complexity:high label routes to the api
-    adapter when preflight passes, and the api worker_template is used for the
-    prompt."""
-    from charlie_work import api_worker
-    from charlie_work.claude_code import ClaudeWorkerRecord
-
-    captured: dict[str, object] = {}
-
-    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
-        captured["prompt_text"] = prompt_text
-        captured["adapter_kind"] = kwargs.get("adapter_kind")
-        captured["provider"] = kwargs.get("provider")
-        return ClaudeWorkerRecord(
-            issue_number=issue_number,
-            branch=branch,
-            worktree_path=str(tmp_path / "wt"),
-            prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
-            command=("claude", "-p"),
-            pid=4242,
-            started_at="2026-07-02T00:00:00Z",
-            log_path=str(tmp_path / "log"),
-        )
-
-    monkeypatch.setattr(api_worker, "launch_claude_worker", _fake_launch)
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    class ComplexityHighGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.issues[0]["labels"] = [
-                {"name": "automated-ready"},
-                {"name": config.labels.complexity_high},
-            ]
-
-    fake_gh = ComplexityHighGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=1)
-
-    assert result.ok is True
-    assert result.data["dispatch_results"][0]["adapter"] == "api"
-    assert captured["adapter_kind"] == "api"
-    assert captured["provider"] == "kimi-k3"
-    # adapter_history recorded with policy:complexity reason.
-    state = load_state(paths.state_file)
-    history = state["issues"]["123"].get("adapter_history", [])
-    assert len(history) == 1
-    assert history[0]["kind"] == "api"
-    assert history[0]["reason"] == "policy:complexity"
-
-
-def test_dispatch_routes_non_complexity_to_default_adapter(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482: an issue without the complexity:high label routes to the
-    default adapter (devin-shell) even when api is enabled — the default
-    policy rule fires and no api candidate matches."""
-    from charlie_work import devin_shell
-    from charlie_work.worktree import WorktreeInfo
-
-    wt_path = tmp_path / "worktrees" / "agent-issue-123-fix-search"
-    wt_path.mkdir(parents=True, exist_ok=True)
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        return WorktreeInfo(path=wt_path, branch=branch, venv_junction=None)
-
-    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=1)
-
-    assert result.ok is True
-    assert result.data["dispatch_results"][0]["adapter"] == "devin-shell"
-    # adapter_history recorded with policy:default reason.
-    state = load_state(paths.state_file)
-    history = state["issues"]["123"].get("adapter_history", [])
-    assert len(history) == 1
-    assert history[0]["kind"] == "devin-shell"
-    assert history[0]["reason"] == "policy:default"
-
-
-def test_dispatch_falls_back_on_missing_api_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482: a complexity:high issue falls back to the default adapter
-    when the api key is missing (preflight auth failure), and the
-    adapter_history records the fallback:auth reason."""
-    from charlie_work import devin_shell
-    from charlie_work.worktree import WorktreeInfo
-
-    wt_path = tmp_path / "worktrees" / "agent-issue-123-fix-search"
-    wt_path.mkdir(parents=True, exist_ok=True)
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        return WorktreeInfo(path=wt_path, branch=branch, venv_junction=None)
-
-    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    class ComplexityHighGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.issues[0]["labels"] = [
-                {"name": "automated-ready"},
-                {"name": config.labels.complexity_high},
-            ]
-
-    fake_gh = ComplexityHighGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=1)
-
-    assert result.ok is True
-    assert result.data["dispatch_results"][0]["adapter"] == "devin-shell"
-    # adapter_history records the fallback:auth reason.
-    state = load_state(paths.state_file)
-    history = state["issues"]["123"].get("adapter_history", [])
-    assert len(history) == 1
-    assert history[0]["kind"] == "devin-shell"
-    assert history[0]["reason"] == "fallback:auth"
-
-
-def test_dispatch_dry_run_includes_adapter_choices(tmp_path: Path) -> None:
-    """Issue #482: dry-run dispatch computes and returns adapter_choices in
-    the result data without launching workers or mutating state."""
-    monkeypatch_local = pytest.MonkeyPatch()
-    monkeypatch_local.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    class ComplexityHighGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.issues[0]["labels"] = [
-                {"name": "automated-ready"},
-                {"name": config.labels.complexity_high},
-            ]
-
-    fake_gh = ComplexityHighGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=1)
-
-    assert result.ok is True
-    assert "adapter_choices" in result.data
-    choices = result.data["adapter_choices"]
-    assert "123" in choices
-    assert choices["123"]["kind"] == "api"
-    assert choices["123"]["reason"] == "policy:complexity"
-    # No state mutation in dry-run.
-    state = load_state(paths.state_file)
-    assert "adapter_history" not in state.get("issues", {}).get("123", {})
-    monkeypatch_local.undo()
-
-
-def test_dispatch_rework_routes_to_api_when_preflight_passes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482: rework dispatch routes to the api adapter when preflight
-    passes (policy:rework), and the adapter_history is recorded."""
-    from charlie_work import api_worker
-    from charlie_work.claude_code import ClaudeWorkerRecord
-
-    captured: dict[str, object] = {}
-
-    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
-        captured["adapter_kind"] = kwargs.get("adapter_kind")
-        captured["provider"] = kwargs.get("provider")
-        return ClaudeWorkerRecord(
-            issue_number=issue_number,
-            branch=branch,
-            worktree_path=str(tmp_path / "wt"),
-            prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
-            command=("claude", "-p"),
-            pid=4242,
-            started_at="2026-07-02T00:00:00Z",
-            log_path=str(tmp_path / "log"),
-        )
-
-    monkeypatch.setattr(api_worker, "launch_claude_worker", _fake_launch)
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    class ReworkGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
-
-    paths.root.mkdir(parents=True, exist_ok=True)
-    with state_lock(paths.state_file):
-        state = load_state(paths.state_file)
-        state["issues"]["123"] = {
-            "number": 123,
-            "title": "Fix search",
-            "url": "https://example.test/issues/123",
-            "status": "rework_requested",
-        }
-        save_state(paths.state_file, state)
-
-    fake_gh = ReworkGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
-    pr_dir.mkdir(parents=True)
-    rework_prompt = pr_dir / "rework-prompt.md"
-    rework_prompt.write_text("Fix the issues", encoding="utf-8")
-
-    result = app.dispatch_rework()
-
-    assert result.ok is True
-    assert captured["adapter_kind"] == "api"
-    assert captured["provider"] == "kimi-k3"
-    state = load_state(paths.state_file)
-    history = state["issues"]["123"].get("adapter_history", [])
-    assert len(history) == 1
-    assert history[0]["kind"] == "api"
-    assert history[0]["reason"] == "policy:rework"
-
-
-def test_dispatch_partitioned_writes_combined_manifest_for_mixed_adapters(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482: when dispatch partitions issues across multiple adapters,
-    the combined session manifest reflects all sessions (not just the last
-    group's)."""
-    from charlie_work import api_worker, devin_shell
-    from charlie_work.claude_code import ClaudeWorkerRecord
-    from charlie_work.worktree import WorktreeInfo
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        wt = tmp_path / "worktrees" / branch.replace("/", "-")
-        wt.mkdir(parents=True, exist_ok=True)
-        return WorktreeInfo(path=wt, branch=branch, venv_junction=None)
-
-    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-
-    def _fake_api_launch(issue_number, branch, prompt_text, **kwargs):
-        return ClaudeWorkerRecord(
-            issue_number=issue_number,
-            branch=branch,
-            worktree_path=str(tmp_path / "wt-api"),
-            prompt_path=str(tmp_path / "wt-api" / ".orchestrator-prompt.md"),
-            command=("claude", "-p"),
-            pid=5001,
-            started_at="2026-07-02T00:00:00Z",
-            log_path=str(tmp_path / "log-api"),
-        )
-
-    monkeypatch.setattr(api_worker, "launch_claude_worker", _fake_api_launch)
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    class MixedGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            # Issue 123: complexity:high -> routes to api
-            self.issues[0]["labels"] = [
-                {"name": "automated-ready"},
-                {"name": config.labels.complexity_high},
-            ]
-            # Issue 124: no complexity label -> routes to devin-shell (default)
-            self.issues.append(
-                {
-                    "number": 124,
-                    "title": "Another issue",
-                    "url": "https://example.test/issues/124",
-                    "body": "Body",
-                    "labels": [{"name": "automated-ready"}],
-                    "state": "OPEN",
-                }
-            )
-            # Add a second PR for issue 124 (closed so it's not an open-PR blocker)
-            self.prs.append(
-                {
-                    "number": 457,
-                    "title": "Fix #124",
-                    "url": "https://example.test/pull/457",
-                    "headRefName": "agent/issue-124-another-issue",
-                    "baseRefName": "main",
-                    "headRefOid": "sha-def456",
-                    "mergeStateStatus": "CLEAN",
-                    "body": "Closes #124",
-                    "labels": [],
-                    "isCrossRepository": False,
-                    "state": "CLOSED",
-                }
-            )
-
-    fake_gh = MixedGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    # Close the first PR too so issue 123 is dispatchable
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=2)
-
-    assert result.ok is True
-    assert result.data["selected_count"] == 2
-    # The manifest should contain both sessions.
-    manifest_path = tmp_path / ".var" / "charlie-work" / "dispatches" / "session-manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    session_issue_numbers = {s["issue_number"] for s in manifest["sessions"]}
-    assert session_issue_numbers == {123, 124}
-    # The combined manifest's adapter label is "mixed" and its instructions
-    # text explains the multi-adapter partition (not the generic fallback).
-    assert manifest["adapter"] == "mixed"
-    assert "multiple worker adapters" in " ".join(manifest["instructions"])
 
 
 def test_manifest_adapter_label_helper() -> None:
@@ -52210,57 +51750,6 @@ def test_manifest_adapter_label_helper() -> None:
     assert manifest_adapter_label({"claude-code"}) == "claude-code"
     assert manifest_adapter_label({"api", "devin-shell"}) == "mixed"
     assert manifest_adapter_label({"api", "claude-code", "devin-shell"}) == "mixed"
-
-
-def test_dispatch_partitioned_homogeneous_batch_labels_with_single_kind(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #626: when api_worker is enabled but every issue in the pass
-    routes to the same fallback adapter (e.g. no API key → fallback:auth for
-    all), the manifest's adapter label is that single kind, not ``"mixed"``.
-    Before #626, ``_dispatch_partitioned`` unconditionally wrote
-    ``adapter="mixed"`` for any non-empty ``adapter_choices``."""
-    from charlie_work import devin_shell
-    from charlie_work.worktree import WorktreeInfo
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        wt = tmp_path / "worktrees" / branch.replace("/", "-")
-        wt.mkdir(parents=True, exist_ok=True)
-        return WorktreeInfo(path=wt, branch=branch, venv_junction=None)
-
-    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-
-    # api_worker enabled but NO API key set → every complexity:high issue
-    # fails preflight with fallback:auth and routes to devin-shell.
-    # Do NOT set MOONSHOT_API_KEY.
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    fake_gh = _two_complexity_high_issues_github(config)
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=2)
-
-    assert result.ok is True
-    assert result.data["selected_count"] == 2
-    manifest_path = tmp_path / ".var" / "charlie-work" / "dispatches" / "session-manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    session_issue_numbers = {s["issue_number"] for s in manifest["sessions"]}
-    assert session_issue_numbers == {123, 124}
-    # Homogeneous batch: both issues fell back to devin-shell. The label must
-    # be "devin-shell", not "mixed" (the #626 bug).
-    assert manifest["adapter"] == "devin-shell"
-    # Instructions text matches the devin-shell adapter, not the mixed
-    # partition text.
-    assert "devin CLI" in " ".join(manifest["instructions"])
-    assert "multiple worker adapters" not in " ".join(manifest["instructions"])
 
 
 def _fake_dispatch_sessions_writing_manifests(
@@ -52364,6 +51853,7 @@ def test_dispatch_rework_combined_manifest_mixed_label(
 
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         rescue=RescueConfig(enabled=True, worker_model="claude-opus-4-1"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -52387,7 +51877,7 @@ def test_dispatch_rework_combined_manifest_mixed_label(
     session_issue_numbers = {s["issue_number"] for s in manifest["sessions"]}
     assert session_issue_numbers == {123, 124}
     assert manifest["adapter"] == "mixed"
-    assert "multiple worker adapters" in " ".join(manifest["instructions"])
+    assert "more than one worker" in " ".join(manifest["instructions"])
 
 
 def test_dispatch_rework_combined_manifest_homogeneous_label(
@@ -52398,32 +51888,29 @@ def test_dispatch_rework_combined_manifest_homogeneous_label(
     the combined manifest's adapter label is ``"claude-code"`` — not
     ``"mixed"`` and not the default adapter name.
 
-    The normal issue routes to claude-code via api_worker's fallback_adapter
-    (api preflight fails on missing API key → fallback:auth → claude-code),
-    while the rescue issue uses claude-code via the rescue adapter. Both
-    kinds are ``"claude-code"`` → homogeneous → ``"claude-code"``. Before
-    #626, the trailing write used ``self.config.devin.adapter`` (``"devin-shell"``
-    here) unconditionally, mislabeling the homogeneous batch."""
+    The normal issue uses claude-code because that is the pass's configured
+    worker harness (``worker.harness``), while the rescue issue uses
+    claude-code via the rescue adapter. Both kinds are ``"claude-code"`` →
+    homogeneous → ``"claude-code"``. Before #626, the trailing write used
+    ``self.config.devin.adapter`` (``"devin-shell"`` here) unconditionally,
+    mislabeling the homogeneous batch."""
     from charlie_work.config import RescueConfig
 
-    # devin.adapter is "devin-shell" but both issues actually use claude-code:
-    # the normal issue falls back to claude-code (fallback_adapter), the
-    # rescue issue uses claude-code (rescue adapter). The old code's trailing
-    # write would label this "devin-shell" (wrong); the fix derives "claude-code"
-    # from the partition.
+    # devin.adapter is "devin-shell" (legacy field, unread once worker.harness
+    # is set) but both issues actually use claude-code: the normal issue via
+    # the configured worker harness, the rescue issue via the rescue adapter.
+    # The old code's trailing write would label this "devin-shell" (wrong);
+    # the fix derives "claude-code" from the partition.
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="claude-code"),
+        worker=WorkerRoleConfig(harness="claude-code"),
+        api_worker=_api_worker_config_for_test(enabled=True),
         rescue=RescueConfig(enabled=True, worker_model="claude-opus-4-1"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     _seed_two_rework_issues(paths, config, rescue_issue_numbers={124})
     fake_gh = _TwoReworkIssuesGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    # Do NOT set MOONSHOT_API_KEY so the normal issue fails api preflight
-    # (fallback:auth) and routes to the claude-code fallback adapter.
-    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
 
     manifest_writes: list[str] = []
     monkeypatch.setattr(
@@ -52456,6 +51943,7 @@ def test_dispatch_rework_no_rescue_skips_redundant_manifest_write(
     too — that is the call #626 makes conditional."""
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     # Only issue 123 (normal), no rescue marker on issue 124's PR.
@@ -52526,255 +52014,6 @@ def test_dispatch_rework_no_rescue_skips_redundant_manifest_write(
     manifest_path = tmp_path / ".var" / "charlie-work" / "dispatches" / "session-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["adapter"] == "devin-shell"
-
-
-def _two_complexity_high_issues_github(config: Any) -> Any:
-    """Build a FakeGitHub with two complexity:high issues (123, 124) and closed PRs."""
-
-    class TwoComplexityHighGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.issues[0]["labels"] = [
-                {"name": "automated-ready"},
-                {"name": config.labels.complexity_high},
-            ]
-            self.issues.append(
-                {
-                    "number": 124,
-                    "title": "Another complex issue",
-                    "url": "https://example.test/issues/124",
-                    "body": "Body",
-                    "labels": [
-                        {"name": "automated-ready"},
-                        {"name": config.labels.complexity_high},
-                    ],
-                    "state": "OPEN",
-                }
-            )
-            self.prs.append(
-                {
-                    "number": 457,
-                    "title": "Fix #124",
-                    "url": "https://example.test/pull/457",
-                    "headRefName": "agent/issue-124-another-complex-issue",
-                    "baseRefName": "main",
-                    "headRefOid": "sha-def456",
-                    "mergeStateStatus": "CLEAN",
-                    "body": "Closes #124",
-                    "labels": [],
-                    "isCrossRepository": False,
-                    "state": "CLOSED",
-                }
-            )
-
-    return TwoComplexityHighGitHub()
-
-
-def test_dispatch_concurrency_cap_defers_second_api_issue_in_same_pass(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482 review fix: when multiple api-eligible (complexity:high) issues
-    are selected in the same dispatch pass and ``max_concurrent_sessions`` is 1,
-    the first routes to api and the second falls back to the default adapter
-    with ``fallback:concurrency`` — the in-pass running counter prevents both
-    from bypassing the cap simultaneously."""
-    from charlie_work import api_worker, devin_shell
-    from charlie_work.claude_code import ClaudeWorkerRecord
-    from charlie_work.worktree import WorktreeInfo
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        wt = tmp_path / "worktrees" / branch.replace("/", "-")
-        wt.mkdir(parents=True, exist_ok=True)
-        return WorktreeInfo(path=wt, branch=branch, venv_junction=None)
-
-    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-
-    api_launches: list[int] = []
-
-    def _fake_api_launch(issue_number, branch, prompt_text, **kwargs):
-        api_launches.append(issue_number)
-        return ClaudeWorkerRecord(
-            issue_number=issue_number,
-            branch=branch,
-            worktree_path=str(tmp_path / f"wt-api-{issue_number}"),
-            prompt_path=str(tmp_path / f"wt-api-{issue_number}" / ".orchestrator-prompt.md"),
-            command=("claude", "-p"),
-            pid=5000 + issue_number,
-            started_at="2026-07-02T00:00:00Z",
-            log_path=str(tmp_path / f"log-api-{issue_number}"),
-        )
-
-    monkeypatch.setattr(api_worker, "launch_claude_worker", _fake_api_launch)
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    fake_gh = _two_complexity_high_issues_github(config)
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=2)
-
-    assert result.ok is True
-    assert result.data["selected_count"] == 2
-    # Exactly one issue routed to api (the cap is 1, 0 live sessions).
-    assert len(api_launches) == 1
-    # The adapter_history for each issue records the routing decision.
-    state = load_state(paths.state_file)
-    hist_123 = state["issues"]["123"].get("adapter_history", [])
-    hist_124 = state["issues"]["124"].get("adapter_history", [])
-    all_kinds = {h["kind"] for h in hist_123 + hist_124}
-    all_reasons = {h["reason"] for h in hist_123 + hist_124}
-    assert "api" in all_kinds
-    assert "devin-shell" in all_kinds
-    assert "fallback:concurrency" in all_reasons
-
-
-def test_dispatch_concurrency_cap_dry_run_defers_second_api_issue(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482 review fix: the in-pass running counter also applies in
-    dry-run, so adapter_choices in the dry-run result reflect the cap."""
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    fake_gh = _two_complexity_high_issues_github(config)
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=2)
-
-    assert result.ok is True
-    choices = result.data["adapter_choices"]
-    kinds = {choices[str(n)]["kind"] for n in (123, 124)}
-    reasons = {choices[str(n)]["reason"] for n in (123, 124)}
-    assert kinds == {"api", "devin-shell"}
-    assert "fallback:concurrency" in reasons
-
-
-def test_dispatch_falls_back_on_exhausted_daily_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482 review fix: a complexity:high issue falls back to the default
-    adapter when the daily budget is exhausted (preflight budget failure), and
-    the adapter_history records the ``fallback:budget`` reason. This exercises
-    the budget wiring path end-to-end (ledger on disk -> budget_status ->
-    routing preflight -> dispatch)."""
-    from charlie_work import devin_shell
-    from charlie_work.api_budget import DayBucket, Ledger, ledger_path, save_ledger
-    from charlie_work.worktree import WorktreeInfo
-
-    wt_path = tmp_path / "worktrees" / "agent-issue-123-fix-search"
-    wt_path.mkdir(parents=True, exist_ok=True)
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        return WorktreeInfo(path=wt_path, branch=branch, venv_junction=None)
-
-    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    # Write a ledger with today's spend at the daily cap so headroom is False.
-    # Defaults: max_usd_per_day=5.0, preflight_reserve_usd=1.0 (max_usd_per_session=0).
-    # spent_today=5.0 -> 5.0 + 1.0 = 6.0 > 5.0 -> daily_headroom=False.
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
-    ledger = Ledger(
-        days={today: DayBucket(usd=5.0)},
-        lifetime_usd=5.0,
-    )
-    paths.root.mkdir(parents=True, exist_ok=True)
-    save_ledger(ledger_path(paths.state_file.parent), ledger)
-
-    class ComplexityHighGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.issues[0]["labels"] = [
-                {"name": "automated-ready"},
-                {"name": config.labels.complexity_high},
-            ]
-
-    fake_gh = ComplexityHighGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=1)
-
-    assert result.ok is True
-    assert result.data["dispatch_results"][0]["adapter"] == "devin-shell"
-    state = load_state(paths.state_file)
-    history = state["issues"]["123"].get("adapter_history", [])
-    assert len(history) == 1
-    assert history[0]["kind"] == "devin-shell"
-    assert history[0]["reason"] == "fallback:budget"
-
-
-def test_dispatch_falls_back_on_provider_cooldown(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482 review fix: a complexity:high issue falls back to the default
-    adapter when the provider is in cooldown (preflight cooldown failure), with
-    a ``fallback:cooldown`` reason. This exercises the cooldown wiring path
-    (throttled_until in state -> _routing_inputs -> is_throttled -> routing
-    preflight -> _select_adapter_for_issue).
-
-    The routing-level cooldown check is defense-in-depth: the dispatch-level
-    throttle gate intercepts first and defers the entire pass when
-    ``is_throttled`` is True. So this test exercises the routing wiring through
-    ``_routing_inputs`` + ``_select_adapter_for_issue`` directly — the full
-    wiring path from state to routing decision — without the dispatch-level
-    gate short-circuiting it."""
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    # Set throttled_until to a future timestamp so is_throttled returns True.
-    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
-    paths.root.mkdir(parents=True, exist_ok=True)
-    with state_lock(paths.state_file):
-        state = load_state(paths.state_file)
-        state = set_throttled_until(state, future)
-        save_state(paths.state_file, state)
-
-    fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    # Exercise the full wiring path: _routing_inputs reads throttled_until from
-    # state and computes provider_in_cooldown via is_throttled; the routing
-    # preflight then fails on cooldown and falls back to the default adapter.
-    routing_inputs = app._routing_inputs()
-    _, _, provider_in_cooldown, _ = routing_inputs
-    assert provider_in_cooldown is True
-    choice = app._select_adapter_for_issue(
-        rework=False,
-        issue_labels={config.labels.complexity_high},
-        routing_inputs=routing_inputs,
-    )
-    assert choice.kind == "devin-shell"
-    assert choice.reason == "fallback:cooldown"
 
 
 def test_sink_census_counts_escalated_and_blocked_only(tmp_path: Path) -> None:
@@ -53033,6 +52272,16 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
             ]
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
+    fake_gh.issues.append(
+        {
+            "number": 1248,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1248",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     salvage_calls: list[tuple[Any, ...]] = []
 
@@ -53139,6 +52388,20 @@ def test_orphaned_worker_salvage_push_threads_dry_run_to_salvage_push_stranded_c
             ]
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
+    # Issue #1229: the branch-issue validator in _detect_and_handle_orphaned_workers
+    # rejects branch-name bindings to issues absent from the open-issue list, so
+    # #1326 must be seeded as an OPEN issue for the pr_by_issue binding to survive
+    # and the salvage loop to fire.
+    fake_gh.issues.append(
+        {
+            "number": 1326,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1326",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     salvage_calls: list[dict[str, Any]] = []
 
@@ -53228,6 +52491,16 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
             ]
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
+    fake_gh.issues.append(
+        {
+            "number": 1248,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1248",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         return SalvagePushResult(
@@ -53313,6 +52586,16 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
             ]
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
+    fake_gh.issues.append(
+        {
+            "number": 1248,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1248",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         return SalvagePushResult(pushed=False, skip_reason="up_to_date", old_remote_sha="abc123")
@@ -53426,6 +52709,7 @@ def test_dispatch_rework_worktree_foreign_writer_does_not_increment_redispatch(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -53522,6 +52806,7 @@ def test_dispatch_rework_worktree_foreign_writer_redispatch_unchanged(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -53775,6 +53060,7 @@ def test_dispatch_rework_blocked_environment_reap_resets_counter(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
             max_auto_redispatch=0,
             redispatch_window_minutes=240,
@@ -53876,6 +53162,7 @@ def test_dispatch_rework_pre_escalation_safety_net_reaps_foreign_writer(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
             max_auto_redispatch=2,
             redispatch_window_minutes=240,

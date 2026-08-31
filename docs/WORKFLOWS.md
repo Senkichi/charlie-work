@@ -9,9 +9,8 @@ All commands below assume you're in the consumer repo root with
 `charlie` resolved via `uv run charlie ...` (or a bare `charlie` if
 the venv is activated). Add `--json` for machine-readable output and
 `--dry-run` to suppress mutating `gh` calls, the fleet self-deploy FF-pull and
-`uv sync`, the runner scale-event and pool-sample writes, and the cross-family
-review report/prompt writes. It does **not** suppress local state writes in
-general or worker adapter subprocesses (see the
+`uv sync`, and the runner scale-event and pool-sample writes. It does **not**
+suppress local state writes in general or worker adapter subprocesses (see the
 scope caveat in
 [QUICKSTART.md](QUICKSTART.md#5-first-cycle-intake--dispatch--review--merge)).
 
@@ -47,8 +46,7 @@ charlie work --limit 3
 # 7. Generate the adversarial review packet
 charlie why-charlie-hate --pr 123
 
-# 8. Read .var/charlie-work/prs/pr-123/review-prompt.md (and the
-#    cross-family report if cross_family.enabled), do the adversarial
+# 8. Read .var/charlie-work/prs/pr-123/review-prompt.md, do the adversarial
 #    review yourself (or via an orchestrating Claude session using
 #    prompts/orchestrator.md as its operating brief), write a summary,
 #    then record the decision
@@ -166,72 +164,20 @@ present. See
 [RUNBOOK.md](RUNBOOK.md#worktree-cleanup-gone-wrong-junction-hazard) for the
 full hazard writeup and manual recovery steps.
 
-## Cross-family review flow
+## Cross-family review flow (removed)
 
-Runs a non-Claude model (`cross_family.model`, default `codex` via the Devin
-CLI) against a PR's diff as a second opinion — its findings are **leads, not
-verdicts**; the primary reviewer must verify each against live code and
-never let it gate a merge on its own (`cross_family.py`'s `_CAVEAT` text,
-reproduced verbatim into every generated report).
+The automatic non-Claude "second opinion" pass this section used to document
+— which ran a `codex`-via-Devin-CLI model against every non-draft PR's diff
+inside `review()` — was deleted wholesale by Phase 2 of the role-config
+refactor, along with its regeneration-budget bookkeeping (issue #1099) and
+its `agent:human-needed` escalation reason. There is no config knob that
+reinstates it.
 
-Enabled by config (`cross_family.enabled: true`, as in
-`examples/orchestrator.config.devin.yaml`) — runs automatically inside
-`review()` for every non-draft PR:
-
-```powershell
-charlie why-charlie-hate --pr 123
-# cross-family-review.md is written to
-# .var/charlie-work/prs/pr-123/cross-family-review.md
-# and its section is folded into review-prompt.md automatically
-```
-
-Or override per-call regardless of config default:
-
-```powershell
-charlie why-charlie-hate --pr 123 --cross-family      # force on
-charlie why-charlie-hate --pr 123 --no-cross-family   # force off
-```
-
-A non-empty successful report is **reused** on repeated `review()`/`loop()`
-passes over the same PR (no repeat model spend) — but a failed run's
-`(UNAVAILABLE)` stub (or one missing its head-SHA marker) is never reused.
-`loop()` forces regeneration instead, bounded **per head SHA** by
-`cross_family.max_regen_attempts` (default `2`). A new push resets the budget,
-since a new head has never been tried.
-
-That bound is really two budgets sharing one head-keyed record and one limit
-(issue #1099):
-
-- **`attempts`** — the cross-family model actually ran and left an unusable
-  report. Past the budget the issue escalates to `agent:human-needed` rather
-  than retrying forever.
-- **`not_reached`** — `review()` was forced for this reason but returned before
-  reaching the regenerator, so the model never ran. Almost always the janitor
-  gate declining a PR with merge conflicts or missing required checks. Past the
-  budget the PR is **parked** — the report stops forcing `review()` by itself —
-  with no escalation and no label, and a `cross_family_regen_not_reached` event
-  recording the decline. It parks rather than escalates because regeneration
-  was never tried, so "unusable *and unfixable*" was never observed; and unlike
-  a `judgment` escalation, a park self-heals on the next push.
-
-See [ARCHITECTURE.md](ARCHITECTURE.md#invariants) and
-[RUNBOOK.md](RUNBOOK.md#handling-agenthuman-needed-escalations).
-
-Setting `max_regen_attempts` to `0` disables forced regeneration entirely: an
-unusable report parks the PR on the first pass. (Before #1099 it escalated on
-the first pass instead. With regeneration disabled the model can never run, so
-that escalation asserted a failure it had no evidence for — the defect #1099
-fixed. The PR does not go dark: the janitor re-runs on every pass and rewrites
-`janitor_ok` / `janitor_failures` on the PR's `state.json` record
-unconditionally, so its actual blocker is always current and readable. A
-`janitor_gate` event is emitted whenever that failure set *changes* — note it is
-change-gated, not per-pass, so read the state record rather than counting
-events.)
-
-Manually running `charlie why-charlie-hate --pr <n>` calls `review()` with the
-budget explicitly disabled (`enforce_regen_budget=False`), so it always attempts
-regeneration and never charges the loop's budget. A human typing a command is
-not the loop the bound defends against.
+The bounded rescue tier (fires only after rework-cycle exhaustion, not on
+every PR) still runs a comparable non-Claude second-opinion pass internally,
+but it is not an operator-invoked workflow — see
+[RUNBOOK.md](RUNBOOK.md#handling-agenthuman-needed-escalations) for how that
+tier's outcome surfaces.
 
 ## Fleet dispatch loop
 
@@ -270,18 +216,7 @@ xdist discipline in
 [RUNBOOK.md](RUNBOOK.md#fleet-cross-repo-dispatch) when running many repos on
 one host.
 
-## Spec-review flow
-
-An explicit, on-demand cross-family pass over a design doc or spec file —
-independent of `cross_family.enabled` (that flag only governs the automatic
-PR-review path) and always runs when invoked:
-
-```powershell
-charlie why-charlie-hate-spec --file docs/SPEC.md
-```
-
-Writes `spec-<slug>-prompt.md` and `spec-<slug>-review.md` under
-`.var/charlie-work/cross-family/`, using the same non-Claude model
-configured under `cross_family.*`. Use this before committing to an
-implementation plan, the same way you'd request a second opinion on a
-design doc from a different reviewer.
+The on-demand `charlie why-charlie-hate-spec` command (an explicit
+cross-family pass over a design doc or spec file, independent of the
+PR-review path above) was deleted along with the rest of this subsystem;
+there is no replacement command for reviewing a standalone spec file.

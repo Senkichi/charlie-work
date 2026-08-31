@@ -132,13 +132,13 @@ class FakeGitHub:
         # Support both old signature (ready_label: str) and new (labels=None, state=None)
         if isinstance(labels, str):
             ready_label = labels
-            return [
+            issues = [
                 issue
                 for issue in self.issues
                 if ready_label in [label["name"] for label in issue.get("labels", [])]
             ]
         elif labels:
-            return [
+            issues = [
                 issue
                 for issue in self.issues
                 if any(
@@ -146,7 +146,25 @@ class FakeGitHub:
                     for label in labels
                 )
             ]
-        return self.issues
+        else:
+            issues = self.issues
+        # Issue #1229: honor the ``state`` parameter when it is explicitly
+        # passed, matching the real ``GitHub.issue_list`` (which the
+        # branch-issue validator calls with ``state="open"``). When ``state``
+        # is None, preserve the pre-#1229 behavior of returning all
+        # label-matched issues — the real client defaults None to "open", but
+        # many existing tests seed ``self.issues`` with CLOSED issues and call
+        # ``issue_list()`` (no state) expecting them back, so narrowing the
+        # default would break them. Callers that need open-only filtering
+        # pass ``state="open"`` explicitly (as the validator does).
+        if state is not None:
+            wanted = state.upper()
+            if wanted == "ALL":
+                return issues
+            issues = [
+                issue for issue in issues if (issue.get("state") or "OPEN").upper() == wanted
+            ]
+        return issues
 
     def issue_view(self, number: int):
         # Return the issue matching the requested number

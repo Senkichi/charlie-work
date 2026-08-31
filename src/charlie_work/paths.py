@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import layout
 from .config import NotifyConfig, OrchestratorConfig
-from .subprocess_runner import hidden_console_kwargs
+from .subprocess_runner import run_captured
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +36,6 @@ class RuntimePaths:
     #: to itself once both call sites are unified, and would false-positive
     #: on a legitimately configured ``claude_code.worktrees_dir`` override.
     worktrees: Path
-    cross_family: Path
 
     def ensure(self) -> None:
         for path in (self.root, self.issues, self.prs, self.dispatches, self.logs):
@@ -46,16 +44,12 @@ class RuntimePaths:
 
 def _resolve_git_path(start: Path, rev_parse_arg: str) -> Path | None:
     """Run ``git rev-parse <rev_parse_arg>`` in *start* and return the resolved path."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", rev_parse_arg],
-            cwd=start,
-            text=True,
-            capture_output=True,
-            check=True,
-            **hidden_console_kwargs(),
-        )
-    except (OSError, subprocess.CalledProcessError):
+    result = run_captured(
+        ["git", "rev-parse", rev_parse_arg],
+        cwd=start,
+        timeout_seconds=30,
+    )
+    if not result.ok:
         return None
     raw = result.stdout.strip()
     if not raw:
@@ -147,20 +141,16 @@ def find_repo_root(cwd: Path | None = None, *, explicit: bool = False) -> Path:
     main_root = _main_worktree_root(start)
     if main_root is not None:
         return main_root
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=start,
-            text=True,
-            capture_output=True,
-            check=True,
-            **hidden_console_kwargs(),
-        )
+    result = run_captured(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=start,
+        timeout_seconds=30,
+    )
+    if result.ok:
         return Path(result.stdout.strip()).resolve()
-    except (OSError, subprocess.CalledProcessError):
-        for candidate in (start, *start.parents):
-            if (candidate / ".git").exists():
-                return candidate
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate
     if explicit:
         raise RepoNotFoundError(f"--repo path is not inside a git work tree: {start}")
     return start
@@ -180,7 +170,6 @@ def runtime_paths(repo_root: Path, state_dir: str) -> RuntimePaths:
         logs=root / layout.LOGS_DIRNAME,
         state_file=layout.state_file_path(root),
         worktrees=layout.worktrees_dir(root),
-        cross_family=layout.cross_family_dir(root),
     )
 
 
@@ -215,7 +204,6 @@ class ResolvedLayout:
     session_results: Path
     reviews_dir: Path
     worktrees: Path
-    cross_family: Path
     notify: NotifyConfig
 
 
@@ -263,7 +251,6 @@ def resolved_layout(config: OrchestratorConfig, repo_root: Path) -> ResolvedLayo
         session_results=session_results,
         reviews_dir=reviews_dir,
         worktrees=worktrees,
-        cross_family=layout.cross_family_dir(root),
         notify=dataclasses.replace(config.notify, file_path=str(notify_file_path)),
     )
 

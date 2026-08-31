@@ -134,11 +134,11 @@ def test_drift_check_passes_for_valid_subset_override(tmp_path: Path) -> None:
     the subset-not-equality direction the issue specifies: equality would
     produce constant false failures and get the check disabled."""
     override = tmp_path / "prompts"
-    # Uses only 3 of the 8 worker keys -- a valid subset.
+    # Uses only 3 of the 9 worker keys -- a valid subset.
     _write_override(
         override,
         "worker.md",
-        "# Work on #$issue_number\n\nBranch: $branch_name\nTier: $worker_model_tier\n",
+        "# Work on #$issue_number\n\nBranch: $branch_name\nURL: $issue_url\n",
     )
     config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir=str(override)))
 

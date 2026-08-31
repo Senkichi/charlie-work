@@ -2879,7 +2879,7 @@ def _worker_kind_from_recovery(recovery: dict[str, Any], config: OrchestratorCon
 
     Returns the most recent ``adapter_history`` entry's ``kind`` (written by
     ``routing.record_adapter_choice`` when api routing is enabled), falling
-    back to ``config.devin.adapter`` when no history is recorded (api routing
+    back to ``config.worker.harness`` when no history is recorded (api routing
     disabled — every worker uses the repo default adapter). Returns ``None``
     only when neither source yields a usable string, which causes
     ``real_activity_for_worker`` to consult all sources as before (issue #639).
@@ -2891,7 +2891,7 @@ def _worker_kind_from_recovery(recovery: dict[str, Any], config: OrchestratorCon
             kind = latest.get("kind")
             if isinstance(kind, str) and kind:
                 return kind
-    default = config.devin.adapter
+    default = config.worker.harness
     if isinstance(default, str) and default:
         return default
     return None
@@ -2969,7 +2969,7 @@ def _probe_recovery_liveness(
     # them would produce permanent "no session found" / "no pid" errors that
     # block recovery forever — "no Devin subject exists" is not "subject
     # exists but could not be read".
-    if resolved_config.devin.adapter == "devin-shell":
+    if resolved_config.worker.harness == "devin-shell":
         started_at = recovery.get("started_at") or recovery.get("dispatched_at") or ""
         pm_config = resolved_config.post_mortem
         now = datetime.now(UTC)
@@ -5149,6 +5149,20 @@ def clean_worktrees(
         if not branch.startswith(config.dispatch.branch_prefix):
             out_of_scope += 1
             continue
+        # Issue #1229 scoping decision: this call site is deliberately NOT
+        # threaded through branch_issue_validator. This is a worktree-cleanup
+        # sweep that resolves worktrees whose PR is EXPECTED to be MERGED or
+        # CLOSED-unmerged (the only states that authorize removal), so the
+        # bound issue is EXPECTED to be closed by the merge -- an open-issue
+        # validator would reject every legitimate binding to its now-closed
+        # issue and break worktree cleanup entirely (the same rationale as the
+        # merged-PR sites in workflow.py). The ``issue_number`` is only a
+        # state.json lookup key used to find a candidate PR number via
+        # ``_find_linked_pr_number``; the actual destructive removal is
+        # fail-closed gated on a live ``gh pr view`` MERGED/CLOSED-unmerged
+        # confirmation of that PR number (state.json is corroboration, never
+        # sufficient on its own), so a stale branch-name binding cannot
+        # authorize removal on its own.
         issue_number = linked_issue_number(
             {"headRefName": branch},
             is_cross_repository=False,

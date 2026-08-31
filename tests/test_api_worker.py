@@ -126,7 +126,6 @@ def _api_worker_config(
         max_concurrent_sessions=1,
         providers={provider_name: provider},
         budget=ApiBudgetConfig(),
-        fallback_adapter="devin-shell",
         worker_template="worker_claude_code.md",
         rework_template="rework.md",
     )

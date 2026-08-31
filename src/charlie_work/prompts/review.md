@@ -18,7 +18,7 @@ You are the senior orchestrator performing a critical, adversarial review. Do no
 
 - PR JSON: `$pr_json_path`
 - Diff patch: `$diff_path`
-$diff_size_section$cross_family_section$janitor_section$prior_review_section
+$diff_size_section$janitor_section$prior_review_section
 ## CI status
 $ci_status_section
 ## Review procedure

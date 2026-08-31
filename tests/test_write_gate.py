@@ -329,3 +329,68 @@ def test_orchestrator_app_write_gate_dry_run_false(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=False)
     assert app.write_gate.dry_run is False
     assert app.write_gate.dry_run == app.dry_run
+
+
+# ---------------------------------------------------------------------------
+# Issue #1324: _record_event centralized onto WriteGate. The forwarding
+# wrapper's body now calls self.write_gate.record_event(...) instead of a
+# bare append_event, so every one of its ~70 call sites is dry-run-gated by
+# construction. These tests verify the centralized gate directly: under
+# dry_run=True, _record_event must perform zero writes to events.db and
+# zero mutation of the in-memory event ring; under dry_run=False it must
+# dual-write as before (events.db row + state.json ring entry).
+# ---------------------------------------------------------------------------
+
+
+def test_record_event_dry_run_true_writes_nothing(tmp_path: Path) -> None:
+    """Issue #1324: _record_event under dry_run=True must not write to
+    events.db or append to the state.json event ring -- the WriteGate
+    invariant ('no event at all under dry-run')."""
+    from charlie_work.instrumentation import event_counts_by_kind
+    from charlie_work.state import empty_state, save_state
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    save_state(paths.state_file, empty_state())
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
+
+    events_before = sum(event_counts_by_kind(paths.state_file).values())
+    state = empty_state()
+    result = app._record_event(state, "test_event", {"key": "value"})
+    events_after = sum(event_counts_by_kind(paths.state_file).values())
+
+    assert events_after == events_before, (
+        f"_record_event under dry_run=True must not write any events.db row "
+        f"(before={events_before}, after={events_after})"
+    )
+    assert result.get("events", []) == [], (
+        "_record_event under dry_run=True must not append to the in-memory event ring"
+    )
+
+
+def test_record_event_dry_run_false_writes_as_before(tmp_path: Path) -> None:
+    """Issue #1324: _record_event under dry_run=False must still dual-write
+    (events.db row + state.json ring entry) -- the gate is a pure
+    passthrough when dry_run is False."""
+    from charlie_work.instrumentation import event_counts_by_kind
+    from charlie_work.state import empty_state, save_state
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    save_state(paths.state_file, empty_state())
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=False)
+
+    events_before = sum(event_counts_by_kind(paths.state_file).values())
+    state = empty_state()
+    result = app._record_event(state, "test_event", {"key": "value"})
+    events_after = sum(event_counts_by_kind(paths.state_file).values())
+
+    assert events_after == events_before + 1, (
+        f"_record_event under dry_run=False must write exactly one events.db row "
+        f"(before={events_before}, after={events_after})"
+    )
+    ring = result.get("events", [])
+    assert len(ring) == 1
+    assert ring[0]["kind"] == "test_event"

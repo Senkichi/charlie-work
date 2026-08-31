@@ -79,7 +79,6 @@ def test_resolved_layout_default_config_matches_historical_literals(tmp_path: Pa
     )
     assert layout_view.reviews_dir == tmp_path / ".var/charlie-work/dispatches/reviews"
     assert layout_view.worktrees == tmp_path / ".var/charlie-work/worktrees"
-    assert layout_view.cross_family == tmp_path / ".var/charlie-work/cross-family"
     assert layout_view.notify.file_path == str(tmp_path / ".var/charlie-work/notify/digest.jsonl")
 
 
@@ -99,7 +98,6 @@ def test_resolved_layout_overridden_state_dir_moves_every_child(tmp_path: Path) 
     assert layout_view.session_results == new_root / "dispatches" / "session-results.json"
     assert layout_view.reviews_dir == new_root / "dispatches" / "reviews"
     assert layout_view.worktrees == new_root / "worktrees"
-    assert layout_view.cross_family == new_root / "cross-family"
     assert layout_view.notify.file_path == str(new_root / "notify" / "digest.jsonl")
 
 
@@ -112,12 +110,10 @@ def test_resolved_layout_explicit_child_override_wins_over_state_dir(tmp_path: P
 
     Every sentinel-style state-child field is set explicitly here, alongside
     an overridden state_dir, and each must resolve to its own explicit value
-    -- NOT nested under the overridden state_dir. ``cross_family`` has no
-    override sentinel of its own (config.py has no ``cross_family_dir``
-    field), so it is asserted as a contrast: it must still derive from the
-    overridden state_dir root, proving the state_dir override itself did
-    take effect and the other fields' independence from it is not an
-    artifact of a no-op override.
+    -- NOT nested under the overridden state_dir. That the state_dir override
+    itself is live (not a no-op) is proven separately by
+    test_resolved_layout_overridden_state_dir_moves_every_child, which sets
+    no per-field overrides at all.
     """
     config = OrchestratorConfig(
         runtime=RuntimeConfig(state_dir="custom-state"),
@@ -139,10 +135,6 @@ def test_resolved_layout_explicit_child_override_wins_over_state_dir(tmp_path: P
     assert layout_view.reviews_dir == tmp_path / "explicit-reviews"
     assert layout_view.worktrees == tmp_path / "explicit-worktrees"
     assert layout_view.notify.file_path == str(tmp_path / "explicit-notify" / "digest.jsonl")
-    # Contrast: no override sentinel exists for cross_family, so it must still
-    # derive from the overridden state_dir root -- proving the state_dir
-    # override is live, not that everything above happened to no-op.
-    assert layout_view.cross_family == tmp_path / "custom-state" / "cross-family"
 
 
 def test_resolve_state_child_absolute_path_does_not_join_repo_root(tmp_path: Path) -> None:

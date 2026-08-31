@@ -79,6 +79,11 @@ class _FakeGitHub:
     def pr_list(self):
         return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "OPEN"]
 
+    def merged_pr_list(self):
+        # Issue #1337: status() fetches merged PRs for the reachability
+        # classifier's mention-coverage map. No merged PRs in these tests.
+        return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "MERGED"]
+
     def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
         return (True, 10000, 0)
 

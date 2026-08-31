@@ -4,7 +4,7 @@ Provides a single implementation of environment sanitization to prevent
 VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT leaks from the orchestrator into
 worker sessions, and to isolate GitHub CLI authentication so workers cannot
 use the orchestrator's stored credentials. Used by claude_code, devin_shell,
-and cross_family adapters.
+and rescue_review's cross-family adapter.
 
 Security (issue #502): workers must not inherit the orchestrator's
 admin-scoped ``GH_TOKEN``/``GITHUB_TOKEN`` (or the GHES equivalents
@@ -337,7 +337,7 @@ def worker_github_token_findings(config: OrchestratorConfig) -> list[WorkerToken
     ``sanitize_env``, never logs a token value. Returns presence as a boolean
     and the variable *name* only.
     """
-    adapter = config.devin.adapter
+    adapter = config.worker.harness
     findings: list[WorkerTokenFinding] = []
 
     if adapter == "devin-shell":

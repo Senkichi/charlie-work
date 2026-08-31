@@ -20,8 +20,8 @@ separately.
                     └─────────────────────────────────────────────┘
   intake ──► dispatch ──► worker session ──► PR ──► review ──► merge-ready
   (issues        │        (Devin / Claude       (adversarial      │
-   labeled       │         Code, one issue       packet, cross-   ├─ merge
-   automated-    │         per session)          family pass)     ├─ labels
+   labeled       │         Code, one issue       review           ├─ merge
+   automated-    │         per session)          packet)          ├─ labels
    ready)        └─ writes worker-prompt.md                       └─ branch
                     + session manifest                               delete
                                                                   (best-effort)
@@ -35,8 +35,7 @@ separately.
 - **Review**: a deterministic **janitor gate** runs first (draft/conflict/red-CI/
   no-issue-link checks) and short-circuits obviously-not-ready PRs before any
   LLM spend. PRs that pass get an adversarial review packet (diff, checks,
-  metadata) and optionally a **cross-family pass** — a non-Claude model (codex
-  via the Devin CLI) attacks the PR; its findings are leads, never merge gates.
+  metadata) for the reviewer to work from.
 - **Merge**: gated on required CI checks + a recorded `approved` decision.
   Branch deletion is remote-only and best-effort — it can never abort the
   merge/label sequence.
@@ -87,7 +86,6 @@ charlie why-charlie-hate --pr 123     # janitor gate → adversarial review pack
 charlie verdict --pr 123 --decision approved --summary-file review.md
 charlie ship-it --pr 123
 charlie bash-rats --limit 3      # intake → dispatch → review → merge in one pass
-charlie why-charlie-hate-spec --file docs/SPEC.md   # cross-family pass on a design doc
 charlie mop-up              # detect label/state drift (--fix to repair)
 charlie fleet status        # aggregate status across every registered repo
 charlie fleet work --limit 3     # dispatch-only wave across all registered repos
@@ -112,7 +110,6 @@ predictable.
 | `charlie intake` | write worker prompts and state for issues already labeled `automated-ready` |
 | `charlie work` | dispatch a dependency-ordered wave of one-issue worker sessions |
 | `charlie why-charlie-hate` | janitor gate + adversarial review packet for a PR |
-| `charlie why-charlie-hate-spec` | cross-family adversarial pass on a design doc |
 | `charlie verdict` | record a review decision (`approved` / `request_changes` / `blocked`) |
 | `charlie ship-it` | merge a PR once it's approved and required checks are green |
 | `charlie bash-rats` | run one pass of intake → work → review → merge |
@@ -184,7 +181,7 @@ the two shipped profiles:
 
 | Profile | Worker runtime | Notes |
 |---|---|---|
-| `orchestrator.config.devin.yaml` | Devin sessions | skills-based worker loop, cross-family review on |
+| `orchestrator.config.devin.yaml` | Devin sessions | skills-based worker loop, no automated reviewer dispatch |
 | `orchestrator.config.claude-code.yaml` | Claude Code | direct-shell worker loop, Claude-only review |
 
 Key knobs: `labels.*` (state-machine label names), `dispatch.default_limit` /
@@ -194,8 +191,7 @@ escalates to `agent:human-needed`), `auto_merge.required_checks` (verify with
 `doctor`), `runtime.prompts_dir` (repo-local template overrides),
 `devin.adapter` (`manual` | `command` | `devin-shell` | `claude-code`),
 `claude_code.*` (worktree/venv settings for the claude-code adapter),
-`cross_family.*` (non-Claude adversarial pass), `test_adequacy.*` (opt-in
-test-adequacy gate), `watchdog.*` (supervisor tripwires: stall/wall-clock/
+`test_adequacy.*` (opt-in test-adequacy gate), `watchdog.*` (supervisor tripwires: stall/wall-clock/
 loop/cost-token budgets, WARN-first by default), `fleet.*`
 (`global_max_concurrent_sessions` — cross-repo worker-count budget),
 `notify.*` (opt-in needs-attention sink: webhook | desktop | shell | file), and
@@ -265,9 +261,14 @@ holds, so a reader can tell "still starved" from "signal stopped working". A
 repo that recovers is dropped from the tracking sidecar so the next episode
 starts a fresh window.
 
-**This repo's own CI check names** (for `auto_merge.required_checks`): `Tests (ubuntu-latest)`,
-`Tests (windows-latest)`, and `Lint`. These correspond to the job `name:` fields in
-`.github/workflows/ci.yml` and are verified by `charlie doctor`.
+**This repo's own CI check names** (for `auto_merge.required_checks`): `Tests` and
+`Lint` — single hosted jobs since the 2026-08-28 hosted-CI return (#1500), no OS
+matrix. These must match the job `name:` fields in `.github/workflows/ci.yml`
+exactly: the merge gate (`checks.py`) compares live check names verbatim, so a
+stale matrix-suffixed entry like `Tests (windows-latest)` would count as
+`missing` forever. Do not rely on `charlie doctor` to catch that case — its
+matrix-suffix tolerance deliberately accepts `Name (suffix)` against a job
+named `Name`, so it fails open when a matrix has been collapsed.
 
 **Worker adapters** (`devin.adapter`): `manual` writes a session manifest for
 the operator to paste; `command` runs a blocking per-issue launcher;
@@ -301,7 +302,8 @@ session dispatch manifest/results. All JSON writes are atomic
 ## Provenance
 
 Unioned from two production forks (June–July 2026) of sibling repos: one
-contributed cross-family review and `why-charlie-hate-spec`; the other
+contributed the (since-removed) cross-family review pass and
+`why-charlie-hate-spec` command; the other
 contributed `--issues` wave dispatch, the `gh pr merge` stdout fix, and the
 worktree/branch-deletion failure report that drove the decoupled merge
 sequence.
