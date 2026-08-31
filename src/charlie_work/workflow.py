@@ -1556,21 +1556,6 @@ def operator_queue_depth(state: dict[str, Any]) -> set[int]:
     return queued
 
 
-def _build_branch_issue_validator(
-    gh: GitHubLike,
-) -> Callable[[int], bool] | None:
-    """Build a validator for branch-name-derived issue numbers (issue #1229).
-
-    Thin delegate to ``github.build_branch_issue_validator`` -- the
-    single-point-of-enforcement constructor lives there so the open-number
-    extraction is shared with ``build_branch_issue_validator_from_issues``
-    (used by ``reconcile.detect_drift``'s snapshot-derived validator). See
-    that function's docstring for the full rationale (fail-open on API
-    outage, ``_LIST_LIMIT`` tradeoff, per-pass caching).
-    """
-    return build_branch_issue_validator(gh)
-
-
 def _detect_and_handle_orphaned_workers(
     sessions_dir: Path,
     state_file: Path,
@@ -1658,7 +1643,7 @@ def _detect_and_handle_orphaned_workers(
     # binding would populate pr_by_issue[<wrong n>] and either mask a real
     # orphan's no-open-PR reclaim (the orphan is wrongly seen as "has a PR")
     # or route the #417 ground-truth label reclaim at the wrong issue subject.
-    branch_validator = _build_branch_issue_validator(gh)
+    branch_validator = build_branch_issue_validator(gh)
     for pr in prs:
         linked = linked_issue_number(
             pr,
@@ -4673,6 +4658,18 @@ class OrchestratorApp:
         for pr in merged_prs:
             if str(pr.get("state") or "").upper() != "MERGED":
                 continue
+            # Issue #1229 scoping decision: this call site is deliberately NOT
+            # threaded through branch_issue_validator. ``bound_issue_numbers``
+            # only gates which CLOSED ready issues have a merged PR binding
+            # them (so they are not stripped as closed-unmerged); no
+            # issue-label transition or state escalation keys off it. A stale
+            # branch-name binding can at worst add a wrong number to
+            # ``bound_issue_numbers``, causing a missed label-strip on an
+            # already-CLOSED (terminal) issue that the next pass recovers --
+            # not the "escalate the wrong issue" failure class the validator
+            # exists to prevent. (Contrast ``detect_mergequeue_wedged``, whose
+            # ``issue_number`` DOES drive ``_escalate_issue`` and is
+            # validator-threaded.)
             bound = linked_issue_number(
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
@@ -21508,14 +21505,33 @@ class OrchestratorApp:
     def _make_branch_issue_validator(self) -> Callable[[int], bool] | None:
         """Build a validator for branch-name-derived issue numbers (issue #1229).
 
-        Thin delegate to the module-level ``_build_branch_issue_validator`` so
-        the rework-routing call sites and the module-level sweeps
-        (``_detect_and_handle_orphaned_workers``,
-        ``_classify_dead_sessions_and_update_throttle_state``) share one
-        construction path — see that function for the open-issue fetch,
-        failure handling, and ``_LIST_LIMIT`` tradeoff.
+        Facade re-export of ``github.build_branch_issue_validator`` -- the
+        single-point-of-enforcement constructor lives there so the open-number
+        extraction is shared with ``build_branch_issue_validator_from_issues``
+        (used by ``reconcile.detect_drift``'s snapshot-derived validator) and
+        cannot diverge between the rework-routing call sites and the
+        module-level sweeps (``_detect_and_handle_orphaned_workers``,
+        ``_classify_dead_sessions_and_update_throttle_state``). See
+        ``github.build_branch_issue_validator``'s docstring for the full
+        rationale (fail-open on API outage, ``_LIST_LIMIT`` tradeoff,
+        per-pass caching).
+
+        Issue #1229 rework note: the prior module-level
+        ``_build_branch_issue_validator`` delegate was a pure one-line
+        pass-through to ``github.build_branch_issue_validator``. It was
+        collapsed into its real home (``github.py``) rather than relocated to
+        ``checks.py`` because ``github.py`` already imports from ``checks.py``
+        at module load (``from .checks import _run_id_from_link``), so
+        ``checks.py`` importing ``build_branch_issue_validator`` back at
+        module level would create a circular import; a lazy import would
+        couple a CI-check-classification module to an unrelated concern for
+        zero behavioral benefit. Calling ``github.build_branch_issue_validator``
+        directly shrinks the workflow monolith more than relocating the
+        delegate would, and this method remains as the in-class facade so
+        the nine ``self._make_branch_issue_validator()`` call sites are
+        unchanged.
         """
-        return _build_branch_issue_validator(self.gh)
+        return build_branch_issue_validator(self.gh)
 
     def _render_issue_comments(self, issue: dict[str, Any]) -> str:
         """Render the ``$issue_comments`` slot for a worker prompt (issue #872).
@@ -21883,6 +21899,17 @@ class OrchestratorApp:
                 and not override_authorized
                 and not queue_sync_covered
             ):
+                # Issue #1229 scoping decision: this call site is deliberately
+                # NOT threaded through branch_issue_validator. The resolved
+                # ``issue_number`` is attached to the unauthorized-merge
+                # finding dict for correlation/reporting only; the finding is
+                # keyed off ``pr_number`` and the review-decision mismatch,
+                # and no issue-label transition or state escalation keys off
+                # the ``issue`` field. A stale branch-name binding can at
+                # worst mislabel the finding's ``issue`` field, not escalate
+                # the wrong issue. (Contrast ``detect_mergequeue_wedged``,
+                # whose ``issue_number`` DOES drive ``_escalate_issue`` and is
+                # validator-threaded.)
                 issue_number = linked_issue_number(
                     pr,
                     is_cross_repository=pr.get("isCrossRepository"),

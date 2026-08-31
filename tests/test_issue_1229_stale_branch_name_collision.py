@@ -835,3 +835,161 @@ def test_detect_drift_launch_stalled_stale_branch_does_not_mask_relabel(
         f"session_failed_relabeled for #709 should have pr_number=None "
         f"(no open PR for #709), got {relabeled[0].pr_number}"
     )
+
+
+def test_detect_mergequeue_wedged_stale_branch_does_not_escalate_wrong_issue(
+    tmp_path: Path,
+) -> None:
+    """Issue #1229: a stale branch name on a mergequeue-wedged PR must not
+    escalate the wrong (closed) issue through ``_escalate_issue``.
+
+    Mirrors ``test_detect_drift_launch_stalled_stale_branch_does_not_mask_relabel``
+    but exercises ``reconcile.detect_mergequeue_wedged`` -- the one
+    ``reconcile.py`` call site whose ``issue_number`` drives an issue-level
+    escalation (``_escalate_issue`` + ``gh.add_issue_label``/
+    ``gh.remove_issue_label`` in ``apply_fixes``'s ``mergequeue_wedged``
+    branch). The PR body claims this site is validator-threaded; this test
+    proves the threading actually rejects a stale binding rather than
+    fail-opening, which the pre-existing wedged tests cannot: they use
+    ``_reconcile_fixtures.FakeGitHub``, which omits ``issue_list``, so
+    ``build_branch_issue_validator`` catches the ``AttributeError`` and
+    returns ``None`` (fail-open) -- the validator never rejects anything.
+
+    Scenario: PR #1660 carries ``mergequeue`` + Aviator ``blocked`` with
+    ``aviator/checks`` completed FAILURE and a genuinely failing non-aviator
+    check (trigger 1). Its branch is ``agent/issue-709-...`` -- a stale name
+    left over from a merged PR #709. Issue #709 is CLOSED (present in the
+    issues list but filtered out by ``issue_list(state="open")``); #1234 is
+    OPEN so the validator's open set is non-empty (proving the rejection is
+    state-filtering, not an empty-set artifact). Without the validator,
+    ``linked_issue_number`` returns 709, the drift item carries
+    ``issue_number=709``, and ``apply_fixes`` escalates the closed #709 (adds
+    ``human_needed``, writes ``state["issues"]["709"]["status"]="escalated"``)
+    -- corrupting an unrelated issue's lifecycle. With the validator, 709 is
+    not in the open-issue set, the binding is rejected, the drift item carries
+    ``issue_number=None``, and ``apply_fixes`` skips the escalation entirely
+    while still stripping ``mergequeue`` from the PR.
+
+    Mutation check: removing ``branch_issue_validator=branch_validator`` from
+    the ``linked_issue_number`` call in ``detect_mergequeue_wedged`` (and the
+    ``branch_validator = build_branch_issue_validator(gh)`` line) causes
+    ``item.issue_number`` to read 709 and ``apply_fixes`` to escalate #709 --
+    the ``issue_number is None`` and ``"709" not in new_state["issues"]``
+    assertions fail.
+    """
+    from dataclasses import replace
+
+    from _reconcile_fixtures import FakeGitHub as ReconcileFakeGitHub
+    from _reconcile_fixtures import _issue, _pr
+    from charlie_work.reconcile import (
+        AVIATOR_CHECK_NAME,
+        apply_fixes,
+        detect_mergequeue_wedged,
+    )
+    from charlie_work.state import empty_state
+
+    class _ReconcileFakeGitHubWithIssueList(ReconcileFakeGitHub):
+        """Reconcile-pass fake that also implements ``issue_list``.
+
+        The base ``_reconcile_fixtures.FakeGitHub`` omits ``issue_list``, so
+        ``build_branch_issue_validator`` catches the ``AttributeError`` and
+        returns ``None`` (fail-open). This subclass honors the ``state``
+        filter so the validator actually runs and a stale branch-name number
+        can be proven rejected rather than trusted by default.
+        """
+
+        def issue_list(self, labels=None, state=None):
+            issues = self._issues
+            if state is not None:
+                wanted = state.upper()
+                if wanted != "ALL":
+                    issues = [i for i in issues if (i.get("state") or "OPEN").upper() == wanted]
+            return issues
+
+    config = replace(
+        OrchestratorConfig(),
+        auto_merge=replace(
+            OrchestratorConfig().auto_merge,
+            mergequeue_label="mergequeue",
+            mergequeue_wedge_hours=24.0,
+        ),
+    )
+    # PR #1660: mergequeue-wedged (trigger 1) with a stale branch referencing
+    # CLOSED issue #709. Same-repo so the branch-name path is trusted without
+    # the validator.
+    pr = {
+        **_pr(
+            1660,
+            "OPEN",
+            head_ref="agent/issue-709-stale-branch-from-merged-pr",
+        ),
+        "headRefOid": "sha-1660",
+        "labels": [{"name": "mergequeue"}, {"name": "blocked"}],
+    }
+    gh = _ReconcileFakeGitHubWithIssueList(
+        prs=[pr],
+        # #709 is CLOSED and present: ``issue_list(state="open")`` filters it
+        # out, so the validator rejects 709. #1234 is OPEN so the open set is
+        # non-empty -- proving the rejection is state-filtering, not an
+        # empty-set artifact.
+        issues=[
+            _issue(709, [], state="CLOSED"),
+            _issue(1234, [], state="OPEN"),
+        ],
+    )
+    gh.check_runs_by_sha["sha-1660"] = [
+        {
+            "id": 1,
+            "name": AVIATOR_CHECK_NAME,
+            "status": "completed",
+            "conclusion": "failure",
+            "output": {},
+        },
+        {
+            "id": 2,
+            "name": "Tests passed",
+            "status": "completed",
+            "conclusion": "failure",
+            "output": {},
+        },
+    ]
+
+    drift = detect_mergequeue_wedged(gh, config, empty_state())
+
+    # Trigger 1 fired: the wedge was detected (not vacuously empty), so the
+    # issue_number assertion below is meaningful.
+    assert len(drift) == 1, (
+        f"expected one mergequeue_wedged drift item, got {len(drift)}: "
+        f"{[(d.kind, d.issue_number, d.pr_number) for d in drift]}"
+    )
+    item = drift[0]
+    assert item.kind == "mergequeue_wedged"
+    assert item.pr_number == 1660
+    # The stale branch-name binding to CLOSED #709 was rejected.
+    assert item.issue_number is None, (
+        f"stale branch name bound wedged PR #1660 to CLOSED issue #709: "
+        f"linked_issue_number returned {item.issue_number}"
+    )
+    assert item.add_labels == (), (
+        f"wedged drift for stale-branch PR should carry no escalation labels, "
+        f"got add_labels={item.add_labels}"
+    )
+    assert item.remove_labels == ("mergequeue",)
+
+    # Prove the rejected binding does not reach _escalate_issue: apply the
+    # fixes and assert no issue-level escalation of #709 happens, while the
+    # PR-level strip of mergequeue still does.
+    new_state = apply_fixes(gh, empty_state(), drift, config)
+
+    assert (709, config.labels.human_needed) not in gh.labels_added, (
+        f"apply_fixes escalated CLOSED issue #709 via gh.add_issue_label: {gh.labels_added}"
+    )
+    assert "709" not in new_state.get("issues", {}), (
+        f"apply_fixes wrote an escalated state entry for CLOSED issue #709: "
+        f"{new_state.get('issues', {})}"
+    )
+    # The PR-level fix still fires: mergequeue is stripped from the wedged PR
+    # regardless of whether a linked issue was resolvable.
+    assert (1660, "mergequeue") in gh.pr_labels_removed, (
+        f"apply_fixes did not strip mergequeue from wedged PR #1660: {gh.pr_labels_removed}"
+    )
