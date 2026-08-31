@@ -58,6 +58,7 @@ from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
     PostMortemConfig,
+    WorkerRoleConfig,
     WorktreeReclamationConfig,
 )
 from charlie_work.devin_shell import SessionRecord
@@ -139,7 +140,9 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
     test proves R6a's design actually protects a live orphan-sweep call
     site end-to-end.
     """
-    config = OrchestratorConfig(devin=DevinConfig(adapter="devin-shell"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(), worker=WorkerRoleConfig(harness="devin-shell")
+    )
     real_run = subprocess.run
 
     # Positive control: dry_run=False, separate directory, before any
@@ -220,7 +223,8 @@ def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path
     this function's own conversion are real, not merely that the classify
     lane (test 3 below) is gated."""
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
 
     def _seed(root: Path) -> Path:
@@ -376,9 +380,9 @@ def test_classify_dead_sessions_worker_blocked_escalation_dry_run_true_writes_no
                 required_checks=("Tests passed", "Lint & Format", "Pre-commit")
             ),
             devin=DevinConfig(
-                adapter="command",
                 dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
             ),
+            worker=WorkerRoleConfig(harness="command"),
             post_mortem=PostMortemConfig(db_path=str(db_path)),
         )
         paths = runtime_paths(root, config.runtime.state_dir)
@@ -525,9 +529,9 @@ def test_loop_dry_run_true_leaks_no_writes_through_the_three_1311_call_sites(
                 required_checks=("Tests passed", "Lint & Format", "Pre-commit")
             ),
             devin=DevinConfig(
-                adapter="command",
                 dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
             ),
+            worker=WorkerRoleConfig(harness="command"),
             # Issue #1311 scoping: _maybe_deescalate_mechanical and
             # _maybe_reclaim_worktrees (both called later in _loop_body,
             # both unrelated to the three named call sites this test

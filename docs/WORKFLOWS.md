@@ -16,7 +16,7 @@ scope caveat in
 
 ## (a) Devin manual adapter loop
 
-The operator-confirmed default (`devin.adapter: manual` — either shipped
+The operator-confirmed default (`worker.harness: manual` — either shipped
 example profile). No subprocess launches a worker; you paste the rendered
 prompt into a Devin session by hand.
 
@@ -81,7 +81,7 @@ charlie bash-rats --limit 3
 
 ## (b) Devin shell adapter loop
 
-Set `devin.adapter: devin-shell` (as in
+Set `worker.harness: devin-shell` (as in
 `examples/orchestrator.config.devin.yaml`). Non-blocking, headless:
 `launch_devin_session()` spawns `devin --prompt-file <path> --print` via
 `Popen` and returns immediately, writing a sidecar JSON
@@ -120,7 +120,7 @@ this adapter (see
 
 ## (c) Claude Code worktree adapter loop
 
-Set `devin.adapter: claude-code` (as in
+Set `worker.harness: claude-code` (as in
 `examples/orchestrator.config.claude-code.yaml`).
 Each worker gets an isolated git worktree (via `worktree.create_worktree()`,
 junction-linked to a shared `.venv` when `venv_source` is given) and a
