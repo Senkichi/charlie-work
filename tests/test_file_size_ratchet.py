@@ -119,7 +119,13 @@ _EXTRACTION_REMEDY = (
     ".stalled_review_reap `from .X import (...)  # noqa: F401 (deliberate "
     "re-export)` blocks at the top of src/charlie_work/workflow.py). A "
     "byte-identical extraction shrinks the source file and passes this ratchet "
-    "trivially. To record a deliberate, reviewed exception (e.g. a new "
+    "trivially. After the extraction, run "
+    "`python scripts/refresh_file_size_ratchet.py` and commit the resulting "
+    "`file_size_ratchet_baseline.json` tightening in this PR -- the script's "
+    "default mode is lower-only (never raises a mark), so it is safe to run "
+    "mid-PR: same-bucket shrinks produce no diff, and cross-bucket shrinks "
+    "write the deterministic quantized value, so concurrent shrink PRs "
+    "converge byte-identically (#1495). To record a deliberate, reviewed exception (e.g. a new "
     "extraction that is itself over the cap), edit "
     "file_size_ratchet_baseline.json directly as a reviewed change in the PR. "
     "When raising a mark, raise it to the NEXT MULTIPLE OF 200 (MARK_QUANTUM) "
@@ -419,3 +425,20 @@ def test_synthetic_plus_one_to_real_workflow_py_trips_check() -> None:
     assert _file_size_violations({path: at_mark + 1}, {path: mark}, FILE_SIZE_CAP) == [
         (path, mark, at_mark + 1)
     ], "a +1 line past workflow.py's at-mark position did not trip the ratchet"
+
+
+def test_extraction_remedy_names_refresh_script() -> None:
+    """Issue #1496: the keystone's extraction remedy text (shown to a worker
+    when a growth violation forces an extraction) must instruct them to run
+    the refresh script in the same PR, so a shrink that fixes the violation
+    also tightens the baseline instead of leaving a stale-high mark. Without
+    this, the only tightening lane is a manual refresh run nothing schedules."""
+    assert "refresh_file_size_ratchet.py" in _EXTRACTION_REMEDY, (
+        "the extraction remedy text must name scripts/refresh_file_size_ratchet.py "
+        "so a worker fixing a growth violation tightens the baseline in the same PR"
+    )
+    assert "file_size_ratchet_baseline.json" in _EXTRACTION_REMEDY
+    assert "lower-only" in _EXTRACTION_REMEDY, (
+        "the safety rationale (lower-only, never raises) must travel with the "
+        "instruction so it is not stripped as a risky mid-PR side effect"
+    )
