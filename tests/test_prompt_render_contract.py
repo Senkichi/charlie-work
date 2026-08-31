@@ -55,9 +55,8 @@ def _template_placeholders(template_name: str) -> set[str]:
     ``$section_*`` partials it pulls in.
 
     A partial can itself reference placeholders (e.g. ``issue_metadata.md``
-    references ``$issue_number``/``$issue_title``/``$issue_url``/
-    ``$worker_model_tier``) that the *top-level* template text never
-    mentions directly. ``render_prompt``'s own strict check
+    references ``$issue_number``/``$issue_title``/``$issue_url``) that the
+    *top-level* template text never mentions directly. ``render_prompt``'s own strict check
     (``prompts.py:87-96``) resolves exactly this expanded set against the
     caller's supplied values, so a contract test that only looked at the
     top-level template's own identifiers would miss a partial that drifted
