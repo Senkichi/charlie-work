@@ -117,6 +117,10 @@ watchdog:
     assert config.watchdog.worktree_mtime_exclude_dirs == (".git", ".venv")
 
 
+def test_dispatch_config_has_no_worker_model_tier_field() -> None:
+    assert not hasattr(DispatchConfig(), "worker_model_tier")
+
+
 def test_dispatch_config_injected_paths_default_excludes_injected_files() -> None:
     """Issue #381/#400/#989: default injected_paths exclude the in-worktree Claude Code prompt file and both protocol markers."""
     from charlie_work.config import (
@@ -2603,9 +2607,14 @@ def test_build_config_from_data_no_deprecations_for_pure_new_style_config() -> N
     assert cfg.deprecations == ()
 
 
-def test_build_config_from_data_worker_model_tier_presence_is_deprecated() -> None:
-    cfg = build_config_from_data({"dispatch": {"worker_model_tier": "capable"}})
-    assert any("dispatch.worker_model_tier is deprecated" in msg for msg in cfg.deprecations)
+def test_build_config_from_data_worker_model_tier_key_is_rejected() -> None:
+    """``dispatch.worker_model_tier`` was a pure deletion (Phase 2 Task 2, no
+    migration target), not a dual-accept rename -- so its presence is no
+    longer a soft deprecation warning. It falls straight through to
+    ``_build_section``'s generic unknown-key rejection, same as any other
+    key a section's dataclass doesn't declare."""
+    with pytest.raises(ConfigError, match=r"unknown key\(s\) in config section 'dispatch'"):
+        build_config_from_data({"dispatch": {"worker_model_tier": "capable"}})
 
 
 def test_build_config_from_data_fallback_adapter_presence_is_deprecated() -> None:

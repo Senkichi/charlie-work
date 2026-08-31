@@ -271,7 +271,6 @@ class LabelConfig:
 class DispatchConfig:
     default_limit: int = 3
     branch_prefix: str = "agent/issue"
-    worker_model_tier: str = "capable"
     # Package template rendered for worker prompts. "worker.md" targets Devin
     # sessions (skills-based loop); "worker_claude_code.md" targets Claude Code
     # workers (direct shell loop). A repo-local prompts dir overrides by filename.
