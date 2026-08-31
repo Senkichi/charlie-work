@@ -70,7 +70,7 @@ hours from the ring alone, you are reading roughly the most recent 9% of history
 | `agent:needs-rework` | `verdict --decision request_changes`, under the rework cap. | `verdict` → event `rework_requested`. |
 | `agent:blocked` | `verdict --decision blocked` — a product/security decision is needed. | `verdict` → event `blocked`. |
 | `agent:done` | PR merged via `ship-it`. Every `active` label is removed in the same transition. | `ship-it` → event `merged`. |
-| `agent:human-needed` | `blocked`, the rework cap exhausted, or the cross-family regeneration budget exhausted. Terminal — no further automation happens until a human clears it. | `verdict` → event `escalated`/`blocked`, or `loop()` → event `cross_family_report_regen_exhausted`. |
+| `agent:human-needed` | `blocked` or the rework cap exhausted. Terminal — no further automation happens until a human clears it. | `verdict` → event `escalated`/`blocked`. |
 
 Legal transitions are exactly `labels.py`'s `_edges()` table — see the
 mermaid diagram in
@@ -88,11 +88,8 @@ internalizing operationally:
 
 ## Handling `agent:human-needed` escalations
 
-An issue lands on `agent:human-needed` for one of three reasons. The first
-two are recorded in `review-decision.json` under
-`.var/charlie-work/prs/pr-<n>/`; the third is raised by `loop()` itself,
-before any reviewer produces a decision file, so check
-`state["issues"][<n>]["escalation_reason"]` in `state.json` instead:
+An issue lands on `agent:human-needed` for one of two reasons, both recorded
+in `review-decision.json` under `.var/charlie-work/prs/pr-<n>/`:
 
 1. **Explicit block** (`"decision": "blocked"`) — a reviewer decided a
    product or security call is needed before more automation should touch
@@ -104,24 +101,6 @@ before any reviewer produces a decision file, so check
    without converging. This usually means the issue brief was wrong,
    ambiguous, or the acceptance criteria are unimplementable as written —
    not that "one more rework round" will fix it.
-3. **Cross-family regeneration budget exhausted**
-   (`escalation_reason == "cross_family_report_unusable"`, `reason_class ==
-   "judgment"`) — the cross-family model **ran** `cross_family.max_regen_attempts`
-   times (default `2`) against the PR's *current* head SHA and the report was
-   still unusable each time (an `(UNAVAILABLE)` failure stub, or one with no
-   head-SHA marker). The budget is per head, not per PR lifetime — a new push
-   starts a fresh budget, since the new head has never been tried. Unlike the
-   rework cap, this never ends in a caveated `approved`: an unconfirmed
-   cross-family head must never pass as reviewed, so it escalates instead (see
-   [ARCHITECTURE.md](ARCHITECTURE.md#invariants)).
-
-   Since #1099 this reason means the model genuinely ran and failed. It used to
-   also fire for PRs whose model had never been invoked once — `review()`
-   returned at the janitor gate long before the regenerator, and the budget was
-   charged anyway. If you are triaging escalations created **before** #1099
-   shipped, check `events.db` for a `cross_family_report_regen_forced` row for
-   that PR with no corresponding model activity: those are false escalations,
-   and the PR's real blocker is whatever its `janitor_gate` payload names.
 
 **Recovery**: fix the underlying problem (rewrite the issue, resolve the
 product ambiguity, or manually push a fix to the PR branch yourself), then
@@ -132,40 +111,11 @@ either:
   routes straight to `ship-it` eligibility, or
 - Manually swap `agent:human-needed` back to `agent:reviewing` (or
   `agent:needs-rework`) on GitHub and re-run `charlie why-charlie-hate --pr <n>` to
-  regenerate a fresh packet before deciding again. For reason 3 specifically,
-  this is enough on its own, and stays so after #1099 moved the budget claim
-  into the regenerator: `charlie why-charlie-hate` passes
-  `enforce_regen_budget=False`, so the manual re-run gets a fresh attempt and
-  charges nothing. `charlie unescalate` additionally clears the PR's
-  `cross_family_regen` record outright, so the automated loop gets a fresh
-  budget too — without that the re-arm would be inert, with `loop()` reading
-  the spent counters and parking the PR again on its very next pass.
+  regenerate a fresh packet before deciding again.
 
 There is no automatic un-escalation — a human decision, once escalated,
 requires a human (or an explicit re-`verdict`) to move the issue
 forward again.
-
-### A PR making no progress with no `agent:human-needed` label
-
-Escalation is not the only terminal-ish state. A PR whose cross-family report is
-unusable **and** whose `review()` never reaches the regenerator is *parked*
-after `cross_family.max_regen_attempts` passes: no escalation, no label, and the
-report simply stops forcing `review()` on its own (issue #1099). This is by
-design — the model was never invoked, so there is nothing to escalate *about*,
-and parking self-heals on the next push.
-
-To confirm that is what you are looking at:
-
-```powershell
-.venv\Scripts\python.exe -c "from pathlib import Path; from charlie_work.instrumentation import query_events; s=Path('.var/charlie-work/state.json'); [print(e['ts'], e['kind'], e['payload']) for k in ('cross_family_regen_not_reached','janitor_gate') for e in query_events(s, kind=k, pr_number=<n>)]"
-```
-
-The `cross_family_regen_not_reached` payload carries `not_reached` and
-`max_attempts`; the `janitor_gate` payload names the PR's **actual** blocker,
-which is what to fix. Merge conflicts and missing required checks are the
-overwhelming majority. Fixing that and pushing resets both budgets, since the
-record is keyed by head SHA. A park with no accompanying `janitor_gate` event is
-worth investigating — it means `review()` returned somewhere else.
 
 ## Corrupt-state quarantine recovery
 
@@ -378,8 +328,8 @@ review gate is the only sanctioned path to `main`, so a worker that inherits the
 orchestrator's admin-scoped credentials can bypass review entirely by running
 `gh pr merge` itself.
 
-`sanitize_env()` (`env_sanitize.py`, shared by the `devin-shell`, `claude-code`,
-and `cross-family` adapters) closes both channels `gh` uses to resolve an
+`sanitize_env()` (`env_sanitize.py`, shared by the `devin-shell` and `claude-code`
+adapters) closes both channels `gh` uses to resolve an
 identity:
 
 - **Environment tokens.** `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, and
@@ -687,15 +637,17 @@ provider environment injected so any **Anthropic-compatible** paid-API endpoint
 entire launch/supervision stack is reused — `api_worker.launch_api_worker`
 delegates to `claude_code.launch_claude_worker` with `adapter_kind="api"`, so
 sidecars land as `issue-<n>.api.json`, the watchdog/supervisor treats api
-workers like any other, and dead-worker reconciliation is unchanged. Routing is
-per-issue (not global per repo): reworks and `complexity:high` first-pass issues
-go to the api worker; everything else goes to the default adapter.
+workers like any other, and dead-worker reconciliation is unchanged. Selection
+is whole-pass, not per-issue: set `worker.harness: api` and every issue this
+pass dispatches uses the api worker. (Phase 2 of the role-config refactor
+deleted the per-issue routing/fallback layer that used to send only reworks
+and `complexity:high` first-pass issues to api — see the budget-exhaustion
+note below for the one open question that deletion left.)
 
 Design reference: [docs/design/api-worker-adapter.md](design/api-worker-adapter.md).
 The config dataclasses are `ApiWorkerConfig`, `ApiProviderConfig`, and
-`ApiBudgetConfig` in `config.py`; the ledger is `api_budget.py`; routing is
-`routing.py`. This section is verified against those modules, not the design
-spec.
+`ApiBudgetConfig` in `config.py`; the ledger is `api_budget.py`. This section
+is verified against those modules, not the design spec.
 
 ### Enabling the api worker per repo
 
@@ -721,7 +673,6 @@ api_worker:
     preflight_reserve_usd: 1.00     # headroom estimate while per-session cap is unset
     max_usd_per_day: 5.00           # daily USD ceiling
     lifetime_usd: 15.00             # lifetime USD ceiling (trial ceiling; raise post-trial)
-  fallback_adapter: devin-shell     # adapter used when an api preflight check fails
   worker_template: worker_claude_code.md
   rework_template: rework.md
 ```
@@ -787,10 +738,9 @@ measure first:
 1. **Enable** the api worker (above) with `max_usd_per_session: 0`, conservative
    `max_usd_per_day` and `lifetime_usd`, and `preflight_reserve_usd` set to a
    headroom estimate (default `1.00`).
-2. **Route two issues through the api worker.** Reworks route to api
-   automatically (`policy:rework`); a first-pass issue routes to api when it
-   carries the `complexity:high` label (`policy:complexity`). Let both sessions
-   run to completion.
+2. **Dispatch two issues with `worker.harness: api` set.** Every issue this
+   pass dispatches uses the api worker — there is no per-issue routing left to
+   trigger. Let both sessions run to completion.
 3. **Read their ledger entries** in `.var/charlie-work/api-budget.json` under
    `sessions`. Each entry records `issue`, `session_id`, `provider`, `model`,
    `started_at`, `ended_at`, `input_tokens`, `output_tokens`, `cached_tokens`,
@@ -805,16 +755,10 @@ measure first:
    Starting guideline: **~1.5× the max `usd` of a healthy session**. Put the
    override in the per-repo (or global) config and reload.
 
-**How daily/lifetime caps protect spend while the per-session cap is unset.**
-With `max_usd_per_session: 0`, the preflight still enforces `max_usd_per_day`
-and `lifetime_usd` every launch: a new api launch is refused when
-`spent_today + reserve > max_usd_per_day` or when lifetime spend has reached
-`lifetime_usd`, and routing falls back to `fallback_adapter` with
-`fallback:budget` (recorded in `adapter_history`). The `reserve` used for the
-daily headroom check is `max_usd_per_session` when set, otherwise
-`preflight_reserve_usd` — that is the conservative stand-in during the
-calibration window. So even with the per-session cap dormant, a runaway day or a
-blown lifetime ceiling still trips and diverts to the fallback adapter.
+**Daily/lifetime caps while the per-session cap is unset.** With
+`max_usd_per_session: 0`, `budget.max_usd_per_day` and `budget.lifetime_usd`
+are the only caps in play — see the budget-exhaustion note below for what
+currently enforces them.
 
 ### Budget operations
 
@@ -834,16 +778,20 @@ Get-Content .var\charlie-work\api-budget.json | ConvertFrom-Json
 Today's spend is `days[<UTC date>].usd`; lifetime is `lifetime_usd`;
 per-session detail is `sessions` (the calibration source).
 
-**What happens at daily/lifetime exhaustion.** Routing's api preflight
-(`routing._api_preflight`) runs before every api launch in order: `enabled` →
-`auth` → `budget` → `cooldown` → `concurrency`. When
-`spent_today + reserve > max_usd_per_day` **or** lifetime spend has reached
-`lifetime_usd`, the preflight returns `fallback:budget` and the issue is routed
-to `fallback_adapter` (default `devin-shell`) instead. The choice is appended to
-that issue's `adapter_history` in `state.json` as
-`{ts, kind, provider, reason}` with `reason: "fallback:budget"` (see Reading
-routing decisions). No api launch happens until headroom returns (a new UTC day
-for the daily cap; a raised `lifetime_usd` for the lifetime cap).
+**What happens at daily/lifetime exhaustion — a known open gap.** Before the
+role-config refactor's Phase 2, a preflight in the now-deleted per-issue
+routing layer (`routing._api_preflight`) refused a new api launch once
+`spent_today + reserve > max_usd_per_day` or lifetime spend reached
+`lifetime_usd`, falling back to a different adapter for that issue. That
+preflight lived nowhere else — it was called only from the routing-selection
+path Phase 2 deletes wholesale (per-issue routing is gone; the api adapter is
+now selected for a whole pass via `worker.harness: api`, not per issue), and
+no replacement pre-launch budget check was introduced in its place. Until a
+follow-up adds one, `days[<date>].usd`/`lifetime_usd` in the ledger are
+monitoring figures only (`doctor` / `fleet status`'s attention digest can
+surface them) — dispatching a pass with `worker.harness: api` set does not
+itself stop at either cap. A follow-up issue should be filed for this gap
+before relying on an automatic cutoff in production.
 
 **Raising caps.** Edit `budget.max_usd_per_day` and/or `budget.lifetime_usd` in
 config (global or per-repo) and reload. There is no ledger reset — raising
@@ -880,9 +828,11 @@ is killed via the shared `kill_process_tree` helper (orphan processes swept
 too), the sidecar is marked `failure_kind: "budget_exceeded"` via an atomic
 write, and a `session_budget_exceeded` event is appended to `state.json`. The
 killed session then flows through the **existing** dead-worker reconciliation
-on the next pass: with-PR → review/rework; without-PR → re-dispatch via
-`routing.select_adapter`, whose preflight naturally decides api-again vs.
-fallback. When the cap is `0`/unset the check is entirely dormant (no cost
+on the next pass: with-PR → review/rework; without-PR → re-dispatched using
+the pass's configured worker harness — unconditionally api again if
+`worker.harness: api` is still set, since Phase 2 removed the per-issue
+fallback that used to try a different harness here. When the cap is `0`/unset
+the check is entirely dormant (no cost
 computation beyond what settlement already does). Non-api workers are never
 budget-evaluated.
 
@@ -894,9 +844,12 @@ throttle markers so a dead key is never mislabeled as a throttle). On a match,
 reusing the existing `throttled_until` state mechanism
 (`state.set_throttled_until`) with the quota-exhaustion constant — **24 hours**,
 not the 15-minute rate-limit window, because a dead key will not self-heal.
-While `throttled_until` is in the future, `routing._api_preflight` returns
-`fallback:cooldown` and the issue routes to `fallback_adapter`; the dispatch
-throttle gate also defers. Recovery:
+While `throttled_until` is in the future, the dispatch-level throttle gate
+(`is_throttled(state)`, checked at the top of both first-pass and rework
+dispatch) defers the **entire** pass — Phase 2 removed the per-issue routing
+layer that used to fall just the affected issue back to a different adapter,
+so a cooldown now pauses dispatch fleet-wide rather than routing around
+itself. Recovery:
 
 1. **Check the key env var** named by the active provider's `api_key_env` is
    present and valid on the host (e.g. `$env:MOONSHOT_API_KEY` is set and the
@@ -909,50 +862,6 @@ throttle gate also defers. Recovery:
 `doctor` surfaces both failure kinds: its launched-sessions probe appends
 `provider-auth: <issues>` and `budget-exceeded: <issues>` fragments to the
 session-record summary when any dead sidecar carries those kinds.
-
-### Reading routing decisions
-
-Every routing decision is appended to that issue's `adapter_history` in
-`state.json` by `routing.record_adapter_choice`:
-
-```json
-{"ts": "2026-07-25T02:00:00Z", "kind": "api", "provider": "kimi-k3", "reason": "policy:rework"}
-```
-
-`kind` is the adapter name (`api`, `devin-shell`, `claude-code`, …). `provider`
-is the api provider key for `kind == "api"` and empty for non-api adapters.
-`reason` is either a `policy:*` string (a routing rule matched and preflight
-passed) or a `fallback:*` string (an api preflight check failed and the
-fallback adapter was chosen). The complete set, enumerated from
-`routing.select_adapter` / `routing._api_preflight`:
-
-**`policy:*` (api chosen, preflight passed):**
-
-| Reason | When |
-|---|---|
-| `policy:rework` | `rework=True` (rework dispatch). Evaluated first, so a rework issue carrying `complexity:high` still routes here. |
-| `policy:complexity` | First pass (`rework=False`) and the issue carries the `complexity:high` label (from `config.labels.complexity_high`, default `complexity:high` — a routing hint, **not** a workflow state label, so it never blocks dispatch selection). |
-| `policy:default` | No api candidate rule matched; the default adapter (`dispatch`-level) is used with no provider. |
-
-**`fallback:*` (api preflight failed → `fallback_adapter`):**
-
-| Reason | Failing check |
-|---|---|
-| `fallback:disabled` | `api_worker.enabled` is false. |
-| `fallback:auth` | The active provider's `api_key_env` env var is missing/empty on the host. |
-| `fallback:budget` | Daily headroom exhausted (`spent_today + reserve > max_usd_per_day`) **or** lifetime headroom exhausted (`lifetime_usd` reached). |
-| `fallback:cooldown` | Provider is in a throttle cooldown (`throttled_until` in the future — e.g. after a `provider_auth` or quota-exhaustion classification). |
-| `fallback:concurrency` | Live api session count (`adapter_kind == "api"`, alive) has reached `max_concurrent_sessions`. |
-
-Preflight checks run in the order above; the **first** failing check wins, so
-the recorded `fallback:*` reason identifies the single binding constraint. To
-inspect an issue's routing history:
-
-```powershell
-Get-Content .var\charlie-work\state.json | ConvertFrom-Json | Select-Object -ExpandProperty issues | ConvertTo-Json -Depth 4
-```
-
-and read `adapter_history` for the issue number.
 
 ## Needs-attention notification and detection latency
 

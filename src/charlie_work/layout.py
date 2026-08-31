@@ -72,7 +72,6 @@ DISPATCHES_DIRNAME = "dispatches"
 SESSIONS_DIRNAME = "sessions"
 REVIEWS_DIRNAME = "reviews"
 WORKTREES_DIRNAME = "worktrees"
-CROSS_FAMILY_DIRNAME = "cross-family"
 NOTIFY_DIRNAME = "notify"
 NOTIFY_DIGEST_FILENAME = "digest.jsonl"
 SESSION_MANIFEST_FILENAME = "session-manifest.json"
@@ -105,7 +104,6 @@ _VAR_DIRNAME = ".var"
 #: production (``worktrees`` being the one that cost 74 uncollected worktrees).
 _ENFORCED_DIRNAMES = (
     WORKTREES_DIRNAME,
-    CROSS_FAMILY_DIRNAME,
     SESSIONS_DIRNAME,
     GH_CONFIG_DIRNAME,
     _VAR_DIRNAME,
@@ -191,11 +189,6 @@ def worktrees_dir(state_root: Path) -> Path:
     the bug described in the module docstring.
     """
     return state_root / WORKTREES_DIRNAME
-
-
-def cross_family_dir(state_root: Path) -> Path:
-    """Return the cross-family review-artifact dir under ``state_root``."""
-    return state_root / CROSS_FAMILY_DIRNAME
 
 
 def dispatches_dir(state_root: Path) -> Path:

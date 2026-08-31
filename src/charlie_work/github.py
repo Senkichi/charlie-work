@@ -2431,6 +2431,28 @@ def _is_not_found_gh_error(error: str) -> bool:
     return bool(re.search(r"\bhttp 404\b", text))
 
 
+def is_transient_repo_resolution_failure(error: str) -> bool:
+    """Classify a ``GitHubNotFoundError`` message as a transient repository-level
+    resolution failure rather than a permanent issue-level 404.
+
+    GitHub's GraphQL emits distinct "Could not resolve to a X" messages:
+    ``Could not resolve to a Repository with the name 'owner/repo'`` is a
+    repository-level resolution failure, while ``Could not resolve to a Issue
+    with the number N`` is an issue-level 404. Both match
+    ``_is_not_found_gh_error``'s broad "could not resolve to a" pattern, so
+    both raise ``GitHubNotFoundError`` — but only the issue-level 404 is
+    permanent. A repository-level failure is transient: the orchestrator
+    already successfully listed PRs from this repo (``pr_list`` at loop start),
+    so the repo *did* resolve moments ago. The failure is a network/infra dip
+    (issue #1132: a ~7-minute connectivity window produced exactly this shape
+    and parked a PR as ``foreign_issue_ref`` for 32 hours).
+
+    Returns True for repository-level resolution failures (transient); False
+    for issue-level 404s and anything else (permanent or unknown).
+    """
+    return "could not resolve to a repository" in error.lower()
+
+
 def _is_transient_gh_error(error: str) -> bool:
     """Classify a gh stderr/stdout string as a transient (retryable) failure.
 

@@ -233,12 +233,13 @@ def test_maybe_reclaim_worktrees_dry_run_threads_and_removes_nothing(
     # modes and must be rate-limited in both.
     state = load_state(app.paths.state_file)
     assert state["worktree_reclamation"]["next_run_at"] is not None
-    # An event was emitted so the preview is observable.
+    # Under dry_run the worktrees_reclaimed event is suppressed per #1324:
+    # _record_event now routes through WriteGate, which produces zero
+    # events.db/state.json writes under dry_run -- the exact leak this fix
+    # closes. The schedule still advances (see above) because that save_state
+    # is a raw call outside _record_event's gate.
     events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
-    assert len(events) == 1
-    assert events[0]["payload"]["dry_run"] is True
-    assert events[0]["payload"]["planned"] == 2
-    assert events[0]["payload"]["removed"] == 0
+    assert len(events) == 0
 
 
 def test_maybe_reclaim_worktrees_runs_and_emits_event(

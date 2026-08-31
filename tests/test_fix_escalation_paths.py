@@ -721,9 +721,7 @@ def test_escalated_label_repair_skipped_under_dry_run(tmp_path: Path) -> None:
     """``--dry-run`` must perform no live GitHub calls, label mutations, or
     state.json writes for the repair sweep.
 
-    Carries its own positive control (pattern from
-    test_dry_run_claims_nothing_and_fires_no_label_edit in
-    test_cross_family_regen_reachability.py): "nothing happened" is equally
+    Carries its own positive control: "nothing happened" is equally
     consistent with "the dry-run gate works" and with "the call never reached
     the mutating code", so the identical seed and call is made against a
     live (non-dry-run) app first and asserted to actually write.

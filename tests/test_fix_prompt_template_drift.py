@@ -155,7 +155,6 @@ def test_packaged_review_template_is_satisfied_by_its_call_site() -> None:
             "issue_url": "iu",
             "pr_json_path": "p.json",
             "diff_path": "d.patch",
-            "cross_family_section": "",
             "janitor_section": "",
             "test_adequacy_section": "",
             "static_probe_section": "",

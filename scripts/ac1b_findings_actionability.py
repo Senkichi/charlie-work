@@ -66,7 +66,7 @@ _FALLBACK_SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_FALLBACK_SRC) not in sys.path:
     sys.path.insert(0, str(_FALLBACK_SRC))
 
-from charlie_work import cross_family  # noqa: E402
+from charlie_work.rescue_review import LEGACY_VACUOUS_SUMMARY  # noqa: E402
 from charlie_work.global_config import load_layered_config  # noqa: E402
 from charlie_work.paths import RepoNotFoundError, find_repo_root, runtime_paths  # noqa: E402
 from charlie_work.workflow import _render_required_changes_section  # noqa: E402
@@ -222,47 +222,18 @@ def derive_cross_family_collapse_sentinel() -> str:
     """Return the legacy generic-collapse fallback string, for classifying
     PRE-issue-#784 on-disk verdicts.
 
-    This function used to derive the sentinel by calling the real parser
-    with a crafted BLOCKER-only/no-``Verdict:``-marker probe (its
-    docstring's own "F5", per ``docs/plans/rework-findings-channel.md``).
-    Issue #784 IS that rewrite: ``cross_family.parse_cross_family_verdict``'s
-    legacy fallback can no longer construct a content-free
-    ``CrossFamilyVerdict`` for that exact shape at all --
-    ``CrossFamilyVerdict.__post_init__`` now raises on it, and the parser
-    catches that and returns a ``MalformedCrossFamilyVerdict`` instead.
-    Deriving the historical literal by probing the live parser is therefore
-    no longer possible; that capability is precisely what #784 removed, by
-    design (unrepresentable content-free verdicts is the whole point of the
-    fix).
-
-    The literal itself survives as ``cross_family.LEGACY_VACUOUS_SUMMARY``,
-    exported specifically so this script and
-    ``workflow._is_carry_forward_eligible`` share one source of truth for
-    recognizing the 8 pre-#784 broken records rather than each hardcoding a
-    second copy. This function still probes the live parser with the same
-    input as before -- not to derive the string, but to prove #784's fix is
-    actually live in the code under test (not just merged elsewhere) before
-    trusting the historical constant for classification.
-
-    Raises RuntimeError (loudly, not silently) if the live parser's
-    behavior for this probe is neither the expected post-#784 shape
-    (``MalformedCrossFamilyVerdict``) nor recognizable at all -- so a future
-    behavior change is caught, not silently misclassified as "real reviewer
-    prose".
+    This function used to also probe the live ``cross_family.parse_cross_family_verdict``
+    parser with a crafted BLOCKER-only/no-``Verdict:``-marker probe on every run, to prove
+    issue #784's fix (a content-free ``CrossFamilyVerdict`` can no longer be constructed for
+    that shape) was still live in the code under test before trusting the historical literal.
+    The role-config Phase 2 cleanup deleted ``cross_family.parse_cross_family_verdict`` and
+    ``cross_family.MalformedCrossFamilyVerdict`` entirely -- the auto-gate path both belonged
+    to is gone, not merely renamed -- so there is no longer a live parser to probe. The
+    historical literal itself survives as ``rescue_review.LEGACY_VACUOUS_SUMMARY``; this
+    function now returns it directly. The classification it feeds only recognizes the 8
+    pre-#784 records already written to disk, which is unaffected by the parser's removal.
     """
-    probe = "## Report\n\n**BLOCKER** unparseable body with no Verdict: marker\n"
-    result = cross_family.parse_cross_family_verdict(probe)
-    if not isinstance(result, cross_family.MalformedCrossFamilyVerdict):
-        raise RuntimeError(
-            "cross_family.parse_cross_family_verdict returned an unexpected "
-            f"shape ({result!r}) for the generic-collapse sentinel probe. "
-            "Expected MalformedCrossFamilyVerdict (issue #784's fix): a "
-            "BLOCKER/MAJOR marker with no extractable summary must no "
-            "longer construct a content-free CrossFamilyVerdict. Update "
-            "this probe or investigate a regression -- do not ignore this "
-            "error."
-        )
-    return cross_family.LEGACY_VACUOUS_SUMMARY
+    return LEGACY_VACUOUS_SUMMARY
 
 
 #: Mirrors the f-string template at src/charlie_work/workflow.py:7231:

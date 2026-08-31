@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from charlie_work.config import DevinConfig, OrchestratorConfig, RescueConfig, ReviewConfig
-from charlie_work.cross_family import CrossFamilyResult
+from charlie_work.rescue_review import CrossFamilyResult
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp

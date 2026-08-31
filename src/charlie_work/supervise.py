@@ -3,7 +3,7 @@
 ``run_supervised`` drives repeated ``OrchestratorApp.loop()`` passes in a
 foreground loop, using cheap local-signal delta detection to decide when a
 pass is warranted.  The loop is single-threaded and injected-clock/sleep
-testable (same pattern as cross_family.py).
+testable.
 
 Design notes:
 - No threads, no asyncio, no daemon process.

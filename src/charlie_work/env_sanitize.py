@@ -4,7 +4,7 @@ Provides a single implementation of environment sanitization to prevent
 VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT leaks from the orchestrator into
 worker sessions, and to isolate GitHub CLI authentication so workers cannot
 use the orchestrator's stored credentials. Used by claude_code, devin_shell,
-and cross_family adapters.
+and rescue_review's cross-family adapter.
 
 Security (issue #502): workers must not inherit the orchestrator's
 admin-scoped ``GH_TOKEN``/``GITHUB_TOKEN`` (or the GHES equivalents

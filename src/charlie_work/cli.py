@@ -193,16 +193,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     review = subparsers.add_parser("why-charlie-hate")
     review.add_argument("--pr", type=int, required=True)
-    cross_family_group = review.add_mutually_exclusive_group()
-    cross_family_group.add_argument(
-        "--cross-family", action="store_const", const=True, dest="cross_family", default=None
-    )
-    cross_family_group.add_argument(
-        "--no-cross-family", action="store_const", const=False, dest="cross_family"
-    )
-
-    spec_review = subparsers.add_parser("why-charlie-hate-spec")
-    spec_review.add_argument("--file", type=Path, required=True, dest="spec_file")
 
     record = subparsers.add_parser("verdict")
     record.add_argument("--pr", type=int, required=True)
@@ -2425,16 +2415,7 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     if args.command == "operator-queue":
         return app.operator_queue()
     if args.command == "why-charlie-hate":
-        # The operator's manual re-run is deliberately exempt from the per-head
-        # cross-family regeneration budget (issue #1099): a human typing a
-        # command is not the loop the bound defends against, and RUNBOOK.md's
-        # recovery procedure for an exhausted budget is exactly this command.
-        return app.review(args.pr, cross_family=args.cross_family, enforce_regen_budget=False)
-    if args.command == "why-charlie-hate-spec":
-        try:
-            return app.spec_review(args.spec_file)
-        except OSError as exc:
-            return CommandResult(False, f"OS error: {exc}", {})
+        return app.review(args.pr)
     if args.command == "verdict":
         try:
             return app.record_review(
@@ -2545,6 +2526,7 @@ def _render_backlog_reachability(reachability: Any) -> str:
                 "active_label",
                 "operator_claimed",
                 "blocked_by_open_dependency",
+                "mention_covered_awaiting_operator",
                 "unidentified",
             )
             if reachability.get(reason)
