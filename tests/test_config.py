@@ -1198,7 +1198,6 @@ def test_api_worker_config_defaults() -> None:
     assert config.api_worker.enabled is False
     assert config.api_worker.provider == ""
     assert config.api_worker.max_concurrent_sessions == 1
-    assert config.api_worker.fallback_adapter == "devin-shell"
     assert config.api_worker.worker_template == "worker_claude_code.md"
     assert config.api_worker.rework_template == "rework.md"
     assert isinstance(config.api_worker.providers, MappingProxyType)
@@ -1227,7 +1226,6 @@ API_WORKER_SAMPLE = """api_worker:
     preflight_reserve_usd: 1.00
     max_usd_per_day: 5.00
     lifetime_usd: 15.00
-  fallback_adapter: devin-shell
   worker_template: worker_claude_code.md
   rework_template: rework.md
 """
@@ -1688,61 +1686,6 @@ def test_orchestrator_config_defaults_include_api_worker() -> None:
     assert config.api_worker.enabled is False
 
 
-# ---------------------------------------------------------------------------
-# LabelConfig — complexity:high routing hint (issue #481)
-# ---------------------------------------------------------------------------
-
-
-def test_label_config_complexity_high_default() -> None:
-    from charlie_work.config import LabelConfig
-
-    assert LabelConfig().complexity_high == "complexity:high"
-
-
-def test_label_config_complexity_high_in_all_for_bootstrap() -> None:
-    """The hint is in ``all`` so bootstrap_labels creates it on GitHub."""
-    from charlie_work.config import LabelConfig
-
-    labels = LabelConfig()
-    assert labels.complexity_high in labels.all
-
-
-def test_label_config_complexity_high_not_in_active_set() -> None:
-    """The hint must never affect issue selection/exclusion (not in active)."""
-    from charlie_work.config import LabelConfig
-
-    labels = LabelConfig()
-    assert labels.complexity_high not in labels.active
-
-
-def test_label_config_complexity_high_not_in_terminal_set() -> None:
-    from charlie_work.config import LabelConfig
-
-    labels = LabelConfig()
-    assert labels.complexity_high not in labels.terminal
-
-
-def test_label_config_complexity_high_not_a_workflow_label() -> None:
-    """The hint is a routing hint, not a workflow state — not in workflow_labels."""
-    from charlie_work.config import LabelConfig
-
-    labels = LabelConfig()
-    assert labels.complexity_high not in labels.workflow_labels
-
-
-def test_label_config_complexity_high_is_overridable(tmp_path: Path) -> None:
-    """The hint string is configurable via the labels: section like every other label."""
-    config_file = tmp_path / "orchestrator.config.yaml"
-    _write_config(
-        config_file,
-        """labels:
-  complexity_high: difficulty:hard
-""",
-    )
-    config = load_config(config_file)
-    assert config.labels.complexity_high == "difficulty:hard"
-
-
 def test_label_config_is_frozen() -> None:
     from dataclasses import FrozenInstanceError
 
@@ -1750,7 +1693,7 @@ def test_label_config_is_frozen() -> None:
 
     labels = LabelConfig()
     with pytest.raises(FrozenInstanceError):
-        labels.complexity_high = "x"  # type: ignore[misc]
+        labels.operator_queue = "x"  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------

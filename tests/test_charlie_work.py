@@ -2225,7 +2225,6 @@ def test_adapter_settings_api_branch_carries_api_worker_config(
         max_concurrent_sessions=2,
         providers={"kimi-k3": api_provider},
         budget=ApiBudgetConfig(max_usd_per_session=1.5),
-        fallback_adapter="claude-code",
     )
     claude_cfg = ClaudeCodeConfig(
         venv_source=".venv",
@@ -39411,7 +39410,9 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
         patch(
             "charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=mock_sweep_orphan
         ),
-        patch("charlie_work.workflow.os.name", "nt"),  # Force Windows path
+        patch("os.name", "nt"),  # Force Windows path (os.name check lives in dead_worker_reap;
+        # patching the os module directly avoids depending on which module happens to
+        # `import os` into its own namespace)
         patch("subprocess.run", side_effect=mock_subprocess_run),
     ):
         from charlie_work.workflow import _sweep_orphan_processes_for_dead_sessions
@@ -51952,18 +51953,17 @@ def test_stalled_review_throttled_rolls_back_attempt_count(monkeypatch, tmp_path
 
 
 # ---------------------------------------------------------------------------
-# Issue #482: per-issue adapter routing + partitioned dispatch integration
+# Issue #626: rescue-tier combined-manifest adapter labeling
 # ---------------------------------------------------------------------------
 
 
-def _api_worker_config_for_routing(
+def _api_worker_config_for_test(
     *,
     enabled: bool = True,
-    fallback_adapter: str = "devin-shell",
     provider_name: str = "kimi-k3",
     api_key_env: str = "MOONSHOT_API_KEY",
 ) -> Any:
-    """Build an ApiWorkerConfig suitable for routing integration tests."""
+    """Build an ApiWorkerConfig for rescue-tier combined-manifest tests."""
     from charlie_work.config import ApiBudgetConfig, ApiProviderConfig, ApiWorkerConfig
 
     provider = ApiProviderConfig(
@@ -51980,407 +51980,9 @@ def _api_worker_config_for_routing(
         max_concurrent_sessions=1,
         providers={provider_name: provider},
         budget=ApiBudgetConfig(),
-        fallback_adapter=fallback_adapter,
         worker_template="worker_claude_code.md",
         rework_template="rework.md",
     )
-
-
-def test_dispatch_with_api_disabled_routes_all_to_default_adapter(tmp_path: Path) -> None:
-    """Issue #482: when api_worker is disabled, all issues route to the default
-    adapter and _dispatch_partitioned falls back to single-group dispatch
-    byte-identical to the pre-#482 behavior."""
-    from charlie_work import devin_shell
-    from charlie_work.worktree import WorktreeInfo
-
-    wt_path = tmp_path / "worktrees" / "agent-issue-123-fix-search"
-    wt_path.mkdir(parents=True, exist_ok=True)
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        return WorktreeInfo(path=wt_path, branch=branch, venv_junction=None)
-
-    monkeypatch_local = pytest.MonkeyPatch()
-    monkeypatch_local.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        worker=WorkerRoleConfig(harness="devin-shell"),
-        api_worker=_api_worker_config_for_routing(enabled=False),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=1)
-
-    assert result.ok is True
-    assert result.data["dispatch_results"][0]["adapter"] == "devin-shell"
-    # No adapter_history should be recorded when api is disabled.
-    state = load_state(paths.state_file)
-    assert "adapter_history" not in state["issues"].get("123", {})
-    monkeypatch_local.undo()
-
-
-def test_dispatch_routes_complexity_high_to_api_adapter(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482: an issue with the complexity:high label routes to the api
-    adapter when preflight passes, and the api worker_template is used for the
-    prompt."""
-    from charlie_work import api_worker
-    from charlie_work.claude_code import ClaudeWorkerRecord
-
-    captured: dict[str, object] = {}
-
-    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
-        captured["prompt_text"] = prompt_text
-        captured["adapter_kind"] = kwargs.get("adapter_kind")
-        captured["provider"] = kwargs.get("provider")
-        return ClaudeWorkerRecord(
-            issue_number=issue_number,
-            branch=branch,
-            worktree_path=str(tmp_path / "wt"),
-            prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
-            command=("claude", "-p"),
-            pid=4242,
-            started_at="2026-07-02T00:00:00Z",
-            log_path=str(tmp_path / "log"),
-        )
-
-    monkeypatch.setattr(api_worker, "launch_claude_worker", _fake_launch)
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    class ComplexityHighGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.issues[0]["labels"] = [
-                {"name": "automated-ready"},
-                {"name": config.labels.complexity_high},
-            ]
-
-    fake_gh = ComplexityHighGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=1)
-
-    assert result.ok is True
-    assert result.data["dispatch_results"][0]["adapter"] == "api"
-    assert captured["adapter_kind"] == "api"
-    assert captured["provider"] == "kimi-k3"
-    # adapter_history recorded with policy:complexity reason.
-    state = load_state(paths.state_file)
-    history = state["issues"]["123"].get("adapter_history", [])
-    assert len(history) == 1
-    assert history[0]["kind"] == "api"
-    assert history[0]["reason"] == "policy:complexity"
-
-
-def test_dispatch_routes_non_complexity_to_default_adapter(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482: an issue without the complexity:high label routes to the
-    default adapter (devin-shell) even when api is enabled — the default
-    policy rule fires and no api candidate matches."""
-    from charlie_work import devin_shell
-    from charlie_work.worktree import WorktreeInfo
-
-    wt_path = tmp_path / "worktrees" / "agent-issue-123-fix-search"
-    wt_path.mkdir(parents=True, exist_ok=True)
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        return WorktreeInfo(path=wt_path, branch=branch, venv_junction=None)
-
-    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=1)
-
-    assert result.ok is True
-    assert result.data["dispatch_results"][0]["adapter"] == "devin-shell"
-    # adapter_history recorded with policy:default reason.
-    state = load_state(paths.state_file)
-    history = state["issues"]["123"].get("adapter_history", [])
-    assert len(history) == 1
-    assert history[0]["kind"] == "devin-shell"
-    assert history[0]["reason"] == "policy:default"
-
-
-def test_dispatch_falls_back_on_missing_api_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482: a complexity:high issue falls back to the default adapter
-    when the api key is missing (preflight auth failure), and the
-    adapter_history records the fallback:auth reason."""
-    from charlie_work import devin_shell
-    from charlie_work.worktree import WorktreeInfo
-
-    wt_path = tmp_path / "worktrees" / "agent-issue-123-fix-search"
-    wt_path.mkdir(parents=True, exist_ok=True)
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        return WorktreeInfo(path=wt_path, branch=branch, venv_junction=None)
-
-    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    class ComplexityHighGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.issues[0]["labels"] = [
-                {"name": "automated-ready"},
-                {"name": config.labels.complexity_high},
-            ]
-
-    fake_gh = ComplexityHighGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=1)
-
-    assert result.ok is True
-    assert result.data["dispatch_results"][0]["adapter"] == "devin-shell"
-    # adapter_history records the fallback:auth reason.
-    state = load_state(paths.state_file)
-    history = state["issues"]["123"].get("adapter_history", [])
-    assert len(history) == 1
-    assert history[0]["kind"] == "devin-shell"
-    assert history[0]["reason"] == "fallback:auth"
-
-
-def test_dispatch_dry_run_includes_adapter_choices(tmp_path: Path) -> None:
-    """Issue #482: dry-run dispatch computes and returns adapter_choices in
-    the result data without launching workers or mutating state."""
-    monkeypatch_local = pytest.MonkeyPatch()
-    monkeypatch_local.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    class ComplexityHighGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.issues[0]["labels"] = [
-                {"name": "automated-ready"},
-                {"name": config.labels.complexity_high},
-            ]
-
-    fake_gh = ComplexityHighGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=1)
-
-    assert result.ok is True
-    assert "adapter_choices" in result.data
-    choices = result.data["adapter_choices"]
-    assert "123" in choices
-    assert choices["123"]["kind"] == "api"
-    assert choices["123"]["reason"] == "policy:complexity"
-    # No state mutation in dry-run.
-    state = load_state(paths.state_file)
-    assert "adapter_history" not in state.get("issues", {}).get("123", {})
-    monkeypatch_local.undo()
-
-
-def test_dispatch_rework_routes_to_api_when_preflight_passes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482: rework dispatch routes to the api adapter when preflight
-    passes (policy:rework), and the adapter_history is recorded."""
-    from charlie_work import api_worker
-    from charlie_work.claude_code import ClaudeWorkerRecord
-
-    captured: dict[str, object] = {}
-
-    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
-        captured["adapter_kind"] = kwargs.get("adapter_kind")
-        captured["provider"] = kwargs.get("provider")
-        return ClaudeWorkerRecord(
-            issue_number=issue_number,
-            branch=branch,
-            worktree_path=str(tmp_path / "wt"),
-            prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
-            command=("claude", "-p"),
-            pid=4242,
-            started_at="2026-07-02T00:00:00Z",
-            log_path=str(tmp_path / "log"),
-        )
-
-    monkeypatch.setattr(api_worker, "launch_claude_worker", _fake_launch)
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    class ReworkGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
-
-    paths.root.mkdir(parents=True, exist_ok=True)
-    with state_lock(paths.state_file):
-        state = load_state(paths.state_file)
-        state["issues"]["123"] = {
-            "number": 123,
-            "title": "Fix search",
-            "url": "https://example.test/issues/123",
-            "status": "rework_requested",
-        }
-        save_state(paths.state_file, state)
-
-    fake_gh = ReworkGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
-    pr_dir.mkdir(parents=True)
-    rework_prompt = pr_dir / "rework-prompt.md"
-    rework_prompt.write_text("Fix the issues", encoding="utf-8")
-
-    result = app.dispatch_rework()
-
-    assert result.ok is True
-    assert captured["adapter_kind"] == "api"
-    assert captured["provider"] == "kimi-k3"
-    state = load_state(paths.state_file)
-    history = state["issues"]["123"].get("adapter_history", [])
-    assert len(history) == 1
-    assert history[0]["kind"] == "api"
-    assert history[0]["reason"] == "policy:rework"
-
-
-def test_dispatch_partitioned_writes_combined_manifest_for_mixed_adapters(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482: when dispatch partitions issues across multiple adapters,
-    the combined session manifest reflects all sessions (not just the last
-    group's)."""
-    from charlie_work import api_worker, devin_shell
-    from charlie_work.claude_code import ClaudeWorkerRecord
-    from charlie_work.worktree import WorktreeInfo
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        wt = tmp_path / "worktrees" / branch.replace("/", "-")
-        wt.mkdir(parents=True, exist_ok=True)
-        return WorktreeInfo(path=wt, branch=branch, venv_junction=None)
-
-    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-
-    def _fake_api_launch(issue_number, branch, prompt_text, **kwargs):
-        return ClaudeWorkerRecord(
-            issue_number=issue_number,
-            branch=branch,
-            worktree_path=str(tmp_path / "wt-api"),
-            prompt_path=str(tmp_path / "wt-api" / ".orchestrator-prompt.md"),
-            command=("claude", "-p"),
-            pid=5001,
-            started_at="2026-07-02T00:00:00Z",
-            log_path=str(tmp_path / "log-api"),
-        )
-
-    monkeypatch.setattr(api_worker, "launch_claude_worker", _fake_api_launch)
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    class MixedGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            # Issue 123: complexity:high -> routes to api
-            self.issues[0]["labels"] = [
-                {"name": "automated-ready"},
-                {"name": config.labels.complexity_high},
-            ]
-            # Issue 124: no complexity label -> routes to devin-shell (default)
-            self.issues.append(
-                {
-                    "number": 124,
-                    "title": "Another issue",
-                    "url": "https://example.test/issues/124",
-                    "body": "Body",
-                    "labels": [{"name": "automated-ready"}],
-                    "state": "OPEN",
-                }
-            )
-            # Add a second PR for issue 124 (closed so it's not an open-PR blocker)
-            self.prs.append(
-                {
-                    "number": 457,
-                    "title": "Fix #124",
-                    "url": "https://example.test/pull/457",
-                    "headRefName": "agent/issue-124-another-issue",
-                    "baseRefName": "main",
-                    "headRefOid": "sha-def456",
-                    "mergeStateStatus": "CLEAN",
-                    "body": "Closes #124",
-                    "labels": [],
-                    "isCrossRepository": False,
-                    "state": "CLOSED",
-                }
-            )
-
-    fake_gh = MixedGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    # Close the first PR too so issue 123 is dispatchable
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=2)
-
-    assert result.ok is True
-    assert result.data["selected_count"] == 2
-    # The manifest should contain both sessions.
-    manifest_path = tmp_path / ".var" / "charlie-work" / "dispatches" / "session-manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    session_issue_numbers = {s["issue_number"] for s in manifest["sessions"]}
-    assert session_issue_numbers == {123, 124}
-    # The combined manifest's adapter label is "mixed" and its instructions
-    # text explains the multi-adapter partition (not the generic fallback).
-    assert manifest["adapter"] == "mixed"
-    assert "multiple worker adapters" in " ".join(manifest["instructions"])
 
 
 def test_manifest_adapter_label_helper() -> None:
@@ -52393,57 +51995,6 @@ def test_manifest_adapter_label_helper() -> None:
     assert manifest_adapter_label({"claude-code"}) == "claude-code"
     assert manifest_adapter_label({"api", "devin-shell"}) == "mixed"
     assert manifest_adapter_label({"api", "claude-code", "devin-shell"}) == "mixed"
-
-
-def test_dispatch_partitioned_homogeneous_batch_labels_with_single_kind(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #626: when api_worker is enabled but every issue in the pass
-    routes to the same fallback adapter (e.g. no API key → fallback:auth for
-    all), the manifest's adapter label is that single kind, not ``"mixed"``.
-    Before #626, ``_dispatch_partitioned`` unconditionally wrote
-    ``adapter="mixed"`` for any non-empty ``adapter_choices``."""
-    from charlie_work import devin_shell
-    from charlie_work.worktree import WorktreeInfo
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        wt = tmp_path / "worktrees" / branch.replace("/", "-")
-        wt.mkdir(parents=True, exist_ok=True)
-        return WorktreeInfo(path=wt, branch=branch, venv_junction=None)
-
-    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-
-    # api_worker enabled but NO API key set → every complexity:high issue
-    # fails preflight with fallback:auth and routes to devin-shell.
-    # Do NOT set MOONSHOT_API_KEY.
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    fake_gh = _two_complexity_high_issues_github(config)
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=2)
-
-    assert result.ok is True
-    assert result.data["selected_count"] == 2
-    manifest_path = tmp_path / ".var" / "charlie-work" / "dispatches" / "session-manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    session_issue_numbers = {s["issue_number"] for s in manifest["sessions"]}
-    assert session_issue_numbers == {123, 124}
-    # Homogeneous batch: both issues fell back to devin-shell. The label must
-    # be "devin-shell", not "mixed" (the #626 bug).
-    assert manifest["adapter"] == "devin-shell"
-    # Instructions text matches the devin-shell adapter, not the mixed
-    # partition text.
-    assert "devin CLI" in " ".join(manifest["instructions"])
-    assert "multiple worker adapters" not in " ".join(manifest["instructions"])
 
 
 def _fake_dispatch_sessions_writing_manifests(
@@ -52570,7 +52121,7 @@ def test_dispatch_rework_combined_manifest_mixed_label(
     session_issue_numbers = {s["issue_number"] for s in manifest["sessions"]}
     assert session_issue_numbers == {123, 124}
     assert manifest["adapter"] == "mixed"
-    assert "multiple worker adapters" in " ".join(manifest["instructions"])
+    assert "more than one worker" in " ".join(manifest["instructions"])
 
 
 def test_dispatch_rework_combined_manifest_homogeneous_label(
@@ -52581,32 +52132,29 @@ def test_dispatch_rework_combined_manifest_homogeneous_label(
     the combined manifest's adapter label is ``"claude-code"`` — not
     ``"mixed"`` and not the default adapter name.
 
-    The normal issue routes to claude-code via api_worker's fallback_adapter
-    (api preflight fails on missing API key → fallback:auth → claude-code),
-    while the rescue issue uses claude-code via the rescue adapter. Both
-    kinds are ``"claude-code"`` → homogeneous → ``"claude-code"``. Before
-    #626, the trailing write used ``self.config.devin.adapter`` (``"devin-shell"``
-    here) unconditionally, mislabeling the homogeneous batch."""
+    The normal issue uses claude-code because that is the pass's configured
+    worker harness (``worker.harness``), while the rescue issue uses
+    claude-code via the rescue adapter. Both kinds are ``"claude-code"`` →
+    homogeneous → ``"claude-code"``. Before #626, the trailing write used
+    ``self.config.devin.adapter`` (``"devin-shell"`` here) unconditionally,
+    mislabeling the homogeneous batch."""
     from charlie_work.config import RescueConfig
 
-    # devin.adapter is "devin-shell" but both issues actually use claude-code:
-    # the normal issue falls back to claude-code (fallback_adapter), the
-    # rescue issue uses claude-code (rescue adapter). The old code's trailing
-    # write would label this "devin-shell" (wrong); the fix derives "claude-code"
-    # from the partition.
+    # devin.adapter is "devin-shell" (legacy field, unread once worker.harness
+    # is set) but both issues actually use claude-code: the normal issue via
+    # the configured worker harness, the rescue issue via the rescue adapter.
+    # The old code's trailing write would label this "devin-shell" (wrong);
+    # the fix derives "claude-code" from the partition.
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="claude-code"),
+        worker=WorkerRoleConfig(harness="claude-code"),
+        api_worker=_api_worker_config_for_test(enabled=True),
         rescue=RescueConfig(enabled=True, worker_model="claude-opus-4-1"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     _seed_two_rework_issues(paths, config, rescue_issue_numbers={124})
     fake_gh = _TwoReworkIssuesGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    # Do NOT set MOONSHOT_API_KEY so the normal issue fails api preflight
-    # (fallback:auth) and routes to the claude-code fallback adapter.
-    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
 
     manifest_writes: list[str] = []
     monkeypatch.setattr(
@@ -52710,255 +52258,6 @@ def test_dispatch_rework_no_rescue_skips_redundant_manifest_write(
     manifest_path = tmp_path / ".var" / "charlie-work" / "dispatches" / "session-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["adapter"] == "devin-shell"
-
-
-def _two_complexity_high_issues_github(config: Any) -> Any:
-    """Build a FakeGitHub with two complexity:high issues (123, 124) and closed PRs."""
-
-    class TwoComplexityHighGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.issues[0]["labels"] = [
-                {"name": "automated-ready"},
-                {"name": config.labels.complexity_high},
-            ]
-            self.issues.append(
-                {
-                    "number": 124,
-                    "title": "Another complex issue",
-                    "url": "https://example.test/issues/124",
-                    "body": "Body",
-                    "labels": [
-                        {"name": "automated-ready"},
-                        {"name": config.labels.complexity_high},
-                    ],
-                    "state": "OPEN",
-                }
-            )
-            self.prs.append(
-                {
-                    "number": 457,
-                    "title": "Fix #124",
-                    "url": "https://example.test/pull/457",
-                    "headRefName": "agent/issue-124-another-complex-issue",
-                    "baseRefName": "main",
-                    "headRefOid": "sha-def456",
-                    "mergeStateStatus": "CLEAN",
-                    "body": "Closes #124",
-                    "labels": [],
-                    "isCrossRepository": False,
-                    "state": "CLOSED",
-                }
-            )
-
-    return TwoComplexityHighGitHub()
-
-
-def test_dispatch_concurrency_cap_defers_second_api_issue_in_same_pass(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482 review fix: when multiple api-eligible (complexity:high) issues
-    are selected in the same dispatch pass and ``max_concurrent_sessions`` is 1,
-    the first routes to api and the second falls back to the default adapter
-    with ``fallback:concurrency`` — the in-pass running counter prevents both
-    from bypassing the cap simultaneously."""
-    from charlie_work import api_worker, devin_shell
-    from charlie_work.claude_code import ClaudeWorkerRecord
-    from charlie_work.worktree import WorktreeInfo
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        wt = tmp_path / "worktrees" / branch.replace("/", "-")
-        wt.mkdir(parents=True, exist_ok=True)
-        return WorktreeInfo(path=wt, branch=branch, venv_junction=None)
-
-    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-
-    api_launches: list[int] = []
-
-    def _fake_api_launch(issue_number, branch, prompt_text, **kwargs):
-        api_launches.append(issue_number)
-        return ClaudeWorkerRecord(
-            issue_number=issue_number,
-            branch=branch,
-            worktree_path=str(tmp_path / f"wt-api-{issue_number}"),
-            prompt_path=str(tmp_path / f"wt-api-{issue_number}" / ".orchestrator-prompt.md"),
-            command=("claude", "-p"),
-            pid=5000 + issue_number,
-            started_at="2026-07-02T00:00:00Z",
-            log_path=str(tmp_path / f"log-api-{issue_number}"),
-        )
-
-    monkeypatch.setattr(api_worker, "launch_claude_worker", _fake_api_launch)
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    fake_gh = _two_complexity_high_issues_github(config)
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=2)
-
-    assert result.ok is True
-    assert result.data["selected_count"] == 2
-    # Exactly one issue routed to api (the cap is 1, 0 live sessions).
-    assert len(api_launches) == 1
-    # The adapter_history for each issue records the routing decision.
-    state = load_state(paths.state_file)
-    hist_123 = state["issues"]["123"].get("adapter_history", [])
-    hist_124 = state["issues"]["124"].get("adapter_history", [])
-    all_kinds = {h["kind"] for h in hist_123 + hist_124}
-    all_reasons = {h["reason"] for h in hist_123 + hist_124}
-    assert "api" in all_kinds
-    assert "devin-shell" in all_kinds
-    assert "fallback:concurrency" in all_reasons
-
-
-def test_dispatch_concurrency_cap_dry_run_defers_second_api_issue(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482 review fix: the in-pass running counter also applies in
-    dry-run, so adapter_choices in the dry-run result reflect the cap."""
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    fake_gh = _two_complexity_high_issues_github(config)
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=2)
-
-    assert result.ok is True
-    choices = result.data["adapter_choices"]
-    kinds = {choices[str(n)]["kind"] for n in (123, 124)}
-    reasons = {choices[str(n)]["reason"] for n in (123, 124)}
-    assert kinds == {"api", "devin-shell"}
-    assert "fallback:concurrency" in reasons
-
-
-def test_dispatch_falls_back_on_exhausted_daily_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482 review fix: a complexity:high issue falls back to the default
-    adapter when the daily budget is exhausted (preflight budget failure), and
-    the adapter_history records the ``fallback:budget`` reason. This exercises
-    the budget wiring path end-to-end (ledger on disk -> budget_status ->
-    routing preflight -> dispatch)."""
-    from charlie_work import devin_shell
-    from charlie_work.api_budget import DayBucket, Ledger, ledger_path, save_ledger
-    from charlie_work.worktree import WorktreeInfo
-
-    wt_path = tmp_path / "worktrees" / "agent-issue-123-fix-search"
-    wt_path.mkdir(parents=True, exist_ok=True)
-
-    def _fake_create_worktree(repo_root, branch, **kwargs):
-        return WorktreeInfo(path=wt_path, branch=branch, venv_junction=None)
-
-    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    # Write a ledger with today's spend at the daily cap so headroom is False.
-    # Defaults: max_usd_per_day=5.0, preflight_reserve_usd=1.0 (max_usd_per_session=0).
-    # spent_today=5.0 -> 5.0 + 1.0 = 6.0 > 5.0 -> daily_headroom=False.
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
-    ledger = Ledger(
-        days={today: DayBucket(usd=5.0)},
-        lifetime_usd=5.0,
-    )
-    paths.root.mkdir(parents=True, exist_ok=True)
-    save_ledger(ledger_path(paths.state_file.parent), ledger)
-
-    class ComplexityHighGitHub(FakeGitHub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.issues[0]["labels"] = [
-                {"name": "automated-ready"},
-                {"name": config.labels.complexity_high},
-            ]
-
-    fake_gh = ComplexityHighGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    app.gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=1)
-
-    assert result.ok is True
-    assert result.data["dispatch_results"][0]["adapter"] == "devin-shell"
-    state = load_state(paths.state_file)
-    history = state["issues"]["123"].get("adapter_history", [])
-    assert len(history) == 1
-    assert history[0]["kind"] == "devin-shell"
-    assert history[0]["reason"] == "fallback:budget"
-
-
-def test_dispatch_falls_back_on_provider_cooldown(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #482 review fix: a complexity:high issue falls back to the default
-    adapter when the provider is in cooldown (preflight cooldown failure), with
-    a ``fallback:cooldown`` reason. This exercises the cooldown wiring path
-    (throttled_until in state -> _routing_inputs -> is_throttled -> routing
-    preflight -> _select_adapter_for_issue).
-
-    The routing-level cooldown check is defense-in-depth: the dispatch-level
-    throttle gate intercepts first and defers the entire pass when
-    ``is_throttled`` is True. So this test exercises the routing wiring through
-    ``_routing_inputs`` + ``_select_adapter_for_issue`` directly — the full
-    wiring path from state to routing decision — without the dispatch-level
-    gate short-circuiting it."""
-    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
-        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    # Set throttled_until to a future timestamp so is_throttled returns True.
-    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
-    paths.root.mkdir(parents=True, exist_ok=True)
-    with state_lock(paths.state_file):
-        state = load_state(paths.state_file)
-        state = set_throttled_until(state, future)
-        save_state(paths.state_file, state)
-
-    fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    # Exercise the full wiring path: _routing_inputs reads throttled_until from
-    # state and computes provider_in_cooldown via is_throttled; the routing
-    # preflight then fails on cooldown and falls back to the default adapter.
-    routing_inputs = app._routing_inputs()
-    _, _, provider_in_cooldown, _ = routing_inputs
-    assert provider_in_cooldown is True
-    choice = app._select_adapter_for_issue(
-        rework=False,
-        issue_labels={config.labels.complexity_high},
-        routing_inputs=routing_inputs,
-    )
-    assert choice.kind == "devin-shell"
-    assert choice.reason == "fallback:cooldown"
 
 
 def test_sink_census_counts_escalated_and_blocked_only(tmp_path: Path) -> None:

@@ -899,11 +899,13 @@ def test_worker_github_token_omitted_for_manual_and_command_adapters(tmp_path: P
 def test_worker_github_token_api_routed_check_fires_alongside_default_adapter(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """A devin-shell default with api_worker enabled still routes some issues to api.
+    """A devin-shell default with api_worker enabled still has an api-routed subset.
 
-    routing.select_adapter can send individual issues to the api adapter
-    (policy:rework/policy:complexity) whenever api_worker.enabled is True,
-    regardless of the configured default adapter. That subset sources
+    Whenever api_worker.enabled is True, some sessions in a pass may launch
+    via the api harness (Task 3 of this plan removed per-issue *routing*
+    policy, not the api harness itself — api_worker.enabled alone is enough
+    to put api sessions in a pass, e.g. via a future non-routing dispatch
+    path). That subset sources
     claude_code.worker_env — a devin-shell default with a devin.worker_env
     token must not hide a missing claude_code.worker_env token for the
     api-routed subset.

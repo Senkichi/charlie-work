@@ -3,7 +3,6 @@ from __future__ import annotations
 import functools
 import json
 import logging
-import os
 import re
 import time
 from collections import Counter
@@ -22,9 +21,6 @@ from .adapters import (
     write_session_manifest,
     write_session_results,
 )
-from .api_budget import budget_status as _api_budget_status
-from .api_budget import ledger_path as _api_ledger_path
-from .api_budget import load_ledger as _api_load_ledger
 from .claude_code import (
     _events_path,
     launch_claude_worker,
@@ -246,7 +242,6 @@ from .process_utils import (
     is_pid_alive,
 )
 from .worker import iter_workers
-from .routing import AdapterChoice, record_adapter_choice, select_adapter
 from .write_gate import WriteGate, require_write_gate
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -4052,162 +4047,6 @@ class OrchestratorApp:
             config=self.config,
         )
 
-    def _routing_inputs(self) -> tuple[Any, bool, bool, list[int]]:
-        """Compute pass-level routing inputs shared across all issues (issue #482).
-
-        Returns ``(budget, api_key_present, provider_in_cooldown,
-        live_api_sessions)`` — the inputs to ``routing.select_adapter`` for one
-        dispatch pass. Per-issue inputs (``rework``, ``issue_labels``) are
-        supplied by the caller.
-
-        * ``budget``: ``routing.BudgetStatus`` from ``api_budget.budget_status``
-          over the loaded ledger.
-        * ``api_key_present``: whether the active provider's ``api_key_env``
-          names a non-empty environment variable.
-        * ``provider_in_cooldown``: from the existing ``throttled_until`` state
-          mechanism (``state.is_throttled``). The dispatch-level throttle gate
-          already defers when this is True, so this is defense-in-depth for the
-          future api-specific cooldown (issue ⑦ in the design decomposition).
-        * ``live_api_sessions``: a **mutable** one-element list ``[count]``
-          holding the number of in-flight api workers (alive workers with
-          ``adapter_kind == "api"`` counted via ``worker.iter_workers``). The
-          list is mutated in place by ``_select_adapter_for_issue``: each issue
-          routed to the api adapter increments ``live_api_sessions[0]`` so that
-          subsequent issues in the same pass see the updated in-flight count and
-          fall back when ``max_concurrent_sessions`` is reached. Without this
-          running increment, every api-eligible issue in a batch would see the
-          same stale count and all bypass the concurrency cap simultaneously.
-        """
-        api_config = self.config.api_worker
-        # Budget status from the on-disk spend ledger (atomic load with
-        # corrupt-file recovery; missing file = empty ledger).
-        #
-        # Known asymmetry (issue #626, part 2): unlike ``live_api_sessions``
-        # below, ``budget`` is computed once per pass and read unchanged for
-        # every issue. A batch can collectively commit past the daily cap
-        # because each issue's preflight sees the same stale snapshot. This is
-        # accepted rather than fixed inline because per-session cost is not
-        # knowable up front (unlike concurrency, where a simple in-place
-        # increment works). The in-flight budget kill (#484/#582) bounds the
-        # overshoot after the fact. A per-pass cap on api routes when remaining
-        # budget is below a multiple of typical session cost is the recorded
-        # follow-up if the overshoot becomes a problem in practice.
-        ledger = _api_load_ledger(_api_ledger_path(self.paths.state_file.parent))
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
-        budget = _api_budget_status(ledger, api_config.budget, today)
-        # API key present from the environment (name from the active provider).
-        provider = api_config.providers.get(api_config.provider)
-        api_key_present = bool(provider and os.environ.get(provider.api_key_env))
-        # Provider in cooldown from the existing throttle-cooldown state.
-        state = load_state_locked(self.paths.state_file)
-        provider_in_cooldown = is_throttled(state)
-        # Live api sessions counted via iter_workers filtered to adapter_kind == "api".
-        # Wrapped in a mutable list so _select_adapter_for_issue can increment it
-        # as issues are routed to api within the same pass (concurrency cap fix).
-        sessions_dir = self._layout.sessions_dir
-        live_api_sessions = sum(
-            1 for w in iter_workers(sessions_dir) if w.adapter_kind == "api" and w.is_alive()
-        )
-        return budget, api_key_present, provider_in_cooldown, [live_api_sessions]
-
-    def _select_adapter_for_issue(
-        self,
-        *,
-        rework: bool,
-        issue_labels: set[str],
-        routing_inputs: tuple[Any, bool, bool, list[int]],
-    ) -> AdapterChoice:
-        """Call ``routing.select_adapter`` for one issue (issue #482).
-
-        The single point of adapter routing enforcement: no inline
-        adapter-choice conditionals live in workflow.py. Per-issue inputs
-        (``rework``, ``issue_labels``) are passed in; pass-level inputs come
-        from ``_routing_inputs``.
-
-        When the choice resolves to the api adapter, the mutable
-        ``live_api_sessions`` counter inside ``routing_inputs`` is incremented
-        in place so the next issue in the same pass sees the updated in-flight
-        count. This prevents a whole batch of api-eligible issues from all
-        passing the concurrency preflight against a stale count and exceeding
-        ``max_concurrent_sessions``.
-        """
-        budget, api_key_present, provider_in_cooldown, live_api_sessions = routing_inputs
-        choice = select_adapter(
-            rework=rework,
-            issue_labels=issue_labels,
-            complexity_high_label=self.config.labels.complexity_high,
-            api_config=self.config.api_worker,
-            budget=budget,
-            api_key_present=api_key_present,
-            provider_in_cooldown=provider_in_cooldown,
-            live_api_sessions=live_api_sessions[0],
-            default_adapter=self.config.devin.adapter,
-        )
-        if choice.kind == "api":
-            live_api_sessions[0] += 1
-        return choice
-
-    def _dispatch_partitioned(
-        self,
-        session_requests: list[SessionRequest],
-        adapter_choices: dict[int, AdapterChoice],
-    ) -> list[SessionDispatchResult]:
-        """Partition requests by ``AdapterChoice.kind`` and dispatch per group (issue #482).
-
-        When ``adapter_choices`` is empty (api disabled), dispatches all
-        requests as a single group with the default ``AdapterSettings`` —
-        byte-identical to the pre-#482 behavior. When non-empty, partitions
-        by kind and invokes ``dispatch_sessions`` once per non-empty group
-        with that group's ``AdapterSettings`` (built via ``_adapter_settings``
-        parameterized by kind). ``launch_stagger_seconds`` applies within each
-        group as today.
-
-        After all groups are dispatched, a combined session manifest and
-        results file are written to the standard paths so the on-disk
-        artifacts reflect every session in the pass (per-group calls each
-        overwrite these files; the combined write at the end is authoritative).
-        """
-        manifest_path = self._layout.session_manifest
-        results_path = self._layout.session_results
-
-        if not adapter_choices:
-            # No routing (api disabled) — single group, today's behavior.
-            return dispatch_sessions(
-                self.repo_root,
-                manifest_path,
-                results_path,
-                self._adapter_settings(),
-                session_requests,
-            )
-
-        # Partition by adapter kind, preserving the original request order
-        # within each group (stable partition).
-        groups: dict[str, list[SessionRequest]] = {}
-        for req in session_requests:
-            kind = adapter_choices[req.issue_number].kind
-            groups.setdefault(kind, []).append(req)
-
-        all_results: list[SessionDispatchResult] = []
-        for kind, group_requests in groups.items():
-            group_results = dispatch_sessions(
-                self.repo_root,
-                manifest_path,
-                results_path,
-                self._adapter_settings(adapter=kind),
-                group_requests,
-            )
-            all_results.extend(group_results)
-
-        # Write combined manifest and results reflecting all sessions in the
-        # pass. Per-group dispatch_sessions calls each overwrite these files;
-        # this final write is the authoritative on-disk artifact. The adapter
-        # label is derived from the actual partition: a homogeneous batch is
-        # labeled with its single kind, not "mixed" (issue #626).
-        label = manifest_adapter_label(set(groups))
-        write_session_manifest(manifest_path, session_requests, adapter=label)
-        write_session_results(results_path, all_results)
-        return all_results
-
     def _rescue_adapter_settings(self) -> AdapterSettings:
         """AdapterSettings for a rescue-tier rework dispatch (issue #555).
 
@@ -4581,21 +4420,15 @@ class OrchestratorApp:
             labels.operator_queue: "A mechanical failure exhausted its automated retries; needs operator triage.",
             labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
             labels.merge_hold: "Approved PR is held out of the merge queue by operator request.",
-            labels.complexity_high: (
-                "Routing hint: route to the api worker (multi-module, "
-                "cross-cutting invariant, or prior escalation)."
-            ),
         }
 
     def _label_color(self, label: str) -> str:
         """Color for a label, derived from LabelConfig fields (no hard-coded names)."""
         labels = self.config.labels
-        # The ready marker is green; the complexity routing hint gets a
-        # distinct amber so it is visually separable from workflow state.
+        # The ready marker is green; every other workflow label shares the
+        # default purple.
         if label == labels.ready:
             return "0E8A16"
-        if label == labels.complexity_high:
-            return "BFD4F2"
         return "5319E7"
 
     def _ensure_labels_core(self) -> CommandResult:
@@ -5536,10 +5369,6 @@ class OrchestratorApp:
             # Compute would-be SessionRequests without state mutation
             session_requests: list[SessionRequest] = []
             full_issues: dict[int, dict[str, Any]] = {}
-            # Issue #482: compute would-be adapter choices (read-only).
-            adapter_choices: dict[int, AdapterChoice] = {}
-            api_enabled = self.config.api_worker.enabled
-            routing_inputs = self._routing_inputs() if api_enabled else None
             # Issue #1010: dry-run cross-repo gate — report which issues would
             # be escalated without mutating state or labels.
             # Issue #1244: dry-run cross-repo *scope* gate — report issues whose
@@ -5569,21 +5398,7 @@ class OrchestratorApp:
                     dry_run_cross_repo_escalated[issue_number] = scope_result.reason
                     continue
 
-                template: str | None = None
-                if api_enabled and routing_inputs is not None:
-                    issue_labels = {label["name"] for label in full_issue.get("labels", [])}
-                    choice = self._select_adapter_for_issue(
-                        rework=False,
-                        issue_labels=issue_labels,
-                        routing_inputs=routing_inputs,
-                    )
-                    adapter_choices[issue_number] = choice
-                    if choice.kind == "api":
-                        template = self.config.api_worker.worker_template
-
-                prompt_path = self._write_worker_prompt(
-                    full_issue, template=template, dry_run=True
-                )
+                prompt_path = self._write_worker_prompt(full_issue, dry_run=True)
 
                 # Check if this is a dead-worker recovery (same logic as real dispatch)
                 recovery_record: dict[str, Any] | None = None
@@ -5619,10 +5434,6 @@ class OrchestratorApp:
                 "label_errors": [],
                 "cross_repo_escalated_issue_numbers": sorted(dry_run_cross_repo_escalated),
                 "sessions": [asdict(request) for request in session_requests],
-                "adapter_choices": {
-                    str(n): {"kind": c.kind, "provider": c.provider, "reason": c.reason}
-                    for n, c in sorted(adapter_choices.items())
-                },
                 "dispatch_results": [],
                 "blocked": [
                     {"issue": issue_number, "blockers": blockers}
@@ -6113,14 +5924,6 @@ class OrchestratorApp:
         # Do all network calls, file writes, and worker launches outside the lock
         session_requests: list[SessionRequest] = []
         full_issues: dict[int, dict[str, Any]] = {}
-        # Issue #482: per-issue adapter routing. When api_worker is enabled,
-        # select_adapter is called once per issue to route it to the api or
-        # fallback adapter. When disabled, adapter_choices stays empty and
-        # _dispatch_partitioned falls back to a single-group dispatch
-        # byte-identical to the pre-#482 behavior.
-        adapter_choices: dict[int, AdapterChoice] = {}
-        api_enabled = self.config.api_worker.enabled
-        routing_inputs = self._routing_inputs() if api_enabled else None
         # Issue #1000: per-issue citation-drift verdicts and the fingerprint that
         # dedups the flag-comment across passes. Populated in the loop below;
         # consumed in the second state-lock section to stamp the issue record and
@@ -6162,22 +5965,7 @@ class OrchestratorApp:
                 cross_repo_escalated[issue_number] = scope_result.reason
                 continue
 
-            # Determine the adapter for this issue (single point of enforcement:
-            # routing.select_adapter). The prompt template follows the choice
-            # so the api worker gets the claude-code-flavored prompt.
-            template: str | None = None
-            if api_enabled and routing_inputs is not None:
-                issue_labels = {label["name"] for label in full_issue.get("labels", [])}
-                choice = self._select_adapter_for_issue(
-                    rework=False,
-                    issue_labels=issue_labels,
-                    routing_inputs=routing_inputs,
-                )
-                adapter_choices[issue_number] = choice
-                if choice.kind == "api":
-                    template = self.config.api_worker.worker_template
-
-            prompt_path = self._write_worker_prompt(full_issue, template=template)
+            prompt_path = self._write_worker_prompt(full_issue)
 
             # Issue #1000: verify path:line citations in the issue body against
             # the working tree before a worker is sent to them. Drift is flagged
@@ -6210,9 +5998,15 @@ class OrchestratorApp:
                     recovery=recovery_record,
                 )
             )
-        dispatch_results = self._dispatch_partitioned(session_requests, adapter_choices)
         manifest_path = self._layout.session_manifest
         results_path = self._layout.session_results
+        dispatch_results = dispatch_sessions(
+            self.repo_root,
+            manifest_path,
+            results_path,
+            self._adapter_settings(),
+            session_requests,
+        )
         successful_issue_numbers = {
             result.issue_number for result in dispatch_results if result.ok
         }
@@ -6569,13 +6363,6 @@ class OrchestratorApp:
                         # interesting transition is into drift, not out of it.
                         entry.pop("citation_drift_flagged_at", None)
                 state["issues"][str(request.issue_number)] = entry
-                # Issue #482: record the adapter choice (including fallback
-                # choices) into adapter_history so every routing decision is
-                # auditable. record_adapter_choice returns a new state dict
-                # (immutable helper); chain it before the atomic save.
-                choice = adapter_choices.get(request.issue_number)
-                if choice is not None:
-                    state = record_adapter_choice(state, request.issue_number, choice, utc_now())
                 # Persist the launched worker BEFORE touching GitHub labels: a
                 # transient label-write failure (or crash) must never leave a live
                 # worker unrecorded and therefore re-dispatchable next wave. The
@@ -20277,9 +20064,6 @@ class OrchestratorApp:
             dry_session_requests: list[SessionRequest] = []
             dry_skipped_issue_numbers: list[int] = []
             dry_missing_prompt_failures: dict[int, str] = {}
-            dry_adapter_choices: dict[int, AdapterChoice] = {}
-            dry_api_enabled = self.config.api_worker.enabled
-            dry_routing_inputs = self._routing_inputs() if dry_api_enabled else None
             dry_rescue_issue_numbers: set[int] = set()
             for issue in dry_selected:
                 issue_number = int(issue["number"])
@@ -20297,15 +20081,6 @@ class OrchestratorApp:
                 pr_state_for_rescue = dry_head_check_state.get("prs", {}).get(str(pr_number), {})
                 if pr_state_for_rescue.get("rescue_attempted"):
                     dry_rescue_issue_numbers.add(issue_number)
-                else:
-                    if dry_api_enabled and dry_routing_inputs is not None:
-                        issue_labels = {label["name"] for label in full_issue.get("labels", [])}
-                        choice = self._select_adapter_for_issue(
-                            rework=True,
-                            issue_labels=issue_labels,
-                            routing_inputs=dry_routing_inputs,
-                        )
-                        dry_adapter_choices[issue_number] = choice
                 dry_session_requests.append(
                     SessionRequest(
                         issue_number=issue_number,
@@ -20332,14 +20107,6 @@ class OrchestratorApp:
                 "deferred_by_concurrency_count": dry_deferred_by_concurrency_count,
                 "skipped_issue_numbers": sorted(dry_skipped_issue_numbers),
                 "sessions": [asdict(request) for request in dry_session_requests],
-                "adapter_choices": {
-                    str(n): {
-                        "kind": c.kind,
-                        "provider": c.provider,
-                        "reason": c.reason,
-                    }
-                    for n, c in sorted(dry_adapter_choices.items())
-                },
                 "dispatch_results": [],
                 "routed_to_review": sorted(dry_routed_to_review),
                 "skipped_head_indeterminate": sorted(dry_head_indeterminate),
@@ -20942,15 +20709,6 @@ class OrchestratorApp:
         full_issues: dict[int, dict[str, Any]] = {}
         skipped_issue_numbers: list[int] = []
         missing_prompt_failures: dict[int, str] = {}
-        # Issue #482: per-issue adapter routing for rework. Rework issues
-        # route to the api adapter when preflight passes (policy:rework),
-        # falling back to the default adapter on any preflight failure.
-        # The rework prompt is already on disk (written during the review
-        # flow with config.dispatch.rework_template); api_worker.rework_template
-        # defaults to the same "rework.md", so no re-render is needed here.
-        adapter_choices: dict[int, AdapterChoice] = {}
-        api_enabled = self.config.api_worker.enabled
-        routing_inputs = self._routing_inputs() if api_enabled else None
         # Rescue tier (issue #555): an issue is rescue-marked when the rescue
         # interception sites (record_review / _route_janitor_gate_failure_to_
         # rework) already stamped `rescue_attempted` on its PR record instead
@@ -21080,24 +20838,12 @@ class OrchestratorApp:
                 # only when a newer verdict makes the findings worth more
                 # than the lost prose.
                 self._write_rework_prompt(pr, issue_number, "")
-            # Rescue tier (issue #555): rescue-marked PRs bypass per-issue
-            # adapter routing — they always launch via the claude-code adapter
-            # pinned to rescue.worker_model, regardless of the primary
-            # configured devin.adapter or api_worker routing preflight.
+            # Rescue tier (issue #555): rescue-marked PRs always launch via
+            # the claude-code adapter pinned to rescue.worker_model,
+            # regardless of the primary configured devin.adapter.
             pr_state_for_rescue = rescue_state_snapshot.get("prs", {}).get(str(pr_number), {})
             if pr_state_for_rescue.get("rescue_attempted"):
                 rescue_issue_numbers.add(issue_number)
-            else:
-                # Route this non-rescue rework issue through the single
-                # enforcement point (issue #482).
-                if api_enabled and routing_inputs is not None:
-                    issue_labels = {label["name"] for label in full_issue.get("labels", [])}
-                    choice = self._select_adapter_for_issue(
-                        rework=True,
-                        issue_labels=issue_labels,
-                        routing_inputs=routing_inputs,
-                    )
-                    adapter_choices[issue_number] = choice
             session_requests.append(
                 SessionRequest(
                     issue_number=issue_number,
@@ -21187,24 +20933,27 @@ class OrchestratorApp:
 
         manifest_path = self._layout.session_manifest
         results_path = self._layout.session_results
-        # Rescue tier (issue #555) + per-issue routing (issue #482): split
-        # the batch so rescue-marked issues launch via the claude-code adapter
-        # pinned to rescue.worker_model (see _rescue_adapter_settings),
-        # while every other candidate is dispatched via the per-issue routing
-        # partition (_dispatch_partitioned). Rescue issues bypass routing
-        # entirely — they always use the rescue adapter/model. Reuses the
-        # same dispatch_sessions()/launch_claude_worker() path for both; the
-        # only difference is which AdapterSettings/config is passed in.
+        # Rescue tier (issue #555): split the batch so rescue-marked issues
+        # launch via the claude-code adapter pinned to rescue.worker_model
+        # (see _rescue_adapter_settings), while every other candidate
+        # dispatches via the pass's single configured worker harness. Reuses
+        # the same dispatch_sessions()/launch_claude_worker() path for both;
+        # the only difference is which AdapterSettings/config is passed in.
         normal_requests = [
             r for r in session_requests if r.issue_number not in rescue_issue_numbers
         ]
         rescue_requests = [r for r in session_requests if r.issue_number in rescue_issue_numbers]
         dispatch_results: list[SessionDispatchResult] = []
         if normal_requests:
-            # adapter_choices only contains non-rescue issues (rescue issues
-            # were never routed in the loop above), so the partition is
-            # correct.
-            dispatch_results.extend(self._dispatch_partitioned(normal_requests, adapter_choices))
+            dispatch_results.extend(
+                dispatch_sessions(
+                    self.repo_root,
+                    manifest_path,
+                    results_path,
+                    self._adapter_settings(),
+                    normal_requests,
+                )
+            )
         if rescue_requests:
             dispatch_results.extend(
                 dispatch_sessions(
@@ -21218,22 +20967,19 @@ class OrchestratorApp:
         # When both normal and rescue tiers dispatched, each sub-call's
         # write_session_manifest/write_session_results overwrote the files with
         # only its subset. Rewrite once with the combined batch so the on-disk
-        # observability files reflect the full pass. The adapter label is
-        # derived from the actual partition (normal routing kinds + the rescue
-        # kind "claude-code") via manifest_adapter_label — a homogeneous batch
-        # is labeled with its single kind, not the default adapter name
-        # (issue #626). When only one tier ran, its sub-call already wrote the
-        # correct manifest, so the combined manifest write is skipped (it was
-        # redundant and, before #626, used the wrong label).
+        # observability files reflect the full pass. When only one tier ran,
+        # its sub-call already wrote the correct manifest, so the combined
+        # manifest write is skipped (it was redundant and, before #626, used
+        # the wrong label).
         if normal_requests and rescue_requests:
-            # When api routing is enabled, adapter_choices has an entry for
-            # every non-rescue issue. When disabled (adapter_choices empty),
-            # all normal issues used the default adapter via the single-group
-            # path in _dispatch_partitioned.
-            if adapter_choices:
-                combined_kinds = {adapter_choices[r.issue_number].kind for r in normal_requests}
-            else:
-                combined_kinds = {self.config.devin.adapter}
+            # Every normal-tier issue uses the single configured worker
+            # harness; the rescue tier always adds "claude-code" (issue #626).
+            # A homogeneous batch is labeled with its single kind via
+            # manifest_adapter_label, not "mixed" — "mixed" still occurs
+            # routinely here whenever the worker harness differs from
+            # claude-code (e.g. a devin-shell primary worker + claude-code
+            # rescue), independent of per-issue routing.
+            combined_kinds = {self.config.worker.harness}
             combined_kinds.add("claude-code")
             write_session_manifest(
                 manifest_path, session_requests, adapter=manifest_adapter_label(combined_kinds)
@@ -21272,12 +21018,6 @@ class OrchestratorApp:
             for request in session_requests:
                 full_issue = full_issues[request.issue_number]
                 ok = request.issue_number in successful_issue_numbers
-                # Issue #482: record the adapter choice into adapter_history
-                # before constructing the entry, so the {**entry} spread below
-                # preserves the adapter_history field.
-                choice = adapter_choices.get(request.issue_number)
-                if choice is not None:
-                    state = record_adapter_choice(state, request.issue_number, choice, utc_now())
                 entry = {
                     **state["issues"].get(str(request.issue_number), {}),
                     "number": request.issue_number,
