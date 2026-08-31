@@ -161,6 +161,22 @@ def test_render_over_cap_section_with_finding() -> None:
     assert "#1283-era extractions" in section
 
 
+def test_render_over_cap_section_instructs_refresh_script() -> None:
+    """Issue #1496: the extraction remedy must also tell the worker to run the
+    ratchet refresh script in the shrink PR, so the baseline tightens
+    alongside the extraction instead of accumulating stale-high headroom.
+    The script's default mode is lower-only, so the instruction is safe to
+    run mid-PR (same-bucket shrinks produce no diff; cross-bucket shrinks
+    write the deterministic quantized value)."""
+    findings = (OverCapFileFinding("src/god_file.py", 102, 100, 2),)
+    section = render_over_cap_section(findings)
+    assert "refresh_file_size_ratchet.py" in section
+    assert "file_size_ratchet_baseline.json" in section
+    # The safety rationale must travel with the instruction so a reviewer
+    # does not strip it as a risky side effect.
+    assert "lower-only" in section
+
+
 # ---------------------------------------------------------------------------
 # Integration tests: built review packet
 # ---------------------------------------------------------------------------
@@ -195,6 +211,11 @@ def test_rubric_text_present_in_built_packet_default(tmp_path: Path) -> None:
     assert "review.file_size_cap_lines" not in packet
     assert "#1442" in packet
     assert "#1283-era extractions" in packet
+    # Issue #1496: the rubric's extraction remedy must name the refresh
+    # script so the reviewer's required_changes propagate the tightening
+    # step to the rework worker. Present even with the cap disabled (the
+    # rubric is permanent template prose).
+    assert "refresh_file_size_ratchet.py" in packet
     # Disabled -> no dynamic section text, and no unresolved placeholder.
     assert "Over-cap file additions" not in packet
     assert "$over_cap_section" not in packet
