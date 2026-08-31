@@ -291,9 +291,29 @@ def _resolve_cwd(payload: dict[str, Any], command: str = "") -> Path:
     Falls back to ``payload.cwd`` (and then ``Path.cwd()``) when no
     unambiguous ``cd`` prefix is present, preserving the original
     fail-closed behavior.
+
+    A parsed ``cd`` target is trusted only when it is **absolute**. A
+    relative target (``cd ../other && git push``) or a ``~``-prefixed
+    target (``cd ~/x && git push``) resolves against a *base* directory
+    the hook cannot know: the hook is spawned at a fixed project-root cwd
+    (the relative command path in ``settings.json``) while
+    ``payload.cwd`` is dynamic, so a relative target silently resolves
+    against the wrong base -- reintroducing #1468's own defect class for
+    the relative case. ``~`` is never expanded by ``shlex``, so
+    ``Path("~/x")`` is a nonexistent path whose lookup surfaces as a
+    spurious fail-closed deny. Both fall back to ``payload.cwd`` -- the
+    owner's fail-closed-on-ambiguity mandate applied to the non-absolute
+    case, not just to the ``cd -`` / ``cd -P`` forms ``_leading_cd_target``
+    already rejects.
+
+    The absolute check lives here, not in ``_leading_cd_target``:
+    ``_leading_cd_target``'s parametrized unit tests use drive-less
+    POSIX-style paths (``Path('/repo')``) that are not ``is_absolute()``
+    on ``WindowsPath``. The parser's contract is "return the parsed
+    target"; the trust decision is the caller's.
     """
     cd_target = _leading_cd_target(command) if command else None
-    if cd_target is not None:
+    if cd_target is not None and cd_target.is_absolute():
         return cd_target
     cwd_value = payload.get("cwd")
     if isinstance(cwd_value, str) and cwd_value:

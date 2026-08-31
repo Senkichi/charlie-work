@@ -618,6 +618,51 @@ def test_resolve_cwd_non_cd_first_token_uses_payload_cwd(hook: ModuleType, tmp_p
 
 
 # ---------------------------------------------------------------------------
+# _resolve_cwd -- non-absolute cd targets fall back to payload.cwd
+# (rework for #1468: the owner's fail-closed-on-ambiguity mandate applied
+# to relative and ~-prefixed cd targets, not just the `cd -`/`cd -P` forms
+# `_leading_cd_target` already rejects).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_cwd_relative_cd_target_falls_back_to_payload_cwd(
+    hook: ModuleType, tmp_path: Path
+) -> None:
+    # `cd ../other && git push` -- a relative target resolves against a
+    # base directory the hook cannot know (it is spawned at a fixed
+    # project-root cwd while payload.cwd is dynamic), so trusting it
+    # silently reintroduces #1468's own defect class. Fall back to
+    # payload.cwd rather than guessing the base.
+    payload_cwd = tmp_path / "session-default"
+    payload_cwd.mkdir()
+    result = hook._resolve_cwd({"cwd": str(payload_cwd)}, "cd ../other && git push")
+    assert result == payload_cwd
+
+
+def test_resolve_cwd_tilde_cd_target_falls_back_to_payload_cwd(
+    hook: ModuleType, tmp_path: Path
+) -> None:
+    # `cd ~/x && git push` -- shlex never expands `~`, so `Path("~/x")`
+    # is a nonexistent path whose lookup surfaces as a spurious
+    # fail-closed deny. Fall back to payload.cwd.
+    payload_cwd = tmp_path / "session-default"
+    payload_cwd.mkdir()
+    result = hook._resolve_cwd({"cwd": str(payload_cwd)}, "cd ~/x && git push")
+    assert result == payload_cwd
+
+
+def test_resolve_cwd_bare_tilde_cd_target_falls_back_to_payload_cwd(
+    hook: ModuleType, tmp_path: Path
+) -> None:
+    # `cd ~ && git push` -- same as ~/x: `Path("~")` is not absolute and
+    # not expanded by shlex, so fall back.
+    payload_cwd = tmp_path / "session-default"
+    payload_cwd.mkdir()
+    result = hook._resolve_cwd({"cwd": str(payload_cwd)}, "cd ~ && git push")
+    assert result == payload_cwd
+
+
+# ---------------------------------------------------------------------------
 # _leading_cd_target -- direct unit tests for the parser.
 # ---------------------------------------------------------------------------
 
@@ -727,6 +772,82 @@ def test_main_push_no_cd_uses_payload_cwd(
     rc = hook.main()
 
     assert rc == 0
+    assert captured == [payload_cwd]
+
+
+def test_main_push_tilde_cd_target_falls_back_to_payload_cwd(
+    hook: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """``cd ~/x && git push`` falls back to ``payload.cwd`` rather than
+    producing a GateError-driven deny (#1468 rework). ``shlex`` never
+    expands ``~``, so ``Path("~/x")`` is a nonexistent path; trusting it
+    would hand ``_repo_root`` a path with no repo, surfacing as a spurious
+    fail-closed deny. Instead ``payload.cwd`` wins and the lint check
+    proceeds normally (here: no changes -> allow)."""
+    payload_cwd = tmp_path / "session-default"
+    payload_cwd.mkdir()
+
+    captured: list[Path] = []
+
+    def _capture_repo_root(cwd: Path) -> Path:
+        captured.append(cwd)
+        return cwd
+
+    fake = _fake_stop_gate(changed=())
+    fake._repo_root = _capture_repo_root  # type: ignore[attr-defined]
+    monkeypatch.setattr(hook, "_load_stop_gate", lambda: fake)
+    monkeypatch.setattr(
+        hook.sys,
+        "stdin",
+        _stdin(_bash_payload("cd ~/x && git push", cwd=str(payload_cwd))),
+    )
+
+    rc = hook.main()
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "", (
+        "tilde cd target must not produce a deny -- it falls back to payload.cwd"
+    )
+    assert captured == [payload_cwd], (
+        f"expected _repo_root resolved from payload.cwd to {payload_cwd}, got {captured}"
+    )
+
+
+def test_main_push_relative_cd_target_falls_back_to_payload_cwd(
+    hook: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """``cd ../other && git push`` falls back to ``payload.cwd`` (#1468
+    rework). A relative target resolves against an unknown base (the
+    hook's spawn cwd, not ``payload.cwd``); trusting it would scope the
+    lint check to the wrong repo. ``payload.cwd`` wins instead."""
+    payload_cwd = tmp_path / "session-default"
+    payload_cwd.mkdir()
+
+    captured: list[Path] = []
+
+    def _capture_repo_root(cwd: Path) -> Path:
+        captured.append(cwd)
+        return cwd
+
+    fake = _fake_stop_gate(changed=())
+    fake._repo_root = _capture_repo_root  # type: ignore[attr-defined]
+    monkeypatch.setattr(hook, "_load_stop_gate", lambda: fake)
+    monkeypatch.setattr(
+        hook.sys,
+        "stdin",
+        _stdin(_bash_payload("cd ../other && git push", cwd=str(payload_cwd))),
+    )
+
+    rc = hook.main()
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == ""
     assert captured == [payload_cwd]
 
 
