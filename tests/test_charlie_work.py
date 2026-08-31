@@ -11919,8 +11919,8 @@ def test_config_rejects_non_string_review_effort(tmp_path: Path) -> None:
     except ConfigError as exc:
         message = str(exc)
 
-    assert "review_effort" in message
-    assert "review_dispatch" in message
+    assert "effort" in message
+    assert "reviewer" in message
     assert "must be a string" in message
 
 

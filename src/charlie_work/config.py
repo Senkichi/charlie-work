@@ -2254,6 +2254,9 @@ def _resolve_role_dual_accept(data: dict[str, Any]) -> list[str]:
     reviewer_raw = _role_section(data, "reviewer")
     review_dispatch_raw = _role_section(data, "review_dispatch")
     rescue_raw = _role_section(data, "rescue")
+    dispatch_raw = _role_section(data, "dispatch")
+    api_worker_raw = _role_section(data, "api_worker")
+    cross_family_raw = _role_section(data, "cross_family")
 
     # === reviewer.harness (Phase 1: claude-code only) ===
     effective_reviewer_harness = reviewer_raw.get("harness", "claude-code")
@@ -2479,6 +2482,28 @@ def _resolve_role_dual_accept(data: dict[str, Any]) -> list[str]:
         if rescue_dep:
             deprecations.append(rescue_msg)
 
+    # === value-only deprecation warnings (no structural mapping) ===
+    if "worker_model_tier" in dispatch_raw:
+        deprecations.append(
+            "dispatch.worker_model_tier is deprecated and no longer selects "
+            "anything; remove it (worker.model is now authoritative, currently "
+            f"{effective_worker_model!r})"
+        )
+    if "fallback_adapter" in api_worker_raw:
+        deprecations.append(
+            "api_worker.fallback_adapter is deprecated; per-issue adapter "
+            "routing is being removed in Phase 2 of the role-config refactor "
+            "and this key will stop being read"
+        )
+    if cross_family_raw:
+        emergent = effective_worker_model != effective_reviewer_model
+        deprecations.append(
+            "cross_family is deprecated; cross-family review is now emergent "
+            "from worker.model != reviewer.model (currently: "
+            f"worker={effective_worker_model!r} reviewer={effective_reviewer_model!r} "
+            f"-> cross-family: {'yes' if emergent else 'no'})"
+        )
+
     return deprecations
 
 
@@ -2533,6 +2558,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             f"unknown config section(s): {', '.join(unknown)} "
             f"(valid: {', '.join(sorted(known_sections))})"
         )
+    deprecations = _resolve_role_dual_accept(data)
     labels = _build_section(LabelConfig, "labels", _section(data, "labels"))
     dispatch_data = _section(data, "dispatch")
     materialize_dirs = dispatch_data.get("materialize_dirs")
@@ -3620,6 +3646,8 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         rescue_reviewer_data = {}
     rescue_data["reviewer"] = WorkerRoleConfig(**rescue_reviewer_data)
     rescue = _build_section(RescueConfig, "rescue", rescue_data)
+    worker = _build_section(WorkerRoleConfig, "worker", _section(data, "worker"))
+    reviewer = _build_section(ReviewerRoleConfig, "reviewer", _section(data, "reviewer"))
     watchdog_data = _section(data, "watchdog")
     terminal_error_markers = watchdog_data.get("terminal_error_markers")
     if terminal_error_markers is not None:
@@ -4104,6 +4132,8 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         api_worker=api_worker,
         cross_family=cross_family,
         rescue=rescue,
+        worker=worker,
+        reviewer=reviewer,
         watchdog=watchdog,
         worktree_reclamation=worktree_reclamation,
         test_adequacy=test_adequacy,
@@ -4117,6 +4147,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         runner_capacity_escalation=runner_capacity_escalation,
         supervisor=supervisor,
         post_mortem=post_mortem,
+        deprecations=tuple(deprecations),
         # ``sources`` is left at its dataclass default here -- this function
         # only ever sees a dict, never a path. ``load_config`` below (and
         # ``load_layered_config``) are the ones that know what path(s) the

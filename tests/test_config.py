@@ -460,7 +460,7 @@ def test_load_config_review_effort_experiment_fraction_rejects_bool(tmp_path: Pa
   review_effort_experiment_fraction: true
 """,
     )
-    with pytest.raises(ConfigError, match="review_effort_experiment_fraction.*must be a number"):
+    with pytest.raises(ConfigError, match="effort_experiment_fraction.*must be a number"):
         load_config(config_file)
 
 
@@ -472,7 +472,7 @@ def test_load_config_review_effort_experiment_fraction_rejects_non_number(tmp_pa
   review_effort_experiment_fraction: "0.5"
 """,
     )
-    with pytest.raises(ConfigError, match="review_effort_experiment_fraction.*must be a number"):
+    with pytest.raises(ConfigError, match="effort_experiment_fraction.*must be a number"):
         load_config(config_file)
 
 
@@ -544,7 +544,7 @@ def test_load_config_review_effort_experiment_salt_rejects_non_str(tmp_path: Pat
   review_effort_experiment_salt: 123
 """,
     )
-    with pytest.raises(ConfigError, match="review_effort_experiment_salt.*must be a string"):
+    with pytest.raises(ConfigError, match="effort_experiment_salt.*must be a string"):
         load_config(config_file)
 
 
@@ -2638,3 +2638,59 @@ def test_build_config_from_data_rescue_worker_reviewer_are_workerroleconfig_inst
     assert cfg.rescue.worker == WorkerRoleConfig(harness="devin-shell", model="glm-5-2")
     assert isinstance(cfg.rescue.reviewer, WorkerRoleConfig)
     assert cfg.rescue.reviewer == WorkerRoleConfig(harness="devin", model="codex")
+
+
+def test_build_config_from_data_wires_worker_and_reviewer_end_to_end() -> None:
+    cfg = build_config_from_data({"devin": {"adapter": "devin-shell", "worker_model": "glm-5-2"}})
+    assert cfg.worker.harness == "devin-shell"
+    assert cfg.worker.model == "glm-5-2"
+    assert cfg.devin.adapter == "devin-shell"
+    assert cfg.devin.worker_model == "glm-5-2"
+
+
+def test_build_config_from_data_records_deprecations_for_old_keys() -> None:
+    cfg = build_config_from_data({"devin": {"adapter": "devin-shell"}})
+    assert any("devin.adapter is deprecated" in msg for msg in cfg.deprecations)
+
+
+def test_build_config_from_data_no_deprecations_for_pure_new_style_config() -> None:
+    cfg = build_config_from_data(
+        {"worker": {"harness": "devin-shell"}, "reviewer": {"model": "x"}}
+    )
+    assert cfg.deprecations == ()
+
+
+def test_build_config_from_data_worker_model_tier_presence_is_deprecated() -> None:
+    cfg = build_config_from_data({"dispatch": {"worker_model_tier": "capable"}})
+    assert any("dispatch.worker_model_tier is deprecated" in msg for msg in cfg.deprecations)
+
+
+def test_build_config_from_data_fallback_adapter_presence_is_deprecated() -> None:
+    cfg = build_config_from_data({"api_worker": {"fallback_adapter": "devin-shell"}})
+    assert any("api_worker.fallback_adapter is deprecated" in msg for msg in cfg.deprecations)
+
+
+def test_build_config_from_data_cross_family_section_presence_is_deprecated_even_without_enabled() -> (
+    None
+):
+    cfg = build_config_from_data({"cross_family": {"command": ["devin", "--model", "{model}"]}})
+    assert any("cross_family is deprecated" in msg for msg in cfg.deprecations)
+
+
+def test_build_config_from_data_cross_family_deprecation_names_emergent_status() -> None:
+    cfg = build_config_from_data(
+        {
+            "cross_family": {"enabled": True},
+            "devin": {"adapter": "devin-shell", "worker_model": "glm-5-2"},
+            "reviewer": {"model": "claude-sonnet-5"},
+        }
+    )
+    msg = next(m for m in cfg.deprecations if m.startswith("cross_family"))
+    assert "worker='glm-5-2'" in msg
+    assert "reviewer='claude-sonnet-5'" in msg
+    assert "cross-family: yes" in msg
+
+
+def test_build_config_from_data_unknown_worker_key_still_raises_configerror() -> None:
+    with pytest.raises(ConfigError, match="unknown key.*worker.*bogus"):
+        build_config_from_data({"worker": {"bogus": "x"}})
