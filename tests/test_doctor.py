@@ -15,7 +15,9 @@ from charlie_work.config import (
     OrchestratorConfig,
     RescueConfig,
     ReviewDispatchConfig,
+    ReviewerRoleConfig,
     RuntimeConfig,
+    WorkerRoleConfig,
 )
 from charlie_work.config import ApiProviderConfig, ApiWorkerConfig
 from charlie_work.doctor import (
@@ -2569,3 +2571,69 @@ def test_doctor_in_progress_corroboration_silent_when_no_workers(
     check = by_name["in-progress worker corroboration"]
     assert check.ok is True
     assert "no in-progress workers" in check.detail
+
+
+def test_doctor_reports_role_config_summary(tmp_path: Path) -> None:
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        worker=WorkerRoleConfig(harness="devin-shell", model="claude-sonnet-4-5"),
+        reviewer=ReviewerRoleConfig(harness="claude-code", model="claude-opus-4-1"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    assert "role config" in by_name
+    role_check = by_name["role config"]
+    assert role_check.ok is True
+    assert "worker: harness=devin-shell model=claude-sonnet-4-5" in role_check.detail
+    assert "reviewer: harness=claude-code model=claude-opus-4-1" in role_check.detail
+    assert ok is True
+
+
+def test_doctor_role_config_summary_reports_cross_family_yes_when_models_differ(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        worker=WorkerRoleConfig(harness="devin-shell", model="glm-5-2"),
+        reviewer=ReviewerRoleConfig(harness="claude-code", model="claude-opus-4-1"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    assert "cross-family: yes" in by_name["role config"].detail
+
+
+def test_doctor_surfaces_deprecated_config_keys_as_warnings(tmp_path: Path) -> None:
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        deprecations=(
+            "devin.adapter is deprecated; set worker.harness instead (effective value: 'devin-shell')",
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    dep_checks = [c for c in checks if c.name == "deprecated config key"]
+    assert len(dep_checks) == 1
+    assert dep_checks[0].severity == "warning"
+    assert "devin.adapter is deprecated" in dep_checks[0].detail
+    assert ok is True  # warning-only, never blocking
+
+
+def test_doctor_omits_deprecated_config_key_checks_when_none_present(tmp_path: Path) -> None:
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    assert not [c for c in checks if c.name == "deprecated config key"]

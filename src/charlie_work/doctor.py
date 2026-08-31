@@ -1403,6 +1403,24 @@ def run_doctor(
             "(set it to null to disable venv sharing)",
         )
 
+    # -- role config summary + deprecation warnings (role-config Phase 1) ---
+    # Always informational (severity is only ever "warning" on the
+    # deprecation entries below, never "error") -- this section never blocks
+    # doctor from passing, it exists purely so an operator can see the
+    # resolved worker/reviewer roles and any legacy key they should migrate
+    # off of in one place, without cross-referencing devin/claude_code/
+    # review_dispatch/rescue by hand.
+    cross_family_status = "yes" if config.worker.model != config.reviewer.model else "no"
+    add(
+        "role config",
+        True,
+        f"worker: harness={config.worker.harness} model={config.worker.model or '(CLI default)'} | "
+        f"reviewer: harness={config.reviewer.harness} model={config.reviewer.model or '(CLI default)'} | "
+        f"cross-family: {cross_family_status}",
+    )
+    for deprecation_message in config.deprecations:
+        add("deprecated config key", True, deprecation_message, severity="warning")
+
     # -- worker GitHub token (issue #873 Part 2) -----------------------------
     # Config-only, no I/O: reads devin.worker_env/claude_code.worker_env, never
     # the process environment or sanitize_env's output.

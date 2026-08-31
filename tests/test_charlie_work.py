@@ -73,6 +73,7 @@ from charlie_work.config import (
     SupervisorConfig,
     TestAdequacyConfig,
     WatchdogConfig,
+    WorkerRoleConfig,
     find_config_path,
     load_config,
 )
@@ -2233,6 +2234,7 @@ def test_adapter_settings_api_branch_carries_api_worker_config(
     )
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="api"),
+        worker=WorkerRoleConfig(harness="api"),
         claude_code=claude_cfg,
         api_worker=api_cfg,
     )
@@ -2263,7 +2265,9 @@ def test_adapter_settings_non_api_branches_omit_api_worker_config(
     must set api_worker_config=None so a stale config block cannot leak into a
     non-api dispatch lane."""
     for adapter in ("devin-shell", "claude-code", "manual"):
-        config = OrchestratorConfig(devin=DevinConfig(adapter=adapter))
+        config = OrchestratorConfig(
+            devin=DevinConfig(adapter=adapter), worker=WorkerRoleConfig(harness=adapter)
+        )
         paths = runtime_paths(tmp_path, config.runtime.state_dir)
         app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
         settings = app._adapter_settings()
@@ -4836,7 +4840,8 @@ def test_command_dispatch_labels_only_successful_launches(tmp_path: Path) -> Non
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -4860,7 +4865,8 @@ def test_command_dispatch_failure_does_not_label_in_progress(tmp_path: Path) -> 
         devin=DevinConfig(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(7)"),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -8468,6 +8474,61 @@ def test_dispatch_reviews_forwards_orchestrator_config_to_launch(
     assert captured[0].get("config") is app.config
 
 
+def test_dispatch_reviews_threads_reviewer_model_as_model_override(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """dispatch_reviews() must pass config.reviewer.model as model_override so
+    a split worker/reviewer model configuration actually changes which model
+    the reviewer launches with -- launch_claude_worker's own fallback
+    (resolved_config.claude_code.model) is claimed by the WORKER when
+    worker.harness == 'claude-code' (see config._resolve_role_dual_accept),
+    so without an explicit override the reviewer would silently launch with
+    the worker's model whenever the two are configured to differ."""
+    from dataclasses import replace
+
+    from charlie_work.config import ReviewerRoleConfig, WorkerRoleConfig
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    app.config = replace(
+        app.config,
+        worker=WorkerRoleConfig(harness="claude-code", model="claude-opus-4-1"),
+        reviewer=ReviewerRoleConfig(harness="claude-code", model="claude-sonnet-5"),
+    )
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    captured: list[dict[str, Any]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        captured.append(kwargs)
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert len(captured) == 1
+    assert captured[0].get("model_override") == "claude-sonnet-5"
+
+
 def test_dispatch_reviews_records_review_effort_arm_on_state_and_event(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -11919,8 +11980,8 @@ def test_config_rejects_non_string_review_effort(tmp_path: Path) -> None:
     except ConfigError as exc:
         message = str(exc)
 
-    assert "review_effort" in message
-    assert "review_dispatch" in message
+    assert "effort" in message
+    assert "reviewer" in message
     assert "must be a string" in message
 
 
@@ -12797,7 +12858,8 @@ def test_review_preserves_recorded_decision_in_state(tmp_path: Path) -> None:
 
 def test_string_dispatch_command_rejects_issue_title(tmp_path: Path) -> None:
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="command", dispatch_command="echo {issue_title}")
+        devin=DevinConfig(adapter="command", dispatch_command="echo {issue_title}"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -13944,7 +14006,8 @@ def test_devin_shell_dispatch_launches_and_labels_in_progress(tmp_path: Path, mo
         devin=DevinConfig(
             adapter="devin-shell",
             shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -13982,7 +14045,9 @@ def test_claude_code_dispatch_routes_and_labels(tmp_path: Path, monkeypatch) -> 
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -14039,7 +14104,9 @@ def test_dispatch_with_recovery_passes_record_to_adapter(tmp_path: Path, monkeyp
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     # Override pr_list to return empty list (no open PRs, so recovery is allowed)
@@ -14097,7 +14164,9 @@ def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
     # candidate selection (the issue must be selectable to reach dispatch).
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
     monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -14165,7 +14234,9 @@ def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
     # test's outcome depend on host state, not the code under test.
     monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -14289,7 +14360,9 @@ def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
     # test's outcome depend on host state, not the code under test.
     monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -14434,7 +14507,9 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
     # under test ever runs.
     monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -14561,7 +14636,9 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
     # of the code under test.
     monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -19858,7 +19935,8 @@ def test_dispatch_rework_restores_rework_requested_on_dispatch_failure(tmp_path:
                 "-c",
                 "import sys; sys.exit(1)",  # Simulate dispatch failure
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19913,7 +19991,8 @@ def test_dispatch_rework_restores_rework_requested_on_dispatch_failure(tmp_path:
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
@@ -19941,7 +20020,8 @@ def test_dispatch_rework_failure_reason_in_event_payload(tmp_path: Path) -> None
                 "-c",
                 "import sys; sys.exit(1)",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -20049,6 +20129,7 @@ def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> No
                 "import sys; sys.exit(1)",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
             max_auto_redispatch=2,
             redispatch_window_minutes=240,
@@ -24703,6 +24784,7 @@ def test_standard_lifecycle_rework_dispatch_selects_issue(tmp_path: Path) -> Non
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -44686,7 +44768,9 @@ def test_phantom_live_worker_preserves_sidecar_for_dirty_worktree_with_commits(
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -47169,6 +47253,7 @@ def test_dispatch_failed_retries_are_capped_and_escalate(tmp_path: Path) -> None
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(7)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=1),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -51922,6 +52007,7 @@ def test_dispatch_with_api_disabled_routes_all_to_default_adapter(tmp_path: Path
             adapter="devin-shell",
             shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
         ),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         api_worker=_api_worker_config_for_routing(enabled=False),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -52553,6 +52639,7 @@ def test_dispatch_rework_no_rescue_skips_redundant_manifest_write(
     too — that is the call #626 makes conditional."""
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     # Only issue 123 (normal), no rescue marker on issue 124's PR.

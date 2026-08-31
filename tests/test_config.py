@@ -7,15 +7,21 @@ from pathlib import Path
 import pytest
 from types import MappingProxyType
 
+from charlie_work import config as config_module
 from charlie_work.config import (
     ApiBudgetConfig,
     ApiProviderConfig,
     ApiWorkerConfig,
+    ClaudeCodeConfig,
     ConfigError,
     DispatchConfig,
     OrchestratorConfig,
+    RescueConfig,
+    ReviewerRoleConfig,
     RuntimeConfig,
+    WorkerRoleConfig,
     build_config_from_data,
+    known_config_sections,
     load_config,
 )
 from charlie_work.global_config import load_layered_config
@@ -454,7 +460,7 @@ def test_load_config_review_effort_experiment_fraction_rejects_bool(tmp_path: Pa
   review_effort_experiment_fraction: true
 """,
     )
-    with pytest.raises(ConfigError, match="review_effort_experiment_fraction.*must be a number"):
+    with pytest.raises(ConfigError, match="effort_experiment_fraction.*must be a number"):
         load_config(config_file)
 
 
@@ -466,7 +472,7 @@ def test_load_config_review_effort_experiment_fraction_rejects_non_number(tmp_pa
   review_effort_experiment_fraction: "0.5"
 """,
     )
-    with pytest.raises(ConfigError, match="review_effort_experiment_fraction.*must be a number"):
+    with pytest.raises(ConfigError, match="effort_experiment_fraction.*must be a number"):
         load_config(config_file)
 
 
@@ -538,7 +544,7 @@ def test_load_config_review_effort_experiment_salt_rejects_non_str(tmp_path: Pat
   review_effort_experiment_salt: 123
 """,
     )
-    with pytest.raises(ConfigError, match="review_effort_experiment_salt.*must be a string"):
+    with pytest.raises(ConfigError, match="effort_experiment_salt.*must be a string"):
         load_config(config_file)
 
 
@@ -2205,3 +2211,486 @@ def test_provider_suspended_is_deterministic_escalation_failure_kind() -> None:
     from charlie_work.config import DETERMINISTIC_ESCALATION_FAILURE_KINDS
 
     assert "provider_suspended" in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+
+
+def test_worker_role_config_defaults_and_frozen() -> None:
+    cfg = WorkerRoleConfig()
+    assert cfg.harness == "manual"
+    assert cfg.model == ""
+    with pytest.raises(AttributeError):
+        cfg.harness = "claude-code"  # type: ignore[misc]
+
+
+def test_reviewer_role_config_defaults_and_frozen() -> None:
+    cfg = ReviewerRoleConfig()
+    assert cfg.harness == "claude-code"
+    assert cfg.model == "claude-sonnet-5"
+    assert cfg.effort == ""
+    assert cfg.effort_experiment_fraction == 0.0
+    assert cfg.effort_experiment_salt == ""
+    with pytest.raises(AttributeError):
+        cfg.model = "x"  # type: ignore[misc]
+
+
+def test_rescue_config_worker_and_reviewer_role_defaults() -> None:
+    cfg = RescueConfig()
+    assert cfg.worker == WorkerRoleConfig(harness="claude-code", model="claude-opus-4-1")
+    assert cfg.reviewer == WorkerRoleConfig(harness="devin", model="codex")
+    # Legacy fields are untouched by this task -- still their own defaults.
+    assert cfg.worker_adapter == "claude-code"
+    assert cfg.worker_model == "claude-opus-4-1"
+    assert cfg.reviewer_adapter == "devin"
+    assert cfg.reviewer_model == "codex"
+
+
+def test_orchestrator_config_worker_reviewer_deprecations_defaults() -> None:
+    cfg = OrchestratorConfig()
+    assert cfg.worker == WorkerRoleConfig()
+    assert cfg.reviewer == ReviewerRoleConfig()
+    assert cfg.deprecations == ()
+
+
+def test_worker_and_reviewer_are_known_config_sections() -> None:
+    sections = known_config_sections()
+    assert "worker" in sections
+    assert "reviewer" in sections
+    # Provenance fields must never be forgeable as a YAML section.
+    assert "deprecations" not in sections
+    assert "sources" not in sections
+
+
+def test_claude_code_config_model_default_uses_shared_constant() -> None:
+    from charlie_work.config import _DEFAULT_CLAUDE_MODEL
+
+    assert ClaudeCodeConfig().model == _DEFAULT_CLAUDE_MODEL
+    assert ReviewerRoleConfig().model == _DEFAULT_CLAUDE_MODEL
+
+
+def test_resolve_dual_accept_new_only() -> None:
+    value, deprecated = config_module._resolve_dual_accept(
+        old_present=False,
+        old_value=None,
+        old_label="old.x",
+        new_present=True,
+        new_value="Y",
+        new_label="new.x",
+        default="D",
+    )
+    assert value == "Y"
+    assert deprecated is False
+
+
+def test_resolve_dual_accept_old_only() -> None:
+    value, deprecated = config_module._resolve_dual_accept(
+        old_present=True,
+        old_value="X",
+        old_label="old.x",
+        new_present=False,
+        new_value=None,
+        new_label="new.x",
+        default="D",
+    )
+    assert value == "X"
+    assert deprecated is True
+
+
+def test_resolve_dual_accept_neither_uses_default() -> None:
+    value, deprecated = config_module._resolve_dual_accept(
+        old_present=False,
+        old_value=None,
+        old_label="old.x",
+        new_present=False,
+        new_value=None,
+        new_label="new.x",
+        default="D",
+    )
+    assert value == "D"
+    assert deprecated is False
+
+
+def test_resolve_dual_accept_agreeing_values_are_deprecated_not_conflicting() -> None:
+    value, deprecated = config_module._resolve_dual_accept(
+        old_present=True,
+        old_value="X",
+        old_label="old.x",
+        new_present=True,
+        new_value="X",
+        new_label="new.x",
+        default="D",
+    )
+    assert value == "X"
+    assert deprecated is True
+
+
+def test_resolve_dual_accept_disagreeing_values_raise() -> None:
+    with pytest.raises(ConfigError, match="old.x.*X.*new.x.*Y"):
+        config_module._resolve_dual_accept(
+            old_present=True,
+            old_value="X",
+            old_label="old.x",
+            new_present=True,
+            new_value="Y",
+            new_label="new.x",
+            default="D",
+        )
+
+
+def test_role_section_absent_key_inserts_empty_dict_back_into_data() -> None:
+    data: dict = {}
+    section = config_module._role_section(data, "worker")
+    assert section == {}
+    assert data["worker"] is section  # must be the SAME object, not a detached copy
+
+
+def test_role_section_non_dict_value_is_coerced_and_inserted() -> None:
+    data = {"worker": "not-a-dict"}
+    section = config_module._role_section(data, "worker")
+    assert section == {}
+    assert data["worker"] is section
+
+
+def test_role_section_existing_dict_is_returned_as_is() -> None:
+    data = {"worker": {"harness": "api"}}
+    section = config_module._role_section(data, "worker")
+    assert section is data["worker"]
+    assert section == {"harness": "api"}
+
+
+def test_resolve_role_dual_accept_scaffold_returns_empty_list() -> None:
+    assert config_module._resolve_role_dual_accept({}) == []
+    assert config_module._resolve_role_dual_accept({"unrelated": 1}) == []
+
+
+def test_resolve_role_dual_accept_worker_harness_old_only() -> None:
+    data = {"devin": {"adapter": "devin-shell"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["devin"]["adapter"] == "devin-shell"
+    assert data["worker"]["harness"] == "devin-shell"
+
+
+def test_resolve_role_dual_accept_worker_harness_new_only() -> None:
+    data = {"worker": {"harness": "api"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["devin"]["adapter"] == "api"
+    assert data["worker"]["harness"] == "api"
+
+
+def test_resolve_role_dual_accept_worker_harness_neither_defaults_to_manual() -> None:
+    data: dict = {}
+    config_module._resolve_role_dual_accept(data)
+    assert data["devin"]["adapter"] == "manual"
+    assert data["worker"]["harness"] == "manual"
+
+
+def test_resolve_role_dual_accept_worker_harness_conflict_raises() -> None:
+    data = {"devin": {"adapter": "devin-shell"}, "worker": {"harness": "api"}}
+    with pytest.raises(ConfigError, match="devin.adapter.*devin-shell.*worker.harness.*api"):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_worker_harness_rejects_invalid_value() -> None:
+    data = {"worker": {"harness": "bogus"}}
+    with pytest.raises(ConfigError, match="worker.*harness.*bogus"):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_worker_model_devin_shell_old_only() -> None:
+    data = {"devin": {"adapter": "devin-shell", "worker_model": "glm-5-2"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["devin"]["worker_model"] == "glm-5-2"
+    assert data["worker"]["model"] == "glm-5-2"
+    # claude_code.model is unclaimed by a devin-shell WORKER, but (as of Task 4)
+    # the reviewer resolution repurposes it as the reviewer's legacy model key
+    # in this branch -- it still gets populated, with the independently
+    # resolved reviewer model (here the shared default, since neither
+    # claude_code.model nor reviewer.model was set).
+    assert data["claude_code"]["model"] == config_module._DEFAULT_CLAUDE_MODEL
+
+
+def test_resolve_role_dual_accept_worker_model_devin_shell_new_only() -> None:
+    data = {"worker": {"harness": "devin-shell", "model": "glm-5-2"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["devin"]["worker_model"] == "glm-5-2"
+    assert data["worker"]["model"] == "glm-5-2"
+
+
+def test_resolve_role_dual_accept_worker_model_devin_shell_conflict_raises() -> None:
+    data = {
+        "devin": {"adapter": "devin-shell", "worker_model": "glm-5-2"},
+        "worker": {"harness": "devin-shell", "model": "sonnet-5"},
+    }
+    with pytest.raises(ConfigError, match="devin.worker_model.*glm-5-2.*worker.model.*sonnet-5"):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_worker_model_devin_shell_no_model_defaults_empty() -> None:
+    data = {"devin": {"adapter": "devin-shell"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["worker"]["model"] == ""
+    assert data["devin"]["worker_model"] == ""
+
+
+def test_resolve_role_dual_accept_worker_model_claude_code_old_only() -> None:
+    data = {"devin": {"adapter": "claude-code"}, "claude_code": {"model": "claude-opus-4-1"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["worker"]["model"] == "claude-opus-4-1"
+    assert data["claude_code"]["model"] == "claude-opus-4-1"
+
+
+def test_resolve_role_dual_accept_worker_model_claude_code_new_only() -> None:
+    data = {"worker": {"harness": "claude-code", "model": "claude-opus-4-1"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["claude_code"]["model"] == "claude-opus-4-1"
+    assert data["worker"]["model"] == "claude-opus-4-1"
+
+
+def test_resolve_role_dual_accept_worker_model_claude_code_conflict_raises() -> None:
+    data = {
+        "devin": {"adapter": "claude-code"},
+        "claude_code": {"model": "claude-opus-4-1"},
+        "worker": {"model": "sonnet-5"},
+    }
+    with pytest.raises(
+        ConfigError,
+        match=r"claude_code\.model \(as worker\).*claude-opus-4-1.*worker\.model.*sonnet-5",
+    ):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_worker_model_claude_code_no_model_defaults_to_shared_constant() -> (
+    None
+):
+    # This is the regression this task must not reintroduce: an unconfigured
+    # claude-code worker must still get the CLI-pin default, never "".
+    data = {"devin": {"adapter": "claude-code"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["worker"]["model"] == config_module._DEFAULT_CLAUDE_MODEL
+    assert data["claude_code"]["model"] == config_module._DEFAULT_CLAUDE_MODEL
+
+
+def test_resolve_role_dual_accept_reviewer_harness_defaults_claude_code() -> None:
+    data: dict = {}
+    config_module._resolve_role_dual_accept(data)
+    assert data["reviewer"]["harness"] == "claude-code"
+
+
+def test_resolve_role_dual_accept_reviewer_harness_rejects_non_claude_code() -> None:
+    data = {"reviewer": {"harness": "devin"}}
+    with pytest.raises(ConfigError, match="reviewer.*harness.*claude-code.*devin"):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_reviewer_model_inherits_claude_code_model_when_worker_also_claude_code() -> (
+    None
+):
+    # Today's actual behavior: a review launch with no model_override falls
+    # back to claude_code.model. With harness=claude-code and no
+    # reviewer.model set, the reviewer must inherit the SAME resolved value
+    # as the worker.
+    data = {"devin": {"adapter": "claude-code"}, "claude_code": {"model": "claude-opus-4-1"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["worker"]["model"] == "claude-opus-4-1"
+    assert data["reviewer"]["model"] == "claude-opus-4-1"
+
+
+def test_resolve_role_dual_accept_reviewer_model_splits_from_worker_model_no_conflict() -> None:
+    # The primary incremental-migration path: keep claude_code.model driving
+    # the (claude-code) worker, add reviewer.model to decouple the reviewer.
+    # This must NOT raise -- it is not a conflict, it is the intended split.
+    data = {
+        "devin": {"adapter": "claude-code"},
+        "claude_code": {"model": "claude-opus-4-1"},
+        "reviewer": {"model": "claude-sonnet-5"},
+    }
+    config_module._resolve_role_dual_accept(data)
+    assert data["worker"]["model"] == "claude-opus-4-1"
+    assert data["reviewer"]["model"] == "claude-sonnet-5"
+    # claude_code.model stays claimed by the worker -- unaffected by the split.
+    assert data["claude_code"]["model"] == "claude-opus-4-1"
+
+
+def test_resolve_role_dual_accept_reviewer_model_non_claude_code_worker_old_only() -> None:
+    data = {"devin": {"adapter": "devin-shell"}, "claude_code": {"model": "claude-opus-4-1"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["reviewer"]["model"] == "claude-opus-4-1"
+    assert data["claude_code"]["model"] == "claude-opus-4-1"
+
+
+def test_resolve_role_dual_accept_reviewer_model_non_claude_code_worker_conflict_raises() -> None:
+    data = {
+        "devin": {"adapter": "devin-shell"},
+        "claude_code": {"model": "claude-opus-4-1"},
+        "reviewer": {"model": "claude-sonnet-5"},
+    }
+    with pytest.raises(
+        ConfigError,
+        match=r"claude_code\.model \(as reviewer\).*claude-opus-4-1.*reviewer\.model.*claude-sonnet-5",
+    ):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_reviewer_model_no_config_anywhere_defaults_to_shared_constant() -> (
+    None
+):
+    data: dict = {}
+    config_module._resolve_role_dual_accept(data)
+    assert data["reviewer"]["model"] == config_module._DEFAULT_CLAUDE_MODEL
+
+
+def test_resolve_role_dual_accept_reviewer_effort_old_only() -> None:
+    data = {"review_dispatch": {"review_effort": "high"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["review_dispatch"]["review_effort"] == "high"
+    assert data["reviewer"]["effort"] == "high"
+
+
+def test_resolve_role_dual_accept_reviewer_effort_new_only() -> None:
+    data = {"reviewer": {"effort": "high"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["review_dispatch"]["review_effort"] == "high"
+    assert data["reviewer"]["effort"] == "high"
+
+
+def test_resolve_role_dual_accept_reviewer_effort_conflict_raises() -> None:
+    data = {"review_dispatch": {"review_effort": "high"}, "reviewer": {"effort": "low"}}
+    with pytest.raises(
+        ConfigError, match="review_dispatch.review_effort.*high.*reviewer.effort.*low"
+    ):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_reviewer_experiment_fraction_and_salt_dual_accept() -> None:
+    data = {
+        "reviewer": {
+            "effort": "high",
+            "effort_experiment_fraction": 0.5,
+            "effort_experiment_salt": "abc",
+        }
+    }
+    config_module._resolve_role_dual_accept(data)
+    assert data["review_dispatch"]["review_effort_experiment_fraction"] == 0.5
+    assert data["review_dispatch"]["review_effort_experiment_salt"] == "abc"
+
+
+def test_resolve_role_dual_accept_reviewer_experiment_fraction_conflict_raises() -> None:
+    data = {
+        "review_dispatch": {"review_effort_experiment_fraction": 0.5},
+        "reviewer": {"effort_experiment_fraction": 0.75},
+    }
+    with pytest.raises(
+        ConfigError,
+        match="review_dispatch.review_effort_experiment_fraction.*0.5.*"
+        "reviewer.effort_experiment_fraction.*0.75",
+    ):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_rescue_worker_old_only() -> None:
+    data = {"rescue": {"worker_adapter": "devin-shell", "worker_model": "glm-5-2"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["rescue"]["worker_adapter"] == "devin-shell"
+    assert data["rescue"]["worker_model"] == "glm-5-2"
+    assert data["rescue"]["worker"] == {"harness": "devin-shell", "model": "glm-5-2"}
+
+
+def test_resolve_role_dual_accept_rescue_worker_new_only() -> None:
+    data = {"rescue": {"worker": {"harness": "devin-shell", "model": "glm-5-2"}}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["rescue"]["worker_adapter"] == "devin-shell"
+    assert data["rescue"]["worker_model"] == "glm-5-2"
+
+
+def test_resolve_role_dual_accept_rescue_worker_conflict_raises() -> None:
+    data = {
+        "rescue": {
+            "worker_adapter": "claude-code",
+            "worker": {"harness": "devin-shell"},
+        }
+    }
+    with pytest.raises(
+        ConfigError, match="rescue.worker_adapter.*claude-code.*rescue.worker.harness.*devin-shell"
+    ):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_rescue_reviewer_old_only() -> None:
+    data = {"rescue": {"reviewer_adapter": "devin", "reviewer_model": "codex"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["rescue"]["reviewer"] == {"harness": "devin", "model": "codex"}
+
+
+def test_resolve_role_dual_accept_rescue_defaults_preserve_current_rescueconfig_defaults() -> None:
+    data: dict = {}
+    config_module._resolve_role_dual_accept(data)
+    assert data["rescue"]["worker_adapter"] == "claude-code"
+    assert data["rescue"]["worker_model"] == "claude-opus-4-1"
+    assert data["rescue"]["reviewer_adapter"] == "devin"
+    assert data["rescue"]["reviewer_model"] == "codex"
+    assert data["rescue"]["worker"] == {"harness": "claude-code", "model": "claude-opus-4-1"}
+    assert data["rescue"]["reviewer"] == {"harness": "devin", "model": "codex"}
+
+
+def test_build_config_from_data_rescue_worker_reviewer_are_workerroleconfig_instances() -> None:
+    cfg = build_config_from_data(
+        {"rescue": {"worker": {"harness": "devin-shell", "model": "glm-5-2"}}}
+    )
+    assert isinstance(cfg.rescue.worker, WorkerRoleConfig)
+    assert cfg.rescue.worker == WorkerRoleConfig(harness="devin-shell", model="glm-5-2")
+    assert isinstance(cfg.rescue.reviewer, WorkerRoleConfig)
+    assert cfg.rescue.reviewer == WorkerRoleConfig(harness="devin", model="codex")
+
+
+def test_build_config_from_data_wires_worker_and_reviewer_end_to_end() -> None:
+    cfg = build_config_from_data({"devin": {"adapter": "devin-shell", "worker_model": "glm-5-2"}})
+    assert cfg.worker.harness == "devin-shell"
+    assert cfg.worker.model == "glm-5-2"
+    assert cfg.devin.adapter == "devin-shell"
+    assert cfg.devin.worker_model == "glm-5-2"
+
+
+def test_build_config_from_data_records_deprecations_for_old_keys() -> None:
+    cfg = build_config_from_data({"devin": {"adapter": "devin-shell"}})
+    assert any("devin.adapter is deprecated" in msg for msg in cfg.deprecations)
+
+
+def test_build_config_from_data_no_deprecations_for_pure_new_style_config() -> None:
+    cfg = build_config_from_data(
+        {"worker": {"harness": "devin-shell"}, "reviewer": {"model": "x"}}
+    )
+    assert cfg.deprecations == ()
+
+
+def test_build_config_from_data_worker_model_tier_presence_is_deprecated() -> None:
+    cfg = build_config_from_data({"dispatch": {"worker_model_tier": "capable"}})
+    assert any("dispatch.worker_model_tier is deprecated" in msg for msg in cfg.deprecations)
+
+
+def test_build_config_from_data_fallback_adapter_presence_is_deprecated() -> None:
+    cfg = build_config_from_data({"api_worker": {"fallback_adapter": "devin-shell"}})
+    assert any("api_worker.fallback_adapter is deprecated" in msg for msg in cfg.deprecations)
+
+
+def test_build_config_from_data_cross_family_section_presence_is_deprecated_even_without_enabled() -> (
+    None
+):
+    cfg = build_config_from_data({"cross_family": {"command": ["devin", "--model", "{model}"]}})
+    assert any("cross_family is deprecated" in msg for msg in cfg.deprecations)
+
+
+def test_build_config_from_data_cross_family_deprecation_names_emergent_status() -> None:
+    cfg = build_config_from_data(
+        {
+            "cross_family": {"enabled": True},
+            "devin": {"adapter": "devin-shell", "worker_model": "glm-5-2"},
+            "reviewer": {"model": "claude-sonnet-5"},
+        }
+    )
+    msg = next(m for m in cfg.deprecations if m.startswith("cross_family"))
+    assert "worker='glm-5-2'" in msg
+    assert "reviewer='claude-sonnet-5'" in msg
+    assert "cross-family: yes" in msg
+
+
+def test_build_config_from_data_unknown_worker_key_still_raises_configerror() -> None:
+    with pytest.raises(ConfigError, match="unknown key.*worker.*bogus"):
+        build_config_from_data({"worker": {"bogus": "x"}})
