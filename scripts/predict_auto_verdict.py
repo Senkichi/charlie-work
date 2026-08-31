@@ -29,10 +29,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from charlie_work.cross_family import (  # noqa: E402
-    extract_head_ref_oid,
-    parse_cross_family_verdict,
-)
+from charlie_work.cross_family import parse_cross_family_verdict  # noqa: E402
+from charlie_work.rescue_review import extract_head_ref_oid  # noqa: E402
 
 # Decisions the auto-verdict path treats as unresolved (workflow.py:10221).
 UNRESOLVED = ("pending", "vacuous")

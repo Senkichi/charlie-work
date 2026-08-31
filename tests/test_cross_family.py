@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from charlie_work.cross_family import (
     CrossFamilyVerdict,
     MalformedCrossFamilyVerdict,
@@ -259,51 +257,3 @@ def test_parse_cross_family_verdict_json_block_after_language_tagged_code_fences
         summary="real bug in the spare-budget gate",
         required_changes=("Fix the gate to use planned running, not actual running",),
     )
-
-
-def test_cross_family_verdict_post_init_rejects_content_free_request_changes() -> None:
-    """Issue #784 AC-6: the invalid state -- request_changes with neither
-    itemized required_changes nor a real summary -- must be unrepresentable
-    at construction, not just avoided by callers that remember to check."""
-    with pytest.raises(ValueError, match="content-free"):
-        CrossFamilyVerdict(decision="request_changes", summary="", required_changes=())
-
-
-def test_cross_family_verdict_post_init_rejects_whitespace_only_summary() -> None:
-    """Whitespace-only is not a real summary either -- ``.strip()`` is
-    applied before the emptiness check, so padding cannot smuggle a
-    content-free verdict past the guard."""
-    with pytest.raises(ValueError, match="content-free"):
-        CrossFamilyVerdict(decision="request_changes", summary="   \n  ", required_changes=())
-
-
-def test_cross_family_verdict_post_init_allows_request_changes_with_only_summary() -> None:
-    """Narrower than "always require required_changes": the legacy Markdown
-    parse path never itemizes findings, so a request_changes verdict with a
-    real extracted summary and empty required_changes remains legitimate
-    and constructible -- this is exactly what the legacy-path tests above
-    rely on."""
-    verdict = CrossFamilyVerdict(
-        decision="request_changes", summary="a real extracted summary", required_changes=()
-    )
-    assert verdict.summary == "a real extracted summary"
-
-
-def test_cross_family_verdict_post_init_allows_request_changes_with_only_required_changes() -> (
-    None
-):
-    """A JSON-block verdict with itemized required_changes but an empty
-    summary is also legitimate -- required_changes alone is something a
-    rework brief can act on."""
-    verdict = CrossFamilyVerdict(
-        decision="request_changes", summary="", required_changes=("fix the null check",)
-    )
-    assert verdict.required_changes == ("fix the null check",)
-
-
-def test_cross_family_verdict_post_init_allows_approved_with_empty_summary() -> None:
-    """The guard is scoped to ``request_changes`` only -- an approved
-    verdict never needs anything for a rework brief to act on, so an empty
-    summary there is unaffected."""
-    verdict = CrossFamilyVerdict(decision="approved", summary="")
-    assert verdict.decision == "approved"

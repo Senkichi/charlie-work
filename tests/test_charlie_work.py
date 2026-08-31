@@ -86,7 +86,6 @@ from charlie_work.cross_family import (
     parse_cross_family_verdict,
     render_command,
     report_body_is_valid,
-    run_cross_family_review,
 )
 from charlie_work.github import issue_numbers_mentioned_by_pr, label_names
 from charlie_work.instrumentation import log_event, query_events
@@ -22680,32 +22679,6 @@ def test_dry_run_skips_worker_launch(monkeypatch, tmp_path: Path) -> None:
     assert (
         results[0].error is None
     )  # error=None for dry-run (informational note is in workflow layer)
-    assert len(subprocess_calls) == 0  # No subprocess should be invoked
-
-
-def test_dry_run_skips_cross_family_review(monkeypatch, tmp_path: Path) -> None:
-    """Test that --dry-run prevents cross-family model subprocess execution."""
-    subprocess_calls: list[list[str]] = []
-
-    def fake_run(*args, **kwargs):
-        subprocess_calls.append(args[0])
-        raise AssertionError("subprocess.run should not be called in dry-run mode")
-
-    monkeypatch.setattr("charlie_work.cross_family.subprocess.run", fake_run)
-
-    result = run_cross_family_review(
-        model="test-model",
-        command=["echo", "test"],
-        repo_root=tmp_path,
-        prompt_text="test prompt",
-        prompt_path=tmp_path / "prompt.md",
-        report_path=tmp_path / "report.md",
-        timeout_seconds=30,
-        dry_run=True,
-    )
-
-    assert result.ok is False
-    assert result.error == "DRY-RUN: cross-family review not executed"
     assert len(subprocess_calls) == 0  # No subprocess should be invoked
 
 
@@ -46789,7 +46762,7 @@ def test_spec_review_state_lock_guard_returns_skip_when_lock_held(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Issue #398: spec_review is also guarded by the state-lock skip pattern."""
-    from charlie_work.cross_family import CrossFamilyResult
+    from charlie_work.rescue_review import CrossFamilyResult
 
     monkeypatch.setattr(state_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
 

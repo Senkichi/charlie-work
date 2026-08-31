@@ -1,0 +1,458 @@
+"""Cross-family review support for the rescue tier (issue #555): run a
+NON-Claude model (e.g. codex via the Devin CLI) against a bounded rescue
+rework attempt and capture its findings.
+
+Rationale: the rescue tier's own reviewer is deliberately a different model
+family than the workers whose repeated rework it is adjudicating, so it does
+not share their blind spots. See the standing practice note in memory
+(feedback_cross_family_devin_review): findings are LEADS, not verdicts — a
+cross-family model over-escalates severity, so every finding must be
+verified against live code before it is accepted.
+
+Hard contract: ``run_cross_family_review`` NEVER raises into its caller. A
+codex outage, timeout, or non-zero exit must not break review-packet
+generation — the failure is captured as a stub report and a not-ok result
+instead.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import subprocess
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+from .env_sanitize import sanitize_env
+from .subprocess_runner import no_console_window_kwargs
+
+logger = logging.getLogger(__name__)
+
+# Signature-compatible with subprocess.run for the happy path; tests inject a fake.
+Runner = Callable[..., "subprocess.CompletedProcess[str]"]
+
+# Historical placeholder emitted by the pre-#784 legacy-path fallback when a
+# BLOCKER/MAJOR marker was found but no summary text could be extracted. Lives
+# here (not in cross_family.py, which this module was split out of) because
+# two other modules need it and importing it from cross_family.py would be
+# either impossible (workflow.py -> rework_prompts.py -> cross_family.py has
+# no cycle today, but workflow.py -> cross_family.py -> rescue_review.py does
+# once cross_family.py imports the survivor cluster back from here) or,
+# post-Task-6, simply wrong (cross_family.py no longer exists at all). Used
+# ONLY for detecting old on-disk verdicts written by pre-#784 code
+# (workflow.py's rework-brief staleness check, rework_prompts.py's summary
+# checks) -- never emitted by current code (see cross_family.py's
+# parse_cross_family_verdict, which raises instead of constructing this).
+LEGACY_VACUOUS_SUMMARY = "Cross-family review found BLOCKER/MAJOR findings"
+
+_CAVEAT = (
+    "> Findings below are **leads, not verdicts** — this cross-family model "
+    "over-escalates severity. Verify each against the live code before folding "
+    "it in, reject over-escalations with a reason, and never let this report "
+    "gate a merge on its own."
+)
+
+# Transient provider failures that merit one bounded in-process retry.
+_TRANSIENT_RE = re.compile(
+    r"(?:rate\s+limit|too\s+many\s+requests|temporarily\s+unavailable|"
+    r"try\s+again\s+later|reset\s+in\s+.*?minute|please\s+try\s+again)",
+    re.IGNORECASE,
+)
+
+_BLOCKED_RE = re.compile(
+    r"(?:blocked from performing|blocked from completing|"
+    r"all tool calls are being rejected|permission denied|please re-run|"
+    r"re-run the review|i'm blocked|i am blocked|cannot perform the review|"
+    r"unable to perform the review|tool use has been disabled|refused to execute)",
+    re.IGNORECASE,
+)
+
+# ``Verdict:`` line, a ``## Verdict`` heading, OR a bold-inline ``**Verdict:**``
+# marker — cross-family models (e.g. kimi-k3) emit the verdict as a markdown
+# heading without a colon, while others (e.g. glm-5.2) emit it as a bold-inline
+# marker within a paragraph (``**Verdict:** Approve with a required
+# follow-up...``) that the first two alternatives never matched, silently
+# routing every such report into the "no extractable summary" failure path.
+_VERDICT_RE = re.compile(
+    r"^\s*verdict\s*:|^#+\s*verdict\b|\*\*\s*verdict\s*:?\s*\*\*\s*:?",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# ``**SEVERITY**`` bold marker OR a ``### SEVERITY`` heading — cross-family
+# models (e.g. kimi-k3) emit findings as ``### NIT — file:line`` headings
+# instead of ``**NIT**`` bold inline markers.
+_SEVERITY_RE = re.compile(
+    r"\*\*(?:BLOCKER|MAJOR|MINOR|NIT)\*\*"
+    r"|^#+\s*(?:BLOCKER|MAJOR|MINOR|NIT)\b",
+    re.MULTILINE,
+)
+
+# Fenced ```json ... ``` (or bare ``` ... ``` or ```<any-language-tag> ... ```)
+# block, mirroring ``workflow._VERDICT_FENCE_RE``. Not imported from
+# ``workflow`` because ``workflow`` imports this module, not the reverse.
+#
+# The language-tag group MUST accept any tag, not just ``json``: a prior
+# ``(?:json)?`` version only recognized an opening fence tagged bare or
+# ``json``, so a report with e.g. ``` ```python ``` citation blocks before its
+# final ```json verdict block desynchronized entirely -- the regex failed to
+# match the ```python fence's own OPENING backtick (its "python" tag isn't
+# "json" and isn't followed by whitespace-then-newline), so ``finditer``
+# skipped past it and instead matched the ```python block's *closing* bare
+# ``` as a spurious new opening, pairing it with the *next* fence's opening
+# as its "closing" -- silently merging two unrelated fenced blocks into one
+# corrupted match and permanently misaligning every fence pair after it in
+# the document (confirmed byte-for-byte against PR #802's real report, whose
+# genuinely well-formed trailing ```json verdict was never found because of
+# this).
+_VERDICT_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
+
+
+def _looks_transient(*texts: str) -> bool:
+    return bool(_TRANSIENT_RE.search("\n".join(texts)))
+
+
+def extract_report_body(text: str) -> str:
+    """Return the model-generated body from a full report.
+
+    If ``text`` starts with the orchestrator report header, strip the header,
+    caveat, and first ``---`` separator so validation operates on the model
+    output rather than on wrapper text that itself contains bold markdown.
+    """
+    text = text.strip()
+    if not text.startswith("# Cross-family adversarial review"):
+        return text
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "---":
+            return "\n".join(lines[i + 1 :]).strip()
+    return text
+
+
+def extract_head_ref_oid(text: str) -> str | None:
+    """Extract the PR head SHA from a cross-family report header.
+
+    Returns None if the report doesn't contain a head SHA comment.
+    """
+    text = text.strip()
+    if not text.startswith("# Cross-family adversarial review"):
+        return None
+    for line in text.splitlines():
+        if line.strip().startswith("<!-- PR head SHA:"):
+            match = re.search(r"PR head SHA: ([^<\s]+)", line)
+            return match.group(1) if match else None
+    return None
+
+
+def report_body_is_valid(body: str) -> bool:
+    """Return True if the captured model output looks like a real review.
+
+    A real review must contain at least one strict severity marker
+    (**BLOCKER**, **MAJOR**, **MINOR**, or **NIT**), a non-refusal
+    ``Verdict:`` line, or a shape-valid JSON verdict block (see
+    ``_find_json_verdict``) — the last case covers a reviewer that emitted
+    the new structured block but, contrary to instructions, dropped the
+    Markdown severity/verdict markers; without this fallback that report
+    would be discarded as UNAVAILABLE and its findings lost entirely.
+    Blocked/refusal messages (e.g. "blocked from performing the review",
+    "all tool calls are being rejected", "please re-run") are rejected even
+    if they include a severity marker or verdict line, so they cannot be
+    cached as a success report.
+    """
+    text = extract_report_body(body)
+    if not text:
+        return False
+    if _BLOCKED_RE.search(text):
+        return False
+    if _SEVERITY_RE.search(text):
+        return True
+    if _VERDICT_RE.search(text):
+        return True
+    return _find_json_verdict(text) is not None
+
+
+@dataclass(frozen=True)
+class CrossFamilyResult:
+    """Outcome of one cross-family review invocation."""
+
+    ok: bool
+    report_path: str
+    model: str
+    returncode: int | None = None
+    error: str | None = None
+    reused: bool = False
+    # ``pending`` is used only by cross_family.py's async launch/reap functions
+    # (issue #1078) — the rescue tier's own run_cross_family_review below never
+    # sets it. Kept here (rather than dropped) because cross_family.py's
+    # auto-gate-only remainder still constructs CrossFamilyResult(pending=True)
+    # through Task 6; Task 6 removes this field once that remainder is deleted.
+    pending: bool = False
+
+
+def render_command(command: Sequence[str] | str, values: dict[str, str]) -> list[str] | str:
+    """Render the configured command template with ``{name}`` placeholders.
+
+    A sequence renders per-part (no shell); a string renders whole (shell=True),
+    mirroring ``adapters._render_command``.
+    """
+    if isinstance(command, str):
+        return command.format(**values)
+    return [str(part).format(**values) for part in command]
+
+
+def run_cross_family_review(
+    *,
+    model: str,
+    command: Sequence[str] | str,
+    repo_root: Path,
+    prompt_text: str,
+    prompt_path: Path,
+    report_path: Path,
+    timeout_seconds: int,
+    dry_run: bool = False,
+    runner: Runner = subprocess.run,
+    sleep: Callable[[float], None] = time.sleep,
+    head_ref_oid: str | None = None,
+) -> CrossFamilyResult:
+    """Write ``prompt_text`` to ``prompt_path``, run the cross-family model from
+    ``repo_root`` (so it can read the real code), and capture stdout to
+    ``report_path``. Returns a result; never raises.
+
+    One bounded retry is performed when the runner fails with a transient
+    provider error (rate-limit/temporarily-unavailable text).  Exit-zero output
+    that is semantically empty or blocked is written as an ``(UNAVAILABLE)``
+    stub instead of a reusable success report.
+
+    If ``dry_run`` is True, skip the subprocess and return a synthetic result.
+    """
+    if dry_run:
+        # Deliberately NOT routed through _fail(): that helper mkdirs and
+        # write_text()s an "(UNAVAILABLE)" stub to report_path, so previewing a PR
+        # that already has a real cross-family report would *destroy* it and leave a
+        # DRY-RUN placeholder in its place -- the report is keyed by PR, so the
+        # genuine review for that PR is gone. A dry-run branch that bails out by
+        # writing is not a dry run (issue #613). The result shape is unchanged
+        # (ok=False, same error text) so existing callers behave exactly as before.
+        return CrossFamilyResult(
+            ok=False,
+            report_path=str(report_path),
+            model=model,
+            returncode=None,
+            error="DRY-RUN: cross-family review not executed",
+        )
+
+    # Check for staleness: if we're about to overwrite a report with a different head SHA,
+    # log a warning. This is a strong signal that the previous report was stale.
+    if report_path.exists() and report_path.stat().st_size > 0:
+        old_text = report_path.read_text(encoding="utf-8")
+        old_head_sha = extract_head_ref_oid(old_text)
+        # head_ref_oid must be known to claim staleness: it is optional (spec reviews
+        # pass no PR head at all), and the warning below subscripts it, so without
+        # this term a caller that omits it hits TypeError on None[:12] -- in a
+        # function whose contract is "never raises". With no new head to compare
+        # against there is also nothing to call stale.
+        if old_head_sha and head_ref_oid and old_head_sha != head_ref_oid:
+            # Check if the reports are byte-identical despite different head SHAs
+            # This is a staleness signal (issue #156)
+            old_body = extract_report_body(old_text)
+            if report_body_is_valid(old_body):
+                logger.warning(
+                    f"Cross-family report staleness detected: overwriting report for PR head "
+                    f"{old_head_sha[:12]} with new report for PR head {head_ref_oid[:12]}. "
+                    f"Previous report may have reviewed stale code."
+                )
+
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(prompt_text, encoding="utf-8")
+
+    rendered = render_command(command, {"model": model, "prompt_path": str(prompt_path)})
+    # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator
+    env = sanitize_env(repo_root)
+    stdout = ""
+    for attempt in range(2):
+        try:
+            completed = runner(
+                rendered,
+                cwd=str(repo_root),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=timeout_seconds,
+                shell=isinstance(rendered, str),
+                check=False,
+                env=env,
+                **no_console_window_kwargs(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            partial = (
+                exc.stdout.decode("utf-8", "replace")
+                if isinstance(exc.stdout, bytes)
+                else (exc.stdout or "")
+            )
+            return _fail(
+                report_path,
+                model,
+                f"cross-family review timed out after {timeout_seconds}s",
+                partial=str(partial),
+            )
+        except OSError as exc:
+            return _fail(report_path, model, f"cross-family runner failed to start: {exc}")
+        except subprocess.SubprocessError as exc:  # any other subprocess failure
+            return _fail(report_path, model, f"cross-family review errored: {exc}")
+
+        stdout = completed.stdout or ""
+        if completed.returncode == 0:
+            break
+
+        detail = (completed.stderr or "").strip()
+        if attempt == 0 and _looks_transient(stdout, detail):
+            sleep(90.0)
+            continue
+
+        return _fail(
+            report_path,
+            model,
+            f"cross-family runner exited {completed.returncode}"
+            + (f": {detail}" if detail else ""),
+            partial=stdout,
+            returncode=completed.returncode,
+        )
+
+    if not report_body_is_valid(stdout):
+        return _fail(
+            report_path,
+            model,
+            "cross-family review produced an empty or blocked report",
+            partial=stdout,
+            returncode=0,
+        )
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(_report(model, stdout, head_ref_oid), encoding="utf-8")
+    return CrossFamilyResult(ok=True, report_path=str(report_path), model=model, returncode=0)
+
+
+def _report(model: str, body: str, head_ref_oid: str | None = None) -> str:
+    header = f"# Cross-family adversarial review — `{model}`"
+    if head_ref_oid:
+        header += f"\n\n<!-- PR head SHA: {head_ref_oid} -->"
+    return f"{header}\n\n{_CAVEAT}\n\n---\n\n{body.strip()}\n"
+
+
+def _fail(
+    report_path: Path,
+    model: str,
+    reason: str,
+    *,
+    partial: str = "",
+    returncode: int | None = None,
+) -> CrossFamilyResult:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    stub = f"# Cross-family adversarial review — `{model}` (UNAVAILABLE)\n\n> {reason}\n"
+    if partial.strip():
+        stub += f"\n---\n\nPartial output before failure:\n\n{partial.strip()}\n"
+    report_path.write_text(stub, encoding="utf-8")
+    return CrossFamilyResult(
+        ok=False, report_path=str(report_path), model=model, returncode=returncode, error=reason
+    )
+
+
+@dataclass(frozen=True)
+class CrossFamilyVerdict:
+    """A parsed JSON verdict block: decision, summary, and itemized findings.
+
+    Used internally by ``_find_json_verdict`` as the shape ``report_body_is_valid``
+    checks for when deciding whether a captured report is a real review (as
+    opposed to empty or blocked output) — not exposed as part of the rescue
+    tier's own verdict-extraction path, which uses
+    ``workflow._extract_verdict_from_text``/``_validate_review_verdict`` on the
+    SAME fenced-JSON contract instead.
+
+    ``__post_init__`` enforces one invariant: a ``request_changes`` decision
+    must carry *something* actionable — either itemized ``required_changes``
+    or a real (non-empty) ``summary``. A decision with neither is
+    content-free: it asserts blockers exist while naming none, which is
+    unrepresentable by construction rather than merely accidental.
+    """
+
+    decision: str
+    summary: str
+    required_changes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            self.decision == "request_changes"
+            and not self.required_changes
+            and not self.summary.strip()
+        ):
+            raise ValueError(
+                "CrossFamilyVerdict(decision='request_changes') requires "
+                "required_changes or a non-empty summary; a verdict with "
+                "neither is content-free and cannot be constructed (issue #784)"
+            )
+
+
+def _find_json_verdict(body: str) -> CrossFamilyVerdict | None:
+    """Return the last shape-valid JSON verdict block in ``body``, or None.
+
+    Scans fenced code blocks from the last one backwards — mirroring
+    ``workflow._extract_verdict_from_text`` — so a reviewer's actual final
+    answer wins over an earlier echo (e.g. of the example block in its own
+    prompt). A block is shape-valid when ``decision`` is ``"approved"`` or
+    ``"request_changes"`` (cross-family review never gates a merge on its
+    own, so unlike the primary reviewer it has no ``"blocked"`` decision)
+    and ``summary`` is a non-empty, non-placeholder string.
+    ``required_changes``, if present, must be a list of strings; a
+    malformed one rejects that block (an earlier fence, if any, is tried
+    next) rather than silently discarding the bad data.
+    """
+    for match in reversed(list(_VERDICT_FENCE_RE.finditer(body))):
+        candidate = match.group(1).strip()
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        decision = data.get("decision")
+        if decision not in ("approved", "request_changes"):
+            continue
+        summary = data.get("summary")
+        if not isinstance(summary, str):
+            continue
+        stripped_summary = summary.strip()
+        if not stripped_summary:
+            continue
+        # An unfilled template placeholder ("<one or two sentence...>") is
+        # prompt boilerplate that leaked into the verdict, never a real
+        # summary — mirrors workflow._validate_review_verdict's guard.
+        if stripped_summary.startswith("<") and stripped_summary.endswith(">"):
+            continue
+        raw_changes = data.get("required_changes")
+        if raw_changes is None:
+            required_changes: tuple[str, ...] = ()
+        elif isinstance(raw_changes, list) and all(isinstance(item, str) for item in raw_changes):
+            required_changes = tuple(item.strip() for item in raw_changes if item.strip())
+        else:
+            continue
+        return CrossFamilyVerdict(
+            decision=decision, summary=stripped_summary, required_changes=required_changes
+        )
+    return None
+
+
+__all__ = [
+    "CrossFamilyResult",
+    "CrossFamilyVerdict",
+    "LEGACY_VACUOUS_SUMMARY",
+    "render_command",
+    "run_cross_family_review",
+    "extract_report_body",
+    "extract_head_ref_oid",
+    "report_body_is_valid",
+]

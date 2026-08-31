@@ -57,15 +57,17 @@ from .notify import AttentionDigest, AttentionEntry, emit_digest
 from . import rescue as rescue_helpers
 from .subprocess_runner import run_captured
 from .cross_family import (
-    CrossFamilyResult,
-    LEGACY_VACUOUS_SUMMARY,
     MalformedCrossFamilyVerdict,
-    extract_head_ref_oid,
-    extract_report_body,
     launch_cross_family_review,
     parse_cross_family_verdict,
     reap_cross_family_review,
     report_is_reusable,
+)
+from .rescue_review import (
+    CrossFamilyResult,
+    LEGACY_VACUOUS_SUMMARY,
+    extract_head_ref_oid,
+    extract_report_body,
     run_cross_family_review,
 )
 from .cross_repo_gate import cross_repo_gate, cross_repo_scope_gate
@@ -11096,7 +11098,7 @@ class OrchestratorApp:
         cfg = self.config.rescue
         cf_result = run_cross_family_review(
             model=cfg.reviewer_model,
-            command=cfg.reviewer_command or self.config.cross_family.command,
+            command=cfg.reviewer_command,
             repo_root=self.repo_root,
             prompt_text=prompt_text,
             prompt_path=prompt_path,

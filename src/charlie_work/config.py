@@ -1492,11 +1492,11 @@ class RescueConfig:
     kept as an explicit field so a future adapter can be wired in by config
     alone, matching the spec's named knobs.
 
-    The rescue review reuses ``cross_family.run_cross_family_review`` (the
+    The rescue review reuses ``rescue_review.run_cross_family_review`` (the
     existing blocking, one-shot cross-family invocation) rather than a new
-    polling worker session — ``reviewer_command`` empty means reuse
-    ``CrossFamilyConfig.command`` with ``model`` overridden to
-    ``reviewer_model``.
+    polling worker session — ``reviewer_command`` defaults to the standard
+    Devin CLI invocation shape; override it only if the rescue tier's
+    reviewer harness differs from that default.
 
     Phase 1 of the role-config refactor: ``worker``/``reviewer`` below are
     dual-accept equivalents of ``worker_adapter``/``worker_model`` and
@@ -1515,9 +1515,17 @@ class RescueConfig:
     worker_model: str = "claude-opus-4-1"
     reviewer_adapter: str = "devin"
     reviewer_model: str = "codex"
-    # Empty means reuse CrossFamilyConfig.command (model still overridden to
-    # reviewer_model above).
-    reviewer_command: str | tuple[str, ...] = ()
+    # Standard Devin CLI invocation shape (matches CrossFamilyConfig.command's
+    # own default) -- override only if the rescue tier's reviewer harness
+    # differs from that default.
+    reviewer_command: str | tuple[str, ...] = (
+        "devin",
+        "--model",
+        "{model}",
+        "-p",
+        "--prompt-file",
+        "{prompt_path}",
+    )
     reviewer_timeout_seconds: int = 300
     worker: WorkerRoleConfig = field(
         default_factory=lambda: WorkerRoleConfig(harness="claude-code", model="claude-opus-4-1")
