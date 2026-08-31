@@ -5056,6 +5056,20 @@ def clean_worktrees(
         if not branch.startswith(config.dispatch.branch_prefix):
             out_of_scope += 1
             continue
+        # Issue #1229 scoping decision: this call site is deliberately NOT
+        # threaded through branch_issue_validator. This is a worktree-cleanup
+        # sweep that resolves worktrees whose PR is EXPECTED to be MERGED or
+        # CLOSED-unmerged (the only states that authorize removal), so the
+        # bound issue is EXPECTED to be closed by the merge -- an open-issue
+        # validator would reject every legitimate binding to its now-closed
+        # issue and break worktree cleanup entirely (the same rationale as the
+        # merged-PR sites in workflow.py). The ``issue_number`` is only a
+        # state.json lookup key used to find a candidate PR number via
+        # ``_find_linked_pr_number``; the actual destructive removal is
+        # fail-closed gated on a live ``gh pr view`` MERGED/CLOSED-unmerged
+        # confirmation of that PR number (state.json is corroboration, never
+        # sufficient on its own), so a stale branch-name binding cannot
+        # authorize removal on its own.
         issue_number = linked_issue_number(
             {"headRefName": branch},
             is_cross_repository=False,

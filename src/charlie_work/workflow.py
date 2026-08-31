@@ -68,6 +68,7 @@ from .github import (
     GitHubNotFoundError,
     GitHubRunResult,
     GraphQLBudgetError,
+    build_branch_issue_validator,
     cancel_superseded_runs,
     defang_closing_keywords,
     detect_prose_only_dependencies,
@@ -1635,11 +1636,20 @@ def _detect_and_handle_orphaned_workers(
     # Fetch PRs once before acquiring the lock (avoid network I/O under lock)
     prs = gh.pr_list()
     pr_by_issue: dict[int, dict[str, Any]] = {}
+    # Issue #1229: validate branch-name-derived issue numbers against the
+    # open-issue set so a stale branch name (e.g. agent/issue-709-… left over
+    # from a merged PR #709, reused by an unrelated issue-less PR) cannot bind
+    # the PR to a non-existent or closed issue here. Without this, a stale
+    # binding would populate pr_by_issue[<wrong n>] and either mask a real
+    # orphan's no-open-PR reclaim (the orphan is wrongly seen as "has a PR")
+    # or route the #417 ground-truth label reclaim at the wrong issue subject.
+    branch_validator = build_branch_issue_validator(gh)
     for pr in prs:
         linked = linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=config.dispatch.branch_prefix,
+            branch_issue_validator=branch_validator,
         )
         if linked is not None:
             pr_by_issue[linked] = pr
@@ -4656,6 +4666,18 @@ class OrchestratorApp:
         for pr in merged_prs:
             if str(pr.get("state") or "").upper() != "MERGED":
                 continue
+            # Issue #1229 scoping decision: this call site is deliberately NOT
+            # threaded through branch_issue_validator. ``bound_issue_numbers``
+            # only gates which CLOSED ready issues have a merged PR binding
+            # them (so they are not stripped as closed-unmerged); no
+            # issue-label transition or state escalation keys off it. A stale
+            # branch-name binding can at worst add a wrong number to
+            # ``bound_issue_numbers``, causing a missed label-strip on an
+            # already-CLOSED (terminal) issue that the next pass recovers --
+            # not the "escalate the wrong issue" failure class the validator
+            # exists to prevent. (Contrast ``detect_mergequeue_wedged``, whose
+            # ``issue_number`` DOES drive ``_escalate_issue`` and is
+            # validator-threaded.)
             bound = linked_issue_number(
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
@@ -5223,11 +5245,20 @@ class OrchestratorApp:
                 merged_pr_bound_issue_numbers | merged_pr_mention_only_issue_numbers
             )
             pr_by_issue = {}
+            # Issue #1229: validate branch-name-derived issue numbers against the
+            # real open-issue set so a stale branch name (e.g. agent/issue-709-…
+            # left over from a merged issue/PR #709, reused by an unrelated
+            # issue-less PR) cannot populate pr_by_issue[<wrong n>] and make the
+            # dry-run report wrongly claim a real, dispatchable issue already has
+            # an open PR. Same validator as the real dispatch-claim path below so
+            # the two cannot diverge.
+            branch_validator = self._make_branch_issue_validator()
             for pr in prs:
                 issue_number = linked_issue_number(
                     pr,
                     is_cross_repository=pr.get("isCrossRepository"),
                     branch_prefix=self.config.dispatch.branch_prefix,
+                    branch_issue_validator=branch_validator,
                 )
                 if issue_number is not None:
                     # If multiple PRs link to the same issue, keep the lowest PR number
@@ -5454,11 +5485,24 @@ class OrchestratorApp:
         )[:finalize_limit]
 
         pr_by_issue = {}
+        # Issue #1229: validate branch-name-derived issue numbers against the
+        # real open-issue set so a stale branch name (e.g. agent/issue-709-…
+        # left over from a merged issue/PR #709, reused by an unrelated
+        # issue-less PR) cannot populate pr_by_issue[<wrong n>] and make the
+        # dispatcher believe a real, dispatchable issue already has an open PR,
+        # silently skipping dispatch for it. This is the same phantom-binding
+        # failure class already fixed at the dead-session escalation guard
+        # (_classify_dead_sessions_and_update_throttle_state) and the
+        # orphaned-worker sweep (_detect_and_handle_orphaned_workers); all
+        # route through _make_branch_issue_validator so the open-issue fetch
+        # cannot diverge between call surfaces.
+        branch_validator = self._make_branch_issue_validator()
         for pr in prs:
             issue_number = linked_issue_number(
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
+                branch_issue_validator=branch_validator,
             )
             if issue_number is not None:
                 # If multiple PRs link to the same issue, keep the lowest PR number
@@ -6781,6 +6825,7 @@ class OrchestratorApp:
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=self.config.dispatch.branch_prefix,
+            branch_issue_validator=self._make_branch_issue_validator(),
         )
 
         # Issue #617: dry-run must short-circuit before the escalation check,
@@ -8650,11 +8695,26 @@ class OrchestratorApp:
         prs = self.gh.pr_list()
         queue: list[dict[str, Any]] = []
 
+        # Issue #1229: validate branch-name-derived issue numbers against the
+        # actual open-issue set so a stale branch name (e.g. agent/issue-709-…
+        # left over from a merged PR #709, reused by an unrelated issue-less
+        # PR) cannot bind the PR to a non-existent or closed issue here. This
+        # is the same phantom-binding failure class already fixed at the
+        # dispatch-claim pr_by_issue construction, the dead-session escalation
+        # guard, and the orphaned-worker sweep: review_queue's issue_number
+        # feeds _reroute_stranded_request_changes (a real rework-routing state
+        # mutation) and _emit_stale_ci_verdict_requeued (a state.json write),
+        # so a stale binding would route rework at the wrong issue subject.
+        # Built once before the loop so a single issue_list(state="open") call
+        # (cached within the pass on the real GitHub client) is shared across
+        # every PR in this queue.
+        branch_validator = self._make_branch_issue_validator()
         for pr in prs:
             issue_number = linked_issue_number(
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
+                branch_issue_validator=branch_validator,
             )
             if issue_number is None:
                 continue
@@ -10933,6 +10993,7 @@ class OrchestratorApp:
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
+                branch_issue_validator=self._make_branch_issue_validator(),
             )
             if pr
             else None
@@ -12483,6 +12544,7 @@ class OrchestratorApp:
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=self.config.dispatch.branch_prefix,
+            branch_issue_validator=self._make_branch_issue_validator(),
         )
         decision = self._review_decision(pr_number)
         approved = decision.get("decision") == "approved"
@@ -13689,6 +13751,7 @@ class OrchestratorApp:
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=self.config.dispatch.branch_prefix,
+            branch_issue_validator=self._make_branch_issue_validator(),
         )
         decision = self._review_decision(pr_number)
         approved = decision.get("decision") == "approved"
@@ -18591,6 +18654,12 @@ class OrchestratorApp:
             if self.config.auto_merge.update_branch_strategy == "front_of_train"
             else None
         )
+        # Issue #1229: validate branch-name-derived issue numbers against the
+        # actual open-issue set so a stale branch name (e.g. agent/issue-709-…
+        # left over from a merged PR #709, reused by an unrelated issue-less
+        # PR) cannot bind the PR to a non-existent or closed issue and corrupt
+        # state["issues"][<n>] with an unrelated rework episode.
+        branch_validator = self._make_branch_issue_validator()
         fir_confirm_passes = self.config.review.foreign_issue_ref_confirm_passes
         fir_reprobe_hours = self.config.review.foreign_issue_ref_reprobe_hours
         loop_now = now or datetime.now(UTC)
@@ -18599,6 +18668,7 @@ class OrchestratorApp:
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
+                branch_issue_validator=branch_validator,
             )
             if issue_number is None:
                 continue
@@ -19147,11 +19217,13 @@ class OrchestratorApp:
         # here vs. later is the same GitHub call.
         prs = self.gh.pr_list()
         pr_by_issue: dict[int, dict[str, Any]] = {}
+        branch_validator = self._make_branch_issue_validator()
         for pr in prs:
             issue_number = linked_issue_number(
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
+                branch_issue_validator=branch_validator,
             )
             if issue_number is not None:
                 # If multiple PRs link to the same issue, keep the lowest PR number
@@ -21438,6 +21510,37 @@ class OrchestratorApp:
     def _branch_name(self, issue: dict[str, Any]) -> str:
         return f"{self.config.dispatch.branch_prefix}-{int(issue['number'])}-{slugify(str(issue.get('title') or 'work'))}"
 
+    def _make_branch_issue_validator(self) -> Callable[[int], bool] | None:
+        """Build a validator for branch-name-derived issue numbers (issue #1229).
+
+        Facade re-export of ``github.build_branch_issue_validator`` -- the
+        single-point-of-enforcement constructor lives there so the open-number
+        extraction is shared with ``build_branch_issue_validator_from_issues``
+        (used by ``reconcile.detect_drift``'s snapshot-derived validator) and
+        cannot diverge between the rework-routing call sites and the
+        module-level sweeps (``_detect_and_handle_orphaned_workers``,
+        ``_classify_dead_sessions_and_update_throttle_state``). See
+        ``github.build_branch_issue_validator``'s docstring for the full
+        rationale (fail-open on API outage, ``_LIST_LIMIT`` tradeoff,
+        per-pass caching).
+
+        Issue #1229 rework note: the prior module-level
+        ``_build_branch_issue_validator`` delegate was a pure one-line
+        pass-through to ``github.build_branch_issue_validator``. It was
+        collapsed into its real home (``github.py``) rather than relocated to
+        ``checks.py`` because ``github.py`` already imports from ``checks.py``
+        at module load (``from .checks import _run_id_from_link``), so
+        ``checks.py`` importing ``build_branch_issue_validator`` back at
+        module level would create a circular import; a lazy import would
+        couple a CI-check-classification module to an unrelated concern for
+        zero behavioral benefit. Calling ``github.build_branch_issue_validator``
+        directly shrinks the workflow monolith more than relocating the
+        delegate would, and this method remains as the in-class facade so
+        the nine ``self._make_branch_issue_validator()`` call sites are
+        unchanged.
+        """
+        return build_branch_issue_validator(self.gh)
+
     def _render_issue_comments(self, issue: dict[str, Any]) -> str:
         """Render the ``$issue_comments`` slot for a worker prompt (issue #872).
 
@@ -21804,6 +21907,17 @@ class OrchestratorApp:
                 and not override_authorized
                 and not queue_sync_covered
             ):
+                # Issue #1229 scoping decision: this call site is deliberately
+                # NOT threaded through branch_issue_validator. The resolved
+                # ``issue_number`` is attached to the unauthorized-merge
+                # finding dict for correlation/reporting only; the finding is
+                # keyed off ``pr_number`` and the review-decision mismatch,
+                # and no issue-label transition or state escalation keys off
+                # the ``issue`` field. A stale branch-name binding can at
+                # worst mislabel the finding's ``issue`` field, not escalate
+                # the wrong issue. (Contrast ``detect_mergequeue_wedged``,
+                # whose ``issue_number`` DOES drive ``_escalate_issue`` and is
+                # validator-threaded.)
                 issue_number = linked_issue_number(
                     pr,
                     is_cross_repository=pr.get("isCrossRepository"),

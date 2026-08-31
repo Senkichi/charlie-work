@@ -307,3 +307,125 @@ def test_linked_issue_number_negation_does_not_shadow_later_genuine_match() -> N
         )
         == 700
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1229: branch_issue_validator — reject stale branch-name bindings
+# ---------------------------------------------------------------------------
+
+
+def test_linked_issue_number_validator_rejects_stale_branch_binding() -> None:
+    """A branch-name number with no matching open issue must not bind.
+
+    This is the core of issue #1229: a branch ``agent/issue-709-…`` left over
+    from a merged PR #709, reused by an unrelated issue-less PR, must not
+    silently bind the PR to issue 709. The validator returns False for 709
+    (not an open issue), so the branch-name binding is rejected.
+    """
+    open_issues = frozenset({123, 456})
+    validator = lambda n: n in open_issues  # noqa: E731
+    assert (
+        linked_issue_number(
+            {"headRefName": "agent/issue-709-stale-branch"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+            branch_issue_validator=validator,
+        )
+        is None
+    )
+
+
+def test_linked_issue_number_validator_accepts_valid_branch_binding() -> None:
+    """A branch-name number that IS a real open issue still binds."""
+    open_issues = frozenset({123, 456})
+    validator = lambda n: n in open_issues  # noqa: E731
+    assert (
+        linked_issue_number(
+            {"headRefName": "agent/issue-123-real-issue"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+            branch_issue_validator=validator,
+        )
+        == 123
+    )
+
+
+def test_linked_issue_number_validator_falls_through_to_closing_keyword() -> None:
+    """When the branch-name binding is rejected, the closing-keyword path runs.
+
+    A PR with a stale branch name ``agent/issue-709-…`` AND a genuine closing
+    keyword ``Fixes #123`` in the body should bind to 123 (the closing
+    keyword), not 709 (the rejected branch name) and not None.
+    """
+    open_issues = frozenset({123})
+    validator = lambda n: n in open_issues  # noqa: E731
+    assert (
+        linked_issue_number(
+            {
+                "headRefName": "agent/issue-709-stale-branch",
+                "body": "Fixes #123",
+            },
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+            branch_issue_validator=validator,
+        )
+        == 123
+    )
+
+
+def test_linked_issue_number_validator_none_preserves_existing_behavior() -> None:
+    """When no validator is supplied, the branch-name binding is trusted.
+
+    This is the backward-compatibility guarantee: existing callers that do not
+    pass ``branch_issue_validator`` get the same behavior as before #1229.
+    """
+    assert (
+        linked_issue_number(
+            {"headRefName": "agent/issue-709-stale-branch"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        == 709
+    )
+
+
+def test_linked_issue_number_validator_does_not_affect_closing_keyword_only() -> None:
+    """A PR that binds via closing keyword only (no branch prefix) is unaffected.
+
+    The validator applies exclusively to the branch-name path; a closing-keyword
+    binding with no branch-name match must still bind regardless of the
+    validator's opinion about that number.
+    """
+    open_issues: frozenset[int] = frozenset()  # empty — nothing is "open"
+    validator = lambda n: n in open_issues  # noqa: E731
+    assert (
+        linked_issue_number(
+            {"body": "Fixes #789"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+            branch_issue_validator=validator,
+        )
+        == 789
+    )
+
+
+def test_linked_issue_number_validator_rejects_then_no_keyword_returns_none() -> None:
+    """Stale branch binding + no closing keyword → None (issue-less PR).
+
+    This is the exact scenario from issue #1229: PR #1660 with branch
+    ``agent/issue-709-…`` and no closing keyword. The validator rejects 709,
+    there is no closing keyword to fall through to, and the result is None —
+    the PR is correctly treated as issue-less, preventing the collision with
+    the unrelated issue/PR #709's state entry.
+    """
+    open_issues = frozenset({123})
+    validator = lambda n: n in open_issues  # noqa: E731
+    assert (
+        linked_issue_number(
+            {"headRefName": "agent/issue-709-stale-branch", "body": "docs update"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+            branch_issue_validator=validator,
+        )
+        is None
+    )

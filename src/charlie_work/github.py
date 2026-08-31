@@ -6,7 +6,7 @@ import random
 import re
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -2240,11 +2240,81 @@ def defang_closing_keywords(text: str) -> str:
     return _CLOSING_KEYWORD_DEFANG_RE.sub(r"\g<1>\g<2>issue \g<3>", text)
 
 
+def build_branch_issue_validator(
+    gh: GitHubLike,
+) -> Callable[[int], bool] | None:
+    """Build a validator for branch-name-derived issue numbers (issue #1229).
+
+    This is the single-point-of-enforcement constructor for the
+    ``branch_issue_validator`` callable consumed by ``linked_issue_number``.
+    Every call site that resolves a branch-name issue number against the real
+    open-issue set -- the module-level sweeps
+    (``_detect_and_handle_orphaned_workers``,
+    ``_classify_dead_sessions_and_update_throttle_state``), the rework-routing
+    ``OrchestratorApp`` methods, and the dispatch-claim ``pr_by_issue``
+    construction -- routes through here so the open-issue fetch, failure
+    handling, and ``_LIST_LIMIT`` tradeoff cannot diverge between call
+    surfaces.
+
+    Returns a callable that returns True iff the given number corresponds to
+    a real *open* issue in this repo, or None when the open-issue list cannot
+    be fetched (API outage). Callers that receive None should pass None to
+    ``linked_issue_number``'s ``branch_issue_validator`` -- the function then
+    trusts the branch-name binding unconditionally, preserving the pre-#1229
+    behavior rather than blocking the sweep during a transient GitHub
+    failure.
+
+    ``issue_list(state="open")`` is cached within a pass on the real
+    ``GitHub`` client, so repeated calls to this helper in the same pass
+    share a single GitHub API call. The list is capped at ``_LIST_LIMIT``
+    (500); a repo with more open issues than the cap could see a false
+    negative (a genuinely open issue treated as absent), which is the safe
+    direction -- refusing a branch-name binding never corrupts state, it
+    only defers an issue-adjacent operation until the issue is confirmed by
+    a closing keyword.
+    """
+    try:
+        open_issues = gh.issue_list(state="open")
+    except Exception:
+        # GitHubError (API outage), AttributeError (test fakes without
+        # issue_list), or any other transient failure -- the safe direction
+        # is to skip validation (return None) so callers preserve the
+        # pre-#1229 branch-name trust behavior rather than crashing or
+        # blocking the sweep.
+        return None
+    return build_branch_issue_validator_from_issues(open_issues)
+
+
+def build_branch_issue_validator_from_issues(
+    open_issues: Iterable[dict[str, Any]],
+) -> Callable[[int], bool]:
+    """Build a branch-issue validator from a pre-fetched OPEN issue snapshot.
+
+    This is the single construction path for the open-number set that
+    ``build_branch_issue_validator`` (which fetches via
+    ``issue_list(state="open")``) and any caller that already holds an
+    open-issue snapshot share, so the ``int(number)`` extraction and the
+    ``frozenset`` shape cannot diverge between call surfaces.
+
+    Use this instead of ``build_branch_issue_validator`` when the caller has
+    already fetched the issue list in the same pass (e.g. ``reconcile.detect_drift``
+    fetches ``issues?state=all`` as one of its two ``gh.run`` list queries and
+    must not issue a third). Unlike ``build_branch_issue_validator``, this
+    never returns None: the snapshot is already in hand, so there is no
+    fetch-outage fail-open path -- validation always runs. ``open_issues``
+    must already be filtered to OPEN state by the caller (this helper only
+    extracts numbers, it does not re-filter by state).
+    """
+    open_numbers = frozenset(int(i["number"]) for i in open_issues if i.get("number") is not None)
+    return lambda n: n in open_numbers
+
+
 def linked_issue_number(
     pr: dict[str, Any],
     *,
     is_cross_repository: bool | None,
     branch_prefix: str,
+    branch_issue_validator: Callable[[int], bool] | None = None,
 ) -> int | None:
     """Resolve the issue a PR is bound to, safe against hijack.
 
@@ -2266,6 +2336,18 @@ def linked_issue_number(
     false LABEL TRANSITION in charlie-work's own state machine; it has no
     effect on GitHub's own issue auto-close, which is a separate mechanism
     charlie-work does not control.
+
+    Issue #1229: ``branch_issue_validator``, when provided, is called with
+    the candidate issue number parsed from the branch name. If it returns
+    False (the number does not correspond to a real open issue), the
+    branch-name binding is rejected and the function falls through to the
+    closing-keyword path instead. This prevents a stale branch-name number
+    (e.g. a branch ``agent/issue-709-…`` left over from a merged issue/PR
+    #709, reused by an unrelated issue-less PR) from silently keying a
+    rework episode under ``state["issues"]["709"]`` and colliding with the
+    unrelated issue's lifecycle. When the validator is None (the default),
+    the branch-name binding is trusted unconditionally — preserving the
+    behavior of callers that do not need the validation.
     """
     # Cross-repo PRs or unknown provenance never bind for lifecycle purposes
     if is_cross_repository is True or is_cross_repository is None:
@@ -2277,9 +2359,17 @@ def linked_issue_number(
         # Only trust the branch ref when:
         # 1. PR is same-repo (is_cross_repository is not True)
         # 2. Branch starts with the configured prefix
+        # 3. (Issue #1229) The parsed number is a real open issue, when a
+        #    validator is supplied. Without a validator, trust unconditionally
+        #    to preserve existing caller behavior.
         has_correct_prefix = head.startswith(branch_prefix)
         if has_correct_prefix:
-            return int(match.group(1))
+            candidate = int(match.group(1))
+            if branch_issue_validator is None or branch_issue_validator(candidate):
+                return candidate
+            # Branch-name number is stale/unmatched — fall through to the
+            # closing-keyword path rather than binding to a non-existent or
+            # closed issue.
     # For same-repo PRs, trust closing keywords in title/body — but a
     # negated keyword ("does not fix #649") must not bind; see
     # `_first_unnegated_closing_keyword_match`.

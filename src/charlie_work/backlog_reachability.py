@@ -365,6 +365,16 @@ def scan_merged_pr_references(
         if str(pr.get("state") or "").upper() != "MERGED":
             continue
         pr_number = int(pr["number"])
+        # Issue #1229 scoping decision: this call site is deliberately NOT
+        # threaded through branch_issue_validator. The ``bound`` set only
+        # feeds the backlog-reachability classifier's mention-only exclusion
+        # (an issue wrongly seen as "bound" is excluded from dispatch as
+        # already-covered, a missed dispatch recovered on the next
+        # classification pass); no issue-label transition or state escalation
+        # keys off it. A stale branch-name binding can at worst misclassify a
+        # ready issue as bound, not escalate the wrong issue. (Contrast
+        # ``detect_mergequeue_wedged``, whose ``issue_number`` DOES drive
+        # ``_escalate_issue`` and is validator-threaded.)
         issue_number = linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),

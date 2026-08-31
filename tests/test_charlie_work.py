@@ -41258,6 +41258,16 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     # Mock PID liveness check to return False (dead PID)
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
@@ -41354,6 +41364,16 @@ def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 1108,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1108",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -41420,6 +41440,16 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -41523,6 +41553,16 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    # Issue #1229: the branch-issue validator threaded through
+    # _detect_and_handle_orphaned_workers calls issue_list(state="open") and
+    # rejects branch-name issue numbers absent from the open-issue set. The
+    # default FakeGitHub.issues only carries #123, so #207 must be planted
+    # here or the validator rejects the agent/issue-207 binding and the orphan
+    # sweep cannot match the PR to the issue (pr_number resolves to None,
+    # orphan_drift_at gets overwritten instead of preserved).
+    fake_gh.issues.append(
+        {"number": 207, "title": "test issue 207", "state": "OPEN", "labels": [], "body": ""}
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -41881,6 +41921,17 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    # Issue #1229: the branch-issue validator threaded through
+    # _detect_and_handle_orphaned_workers calls issue_list(state="open") and
+    # rejects branch-name issue numbers absent from the open-issue set. The
+    # default FakeGitHub.issues only carries #123, so #207 must be planted
+    # here or the validator rejects the agent/issue-207 binding, the orphan
+    # sweep cannot match the PR to the issue, and the fingerprint short-circuit
+    # (which requires the PR to be found) never fires — orphan_drift_at gets
+    # overwritten with a fresh timestamp instead of being preserved.
+    fake_gh.issues.append(
+        {"number": 207, "title": "test issue 207", "state": "OPEN", "labels": [], "body": ""}
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -42067,6 +42118,16 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
             return super().issue_list(labels=labels, state=state)
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -42079,8 +42140,10 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
         )
 
     # Issue 207 has a linked open PR (number 100), so no_pr_orphans is empty
-    # and the bulk issue-list sweep must not run.
-    assert fake_gh.issue_list_calls == 0
+    # and the bulk issue-list sweep must not run. The single issue_list call
+    # is the branch-issue validator's own open-issue fetch (issue #1229), not
+    # the bulk reclaim sweep.
+    assert fake_gh.issue_list_calls == 1
 
 
 def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Path) -> None:
@@ -42124,6 +42187,16 @@ def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Pa
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -42213,6 +42286,16 @@ def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) 
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -42299,6 +42382,16 @@ def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     # Mock PID liveness check to return False (dead PID)
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
@@ -42436,6 +42529,16 @@ def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     # Mock the helper to simulate PID recycling (alive check returns False due to start-time mismatch)
     def mock_worker_pid_alive(entry):
@@ -42620,6 +42723,16 @@ def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_pat
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -46965,6 +47078,16 @@ def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 457,
+            "title": "Test issue",
+            "url": "https://example.test/issues/457",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     def fake_review(pr_number: int):
         return CommandResult(True, "review packet generated", {"pr_number": pr_number})
@@ -47040,6 +47163,16 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 457,
+            "title": "Test issue",
+            "url": "https://example.test/issues/457",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     def fake_review(pr_number: int):
         return CommandResult(False, "janitor gate blocked review", {"pr_number": pr_number})
@@ -47115,6 +47248,7 @@ def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "approved", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -47129,6 +47263,16 @@ def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 457,
+            "title": "Test issue",
+            "url": "https://example.test/issues/457",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -47200,6 +47344,16 @@ def test_orphaned_worker_approved_rework_dead_worker_auto_resets(tmp_path: Path)
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 1109,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1109",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -47287,6 +47441,16 @@ def test_orphaned_worker_approved_rework_clean_exit_no_op_drift(tmp_path: Path) 
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 1109,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1109",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -47363,6 +47527,7 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: P
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "approved", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -47377,6 +47542,16 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: P
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 1109,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1109",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -47425,6 +47600,23 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self):
+            super().__init__()
+            # Issue #457 must appear in issue_list() (the open-issue snapshot)
+            # as well as issue_view(), so the branch-issue validator added in
+            # issue #1229 accepts agent/issue-457 as a real open issue.
+            self.issues = [
+                *self.issues,
+                {
+                    "number": 457,
+                    "title": "Orphan drift test",
+                    "url": "https://example.test/issues/457",
+                    "body": "",
+                    "labels": [{"name": config.labels.needs_rework}],
+                    "state": "OPEN",
+                },
+            ]
+
         def pr_list(self):
             return [
                 {
@@ -47463,6 +47655,18 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+
+    # Issue #1229: review_decision() reads from the file, not state.json.
+    # Without a review-decision.json file, last_decision is None, which
+    # routes through the #1128 pr-open transition instead of the
+    # dead_worker_unsafe_to_auto_reset drift path this test exercises.
+    # Write the file so last_decision is "approved" as the state entry implies.
+    pr_dir = paths.prs / "pr-100"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "abc123"}),
+        encoding="utf-8",
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -52068,6 +52272,16 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
             ]
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
+    fake_gh.issues.append(
+        {
+            "number": 1248,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1248",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     salvage_calls: list[tuple[Any, ...]] = []
 
@@ -52174,6 +52388,20 @@ def test_orphaned_worker_salvage_push_threads_dry_run_to_salvage_push_stranded_c
             ]
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
+    # Issue #1229: the branch-issue validator in _detect_and_handle_orphaned_workers
+    # rejects branch-name bindings to issues absent from the open-issue list, so
+    # #1326 must be seeded as an OPEN issue for the pr_by_issue binding to survive
+    # and the salvage loop to fire.
+    fake_gh.issues.append(
+        {
+            "number": 1326,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1326",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     salvage_calls: list[dict[str, Any]] = []
 
@@ -52263,6 +52491,16 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
             ]
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
+    fake_gh.issues.append(
+        {
+            "number": 1248,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1248",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         return SalvagePushResult(
@@ -52348,6 +52586,16 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
             ]
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
+    fake_gh.issues.append(
+        {
+            "number": 1248,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1248",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
 
     def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         return SalvagePushResult(pushed=False, skip_reason="up_to_date", old_remote_sha="abc123")

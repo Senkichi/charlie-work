@@ -249,6 +249,19 @@ def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path
         return paths.state_file
 
     class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.issues.append(
+                {
+                    "number": 207,
+                    "title": "Test issue",
+                    "url": "https://example.test/issues/207",
+                    "body": "",
+                    "labels": [],
+                    "state": "OPEN",
+                }
+            )
+
         def pr_list(self):
             return [
                 {
