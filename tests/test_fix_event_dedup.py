@@ -95,7 +95,7 @@ class FakeGitHubWithBlockers(FakeGitHub):
 
 
 def _blocked_app(tmp_path: Path, **kwargs) -> OrchestratorApp:
-    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    config = OrchestratorConfig(devin=DevinConfig())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHubWithBlockers(**kwargs)
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)

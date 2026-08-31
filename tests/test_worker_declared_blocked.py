@@ -18,7 +18,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig
+from charlie_work.config import (
+    DevinConfig,
+    OrchestratorConfig,
+    WatchdogConfig,
+    WorkerRoleConfig,
+)
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.state import load_state, save_state
 from charlie_work.worktree import worktree_path_for_branch
@@ -51,7 +56,8 @@ def test_blocked_outcome_routes_to_operator_queue_on_first_pass(
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -177,7 +183,8 @@ def test_no_outcome_file_keeps_redispatch_behavior(tmp_path: Path) -> None:
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

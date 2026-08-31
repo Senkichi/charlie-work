@@ -67,6 +67,7 @@ from charlie_work.config import (
     ReconcilePassConfig,
     ReviewConfig,
     ReviewDispatchConfig,
+    ReviewerRoleConfig,
     RuntimeConfig,
     SignatureRule,
     SupervisorConfig,
@@ -2197,7 +2198,6 @@ def test_adapter_settings_api_branch_carries_api_worker_config(
         tee_stream_json=True,
     )
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="api"),
         worker=WorkerRoleConfig(harness="api"),
         claude_code=claude_cfg,
         api_worker=api_cfg,
@@ -2229,9 +2229,7 @@ def test_adapter_settings_non_api_branches_omit_api_worker_config(
     must set api_worker_config=None so a stale config block cannot leak into a
     non-api dispatch lane."""
     for adapter in ("devin-shell", "claude-code", "manual"):
-        config = OrchestratorConfig(
-            devin=DevinConfig(adapter=adapter), worker=WorkerRoleConfig(harness=adapter)
-        )
+        config = OrchestratorConfig(worker=WorkerRoleConfig(harness=adapter))
         paths = runtime_paths(tmp_path, config.runtime.state_dir)
         app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
         settings = app._adapter_settings()
@@ -4320,9 +4318,7 @@ def test_dispatch_merged_pr_mention_rearmed_re_enters_dispatch(tmp_path: Path) -
     operator's removal, exercising the re-arm detection path that reads
     the already-loaded issue labels.
     """
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),  # avoid real worker launch
-    )
+    config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     human_needed = config.labels.human_needed
 
@@ -4417,9 +4413,7 @@ def test_dispatch_merged_pr_mention_still_carries_human_needed_stays_excluded(
     that lifts the exclusion purely on the flag timestamp (without checking the
     label / durable re-arm marker) makes this test fail.
     """
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
-    )
+    config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     class LabelMutatingFakeGitHub(FakeGitHub):
@@ -4465,9 +4459,7 @@ def test_dispatch_merged_pr_mention_never_flagged_stays_excluded(tmp_path: Path)
     exclusion for any issue with the flag timestamp set this pass (before the
     operator has had a chance to rule) makes this test fail.
     """
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
-    )
+    config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     fake_gh = FakeGitHub()
@@ -4496,9 +4488,7 @@ def test_dispatch_merged_pr_bound_exclusion_unaffected_by_rearm(tmp_path: Path) 
     A regression that subtracts rearmed issues from the bound set (instead of
     only the mention-only set) makes this test fail.
     """
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
-    )
+    config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     fake_gh = FakeGitHub()
@@ -4797,13 +4787,12 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
 def test_command_dispatch_labels_only_successful_launches(tmp_path: Path) -> None:
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -4826,10 +4815,7 @@ def test_command_dispatch_labels_only_successful_launches(tmp_path: Path) -> Non
 
 def test_command_dispatch_failure_does_not_label_in_progress(tmp_path: Path) -> None:
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(7)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(7)")),
         worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -5335,15 +5321,15 @@ def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -8444,10 +8430,11 @@ def test_dispatch_reviews_threads_reviewer_model_as_model_override(
     """dispatch_reviews() must pass config.reviewer.model as model_override so
     a split worker/reviewer model configuration actually changes which model
     the reviewer launches with -- launch_claude_worker's own fallback
-    (resolved_config.claude_code.model) is claimed by the WORKER when
-    worker.harness == 'claude-code' (see config._resolve_role_dual_accept),
-    so without an explicit override the reviewer would silently launch with
-    the worker's model whenever the two are configured to differ."""
+    (resolved_config.worker.model) is claimed by the WORKER when
+    worker.harness == 'claude-code' (worker.harness is read directly from
+    config, with no resolver involved), so without an explicit override the
+    reviewer would silently launch with the worker's model whenever the two
+    are configured to differ."""
     from dataclasses import replace
 
     from charlie_work.config import ReviewerRoleConfig, WorkerRoleConfig
@@ -8515,11 +8502,8 @@ def test_dispatch_reviews_records_review_effort_arm_on_state_and_event(
         },
     ]
     config = OrchestratorConfig(
-        review_dispatch=ReviewDispatchConfig(
-            enabled=True,
-            review_effort="high",
-            review_effort_experiment_fraction=1.0,
-        ),
+        review_dispatch=ReviewDispatchConfig(enabled=True),
+        reviewer=ReviewerRoleConfig(effort="high", effort_experiment_fraction=1.0),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -8581,7 +8565,8 @@ def test_dispatch_reviews_experiment_disabled_records_no_arm(monkeypatch, tmp_pa
         },
     ]
     config = OrchestratorConfig(
-        review_dispatch=ReviewDispatchConfig(enabled=True, review_effort="high"),
+        review_dispatch=ReviewDispatchConfig(enabled=True),
+        reviewer=ReviewerRoleConfig(effort="high"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -11903,7 +11888,7 @@ def test_config_rejects_non_string_review_effort(tmp_path: Path) -> None:
     from charlie_work.config import ConfigError
 
     path = tmp_path / "c.yaml"
-    path.write_text("review_dispatch:\n  review_effort: 3\n", encoding="utf-8")
+    path.write_text("reviewer:\n  effort: 3\n", encoding="utf-8")
 
     try:
         load_config(path)
@@ -11918,11 +11903,11 @@ def test_config_rejects_non_string_review_effort(tmp_path: Path) -> None:
 
 def test_config_accepts_string_review_effort(tmp_path: Path) -> None:
     path = tmp_path / "c.yaml"
-    path.write_text("review_dispatch:\n  review_effort: high\n", encoding="utf-8")
+    path.write_text("reviewer:\n  effort: high\n", encoding="utf-8")
 
     config = load_config(path)
 
-    assert config.review_dispatch.review_effort == "high"
+    assert config.reviewer.effort == "high"
 
 
 def test_run_cross_family_sanitizes_environment(
@@ -12481,7 +12466,7 @@ def test_review_preserves_recorded_decision_in_state(tmp_path: Path) -> None:
 
 def test_string_dispatch_command_rejects_issue_title(tmp_path: Path) -> None:
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="command", dispatch_command="echo {issue_title}"),
+        devin=DevinConfig(dispatch_command="echo {issue_title}"),
         worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -12656,7 +12641,6 @@ def test_loop_dead_session_notifies_when_watchdog_disabled(
 
     issue_number = 706
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
         watchdog=WatchdogConfig(
             enabled=False,
             stall_minutes=20,
@@ -13478,9 +13462,7 @@ def test_dispatch_skips_prose_only_deps_labeled_issues(tmp_path: Path) -> None:
                 },
             ]
 
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
-    )
+    config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = ProseOnlyDepsGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -13623,10 +13605,7 @@ def test_devin_shell_dispatch_launches_and_labels_in_progress(tmp_path: Path, mo
     monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
+        devin=DevinConfig(shell_command=(sys.executable, "-c", "import sys; sys.exit(0)")),
         worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -13665,9 +13644,7 @@ def test_claude_code_dispatch_routes_and_labels(tmp_path: Path, monkeypatch) -> 
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
-    )
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -13724,9 +13701,7 @@ def test_dispatch_with_recovery_passes_record_to_adapter(tmp_path: Path, monkeyp
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
-    )
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     # Override pr_list to return empty list (no open PRs, so recovery is allowed)
@@ -13784,9 +13759,7 @@ def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
     # candidate selection (the issue must be selectable to reach dispatch).
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
     monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
-    )
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -13854,9 +13827,7 @@ def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
     # test's outcome depend on host state, not the code under test.
     monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
-    )
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -13980,9 +13951,7 @@ def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
     # test's outcome depend on host state, not the code under test.
     monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
-    )
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -14127,9 +14096,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
     # under test ever runs.
     monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
-    )
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -14256,9 +14223,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
     # of the code under test.
     monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
-    )
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.pr_list = lambda: []
@@ -14417,7 +14382,7 @@ def test_orphaned_worker_sweep_runs_with_watchdog_disabled(tmp_path: Path) -> No
 
     # watchdog disabled — the sweep must still run.
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=False, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -18779,7 +18744,8 @@ def test_merge_ready_mergequeue_check_failure_still_routes_to_rework(tmp_path: P
             mergequeue_label="mergequeue",
             failed_attempt_alarm=1,
         ),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHubWithChecks(
@@ -19315,7 +19281,7 @@ def test_review_started_clears_needs_rework() -> None:
 
 def test_dispatch_rework_skips_manual_adapter(tmp_path: Path) -> None:
     """Rework dispatch must skip manual adapters to preserve human-paste path."""
-    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -19331,13 +19297,12 @@ def test_dispatch_rework_finds_needs_rework_issues_with_open_prs(tmp_path: Path)
     """Rework dispatch must find issues with rework_requested status and open PRs."""
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -19383,13 +19348,12 @@ def test_dispatch_rework_transitions_to_rework_dispatched(tmp_path: Path) -> Non
     """Rework dispatch must transition to rework_dispatched label on success."""
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -19435,13 +19399,12 @@ def test_dispatch_rework_transition_failure_recorded(tmp_path: Path) -> None:
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -19496,14 +19459,14 @@ def test_dispatch_rework_releases_claims_when_all_skipped(tmp_path: Path) -> Non
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
-        )
+            )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19551,14 +19514,7 @@ def test_dispatch_rework_restores_rework_requested_on_dispatch_failure(tmp_path:
     excluding the issue from rework selection (state-driven selection).
     """
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(
-                sys.executable,
-                "-c",
-                "import sys; sys.exit(1)",  # Simulate dispatch failure
-            ),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
         worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -19607,13 +19563,12 @@ def test_dispatch_rework_restores_rework_requested_on_dispatch_failure(tmp_path:
     # Fix the command to succeed
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -19636,14 +19591,7 @@ def test_dispatch_rework_restores_rework_requested_on_dispatch_failure(tmp_path:
 def test_dispatch_rework_failure_reason_in_event_payload(tmp_path: Path) -> None:
     """Issue #448: failed rework dispatch must record the per-issue reason in the event payload."""
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(
-                sys.executable,
-                "-c",
-                "import sys; sys.exit(1)",
-            ),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
         worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -19698,13 +19646,12 @@ def test_dispatch_rework_event_indexes_pr_number(tmp_path: Path) -> None:
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -19745,19 +19692,9 @@ def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> No
     redispatch cap and escalate instead of retrying forever.
     """
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(
-                sys.executable,
-                "-c",
-                "import sys; sys.exit(1)",
-            ),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
         worker=WorkerRoleConfig(harness="command"),
-        watchdog=WatchdogConfig(
-            max_auto_redispatch=2,
-            redispatch_window_minutes=240,
-        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19833,19 +19770,9 @@ def test_dispatch_rework_worktree_unsafe_local_commits_escalates_as_judgment(
     from charlie_work.adapters import SessionDispatchResult
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(
-                sys.executable,
-                "-c",
-                "import sys; sys.exit(1)",
-            ),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
         worker=WorkerRoleConfig(harness="command"),
-        watchdog=WatchdogConfig(
-            max_auto_redispatch=2,
-            redispatch_window_minutes=240,
-        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19922,13 +19849,12 @@ def test_dry_run_dispatch_rework_leaves_state_unchanged(tmp_path: Path) -> None:
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -19995,19 +19921,15 @@ def test_dry_run_dispatch_rework_no_op_escalation_does_not_escalate(
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
-        watchdog=WatchdogConfig(
-            max_auto_redispatch=2,
-            redispatch_window_minutes=240,
-        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -20091,13 +20013,12 @@ def test_dry_run_dispatch_rework_review_routing_does_not_invoke_review(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -20221,19 +20142,15 @@ def test_dry_run_dispatch_rework_worker_death_escalation_does_not_escalate(
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
-        watchdog=WatchdogConfig(
-            max_auto_redispatch=2,
-            redispatch_window_minutes=240,
-        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -21467,10 +21384,8 @@ def test_dispatch_guard_blocks_second_worker_for_live_dispatched_issue(tmp_path:
     from charlie_work.devin_shell import SessionRecord
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        )
+        devin=DevinConfig(shell_command=(sys.executable, "-c", "import sys; sys.exit(0)")),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -21520,11 +21435,7 @@ def test_dispatch_recovers_dead_worker_without_open_pr(tmp_path: Path) -> None:
     """Issue #5: a dead worker with no open PR becomes dispatchable again."""
     from charlie_work.devin_shell import SessionRecord
 
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="manual",  # Use manual to avoid actual worker launch
-        )
-    )
+    config = OrchestratorConfig(devin=DevinConfig())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     # Mark the default PR as closed so the issue is considered dispatchable.
@@ -21579,11 +21490,7 @@ def test_dispatch_does_not_recover_dead_worker_with_open_pr(tmp_path: Path) -> N
     """Issue #5: a dead worker with an open PR is NOT re-dispatched (mid-review)."""
     from charlie_work.devin_shell import SessionRecord
 
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="manual",  # Use manual to avoid actual worker launch
-        )
-    )
+    config = OrchestratorConfig(devin=DevinConfig())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     # Override prs to return an open PR for this issue
@@ -21643,11 +21550,7 @@ def test_dispatch_does_not_recover_dead_worker_with_open_pr(tmp_path: Path) -> N
 
 def test_dispatch_clears_stale_orphan_flagged_at(tmp_path: Path) -> None:
     """Issue #259 review: a fresh dispatch must clear a stale orphan flag."""
-    config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="manual",  # Use manual to avoid actual worker launch
-        )
-    )
+    config = OrchestratorConfig(devin=DevinConfig())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     # Close the default PR so the issue is dispatchable.
@@ -21693,10 +21596,7 @@ def test_dispatch_isolates_label_write_failure(tmp_path: Path, monkeypatch) -> N
             return False
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="devin-shell",
-            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
+        devin=DevinConfig(shell_command=(sys.executable, "-c", "import sys; sys.exit(0)")),
         worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -21731,10 +21631,7 @@ def test_dispatch_issues_reports_skipped(tmp_path: Path) -> None:
 def test_concurrent_dispatch_claims_prevent_double_launch(tmp_path: Path) -> None:
     """A dispatch_pending claim must block a second dispatch for the same issue."""
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(0)")),
         worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -21772,10 +21669,7 @@ def test_stale_dispatch_pending_claim_is_redispatchable(tmp_path: Path, monkeypa
     from charlie_work.state import is_claim_stale
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(0)")),
         worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -22368,9 +22262,7 @@ def test_dry_run_dispatch_dependency_gate_filter(tmp_path: Path) -> None:
     dispatch_limit=1, the dry-run report should list the eligible issue as
     dispatchable and the blocked issue should be excluded from sessions.
     """
-    config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
-    )
+    config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     # Create a fake GitHub with blocked issue first, then eligible issue
@@ -24338,13 +24230,12 @@ def test_standard_lifecycle_rework_dispatch_selects_issue(tmp_path: Path) -> Non
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -24407,16 +24298,16 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     is NOT rework_requested and dispatch_rework does not select it.
     """
     config = OrchestratorConfig(
-        review=ReviewConfig(max_rework_cycles=2),  # Set max to 2 for this test
+        review=ReviewConfig(max_rework_cycles=2),
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -24512,14 +24403,14 @@ def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Pa
     config = OrchestratorConfig(
         review=ReviewConfig(max_rework_cycles=2),
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -24592,14 +24483,14 @@ def test_at_cap_request_changes_on_unchanged_head_does_not_escalate(
     config = OrchestratorConfig(
         review=ReviewConfig(max_rework_cycles=2),
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -25266,10 +25157,8 @@ def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -25420,10 +25309,8 @@ def test_loop_reaps_launch_failure_sidecar_and_reports_reaped(
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -25480,10 +25367,8 @@ def test_loop_launch_failure_with_throttle_signature_persists_throttled_until(
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -25556,10 +25441,8 @@ def test_loop_pid_none_no_error_not_classified_as_launch_failed(
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -25613,10 +25496,8 @@ def test_classify_dead_sessions_relabel_idempotent(tmp_path: Path) -> None:
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -25730,10 +25611,8 @@ def test_classify_dead_sessions_preserves_state_record_branch(tmp_path: Path) ->
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -25824,10 +25703,8 @@ def test_classify_dead_sessions_dispatch_recovery_integration(tmp_path: Path) ->
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -25956,10 +25833,8 @@ def test_classify_dead_sessions_with_closed_pr_triggers_relabel(tmp_path: Path) 
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -26048,10 +25923,8 @@ def test_classify_dead_sessions_with_open_pr_suppresses_relabel(tmp_path: Path) 
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -26157,13 +26030,12 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -26310,14 +26182,14 @@ def test_classify_dead_rework_session_stale_prompt_does_not_reopen_approved_head
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
-        )
+            )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -26408,14 +26280,14 @@ def test_classify_dead_rework_session_escalates_at_death_cap(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
-        )
+            )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -26522,14 +26394,14 @@ def test_classify_dead_rework_session_no_op_cap_with_prior_no_ops(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
-        )
+            )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -26624,14 +26496,14 @@ def test_classify_dead_rework_session_deaths_below_cap_not_escalated(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
-        )
+            )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -26729,10 +26601,8 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -26843,10 +26713,8 @@ def test_classify_dead_rework_session_worktree_unsafe_local_commits_escalates_as
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -26937,10 +26805,8 @@ def test_classify_dead_rework_session_rework_branch_conflict_escalates_immediate
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -27146,11 +27012,9 @@ def test_classify_dead_sessions_worker_blocked_escalates_and_suppresses_redispat
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -27266,11 +27130,9 @@ def test_classify_dead_sessions_worker_blocked_log_tail_fallback_escalates_and_s
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
         post_mortem=PostMortemConfig(db_path=str(missing_db_path)),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -27352,10 +27214,8 @@ def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
     now = datetime.now(UTC)
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -27446,10 +27306,8 @@ def test_worktree_probe_failed_launch_failure_does_not_escalate(
     now = datetime.now(UTC)
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -27551,7 +27409,6 @@ def test_classify_dead_sessions_retains_sidecar_on_inconclusive_probe(
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
         # Point post-mortem's sessions.db at a path that can never exist, so
         # the real-activity probe is deterministically inconclusive (every
         # source errors) regardless of what happens to be on the test host.
@@ -27619,7 +27476,7 @@ def test_classify_dead_sessions_reaps_sidecar_when_probe_conclusively_stale(
     from charlie_work.devin_shell import SessionRecord
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.issues = [
@@ -27719,7 +27576,6 @@ def test_stall_and_dead_lane_increment_deferral_counter_at_most_once_per_pass(
     )
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
         post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db")),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -27842,7 +27698,6 @@ def test_stall_then_dead_lane_composition_survives_phantom_post_mortem_sidecar(
     )
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
         post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db")),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -29305,7 +29160,8 @@ def test_merge_ready_conflict_rework_debounces_and_preserves_approval(tmp_path: 
             update_open_prs="next",
             failed_attempt_alarm=3,
         ),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -29394,7 +29250,7 @@ def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
             update_open_prs="next",
             failed_attempt_alarm=1,
         ),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
         worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -29483,7 +29339,7 @@ def test_merge_ready_check_failure_routes_to_rework(tmp_path: Path) -> None:
             update_open_prs="next",
             failed_attempt_alarm=1,
         ),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
         worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -29700,7 +29556,8 @@ def test_merge_ready_silent_cross_pr_revert_blocks_and_routes_to_rework(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
             update_open_prs="next",
         ),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -29754,7 +29611,8 @@ def test_merge_ready_silent_cross_pr_revert_allows_explicit_marker(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
             update_open_prs="next",
         ),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -29797,7 +29655,8 @@ def test_merge_ready_silent_cross_pr_revert_prompt_echo_does_not_bypass(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
             update_open_prs="next",
         ),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -29962,7 +29821,8 @@ def test_merge_ready_conflict_rework_routes_past_threshold(tmp_path: Path) -> No
             update_open_prs="next",
             failed_attempt_alarm=3,
         ),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -30360,7 +30220,8 @@ def test_merge_ready_conflict_rework_dispatch_bounded_by_cap_across_repeated_eva
             failed_attempt_alarm=1,
         ),
         review=ReviewConfig(max_conflict_rework_attempts=2),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -30475,10 +30336,7 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
             update_open_prs="next",
             failed_attempt_alarm=1,
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=3, redispatch_window_minutes=240),
     )
@@ -30571,7 +30429,8 @@ def test_startup_death_does_not_consume_conflict_rework_cap(
             failed_attempt_alarm=1,
         ),
         review=ReviewConfig(max_conflict_rework_attempts=2),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -30638,7 +30497,8 @@ def test_startup_death_does_not_consume_no_op_rework_cap(
     """
     config = OrchestratorConfig(
         review=ReviewConfig(max_no_op_rework_attempts=2),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -30704,7 +30564,8 @@ def test_non_startup_death_still_consumes_conflict_rework_cap(
             failed_attempt_alarm=1,
         ),
         review=ReviewConfig(max_conflict_rework_attempts=2),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -30794,14 +30655,14 @@ def test_reap_restore_sets_startup_death_flag(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
-        )
+            )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -30900,14 +30761,14 @@ def test_reap_restore_startup_death_stalled_real_pid_under_classification_delay(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
-        )
+            )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -31022,14 +30883,14 @@ def test_reap_restore_stalled_long_runtime_not_startup_death(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
-        )
+            )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -31221,13 +31082,12 @@ def test_dispatch_rework_clears_startup_death_flag_on_new_dispatch(
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -31297,7 +31157,8 @@ def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
             failed_attempt_alarm=1,
         ),
         review=ReviewConfig(max_conflict_rework_attempts=2),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -31420,7 +31281,8 @@ def test_merge_ready_conflict_carry_forward_resets_counter_before_dispatch(
             update_open_prs="next",
             failed_attempt_alarm=3,
         ),
-        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        devin=DevinConfig(dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -32454,7 +32316,7 @@ def test_concurrency_governor_unlimited_when_unset(tmp_path: Path) -> None:
     """When max_concurrent_sessions is 0 (default), dispatch should behave as before (unlimited)."""
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=0),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -32482,7 +32344,7 @@ def test_concurrency_governor_clamps_dispatch_when_sessions_alive(
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -32511,13 +32373,12 @@ def test_concurrency_governor_clamps_rework_dispatch(tmp_path: Path, monkeypatch
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -32570,7 +32431,7 @@ def test_concurrency_governor_allows_partial_dispatch(tmp_path: Path, monkeypatc
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -32641,7 +32502,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch(tmp_path: Path, monkey
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -32713,7 +32574,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch_with_live_sessions(
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -32784,7 +32645,7 @@ def test_concurrency_governor_clamps_only_issues_dry_run(tmp_path: Path, monkeyp
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -32856,13 +32717,12 @@ def test_concurrency_governor_clamps_only_issues_rework_dispatch(
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -33027,13 +32887,12 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=5),
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -33163,13 +33022,12 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
     partial_config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -33287,13 +33145,12 @@ def test_concurrency_governor_zero_rework_dry_run_automatic_path(
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=5),
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -33464,7 +33321,7 @@ def test_fleet_concurrency_governor_unlimited_when_unset(tmp_path: Path, monkeyp
     config = OrchestratorConfig(
         fleet=FleetConfig(global_max_concurrent_sessions=0),
         dispatch=DispatchConfig(max_concurrent_sessions=0),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -33494,7 +33351,7 @@ def test_fleet_concurrency_governor_clamps_when_fleet_live_at_cap(
     config = OrchestratorConfig(
         fleet=FleetConfig(global_max_concurrent_sessions=3),
         dispatch=DispatchConfig(max_concurrent_sessions=5, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -33529,7 +33386,7 @@ def test_fleet_concurrency_governor_tighter_cap_wins(tmp_path: Path, monkeypatch
     config = OrchestratorConfig(
         fleet=FleetConfig(global_max_concurrent_sessions=1),
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -33566,7 +33423,7 @@ def test_fleet_concurrency_governor_per_repo_cap_tighter(tmp_path: Path, monkeyp
     config = OrchestratorConfig(
         fleet=FleetConfig(global_max_concurrent_sessions=5),
         dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -33704,7 +33561,7 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -33811,7 +33668,7 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
     fleet_config = OrchestratorConfig(
         fleet=FleetConfig(global_max_concurrent_sessions=3),
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     fleet_gh = SaturatedGitHub(3)
     fleet_app = OrchestratorApp(
@@ -33916,7 +33773,7 @@ def test_apply_concurrency_governor_helper_unlimited(tmp_path: Path) -> None:
     """_apply_concurrency_governor returns unclamped result when max_concurrent is 0."""
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=0),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -33941,7 +33798,7 @@ def test_apply_concurrency_governor_helper_clamped(tmp_path: Path, monkeypatch) 
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -33966,7 +33823,7 @@ def test_apply_concurrency_governor_helper_partial_slots(tmp_path: Path, monkeyp
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -33991,7 +33848,7 @@ def test_apply_concurrency_governor_open_pr_backpressure_clamps(tmp_path: Path) 
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_open_agent_prs=2, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -34013,7 +33870,7 @@ def test_apply_concurrency_governor_open_pr_backpressure_zero_when_full(tmp_path
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_open_agent_prs=1, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -34032,7 +33889,7 @@ def test_apply_concurrency_governor_open_pr_backpressure_off_when_disabled(tmp_p
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_open_agent_prs=0, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -34052,7 +33909,7 @@ def test_apply_concurrency_governor_open_pr_backpressure_exempt_by_default(tmp_p
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_open_agent_prs=1, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -34073,7 +33930,7 @@ def test_apply_concurrency_governor_open_pr_backpressure_records_event(tmp_path:
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_open_agent_prs=1, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -34097,7 +33954,7 @@ def test_apply_concurrency_governor_open_pr_backpressure_no_event_when_not_clamp
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_open_agent_prs=10, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -34125,7 +33982,7 @@ def test_apply_concurrency_governor_open_pr_backpressure_no_event_under_dry_run(
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_open_agent_prs=1, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -34158,7 +34015,7 @@ def test_apply_concurrency_governor_open_pr_backpressure_combined_with_sessions(
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=3, max_open_agent_prs=2, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -34220,7 +34077,7 @@ def test_loop_surfaces_open_pr_backpressure_fields(tmp_path: Path) -> None:
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_open_agent_prs=1, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -34270,7 +34127,7 @@ def test_open_pr_backpressure_clamps_dispatch_end_to_end(tmp_path: Path) -> None
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_open_agent_prs=1, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -34312,13 +34169,12 @@ def test_dispatch_rework_state_driven_selection(tmp_path: Path) -> None:
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -34366,13 +34222,12 @@ def test_dispatch_rework_state_wins_over_missing_label(tmp_path: Path) -> None:
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -34426,14 +34281,14 @@ def test_dispatch_rework_skips_issue_view_for_rework_requested_issue_with_closed
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -34484,20 +34339,14 @@ def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
-        # This test intentionally leaves issues in rework_requested with only the
-        # needs-rework label. The in-loop reconcile pass would otherwise see open PRs
-        # with a stale active label and self-heal the status to open_passive before
-        # dispatch_rework can run (issue #762 paginated issue snapshots now expose the
-        # fixture to real reconcile drift detection).
         reconcile_pass=ReconcilePassConfig(enabled=False),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -34596,14 +34445,14 @@ def test_dispatch_rework_approved_verdict_clears_rework_requested(tmp_path: Path
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -34671,13 +34520,12 @@ def test_dispatch_rework_approved_verdict_clears_rework_requested(tmp_path: Path
 def _dispatch_rework_config() -> OrchestratorConfig:
     return OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -34819,13 +34667,12 @@ def test_dry_run_dispatch_rework_conflict_bypass_direct_conflicting(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -34936,13 +34783,12 @@ def test_dry_run_dispatch_rework_conflict_bypass_unknown_mergeable_pr_view_fallb
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -35813,7 +35659,7 @@ def test_dispatch_defers_when_provider_throttled(tmp_path: Path) -> None:
     """When provider throttle window is active, dispatch should defer and report why."""
     config = OrchestratorConfig(
         dispatch=DispatchConfig(default_limit=3),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -35845,7 +35691,7 @@ def test_dispatch_proceeds_when_throttle_window_expired(tmp_path: Path) -> None:
     """When provider throttle window has passed, dispatch should proceed normally."""
     config = OrchestratorConfig(
         dispatch=DispatchConfig(default_limit=3),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -35874,7 +35720,7 @@ def test_dispatch_rework_defers_when_provider_throttled(tmp_path: Path) -> None:
     """When provider throttle window is active, rework dispatch should also defer."""
     config = OrchestratorConfig(
         dispatch=DispatchConfig(default_limit=3),
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
         worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -36788,10 +36634,8 @@ def test_loop_emits_concurrency_fields_when_governor_enabled(tmp_path: Path) -> 
     # Configure with max_concurrent_sessions=5 (enabled but not clamping in this scenario)
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=5),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -37125,7 +36969,7 @@ def test_detect_prose_only_dependencies_descriptive_task_refs_no_match() -> None
 def test_dispatch_skips_issue_with_open_blocker(tmp_path: Path) -> None:
     """Issue #108: dispatch should skip issues with open blockers."""
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -37201,7 +37045,7 @@ def test_dispatch_skips_issue_with_open_blocker(tmp_path: Path) -> None:
 def test_dispatch_proceeds_when_blocker_closed(tmp_path: Path) -> None:
     """Issue #108: dispatch should proceed when blocker is closed."""
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -37275,7 +37119,7 @@ def test_dispatch_proceeds_when_blocker_closed(tmp_path: Path) -> None:
 def test_dispatch_skips_when_any_blocker_open(tmp_path: Path) -> None:
     """Issue #108: dispatch should skip when ANY blocker is open (logical AND)."""
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -37360,7 +37204,7 @@ def test_dispatch_handles_self_reference_blocker(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -37539,7 +37383,7 @@ def test_blocked_issue_does_not_consume_slot(tmp_path: Path) -> None:
     should be in the skip event.
     """
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -37645,7 +37489,7 @@ def test_dispatch_reachability_blocker_lookups_are_batched(tmp_path: Path) -> No
     _prefetch_blocker_data call before reachability) the batch method is
     never invoked and N serial per-issue ``run`` calls are made instead.
     """
-    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    config = OrchestratorConfig(devin=DevinConfig())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     # Three ready issues, each blocked by an open predecessor. The blocker
@@ -37756,7 +37600,7 @@ def test_dispatch_reachability_blocker_lookups_are_batched(tmp_path: Path) -> No
 def test_status_includes_blocked_section(tmp_path: Path) -> None:
     """Issue #108: status (roll-call) should include blocked section."""
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -37930,7 +37774,7 @@ def test_status_prefetch_uses_batched_graphql_for_blocker_data(
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    config = OrchestratorConfig(devin=DevinConfig())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = github_module.GitHub(repo_root=tmp_path)
     # Avoid a real `git remote` call; the owner/name are only used for the
@@ -37968,7 +37812,7 @@ def test_status_includes_stalled_section(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -38045,7 +37889,7 @@ def test_status_includes_workers_section(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -38129,7 +37973,7 @@ def test_status_workers_section_claude_code_rework_layout(tmp_path: Path) -> Non
     """
     from datetime import UTC, datetime
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    config = OrchestratorConfig(devin=DevinConfig())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     class FakeGitHubWithWorkers(FakeGitHub):
@@ -38213,7 +38057,7 @@ def test_status_workers_not_killed_when_real_activity_probe_fresh(tmp_path: Path
     from datetime import timedelta
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
         post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
     )
@@ -38292,7 +38136,7 @@ def test_status_workers_surfaces_corroboration_alive_but_polling(tmp_path: Path)
     from datetime import timedelta
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
         post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
     )
@@ -38383,7 +38227,7 @@ def test_status_workers_surfaces_corroboration_alive_but_polling(tmp_path: Path)
 def test_status_workers_empty_when_no_live_sessions(tmp_path: Path) -> None:
     """Issue #167: workers section should be empty list when no live sessions exist."""
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -38411,7 +38255,7 @@ def test_status_stalled_section_unchanged(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -38495,7 +38339,10 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),  # Use devin-shell adapter for watchdog support
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(
+            harness="devin-shell"
+        ),  # Use devin-shell adapter for watchdog support
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -38661,7 +38508,8 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -38741,7 +38589,8 @@ def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -38798,7 +38647,8 @@ def test_stall_reap_falls_back_to_stalled_when_no_throttle_signature(tmp_path: P
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -38849,7 +38699,8 @@ def test_dispatch_defers_after_stall_reap_sets_throttled_until(tmp_path: Path) -
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(default_limit=3),
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -38899,7 +38750,8 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
     import subprocess
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -39035,7 +38887,8 @@ def test_sweep_orphan_processes_called_from_production_loop(tmp_path: Path) -> N
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -39084,7 +38937,7 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
         watchdog=WatchdogConfig(enabled=False, stall_minutes=20),  # Disabled
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -39742,7 +39595,7 @@ def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monke
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -40796,7 +40649,8 @@ def test_loop_advances_inconclusive_probe_deferral_counter_once_per_pass(
     from charlie_work.post_mortem import ActivitySource, RealActivityProbe
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(
             enabled=True, stall_minutes=20, max_inconclusive_probe_deferrals=10
         ),
@@ -40890,7 +40744,7 @@ def test_standalone_dispatch_and_rework_advance_inconclusive_probe_counter_once(
     from charlie_work.post_mortem import ActivitySource, RealActivityProbe
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
         worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(
             enabled=True, stall_minutes=20, max_inconclusive_probe_deferrals=10
@@ -41224,7 +41078,8 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -41332,7 +41187,8 @@ def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
 
     # watchdog disabled — the sweep must still run.
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=False, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -41408,7 +41264,8 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -41510,7 +41367,8 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -41643,7 +41501,8 @@ def test_orphaned_worker_no_open_pr_mention_flag_reaped_after_grace(tmp_path: Pa
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -41753,7 +41612,8 @@ def test_orphaned_worker_no_open_pr_already_flagged_backstop_backfills(tmp_path:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -41870,7 +41730,8 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -41982,7 +41843,8 @@ def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=0),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -42070,7 +41932,8 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -42155,7 +42018,8 @@ def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Pa
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -42254,7 +42118,8 @@ def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) 
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -42348,7 +42213,8 @@ def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -42428,7 +42294,8 @@ def test_orphaned_worker_detection_with_live_pid(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -42495,7 +42362,8 @@ def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -42577,7 +42445,8 @@ def test_orphaned_worker_detection_no_open_pr(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -42641,7 +42510,8 @@ def test_orphaned_worker_detection_no_open_pr_emits_once(tmp_path: Path) -> None
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -42690,7 +42560,8 @@ def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_pat
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -42771,7 +42642,8 @@ def test_orphaned_worker_detection_bulk_sweep_excludes_pre_flagged(tmp_path: Pat
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -42831,7 +42703,8 @@ def test_orphaned_worker_detection_bulk_sweep_does_not_flood_event_buffer(tmp_pa
     same-kind events into one summary event, so prior diagnostic events survive.
     """
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -42903,7 +42776,8 @@ def test_orphaned_worker_no_open_pr_completes_interrupted_reclaim(tmp_path: Path
     an issue that is already fully fixed. It must not.
     """
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -42998,7 +42872,8 @@ def test_orphaned_worker_no_open_pr_reclaim_survives_label_api_failure(tmp_path:
     and a later pass -- once the API recovers -- must complete the reclaim.
     """
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -43094,7 +42969,8 @@ def test_orphaned_worker_pushed_branch_opens_pr(tmp_path: Path) -> None:
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -43249,7 +43125,8 @@ def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -43362,7 +43239,8 @@ def test_orphaned_worker_pr_create_failed_stranded_drift_dedups_on_repeat_sweep(
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -43488,9 +43366,9 @@ def test_classify_dead_sessions_no_open_pr_happy_path_reclaims_in_one_pass(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
         devin=DevinCfg(
-            adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -43563,7 +43441,8 @@ def test_orphaned_worker_no_open_pr_terminal_label_only_is_left_alone(tmp_path: 
     must fail against a head that regresses to that gate.
     """
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -43634,9 +43513,9 @@ def test_classify_dead_sessions_terminal_label_only_is_left_alone(tmp_path: Path
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
         devin=DevinCfg(
-            adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -44281,10 +44160,8 @@ def test_worktree_unsafe_launch_failure_with_commits_salvages_before_escalation(
     worktree_path, branch = _setup_completed_worktree(repo_root, 1130)
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub(repo_root=repo_root)
@@ -44372,10 +44249,8 @@ def test_worktree_unsafe_launch_failure_no_commits_still_escalates(
     (worktree_path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub(repo_root=repo_root)
@@ -44464,7 +44339,7 @@ def test_phantom_live_worker_preserves_sidecar_for_dirty_worktree_with_commits(
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="claude-code"), worker=WorkerRoleConfig(harness="claude-code")
+        devin=DevinConfig(), worker=WorkerRoleConfig(harness="claude-code")
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -44920,7 +44795,8 @@ def test_orphaned_worker_reclaim_carries_required_reason(tmp_path: Path) -> None
     already used ``reason`` before the fix, but it is now routed through the
     shared payload builder so the invariant is enforced at one point."""
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -44988,7 +44864,8 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -45125,7 +45002,8 @@ def test_orphan_sweep_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> No
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -45219,7 +45097,8 @@ def test_orphan_sweep_redispatch_cap_resets_on_stranded_local_commits(
     from charlie_work.worktree import worktree_path_for_branch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -45340,7 +45219,8 @@ def test_orphan_sweep_redispatch_cap_first_observation_with_long_history(
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -45441,7 +45321,8 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
 
     # api_worker.enabled defaults to False -- no need to set it explicitly.
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
     )
     assert config.api_worker.enabled is False, "api_worker must be disabled by default"
@@ -45563,7 +45444,8 @@ def test_orphan_sweep_redispatch_cap_dedupes_repeated_observation(tmp_path: Path
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -45646,7 +45528,8 @@ def test_orphan_sweep_redispatch_cap_counts_distinct_identities_and_escalates(
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -46317,7 +46200,8 @@ def test_fleet_lock_serializes_cross_repo_dispatch(tmp_path: Path, monkeypatch) 
         }
 
         config = OrchestratorConfig(
-            devin=DevinConfig(adapter="devin-shell"),
+            devin=DevinConfig(),
+            worker=WorkerRoleConfig(harness="devin-shell"),
             dispatch=DispatchConfig(
                 default_limit=3,
                 launch_stagger_seconds=0,
@@ -46435,7 +46319,7 @@ def test_state_lock_guard_returns_skip_when_lock_held(
     monkeypatch.setattr(state_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
         worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -46745,13 +46629,12 @@ def test_dispatch_label_error_reason_in_event_payload(tmp_path: Path) -> None:
     """Issue #453: dispatch label transition failures must carry a reason in the failures map."""
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -46787,13 +46670,12 @@ def test_dispatch_rework_label_error_reason_in_event_payload(tmp_path: Path) -> 
     """Issue #453: rework dispatch label transition failures must carry a reason in the failures map."""
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -46848,13 +46730,12 @@ def test_dispatch_rework_missing_prompt_reason_in_event_payload(tmp_path: Path) 
     """Issue #453: missing rework prompt skips must carry a reason in the failures map."""
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -46899,10 +46780,7 @@ def test_dispatch_rework_missing_prompt_reason_in_event_payload(tmp_path: Path) 
 def test_dispatch_failed_retries_are_capped_and_escalate(tmp_path: Path) -> None:
     """Issue #461: repeated dispatch failures are capped and then escalated."""
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(7)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(7)")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=1),
     )
@@ -47046,7 +46924,8 @@ def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -47131,7 +47010,8 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -47230,7 +47110,8 @@ def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -47309,7 +47190,8 @@ def test_orphaned_worker_approved_rework_dead_worker_auto_resets(tmp_path: Path)
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -47408,7 +47290,8 @@ def test_orphaned_worker_approved_rework_clean_exit_no_op_drift(tmp_path: Path) 
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -47508,7 +47391,8 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: P
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -47590,10 +47474,7 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
     from charlie_work.adapters import SessionDispatchResult
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
@@ -47754,7 +47635,8 @@ def test_orphaned_worker_unreviewed_open_pr_pending_file_advances_to_pr_open(
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -47849,7 +47731,8 @@ def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) 
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -47960,7 +47843,8 @@ def test_orphaned_worker_unreviewed_open_pr_label_failure_falls_back_to_drift(
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -48061,7 +47945,8 @@ def test_orphaned_worker_unreviewed_pr_with_rework_status_advances_not_resets(
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -48165,7 +48050,8 @@ def test_dispatch_rework_does_not_re_run_orphan_detection(tmp_path: Path) -> Non
     from unittest.mock import patch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -48213,7 +48099,7 @@ def test_dispatch_fresh_candidates_take_priority_over_recovery_retry(
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=1),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     state = empty_state()
@@ -48275,7 +48161,7 @@ def test_dispatch_emits_attention_digest_for_live_worker_redispatch_averted(
     digest_path = tmp_path / "digest.jsonl"
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=1),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
         notify=NotifyConfig(enabled=True, sink="file", file_path=str(digest_path)),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -48345,7 +48231,7 @@ def test_dispatch_only_issues_preserves_mixed_fresh_recovery_order(
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(default_limit=3),
-        devin=DevinConfig(adapter="manual"),
+        devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     state = empty_state()
@@ -49060,13 +48946,12 @@ def test_dispatch_rework_regenerates_stale_brief_after_decision_edit(
     brief, reflecting the edit."""
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -49155,13 +49040,12 @@ def test_dispatch_rework_regenerates_brief_after_renderer_change(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -49254,14 +49138,14 @@ def test_dispatch_rework_leaves_brief_untouched_when_nothing_changed(
     """
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
-        )
+            )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -49330,14 +49214,14 @@ def test_dispatch_rework_does_not_regenerate_when_sidecar_is_unreadable(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
-        )
+            )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -50058,13 +49942,12 @@ def test_no_op_rework_repair_note_survives_dispatch_rework_regeneration(tmp_path
     stale one."""
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         worker=WorkerRoleConfig(harness="command"),
     )
@@ -50368,10 +50251,7 @@ def test_dispatch_rework_deterministic_failure_kind_escalates_immediately(
     from charlie_work.adapters import SessionDispatchResult
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=3, redispatch_window_minutes=240),
     )
@@ -50438,10 +50318,7 @@ def test_dispatch_rework_no_op_rework_cap_escalates(tmp_path: Path) -> None:
     from datetime import UTC, datetime
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
@@ -50497,10 +50374,7 @@ def test_dispatch_rework_worker_deaths_dont_count_as_no_op(tmp_path: Path) -> No
     from datetime import UTC, datetime
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
@@ -50559,10 +50433,7 @@ def test_dispatch_rework_mixed_deaths_and_no_ops_no_op_dominates(tmp_path: Path)
     from datetime import UTC, datetime
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
@@ -50617,10 +50488,7 @@ def test_dispatch_rework_deaths_below_cap_still_dispatched(tmp_path: Path) -> No
     from datetime import UTC, datetime
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
@@ -50720,10 +50588,7 @@ def test_dispatch_rework_worker_death_loop_includes_stranded_commits(
     # Create a worktree at the expected path and add a commit to it
     # (simulating a worker that completed work but died before pushing).
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
@@ -50904,10 +50769,7 @@ def test_dispatch_rework_death_loop_salvages_stranded_commits(
     # Create a branch from main and a worktree at the expected orchestrator path.
     run(["git", "branch", branch])
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
@@ -51029,10 +50891,7 @@ def test_dispatch_rework_death_loop_empty_death_still_escalates(
 
     run(["git", "branch", branch])
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
@@ -51121,15 +50980,15 @@ def test_reap_restore_rework_requested_salvages_stranded_commits(
     run(["git", "branch", branch])
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+        worker=WorkerRoleConfig(harness="command"),
     )
     layout = resolved_layout(config, repo_root)
     wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
@@ -51287,15 +51146,15 @@ def test_reap_restore_rework_requested_skips_salvage_when_status_not_dispatched(
     run(["git", "branch", branch])
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+        worker=WorkerRoleConfig(harness="command"),
     )
     layout = resolved_layout(config, repo_root)
     wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
@@ -51449,11 +51308,9 @@ def test_salvage_rework_stranded_commits_skips_when_status_not_rework_requested(
     # Create a branch from main and a worktree at the expected orchestrator path.
     run(["git", "branch", branch])
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+        worker=WorkerRoleConfig(harness="command"),
     )
     layout = resolved_layout(config, repo_root)
     wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
@@ -51852,7 +51709,7 @@ def test_dispatch_rework_combined_manifest_mixed_label(
     from charlie_work.config import RescueConfig
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
         worker=WorkerRoleConfig(harness="devin-shell"),
         rescue=RescueConfig(enabled=True, worker_model="claude-opus-4-1"),
     )
@@ -51896,13 +51753,15 @@ def test_dispatch_rework_combined_manifest_homogeneous_label(
     mislabeling the homogeneous batch."""
     from charlie_work.config import RescueConfig
 
-    # devin.adapter is "devin-shell" (legacy field, unread once worker.harness
-    # is set) but both issues actually use claude-code: the normal issue via
-    # the configured worker harness, the rescue issue via the rescue adapter.
-    # The old code's trailing write would label this "devin-shell" (wrong);
-    # the fix derives "claude-code" from the partition.
+    # DevinConfig.adapter has been deleted (worker harness now lives on
+    # worker.harness). Both issues actually use claude-code: the normal issue
+    # via the configured worker harness, the rescue issue via the rescue
+    # adapter. Both kinds are "claude-code" -> homogeneous -> "claude-code".
+    # (Historically, before #626, the trailing write used
+    # self.config.devin.adapter unconditionally and would have mislabeled
+    # this "devin-shell".)
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
         worker=WorkerRoleConfig(harness="claude-code"),
         api_worker=_api_worker_config_for_test(enabled=True),
         rescue=RescueConfig(enabled=True, worker_model="claude-opus-4-1"),
@@ -51942,7 +51801,7 @@ def test_dispatch_rework_no_rescue_skips_redundant_manifest_write(
     (not just ``dispatch_sessions``) so the trailing direct call is counted
     too — that is the call #626 makes conditional."""
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
         worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -52240,7 +52099,8 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
     from charlie_work.worktree import SalvagePushResult
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -52361,7 +52221,8 @@ def test_orphaned_worker_salvage_push_threads_dry_run_to_salvage_push_stranded_c
     from charlie_work.worktree import SalvagePushResult
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -52459,7 +52320,8 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
     from charlie_work.worktree import SalvagePushResult
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -52554,7 +52416,8 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
     from charlie_work.worktree import SalvagePushResult
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -52638,7 +52501,8 @@ def test_orphaned_worker_salvage_push_skips_cross_repository_pr(tmp_path: Path) 
     from charlie_work.worktree import SalvagePushResult
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -52705,10 +52569,7 @@ def test_dispatch_rework_worktree_foreign_writer_does_not_increment_redispatch(
     from charlie_work.adapters import SessionDispatchResult
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
@@ -52802,10 +52663,7 @@ def test_dispatch_rework_worktree_foreign_writer_redispatch_unchanged(
     from charlie_work.adapters import SessionDispatchResult
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
@@ -52894,11 +52752,9 @@ def test_dispatch_fresh_worktree_foreign_writer_does_not_increment_dispatch_fail
     from charlie_work.adapters import SessionDispatchResult
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -52965,15 +52821,11 @@ def test_dispatch_fresh_blocked_environment_reap_resets_counter(
     from charlie_work.adapters import SessionDispatchResult
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
         watchdog=WatchdogConfig(
-            max_auto_redispatch=2,
-            redispatch_window_minutes=240,
-            max_foreign_writer_reaps=2,
+            max_auto_redispatch=2, redispatch_window_minutes=240, max_foreign_writer_reaps=2
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -53056,15 +52908,10 @@ def test_dispatch_rework_blocked_environment_reap_resets_counter(
     from charlie_work.worktree import worktree_path_for_branch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
-            max_auto_redispatch=0,
-            redispatch_window_minutes=240,
-            max_foreign_writer_reaps=2,
+            max_auto_redispatch=0, redispatch_window_minutes=240, max_foreign_writer_reaps=2
         ),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -53158,15 +53005,10 @@ def test_dispatch_rework_pre_escalation_safety_net_reaps_foreign_writer(
     from charlie_work.worktree import worktree_path_for_branch
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
         worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
-            max_auto_redispatch=2,
-            redispatch_window_minutes=240,
-            max_foreign_writer_reaps=2,
+            max_auto_redispatch=2, redispatch_window_minutes=240, max_foreign_writer_reaps=2
         ),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -53392,15 +53234,11 @@ def test_dispatch_fresh_blocked_environment_reap_cap_escalates(
     from charlie_work.adapters import SessionDispatchResult
 
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
         watchdog=WatchdogConfig(
-            max_auto_redispatch=2,
-            redispatch_window_minutes=240,
-            max_foreign_writer_reaps=2,
+            max_auto_redispatch=2, redispatch_window_minutes=240, max_foreign_writer_reaps=2
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()

@@ -189,7 +189,7 @@ Key knobs: `labels.*` (state-machine label names), `dispatch.default_limit` /
 `review.max_rework_cycles` (past this many `request_changes` cycles a PR
 escalates to `agent:human-needed`), `auto_merge.required_checks` (verify with
 `doctor`), `runtime.prompts_dir` (repo-local template overrides),
-`devin.adapter` (`manual` | `command` | `devin-shell` | `claude-code`),
+`worker.harness` (`manual` | `command` | `devin-shell` | `claude-code`),
 `claude_code.*` (worktree/venv settings for the claude-code adapter),
 `test_adequacy.*` (opt-in test-adequacy gate), `watchdog.*` (supervisor tripwires: stall/wall-clock/
 loop/cost-token budgets, WARN-first by default), `fleet.*`
@@ -270,7 +270,7 @@ stale matrix-suffixed entry like `Tests (windows-latest)` would count as
 matrix-suffix tolerance deliberately accepts `Name (suffix)` against a job
 named `Name`, so it fails open when a matrix has been collapsed.
 
-**Worker adapters** (`devin.adapter`): `manual` writes a session manifest for
+**Worker adapters** (`worker.harness`): `manual` writes a session manifest for
 the operator to paste; `command` runs a blocking per-issue launcher;
 `devin-shell` launches headless `devin --print --permission-mode dangerous`
 sessions non-blocking, each in an isolated per-issue git worktree (creation
