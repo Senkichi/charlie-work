@@ -1,4 +1,3 @@
 - Number: #$issue_number
 - Title: $issue_title
 - URL: $issue_url
-- Model tier target: $worker_model_tier

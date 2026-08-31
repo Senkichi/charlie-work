@@ -3144,7 +3144,6 @@ WORKER_PROMPT_KEYS: frozenset[str] = frozenset(
         "issue_body_block",
         "issue_comments",
         "branch_name",
-        "worker_model_tier",
         # Issue #1444: the module-map section, derived from the live tree at
         # packet build time by ``build_module_map``. Empty string when the map
         # could not be derived (fail-soft: omitted section + a
@@ -22524,7 +22523,6 @@ class OrchestratorApp:
                 "issue_body_block": fenced_block(str(issue.get("body") or ""), "md"),
                 "issue_comments": self._render_issue_comments(issue),
                 "branch_name": self._branch_name(issue),
-                "worker_model_tier": self.config.dispatch.worker_model_tier,
                 # Issue #1444: the module-map section, derived from the live
                 # tree at packet build time. Fail-soft: a parse failure yields
                 # an empty string (omitted section) plus a
