@@ -55,6 +55,7 @@ from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
     WatchdogConfig,
+    WorkerRoleConfig,
 )
 from charlie_work.paths import runtime_paths
 from charlie_work.reconcile import apply_fixes, detect_drift
@@ -467,7 +468,8 @@ def test_orphan_sweep_escalates_zero_artifact_loop(tmp_path: Path) -> None:
     from _fakes_github import FakeGitHub as CWFakeGitHub
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -545,7 +547,8 @@ def test_orphan_sweep_relabels_when_not_zero_artifact_loop(tmp_path: Path) -> No
     from _fakes_github import FakeGitHub as CWFakeGitHub
 
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
