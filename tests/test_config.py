@@ -2281,3 +2281,22 @@ def test_build_config_from_data_empty_bodied_cross_family_section_is_rejected() 
 def test_build_config_from_data_unknown_worker_key_still_raises_configerror() -> None:
     with pytest.raises(ConfigError, match="unknown key.*worker.*bogus"):
         build_config_from_data({"worker": {"bogus": "x"}})
+
+
+def test_build_config_from_data_invalid_worker_harness_is_rejected() -> None:
+    """Harness membership validation moved from the deleted dual-accept
+    resolver to the top-level ``worker = _build_section(...)`` call site
+    (role-config Phase 2 Track E); this pins the relocated check so a future
+    refactor cannot silently drop it."""
+    with pytest.raises(ConfigError, match=r"section 'worker' key 'harness' must be one of"):
+        build_config_from_data({"worker": {"harness": "bogus-harness"}})
+
+
+def test_build_config_from_data_non_claude_reviewer_harness_is_rejected() -> None:
+    """The reviewer-harness-must-be-claude-code constraint (#1513) moved into
+    ``ReviewerRoleConfig.__post_init__`` when the dual-accept resolver was
+    deleted (role-config Phase 2 Track E); this pins the relocated check."""
+    with pytest.raises(
+        ConfigError, match=r"section 'reviewer' key 'harness' only supports 'claude-code'"
+    ):
+        build_config_from_data({"reviewer": {"harness": "devin"}})
