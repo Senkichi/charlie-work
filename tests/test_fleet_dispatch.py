@@ -5765,6 +5765,66 @@ def test_ci_fleet_guard_no_git_is_inert(tmp_path: Path) -> None:
     assert check.dirty_paths == ()
 
 
+def test_ci_fleet_guard_wheel_in_venv_nested_in_worktree_is_inert(
+    tmp_path: Path,
+) -> None:
+    """Issue #1511: a wheel install under ``.venv/site-packages`` nested inside
+    a git worktree must not flag the worktree's own uncommitted ``src/`` as
+    ci_fleet dirty.
+
+    Reproduces the false positive: ``ci_fleet`` resolves to a wheel inside the
+    worktree's ``.venv/Lib/site-packages``, the walk-up from there finds the
+    worktree's own ``.git``, and the guard treats the entire active checkout
+    as "the ci_fleet dependency tree" -- flagging it dirty for any uncommitted
+    ``src/`` file, regardless of whether it touches ci_fleet at all. The fix
+    short-circuits to inert before the walk-up when the resolved module path
+    is under a ``site-packages``/``dist-packages`` directory.
+    """
+    # A git worktree (the standard ``git worktree add`` + ``uv venv`` layout)
+    # with a clean committed tree, then a dirty unrelated ``src/`` file added.
+    worktree = _make_ci_fleet_git_repo(tmp_path)
+    unrelated_src = worktree / "src" / "charlie_work" / "config.py"
+    unrelated_src.parent.mkdir(parents=True, exist_ok=True)
+    unrelated_src.write_text("x = 1", encoding="utf-8")
+
+    # ci_fleet is a wheel install inside the worktree's own .venv/site-packages.
+    wheel_pkg = worktree / ".venv" / "Lib" / "site-packages" / "ci_fleet"
+    wheel_pkg.mkdir(parents=True)
+    module_file = wheel_pkg / "__init__.py"
+    module_file.write_text("# wheel install", encoding="utf-8")
+
+    check = _real_ci_fleet_worktree_dirty(module_file)
+
+    assert check.is_dirty is False
+    assert check.repo_root is None
+    assert check.dirty_paths == ()
+    assert "site-packages" in (check.reason or "")
+
+
+def test_ci_fleet_guard_editable_install_outside_site_packages_still_checked(
+    tmp_path: Path,
+) -> None:
+    """Issue #1511 regression guard: the site-packages short-circuit must not
+    suppress the dirty check for a real editable install whose ``__file__``
+    is NOT under site-packages.
+
+    An editable install's resolved origin points at the source tree (e.g.
+    ``<checkout>/src/ci_fleet/__init__.py``), never inside site-packages.
+    The guard must still walk up to ``.git`` and detect uncommitted ``src/``
+    changes in that tree -- the original #927 behavior.
+    """
+    repo = _make_ci_fleet_git_repo(tmp_path)
+    module_file = repo / "src" / "ci_fleet" / "__init__.py"
+    # Dirty an uncommitted file under src/ -- the #927 positive-control shape.
+    (repo / "src" / "ci_fleet" / "planner.py").write_text("x = 1", encoding="utf-8")
+
+    check = _real_ci_fleet_worktree_dirty(module_file)
+
+    assert check.is_dirty is True
+    assert check.repo_root == repo
+    assert any("planner.py" in p for p in check.dirty_paths)
+
+
 def test_ci_fleet_guard_git_failure_is_inert(tmp_path: Path, monkeypatch: Any) -> None:
     """A git error must make the guard a no-op, not a hard stop."""
     repo = _make_ci_fleet_git_repo(tmp_path)
