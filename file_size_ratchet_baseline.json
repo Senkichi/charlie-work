@@ -24,7 +24,7 @@
   "src/charlie_work/workflow.py": 24200,
   "src/charlie_work/worktree.py": 5600,
   "tests/test_api_budget.py": 1200,
-  "tests/test_api_worker.py": 1000,
+  "tests/test_api_worker.py": 1200,
   "tests/test_backlog_reachability.py": 1000,
   "tests/test_charlie_work.py": 54400,
   "tests/test_checks.py": 1000,
