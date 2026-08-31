@@ -3998,11 +3998,14 @@ class OrchestratorApp:
             # against (worker.harness). When `adapter` overrides the
             # configured harness -- the routed-fallback case, e.g. api
             # routing falling back to devin-shell for one issue -- fall back
-            # to devin.worker_model directly: build_config_from_data's dual-
-            # write keeps it in sync with worker.model for EVERY non-
-            # claude-code harness (not just devin-shell specifically), so it
-            # remains correct for a devin-shell override regardless of what
-            # the configured harness actually is.
+            # to devin.worker_model instead: role-config Phase 2 (Track E)
+            # deleted the dual-accept bridge that used to mirror worker.model
+            # onto devin.worker_model, so the two are independent config
+            # values again. devin.worker_model is now the dedicated,
+            # separately-configured model for a devin-shell fallback launch
+            # (set it explicitly if a routed fallback should pin a model);
+            # it is never overwritten by worker.model regardless of what the
+            # primary configured harness is.
             worker_model=(
                 worker.model if resolved_adapter == worker.harness else devin.worker_model
             ),
@@ -10344,7 +10347,7 @@ class OrchestratorApp:
                 pr_state = state["prs"].get(str(pr_number), {})
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
                 review_effort_used, review_effort_arm = resolve_review_effort(
-                    pr_number, self.config.review_dispatch, self.config.claude_code
+                    pr_number, self.config.reviewer, self.config.claude_code
                 )
                 resolved_review_efforts[pr_number] = review_effort_used
                 # Issue #1439: read the structure multiplier stamped into the
@@ -10496,15 +10499,16 @@ class OrchestratorApp:
                     # turn-limit miss escalates the next dispatch's cap.
                     "max_turns_override": resolved_review_turn_caps.get(pr_number),
                     # Issue TBD (role-config Phase 1): without this, every
-                    # reviewer launch fell back to launch_claude_worker's own
-                    # resolved_config.claude_code.model, which
-                    # build_config_from_data's dual-write claims for the
-                    # WORKER whenever worker.harness == "claude-code" (see
-                    # config._resolve_role_dual_accept) -- so a worker/
-                    # reviewer split configuration would resolve correctly on
-                    # the config object but never actually change which model
-                    # the reviewer launches with. Passing it explicitly here
-                    # is the single enforcement point.
+                    # reviewer launch would fall back to
+                    # launch_claude_worker's own default model resolution,
+                    # which is resolved_config.worker.model (see
+                    # _apply_model_pin's caller in claude_code.py) -- so a
+                    # worker/reviewer split configuration (different
+                    # worker.model vs reviewer.model) would resolve correctly
+                    # on the config object but never actually change which
+                    # model the reviewer launches with. Passing
+                    # resolved_config.reviewer.model explicitly here as
+                    # model_override is the single enforcement point.
                     "model_override": self.config.reviewer.model or None,
                 }
 

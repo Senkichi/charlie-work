@@ -13,7 +13,7 @@
 
 The fleet currently has two worker adapters: `devin-shell` (free local swe-1.6
 subprocesses — cheap, weak) and `claude-code`. Adapter selection is **global per
-repo** (`devin.adapter`), so every issue in a repo gets the same worker
+repo** (`worker.harness`), so every issue in a repo gets the same worker
 regardless of difficulty, and reworks go back to the same (weak) worker that
 produced the flawed first pass.
 
