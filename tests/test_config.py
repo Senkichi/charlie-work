@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from types import MappingProxyType
 
+from charlie_work import config as config_module
 from charlie_work.config import (
     ApiBudgetConfig,
     ApiProviderConfig,
@@ -2263,3 +2264,98 @@ def test_claude_code_config_model_default_uses_shared_constant() -> None:
 
     assert ClaudeCodeConfig().model == _DEFAULT_CLAUDE_MODEL
     assert ReviewerRoleConfig().model == _DEFAULT_CLAUDE_MODEL
+
+
+def test_resolve_dual_accept_new_only() -> None:
+    value, deprecated = config_module._resolve_dual_accept(
+        old_present=False,
+        old_value=None,
+        old_label="old.x",
+        new_present=True,
+        new_value="Y",
+        new_label="new.x",
+        default="D",
+    )
+    assert value == "Y"
+    assert deprecated is False
+
+
+def test_resolve_dual_accept_old_only() -> None:
+    value, deprecated = config_module._resolve_dual_accept(
+        old_present=True,
+        old_value="X",
+        old_label="old.x",
+        new_present=False,
+        new_value=None,
+        new_label="new.x",
+        default="D",
+    )
+    assert value == "X"
+    assert deprecated is True
+
+
+def test_resolve_dual_accept_neither_uses_default() -> None:
+    value, deprecated = config_module._resolve_dual_accept(
+        old_present=False,
+        old_value=None,
+        old_label="old.x",
+        new_present=False,
+        new_value=None,
+        new_label="new.x",
+        default="D",
+    )
+    assert value == "D"
+    assert deprecated is False
+
+
+def test_resolve_dual_accept_agreeing_values_are_deprecated_not_conflicting() -> None:
+    value, deprecated = config_module._resolve_dual_accept(
+        old_present=True,
+        old_value="X",
+        old_label="old.x",
+        new_present=True,
+        new_value="X",
+        new_label="new.x",
+        default="D",
+    )
+    assert value == "X"
+    assert deprecated is True
+
+
+def test_resolve_dual_accept_disagreeing_values_raise() -> None:
+    with pytest.raises(ConfigError, match="old.x.*X.*new.x.*Y"):
+        config_module._resolve_dual_accept(
+            old_present=True,
+            old_value="X",
+            old_label="old.x",
+            new_present=True,
+            new_value="Y",
+            new_label="new.x",
+            default="D",
+        )
+
+
+def test_role_section_absent_key_inserts_empty_dict_back_into_data() -> None:
+    data: dict = {}
+    section = config_module._role_section(data, "worker")
+    assert section == {}
+    assert data["worker"] is section  # must be the SAME object, not a detached copy
+
+
+def test_role_section_non_dict_value_is_coerced_and_inserted() -> None:
+    data = {"worker": "not-a-dict"}
+    section = config_module._role_section(data, "worker")
+    assert section == {}
+    assert data["worker"] is section
+
+
+def test_role_section_existing_dict_is_returned_as_is() -> None:
+    data = {"worker": {"harness": "api"}}
+    section = config_module._role_section(data, "worker")
+    assert section is data["worker"]
+    assert section == {"harness": "api"}
+
+
+def test_resolve_role_dual_accept_scaffold_returns_empty_list() -> None:
+    assert config_module._resolve_role_dual_accept({}) == []
+    assert config_module._resolve_role_dual_accept({"unrelated": 1}) == []

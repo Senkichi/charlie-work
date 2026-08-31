@@ -2076,6 +2076,90 @@ def _build_section(cls: type, name: str, data: dict[str, Any]) -> Any:
     return cls(**data)
 
 
+def _role_section(data: dict[str, Any], key: str) -> dict[str, Any]:
+    """Like ``_section``, but inserts the coerced dict back into ``data`` so a
+    later ``_section(data, key)`` call (and ``_build_section``) observes any
+    values written into this function's return value. ``_section`` deliberately
+    does NOT do this insertion -- many of its callers want a read-only peek at
+    a section that may not exist without creating one. This is a distinct
+    helper for ``_resolve_role_dual_accept``, which must write into a section
+    that may be entirely absent from an old-style config (e.g. no ``worker:``
+    block at all) and have that write actually reach the section's own later
+    ``_build_section`` call further down in ``build_config_from_data``.
+    """
+    value = data.get(key)
+    if not isinstance(value, dict):
+        value = {}
+    data[key] = value
+    return value
+
+
+def _resolve_dual_accept(
+    *,
+    old_present: bool,
+    old_value: Any,
+    old_label: str,
+    new_present: bool,
+    new_value: Any,
+    new_label: str,
+    default: Any,
+) -> tuple[Any, bool]:
+    """Resolve one (old_key, new_key) config pair to a single effective value.
+
+    Returns ``(effective_value, deprecated)``. ``deprecated`` is True whenever
+    the old key is present at all, whether or not it was the one used to
+    resolve the value -- co-presence with an agreeing new-key value is still
+    a signal the operator has not migrated that key yet.
+
+    Raises ``ConfigError`` when both keys are present with disagreeing
+    values: silently preferring one during the Phase 1 dual-accept window
+    would let a config say two different things and run whichever one nobody
+    was looking at.
+    """
+    if old_present and new_present and old_value != new_value:
+        raise ConfigError(
+            f"config conflict: '{old_label}' = {old_value!r} but '{new_label}' = "
+            f"{new_value!r} -- these must agree during the Phase 1 role-config "
+            "dual-accept window (unset one, or set them to the same value)"
+        )
+    if new_present:
+        return new_value, old_present
+    if old_present:
+        return old_value, True
+    return default, False
+
+
+def _resolve_role_dual_accept(data: dict[str, Any]) -> list[str]:
+    """Resolve the worker/reviewer role dual-accept mapping in place on
+    ``data`` (Phase 1 of the role-config refactor, issue TBD).
+
+    For every (old_key, new_key) pair this function covers, it computes one
+    effective value, raises ``ConfigError`` on disagreement, and writes the
+    effective value into BOTH the old key's location and the new key's
+    location in ``data`` -- so every existing call site reading a legacy
+    field (``config.devin.adapter``, ``config.claude_code.model``, ...) and
+    every new call site reading a role field (``config.worker.harness``,
+    ``config.reviewer.model``, ...) observe the same effective config,
+    regardless of which one the operator actually set.
+
+    Must run immediately after the top-level unknown-section check in
+    ``build_config_from_data``, before any ``_section``/``_build_section``
+    call for a section this function touches (``dispatch``,
+    ``review_dispatch``, ``devin``, ``claude_code``, ``api_worker``,
+    ``cross_family``, ``rescue``, ``worker``, ``reviewer``) -- ``_section``
+    itself does not persist a coerced empty-dict default back into ``data``,
+    so a write into its return value for an absent section would otherwise
+    be silently lost; ``_role_section`` (used throughout this function)
+    exists specifically to avoid that.
+
+    Returns the list of human-readable deprecation messages for every
+    deprecated legacy key found present. Callers attach this list (as a
+    tuple) to ``OrchestratorConfig.deprecations``.
+    """
+    deprecations: list[str] = []
+    return deprecations
+
+
 def known_config_sections() -> frozenset[str]:
     """The section names ``load_config`` accepts at the top level.
 
