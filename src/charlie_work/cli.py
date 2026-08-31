@@ -14,6 +14,10 @@ import yaml
 from . import CLI_NAME
 from .closing_keyword_gate import find_unexpected_closing_references
 from .mojibake_gate import find_mojibake_in_diff
+from .private_slug_check_command import (
+    register_private_slug_check_subparser,
+    run_private_slug_check_command,
+)
 from .config import ConfigError, OrchestratorConfig, find_config_path
 from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import (
@@ -475,6 +479,8 @@ def build_parser() -> argparse.ArgumentParser:
         "in shallow clones (CI uses fetch-depth: 1) where three-dot "
         "(base...HEAD) cannot resolve the merge-base.",
     )
+
+    register_private_slug_check_subparser(subparsers)
 
     migrate_parser = subparsers.add_parser(
         "migrate-state-dir",
@@ -2620,6 +2626,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_closing_keyword_check_command(args)
         elif args.command == "mojibake-check":
             result = run_mojibake_check_command(args)
+        elif args.command == "private-slug-check":
+            result = run_private_slug_check_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)
