@@ -72,7 +72,7 @@ for the full dataclass list and defaults):
 
 | Key | Meaning |
 |---|---|
-| `labels.*` | The `agent:*` / `automated-ready` label strings that make up the state machine (see [ARCHITECTURE.md](ARCHITECTURE.md#label-state-machine)), plus the `complexity_high` routing hint (not a workflow state — see [§4](#4-bootstrap-labels)). |
+| `labels.*` | The `agent:*` / `automated-ready` label strings that make up the state machine (see [ARCHITECTURE.md](ARCHITECTURE.md#label-state-machine)). |
 | `dispatch.default_limit` / `branch_prefix` / `worker_template` | Wave size, branch-name prefix, which prompt template renders per-issue worker prompts (`worker.md` for Devin, `worker_claude_code.md` for Claude Code). |
 | `review.max_rework_cycles` | `request_changes` cycles allowed before escalating to `agent:human-needed` instead of dispatching another rework round. |
 | `auto_merge.required_checks` | CI check-run names that must be green before `ship-it` will merge. **Must match your `.github/workflows/*.yml` job `name:` fields exactly** — `doctor` verifies this. |
@@ -80,7 +80,6 @@ for the full dataclass list and defaults):
 | `auto_merge.admin` | Legacy field for `gh pr merge --admin` (required when the base branch is protected and your gh auth has admin on the repo). Superseded by `merge_flags` but preserved for backward compatibility. |
 | `runtime.prompts_dir` | Repo-local directory that overrides package prompt templates **by filename** — drop in your own `worker.md` and everything else keeps the package default. |
 | `devin.adapter` | How a worker is launched: `manual` (write a session manifest for a human to paste), `command` (blocking subprocess via `devin.dispatch_command`), `devin-shell` (non-blocking headless `devin --print`), or `claude-code` (non-blocking headless `claude -p` in an isolated worktree). See [ARCHITECTURE.md](ARCHITECTURE.md#adapter-boundary). |
-| `cross_family.*` | Enables the non-Claude adversarial pass (`enabled: false` by default; both example profiles show how to turn it on/off). |
 | `watchdog.*` | Supervisor tripwires (stall, wall-clock, loop/no-progress, cost/token budget) and restart-intensity cap. WARN-first by default — see [RUNBOOK.md](RUNBOOK.md#supervisor-worker-health--escalation). |
 | `fleet.global_max_concurrent_sessions` | Cross-repo worker-count budget for `charlie fleet …` (default `0` = unlimited). |
 | `notify.*` | Opt-in needs-attention sink (webhook \| desktop \| shell \| file); `enabled: false` by default. See `examples/notify.config.yaml`. |
@@ -96,8 +95,7 @@ authenticated, config file presence, `required_checks` configured (if
 `auto_merge.enabled`), each required check name matched against live
 `.github/workflows/*.yml` job names, all `LabelConfig.all` labels exist on
 the repo, the state file loads cleanly, the dispatch adapter is sane
-(`command` adapter requires a non-empty `dispatch_command`), the
-cross-family binary is on PATH (if `cross_family.enabled`), and the
+(`command` adapter requires a non-empty `dispatch_command`), and the
 configured worker template resolves to a real file. Exit code is non-zero
 only on hard (`severity="error"`) failures — warnings don't block. Fix
 everything `doctor` flags before your first real dispatch.
@@ -114,24 +112,11 @@ uv run charlie bootstrap-labels
 Creates all labels from `LabelConfig.all` (`automated-ready`,
 `agent:queued`, `agent:in-progress`, `agent:pr-open`, `agent:reviewing`,
 `agent:needs-rework`, `agent:blocked`, `agent:done`, `agent:human-needed`,
-plus the `complexity:high` routing hint) with descriptions.
-
-### Routing hint: `complexity:high`
-
-`complexity:high` is **not** a workflow state — it never affects issue
-selection or exclusion. It is a deterministic, human-applied routing hint
-read by `routing.select_adapter`: a first-pass issue carrying this label is
-sent to the paid `api` worker (the stronger tier) instead of the weaker
-default worker, subject to the same preflight/fallback chain as reworks.
-Apply `complexity:high` at filing time for multi-module changes,
-cross-cutting invariant work, or issues with prior escalation history. It is
-inert when `api_worker.enabled` is false (preflight returns
-`fallback:disabled` and the default adapter runs).
+plus `complexity:high`) with descriptions.
 
 ## 5. First cycle: intake → dispatch → review → merge
 
-Label a real issue `automated-ready` on GitHub (add `complexity:high` too if
-it qualifies — see the routing-hint note above), then run the loop by hand
+Label a real issue `automated-ready` on GitHub, then run the loop by hand
 (one step at a time, so you can see each artifact) or via `bash-rats` (all
 steps, one pass):
 
@@ -179,16 +164,6 @@ run during a "preview":
   supervisor by design, an ungated preview could take the fleet down.
 - the runner **scale-event cooldown** write, which gates *both* scale directions
   (issue #609), and the runner **pool-sample** write that feeds idle detection.
-- the **cross-family review report** write. This one was actively destructive: the
-  dry-run branch bailed out through the shared failure helper, which writes an
-  `(UNAVAILABLE)` stub over `report_path` — so previewing a PR that already had a
-  real cross-family review *destroyed* it, and the reports are keyed by PR, so
-  there was no second copy. A preview now writes neither the report nor the
-  prompt and never spawns the reviewer — but **only on the PR-review path**
-  (`why-charlie-hate --pr`), which is the one call site that passes the flag
-  down. The rescue-review and `why-charlie-hate-spec` paths still do not thread
-  `--dry-run`, so they continue to spawn the real reviewer and write a real
-  report. Those two are tracked separately and are *not* fixed by the above.
 
 It does **not** suppress local state writes in general. **Worker** adapter
 launches (`devin-shell` / `claude-code`) are a separate mechanism —
@@ -203,12 +178,12 @@ runtimes:
 
 | Profile | `dispatch.worker_template` | `devin.adapter` | Notes |
 |---|---|---|---|
-| `examples/orchestrator.config.devin.yaml` | `worker.md` | `devin-shell` | Skills-based worker loop (`/create-branch`, `/commit`, `/test`, `/preflight`, `/push`, `/create-pr`, `/complete`); cross-family review **on**. |
-| `examples/orchestrator.config.claude-code.yaml` | `worker_claude_code.md` | `claude-code` | Direct-shell worker loop (no Devin skills, plain git/test commands in the prompt); cross-family review **off** (Claude-only review). |
+| `examples/orchestrator.config.devin.yaml` | `worker.md` | `devin-shell` | Skills-based worker loop (`/create-branch`, `/commit`, `/test`, `/preflight`, `/push`, `/create-pr`, `/complete`); no automated reviewer dispatch (`review_dispatch.enabled: false`). |
+| `examples/orchestrator.config.claude-code.yaml` | `worker_claude_code.md` | `claude-code` | Direct-shell worker loop (no Devin skills, plain git/test commands in the prompt); no automated reviewer dispatch (Claude-only review). |
 
 Both shipped profiles use a non-blocking adapter that actually launches a
 worker (`devin-shell` / `claude-code`); each comments `# Fall back to
-adapter: manual` inline if you'd rather have the orchestrator only write the
+harness: manual` inline if you'd rather have the orchestrator only write the
 session manifest and prompt files and paste them into a worker session (Devin
 app, or a `claude` terminal in a worktree) by hand. The `command` adapter
 (blocking subprocess-launch via `devin.dispatch_command`) is a fourth option —
@@ -220,7 +195,7 @@ the configured adapter's CLI is reachable with `charlie doctor --adapter-probe`.
 
 Package defaults live in `src/charlie_work/prompts/`
 (`orchestrator.md`, `worker.md`, `worker_claude_code.md`, `review.md`,
-`rework.md`, `cross_family_review.md`, `cross_family_spec_review.md`). A
+`rework.md`). A
 repo-local `runtime.prompts_dir` overrides these **by filename** — point it
 at a tracked directory in your consumer repo and drop in your own
 `worker.md` carrying repo-specific invariants and canonical commands; every

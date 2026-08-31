@@ -11764,12 +11764,16 @@ def test_render_command_templates_list_and_string() -> None:
     assert render_command("devin --model {model}", values) == "devin --model codex"
 
 
-def test_devin_example_config_enables_cross_family() -> None:
+def test_devin_example_config_no_longer_configures_cross_family() -> None:
+    # Phase 2 Track D (2026-08-30 role-config-phase2-deletions, Task 1) removed
+    # the cross_family: block from this example -- the subsystem itself is
+    # deleted wholesale in a later, independently-landing track (A). Until
+    # that lands, confirm the example falls back to the (disabled) default
+    # rather than silently keeping the old enabled: true behavior via some
+    # other path.
     config = load_config(EXAMPLES_DIR / "orchestrator.config.devin.yaml")
 
-    assert config.cross_family.enabled is True
-    assert config.cross_family.model == "codex"
-    assert config.cross_family.command[0] == "devin"
+    assert config.cross_family.enabled is False
     assert config.dispatch.worker_template == "worker.md"
 
 
