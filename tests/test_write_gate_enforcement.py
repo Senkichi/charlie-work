@@ -884,6 +884,19 @@ _RATCHET_BASELINE: dict[str, int] = {
     # caller — the same out-of-wave pattern as the #1423 worktree.py sites.
     # The ratchet holds at the new count until this module's conversion wave.
     "capacity_starvation_escalation.py": 1,
+    # Issue #1514: +1 raw log_event call in launch_api_worker's budget-preflight
+    # refusal (the api_budget_refused event emitted when the daily/lifetime cap
+    # is exhausted, so the operator can see launches are being held by the
+    # budget). launch_api_worker is a standalone module-level function in
+    # api_worker.py, not an OrchestratorApp method, so it has no
+    # self.write_gate receiver and cannot use Convention A without a write_gate
+    # parameter threaded through every caller — the same out-of-wave pattern as
+    # the #763 capacity_starvation_escalation.py site. The log_event call is
+    # best-effort (instrumentation.log_event catches any I/O error internally,
+    # never breaking the launch path), and the refusal itself is returned as a
+    # ClaudeWorkerRecord value regardless of whether the event lands. The
+    # ratchet holds at the new count until api_worker.py's conversion wave.
+    "api_worker.py": 1,
 }
 
 
