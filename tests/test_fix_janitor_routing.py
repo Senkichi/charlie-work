@@ -24,7 +24,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from _janitor_routing_fixtures import _conflicting_app, _set_decision
-from charlie_work.config import DevinConfig, OrchestratorConfig, ReviewConfig, WatchdogConfig
+from charlie_work.config import (
+    DevinConfig,
+    OrchestratorConfig,
+    ReviewConfig,
+    WatchdogConfig,
+    WorkerRoleConfig,
+)
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
 from charlie_work.workflow import OrchestratorApp
@@ -676,7 +682,8 @@ def test_route_rework_candidate_to_review_does_not_flip_when_pr_closes_mid_pass(
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = _RaceClosedGitHub()

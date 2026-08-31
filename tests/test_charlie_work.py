@@ -19338,7 +19338,8 @@ def test_dispatch_rework_finds_needs_rework_issues_with_open_prs(tmp_path: Path)
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19389,7 +19390,8 @@ def test_dispatch_rework_transitions_to_rework_dispatched(tmp_path: Path) -> Non
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19440,7 +19442,8 @@ def test_dispatch_rework_transition_failure_recorded(tmp_path: Path) -> None:
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19703,6 +19706,7 @@ def test_dispatch_rework_event_indexes_pr_number(tmp_path: Path) -> None:
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19837,6 +19841,7 @@ def test_dispatch_rework_worktree_unsafe_local_commits_escalates_as_judgment(
                 "import sys; sys.exit(1)",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
             max_auto_redispatch=2,
             redispatch_window_minutes=240,
@@ -19925,6 +19930,7 @@ def test_dry_run_dispatch_rework_leaves_state_unchanged(tmp_path: Path) -> None:
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -19997,6 +20003,7 @@ def test_dry_run_dispatch_rework_no_op_escalation_does_not_escalate(
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
             max_auto_redispatch=2,
             redispatch_window_minutes=240,
@@ -20092,6 +20099,7 @@ def test_dry_run_dispatch_rework_review_routing_does_not_invoke_review(
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -20221,6 +20229,7 @@ def test_dry_run_dispatch_rework_worker_death_escalation_does_not_escalate(
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
             max_auto_redispatch=2,
             redispatch_window_minutes=240,
@@ -21687,7 +21696,8 @@ def test_dispatch_isolates_label_write_failure(tmp_path: Path, monkeypatch) -> N
         devin=DevinConfig(
             adapter="devin-shell",
             shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = LabelFailGitHub()
@@ -21724,7 +21734,8 @@ def test_concurrent_dispatch_claims_prevent_double_launch(tmp_path: Path) -> Non
         devin=DevinConfig(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -21764,7 +21775,8 @@ def test_stale_dispatch_pending_claim_is_redispatchable(tmp_path: Path, monkeypa
         devin=DevinConfig(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -26152,7 +26164,8 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -29382,6 +29395,7 @@ def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
             failed_attempt_alarm=1,
         ),
         devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -29470,6 +29484,7 @@ def test_merge_ready_check_failure_routes_to_rework(tmp_path: Path) -> None:
             failed_attempt_alarm=1,
         ),
         devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHubWithChecks(
@@ -30464,6 +30479,7 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=3, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -31212,7 +31228,8 @@ def test_dispatch_rework_clears_startup_death_flag_on_new_dispatch(
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -32502,6 +32519,7 @@ def test_concurrency_governor_clamps_rework_dispatch(tmp_path: Path, monkeypatch
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -32846,6 +32864,7 @@ def test_concurrency_governor_clamps_only_issues_rework_dispatch(
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -33016,6 +33035,7 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -33151,6 +33171,7 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     partial_paths = runtime_paths(tmp_path / "partial", partial_config.runtime.state_dir)
     partial_gh = ReworkSaturatedGitHub(8)
@@ -33274,6 +33295,7 @@ def test_concurrency_governor_zero_rework_dry_run_automatic_path(
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -34298,6 +34320,7 @@ def test_dispatch_rework_state_driven_selection(tmp_path: Path) -> None:
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -34351,6 +34374,7 @@ def test_dispatch_rework_state_wins_over_missing_label(tmp_path: Path) -> None:
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -34468,6 +34492,7 @@ def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         # This test intentionally leaves issues in rework_requested with only the
         # needs-rework label. The in-loop reconcile pass would otherwise see open PRs
         # with a stale active label and self-heal the status to open_passive before
@@ -34654,6 +34679,7 @@ def _dispatch_rework_config() -> OrchestratorConfig:
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
 
 
@@ -34801,6 +34827,7 @@ def test_dry_run_dispatch_rework_conflict_bypass_direct_conflicting(
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -34917,6 +34944,7 @@ def test_dry_run_dispatch_rework_conflict_bypass_unknown_mergeable_pr_view_fallb
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -35847,6 +35875,7 @@ def test_dispatch_rework_defers_when_provider_throttled(tmp_path: Path) -> None:
     config = OrchestratorConfig(
         dispatch=DispatchConfig(default_limit=3),
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -40862,6 +40891,7 @@ def test_standalone_dispatch_and_rework_advance_inconclusive_probe_counter_once(
 
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(
             enabled=True, stall_minutes=20, max_inconclusive_probe_deferrals=10
         ),
@@ -46291,7 +46321,10 @@ def test_state_lock_guard_returns_skip_when_lock_held(
     """
     monkeypatch.setattr(state_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
 
-    config = OrchestratorConfig(devin=DevinConfig(adapter="devin-shell"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
 
@@ -46606,7 +46639,8 @@ def test_dispatch_label_error_reason_in_event_payload(tmp_path: Path) -> None:
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -46647,7 +46681,8 @@ def test_dispatch_rework_label_error_reason_in_event_payload(tmp_path: Path) -> 
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -46707,7 +46742,8 @@ def test_dispatch_rework_missing_prompt_reason_in_event_payload(tmp_path: Path) 
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -47383,6 +47419,7 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -48826,7 +48863,8 @@ def test_dispatch_rework_regenerates_stale_brief_after_decision_edit(
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -48920,7 +48958,8 @@ def test_dispatch_rework_regenerates_brief_after_renderer_change(
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -49822,7 +49861,8 @@ def test_no_op_rework_repair_note_survives_dispatch_rework_regeneration(tmp_path
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
             ),
-        )
+        ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -50128,6 +50168,7 @@ def test_dispatch_rework_deterministic_failure_kind_escalates_immediately(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=3, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -50197,6 +50238,7 @@ def test_dispatch_rework_no_op_rework_cap_escalates(tmp_path: Path) -> None:
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -50255,6 +50297,7 @@ def test_dispatch_rework_worker_deaths_dont_count_as_no_op(tmp_path: Path) -> No
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -50316,6 +50359,7 @@ def test_dispatch_rework_mixed_deaths_and_no_ops_no_op_dominates(tmp_path: Path)
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -50373,6 +50417,7 @@ def test_dispatch_rework_deaths_below_cap_still_dispatched(tmp_path: Path) -> No
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -50475,6 +50520,7 @@ def test_dispatch_rework_worker_death_loop_includes_stranded_commits(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     layout = resolved_layout(config, repo_root)
@@ -50658,6 +50704,7 @@ def test_dispatch_rework_death_loop_salvages_stranded_commits(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     layout = resolved_layout(config, repo_root)
@@ -50782,6 +50829,7 @@ def test_dispatch_rework_death_loop_empty_death_still_escalates(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "print('ok')"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     layout = resolved_layout(config, repo_root)
@@ -51601,6 +51649,7 @@ def test_dispatch_rework_combined_manifest_mixed_label(
 
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         rescue=RescueConfig(enabled=True, worker_model="claude-opus-4-1"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -52412,6 +52461,7 @@ def test_dispatch_rework_worktree_foreign_writer_does_not_increment_redispatch(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -52508,6 +52558,7 @@ def test_dispatch_rework_worktree_foreign_writer_redispatch_unchanged(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -52761,6 +52812,7 @@ def test_dispatch_rework_blocked_environment_reap_resets_counter(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
             max_auto_redispatch=0,
             redispatch_window_minutes=240,
@@ -52862,6 +52914,7 @@ def test_dispatch_rework_pre_escalation_safety_net_reaps_foreign_writer(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
             max_auto_redispatch=2,
             redispatch_window_minutes=240,

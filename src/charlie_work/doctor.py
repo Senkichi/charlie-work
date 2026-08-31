@@ -183,7 +183,7 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
     custom wrapper set in ``devin.shell_command`` / ``claude_code.command`` is
     exercised — not the hardcoded default name.
     """
-    adapter = config.devin.adapter
+    adapter = config.worker.harness
     if adapter == "devin-shell":
         from .devin_shell import DEFAULT_COMMAND_TEMPLATE, probe_devin
 
@@ -276,7 +276,7 @@ def _check_worker_github_token(add: Any, config: OrchestratorConfig) -> None:
 
     Two other paths dispatch through the claude-code launch path
     (``claude_code.worker_env``) regardless of the configured default
-    ``devin.adapter``, so a ``devin-shell``/``manual``/``command`` default
+    ``worker.harness``, so a ``devin-shell``/``manual``/``command`` default
     can still stall a worker mid-pass with no visible finding unless both are
     covered:
 
@@ -1366,31 +1366,31 @@ def run_doctor(
         )
 
     # -- adapters ------------------------------------------------------------
-    if config.devin.adapter == "command" and not config.devin.dispatch_command:
+    if config.worker.harness == "command" and not config.devin.dispatch_command:
         add("dispatch adapter", False, "adapter is `command` but dispatch_command is empty")
     else:
-        add("dispatch adapter", True, config.devin.adapter)
+        add("dispatch adapter", True, config.worker.harness)
 
     # Report the effective devin-shell worker model so the operator can see
     # what dispatch will actually launch.
-    if config.devin.adapter == "devin-shell":
-        if config.devin.worker_model:
+    if config.worker.harness == "devin-shell":
+        if config.worker.model:
             add(
                 "devin-shell worker model",
                 True,
-                f"config-driven: {config.devin.worker_model}",
+                f"config-driven: {config.worker.model}",
             )
         else:
             add(
                 "devin-shell worker model",
                 True,
-                "CLI default (no devin.worker_model configured)",
+                "CLI default (no worker.model configured)",
                 severity="warning",
             )
 
     # claude-code worktrees junction a shared venv in; surface a missing
     # venv_source at preflight rather than deferring it to the first dispatch.
-    if config.devin.adapter == "claude-code" and config.claude_code.venv_source:
+    if config.worker.harness == "claude-code" and config.claude_code.venv_source:
         venv = Path(config.claude_code.venv_source)
         if not venv.is_absolute():
             venv = repo_root / venv
