@@ -11,11 +11,16 @@ from charlie_work.config import (
     ApiBudgetConfig,
     ApiProviderConfig,
     ApiWorkerConfig,
+    ClaudeCodeConfig,
     ConfigError,
     DispatchConfig,
     OrchestratorConfig,
+    RescueConfig,
+    ReviewerRoleConfig,
     RuntimeConfig,
+    WorkerRoleConfig,
     build_config_from_data,
+    known_config_sections,
     load_config,
 )
 from charlie_work.global_config import load_layered_config
@@ -2205,3 +2210,56 @@ def test_provider_suspended_is_deterministic_escalation_failure_kind() -> None:
     from charlie_work.config import DETERMINISTIC_ESCALATION_FAILURE_KINDS
 
     assert "provider_suspended" in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+
+
+def test_worker_role_config_defaults_and_frozen() -> None:
+    cfg = WorkerRoleConfig()
+    assert cfg.harness == "manual"
+    assert cfg.model == ""
+    with pytest.raises(AttributeError):
+        cfg.harness = "claude-code"  # type: ignore[misc]
+
+
+def test_reviewer_role_config_defaults_and_frozen() -> None:
+    cfg = ReviewerRoleConfig()
+    assert cfg.harness == "claude-code"
+    assert cfg.model == "claude-sonnet-5"
+    assert cfg.effort == ""
+    assert cfg.effort_experiment_fraction == 0.0
+    assert cfg.effort_experiment_salt == ""
+    with pytest.raises(AttributeError):
+        cfg.model = "x"  # type: ignore[misc]
+
+
+def test_rescue_config_worker_and_reviewer_role_defaults() -> None:
+    cfg = RescueConfig()
+    assert cfg.worker == WorkerRoleConfig(harness="claude-code", model="claude-opus-4-1")
+    assert cfg.reviewer == WorkerRoleConfig(harness="devin", model="codex")
+    # Legacy fields are untouched by this task -- still their own defaults.
+    assert cfg.worker_adapter == "claude-code"
+    assert cfg.worker_model == "claude-opus-4-1"
+    assert cfg.reviewer_adapter == "devin"
+    assert cfg.reviewer_model == "codex"
+
+
+def test_orchestrator_config_worker_reviewer_deprecations_defaults() -> None:
+    cfg = OrchestratorConfig()
+    assert cfg.worker == WorkerRoleConfig()
+    assert cfg.reviewer == ReviewerRoleConfig()
+    assert cfg.deprecations == ()
+
+
+def test_worker_and_reviewer_are_known_config_sections() -> None:
+    sections = known_config_sections()
+    assert "worker" in sections
+    assert "reviewer" in sections
+    # Provenance fields must never be forgeable as a YAML section.
+    assert "deprecations" not in sections
+    assert "sources" not in sections
+
+
+def test_claude_code_config_model_default_uses_shared_constant() -> None:
+    from charlie_work.config import _DEFAULT_CLAUDE_MODEL
+
+    assert ClaudeCodeConfig().model == _DEFAULT_CLAUDE_MODEL
+    assert ReviewerRoleConfig().model == _DEFAULT_CLAUDE_MODEL

@@ -1157,6 +1157,14 @@ class RuntimeConfig:
     status_snapshot_ttl_seconds: int = 900
 
 
+# Shared default for every Claude Code model field this refactor touches
+# (ClaudeCodeConfig.model, ReviewerRoleConfig.model, and the claude-code
+# branch of _resolve_role_dual_accept's worker.model resolution) so the
+# three cannot silently drift apart -- CLAUDE.md's "no hardcoded lists"
+# rule applied to a scalar default instead of a list.
+_DEFAULT_CLAUDE_MODEL: str = "claude-sonnet-5"
+
+
 @dataclass(frozen=True)
 class DevinConfig:
     # "manual" writes a session manifest for the operator; "command" runs a
@@ -1220,7 +1228,7 @@ class ClaudeCodeConfig:
     # a premium tier silently propagated to every reviewer launch and hit a
     # credits wall, stalling every PR review fleet-wide with zero backoff
     # signal since the error didn't match the quota-exhaustion classifier).
-    model: str = "claude-sonnet-5"
+    model: str = _DEFAULT_CLAUDE_MODEL
     # Effort level pinned via ``--effort`` on every worker/reviewer launch —
     # see claude_code._apply_effort_pin. Empty string means no pin (the CLI
     # uses its default effort). Mirrors the model pin: prevents ambient CLI
@@ -1421,6 +1429,56 @@ class CrossFamilyConfig:
 
 
 @dataclass(frozen=True)
+class WorkerRoleConfig:
+    """The designated worker: which harness dispatches fresh/rework issues,
+    and which model that harness should use.
+
+    Phase 1 of the role-config refactor (issue TBD): dual-accept alongside
+    the legacy ``devin.adapter``/``devin.worker_model``/``claude_code.model``
+    fields -- see ``_resolve_role_dual_accept`` below for the exact mapping
+    and conflict rules. ``harness`` mirrors ``DevinConfig.adapter``'s legal
+    values (``devin-shell`` | ``claude-code`` | ``api`` | ``command`` |
+    ``manual``). ``model`` is harness-specific: empty string means "let the
+    harness's own default apply" for every harness except ``claude-code``,
+    which defaults to ``_DEFAULT_CLAUDE_MODEL`` (matching
+    ``ClaudeCodeConfig.model``'s own default, since a claude-code worker
+    launch with no override reads that field directly).
+
+    Kept intentionally minimal in Phase 1 (just harness + model). The design
+    spec's example config leaves room for future harness-specific per-role
+    knobs; adding those is explicitly out of this phase's scope.
+    """
+
+    harness: str = "manual"
+    model: str = ""
+
+
+@dataclass(frozen=True)
+class ReviewerRoleConfig:
+    """The designated reviewer: which harness launches PR review sessions,
+    which model it uses, and the review-effort A/B experiment knobs
+    (relocated from ``ReviewDispatchConfig`` -- issue TBD).
+
+    Phase 1 of the role-config refactor: dual-accept alongside
+    ``claude_code.model`` (as the reviewer's model) and
+    ``review_dispatch.review_effort``/``.review_effort_experiment_fraction``/
+    ``.review_effort_experiment_salt`` -- see ``_resolve_role_dual_accept``.
+
+    ``harness`` currently only accepts ``"claude-code"``; any other value is
+    rejected with ``ConfigError`` at load (the design spec's Phase-1
+    constraint). The field exists, rather than the reviewer harness being
+    implicit, so a future non-claude-code reviewer can be added by relaxing
+    this one check.
+    """
+
+    harness: str = "claude-code"
+    model: str = _DEFAULT_CLAUDE_MODEL
+    effort: str = ""
+    effort_experiment_fraction: float = 0.0
+    effort_experiment_salt: str = ""
+
+
+@dataclass(frozen=True)
 class RescueConfig:
     """Bounded strong-model rescue tier (issue #555).
 
@@ -1449,6 +1507,17 @@ class RescueConfig:
     polling worker session — ``reviewer_command`` empty means reuse
     ``CrossFamilyConfig.command`` with ``model`` overridden to
     ``reviewer_model``.
+
+    Phase 1 of the role-config refactor: ``worker``/``reviewer`` below are
+    dual-accept equivalents of ``worker_adapter``/``worker_model`` and
+    ``reviewer_adapter``/``reviewer_model`` above -- see
+    ``_resolve_role_dual_accept``. Both reuse ``WorkerRoleConfig`` (not
+    ``ReviewerRoleConfig``): the rescue reviewer legitimately defaults to a
+    non-claude-code harness (``"devin"``/``"codex"``) and launches through
+    ``cross_family.run_cross_family_review``, never
+    ``claude_code.launch_claude_worker`` -- so ``ReviewerRoleConfig``'s
+    claude-code-only harness restriction and its effort/experiment fields
+    would both be wrong here.
     """
 
     enabled: bool = False
@@ -1460,6 +1529,12 @@ class RescueConfig:
     # reviewer_model above).
     reviewer_command: str | tuple[str, ...] = ()
     reviewer_timeout_seconds: int = 300
+    worker: WorkerRoleConfig = field(
+        default_factory=lambda: WorkerRoleConfig(harness="claude-code", model="claude-opus-4-1")
+    )
+    reviewer: WorkerRoleConfig = field(
+        default_factory=lambda: WorkerRoleConfig(harness="devin", model="codex")
+    )
 
 
 @dataclass(frozen=True)
@@ -1915,6 +1990,8 @@ class OrchestratorConfig:
     api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
     cross_family: CrossFamilyConfig = field(default_factory=CrossFamilyConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
+    worker: WorkerRoleConfig = field(default_factory=WorkerRoleConfig)
+    reviewer: ReviewerRoleConfig = field(default_factory=ReviewerRoleConfig)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     worktree_reclamation: WorktreeReclamationConfig = field(
         default_factory=WorktreeReclamationConfig
@@ -1958,6 +2035,16 @@ class OrchestratorConfig:
     # obtained, not part of the value: two configs with identical sections are
     # the same config whether they came from one file, two, or none.
     sources: tuple[str, ...] = field(default=(), compare=False, metadata={"provenance": True})
+
+    # Phase 1 of the role-config refactor (issue TBD): human-readable
+    # deprecation warnings for every legacy key build_config_from_data found
+    # present while resolving the worker/reviewer dual-accept mapping (see
+    # _resolve_role_dual_accept). Populated only by build_config_from_data --
+    # a directly-constructed OrchestratorConfig() always has this at its
+    # empty default, exactly like ``sources`` above and for the same reason:
+    # ``metadata={"provenance": True}`` keeps a config file from declaring
+    # its own deprecation list.
+    deprecations: tuple[str, ...] = field(default=(), compare=False, metadata={"provenance": True})
 
 
 def find_config_path(repo_root: Path, explicit: Path | None = None) -> Path | None:
