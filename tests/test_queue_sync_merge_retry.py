@@ -208,9 +208,16 @@ def test_queue_sync_merge_covered_exhausted_retries_indeterminate(
 
     Also proves the retry backoff is fully injectable: with
     ``_QUEUE_SYNC_RETRY_SLEEP`` patched, this test -- which exhausts a full
-    retry budget -- completes in well under a second instead of the ~3s
-    (1s + 2s) of real backoff it would otherwise cost, and the recorded sleep
-    args (``[1, 2]``) double as a check on the backoff schedule itself.
+    retry budget -- completes in seconds instead of the ~3s (1s + 2s) of real
+    backoff it would otherwise cost, and the recorded sleep args (``[1, 2]``)
+    double as a check on the backoff schedule itself. The ``sleeps == [1, 2]``
+    check is the definitive proof that ``time.sleep`` was not called: if the
+    injection had failed, ``sleeps`` would be empty. The ``elapsed`` bound
+    below is a generous defense-in-depth sanity check (5s, well above the
+    ~3s real-backoff cost and any CI runner's non-sleep overhead) rather than
+    a tight performance assertion -- the wall time of
+    ``_detect_unauthorized_merges`` includes fixture/API-mock work unrelated
+    to the retry logic (issue #1510).
     """
     # _QUEUE_SYNC_RETRY_SLEEP lives in queue_sync_coverage.py (issue #1442
     # extraction) -- workflow.py only re-exports the name via its facade
@@ -233,7 +240,7 @@ def test_queue_sync_merge_covered_exhausted_retries_indeterminate(
     elapsed = time.perf_counter() - started
 
     assert sleeps == [1, 2]
-    assert elapsed < 0.5, f"retry backoff appears to have slept for real: {elapsed:.2f}s elapsed"
+    assert elapsed < 5, f"retry backoff appears to have slept for real: {elapsed:.2f}s elapsed"
     assert fake_gh.commit_calls["sha-syncmerge"] == 3
 
     assert len(detected) == 1
