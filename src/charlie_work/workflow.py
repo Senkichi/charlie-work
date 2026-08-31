@@ -3778,6 +3778,7 @@ def _try_reap_blocked_foreign_writer(
     config: OrchestratorConfig,
     state_file: Path,
     issue_number: int,
+    sessions_dir: Path,
 ) -> bool:
     """Attempt to reap an idle foreign writer at the blocked-environment cap.
 
@@ -3789,11 +3790,24 @@ def _try_reap_blocked_foreign_writer(
     a process the stall detector would have reaped if it could see it.
 
     This helper reads the marker from the failed dispatch's worktree path and
-    delegates to ``_reap_idle_foreign_writer`` (the same activity probe + kill
-    path the marker check uses). When the writer is idle past the threshold,
-    it is reaped and the caller resets the counter instead of escalating.
-    When the writer is still active, the caller escalates as before —
-    escalation is reserved for a writer that is alive *and* active.
+    delegates to ``_reap_idle_foreign_writer`` (the single enforcement point
+    for every reap-candidate guard + the activity probe + kill path). When the
+    writer is idle past the threshold, it is reaped and the caller resets the
+    counter instead of escalating. When the writer is still active, the caller
+    escalates as before — escalation is reserved for a writer that is alive
+    *and* active.
+
+    Issue #1443 finding 2: the pid is no longer read from ``failed_result``.
+    ``_reap_idle_foreign_writer`` derives it from the marker (single source of
+    truth) so the pid can never disagree with the ``process_start_time``
+    fingerprint passed to ``kill_process_tree``. ``failed_result`` is used
+    only to locate the worktree path and confirm the failure kind.
+
+    Issue #1443 review: ``sessions_dir`` is a required parameter (no default).
+    Every production caller passes it explicitly; removing the default converts
+    a silently-disabled own-live-session guard into an immediate ``TypeError``
+    if a future call site drops or reorders the argument — the exact bug shape
+    #1443 was filed to fix.
 
     Returns ``True`` when the writer was reaped, ``False`` otherwise (including
     when the failed result is not a foreign-writer block or the marker is gone).
@@ -3803,9 +3817,8 @@ def _try_reap_blocked_foreign_writer(
     failure_kind = getattr(failed_result, "failure_kind", None)
     if failure_kind != "worktree_foreign_writer":
         return False
-    pid = getattr(failed_result, "pid", None)
     worktree_path_str = getattr(failed_result, "worktree_path", None)
-    if not pid or not worktree_path_str:
+    if not worktree_path_str:
         return False
     worktree_path = Path(worktree_path_str)
     marker = read_worktree_marker(worktree_path)
@@ -3813,10 +3826,9 @@ def _try_reap_blocked_foreign_writer(
         return False
     return _reap_idle_foreign_writer(
         worktree_path,
-        pid,
-        marker.get("session_id"),
         marker,
         config,
+        sessions_dir,
         state_file=state_file,
         issue_number=issue_number,
     )
@@ -6207,6 +6219,7 @@ class OrchestratorApp:
                                 self.config,
                                 self.paths.state_file,
                                 request.issue_number,
+                                sessions_dir,
                             ):
                                 entry["blocked_environment_at"] = []
                                 entry["foreign_writer_reaps"] = prior_reaps + [
@@ -19627,54 +19640,53 @@ class OrchestratorApp:
                             self.repo_root, branch_pre, self._layout.worktrees
                         )
                         marker_pre = read_worktree_marker(wt_path_pre)
-                        if marker_pre is not None:
-                            pid_pre = marker_pre.get("pid")
-                            if (
-                                isinstance(pid_pre, int)
-                                and pid_pre > 0
-                                and is_pid_alive(pid_pre, None)
-                                and _reap_idle_foreign_writer(
-                                    wt_path_pre,
-                                    pid_pre,
-                                    marker_pre.get("session_id"),
-                                    marker_pre,
-                                    self.config,
-                                    state_file=self.paths.state_file,
-                                    issue_number=issue_number,
-                                )
-                            ):
-                                # Writer reaped: clear the counter so the issue
-                                # proceeds as a legitimate candidate, and record
-                                # the reap so a persistently-blocked worktree
-                                # eventually escalates instead of looping.
-                                with state_lock(self.paths.state_file):
-                                    state = load_state(self.paths.state_file)
-                                    issue_entry = state["issues"].get(str(issue_number), {})
-                                    if isinstance(issue_entry, dict):
-                                        issue_entry["blocked_environment_at"] = []
-                                        existing_reaps = _windowed_foreign_writer_reaps(
-                                            issue_entry,
-                                            window_minutes=self.config.watchdog.redispatch_window_minutes,
-                                        )
-                                        issue_entry["foreign_writer_reaps"] = existing_reaps + [
-                                            datetime.now(UTC).isoformat().replace("+00:00", "Z")
-                                        ]
-                                        state["issues"][str(issue_number)] = issue_entry
-                                        state = append_event(  # event-consumer: audit-only -- records a pre-escalation foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
-                                            state,
-                                            "dispatch_blocked_environment_reaped",
-                                            {
-                                                "issue_number": issue_number,
-                                                "pid": pid_pre,
-                                                "blocked_environment_count": len(prior_blocked),
-                                                "foreign_writer_reap_count": len(existing_reaps)
-                                                + 1,
-                                            },
-                                            state_path=self.paths.state_file,
-                                        )
-                                        save_state(self.paths.state_file, state)
-                                filtered_candidates.append(issue)
-                                continue
+                        # Issue #1443: the reap-candidate guards (operator,
+                        # stale-pid, own-live-session) and the pid are enforced
+                        # inside ``_reap_idle_foreign_writer`` (single point of
+                        # enforcement) so this pre-filter cannot drop one and
+                        # reap one of our own idle workers as
+                        # ``foreign_writer_reaped``. The pid for the audit event
+                        # is read from the marker (same source of truth as the
+                        # kill path).
+                        if marker_pre is not None and _reap_idle_foreign_writer(
+                            wt_path_pre,
+                            marker_pre,
+                            self.config,
+                            sessions_dir,
+                            state_file=self.paths.state_file,
+                            issue_number=issue_number,
+                        ):
+                            # Writer reaped: clear the counter so the issue
+                            # proceeds as a legitimate candidate, and record
+                            # the reap so a persistently-blocked worktree
+                            # eventually escalates instead of looping.
+                            with state_lock(self.paths.state_file):
+                                state = load_state(self.paths.state_file)
+                                issue_entry = state["issues"].get(str(issue_number), {})
+                                if isinstance(issue_entry, dict):
+                                    issue_entry["blocked_environment_at"] = []
+                                    existing_reaps = _windowed_foreign_writer_reaps(
+                                        issue_entry,
+                                        window_minutes=self.config.watchdog.redispatch_window_minutes,
+                                    )
+                                    issue_entry["foreign_writer_reaps"] = existing_reaps + [
+                                        datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                                    ]
+                                    state["issues"][str(issue_number)] = issue_entry
+                                    state = append_event(  # event-consumer: audit-only -- records a pre-escalation foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
+                                        state,
+                                        "dispatch_blocked_environment_reaped",
+                                        {
+                                            "issue_number": issue_number,
+                                            "pid": marker_pre.get("pid"),
+                                            "blocked_environment_count": len(prior_blocked),
+                                            "foreign_writer_reap_count": len(existing_reaps) + 1,
+                                        },
+                                        state_path=self.paths.state_file,
+                                    )
+                                    save_state(self.paths.state_file, state)
+                            filtered_candidates.append(issue)
+                            continue
                     blocked_environment_escalated.append(issue_number)
                     continue
 
@@ -20603,6 +20615,7 @@ class OrchestratorApp:
                                 self.config,
                                 self.paths.state_file,
                                 request.issue_number,
+                                sessions_dir,
                             ):
                                 entry["status"] = "rework_requested"
                                 entry["dispatched_at"] = None
