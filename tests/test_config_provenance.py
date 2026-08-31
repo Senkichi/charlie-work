@@ -344,3 +344,77 @@ def test_layered_control_known_section_unknown_key_already_consistent(
     repo_root.mkdir()
     with pytest.raises(ConfigError, match="unknown key"):
         load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
+
+
+# --------------------------------------------------------------------------
+# Role-config Phase 1 (issue TBD): layered-merge coverage for the new
+# worker/reviewer sections and their dual-accept legacy counterparts. Note
+# the global/fleet layer file is always ``config.yaml`` (``GLOBAL_CONFIG_
+# FILENAME`` in layout.py) -- distinct from the per-repo
+# ``orchestrator.config.yaml`` that ``_repo_with_config`` writes -- matching
+# every other layered test above.
+# --------------------------------------------------------------------------
+
+
+def test_layered_merges_worker_section_repo_overrides_global(tmp_path: pathlib.Path) -> None:
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "config.yaml").write_text(
+        "worker:\n  harness: devin-shell\n  model: glm-5-2\n", encoding="utf-8"
+    )
+    repo_root = tmp_path / "repo"
+    _repo_with_config(repo_root, "worker:\n  model: sonnet-5\n")
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
+
+    # Shallow per-section merge: repo's worker.model wins, global's
+    # worker.harness (absent from the repo layer) survives.
+    assert config.worker.harness == "devin-shell"
+    assert config.worker.model == "sonnet-5"
+
+
+def test_layered_cross_layer_old_new_conflict_falls_back_to_repo_alone(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The #665/#623 silent-global-discard shape, reachable during a
+    # staggered global/repo role-config cutover: global sets the OLD key,
+    # repo sets the disagreeing NEW key. The merged dict fails
+    # build_config_from_data's conflict check, so the loader falls back to
+    # the per-repo config alone (with a warning) rather than raising.
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "config.yaml").write_text("devin:\n  adapter: devin-shell\n", encoding="utf-8")
+    repo_root = tmp_path / "repo"
+    _repo_with_config(repo_root, "worker:\n  harness: claude-code\n")
+
+    with caplog.at_level("WARNING"):
+        config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
+
+    # Per-repo-alone fallback: only the repo's worker.harness took effect,
+    # the global devin.adapter was discarded.
+    assert config.worker.harness == "claude-code"
+    assert config.devin.adapter == "claude-code"
+    assert any("global layer was discarded" in record.message for record in caplog.records)
+
+
+def test_layered_mixed_old_worker_new_reviewer_across_layers_merges_cleanly(
+    tmp_path: pathlib.Path,
+) -> None:
+    # The claim-asymmetry rule from Task 4 also makes this the OK case, not
+    # a conflict: global keeps the legacy claude_code.model driving a
+    # claude-code worker, repo adds a new reviewer.model to decouple the
+    # reviewer. Confirms the rule holds across the layered-merge boundary,
+    # not just within one file.
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "config.yaml").write_text(
+        "devin:\n  adapter: claude-code\nclaude_code:\n  model: claude-opus-4-1\n",
+        encoding="utf-8",
+    )
+    repo_root = tmp_path / "repo"
+    _repo_with_config(repo_root, "reviewer:\n  model: claude-sonnet-5\n")
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
+
+    assert config.worker.model == "claude-opus-4-1"
+    assert config.reviewer.model == "claude-sonnet-5"
