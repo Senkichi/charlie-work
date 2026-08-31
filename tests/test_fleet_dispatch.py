@@ -1307,12 +1307,13 @@ def test_fleet_loop_real_unknown_config_key_reproduces_incident(
     The original incident's exact shape was an unknown key inside
     ``cross_family:`` (``cross_family: auto_verdict`` under a version-skew
     binary that didn't yet recognize it). The role-config Phase 2 cleanup
-    made a bare ``cross_family:`` section dual-accept -- deprecated, but no
-    longer a parse error regardless of its inner keys (see
-    ``config._DEPRECATED_SECTIONS_WITHOUT_A_FIELD``) -- so that exact shape
-    no longer raises. This reproduces the same class of failure (an unknown
-    key inside a real config file) via a section that still validates its
-    keys (``labels``), driving the real, unmocked ``load_layered_config`` to
+    deleted the dual-accept section tolerance entirely, so a bare
+    ``cross_family:`` section is no longer specially tolerated -- it is
+    rejected as an unknown top-level section like any other bogus key, the
+    same as the original incident's exact shape would raise again today.
+    This reproduces the same class of failure (an unknown key inside a real
+    config file) via a section that has always validated its own keys
+    (``labels``), driving the real, unmocked ``load_layered_config`` to
     raise ``ConfigError``. This proves: (a) an events.db row is recorded
     for the failing repo (queryable via query_events(kind=
     "fleet_pass_config_error")), (b) the fleet digest carries a matching

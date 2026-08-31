@@ -43,7 +43,7 @@ from .config import (
     CLAUDE_CODE_PROMPT_FILENAME,
     ClaudeCodeConfig,
     OrchestratorConfig,
-    ReviewDispatchConfig,
+    ReviewerRoleConfig,
     _DEFAULT_CLAUDE_MODEL,
 )
 from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
@@ -863,29 +863,40 @@ def _review_effort_arm(pr_number: int, fraction: float, salt: str) -> bool:
 
 def resolve_review_effort(
     pr_number: int,
-    review_dispatch: ReviewDispatchConfig,
+    reviewer: ReviewerRoleConfig,
     claude_code: ClaudeCodeConfig,
 ) -> tuple[str, str | None]:
     """Resolve the ``--effort`` string for a reviewer session, plus which
-    review_effort_experiment arm (if any) the PR was assigned to.
+    effort_experiment arm (if any) the PR was assigned to.
 
     Returns ``(effort, arm)``:
-      - When ``review_dispatch.review_effort_experiment_fraction <= 0.0``
-        (the default), the experiment is disabled: ``arm`` is ``None`` and
-        ``effort`` is ``review_dispatch.review_effort`` when set, else
-        ``claude_code.effort`` — exactly the pre-experiment behavior.
+      - When ``reviewer.effort_experiment_fraction <= 0.0`` (the default),
+        the experiment is disabled: ``arm`` is ``None`` and ``effort`` is
+        ``reviewer.effort`` when set, else ``claude_code.effort`` — exactly
+        the pre-experiment behavior.
       - Otherwise, ``arm`` is ``"treatment"`` or ``"control"`` per
-        ``_review_effort_arm``, and ``effort`` is ``review_dispatch.review_effort``
-        for treatment or ``claude_code.effort`` for control.
+        ``_review_effort_arm``, and ``effort`` is ``reviewer.effort`` for
+        treatment or ``claude_code.effort`` for control.
 
     Only meaningful for reviewer (``review=True``) launches; callers must
     gate on that themselves (worker launches always use ``claude_code.effort``).
+
+    Reads ``reviewer.*`` (``ReviewerRoleConfig``) exclusively -- the legacy
+    ``review_dispatch.review_effort``/``review_effort_experiment_fraction``/
+    ``review_effort_experiment_salt`` fields these mirrored under role-config
+    Phase 1's dual-accept bridge were deleted whole in Phase 2 (Track E), the
+    same deletion that removed the bridge itself. There is no fallback to a
+    ``review_dispatch`` value here for the same reason ``devin.adapter`` was
+    deleted rather than silently ignored: an old key that's still read halfway
+    is worse than one that errors loudly at load (config.py's ``_build_section``
+    already rejects any surviving ``review_dispatch.review_effort*`` key as
+    unknown before this function ever runs).
     """
-    fraction = review_dispatch.review_effort_experiment_fraction
+    fraction = reviewer.effort_experiment_fraction
     if fraction <= 0.0:
-        return (review_dispatch.review_effort or claude_code.effort, None)
-    if _review_effort_arm(pr_number, fraction, review_dispatch.review_effort_experiment_salt):
-        return (review_dispatch.review_effort, "treatment")
+        return (reviewer.effort or claude_code.effort, None)
+    if _review_effort_arm(pr_number, fraction, reviewer.effort_experiment_salt):
+        return (reviewer.effort, "treatment")
     return (claude_code.effort, "control")
 
 
@@ -1138,7 +1149,7 @@ def launch_claude_worker(
             resolved_review_effort
             if resolved_review_effort is not None
             else resolve_review_effort(
-                issue_number, resolved_config.review_dispatch, resolved_config.claude_code
+                issue_number, resolved_config.reviewer, resolved_config.claude_code
             )[0]
         )
     else:

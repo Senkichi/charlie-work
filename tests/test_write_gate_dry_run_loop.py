@@ -118,6 +118,7 @@ from charlie_work.config import (
     MainCiReclaimConfig,
     OrchestratorConfig,
     ReconcilePassConfig,
+    WorkerRoleConfig,
     WorktreeReclamationConfig,
 )
 from charlie_work.devin_shell import SessionRecord
@@ -129,18 +130,12 @@ from charlie_work.workflow import OrchestratorApp
 
 def _build_app(root: Path, *, dry_run: bool) -> tuple[OrchestratorApp, Any]:
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
-        # See the module docstring: these four are cadence-gated lanes with
-        # their own, separately tracked always-emit-on-due-pass behavior
-        # that the wave's clusters never converted. quota_probe is
-        # deliberately left enabled -- see the docstring.
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
         deescalation=DeescalationConfig(enabled=False),
         worktree_reclamation=WorktreeReclamationConfig(enabled=False),
         main_ci_reclaim=MainCiReclaimConfig(enabled=False),
         reconcile_pass=ReconcilePassConfig(enabled=False),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(root, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)

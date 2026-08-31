@@ -1,7 +1,7 @@
 {
   "scripts/backfill_stale_rework_briefs.py": 1000,
   "scripts/heartbeat_check.py": 3000,
-  "src/charlie_work/claude_code.py": 1800,
+  "src/charlie_work/claude_code.py": 2000,
   "src/charlie_work/cli.py": 3000,
   "src/charlie_work/config.py": 4200,
   "src/charlie_work/cross_family.py": 1000,

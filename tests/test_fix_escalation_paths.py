@@ -1057,14 +1057,11 @@ def _closed_pr_app(tmp_path: Path) -> tuple[OrchestratorApp, FakeGitHub]:
     test_dispatch_failed_retries_are_capped_and_escalate in test_charlie_work.py)."""
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
         # Role-config Phase 1.5: the manual-adapter manifest-writing branch
-        # in _dispatch_impl reads worker.harness, not devin.adapter. Direct
-        # OrchestratorConfig construction bypasses the dual-accept sync
-        # build_config_from_data would otherwise perform, so worker.harness
-        # must be set to match.
+        # in _dispatch_impl reads worker.harness, so it must be set to
+        # "command" to match the devin.dispatch_command above.
         worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
