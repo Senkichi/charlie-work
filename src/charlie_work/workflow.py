@@ -665,7 +665,11 @@ def render_over_cap_section(findings: tuple[OverCapFileFinding, ...] | None) -> 
             f"(cap {finding.cap}), +{finding.added_lines} added -- "
             "REPORTABLE FINDING. Suggested remedy: extract the new code to a "
             "domain module (facade re-export block in the monolith, "
-            "implementation in the module), matching the #1283-era extractions."
+            "implementation in the module), matching the #1283-era extractions. "
+            "Then run `python scripts/refresh_file_size_ratchet.py` and commit "
+            "the resulting `file_size_ratchet_baseline.json` tightening in this "
+            "PR -- the script's default mode is lower-only (never raises a "
+            "mark), so it is safe to run mid-PR (#1495)."
         )
     return "\n".join(lines) + "\n"
 
