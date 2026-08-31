@@ -18,6 +18,7 @@ from charlie_work.config import (
     OrchestratorConfig,
     PostMortemConfig,
     WatchdogConfig,
+    WorkerRoleConfig,
 )
 from charlie_work.devin_shell import (
     SessionRecord,
@@ -811,6 +812,7 @@ def test_workflow_classify_dead_sessions_reaps_sidecar(tmp_path: Path) -> None:
         DevinConfig,
         OrchestratorConfig,
         WatchdogConfig,
+        WorkerRoleConfig,
     )
     from charlie_work.devin_shell import SessionRecord
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
@@ -822,19 +824,9 @@ def test_workflow_classify_dead_sessions_reaps_sidecar(tmp_path: Path) -> None:
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
-        # Issue #343: the dead-session lane now corroborates a not-alive pid
-        # against real-session activity before reaping (never fail-open on a
-        # merely-inconclusive probe). This test's concern is the reap-on-dead
-        # mechanics (issue #113), not corroboration timing, so pin the
-        # deferral cap to 0 to keep its original immediate-reap assertion --
-        # a bare test environment with no real sessions.db always produces an
-        # inconclusive probe, which would otherwise defer for
-        # max_inconclusive_probe_deferrals passes before reaping.
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=0),
+        worker=WorkerRoleConfig(harness="command"),
     )
 
     # Create a sessions directory with a dead session
@@ -932,12 +924,9 @@ def test_workflow_classify_dead_sessions_reaps_probe_error_sidecar(
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
-        # Cap at 1 so the test reaches the reap in two passes.
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=1),
+        worker=WorkerRoleConfig(harness="command"),
     )
 
     sessions_dir = tmp_path / "sessions"
@@ -1206,13 +1195,9 @@ def test_workflow_classify_dead_sessions_completed_skips_log_tail_throttle(
         auto_merge=AutoMergeConfig(
             required_checks=("Tests passed", "Lint & Format", "Pre-commit")
         ),
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
-        ),
-        # pid=None skips the corroboration/deferral lane entirely, so the
-        # deferral cap is irrelevant here; pin it for determinism anyway.
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=0),
+        worker=WorkerRoleConfig(harness="command"),
     )
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)

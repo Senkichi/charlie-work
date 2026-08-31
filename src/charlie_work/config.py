@@ -704,37 +704,6 @@ class ReviewDispatchConfig:
     # include the full diff guidance). 500 lines is ~12K tokens, a reasonable
     # single-read budget; beyond that the reviewer should read file-by-file.
     diff_line_threshold: int = 500
-    # Effort level pinned via --effort on reviewer session launches. Empty
-    # string means fall back to claude_code.effort (the worker/reviewer
-    # default). Its MEANING depends on review_effort_experiment_fraction below:
-    #   - fraction == 0.0 (default, experiment disabled): review_effort, when
-    #     set, applies to ALL reviewer launches unconditionally — exactly the
-    #     pre-experiment behavior. This is the "just pin reviewer effort"
-    #     knob with no A/B semantics.
-    #   - fraction in (0.0, 1.0]: review_effort becomes the TREATMENT arm's
-    #     effort, applied only to the assigned fraction of PRs (see
-    #     claude_code._review_effort_arm / resolve_review_effort). The
-    #     remaining PRs (control) fall back to claude_code.effort as if
-    #     review_effort were unset. This lets the A/B be compared via the
-    #     per-review session telemetry (review_session_metrics /
-    #     review_effort_arm on record_review) without confounding from
-    #     concurrent pipeline changes (time-windowed A/B was replaced by this
-    #     per-PR randomized assignment for exactly that reason).
-    review_effort: str = ""
-    # Fraction (0.0-1.0) of PRs randomly (but deterministically, see
-    # claude_code._review_effort_arm) assigned to the review_effort
-    # "treatment" arm. 0.0 (default) disables the experiment: review_effort
-    # applies to every review when set, same as before this field existed.
-    # Assignment is a stateless hash of the PR number (+ salt below), so the
-    # same PR always lands in the same arm across rework rounds/re-dispatches
-    # — arm-hopping across rounds would contaminate the per-PR quality
-    # signal the experiment is trying to measure.
-    review_effort_experiment_fraction: float = 0.0
-    # Mixed into the per-PR assignment hash alongside the PR number. Change
-    # this to re-randomize arm assignment for a new experiment epoch (e.g.
-    # after a config change invalidates the current cohort) without needing
-    # to rename or remove the fraction field.
-    review_effort_experiment_salt: str = ""
     # Issue #1439: structure-aware reviewer turn cap. The flat
     # ``review_max_turns`` budget ignores the size of the files a diff touches,
     # so a PR threading a monolith (e.g. workflow.py at ~25k lines) burns the
@@ -1149,21 +1118,15 @@ class RuntimeConfig:
 
 
 # Shared default for every Claude Code model field this refactor touches
-# (ClaudeCodeConfig.model, ReviewerRoleConfig.model, and the claude-code
-# branch of _resolve_role_dual_accept's worker.model resolution) so the
-# three cannot silently drift apart -- CLAUDE.md's "no hardcoded lists"
-# rule applied to a scalar default instead of a list.
+# (ReviewerRoleConfig.model, and claude_code.py's read-site fallback for an
+# empty worker/reviewer model pin) so they cannot silently drift apart --
+# CLAUDE.md's "no hardcoded lists" rule applied to a scalar default instead
+# of a list.
 _DEFAULT_CLAUDE_MODEL: str = "claude-sonnet-5"
 
 
 @dataclass(frozen=True)
 class DevinConfig:
-    # "manual" writes a session manifest for the operator; "command" runs a
-    # blocking dispatch_command per issue; "devin-shell" launches headless
-    # `devin` CLI sessions non-blocking with sidecar tracking (devin_shell.py);
-    # "claude-code" launches Claude Code workers in isolated git worktrees
-    # (claude_code.py, configured under the claude_code section).
-    adapter: str = "manual"
     # Empty string means "derive from runtime.state_dir" (layout.py's
     # session_manifest_default/session_results_default) rather than a fixed
     # literal -- see paths.resolved_layout, the single place that resolves
@@ -1208,18 +1171,20 @@ class DevinConfig:
 
 @dataclass(frozen=True)
 class ClaudeCodeConfig:
-    """Settings for the claude-code worker adapter (devin.adapter: claude-code)."""
+    """Settings for the claude-code worker/reviewer harness (worker.harness:
+    claude-code / reviewer.harness: claude-code). The model launched under
+    this harness is ``worker.model``/``reviewer.model`` -- see
+    ``WorkerRoleConfig``/``ReviewerRoleConfig`` -- not a field here; every
+    worker/reviewer launch pins ``--model`` explicitly from the resolved
+    role config (claude_code._apply_model_pin), falling back to
+    ``_DEFAULT_CLAUDE_MODEL`` only when the role's own model is unset. This
+    keeps a single source of truth instead of an ambient `claude` CLI
+    session's last `/model` choice leaking into headless fleet dispatch
+    (2026-07-22 outage: exactly that leak stalled every PR review fleet-wide
+    with zero backoff signal since the error didn't match the
+    quota-exhaustion classifier).
+    """
 
-    # Every worker/reviewer launch pins this explicitly via `--model` — see
-    # claude_code._apply_model_pin. Without an explicit pin, the spawned
-    # `claude` CLI subprocess falls back to whatever model an interactive
-    # session on this machine last set globally (e.g. via `/model`), which
-    # is never guaranteed to be available/affordable for headless fleet
-    # dispatch (2026-07-22 outage: an operator session's `/model` choice of
-    # a premium tier silently propagated to every reviewer launch and hit a
-    # credits wall, stalling every PR review fleet-wide with zero backoff
-    # signal since the error didn't match the quota-exhaustion classifier).
-    model: str = _DEFAULT_CLAUDE_MODEL
     # Effort level pinned via ``--effort`` on every worker/reviewer launch —
     # see claude_code._apply_effort_pin. Empty string means no pin (the CLI
     # uses its default effort). Mirrors the model pin: prevents ambient CLI
@@ -1379,20 +1344,20 @@ class WorkerRoleConfig:
     """The designated worker: which harness dispatches fresh/rework issues,
     and which model that harness should use.
 
-    Phase 1 of the role-config refactor (issue TBD): dual-accept alongside
-    the legacy ``devin.adapter``/``devin.worker_model``/``claude_code.model``
-    fields -- see ``_resolve_role_dual_accept`` below for the exact mapping
-    and conflict rules. ``harness`` mirrors ``DevinConfig.adapter``'s legal
-    values (``devin-shell`` | ``claude-code`` | ``api`` | ``command`` |
-    ``manual``). ``model`` is harness-specific: empty string means "let the
-    harness's own default apply" for every harness except ``claude-code``,
-    which defaults to ``_DEFAULT_CLAUDE_MODEL`` (matching
-    ``ClaudeCodeConfig.model``'s own default, since a claude-code worker
-    launch with no override reads that field directly).
+    ``harness`` must be one of ``_VALID_WORKER_HARNESSES`` (``devin-shell`` |
+    ``claude-code`` | ``api`` | ``command`` | ``manual``) -- enforced at the
+    top-level ``worker:`` build site in ``build_config_from_data``, not here
+    in ``__post_init__``, because this same dataclass is reused for
+    ``rescue.worker``/``rescue.reviewer``, and ``rescue.reviewer``'s own
+    documented default harness (``"devin"``) is not a member of that
+    frozenset -- a blanket per-instance check would reject that reuse's own
+    defaults. ``model`` is harness-specific: empty string means "let the
+    harness's own default apply"; ``claude_code.py``'s launch call sites fall
+    back to ``_DEFAULT_CLAUDE_MODEL`` when the resolved worker/reviewer model
+    is empty and the harness is claude-code.
 
-    Kept intentionally minimal in Phase 1 (just harness + model). The design
-    spec's example config leaves room for future harness-specific per-role
-    knobs; adding those is explicitly out of this phase's scope.
+    Kept intentionally minimal (just harness + model). The design spec's
+    example config leaves room for future harness-specific per-role knobs.
     """
 
     harness: str = "manual"
@@ -1402,19 +1367,16 @@ class WorkerRoleConfig:
 @dataclass(frozen=True)
 class ReviewerRoleConfig:
     """The designated reviewer: which harness launches PR review sessions,
-    which model it uses, and the review-effort A/B experiment knobs
-    (relocated from ``ReviewDispatchConfig`` -- issue TBD).
-
-    Phase 1 of the role-config refactor: dual-accept alongside
-    ``claude_code.model`` (as the reviewer's model) and
-    ``review_dispatch.review_effort``/``.review_effort_experiment_fraction``/
-    ``.review_effort_experiment_salt`` -- see ``_resolve_role_dual_accept``.
+    which model it uses, and the review-effort A/B experiment knobs.
 
     ``harness`` currently only accepts ``"claude-code"``; any other value is
-    rejected with ``ConfigError`` at load (the design spec's Phase-1
-    constraint). The field exists, rather than the reviewer harness being
-    implicit, so a future non-claude-code reviewer can be added by relaxing
-    this one check.
+    rejected with ``ConfigError`` at load (see ``__post_init__`` -- issue
+    #1513). This dataclass is used exclusively for the single top-level
+    ``config.reviewer`` role (unlike ``WorkerRoleConfig``, which is also
+    reused for ``rescue.worker``/``rescue.reviewer``), so a blanket
+    per-instance check here has no conflicting reuse to worry about. The
+    field exists, rather than the reviewer harness being implicit, so a
+    future non-claude-code reviewer can be added by relaxing this one check.
     """
 
     harness: str = "claude-code"
@@ -1422,6 +1384,49 @@ class ReviewerRoleConfig:
     effort: str = ""
     effort_experiment_fraction: float = 0.0
     effort_experiment_salt: str = ""
+
+    def __post_init__(self) -> None:
+        if self.harness != "claude-code":
+            raise ConfigError(
+                "config section 'reviewer' key 'harness' only supports "
+                f"'claude-code'; got {self.harness!r}"
+            )
+        if not isinstance(self.effort, str):
+            raise ConfigError(
+                "config section 'reviewer' key 'effort' must be a string, "
+                f"got {type(self.effort).__name__}"
+            )
+        fraction = self.effort_experiment_fraction
+        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+            raise ConfigError(
+                "config section 'reviewer' key 'effort_experiment_fraction' must be a "
+                f"number, got {type(fraction).__name__}"
+            )
+        if not (0.0 <= fraction <= 1.0):
+            raise ConfigError(
+                "config section 'reviewer' key 'effort_experiment_fraction' must be in "
+                f"[0.0, 1.0], got {fraction}"
+            )
+        if not isinstance(self.effort_experiment_salt, str):
+            raise ConfigError(
+                "config section 'reviewer' key 'effort_experiment_salt' must be a string, "
+                f"got {type(self.effort_experiment_salt).__name__}"
+            )
+        # Cross-field check: a fraction > 0.0 enables the experiment, whose
+        # treatment arm IS effort verbatim (resolve_review_effort returns it
+        # unmodified). Enabling the experiment without a treatment effort
+        # would silently make "treatment" mean "no --effort pin at all" while
+        # "control" still gets claude_code.effort -- a corrupted, undocumented
+        # comparison that would run for the life of the experiment with no
+        # warning. Fail loud at load instead. (Relocated from the deleted
+        # review_dispatch.review_effort_experiment_fraction cross-field check
+        # -- role-config Phase 2 Track E.)
+        if fraction > 0.0 and not self.effort:
+            raise ConfigError(
+                "config section 'reviewer': 'effort_experiment_fraction' is "
+                f"{fraction} but 'effort' is unset -- set 'effort' to the treatment "
+                "effort string (e.g. 'high') before enabling the experiment"
+            )
 
 
 @dataclass(frozen=True)
@@ -1443,11 +1448,12 @@ class RescueConfig:
 
     The rescue rework reuses the existing claude-code rework-dispatch path
     (``_dispatch_rework_impl`` → ``adapters.dispatch_sessions`` →
-    ``claude_code.launch_claude_worker``) with ``claude_code.model``
-    overridden to ``worker_model`` for that one dispatch — never a parallel
-    launch path. ``worker_adapter`` is currently always ``"claude-code"``;
-    kept as an explicit field so a future adapter can be wired in by config
-    alone, matching the spec's named knobs.
+    ``claude_code.launch_claude_worker``) with ``worker.model`` overridden
+    to ``worker_model`` for that one dispatch (see
+    ``Workflow._rescue_adapter_settings``) — never a parallel launch path.
+    ``worker_adapter`` is currently always ``"claude-code"``; kept as an
+    explicit field so a future adapter can be wired in by config alone,
+    matching the spec's named knobs.
 
     The rescue review reuses ``rescue_review.run_cross_family_review`` (the
     existing blocking, one-shot cross-family invocation) rather than a new
@@ -1455,12 +1461,17 @@ class RescueConfig:
     Devin CLI invocation shape; override it only if the rescue tier's
     reviewer harness differs from that default.
 
-    Phase 1 of the role-config refactor: ``worker``/``reviewer`` below are
-    dual-accept equivalents of ``worker_adapter``/``worker_model`` and
-    ``reviewer_adapter``/``reviewer_model`` above -- see
-    ``_resolve_role_dual_accept``. Both reuse ``WorkerRoleConfig`` (not
-    ``ReviewerRoleConfig``): the rescue reviewer legitimately defaults to a
-    non-claude-code harness (``"devin"``/``"codex"``) and launches through
+    ``worker``/``reviewer`` below are ``WorkerRoleConfig``-typed nested
+    equivalents of ``worker_adapter``/``worker_model`` and
+    ``reviewer_adapter``/``reviewer_model`` above, parsed directly from
+    ``rescue.worker:``/``rescue.reviewer:`` YAML sections. They are not
+    synced with the flat fields above -- there was a role-config Phase 1
+    dual-accept bridge between the two representations, deleted whole in
+    Phase 2 (Track E) since neither ``src/`` nor any test fixture reads
+    these nested fields; the flat fields remain the only ones consumed at
+    runtime. Both reuse ``WorkerRoleConfig`` (not ``ReviewerRoleConfig``):
+    the rescue reviewer legitimately defaults to a non-claude-code harness
+    (``"devin"``/``"codex"``) and launches through
     ``rescue_review.run_cross_family_review``, never
     ``claude_code.launch_claude_worker`` -- so ``ReviewerRoleConfig``'s
     claude-code-only harness restriction and its effort/experiment fields
@@ -1989,16 +2000,6 @@ class OrchestratorConfig:
     # the same config whether they came from one file, two, or none.
     sources: tuple[str, ...] = field(default=(), compare=False, metadata={"provenance": True})
 
-    # Phase 1 of the role-config refactor (issue TBD): human-readable
-    # deprecation warnings for every legacy key build_config_from_data found
-    # present while resolving the worker/reviewer dual-accept mapping (see
-    # _resolve_role_dual_accept). Populated only by build_config_from_data --
-    # a directly-constructed OrchestratorConfig() always has this at its
-    # empty default, exactly like ``sources`` above and for the same reason:
-    # ``metadata={"provenance": True}`` keeps a config file from declaring
-    # its own deprecation list.
-    deprecations: tuple[str, ...] = field(default=(), compare=False, metadata={"provenance": True})
-
 
 def find_config_path(repo_root: Path, explicit: Path | None = None) -> Path | None:
     """Resolve the config file: an explicit path wins; otherwise the consumer
@@ -2034,459 +2035,6 @@ _VALID_WORKER_HARNESSES: frozenset[str] = frozenset(
 )
 
 
-def _role_section(data: dict[str, Any], key: str) -> dict[str, Any]:
-    """Like ``_section``, but inserts the coerced dict back into ``data`` so a
-    later ``_section(data, key)`` call (and ``_build_section``) observes any
-    values written into this function's return value. ``_section`` deliberately
-    does NOT do this insertion -- many of its callers want a read-only peek at
-    a section that may not exist without creating one. This is a distinct
-    helper for ``_resolve_role_dual_accept``, which must write into a section
-    that may be entirely absent from an old-style config (e.g. no ``worker:``
-    block at all) and have that write actually reach the section's own later
-    ``_build_section`` call further down in ``build_config_from_data``.
-    """
-    value = data.get(key)
-    if not isinstance(value, dict):
-        value = {}
-    data[key] = value
-    return value
-
-
-def _resolve_dual_accept(
-    *,
-    old_present: bool,
-    old_value: Any,
-    old_label: str,
-    new_present: bool,
-    new_value: Any,
-    new_label: str,
-    default: Any,
-) -> tuple[Any, bool]:
-    """Resolve one (old_key, new_key) config pair to a single effective value.
-
-    Returns ``(effective_value, deprecated)``. ``deprecated`` is True whenever
-    the old key is present at all, whether or not it was the one used to
-    resolve the value -- co-presence with an agreeing new-key value is still
-    a signal the operator has not migrated that key yet.
-
-    Raises ``ConfigError`` when both keys are present with disagreeing
-    values: silently preferring one during the Phase 1 dual-accept window
-    would let a config say two different things and run whichever one nobody
-    was looking at.
-    """
-    if old_present and new_present and old_value != new_value:
-        raise ConfigError(
-            f"config conflict: '{old_label}' = {old_value!r} but '{new_label}' = "
-            f"{new_value!r} -- these must agree during the Phase 1 role-config "
-            "dual-accept window (unset one, or set them to the same value)"
-        )
-    if new_present:
-        return new_value, old_present
-    if old_present:
-        return old_value, True
-    return default, False
-
-
-def _resolve_role_dual_accept(data: dict[str, Any]) -> list[str]:
-    """Resolve the worker/reviewer role dual-accept mapping in place on
-    ``data`` (Phase 1 of the role-config refactor, issue TBD).
-
-    For every (old_key, new_key) pair this function covers, it computes one
-    effective value, raises ``ConfigError`` on disagreement, and writes the
-    effective value into BOTH the old key's location and the new key's
-    location in ``data`` -- so every existing call site reading a legacy
-    field (``config.devin.adapter``, ``config.claude_code.model``, ...) and
-    every new call site reading a role field (``config.worker.harness``,
-    ``config.reviewer.model``, ...) observe the same effective config,
-    regardless of which one the operator actually set.
-
-    Must run immediately after the top-level unknown-section check in
-    ``build_config_from_data``, before any ``_section``/``_build_section``
-    call for a section this function touches (``dispatch``,
-    ``review_dispatch``, ``devin``, ``claude_code``, ``api_worker``,
-    ``cross_family``, ``rescue``, ``worker``, ``reviewer``) -- ``_section``
-    itself does not persist a coerced empty-dict default back into ``data``,
-    so a write into its return value for an absent section would otherwise
-    be silently lost; ``_role_section`` (used throughout this function)
-    exists specifically to avoid that.
-
-    Returns the list of human-readable deprecation messages for every
-    deprecated legacy key found present. Callers attach this list (as a
-    tuple) to ``OrchestratorConfig.deprecations``.
-    """
-    deprecations: list[str] = []
-
-    devin_raw = _role_section(data, "devin")
-    claude_code_raw = _role_section(data, "claude_code")
-    worker_raw = _role_section(data, "worker")
-
-    # === worker.harness <- devin.adapter ===
-    effective_harness, harness_deprecated = _resolve_dual_accept(
-        old_present="adapter" in devin_raw,
-        old_value=devin_raw.get("adapter"),
-        old_label="devin.adapter",
-        new_present="harness" in worker_raw,
-        new_value=worker_raw.get("harness"),
-        new_label="worker.harness",
-        default="manual",
-    )
-    if not isinstance(effective_harness, str):
-        raise ConfigError(
-            "config section 'worker' key 'harness' must be a string, "
-            f"got {type(effective_harness).__name__}"
-        )
-    if effective_harness not in _VALID_WORKER_HARNESSES:
-        raise ConfigError(
-            "config section 'worker' key 'harness' must be one of "
-            f"{sorted(_VALID_WORKER_HARNESSES)}, got {effective_harness!r}"
-        )
-    devin_raw["adapter"] = effective_harness
-    worker_raw["harness"] = effective_harness
-    if harness_deprecated:
-        deprecations.append(
-            "devin.adapter is deprecated; set worker.harness instead "
-            f"(effective value: {effective_harness!r})"
-        )
-
-    # === worker.model <- devin.worker_model / claude_code.model ===
-    # claude_code.model has historically served two roles at once: the
-    # worker's model (only when devin.adapter == "claude-code") and the
-    # reviewer's model (always -- dispatch_reviews() launches every reviewer
-    # via claude-code regardless of the worker's adapter and, before this
-    # refactor, never passed model_override, so it fell back to
-    # claude_code.model unconditionally -- see claude_code.py:1112-1114).
-    # Here, worker.model's OLD source is harness-conditional: claude_code
-    # .model when the worker's own harness is claude-code (matching today's
-    # actual worker-launch behavior), else devin.worker_model (which has no
-    # other claimant). Task 4 resolves reviewer.model separately and, in the
-    # claude-code branch, treats claude_code.model as already claimed here
-    # rather than re-checking it for conflicts against reviewer.model.
-    if effective_harness == "claude-code":
-        worker_model_old_present = "model" in claude_code_raw
-        worker_model_old_value = claude_code_raw.get("model")
-        worker_model_old_label = "claude_code.model (as worker)"
-        worker_model_default = _DEFAULT_CLAUDE_MODEL
-    else:
-        worker_model_old_present = "worker_model" in devin_raw
-        worker_model_old_value = devin_raw.get("worker_model")
-        worker_model_old_label = "devin.worker_model"
-        worker_model_default = ""
-
-    effective_worker_model, worker_model_deprecated = _resolve_dual_accept(
-        old_present=worker_model_old_present,
-        old_value=worker_model_old_value,
-        old_label=worker_model_old_label,
-        new_present="model" in worker_raw,
-        new_value=worker_raw.get("model"),
-        new_label="worker.model",
-        default=worker_model_default,
-    )
-    if not isinstance(effective_worker_model, str):
-        raise ConfigError(
-            "config section 'worker' key 'model' must be a string, "
-            f"got {type(effective_worker_model).__name__}"
-        )
-    worker_raw["model"] = effective_worker_model
-    if effective_harness == "claude-code":
-        claude_code_raw["model"] = effective_worker_model
-    else:
-        devin_raw["worker_model"] = effective_worker_model
-    if worker_model_deprecated:
-        if effective_harness == "claude-code":
-            deprecations.append(
-                "claude_code.model is deprecated; set worker.model instead "
-                f"(effective worker value: {effective_worker_model!r}) -- and set "
-                "reviewer.model too if the reviewer should use a different model"
-            )
-        else:
-            deprecations.append(
-                f"{worker_model_old_label} is deprecated; set worker.model instead "
-                f"(effective value: {effective_worker_model!r})"
-            )
-
-    reviewer_raw = _role_section(data, "reviewer")
-    review_dispatch_raw = _role_section(data, "review_dispatch")
-    rescue_raw = _role_section(data, "rescue")
-    dispatch_raw = _role_section(data, "dispatch")
-    api_worker_raw = _role_section(data, "api_worker")
-    cross_family_raw = _role_section(data, "cross_family")
-
-    # === reviewer.harness (Phase 1: claude-code only) ===
-    effective_reviewer_harness = reviewer_raw.get("harness", "claude-code")
-    if not isinstance(effective_reviewer_harness, str):
-        raise ConfigError(
-            "config section 'reviewer' key 'harness' must be a string, "
-            f"got {type(effective_reviewer_harness).__name__}"
-        )
-    if effective_reviewer_harness != "claude-code":
-        raise ConfigError(
-            "config section 'reviewer' key 'harness' only supports 'claude-code' "
-            f"in Phase 1 of the role-config refactor; got {effective_reviewer_harness!r}"
-        )
-    reviewer_raw["harness"] = effective_reviewer_harness
-
-    # === reviewer.model <- claude_code.model ===
-    # claude_code.model is fully claimed by the worker above when
-    # effective_harness == "claude-code" (it is now the worker's resolved
-    # value, not an independent reviewer signal) -- so in that branch the
-    # reviewer simply inherits it by default (today's actual behavior: a
-    # review launch with no model_override falls back to claude_code.model)
-    # or is explicitly overridden by reviewer.model. It is never *conflicted*
-    # against claude_code.model in this branch: that is the split-worker-
-    # and-reviewer incremental migration path (old claude_code.model kept
-    # for the worker, new reviewer.model added to decouple the reviewer),
-    # not a contradiction.
-    #
-    # Only when effective_harness != "claude-code" is claude_code.model
-    # unclaimed by the worker (which sources from devin.worker_model
-    # instead) -- there it unambiguously means "old-style reviewer model"
-    # and IS dual-accept/conflict-checked against reviewer.model.
-    if effective_harness == "claude-code":
-        if "model" in reviewer_raw:
-            effective_reviewer_model = reviewer_raw["model"]
-        else:
-            effective_reviewer_model = effective_worker_model
-        reviewer_model_deprecated = False
-    else:
-        effective_reviewer_model, reviewer_model_deprecated = _resolve_dual_accept(
-            old_present="model" in claude_code_raw,
-            old_value=claude_code_raw.get("model"),
-            old_label="claude_code.model (as reviewer)",
-            new_present="model" in reviewer_raw,
-            new_value=reviewer_raw.get("model"),
-            new_label="reviewer.model",
-            default=_DEFAULT_CLAUDE_MODEL,
-        )
-    if not isinstance(effective_reviewer_model, str):
-        raise ConfigError(
-            "config section 'reviewer' key 'model' must be a string, "
-            f"got {type(effective_reviewer_model).__name__}"
-        )
-    reviewer_raw["model"] = effective_reviewer_model
-    if effective_harness != "claude-code":
-        claude_code_raw["model"] = effective_reviewer_model
-    if reviewer_model_deprecated:
-        deprecations.append(
-            "claude_code.model (as reviewer) is deprecated; set reviewer.model "
-            f"instead (effective value: {effective_reviewer_model!r})"
-        )
-
-    # === reviewer.effort / effort_experiment_fraction / effort_experiment_salt
-    # <- review_dispatch.review_effort / .review_effort_experiment_fraction /
-    # .review_effort_experiment_salt ===
-    role_effective_effort, effort_deprecated = _resolve_dual_accept(
-        old_present="review_effort" in review_dispatch_raw,
-        old_value=review_dispatch_raw.get("review_effort"),
-        old_label="review_dispatch.review_effort",
-        new_present="effort" in reviewer_raw,
-        new_value=reviewer_raw.get("effort"),
-        new_label="reviewer.effort",
-        default="",
-    )
-    role_effective_fraction, fraction_deprecated = _resolve_dual_accept(
-        old_present="review_effort_experiment_fraction" in review_dispatch_raw,
-        old_value=review_dispatch_raw.get("review_effort_experiment_fraction"),
-        old_label="review_dispatch.review_effort_experiment_fraction",
-        new_present="effort_experiment_fraction" in reviewer_raw,
-        new_value=reviewer_raw.get("effort_experiment_fraction"),
-        new_label="reviewer.effort_experiment_fraction",
-        default=0.0,
-    )
-    role_effective_salt, salt_deprecated = _resolve_dual_accept(
-        old_present="review_effort_experiment_salt" in review_dispatch_raw,
-        old_value=review_dispatch_raw.get("review_effort_experiment_salt"),
-        old_label="review_dispatch.review_effort_experiment_salt",
-        new_present="effort_experiment_salt" in reviewer_raw,
-        new_value=reviewer_raw.get("effort_experiment_salt"),
-        new_label="reviewer.effort_experiment_salt",
-        default="",
-    )
-    if role_effective_effort is not None and not isinstance(role_effective_effort, str):
-        raise ConfigError(
-            "config section 'reviewer' key 'effort' must be a string, "
-            f"got {type(role_effective_effort).__name__}"
-        )
-    if role_effective_fraction is not None and (
-        isinstance(role_effective_fraction, bool)
-        or not isinstance(role_effective_fraction, (int, float))
-    ):
-        raise ConfigError(
-            "config section 'reviewer' key 'effort_experiment_fraction' must be a "
-            f"number, got {type(role_effective_fraction).__name__}"
-        )
-    if role_effective_salt is not None and not isinstance(role_effective_salt, str):
-        raise ConfigError(
-            "config section 'reviewer' key 'effort_experiment_salt' must be a string, "
-            f"got {type(role_effective_salt).__name__}"
-        )
-    review_dispatch_raw["review_effort"] = role_effective_effort
-    review_dispatch_raw["review_effort_experiment_fraction"] = role_effective_fraction
-    review_dispatch_raw["review_effort_experiment_salt"] = role_effective_salt
-    reviewer_raw["effort"] = role_effective_effort
-    reviewer_raw["effort_experiment_fraction"] = role_effective_fraction
-    reviewer_raw["effort_experiment_salt"] = role_effective_salt
-    if effort_deprecated:
-        deprecations.append(
-            "review_dispatch.review_effort is deprecated; set reviewer.effort "
-            f"instead (effective value: {role_effective_effort!r})"
-        )
-    if fraction_deprecated:
-        deprecations.append(
-            "review_dispatch.review_effort_experiment_fraction is deprecated; set "
-            "reviewer.effort_experiment_fraction instead "
-            f"(effective value: {role_effective_fraction!r})"
-        )
-    if salt_deprecated:
-        deprecations.append(
-            "review_dispatch.review_effort_experiment_salt is deprecated; set "
-            "reviewer.effort_experiment_salt instead "
-            f"(effective value: {role_effective_salt!r})"
-        )
-
-    # === rescue.worker / rescue.reviewer <- rescue.worker_adapter/worker_model/
-    # reviewer_adapter/reviewer_model ===
-    rescue_worker_raw = rescue_raw.get("worker")
-    if not isinstance(rescue_worker_raw, dict):
-        rescue_worker_raw = {}
-    rescue_raw["worker"] = rescue_worker_raw
-    rescue_reviewer_raw = rescue_raw.get("reviewer")
-    if not isinstance(rescue_reviewer_raw, dict):
-        rescue_reviewer_raw = {}
-    rescue_raw["reviewer"] = rescue_reviewer_raw
-
-    effective_rescue_worker_harness, rw_h_dep = _resolve_dual_accept(
-        old_present="worker_adapter" in rescue_raw,
-        old_value=rescue_raw.get("worker_adapter"),
-        old_label="rescue.worker_adapter",
-        new_present="harness" in rescue_worker_raw,
-        new_value=rescue_worker_raw.get("harness"),
-        new_label="rescue.worker.harness",
-        default="claude-code",
-    )
-    effective_rescue_worker_model, rw_m_dep = _resolve_dual_accept(
-        old_present="worker_model" in rescue_raw,
-        old_value=rescue_raw.get("worker_model"),
-        old_label="rescue.worker_model",
-        new_present="model" in rescue_worker_raw,
-        new_value=rescue_worker_raw.get("model"),
-        new_label="rescue.worker.model",
-        default="claude-opus-4-1",
-    )
-    effective_rescue_reviewer_harness, rr_h_dep = _resolve_dual_accept(
-        old_present="reviewer_adapter" in rescue_raw,
-        old_value=rescue_raw.get("reviewer_adapter"),
-        old_label="rescue.reviewer_adapter",
-        new_present="harness" in rescue_reviewer_raw,
-        new_value=rescue_reviewer_raw.get("harness"),
-        new_label="rescue.reviewer.harness",
-        default="devin",
-    )
-    effective_rescue_reviewer_model, rr_m_dep = _resolve_dual_accept(
-        old_present="reviewer_model" in rescue_raw,
-        old_value=rescue_raw.get("reviewer_model"),
-        old_label="rescue.reviewer_model",
-        new_present="model" in rescue_reviewer_raw,
-        new_value=rescue_reviewer_raw.get("model"),
-        new_label="rescue.reviewer.model",
-        default="codex",
-    )
-    for rescue_role_label, rescue_role_value in (
-        ("rescue.worker.harness", effective_rescue_worker_harness),
-        ("rescue.worker.model", effective_rescue_worker_model),
-        ("rescue.reviewer.harness", effective_rescue_reviewer_harness),
-        ("rescue.reviewer.model", effective_rescue_reviewer_model),
-    ):
-        if not isinstance(rescue_role_value, str):
-            raise ConfigError(
-                f"config section '{rescue_role_label}' must be a string, "
-                f"got {type(rescue_role_value).__name__}"
-            )
-
-    rescue_raw["worker_adapter"] = effective_rescue_worker_harness
-    rescue_raw["worker_model"] = effective_rescue_worker_model
-    rescue_raw["reviewer_adapter"] = effective_rescue_reviewer_harness
-    rescue_raw["reviewer_model"] = effective_rescue_reviewer_model
-    rescue_worker_raw["harness"] = effective_rescue_worker_harness
-    rescue_worker_raw["model"] = effective_rescue_worker_model
-    rescue_reviewer_raw["harness"] = effective_rescue_reviewer_harness
-    rescue_reviewer_raw["model"] = effective_rescue_reviewer_model
-    for rescue_dep, rescue_msg in (
-        (
-            rw_h_dep,
-            "rescue.worker_adapter is deprecated; set rescue.worker.harness "
-            f"instead (effective value: {effective_rescue_worker_harness!r})",
-        ),
-        (
-            rw_m_dep,
-            "rescue.worker_model is deprecated; set rescue.worker.model "
-            f"instead (effective value: {effective_rescue_worker_model!r})",
-        ),
-        (
-            rr_h_dep,
-            "rescue.reviewer_adapter is deprecated; set rescue.reviewer.harness "
-            f"instead (effective value: {effective_rescue_reviewer_harness!r})",
-        ),
-        (
-            rr_m_dep,
-            "rescue.reviewer_model is deprecated; set rescue.reviewer.model "
-            f"instead (effective value: {effective_rescue_reviewer_model!r})",
-        ),
-    ):
-        if rescue_dep:
-            deprecations.append(rescue_msg)
-
-    # === value-only deprecation warnings (no structural mapping) ===
-    if "worker_model_tier" in dispatch_raw:
-        deprecations.append(
-            "dispatch.worker_model_tier is deprecated and no longer selects "
-            "anything; remove it (worker.model is now authoritative, currently "
-            f"{effective_worker_model!r})"
-        )
-    if "fallback_adapter" in api_worker_raw:
-        deprecations.append(
-            "api_worker.fallback_adapter is deprecated and no longer does "
-            "anything; per-issue adapter routing was removed in Phase 2 of "
-            "the role-config refactor and this key is no longer read"
-        )
-        # Phase 2 deleted ApiWorkerConfig.fallback_adapter outright (no
-        # renamed successor field), so _build_section's unknown-key check
-        # would otherwise turn a config that has not migrated yet into a
-        # hard ConfigError instead of a soft warning. Pop it from the same
-        # dict object _build_section validates later (api_worker_raw IS
-        # api_worker_data -- see _role_section's docstring) so the promise
-        # above ("no longer read") holds without breaking an unconverted
-        # config while dual-accept is still in effect (Track E deletes this
-        # whole apparatus last, once every config is expected to be clean).
-        api_worker_raw.pop("fallback_adapter", None)
-    if cross_family_raw:
-        emergent = effective_worker_model != effective_reviewer_model
-        deprecations.append(
-            "cross_family is deprecated; cross-family review is now emergent "
-            "from worker.model != reviewer.model (currently: "
-            f"worker={effective_worker_model!r} reviewer={effective_reviewer_model!r} "
-            f"-> cross-family: {'yes' if emergent else 'no'})"
-        )
-
-    return deprecations
-
-
-#: Top-level section names accepted for their deprecation-notice value alone
-#: -- role-config phase 2, track A deleted the ``OrchestratorConfig`` field
-#: (and the dataclass backing it) each of these named, but
-#: ``_resolve_role_dual_accept`` still reads the raw section from ``data`` to
-#: emit its "is deprecated" message for a config that has not migrated yet
-#: (the same promise ``api_worker.fallback_adapter`` gets via a narrower,
-#: key-level pop() a few lines above in that function). Without this, a
-#: config still carrying the section would hit the unknown-*section* check
-#: below before ever reaching that soft warning, turning it into a hard
-#: ConfigError instead. This set is temporary and, like the rest of the
-#: dual-accept apparatus it belongs to, goes away with Track E once every
-#: config is expected to be clean -- do not add a new entry here for a
-#: section that never had dual-accept deprecation wording; add the wording
-#: first, then the entry.
-_DEPRECATED_SECTIONS_WITHOUT_A_FIELD: frozenset[str] = frozenset({"cross_family"})
-
-
 def known_config_sections() -> frozenset[str]:
     """The section names ``load_config`` accepts at the top level.
 
@@ -2495,16 +2043,14 @@ def known_config_sections() -> frozenset[str]:
     its field is added. Provenance fields (see ``OrchestratorConfig.sources``)
     are excluded -- a config file must never be able to declare where it came
     from -- and that exclusion is keyed off field metadata rather than a name
-    so it cannot be forgotten for a future provenance field. Also includes
-    :data:`_DEPRECATED_SECTIONS_WITHOUT_A_FIELD` -- see its docstring.
+    so it cannot be forgotten for a future provenance field.
 
     Shared with :func:`charlie_work.global_config.load_layered_config`, which
     needs the same set to reject an unknown *section name* before its
     merge drops an empty-bodied one -- see issue #962.
     """
-    return (
-        frozenset(f.name for f in fields(OrchestratorConfig) if not f.metadata.get("provenance"))
-        | _DEPRECATED_SECTIONS_WITHOUT_A_FIELD
+    return frozenset(
+        f.name for f in fields(OrchestratorConfig) if not f.metadata.get("provenance")
     )
 
 
@@ -2540,7 +2086,6 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             f"unknown config section(s): {', '.join(unknown)} "
             f"(valid: {', '.join(sorted(known_sections))})"
         )
-    deprecations = _resolve_role_dual_accept(data)
     labels = _build_section(LabelConfig, "labels", _section(data, "labels"))
     dispatch_data = _section(data, "dispatch")
     materialize_dirs = dispatch_data.get("materialize_dirs")
@@ -2832,47 +2377,6 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             raise ConfigError(
                 f"config section 'review_dispatch' key '{_rd_key}' must be >= 0, got {_rd_val}"
             )
-    rd_effort = review_dispatch_data.get("review_effort")
-    if rd_effort is not None and not isinstance(rd_effort, str):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'review_effort' must be a string, "
-            f"got {type(rd_effort).__name__}"
-        )
-    rd_experiment_fraction = review_dispatch_data.get("review_effort_experiment_fraction")
-    if rd_experiment_fraction is not None and (
-        isinstance(rd_experiment_fraction, bool)
-        or not isinstance(rd_experiment_fraction, (int, float))
-    ):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'review_effort_experiment_fraction' "
-            f"must be a number, got {type(rd_experiment_fraction).__name__}"
-        )
-    if rd_experiment_fraction is not None and not (0.0 <= rd_experiment_fraction <= 1.0):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'review_effort_experiment_fraction' "
-            f"must be in [0.0, 1.0], got {rd_experiment_fraction}"
-        )
-    rd_experiment_salt = review_dispatch_data.get("review_effort_experiment_salt")
-    if rd_experiment_salt is not None and not isinstance(rd_experiment_salt, str):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'review_effort_experiment_salt' must be a "
-            f"string, got {type(rd_experiment_salt).__name__}"
-        )
-    # Cross-field check: a fraction > 0.0 enables the experiment, whose
-    # treatment arm IS review_effort verbatim (resolve_review_effort returns
-    # it unmodified). Enabling the experiment without a treatment effort
-    # would silently make "treatment" mean "no --effort pin at all" while
-    # "control" still gets claude_code.effort -- a corrupted, undocumented
-    # comparison that would run for the life of the experiment with no
-    # warning. Fail loud at load instead.
-    effective_fraction = rd_experiment_fraction if rd_experiment_fraction is not None else 0.0
-    effective_effort = rd_effort if rd_effort is not None else ""
-    if effective_fraction > 0.0 and not effective_effort:
-        raise ConfigError(
-            "config section 'review_dispatch': 'review_effort_experiment_fraction' is "
-            f"{effective_fraction} but 'review_effort' is unset -- set 'review_effort' to the "
-            "treatment effort string (e.g. 'high') before enabling the experiment"
-        )
     review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
     quota_probe_data = _section(data, "quota_probe")
     qp_enabled = quota_probe_data.get("enabled")
@@ -3606,16 +3110,46 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'rescue' key 'reviewer_timeout_seconds' must be >= 0, "
             f"got {rescue_timeout}"
         )
-    rescue_worker_data = rescue_data.get("worker", {})
-    if not isinstance(rescue_worker_data, dict):
-        rescue_worker_data = {}
-    rescue_data["worker"] = WorkerRoleConfig(**rescue_worker_data)
-    rescue_reviewer_data = rescue_data.get("reviewer", {})
-    if not isinstance(rescue_reviewer_data, dict):
-        rescue_reviewer_data = {}
-    rescue_data["reviewer"] = WorkerRoleConfig(**rescue_reviewer_data)
+    # Only construct (and thus override) rescue.worker/.reviewer when the
+    # section actually names that key. If it's absent, leave it out of
+    # rescue_data entirely so _build_section's cls(**data) below does NOT
+    # pass worker=/reviewer= at all -- letting RescueConfig's own
+    # field-level default_factory apply (harness="claude-code",
+    # model="claude-opus-4-1" for worker; harness="devin", model="codex"
+    # for reviewer). Unconditionally constructing a bare WorkerRoleConfig()
+    # here regardless of presence used to silently override those
+    # RescueConfig-specific defaults with WorkerRoleConfig's OWN bare
+    # defaults (harness="manual", model="") any time no rescue.worker/
+    # rescue.reviewer section was configured -- making a loaded (but
+    # rescue-section-absent) config disagree with a bare RescueConfig()
+    # Python construction, which several tests assert must be equivalent
+    # (test_config_provenance.py's "configured-off is indistinguishable
+    # from never-loaded" invariant). Caught during role-config Phase 2
+    # Track E test triage.
+    if "worker" in rescue_data:
+        rescue_worker_data = rescue_data.get("worker") or {}
+        if not isinstance(rescue_worker_data, dict):
+            rescue_worker_data = {}
+        rescue_data["worker"] = WorkerRoleConfig(**rescue_worker_data)
+    if "reviewer" in rescue_data:
+        rescue_reviewer_data = rescue_data.get("reviewer") or {}
+        if not isinstance(rescue_reviewer_data, dict):
+            rescue_reviewer_data = {}
+        rescue_data["reviewer"] = WorkerRoleConfig(**rescue_reviewer_data)
     rescue = _build_section(RescueConfig, "rescue", rescue_data)
     worker = _build_section(WorkerRoleConfig, "worker", _section(data, "worker"))
+    # Harness membership is enforced here, at the top-level worker build site,
+    # rather than in WorkerRoleConfig.__post_init__: the dataclass is reused
+    # for rescue.worker/rescue.reviewer above, and rescue.reviewer's own
+    # documented default harness ("devin") is not a member of
+    # _VALID_WORKER_HARNESSES -- a blanket per-instance check would reject
+    # that reuse's own defaults. This check only ever applies to the single
+    # top-level worker role.
+    if worker.harness not in _VALID_WORKER_HARNESSES:
+        raise ConfigError(
+            "config section 'worker' key 'harness' must be one of "
+            f"{sorted(_VALID_WORKER_HARNESSES)}, got {worker.harness!r}"
+        )
     reviewer = _build_section(ReviewerRoleConfig, "reviewer", _section(data, "reviewer"))
     watchdog_data = _section(data, "watchdog")
     terminal_error_markers = watchdog_data.get("terminal_error_markers")
@@ -4115,7 +3649,6 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         runner_capacity_escalation=runner_capacity_escalation,
         supervisor=supervisor,
         post_mortem=post_mortem,
-        deprecations=tuple(deprecations),
         # ``sources`` is left at its dataclass default here -- this function
         # only ever sees a dict, never a path. ``load_config`` below (and
         # ``load_layered_config``) are the ones that know what path(s) the

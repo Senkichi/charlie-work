@@ -675,7 +675,6 @@ def test_route_rework_candidate_to_review_does_not_flip_when_pr_closes_mid_pass(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
@@ -748,7 +747,8 @@ def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
     closed-unmerged issue-side reconcile handling.
     """
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

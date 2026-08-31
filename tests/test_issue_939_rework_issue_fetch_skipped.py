@@ -29,7 +29,6 @@ from _fakes_github import FakeGitHub
 def _make_app(tmp_path: Path, fake_gh: FakeGitHub, **kwargs) -> tuple[OrchestratorApp, object]:
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 "python",
                 "-c",
@@ -38,9 +37,8 @@ def _make_app(tmp_path: Path, fake_gh: FakeGitHub, **kwargs) -> tuple[Orchestrat
             ),
         ),
         # Role-config Phase 1.5: dispatch_rework's manual-adapter skip gate
-        # reads worker.harness, not devin.adapter. Direct OrchestratorConfig
-        # construction bypasses the dual-accept sync build_config_from_data
-        # would otherwise perform, so worker.harness must be set to match.
+        # reads worker.harness, so it must be set to "command" to match the
+        # devin.dispatch_command above.
         worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -199,7 +197,6 @@ def test_rework_issue_fetch_skipped_lock_busy_does_not_defer_healthy_candidate(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",

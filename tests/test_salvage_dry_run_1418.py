@@ -22,7 +22,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from _fakes_github import FakeGitHub
-from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig
+from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig, WorkerRoleConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
@@ -150,15 +150,15 @@ def test_reap_restore_rework_requested_salvage_threads_dry_run(tmp_path: Path) -
     run(["git", "branch", branch])
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
                 "import sys; print(sys.argv[1])",
                 "{issue_number}",
-            ),
+            )
         ),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+        worker=WorkerRoleConfig(harness="command"),
     )
     layout = resolved_layout(config, repo_root)
     wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
@@ -313,11 +313,9 @@ def test_salvage_rework_stranded_commits_threads_dry_run(tmp_path: Path) -> None
 
     run(["git", "branch", branch])
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+        worker=WorkerRoleConfig(harness="command"),
     )
     layout = resolved_layout(config, repo_root)
     wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
@@ -546,11 +544,9 @@ def test_salvage_rework_stranded_commits_dry_run_no_mock_end_to_end(
 
     run(["git", "branch", branch])
     config = OrchestratorConfig(
-        devin=DevinConfig(
-            adapter="command",
-            dispatch_command=(sys.executable, "-c", "print('ok')"),
-        ),
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
         watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+        worker=WorkerRoleConfig(harness="command"),
     )
     layout = resolved_layout(config, repo_root)
     wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
