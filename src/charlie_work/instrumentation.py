@@ -153,17 +153,6 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # failure — the operator must learn about it in minutes, not after the
         # redispatch cap drains. Error, like the other *_escalated kinds.
         "api_worker_provider_suspended": "error",
-        "cross_family_verdict_abandoned": "error",
-        # The head-SHA guard could not adjudicate, so no verdict is recorded on
-        # this pass. Since #1081 an unusable report is regenerated (bounded per
-        # head) rather than persisting forever, so this is normally transient --
-        # but the pass it fires on still ended a lane, and if regeneration keeps
-        # failing it is `cross_family_report_regen_exhausted` that terminates.
-        "cross_family_verdict_head_indeterminate": "error",
-        # Regeneration budget for one PR head is spent and the report is still
-        # unusable: escalated to a human rather than approved on an unconfirmed
-        # head. Terminal for this lane -> error.
-        "cross_family_report_regen_exhausted": "error",
         "dispatch_blocked_chain_dead": "error",
         # Issue #1010: the pre-flight cross-repo gate escalated an issue whose
         # referenced file paths were all absent from the target repo, ending
@@ -259,20 +248,6 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # substrate for the 2-week false-positive measurement window before
         # any promotion to a hard gate is considered.
         "coverage_probe_flagged": "warning",
-        "cross_family_verdict_unparseable": "warning",
-        # The packet was forced stale so an unusable cross-family report gets
-        # regenerated. The lane recovers, but it needed repair to get there and
-        # a repeating burst on one PR is the signature of a model outage.
-        "cross_family_report_regen_forced": "warning",
-        # review() was forced to run to regenerate an unusable cross-family
-        # report and returned before ever reaching the regenerator -- almost
-        # always the janitor gate declining a PR with merge conflicts or missing
-        # checks. Warning, not error: the PR has a real upstream problem that
-        # its own gate already reported, and this bound only stops the fleet
-        # from re-entering review() for it forever. Before #1099 this decline
-        # was recorded nowhere, which is why diagnosing it took reconstructing
-        # the call path by hand.
-        "cross_family_regen_not_reached": "warning",
         "dead_dispatched_worker_reaped": "warning",
         "deescalation_cap_exhausted": "warning",
         # Issue #1383: a required check failed due to a fleet-wide infra

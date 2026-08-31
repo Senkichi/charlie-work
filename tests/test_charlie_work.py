@@ -57,7 +57,6 @@ from charlie_work.config import (
     AutoMergeConfig,
     ClaudeCodeConfig,
     ConfigError,
-    CrossFamilyConfig,
     DevinConfig,
     DispatchConfig,
     FleetConfig,
@@ -77,13 +76,10 @@ from charlie_work.config import (
     find_config_path,
     load_config,
 )
-from charlie_work.cross_family import (
-    _CAVEAT,
-    CrossFamilyResult,
-    CrossFamilyVerdict,
+from charlie_work.rescue_review import (
     LEGACY_VACUOUS_SUMMARY,
+    _CAVEAT,
     extract_report_body,
-    parse_cross_family_verdict,
     render_command,
     report_body_is_valid,
 )
@@ -931,27 +927,6 @@ def test_load_config_rejects_unknown_claude_code_command_placeholder(tmp_path: P
     assert "bad_token" in message
 
 
-def test_load_config_rejects_unknown_cross_family_command_placeholder(tmp_path: Path) -> None:
-    """Issue #4: unknown placeholder in cross_family.command is rejected at load."""
-    from charlie_work.config import ConfigError
-
-    config_path = tmp_path / "orchestrator.config.yaml"
-    config_path.write_text(
-        'cross_family:\n  enabled: true\n  command:\n    - devin\n    - "{invalid}"',
-        encoding="utf-8",
-    )
-
-    try:
-        load_config(config_path)
-    except ConfigError as exc:
-        message = str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("expected ConfigError for unknown placeholder")
-
-    assert "cross_family.command" in message
-    assert "invalid" in message
-
-
 def test_load_config_accepts_valid_placeholders(tmp_path: Path) -> None:
     """Issue #4: valid placeholders in command templates are accepted."""
     config_path = tmp_path / "orchestrator.config.yaml"
@@ -966,12 +941,6 @@ claude_code:
   command:
     - claude
     - "{prompt_path}"
-cross_family:
-  enabled: true
-  command:
-    - devin
-    - "{model}"
-    - "{prompt_path}"
 """,
         encoding="utf-8",
     )
@@ -979,7 +948,6 @@ cross_family:
     config = load_config(config_path)
     assert config.devin.shell_command == ("devin", "{prompt_path}", "{issue_number}", "{branch}")
     assert config.claude_code.command == ("claude", "{prompt_path}")
-    assert config.cross_family.command == ("devin", "{model}", "{prompt_path}")
 
 
 def test_load_config_rejects_bare_brace_in_shell_command(tmp_path: Path) -> None:
@@ -11760,47 +11728,10 @@ def test_render_command_templates_list_and_string() -> None:
     assert render_command("devin --model {model}", values) == "devin --model codex"
 
 
-def test_devin_example_config_no_longer_configures_cross_family() -> None:
-    # Phase 2 Track D (2026-08-30 role-config-phase2-deletions, Task 1) removed
-    # the cross_family: block from this example -- the subsystem itself is
-    # deleted wholesale in a later, independently-landing track (A). Until
-    # that lands, confirm the example falls back to the (disabled) default
-    # rather than silently keeping the old enabled: true behavior via some
-    # other path.
-    config = load_config(EXAMPLES_DIR / "orchestrator.config.devin.yaml")
-
-    assert config.cross_family.enabled is False
-    assert config.dispatch.worker_template == "worker.md"
-
-
 def test_claude_code_example_config_selects_claude_worker() -> None:
     config = load_config(EXAMPLES_DIR / "orchestrator.config.claude-code.yaml")
 
     assert config.dispatch.worker_template == "worker_claude_code.md"
-    assert config.cross_family.enabled is False
-
-
-def test_config_absent_cross_family_block_defaults_disabled(tmp_path: Path) -> None:
-    path = tmp_path / "c.yaml"
-    path.write_text("labels:\n  ready: automated-ready\n", encoding="utf-8")
-
-    config = load_config(path)
-
-    assert config.cross_family.enabled is False
-
-
-def test_config_parses_cross_family_command_list_to_tuple(tmp_path: Path) -> None:
-    path = tmp_path / "c.yaml"
-    path.write_text(
-        "cross_family:\n  enabled: true\n  model: codex\n"
-        "  command: [devin, --model, '{model}']\n  timeout_seconds: 120\n",
-        encoding="utf-8",
-    )
-
-    config = load_config(path)
-
-    assert config.cross_family.command == ("devin", "--model", "{model}")
-    assert config.cross_family.timeout_seconds == 120
 
 
 def test_claude_code_example_config_sets_bounded_xdist_worker_env() -> None:
@@ -11994,40 +11925,6 @@ def test_config_accepts_string_review_effort(tmp_path: Path) -> None:
     assert config.review_dispatch.review_effort == "high"
 
 
-def test_spec_review_runs_and_writes_report(tmp_path: Path, monkeypatch) -> None:
-    spec = tmp_path / "SPEC.md"
-    spec.write_text("# My spec\nclaims", encoding="utf-8")
-    config = OrchestratorConfig()
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
-
-    VALID_REPORT = "**MAJOR**\nissue\n\nVerdict: safe"
-
-    def _fake_run(**kwargs):
-        assert "My spec" in kwargs["prompt_text"]  # artifact text inlined into the prompt
-        Path(kwargs["report_path"]).write_text(VALID_REPORT, encoding="utf-8")
-        return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
-
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
-
-    result = app.spec_review(spec)
-
-    assert result.ok is True
-    assert Path(result.data["report_path"]).read_text(encoding="utf-8") == VALID_REPORT
-
-
-def test_spec_review_missing_file_propagates_os_error(tmp_path: Path) -> None:
-    """A missing spec file raises naturally from read_text; the CLI boundary converts."""
-    config = OrchestratorConfig()
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
-
-    with pytest.raises(OSError):
-        app.spec_review(tmp_path / "nope.md")
-
-    assert not (tmp_path / ".var" / "charlie-work" / "cross-family").exists()
-
-
 def test_run_cross_family_sanitizes_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -12113,133 +12010,6 @@ def test_extract_report_body_strips_wrapper_but_preserves_model_output() -> None
     wrapped = f"# Cross-family adversarial review — `codex`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     assert extract_report_body(wrapped) == body
     assert extract_report_body(body) == body
-
-
-# --------------------------------------------------------------------------
-# Issue #784 AC-8: review_queue() must never silently re-confirm a
-# content-free recorded verdict via the head-unchanged shortcut -- it is
-# queued as "vacuous" instead, regardless of whether the head moved.
-# --------------------------------------------------------------------------
-
-
-def test_review_queue_flags_content_free_request_changes_as_vacuous(tmp_path: Path) -> None:
-    """The dominant real-world shape: reviewed_head_sha == live head (a
-    label-strip requeue never moves the head). Pre-#784, this would hit the
-    head-unchanged shortcut and be silently excluded from the queue
-    forever, permanently blocking the merge lane."""
-    prs = [
-        {
-            "number": 700,
-            "title": "Fix #70: vacuous verdict on current head",
-            "url": "https://example.test/pull/700",
-            "headRefName": "agent/issue-70-fix",
-            "baseRefName": "main",
-            "headRefOid": "sha-700",
-            "mergeStateStatus": "CLEAN",
-            "body": "Closes #70",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "OPEN",
-        },
-    ]
-    app = _review_queue_app(tmp_path, prs=prs)
-    _write_review_packet(
-        tmp_path,
-        700,
-        "sha-700",
-        {
-            "decision": "request_changes",
-            "reviewed_head_sha": "sha-700",
-            "required_changes": [],
-            "summary": "",
-        },
-    )
-
-    result = app.review_queue()
-
-    assert result.ok is True
-    assert result.data["queue"] == [
-        {
-            "pr": 700,
-            "issue": 70,
-            "packet_head_sha": "sha-700",
-            "decision": "vacuous",
-            "reviewed_head_sha": "sha-700",
-            "mergeable": None,
-            "mergeStateStatus": "CLEAN",
-        },
-    ]
-
-
-def test_review_queue_treats_legacy_placeholder_summary_as_vacuous(tmp_path: Path) -> None:
-    prs = [
-        {
-            "number": 701,
-            "title": "Fix #71: legacy placeholder summary",
-            "url": "https://example.test/pull/701",
-            "headRefName": "agent/issue-71-fix",
-            "baseRefName": "main",
-            "headRefOid": "sha-701",
-            "mergeStateStatus": "CLEAN",
-            "body": "Closes #71",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "OPEN",
-        },
-    ]
-    app = _review_queue_app(tmp_path, prs=prs)
-    _write_review_packet(
-        tmp_path,
-        701,
-        "sha-701",
-        {
-            "decision": "request_changes",
-            "reviewed_head_sha": "sha-701",
-            "required_changes": [],
-            "summary": LEGACY_VACUOUS_SUMMARY,
-        },
-    )
-
-    result = app.review_queue()
-
-    assert result.data["queue"][0]["decision"] == "vacuous"
-
-
-def test_review_queue_stale_packet_excludes_vacuous_verdict(tmp_path: Path) -> None:
-    """A vacuous verdict is only queued when the packet head is current --
-    matching every other review_queue category's contract: a stale packet
-    cannot be re-reviewed from, so it is excluded rather than queued."""
-    prs = [
-        {
-            "number": 702,
-            "title": "Fix #72: vacuous verdict, stale packet",
-            "url": "https://example.test/pull/702",
-            "headRefName": "agent/issue-72-fix",
-            "baseRefName": "main",
-            "headRefOid": "sha-702-new",
-            "mergeStateStatus": "CLEAN",
-            "body": "Closes #72",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "OPEN",
-        },
-    ]
-    app = _review_queue_app(tmp_path, prs=prs)
-    _write_review_packet(
-        tmp_path,
-        702,
-        "sha-702-old",
-        {
-            "decision": "request_changes",
-            "reviewed_head_sha": "sha-702-old",
-            "required_changes": [],
-            "summary": "",
-        },
-    )
-
-    result = app.review_queue()
-
-    assert result.data["queue"] == []
 
 
 # --------------------------------------------------------------------------
@@ -12672,153 +12442,6 @@ def test_review_queue_does_not_reroute_escalated_request_changes(tmp_path: Path)
     assert app.gh.labels_added == []
 
 
-# --------------------------------------------------------------------------
-# Issue #784 AC-8 bound: _handle_malformed_cross_family_verdict /
-# _record_cross_family_verdicts. A malformed verdict never increments
-# request_changes_count or dispatches rework (AC-3); a SEPARATE bounded
-# counter (cross_family_parse_failure_count) caps how many times the
-# content-free-verdict -> forced-regeneration cycle can repeat for one PR,
-# so removing the request_changes-cycle counter from this path does not
-# create an unbounded loop. Past the cap, cross-family review is abandoned
-# via a caveated, non-blocking "approved" verdict -- never
-# agent:human-needed, never a blocking request_changes.
-# --------------------------------------------------------------------------
-
-
-def _cross_family_auto_verdict_app(
-    tmp_path: Path, *, max_parse_failures: int = 2, prs: list[dict[str, Any]] | None = None
-) -> OrchestratorApp:
-    config = OrchestratorConfig(
-        cross_family=CrossFamilyConfig(auto_verdict=True, max_parse_failures=max_parse_failures)
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    paths.root.mkdir(parents=True, exist_ok=True)
-    (paths.root / "state.json").write_text(
-        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
-        encoding="utf-8",
-    )
-    fake_gh = FakeGitHub()
-    if prs is not None:
-        fake_gh.prs = prs
-    return OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-
-def _malformed_cross_family_pr(number: int, head_sha: str) -> dict[str, Any]:
-    return {
-        "number": number,
-        "title": f"Fix #{number}: unparseable cross-family report",
-        "url": f"https://example.test/pull/{number}",
-        "headRefName": f"agent/issue-{number}-fix",
-        "baseRefName": "main",
-        "headRefOid": head_sha,
-        "mergeStateStatus": "CLEAN",
-        "body": f"Closes #{number}",
-        "labels": [],
-        "isCrossRepository": False,
-        "state": "OPEN",
-    }
-
-
-def test_handle_malformed_cross_family_verdict_below_cap_logs_without_recording(
-    tmp_path: Path,
-) -> None:
-    prs = [_malformed_cross_family_pr(800, "sha-800")]
-    app = _cross_family_auto_verdict_app(tmp_path, max_parse_failures=2, prs=prs)
-    _write_review_packet(tmp_path, 800, "sha-800", {"decision": "pending"})
-    pr_dir = app.paths.prs / "pr-800"
-    (pr_dir / "cross-family-review.md").write_text(
-        "# Cross-family adversarial review — `glm-5.2`\n\n"
-        "<!-- PR head SHA: sha-800 -->\n\n"
-        f"{_CAVEAT}\n\n---\n\n"
-        "**BLOCKER** something is wrong, no Verdict line here\n",
-        encoding="utf-8",
-    )
-
-    results = app._record_cross_family_verdicts()
-
-    assert results == [
-        {
-            "pr_number": 800,
-            "decision": "unparseable",
-            "ok": False,
-            "message": (
-                "cross-family verdict unparseable "
-                "(blocker_or_major_with_no_extractable_summary), attempt 1/2"
-            ),
-        }
-    ]
-    decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-    assert decision["decision"] == "pending"
-    state = load_state(app.paths.state_file)
-    assert state["prs"]["800"]["cross_family_parse_failure_count"] == 1
-    # AC-3: never touches the separate request_changes rework-cycle counter.
-    assert state["prs"]["800"].get("request_changes_count", 0) == 0
-
-
-def test_handle_malformed_cross_family_verdict_abandons_after_cap_exceeded(
-    tmp_path: Path,
-) -> None:
-    """The coordinator's required bound: past max_parse_failures, the cycle
-    terminates in a caveated, non-blocking approved verdict -- not
-    agent:human-needed, not an indefinitely-blocking request_changes."""
-    prs = [_malformed_cross_family_pr(801, "sha-801")]
-    app = _cross_family_auto_verdict_app(tmp_path, max_parse_failures=2, prs=prs)
-    _write_review_packet(tmp_path, 801, "sha-801", {"decision": "pending"})
-    pr_dir = app.paths.prs / "pr-801"
-    (pr_dir / "cross-family-review.md").write_text(
-        "# Cross-family adversarial review — `glm-5.2`\n\n"
-        "<!-- PR head SHA: sha-801 -->\n\n"
-        f"{_CAVEAT}\n\n---\n\n"
-        "**BLOCKER** something is wrong, no Verdict line here\n",
-        encoding="utf-8",
-    )
-
-    for expected_attempt in (1, 2):
-        results = app._record_cross_family_verdicts()
-        assert results[0]["decision"] == "unparseable"
-        assert results[0]["ok"] is False
-        decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-        assert decision["decision"] == "pending"
-        state = load_state(app.paths.state_file)
-        assert state["prs"]["801"]["cross_family_parse_failure_count"] == expected_attempt
-
-    results = app._record_cross_family_verdicts()
-
-    assert results[0]["decision"] == "approved"
-    assert results[0]["ok"] is True
-    decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-    assert decision["decision"] == "approved"
-    assert decision["required_changes"] == []
-    assert "784" in decision["summary"]
-    assert "3 attempts" in decision["summary"]
-    state = load_state(app.paths.state_file)
-    # record_review resets the parse-failure budget on any real verdict.
-    assert state["prs"]["801"]["cross_family_parse_failure_count"] == 0
-    assert state["prs"]["801"].get("request_changes_count", 0) == 0
-
-
-def test_record_review_resets_cross_family_parse_failure_count(tmp_path: Path) -> None:
-    """Whenever ANY real verdict is subsequently recorded for a PR --
-    whether a genuine parse succeeds after prior failures, or this is
-    _handle_malformed_cross_family_verdict's own abandon-call -- the budget
-    resets, so a future review cycle (new head, new content) starts fresh
-    rather than inheriting an exhausted one."""
-    config = OrchestratorConfig()
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-
-    with state_lock(paths.state_file):
-        state = load_state(paths.state_file)
-        state["prs"]["456"] = {"number": 456, "cross_family_parse_failure_count": 5}
-        save_state(paths.state_file, state)
-
-    app.record_review(456, "approved", summary="all clear", verdict_provenance="fresh_llm_review")
-
-    state = load_state(paths.state_file)
-    assert state["prs"]["456"]["cross_family_parse_failure_count"] == 0
-
-
 # --- P0 fixes: state safety, label honesty, rework cap, loop isolation --------
 
 
@@ -12967,7 +12590,6 @@ def test_loop_parks_foreign_issue_ref_pr(monkeypatch, tmp_path: Path) -> None:
             return super().issue_view(number)
 
     config = OrchestratorConfig(
-        cross_family=CrossFamilyConfig(enabled=False),
         notify=NotifyConfig(enabled=True),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -13045,7 +12667,6 @@ def test_loop_dead_session_notifies_when_watchdog_disabled(
             max_inconclusive_probe_deferrals=0,
         ),
         notify=NotifyConfig(enabled=True, sink="file", file_path=""),
-        cross_family=CrossFamilyConfig(enabled=False),
         review_dispatch=ReviewDispatchConfig(enabled=False),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -13938,7 +13559,7 @@ def test_loop_honors_intake_failure_signal(tmp_path: Path) -> None:
                 raise _GitHubError("transient gh issue view failure")
             return super().issue_view(number)
 
-    config = OrchestratorConfig(cross_family=CrossFamilyConfig(enabled=False))
+    config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FlakyIntakeGitHub())
 
@@ -13956,7 +13577,6 @@ def test_loop_corrupt_review_decision_does_not_crash_or_merge(tmp_path: Path) ->
     """A corrupt review-decision.json on the loop path must be treated as a
     non-approval: the loop re-reviews the PR and never attempts to merge."""
     config = OrchestratorConfig(
-        cross_family=CrossFamilyConfig(enabled=False),
         auto_merge=_approved_automerge(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -22969,50 +22589,6 @@ def test_dry_run_intake_does_not_write_files_or_state(tmp_path: Path) -> None:
     with state_lock(paths.state_file):
         final_state = load_state(paths.state_file)
     assert final_state["issues"] == {}
-    assert final_state["events"] == []
-
-
-def test_dry_run_spec_review_does_not_write_state_or_run_model(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #618-D: ``spec_review`` in dry-run must not invoke the cross-family
-    model subprocess, write the report, create the reviews directory, or record
-    a state event.
-    """
-    spec = tmp_path / "SPEC.md"
-    spec.write_text("# My spec\nclaims", encoding="utf-8")
-    config = OrchestratorConfig()
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    initial_state = {
-        "issues": {},
-        "prs": {},
-        "events": [],
-        "generated_at": "2024-01-01T00:00:00Z",
-    }
-    save_state(paths.state_file, initial_state)
-
-    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
-
-    subprocess_calls: list[Any] = []
-
-    def fake_run(*args, **kwargs):
-        subprocess_calls.append(args[0] if args else kwargs)
-        raise AssertionError("subprocess.run should not be called in dry-run mode")
-
-    monkeypatch.setattr("charlie_work.cross_family.subprocess.run", fake_run)
-
-    result = app.spec_review(spec)
-
-    # Dry-run preview succeeded
-    assert result.ok is True
-    assert "dry-run" in result.message.lower()
-    # No subprocess invoked
-    assert len(subprocess_calls) == 0
-    # No reviews directory created
-    assert not paths.cross_family.exists()
-    # No state event recorded
-    with state_lock(paths.state_file):
-        final_state = load_state(paths.state_file)
     assert final_state["events"] == []
 
 
@@ -46757,57 +46333,6 @@ def test_state_lock_guard_returns_skip_when_lock_held(
     assert state_path.read_text(encoding="utf-8") == initial_content
 
 
-def test_spec_review_state_lock_guard_returns_skip_when_lock_held(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Issue #398: spec_review is also guarded by the state-lock skip pattern."""
-    from charlie_work.rescue_review import CrossFamilyResult
-
-    monkeypatch.setattr(state_module, "_LOCK_TIMEOUT_SECONDS", 0.05)
-
-    config = OrchestratorConfig(devin=DevinConfig(adapter="devin-shell"))
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    # Issue #618: dry_run=False so the state_lock block is reached — in dry-run
-    # the state write is correctly skipped, so the lock guard never fires.
-    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=False)
-
-    spec_path = tmp_path / "spec.md"
-    spec_path.write_text("# spec\n", encoding="utf-8")
-
-    state_path = paths.state_file
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    initial_state = {
-        "version": 1,
-        "generated_at": "2026-01-01T00:00:00Z",
-        "issues": {},
-        "prs": {},
-        "events": [],
-    }
-    state_path.write_text(json.dumps(initial_state), encoding="utf-8")
-    initial_mtime = state_path.stat().st_mtime
-    initial_content = state_path.read_text(encoding="utf-8")
-
-    def fake_run_cross_family_review(*args: object, **kwargs: object) -> CrossFamilyResult:
-        return CrossFamilyResult(ok=True, report_path=str(tmp_path / "report.md"), model="test")
-
-    monkeypatch.setattr(
-        "charlie_work.workflow.run_cross_family_review",
-        fake_run_cross_family_review,
-    )
-
-    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
-    with _hold_state_lock(lock_path):
-        result = app.spec_review(spec_path)
-
-    assert result.ok is True
-    reason = result.data.get("reason") or result.data.get("deferred_reason")
-    assert reason in {"state_lock_busy", "supervisor_lock_held", "graphql_rate_limit"}
-    assert result.data.get("pass_skipped") is True or result.data.get("state_lock_busy") is True
-    assert state_path.stat().st_mtime == initial_mtime
-    assert state_path.read_text(encoding="utf-8") == initial_content
-
-
 def test_is_pre_review_rework_candidate_detects_merge_conflict_and_stale_empty_checks() -> None:
     """Issue #439: the two pre-review rework predicates are detected independently."""
     from datetime import UTC, datetime, timedelta
@@ -49119,39 +48644,39 @@ def test_record_review_persists_required_changes(tmp_path: Path) -> None:
 def test_cross_family_request_changes_verdict_persists_required_changes(
     tmp_path: Path,
 ) -> None:
-    """End-to-end: a cross-family report's parsed request_changes verdict,
-    recorded the same way ``_record_cross_family_verdicts`` does (workflow.py),
-    ends up with a populated ``required_changes`` in review-decision.json --
-    the exact defect this fix closes (8 of 20 request_changes verdicts had it
-    silently empty)."""
-    body = (
-        "**MAJOR**\nfile.py:10 does the wrong thing\n\n"
-        "Verdict: MAJOR issue blocks merge\n\n"
-        "```json\n"
-        '{"decision": "request_changes", '
-        '"summary": "file.py:10 has a real bug that breaks X", '
-        '"required_changes": ["Fix the off-by-one in file.py:10", '
-        '"Add a regression test for the empty-list case"]}\n'
-        "```\n"
+    """End-to-end: a rescue-tier request_changes verdict's decision/summary/
+    required_changes, recorded the same way the rescue tier's own
+    record_review call site does, ends up with a populated
+    ``required_changes`` in review-decision.json -- the exact defect this fix
+    closes (8 of 20 request_changes verdicts had it silently empty).
+
+    The decision/summary/required_changes below are the literal values a
+    JSON verdict block of
+    ``{"decision": "request_changes", "summary": "file.py:10 has a real bug
+    that breaks X", "required_changes": ["Fix the off-by-one in
+    file.py:10", "Add a regression test for the empty-list case"]}``
+    used to parse to, back when ``parse_cross_family_verdict`` (deleted in
+    the role-config Phase 2 cleanup) extracted them from a report body."""
+    verdict_decision = "request_changes"
+    verdict_summary = "file.py:10 has a real bug that breaks X"
+    verdict_required_changes = (
+        "Fix the off-by-one in file.py:10",
+        "Add a regression test for the empty-list case",
     )
-    report_text = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    parsed = parse_cross_family_verdict(report_text)
-    assert parsed is not None
-    assert parsed.decision == "request_changes"
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    # Mirrors workflow.py's _record_cross_family_verdicts call site exactly.
+    # Mirrors the rescue tier's own record_review call site.
     # PR 456 is FakeGitHub's seeded default PR.
     result = app.record_review(
         456,
-        parsed.decision,
-        summary=parsed.summary,
-        required_changes=parsed.required_changes,
-        verdict_provenance="cross_family_review",
+        verdict_decision,
+        summary=verdict_summary,
+        required_changes=verdict_required_changes,
+        verdict_provenance="rescue_review",
     )
     assert result.ok
 
@@ -49168,45 +48693,48 @@ def test_cross_family_request_changes_verdict_persists_required_changes(
 def test_cross_family_legacy_path_verdict_with_empty_required_changes_gets_derived(
     tmp_path: Path,
 ) -> None:
-    """AC-6 (cross-family producer): the legacy Markdown-only parse path
-    (no JSON verdict block) never itemizes required_changes -- it only ever
-    extracts a summary -- so a request_changes verdict recorded from it
-    always arrives at record_review with required_changes=() and a real,
-    non-vacuous summary. This is the shape record_review's derivation
-    exists for. Contrast with test_handle_malformed_cross_family_verdict_*:
-    a JSON verdict block declaring request_changes with an empty
-    required_changes is diverted to MalformedCrossFamilyVerdict before ever
-    reaching record_review (issue #795) -- this test's report has no JSON
-    block at all, so that defense-in-depth layer does not apply here and
+    """AC-6 (rescue-tier producer): a request_changes verdict with an empty
+    required_changes and a real, non-vacuous summary -- the shape the legacy
+    Markdown-only cross-family parse path (no JSON verdict block, deleted
+    along with ``parse_cross_family_verdict`` in the role-config Phase 2
+    cleanup) used to produce, since it only ever extracted a summary, never
+    itemized findings -- always arrives at record_review as
+    required_changes=(). This is the shape record_review's derivation
+    exists for. Contrast with the (deleted) AC-8 malformed-verdict tests: a
+    JSON verdict block declaring request_changes with an empty
+    required_changes was diverted to MalformedCrossFamilyVerdict before ever
+    reaching record_review (issue #795) -- this scenario has no JSON block
+    at all, so that defense-in-depth layer never applied here and
     record_review's own derivation is what prevents the content-free
-    outcome."""
-    body = "**MAJOR**\nreal bug\n\nVerdict: MAJOR issues block merge"
-    report_text = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
-    parsed = parse_cross_family_verdict(report_text)
-    assert isinstance(parsed, CrossFamilyVerdict)
-    assert parsed.decision == "request_changes"
-    assert parsed.required_changes == ()
-    assert parsed.summary and not _summary_is_vacuous(parsed.summary)
+    outcome.
+
+    ``verdict_summary`` below is the literal value
+    ``"**MAJOR**\\nreal bug\\n\\nVerdict: MAJOR issues block merge"``
+    used to parse to via the legacy path's verdict-line extraction."""
+    verdict_decision = "request_changes"
+    verdict_summary = "MAJOR issues block merge"
+    verdict_required_changes: tuple[str, ...] = ()
+    assert verdict_summary and not _summary_is_vacuous(verdict_summary)
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    # Mirrors workflow.py's _record_cross_family_verdicts call site exactly.
+    # Mirrors the rescue tier's own record_review call site.
     result = app.record_review(
         456,
-        parsed.decision,
-        summary=parsed.summary,
-        required_changes=parsed.required_changes,
-        verdict_provenance="cross_family_review",
+        verdict_decision,
+        summary=verdict_summary,
+        required_changes=verdict_required_changes,
+        verdict_provenance="rescue_review",
     )
     assert result.ok is True
 
     decision = json.loads(
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
-    assert decision["required_changes"] == [parsed.summary]
+    assert decision["required_changes"] == [verdict_summary]
     assert decision["findings_channel"] == "derived"
 
 

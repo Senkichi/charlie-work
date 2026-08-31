@@ -224,8 +224,7 @@ def build_repo_report(
 # gh fetch -- the only part of this script that touches the network. Every
 # failure mode here fails loudly: non-zero exit, unparseable JSON, and an
 # empty result are each a BROKEN QUERY, not "zero merges" -- conflating them
-# is the false-zero this repo's tooling keeps re-discovering (see module
-# docstring's sibling note in scripts/predict_auto_verdict.py).
+# is the false-zero this repo's tooling keeps re-discovering.
 # --------------------------------------------------------------------------
 
 

@@ -27,7 +27,6 @@ _STATE_ROOT_HELPERS: list[object] = [
     pytest.param(layout.supervisor_lock_path, ("supervisor.lock",), id="supervisor_lock_path"),
     pytest.param(layout.pending_sync_path, ("pending-sync.json",), id="pending_sync_path"),
     pytest.param(layout.worktrees_dir, ("worktrees",), id="worktrees_dir"),
-    pytest.param(layout.cross_family_dir, ("cross-family",), id="cross_family_dir"),
     pytest.param(layout.dispatches_dir, ("dispatches",), id="dispatches_dir"),
     pytest.param(
         layout.sessions_dir_default, ("dispatches", "sessions"), id="sessions_dir_default"
@@ -120,11 +119,6 @@ def test_pending_sync_path_matches_historical_literal(tmp_path: Path) -> None:
         layout.pending_sync_path(layout.default_state_root(repo))
         == repo / ".var" / "charlie-work" / "pending-sync.json"
     )
-
-
-def test_cross_family_dir_matches_historical_literal(tmp_path: Path) -> None:
-    root = tmp_path / "root"
-    assert layout.cross_family_dir(root) == root / "cross-family"
 
 
 def test_notify_digest_default_matches_historical_literal(tmp_path: Path) -> None:

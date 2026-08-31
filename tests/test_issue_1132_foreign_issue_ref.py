@@ -29,7 +29,6 @@ from typing import Any
 from _fakes_github import FakeGitHub
 
 from charlie_work.config import (
-    CrossFamilyConfig,
     NotifyConfig,
     OrchestratorConfig,
     ReviewConfig,
@@ -47,7 +46,6 @@ from charlie_work.workflow import OrchestratorApp
 
 def _foreign_pr_config(**review_kwargs: Any) -> OrchestratorConfig:
     return OrchestratorConfig(
-        cross_family=CrossFamilyConfig(enabled=False),
         notify=NotifyConfig(enabled=True),
         review=ReviewConfig(**review_kwargs),
     )

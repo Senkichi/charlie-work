@@ -227,7 +227,7 @@ def test_pending_reset_packet_stamps_none_sentinel_not_omission(tmp_path: Path) 
     """review()'s fresh-packet path (no prior review-decision.json) writes
     the pending-reset decision_template. It must carry an explicit
     "verdict_provenance": None key."""
-    app = _cross_family_app(tmp_path, enabled=False)
+    app = _cross_family_app(tmp_path)
     decision_path = app.paths.prs / "pr-456" / "review-decision.json"
     assert not decision_path.exists()
 
@@ -251,7 +251,7 @@ def test_pending_reset_voids_stale_terminal_decision_with_none_sentinel(
     the same explicit None sentinel -- both write call sites share the one
     decision_template literal, so this pins that both are actually reached,
     not just the fresh-packet one."""
-    app = _cross_family_app(tmp_path, enabled=False)
+    app = _cross_family_app(tmp_path)
     decision_dir = app.paths.prs / "pr-456"
     decision_dir.mkdir(parents=True)
     (decision_dir / "review-decision.json").write_text(
@@ -599,7 +599,7 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
     # remembered count instead of a fresh derivation -- this asserts the
     # scan finds real sites in both files/functions it is supposed to cover,
     # not just that it ran without error.
-    assert len(scanned_call_sites) >= 9, scanned_call_sites
+    assert len(scanned_call_sites) >= 7, scanned_call_sites
     assert any("cli.py" in site for site in scanned_call_sites), scanned_call_sites
     assert any("workflow.py" in site for site in scanned_call_sites), scanned_call_sites
     assert any("_update_approval_head" in site for site in scanned_write_sites), (
@@ -656,10 +656,6 @@ _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE: dict[tuple[str, str], Counter[str]] 
     ("workflow.py", "review"): Counter({"ci_gate_auto_reject": 2, "test_adequacy_auto_reject": 1}),
     ("workflow.py", "_reap_review_verdicts"): Counter({"fresh_llm_review": 1}),
     ("workflow.py", "_reconcile_stranded_verdicts"): Counter({"stranded_reconciliation": 1}),
-    ("workflow.py", "_record_cross_family_verdicts"): Counter({"cross_family_review": 1}),
-    ("workflow.py", "_handle_malformed_cross_family_verdict"): Counter(
-        {"unparseable_exhausted": 1}
-    ),
     ("workflow.py", "_process_rescue_review"): Counter({"rescue_review": 1}),
     ("cli.py", "run_command"): Counter({"operator_manual": 1}),
 }
@@ -706,7 +702,7 @@ def test_record_review_call_sites_map_to_expected_provenance_literal() -> None:
     total_sites = sum(
         sum(counter.values()) for counter in _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE.values()
     )
-    assert total_sites == 9, _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE
+    assert total_sites == 7, _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE
 
 
 # ---------------------------------------------------------------------------
@@ -782,20 +778,18 @@ def test_record_review_missing_verdict_provenance_raises_typeerror_at_call_bound
 def test_verdict_provenance_fixture_drives_every_enum_value_and_null_sentinel(
     tmp_path: Path,
 ) -> None:
-    # 8 of the 9 enum values are ever passed to record_review() as a fresh
+    # 6 of the 7 enum values are ever passed to record_review() as a fresh
     # decision; "carried_forward" is stamped only by _update_approval_head,
     # which never calls record_review (see the AC3 tests above) -- so it is
     # exercised separately below, not through this loop.
     record_review_values = sorted(VERDICT_PROVENANCE_VALUES - {"carried_forward"})
     assert record_review_values == [
         "ci_gate_auto_reject",
-        "cross_family_review",
         "fresh_llm_review",
         "operator_manual",
         "rescue_review",
         "stranded_reconciliation",
         "test_adequacy_auto_reject",
-        "unparseable_exhausted",
     ], record_review_values
 
     for index, value in enumerate(record_review_values):
@@ -845,7 +839,7 @@ def test_verdict_provenance_fixture_drives_every_enum_value_and_null_sentinel(
 
     # The pending-reset None sentinel, driven through review()'s real
     # fresh-packet path (same mechanism as the AC4 tests above).
-    none_app = _cross_family_app(tmp_path / "case-none-sentinel", enabled=False)
+    none_app = _cross_family_app(tmp_path / "case-none-sentinel")
     none_decision_path = none_app.paths.prs / "pr-456" / "review-decision.json"
     none_app.review(456)
     none_on_disk = json.loads(none_decision_path.read_text(encoding="utf-8"))

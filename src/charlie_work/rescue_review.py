@@ -36,16 +36,15 @@ Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 
 # Historical placeholder emitted by the pre-#784 legacy-path fallback when a
 # BLOCKER/MAJOR marker was found but no summary text could be extracted. Lives
-# here (not in cross_family.py, which this module was split out of) because
-# two other modules need it and importing it from cross_family.py would be
-# either impossible (workflow.py -> rework_prompts.py -> cross_family.py has
-# no cycle today, but workflow.py -> cross_family.py -> rescue_review.py does
-# once cross_family.py imports the survivor cluster back from here) or,
-# post-Task-6, simply wrong (cross_family.py no longer exists at all). Used
-# ONLY for detecting old on-disk verdicts written by pre-#784 code
-# (workflow.py's rework-brief staleness check, rework_prompts.py's summary
-# checks) -- never emitted by current code (see cross_family.py's
-# parse_cross_family_verdict, which raises instead of constructing this).
+# here rather than in cross_family.py (the module this was originally split
+# out of, deleted entirely in role-config phase 2, track A) because two other
+# modules need it: workflow.py and rework_prompts.py, both of which import it
+# from here. Used ONLY for detecting old on-disk verdicts written by pre-#784
+# code (workflow.py's rework-brief staleness check, rework_prompts.py's
+# summary checks) -- never emitted by current code. The current parser in
+# this module (``_find_json_verdict`` / ``CrossFamilyVerdict``) never falls
+# back to constructing this placeholder; an unparseable report is surfaced as
+# ``None`` instead.
 LEGACY_VACUOUS_SUMMARY = "Cross-family review found BLOCKER/MAJOR findings"
 
 _CAVEAT = (
@@ -183,12 +182,6 @@ class CrossFamilyResult:
     returncode: int | None = None
     error: str | None = None
     reused: bool = False
-    # ``pending`` is used only by cross_family.py's async launch/reap functions
-    # (issue #1078) — the rescue tier's own run_cross_family_review below never
-    # sets it. Kept here (rather than dropped) because cross_family.py's
-    # auto-gate-only remainder still constructs CrossFamilyResult(pending=True)
-    # through Task 6; Task 6 removes this field once that remainder is deleted.
-    pending: bool = False
 
 
 def render_command(command: Sequence[str] | str, values: dict[str, str]) -> list[str] | str:

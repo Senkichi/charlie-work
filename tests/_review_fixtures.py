@@ -16,7 +16,7 @@ from typing import Any
 
 from _fakes_github import FakeGitHub
 from charlie_work.claude_code import ClaudeWorkerRecord
-from charlie_work.config import CrossFamilyConfig, OrchestratorConfig, ReviewDispatchConfig
+from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
@@ -180,7 +180,6 @@ def _approved_automerge():
 def _make_loop_app(tmp_path: Path, *, prs: list[dict]) -> tuple[OrchestratorApp, FakeGitHub]:
     """Build a minimal OrchestratorApp with the given open PRs for loop() tests."""
     config = OrchestratorConfig(
-        cross_family=CrossFamilyConfig(enabled=False),
         auto_merge=_approved_automerge(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

@@ -36,7 +36,6 @@ class RuntimePaths:
     #: to itself once both call sites are unified, and would false-positive
     #: on a legitimately configured ``claude_code.worktrees_dir`` override.
     worktrees: Path
-    cross_family: Path
 
     def ensure(self) -> None:
         for path in (self.root, self.issues, self.prs, self.dispatches, self.logs):
@@ -171,7 +170,6 @@ def runtime_paths(repo_root: Path, state_dir: str) -> RuntimePaths:
         logs=root / layout.LOGS_DIRNAME,
         state_file=layout.state_file_path(root),
         worktrees=layout.worktrees_dir(root),
-        cross_family=layout.cross_family_dir(root),
     )
 
 
@@ -206,7 +204,6 @@ class ResolvedLayout:
     session_results: Path
     reviews_dir: Path
     worktrees: Path
-    cross_family: Path
     notify: NotifyConfig
 
 
@@ -254,7 +251,6 @@ def resolved_layout(config: OrchestratorConfig, repo_root: Path) -> ResolvedLayo
         session_results=session_results,
         reviews_dir=reviews_dir,
         worktrees=worktrees,
-        cross_family=layout.cross_family_dir(root),
         notify=dataclasses.replace(config.notify, file_path=str(notify_file_path)),
     )
 

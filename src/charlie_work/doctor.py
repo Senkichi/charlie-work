@@ -1443,31 +1443,21 @@ def run_doctor(
     if live:
         _validate_gh_field_lists(add, gh)
 
-    if config.cross_family.enabled:
-        command = config.cross_family.command
-        binary = command.split()[0] if isinstance(command, str) else str(command[0])
-        found = shutil.which(binary)
-        add(
-            "cross-family binary",
-            found is not None,
-            found or f"cross_family.enabled but `{binary}` not found on PATH",
-            severity="warning",
-        )
-
     # -- review-to-verdict path (gap that let 34 reviews sit unread) ---------
-    # review_dispatch.enabled and cross_family.auto_verdict are the only two
-    # paths that call record_review(). If both are off there is no automated
-    # route from a completed review to a recorded verdict at all: PRs pile up
-    # in "reviewing" with valid reports and no decision, invisible to any
-    # other check here.
-    has_review_to_verdict_path = config.review_dispatch.enabled or config.cross_family.auto_verdict
+    # review_dispatch.enabled and rescue.enabled are the two paths that call
+    # record_review() automatically (the rescue tier's own reviewer launch
+    # calls it directly from _process_rescue_review, workflow.py). If both
+    # are off there is no automated route from a completed review to a
+    # recorded verdict at all: PRs pile up in "reviewing" with valid reports
+    # and no decision, invisible to any other check here.
+    has_review_to_verdict_path = config.review_dispatch.enabled or config.rescue.enabled
     add(
         "review-to-verdict path",
         has_review_to_verdict_path,
         "ok"
         if has_review_to_verdict_path
         else (
-            "review_dispatch.enabled and cross_family.auto_verdict are both "
+            "review_dispatch.enabled and rescue.enabled are both "
             "false: no automated path from review to verdict; PRs accumulate "
             "in reviewing with valid reports and no decision"
         ),

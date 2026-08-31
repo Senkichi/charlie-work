@@ -1375,50 +1375,6 @@ class ApiWorkerConfig:
 
 
 @dataclass(frozen=True)
-class CrossFamilyConfig:
-    """Auto cross-family (non-Claude) adversarial pass over specs and PRs.
-
-    ``enabled`` defaults False so an absent config block is a no-op. Trivially
-    removable: flip ``enabled`` to false (or drop the block) and the
-    orchestrator behaves exactly as before.
-    """
-
-    enabled: bool = False
-    model: str = "codex"
-    command: str | tuple[str, ...] = (
-        "devin",
-        "--model",
-        "{model}",
-        "-p",
-        "--prompt-file",
-        "{prompt_path}",
-    )
-    timeout_seconds: int = 300
-    auto_verdict: bool = False
-    # Issue #784: bounds the "content-free verdict -> forced regeneration ->
-    # still content-free" cycle. Counts distinct parse-failure attempts (one
-    # per genuinely new report/head, never per loop-pass re-read of a cached
-    # one) per PR. Once exceeded, the PR is released from the cross-family
-    # gate (recorded as a caveated "approved") instead of looping forever or
-    # escalating to a human — see workflow._record_cross_family_verdicts.
-    max_parse_failures: int = 2
-    # Issue #1081: bounds how many times loop() will force review() to
-    # regenerate an *unusable* cross-family report (a "(UNAVAILABLE)" failure
-    # stub, or one carrying no head SHA) for one unchanged PR head. The bound
-    # is required because regeneration runs the cross-family model
-    # synchronously for up to ``timeout_seconds``; unbounded, a model that is
-    # simply down burns that timeout on every pass and starves the other repo
-    # in the shared sequential loop (#1078).
-    #
-    # This does NOT share max_parse_failures' terminal behaviour, and must not
-    # be "unified" with it. That bound ends in a caveated "approved"; this one
-    # ends in a human_needed escalation, because exhausting it means the head
-    # was never confirmed and approving on an unconfirmed head is precisely the
-    # fail-open #1079 closed.
-    max_regen_attempts: int = 2
-
-
-@dataclass(frozen=True)
 class WorkerRoleConfig:
     """The designated worker: which harness dispatches fresh/rework issues,
     and which model that harness should use.
@@ -1475,7 +1431,8 @@ class RescueConfig:
     Inserts exactly one Opus rework attempt + one cross-family (non-Claude)
     review pass between "cheap-worker cap exhausted" and escalating to a
     human. ``enabled`` defaults False so an absent config block is a no-op —
-    mirrors ``CrossFamilyConfig`` (config.py:236).
+    the same "absent block is a no-op" contract every other optional config
+    section in this module follows.
 
     Only the three verdict-driven caps route through here
     (``max_rework_cycles``, ``max_conflict_rework_attempts``,
@@ -1504,7 +1461,7 @@ class RescueConfig:
     ``_resolve_role_dual_accept``. Both reuse ``WorkerRoleConfig`` (not
     ``ReviewerRoleConfig``): the rescue reviewer legitimately defaults to a
     non-claude-code harness (``"devin"``/``"codex"``) and launches through
-    ``cross_family.run_cross_family_review``, never
+    ``rescue_review.run_cross_family_review``, never
     ``claude_code.launch_claude_worker`` -- so ``ReviewerRoleConfig``'s
     claude-code-only harness restriction and its effort/experiment fields
     would both be wrong here.
@@ -1515,9 +1472,8 @@ class RescueConfig:
     worker_model: str = "claude-opus-4-1"
     reviewer_adapter: str = "devin"
     reviewer_model: str = "codex"
-    # Standard Devin CLI invocation shape (matches CrossFamilyConfig.command's
-    # own default) -- override only if the rescue tier's reviewer harness
-    # differs from that default.
+    # Standard Devin CLI invocation shape -- override only if the rescue
+    # tier's reviewer harness differs from that default.
     reviewer_command: str | tuple[str, ...] = (
         "devin",
         "--model",
@@ -1654,8 +1610,8 @@ class WorktreeReclamationConfig:
 class TestAdequacyConfig:
     """Config for the opt-in test-adequacy gate (janitor.check_test_adequacy).
 
-    ``enabled`` defaults False so an absent config block is a no-op — mirrors
-    CrossFamilyConfig (config.py:236). When enabled, ``OrchestratorApp.review()``
+    ``enabled`` defaults False so an absent config block is a no-op. When enabled,
+    ``OrchestratorApp.review()``
     runs the structural check (``janitor.check_test_adequacy``) before packet
     generation: a Tier-1 "pure skip" failure auto-records a ``request_changes``
     decision, and a passing PR gets a test-quality rubric folded into the review
@@ -1709,7 +1665,7 @@ class CoverageProbeConfig:
     probes (``diff_coverage_probe.run_static_probe``, issues #1260/#1261).
 
     ``enabled`` defaults False so an absent config block is a no-op --
-    mirrors ``CrossFamilyConfig``/``TestAdequacyConfig``. This is a new,
+    mirrors ``TestAdequacyConfig``. This is a new,
     independent config section: it does NOT read, gate on, or repurpose any
     field of ``TestAdequacyConfig``, including that class's reserved Tier-3
     ``coverage_enabled``/``coverage_command``/``min_diff_coverage`` fields
@@ -1781,7 +1737,7 @@ class NotifyConfig:
     Detect (supervisor) and escalate (label policy) are separate concerns — this
     section only decides where a digest goes once a needs-attention transition
     has already fired. ``enabled`` defaults False so an absent config block is
-    a no-op — mirrors CrossFamilyConfig (config.py:236).
+    a no-op.
     """
 
     enabled: bool = False
@@ -1799,9 +1755,9 @@ class RunnersConfig:
     """GitHub Actions runner management.
 
     ``cancel_superseded_main_runs`` defaults False so an absent config block is
-    a no-op — mirrors CrossFamilyConfig (config.py:236). When enabled, cancels
-    queued runs on the default branch for the configured workflow, keeping only
-    the newest (its tree contains every earlier merge).
+    a no-op. When enabled, cancels queued runs on the default branch for the
+    configured workflow, keeping only the newest (its tree contains every
+    earlier merge).
 
     ``fleet_autoscale_prologue`` defaults False so an absent config block is
     a no-op. When enabled, runs the autoscale decision before fleet bash-rats.
@@ -1986,7 +1942,6 @@ class OrchestratorConfig:
     devin: DevinConfig = field(default_factory=DevinConfig)
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
-    cross_family: CrossFamilyConfig = field(default_factory=CrossFamilyConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
     worker: WorkerRoleConfig = field(default_factory=WorkerRoleConfig)
     reviewer: ReviewerRoleConfig = field(default_factory=ReviewerRoleConfig)
@@ -2515,6 +2470,23 @@ def _resolve_role_dual_accept(data: dict[str, Any]) -> list[str]:
     return deprecations
 
 
+#: Top-level section names accepted for their deprecation-notice value alone
+#: -- role-config phase 2, track A deleted the ``OrchestratorConfig`` field
+#: (and the dataclass backing it) each of these named, but
+#: ``_resolve_role_dual_accept`` still reads the raw section from ``data`` to
+#: emit its "is deprecated" message for a config that has not migrated yet
+#: (the same promise ``api_worker.fallback_adapter`` gets via a narrower,
+#: key-level pop() a few lines above in that function). Without this, a
+#: config still carrying the section would hit the unknown-*section* check
+#: below before ever reaching that soft warning, turning it into a hard
+#: ConfigError instead. This set is temporary and, like the rest of the
+#: dual-accept apparatus it belongs to, goes away with Track E once every
+#: config is expected to be clean -- do not add a new entry here for a
+#: section that never had dual-accept deprecation wording; add the wording
+#: first, then the entry.
+_DEPRECATED_SECTIONS_WITHOUT_A_FIELD: frozenset[str] = frozenset({"cross_family"})
+
+
 def known_config_sections() -> frozenset[str]:
     """The section names ``load_config`` accepts at the top level.
 
@@ -2523,14 +2495,16 @@ def known_config_sections() -> frozenset[str]:
     its field is added. Provenance fields (see ``OrchestratorConfig.sources``)
     are excluded -- a config file must never be able to declare where it came
     from -- and that exclusion is keyed off field metadata rather than a name
-    so it cannot be forgotten for a future provenance field.
+    so it cannot be forgotten for a future provenance field. Also includes
+    :data:`_DEPRECATED_SECTIONS_WITHOUT_A_FIELD` -- see its docstring.
 
     Shared with :func:`charlie_work.global_config.load_layered_config`, which
     needs the same set to reject an unknown *section name* before its
     merge drops an empty-bodied one -- see issue #962.
     """
-    return frozenset(
-        f.name for f in fields(OrchestratorConfig) if not f.metadata.get("provenance")
+    return (
+        frozenset(f.name for f in fields(OrchestratorConfig) if not f.metadata.get("provenance"))
+        | _DEPRECATED_SECTIONS_WITHOUT_A_FIELD
     )
 
 
@@ -3590,19 +3564,6 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         api_worker_data["providers"] = MappingProxyType(built_providers)
 
     api_worker = _build_section(ApiWorkerConfig, "api_worker", api_worker_data)
-    cross_family_data = _section(data, "cross_family")
-    cf_command = cross_family_data.get("command")
-    if isinstance(cf_command, list):
-        cross_family_data["command"] = tuple(str(item) for item in cf_command)
-    # Validate cross_family.command placeholders
-    cf_command = cross_family_data.get("command")
-    if cf_command:
-        _validate_command_placeholders(
-            cf_command,
-            {"prompt_path", "issue_number", "branch", "model"},
-            "cross_family.command",
-        )
-    cross_family = _build_section(CrossFamilyConfig, "cross_family", cross_family_data)
     rescue_data = _section(data, "rescue")
     rescue_enabled = rescue_data.get("enabled")
     if rescue_enabled is not None and not isinstance(rescue_enabled, bool):
@@ -4138,7 +4099,6 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         devin=devin,
         claude_code=claude_code,
         api_worker=api_worker,
-        cross_family=cross_family,
         rescue=rescue,
         worker=worker,
         reviewer=reviewer,
