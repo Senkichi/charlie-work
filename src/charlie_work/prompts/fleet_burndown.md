@@ -46,7 +46,7 @@ Repeat until the termination condition below:
 3. **Review every PR with a fresh packet.** For each
    `<state_dir>/prs/pr-*/review-prompt.md` (where `<state_dir>` is that repo's
    configured `runtime.state_dir`, e.g. `.var/charlie-work`) and its
-   `cross-family-review.md` if present, do a real adversarial review —
+   `rescue-review-report.md` if present, do a real adversarial review —
    inspect the linked issue, PR metadata, changed files, diff, tests, and
    CI. **Never approve from the summary alone.** Treat cross-family findings
    and the test-adequacy rubric as leads to verify, not verdicts.

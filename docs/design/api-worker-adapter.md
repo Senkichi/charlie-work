@@ -4,12 +4,16 @@
 - **Status:** Approved design, pending implementation
 - **Branch:** `senk/api-worker-architecture-b97087`
 - **Trial provider:** Kimi K3 via Moonshot ($15 trial budget)
+- **Update (2026-08-30):** the per-issue adapter-selection layer this design
+  describes in §5 and table row `⑤` was later deleted by Phase 2 of the
+  role-config refactor. §5 below has been updated to reflect the current
+  mechanism; the rest of this document is left as a historical design record.
 
 ## 1. Motivation
 
 The fleet currently has two worker adapters: `devin-shell` (free local swe-1.6
 subprocesses — cheap, weak) and `claude-code`. Adapter selection is **global per
-repo** (`devin.adapter`), so every issue in a repo gets the same worker
+repo** (`worker.harness`), so every issue in a repo gets the same worker
 regardless of difficulty, and reworks go back to the same (weak) worker that
 produced the flawed first pass.
 
@@ -55,7 +59,6 @@ existing launch/supervision stack carries over. New modules:
 | Module | Responsibility | Size |
 |---|---|---|
 | `api_worker.py` | Resolve active provider → env dict; budget preflight; delegate to `claude_code.launch_claude_worker(adapter_kind="api", ...)` | ~150 lines |
-| `routing.py` | Pure `select_adapter(request, *, config, budget_status, issue_labels) -> AdapterChoice` | small |
 | `api_budget.py` | Atomic-JSON spend ledger; session settlement from events.jsonl usage × provider pricing | small |
 
 **Prerequisite refactor:** `claude_code.launch_claude_worker` gains
@@ -103,7 +106,6 @@ api_worker:
     preflight_reserve_usd: 1.00  # headroom estimate while per-session cap is unset
     max_usd_per_day: 5.00
     lifetime_usd: 15.00       # trial ceiling; raise/remove post-trial
-  fallback_adapter: devin-shell
   worker_template: worker_claude_code.md
   rework_template: rework.md
 ```
@@ -113,32 +115,26 @@ must be > 0 when budget enforcement is enabled; `api_key_env` must be a
 non-empty name (presence of the env var itself is a doctor/runtime check, not a
 load-time failure, so unrelated repos with the section absent are unaffected).
 
-## 5. Routing policy
+## 5. Routing policy (superseded)
 
-`routing.select_adapter` returns a frozen
-`AdapterChoice(kind, provider, reason)`. Rules, in order:
+Phase 2 of the role-config refactor (a separate, later project) deleted the
+per-issue adapter-selection layer this section originally described — the
+pure selection function, its frozen `AdapterChoice` return type, the
+`rework=True` and `complexity:high`-label rules, the preflight checks, and the
+fallback-to-a-different-adapter-on-failure chain, along with the
+`adapter_history` state recording that made each choice auditable. None of
+that exists anymore.
 
-1. `rework=True` → `api` *(Phase 1)*
-2. First pass and issue carries `config.labels.complexity_high`
-   (new `LabelConfig` field, default `"complexity:high"`, **not** in the ACTIVE
-   label set so it never blocks dispatch selection) → `api` *(Phase 2)*
-3. Otherwise → `devin-shell`
-4. Any `api` choice passes preflight: `enabled`, key env var present, budget
-   headroom (§6), provider not in failure cooldown, live `api` session count
-   < `max_concurrent_sessions`. On failure → `fallback_adapter` with a
-   machine-readable reason (`fallback:budget`, `fallback:auth`,
-   `fallback:cooldown`, `fallback:concurrency`, `fallback:disabled`).
-
-Both `dispatch()` and `dispatch_rework()` call the same function — no policy
-duplication. Dispatch partitions the pass's `SessionRequest`s by chosen adapter
-and calls `dispatch_sessions` once per group; `AdapterSettings` stays
-per-call-global, unchanged in shape.
-
-**State recording:** every choice appends
-`{ts, kind, provider, reason}` to `state["issues"][n]["adapter_history"]`.
-This creates the first-pass-adapter memory the state machine currently lacks
-(nothing today records which adapter ran an issue) and makes every routing
-decision auditable after the fact.
+`api` is now selected purely via `worker.harness: api` (and, symmetrically,
+`reviewer.harness: api` for review dispatch) — a whole-pass config choice,
+not a per-issue policy decision made at dispatch time. Whichever harness the
+config names is what every issue in that pass gets; there is no per-issue
+rework-routes-to-api rule and no runtime fallback to a different harness when
+a preflight-style check would have failed. See
+[docs/RUNBOOK.md](../RUNBOOK.md#api-worker-operations) for the current
+selection and budget-exhaustion behavior, including the open gap left by this
+deletion: no pre-launch budget check currently exists to replace the one
+described in §6 below.
 
 ## 6. Budget governance
 
@@ -211,7 +207,8 @@ silently forgotten.
 ## 10. Testing
 
 Mirror the per-adapter test pattern: new `tests/test_api_worker.py`,
-`tests/test_routing.py`, `tests/test_api_budget.py`; third-arm additions to
+`tests/test_api_budget.py` (the per-issue selection layer's own test file was
+deleted along with it — see §5); third-arm additions to
 `tests/test_worker.py` / `tests/test_worker_health.py`; `dispatch_sessions`
 partition coverage alongside the existing adapter glue tests. Routing and
 budget are pure functions over frozen inputs — exhaustively testable. No
@@ -237,7 +234,7 @@ after ⑤. All are `automated-ready` except ⑪.
 | ② | `claude_code` `adapter_kind` parameterization (sidecar suffix, `provider` field, default-preserving) | ① |
 | ③ | `api_worker.py` + `adapters.py` branch + `worker.py` third-arm wiring + `iter_workers` | ② |
 | ④ | `api_budget.py` ledger + settlement on reap + force `tee_stream_json` | ③ |
-| ⑤ | `routing.py` + `adapter_history` state recording | ① |
+| ⑤ | the per-issue selection module (deleted in Phase 2 of the role-config refactor — see §5) + `adapter_history` state recording | ① |
 | ⑥ | Dispatch/rework-dispatch integration: per-issue partition, per-group `dispatch_sessions`, fallback path | ③ ④ ⑤ |
 | ⑦ | Watchdog in-flight budget kill + `budget_exceeded`/`provider_auth` failure kinds + auth cooldown | ④ ⑥ |
 

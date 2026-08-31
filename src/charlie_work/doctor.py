@@ -84,20 +84,95 @@ def workflow_job_names(repo_root: Path) -> set[str]:
     return names
 
 
-def _check_name_matches(required: str, job_names: set[str]) -> bool:
-    if required in job_names:
-        return True
-    # Matrix jobs report as "<name> (<matrix values>)"; reusable workflows as
-    # "<caller> / <callee>". Only these delimited expansions count as a match —
-    # a bare prefix must not (job "Test" is not the check "Tests passed").
+def workflow_job_matrix_flags(repo_root: Path) -> dict[str, bool]:
+    """Map each workflow job display name to whether that job uses ``strategy.matrix``.
+
+    Derives matrix-ness from the parsed workflow YAML rather than a hardcoded
+    job-name list, scoped PER JOB (not repo-wide), so the required-check
+    verifier (issue #1508) can decide whether matrix-suffix tolerance
+    (``Name (suffix)`` matching job ``Name``) is justified by an actual matrix
+    expansion ON THE MATCHED JOB -- or is matching a stale suffixed
+    required-check entry that the exact-match merge gate (``checks.py``) would
+    report ``missing`` forever.
+
+    A previous repo-wide boolean could justify a tolerance match against a
+    non-matrix job in workflow B merely because an unrelated job in workflow A
+    had a matrix -- silently reintroducing the exact false-pass hazard #1508
+    closed once any workflow in a multi-workflow repo gained a matrix job.
+    Scoping to the matched job's own matrix flag is the single point of
+    enforcement.
+
+    A display name shared by several jobs is matrix-backed if ANY job reporting
+    under that name has a matrix (OR-combined), so a tolerance match on that
+    name is justified whenever at least one underlying job would actually
+    expand it.
+    """
+    flags: dict[str, bool] = {}
+    workflows_dir = repo_root / ".github" / "workflows"
+    if not workflows_dir.is_dir():
+        return flags
+    for candidate in sorted(workflows_dir.glob("*.y*ml")):
+        try:
+            raw = yaml.safe_load(candidate.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        jobs = raw.get("jobs") if isinstance(raw, dict) else None
+        if not isinstance(jobs, dict):
+            continue
+        for job_id, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            # Mirror workflow_job_names' name resolution exactly so the keys
+            # here align with the names a tolerance match is computed against.
+            name = str(job["name"]) if job.get("name") else str(job_id)
+            strategy = job.get("strategy")
+            has_matrix = isinstance(strategy, dict) and isinstance(strategy.get("matrix"), dict)
+            flags[name] = flags.get(name, False) or has_matrix
+    return flags
+
+
+def _tolerance_match_base_names(required: str, job_names: set[str]) -> list[str]:
+    """Return the workflow job display names a required check matches via tolerance.
+
+    A tolerance match is a matrix-suffix or reusable-workflow-delimiter match
+    (``Name (suffix)`` / ``caller / callee``). The returned names are the
+    workflow job display names (the ``name``/``id`` from
+    :func:`workflow_job_names`) that the suffix/delimiter expands from -- i.e.
+    the jobs whose own ``strategy.matrix`` flag decides whether the tolerance
+    is justified. A bare prefix never counts (job "Test" is not the check
+    "Tests passed").
+    """
+    bases: list[str] = []
     for name in job_names:
         if not name:
             continue
         if required.startswith(f"{name} (") or required.startswith(f"{name} / "):
-            return True
-        if name.startswith(f"{required} (") or name.startswith(f"{required} / "):
-            return True
-    return False
+            bases.append(name)
+        elif name.startswith(f"{required} (") or name.startswith(f"{required} / "):
+            bases.append(name)
+    return bases
+
+
+def _check_name_match_kind(required: str, job_names: set[str]) -> str | None:
+    """Classify how a required check matches workflow job names.
+
+    Returns ``"exact"`` for a direct name match, ``"tolerance"`` for a
+    matrix-suffix or reusable-workflow-delimiter match
+    (``Name (suffix)`` / ``caller / callee``), or ``None`` for no match.
+
+    The merge gate in ``checks.py`` uses EXACT match only, so a
+    ``"tolerance"``-only match is a stale-required-check-entry hazard when the
+    matched job has no ``strategy.matrix`` (issue #1508): doctor would pass a
+    ``Tests (windows-latest)`` required-check entry that the merge gate
+    reports ``missing`` forever. Whether the tolerance is justified is decided
+    by the caller, scoped to the matched job via
+    :func:`workflow_job_matrix_flags` + :func:`_tolerance_match_base_names`.
+    """
+    if required in job_names:
+        return "exact"
+    if _tolerance_match_base_names(required, job_names):
+        return "tolerance"
+    return None
 
 
 def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> None:
@@ -108,7 +183,7 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
     custom wrapper set in ``devin.shell_command`` / ``claude_code.command`` is
     exercised — not the hardcoded default name.
     """
-    adapter = config.devin.adapter
+    adapter = config.worker.harness
     if adapter == "devin-shell":
         from .devin_shell import DEFAULT_COMMAND_TEMPLATE, probe_devin
 
@@ -201,7 +276,7 @@ def _check_worker_github_token(add: Any, config: OrchestratorConfig) -> None:
 
     Two other paths dispatch through the claude-code launch path
     (``claude_code.worker_env``) regardless of the configured default
-    ``devin.adapter``, so a ``devin-shell``/``manual``/``command`` default
+    ``worker.harness``, so a ``devin-shell``/``manual``/``command`` default
     can still stall a worker mid-pass with no visible finding unless both are
     covered:
 
@@ -1185,17 +1260,54 @@ def run_doctor(
 
     # -- required checks vs live workflow files ------------------------------
     job_names = workflow_job_names(repo_root)
+    # Per-job matrix flags (issue #1508): a tolerance match is justified only
+    # when the SPECIFIC job it expands from has strategy.matrix, not when any
+    # unrelated workflow in the repo has one. The repo-wide boolean this
+    # replaced could pass a stale suffixed required-check entry against a
+    # non-matrix job merely because a sibling workflow gained a matrix job.
+    job_matrix_flags = workflow_job_matrix_flags(repo_root)
     if config.auto_merge.required_checks:
         if job_names:
             for required in config.auto_merge.required_checks:
-                matched = _check_name_matches(required, job_names)
-                add(
-                    f"check name: {required}",
-                    matched,
-                    "matches a workflow job"
-                    if matched
-                    else f"no job in .github/workflows/ reports this name; found: {sorted(job_names)}",
-                )
+                kind = _check_name_match_kind(required, job_names)
+                if kind is None:
+                    add(
+                        f"check name: {required}",
+                        False,
+                        f"no job in .github/workflows/ reports this name; found: {sorted(job_names)}",
+                    )
+                elif kind == "exact":
+                    add(f"check name: {required}", True, "matches a workflow job")
+                else:  # tolerance -- matrix-suffix or reusable-workflow delimiter
+                    # Scope the matrix justification to the job(s) that produced
+                    # the tolerance match, not the whole repo.
+                    bases = _tolerance_match_base_names(required, job_names)
+                    matched_has_matrix = any(job_matrix_flags.get(base, False) for base in bases)
+                    if matched_has_matrix:
+                        add(
+                            f"check name: {required}",
+                            True,
+                            "matches a workflow job via matrix-suffix tolerance "
+                            "(matched job has strategy.matrix)",
+                        )
+                    else:
+                        # The merge gate (checks.py) uses EXACT match only, so a
+                        # suffixed required-check entry that matches only via
+                        # tolerance would be reported `missing` forever -- the
+                        # same stale-required-check trap #1507 corrected in the
+                        # README. Fail rather than warn: doctor's job is to catch
+                        # this before a dispatch wave strands an approved PR
+                        # (issue #1508). The matched job has no strategy.matrix,
+                        # so the suffix is a stale entry, not a real expansion --
+                        # even if some OTHER workflow in the repo has a matrix.
+                        add(
+                            f"check name: {required}",
+                            False,
+                            "matches a workflow job only via matrix-suffix tolerance, "
+                            "but the matched job has no strategy.matrix -- "
+                            "the exact-match merge gate (checks.py) would report this "
+                            "required check as missing forever",
+                        )
         else:
             add(
                 "workflow files",
@@ -1254,31 +1366,31 @@ def run_doctor(
         )
 
     # -- adapters ------------------------------------------------------------
-    if config.devin.adapter == "command" and not config.devin.dispatch_command:
+    if config.worker.harness == "command" and not config.devin.dispatch_command:
         add("dispatch adapter", False, "adapter is `command` but dispatch_command is empty")
     else:
-        add("dispatch adapter", True, config.devin.adapter)
+        add("dispatch adapter", True, config.worker.harness)
 
     # Report the effective devin-shell worker model so the operator can see
     # what dispatch will actually launch.
-    if config.devin.adapter == "devin-shell":
-        if config.devin.worker_model:
+    if config.worker.harness == "devin-shell":
+        if config.worker.model:
             add(
                 "devin-shell worker model",
                 True,
-                f"config-driven: {config.devin.worker_model}",
+                f"config-driven: {config.worker.model}",
             )
         else:
             add(
                 "devin-shell worker model",
                 True,
-                "CLI default (no devin.worker_model configured)",
+                "CLI default (no worker.model configured)",
                 severity="warning",
             )
 
     # claude-code worktrees junction a shared venv in; surface a missing
     # venv_source at preflight rather than deferring it to the first dispatch.
-    if config.devin.adapter == "claude-code" and config.claude_code.venv_source:
+    if config.worker.harness == "claude-code" and config.claude_code.venv_source:
         venv = Path(config.claude_code.venv_source)
         if not venv.is_absolute():
             venv = repo_root / venv
@@ -1290,6 +1402,20 @@ def run_doctor(
             else f"claude_code.venv_source does not exist: {venv} "
             "(set it to null to disable venv sharing)",
         )
+
+    # -- role config summary ------------------------------------------------
+    # Always informational -- this section never blocks doctor from passing,
+    # it exists purely so an operator can see the resolved worker/reviewer
+    # roles in one place, without cross-referencing devin/claude_code/
+    # review_dispatch/rescue by hand.
+    cross_family_status = "yes" if config.worker.model != config.reviewer.model else "no"
+    add(
+        "role config",
+        True,
+        f"worker: harness={config.worker.harness} model={config.worker.model or '(CLI default)'} | "
+        f"reviewer: harness={config.reviewer.harness} model={config.reviewer.model or '(CLI default)'} | "
+        f"cross-family: {cross_family_status}",
+    )
 
     # -- worker GitHub token (issue #873 Part 2) -----------------------------
     # Config-only, no I/O: reads devin.worker_env/claude_code.worker_env, never
@@ -1313,31 +1439,21 @@ def run_doctor(
     if live:
         _validate_gh_field_lists(add, gh)
 
-    if config.cross_family.enabled:
-        command = config.cross_family.command
-        binary = command.split()[0] if isinstance(command, str) else str(command[0])
-        found = shutil.which(binary)
-        add(
-            "cross-family binary",
-            found is not None,
-            found or f"cross_family.enabled but `{binary}` not found on PATH",
-            severity="warning",
-        )
-
     # -- review-to-verdict path (gap that let 34 reviews sit unread) ---------
-    # review_dispatch.enabled and cross_family.auto_verdict are the only two
-    # paths that call record_review(). If both are off there is no automated
-    # route from a completed review to a recorded verdict at all: PRs pile up
-    # in "reviewing" with valid reports and no decision, invisible to any
-    # other check here.
-    has_review_to_verdict_path = config.review_dispatch.enabled or config.cross_family.auto_verdict
+    # review_dispatch.enabled and rescue.enabled are the two paths that call
+    # record_review() automatically (the rescue tier's own reviewer launch
+    # calls it directly from _process_rescue_review, workflow.py). If both
+    # are off there is no automated route from a completed review to a
+    # recorded verdict at all: PRs pile up in "reviewing" with valid reports
+    # and no decision, invisible to any other check here.
+    has_review_to_verdict_path = config.review_dispatch.enabled or config.rescue.enabled
     add(
         "review-to-verdict path",
         has_review_to_verdict_path,
         "ok"
         if has_review_to_verdict_path
         else (
-            "review_dispatch.enabled and cross_family.auto_verdict are both "
+            "review_dispatch.enabled and rescue.enabled are both "
             "false: no automated path from review to verdict; PRs accumulate "
             "in reviewing with valid reports and no decision"
         ),

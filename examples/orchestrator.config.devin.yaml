@@ -10,7 +10,6 @@ dispatch:
   # (stale ready-label cleanup). 0 disables finalization.
   finalize_limit: 25
   branch_prefix: agent/issue
-  worker_model_tier: capable
   # Devin worker sessions use the skills-based loop.
   worker_template: worker.md
   # Dispatch order: "oldest" (default) or "newest" (previous behavior)
@@ -106,23 +105,44 @@ runtime:
   # actual reset. Default 90 seconds.
   # throttle_resume_margin_s: 90
 
-devin:
+worker:
   # devin-shell launches headless `devin` CLI sessions per issue, non-blocking,
-  # with sidecar JSON + per-session logs under sessions_dir. Each worker runs
-  # in an isolated per-issue git worktree so concurrent sessions do not fight
-  # over the shared checkout. Verify with `charlie doctor --adapter-probe`
-  # before the first wave. Fall back to `adapter: manual` (operator pastes
-  # prompts from the session manifest) if the devin CLI is unavailable.
-  adapter: devin-shell
+  # with sidecar JSON + per-session logs under devin.sessions_dir below. Each
+  # worker runs in an isolated per-issue git worktree so concurrent sessions do
+  # not fight over the shared checkout. Verify with `charlie doctor
+  # --adapter-probe` before the first wave. Fall back to harness: manual
+  # (operator pastes prompts from the session manifest) if the devin CLI is
+  # unavailable.
+  harness: devin-shell
+  # Empty string means CLI default (currently claude-opus-4-8-medium, the
+  # premium tier). Set to a specific model name (e.g. "claude-sonnet-4-5") to
+  # control cost. Run `charlie doctor` to verify the effective model.
+  model: ""
+
+reviewer:
+  # Phase 1 of the role-config refactor only accepts harness: claude-code
+  # here (config.ReviewerRoleConfig) — a non-Claude reviewer.harness is
+  # rejected at load with ConfigError. review_dispatch is off in this
+  # profile, so no automated Claude reviewer session is actually launched;
+  # the field is declared for when review_dispatch is flipped on.
+  #
+  # This profile used to run its adversarial review through cross_family
+  # (model: codex via the Devin CLI) instead of review_dispatch — that was
+  # the auto-gate subsystem Phase 2 (Part A2) deletes wholesale. There is no
+  # role-schema equivalent for a non-Claude PRIMARY reviewer in Phase 1: only
+  # the bounded rescue tier (rescue.reviewer, fires after rework-cycle
+  # exhaustion, not on every PR) can still name a non-claude-code harness.
+  # Tracked as a design gap between this deletion project and Phase 1's
+  # shipped reviewer.harness constraint (no non-Claude PRIMARY reviewer path
+  # exists post-deletion). A follow-up issue should be filed to resolve this
+  # before it is relied on in production.
+  harness: claude-code
+
+devin:
+  # devin-shell adapter: sidecar JSON + per-session logs live here.
   session_manifest: .var/charlie-work/dispatches/session-manifest.json
   session_results: .var/charlie-work/dispatches/session-results.json
   sessions_dir: .var/charlie-work/dispatches/sessions
-  # Worker model for devin-shell sessions; empty string means CLI default
-  # (currently claude-opus-4-8-medium, the premium tier). Set to a specific
-  # model name (e.g. "claude-sonnet-4-5") to control cost. The rendered command
-  # will include "--model <value>" when set. Run `charlie doctor` to verify the
-  # effective model before dispatching.
-  worker_model: ""
   # Disabled by default (issue #112): a devin-shell worker has a full shell and
   # can run uv sync, which would rewrite a shared venv's editable-install .pth
   # to point at the worktree, causing other worktrees to silently import that
@@ -133,29 +153,16 @@ devin:
   # Placeholders: {prompt_path} {issue_number} {branch} {model_args}. A list runs without a
   # shell. --permission-mode dangerous is required for headless workers; without
   # it the Devin CLI defaults to auto (read-only tools) and stalls on git/uv/gh.
-  # The {model_args} placeholder is replaced with "--model <worker_model>" when
-  # worker_model is set, or an empty string when unset (CLI default).
+  # The {model_args} placeholder is replaced with "--model <worker.model>" when
+  # worker.model is set, or an empty string when unset (CLI default).
   # shell_command: [devin, --prompt-file, "{prompt_path}", --print, --permission-mode, dangerous]
-  # A blocking alternative is adapter: command with dispatch_command +
+  # A blocking alternative is worker.harness: command with dispatch_command +
   # command_timeout_seconds (one blocking launcher call per issue).
 
-cross_family:
-  # Auto adversarial pass by a NON-Claude model (codex via the Devin CLI) on
-  # every non-draft PR `why-charlie-hate` and on-demand `why-charlie-hate-spec`. Findings are
-  # LEADS, not verdicts (the model over-escalates severity) and never gate a
-  # merge. Set `enabled: false` (or delete this block) to revert to
-  # Claude-only review.
-  enabled: true
-  model: codex
-  # {model} and {prompt_path} are substituted at run time. A list runs without a shell.
-  command:
-    - devin
-    - --model
-    - "{model}"
-    - -p
-    - --prompt-file
-    - "{prompt_path}"
-  timeout_seconds: 300
+# cross_family (the codex-via-devin-CLI auto-gate that used to run here as
+# this profile's sole automated review/verdict path, since review_dispatch is
+# off) is deleted in Phase 2 Track A — see reviewer: above for what replaces
+# it and what does not.
 
 supervisor:
   # Foreground poll/sleep loop used by `charlie bash-rats` (per-repo) and

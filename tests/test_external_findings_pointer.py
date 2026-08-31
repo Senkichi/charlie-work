@@ -18,7 +18,7 @@ function of a ``decision`` dict -- no ``OrchestratorApp``/state needed.
 
 from __future__ import annotations
 
-from charlie_work.cross_family import LEGACY_VACUOUS_SUMMARY
+from charlie_work.rescue_review import LEGACY_VACUOUS_SUMMARY
 from charlie_work.github import _CLOSING_KEYWORD_REF
 from charlie_work.workflow import _render_required_changes_section
 

@@ -23,7 +23,7 @@ boring and auditable.
 orchestrator crash, a machine reboot, or a switch to a different operator's
 laptop: `charlie roll-call` reconstructs everything by re-querying GitHub.
 The local `state.json` is a derived event log and convenience cache (recent
-runs, artifact paths, cross-family reuse), never the source of truth for
+runs, artifact paths), never the source of truth for
 "what state is this issue in."
 
 ```
@@ -32,9 +32,9 @@ runs, artifact paths, cross-family reuse), never the source of truth for
                     └─────────────────────────────────────────────┘
   intake ──► dispatch ──► worker session ──► PR ──► review ──► merge-ready
   (issues        │        (Devin / Claude       (janitor gate,      │
-   labeled       │         Code, one issue       review packet,     ├─ merge
-   automated-    │         per session)          optional cross-    ├─ labels
-   ready)        └─ writes worker-prompt.md      family pass)       └─ branch
+   labeled       │         Code, one issue       review packet)     ├─ merge
+   automated-    │         per session)                             ├─ labels
+   ready)        └─ writes worker-prompt.md                         └─ branch
                     + session manifest/sidecar                        delete
                                                                     (best-effort)
 ```
@@ -48,23 +48,22 @@ should not need to be read to reason about it.
 |---|---|
 | `__init__.py` | Package version and `CLI_NAME` (`charlie`) constant. |
 | `cli.py` | `argparse` surface: parses `charlie <command>` invocations, builds `OrchestratorApp`, and prints `CommandResult` as text or `--json`. No business logic. |
-| `config.py` | Frozen dataclasses (`LabelConfig`, `DispatchConfig`, `ReviewConfig`, `AutoMergeConfig`, `RuntimeConfig`, `DevinConfig`, `ClaudeCodeConfig`, `CrossFamilyConfig`, `WatchdogConfig`, `TestAdequacyConfig`, `FleetConfig`, `NotifyConfig`) plus `load_config`/`find_config_path`. Absent `orchestrator.config.yaml` → pure dataclass defaults. |
+| `config.py` | Frozen dataclasses (`LabelConfig`, `DispatchConfig`, `ReviewConfig`, `AutoMergeConfig`, `RuntimeConfig`, `DevinConfig`, `ClaudeCodeConfig`, `WorkerRoleConfig`, `ReviewerRoleConfig`, `WatchdogConfig`, `TestAdequacyConfig`, `FleetConfig`, `NotifyConfig`) plus `load_config`/`find_config_path`. Absent `orchestrator.config.yaml` → pure dataclass defaults. |
 | `workflow.py` | `OrchestratorApp` — the orchestration engine: `status`, `bootstrap_labels`, `intake`, `dispatch`, `review`, `record_review`, `merge_ready`, `spec_review`, `loop`. Owns every multi-step business rule (merge-update-not-replace, rework cap, merge/label/branch-delete ordering). |
 | `github.py` | `GitHub` — every `gh` CLI invocation, JSON parsing, and the `dry_run` mutating-call guard. Also `label_names()` and `linked_issue_number()` helpers used across the codebase to read label/issue-link state from raw `gh` JSON. |
 | `labels.py` | **Single point of enforcement** for label transitions — `transition(gh, labels, issue_number, event)`. Every add/remove pair is a named edge (`queued`, `dispatched`, `review_started`, `rework_requested`, `escalated`, `blocked`, `merged`); workflow code names the event, never touches individual labels. |
 | `adapters.py` | `dispatch_sessions()` — the Devin `manual` (write-manifest-only) and `command` (subprocess-launch) adapters, plus the session manifest/results JSON writers. Refuses `{issue_title}` interpolation in string-form (shell) commands — command injection risk, since issue titles are attacker-influenceable on any repo taking public issues. |
-| `subprocess_runner.py` | `run_captured()` — the one subprocess entry point for adapters and cross-family calls. Centralizes UTF-8 + `errors="replace"` decoding and bytes-safe `TimeoutExpired` handling so Windows console encoding never crashes a caller. |
+| `subprocess_runner.py` | `run_captured()` — the one subprocess entry point for adapters. Centralizes UTF-8 + `errors="replace"` decoding and bytes-safe `TimeoutExpired` handling so Windows console encoding never crashes a caller. |
 | `checks.py` | `summarize_checks()` / `CheckSummary` — classifies `gh pr checks` output against `auto_merge.required_checks` into passed/pending/failed/missing; `.ready` is true only when none are pending, failed, or missing. |
-| `cross_family.py` | `run_cross_family_review()` — runs a non-Claude model (codex via the Devin CLI, by default) against a PR diff or spec file and captures its findings as **leads, not verdicts**. Never raises; a timeout/missing-binary/non-zero exit becomes a `(UNAVAILABLE)` stub report and a not-ok result rather than aborting review-packet generation. |
 | `prompts.py` | `render_prompt()` / `resolve_template()` — `string.Template.safe_substitute` rendering of `.md` templates under `prompts/`, with repo-local `runtime.prompts_dir` overriding package defaults by filename. |
 | `paths.py` | `find_repo_root()` (via `git rev-parse --git-dir`/`--git-common-dir` to resolve the shared main worktree root from a linked worktree, falling back to `--show-toplevel` with a `.git`-walk fallback) and `runtime_paths()` — derives the `RuntimePaths` tree (`issues/`, `prs/`, `dispatches/`, `logs/`, `state.json`) under `runtime.state_dir`. |
 | `state.py` | `load_state()` / `save_state()` / `append_event()` — the `state.json` reader/writer. Atomic writes (temp-file + `Path.replace`). A corrupt/truncated file is quarantined to `state.json.corrupt-<timestamp>`, never crashed on and never silently discarded. `append_event()` dual-writes to `events.db` (SQLite) when `state_path` is provided. |
 | `instrumentation.py` | SQLite-backed append-only event log (`events.db`) with correlation ID support. `log_event()` (best-effort, never raises), `record_loop_pass()` (loop pass summary table), `correlation_context()` (thread-local ID per orchestration pass), `read_event_log()` / `events_by_correlation_id()` / `query_events()` / `event_counts_by_kind()` (retrieval and aggregation). WAL mode, indexed on kind/ts/correlation_id/pr_number/issue_number. Auto-migrates legacy `events.jsonl`. |
-| `doctor.py` | `run_doctor()` — preflight diagnostics: `gh` on PATH + authenticated, config file presence, `required_checks` configured and matched against live `.github/workflows/*.yml` job names, GitHub labels exist, state file loads, dispatch adapter configured, cross-family binary on PATH (if enabled), worker template resolves. |
+| `doctor.py` | `run_doctor()` — preflight diagnostics: `gh` on PATH + authenticated, config file presence, `required_checks` configured and matched against live `.github/workflows/*.yml` job names, GitHub labels exist, state file loads, dispatch adapter configured, worker template resolves. |
 | `worktree.py` | Junction-safe git worktree lifecycle: `create_worktree()` (creates a worktree + optional `.venv` Windows-junction/symlink to a shared virtualenv) and `remove_worktree()` (unlinks the `.venv` reparse point *before* `git worktree remove`, so teardown never follows the junction into the shared venv and deletes its contents). See [Invariants](#invariants) below. |
-| `devin_shell.py` | Non-blocking headless Devin CLI dispatch: `launch_devin_session()` spawns `devin --prompt-file <path> --print` via `Popen` (never blocks on completion) and writes a durable sidecar JSON (`sessions_dir/issue-<n>.json`) atomically before returning. `read_session_records()`, `is_session_alive()` (Windows liveness via ctypes `OpenProcess`+`GetExitCodeProcess`, since `os.kill(pid, 0)` is unreliable on Windows; `os.kill` on POSIX), and `probe_devin()` (for `doctor --adapter-probe`) round out the module. Selected by `devin.adapter: devin-shell`. |
-| `claude_code.py` | Worktree-isolated Claude Code workers: `launch_claude_worker()` composes `worktree.create_worktree()` with a headless `claude -p` `Popen` launch, writing a `.claude.json` sidecar per issue (field names mirror `devin_shell`'s sidecar so downstream code can treat both worker kinds uniformly). Best-effort worktree cleanup on a failed launch. `read_worker_records()` and `probe_claude()` mirror the `devin_shell` helpers. Selected by `devin.adapter: claude-code`. |
-| `janitor.py` | Deterministic, non-LLM pre-review gate: `run_janitor(pr, checks, config)` returns a `JanitorVerdict` (pass/fail + warnings) by checking draft state, PR/mergeable state, required-checks status, linked-issue presence, non-empty body with a tests/rationale mention, conventional-commit-shaped title (warning only), and oversized-diff size (warning only). Pure function — no I/O, no `gh` calls; the caller feeds it data it already fetched. `review()` calls it **before** any packet or cross-family spend and short-circuits a failing PR to `janitor_blocked`. |
+| `devin_shell.py` | Non-blocking headless Devin CLI dispatch: `launch_devin_session()` spawns `devin --prompt-file <path> --print` via `Popen` (never blocks on completion) and writes a durable sidecar JSON (`sessions_dir/issue-<n>.json`) atomically before returning. `read_session_records()`, `is_session_alive()` (Windows liveness via ctypes `OpenProcess`+`GetExitCodeProcess`, since `os.kill(pid, 0)` is unreliable on Windows; `os.kill` on POSIX), and `probe_devin()` (for `doctor --adapter-probe`) round out the module. Selected by `worker.harness: devin-shell`. |
+| `claude_code.py` | Worktree-isolated Claude Code workers: `launch_claude_worker()` composes `worktree.create_worktree()` with a headless `claude -p` `Popen` launch, writing a `.claude.json` sidecar per issue (field names mirror `devin_shell`'s sidecar so downstream code can treat both worker kinds uniformly). Best-effort worktree cleanup on a failed launch. `read_worker_records()` and `probe_claude()` mirror the `devin_shell` helpers. Selected by `worker.harness: claude-code`. |
+| `janitor.py` | Deterministic, non-LLM pre-review gate: `run_janitor(pr, checks, config)` returns a `JanitorVerdict` (pass/fail + warnings) by checking draft state, PR/mergeable state, required-checks status, linked-issue presence, non-empty body with a tests/rationale mention, conventional-commit-shaped title (warning only), and oversized-diff size (warning only). Pure function — no I/O, no `gh` calls; the caller feeds it data it already fetched. `review()` calls it **before** any packet spend and short-circuits a failing PR to `janitor_blocked`. |
 | `reconcile.py` | Drift detection between GitHub's actual state and the orchestrator's recorded state — e.g. a PR merged outside `merge_ready()` whose issue is still labeled `agent:in-progress`. `detect_drift()` is read-only (two `gh` list calls, zero mutations); `apply_fixes()` returns a *new* state and repairs labels via `labels.transition`. Surfaced as `charlie mop-up [--fix]` (read-only without `--fix`). |
 | `prompt_sections.py` | Shared worker-prompt partials: `section_variables(search_dirs)` discovers every `*.md` file under a `worker_sections/` directory (package default `prompts/worker_sections/`, e.g. `scope_contract.md`, `issue_metadata.md`) and exposes each as a `section_<stem>` template value — repo-local `<search_dir>/worker_sections/` wins over the package default per filename, mirroring `prompts.resolve_template`. No section names are hardcoded; the available set is whatever `*.md` files exist on disk. `render_prompt()` folds these in and runs a two-pass substitution so section text carrying its own `$placeholders` resolves. |
 | `worker.py` | Adapter-agnostic worker abstraction: `WorkerView` (frozen dataclass) provides a unified shape for worker records across all adapters (devin-shell, claude-code). `iter_workers()` reads every devin-shell + claude-code sidecar in sessions_dir and returns a unified, adapter-tagged list. `update_worker_log_stat()` refreshes last_activity_at and log_bytes fields from a fresh stat() of the log file. This collapses duplicated adapter-iteration loops in workflow.py into a single abstraction point for fleet supervision. |
@@ -74,7 +73,7 @@ should not need to be read to reason about it.
 | `fleet_dispatch.py` | `fleet_loop()` — composes N per-repo passes across the registry under one global budget. Selects/orders repos (explicit `--repos` or oldest-`last_seen`-first), runs each repo's `dispatch()` (`work_only`) or `loop()` (bash-rats), isolates per-repo failures so one broken repo never aborts the sweep, and emits a consolidated attention digest (`notify.emit_digest`). Backs `charlie fleet work` / `fleet bash-rats`. |
 | `notify.py` | Pluggable needs-attention notification layer: `classify_worker_health()`-fed `AttentionDigest`/`AttentionEntry` value objects and `emit_digest()` fan-out to one of four sinks (webhook, desktop toast, shell command, file) selected by `NotifyConfig.sink`. Sink failures come back as values and never fail the pass. Disabled by default (`notify.enabled: false`). |
 | `worker.py` (health) | Beyond the `WorkerView` abstraction, owns the supervisor's `WorkerHealth` enum, `UsageSnapshot`, and `classify_worker_health()` — the multi-signal (liveness, log staleness, terminal markers, wall-clock, loop, cost/token) classifier the per-repo supervisor sweep and `status()`'s `workers` section both consume. |
-| `env_sanitize.py` | `sanitize_env(target_path)` — single implementation of worker-subprocess environment sanitization; drops `VIRTUAL_ENV`/`UV_PROJECT_ENVIRONMENT` (or repoints `VIRTUAL_ENV` at the target's `.venv`) so the orchestrator's env never leaks into a worker. Shared by `claude_code`, `devin_shell`, and `cross_family`. |
+| `env_sanitize.py` | `sanitize_env(target_path)` — single implementation of worker-subprocess environment sanitization; drops `VIRTUAL_ENV`/`UV_PROJECT_ENVIRONMENT` (or repoints `VIRTUAL_ENV` at the target's `.venv`) so the orchestrator's env never leaks into a worker. Shared by `claude_code` and `devin_shell`. |
 | `process_utils.py` | Shared cross-adapter process helpers — `/proc/<pid>/stat` starttime parsing (PID-reuse-safe liveness), process-age computation, and related primitives used by the liveness/orphan-reaping paths. |
 
 `runners.py`, `runner_allocation.py`, `runner_slots.py`, and `runner_allocation_pass.py`
@@ -181,8 +180,6 @@ sorted keys. Schema version pinned by `state.STATE_VERSION = 1`.
       "prompt_path": ".var/charlie-work/prs/pr-123/review-prompt.md",
       "decision_path": ".var/charlie-work/prs/pr-123/review-decision.json",
       "status": "reviewing",
-      "cross_family_report": ".var/charlie-work/prs/pr-123/cross-family-review.md",
-      "cross_family_ok": true,
       "decision": "approved",              // set by record_review()
       // merge_ready() also folds in: can_merge, auto_merge_enabled, merged,
       // merge_output, branch_deleted, review_decision, checks
@@ -191,7 +188,7 @@ sorted keys. Schema version pinned by `state.STATE_VERSION = 1`.
   "events": [
     {"at": "2026-07-02T18:00:00Z", "kind": "intake", "payload": {"issue_count": 3}},
     {"at": "2026-07-02T18:01:00Z", "kind": "dispatch", "payload": {"issue_numbers": [565], "failed_issue_numbers": []}},
-    {"at": "2026-07-02T18:05:00Z", "kind": "review_packet", "payload": {"pr_number": 123, "issue_number": 565, "cross_family_ok": true, "cross_family_reused": false}},
+    {"at": "2026-07-02T18:05:00Z", "kind": "review_packet", "payload": {"pr_number": 123, "issue_number": 565}},
     {"at": "2026-07-02T18:10:00Z", "kind": "record_review", "payload": {"pr_number": 123, "decision": "approved"}},
     {"at": "2026-07-02T18:11:00Z", "kind": "merge_ready", "payload": {"pr_number": 123, "can_merge": true, "merged": true}}
     // capped at state.DEFAULT_EVENT_RING_SIZE (2000) entries, overridable via
@@ -274,9 +271,7 @@ The per-issue/PR artifact tree alongside `state.json`:
 │   ├── review-prompt.md        # rendered from prompts/review.md
 │   ├── review-decision.json    # the merge-gate authority (see below)
 │   ├── rework-prompt.md        # rendered on request_changes, under cap
-│   ├── review-comment.md       # written when verdict --comment
-│   └── cross-family-review.md  # if cross_family enabled and PR non-draft
-├── cross-family/                # why-charlie-hate-spec artifacts (prompt + report per slug)
+│   └── review-comment.md       # written when verdict --comment
 ├── dispatches/
 │   ├── session-manifest.json   # dispatch_sessions() write, every wave
 │   └── session-results.json    # per-request ok/error outcome
@@ -295,7 +290,6 @@ janitor gate (deterministic, no LLM cost)
         ▼  passes
 review packet generation (review())
    - snapshot pr.json / checks.json / diff.patch
-   - optional cross-family pass (non-draft PR, cross_family.enabled or --cross-family)
    - render review-prompt.md
    - transition("review_started") → agent:pr-open + agent:reviewing
         │
@@ -316,10 +310,7 @@ ship-it
 deterministic gate — a pure function over `pr`/`checks` data the caller
 already fetched, so it costs no extra `gh` calls and no LLM tokens. A failing
 verdict short-circuits `review()` to a `janitor_blocked` result with zero
-packet or cross-family spend. The `cross_family` pass, when enabled, augments the review packet
-with a non-Claude model's findings but never gates by itself — its findings
-are leads the reviewer must verify, exactly as `cross_family.py`'s own
-`_CAVEAT` text states.
+packet-generation spend.
 
 ## Invariants
 
@@ -349,47 +340,6 @@ incidents actually happened — not scattered as defensive checks:
   instead of another rework prompt. This exists because iteration past ~2-3
   rounds empirically thrashes (wrong brief or genuinely unimplementable
   criteria) rather than converging.
-- **Cross-family stub reuse only on success.** `_cross_family_for_pr` reuses
-  an existing `cross-family-review.md` only if its first line does **not**
-  contain `(UNAVAILABLE)` — a failed run's stub must not be treated as a
-  permanent success on the next pass.
-- **Cross-family regeneration cap, per head SHA — two budgets.** `loop()`'s
-  same-head packet skip treats an unusable cross-family report (an
-  `(UNAVAILABLE)` stub, or one carrying no head-SHA marker) as staleness and
-  forces `review()` to regenerate it. Two separate budgets bound that, both
-  counted in one head-keyed record in `state.json` and both bounded by
-  `cross_family.max_regen_attempts` (default `2`). A new push resets **both**
-  together, since a new head has never been tried. Sharing the bound is safe
-  only because they share that key.
-
-  - `attempts` — charged by `_cross_family_for_pr` immediately before
-    `run_cross_family_review`, i.e. by the model call it bounds. Necessary
-    because regeneration runs the cross-family model synchronously for up to
-    `cross_family.timeout_seconds`; unbounded, a model that is simply down
-    would burn that timeout every pass and starve the other repo in the shared
-    sequential loop (#1078). Past the cap — adjudicated *after* the model
-    returns, when "the report is still unusable" is an observation rather than
-    a guess — the issue escalates to `agent:human-needed`
-    (`reason="cross_family_report_unusable"`, `reason_class="judgment"`).
-  - `not_reached` — charged when `review()` was forced for this reason, ran,
-    and returned before ever reaching the regenerator. Overwhelmingly the
-    janitor gate declining a PR with merge conflicts or missing required
-    checks. Past the cap the PR is **parked**: the cross-family report stops
-    forcing `review()` by itself, with no escalation and no label.
-
-  The asymmetric terminations are deliberate. A park is keyed by head SHA and
-  self-heals on the next push; `reason_class="judgment"` is excluded from the
-  automatic de-escalation sweep and needs a human. Escalating a PR whose model
-  was never invoked asserts "unusable *and unfixable*" on evidence for only the
-  first half — the #1099 defect, which put 36 of 54 escalated issues in one
-  consumer repo into a sink that refilled as fast as it was drained. A parked PR is not
-  silent: the janitor gate reports its actual blocker on its own channel every
-  pass, and `cross_family_regen_not_reached` records the decline.
-
-  Neither cap shares `max_parse_failures`' terminal shape — that one ends in a
-  caveated `approved`; neither of these ever does, because approving against a
-  head that was never positively confirmed is exactly the fail-open #1079
-  closed.
 - **Per-PR isolation in `loop()`.** Each PR's `review()`/`merge_ready()` call
   is wrapped in its own `try/except GitHubError`; one PR's merge conflict or
   `gh` failure is recorded in `errors` and does not abort the rest of the
@@ -405,7 +355,7 @@ incidents actually happened — not scattered as defensive checks:
 
 ## Adapter boundary
 
-`devin.adapter` selects how a worker session actually gets launched:
+`worker.harness` selects how a worker session actually gets launched:
 
 - `manual` — write a session manifest, operator pastes the prompt into a Devin
   app session by hand. No subprocess; `ok=True` means "manifest written", not

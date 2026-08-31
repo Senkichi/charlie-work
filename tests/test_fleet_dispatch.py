@@ -1304,10 +1304,17 @@ def test_fleet_loop_real_unknown_config_key_reproduces_incident(
 ) -> None:
     """#6-G / G-AC5: full reproduction of the 2026-07-29 incident.
 
-    An unknown key in one repo's real config file (``cross_family:
-    totally_unknown_key``, mirroring the actual ``cross_family: auto_verdict``
-    version-skew incident) drives the real, unmocked ``load_layered_config``
-    to raise ``ConfigError``. This proves: (a) an events.db row is recorded
+    The original incident's exact shape was an unknown key inside
+    ``cross_family:`` (``cross_family: auto_verdict`` under a version-skew
+    binary that didn't yet recognize it). The role-config Phase 2 cleanup
+    deleted the dual-accept section tolerance entirely, so a bare
+    ``cross_family:`` section is no longer specially tolerated -- it is
+    rejected as an unknown top-level section like any other bogus key, the
+    same as the original incident's exact shape would raise again today.
+    This reproduces the same class of failure (an unknown key inside a real
+    config file) via a section that has always validated its own keys
+    (``labels``), driving the real, unmocked ``load_layered_config`` to
+    raise ``ConfigError``. This proves: (a) an events.db row is recorded
     for the failing repo (queryable via query_events(kind=
     "fleet_pass_config_error")), (b) the fleet digest carries a matching
     AttentionEntry, and (c) a second, healthy repo's lane still completes —
@@ -1327,10 +1334,9 @@ def test_fleet_loop_real_unknown_config_key_reproduces_incident(
     (repo1 / "orchestrator.config.yaml").write_text(
         "labels:\n"
         "  ready: automated-ready\n"
+        "  totally_unknown_key: true\n"
         "runtime:\n"
-        "  state_dir: .var/charlie-work\n"
-        "cross_family:\n"
-        "  totally_unknown_key: true\n",
+        "  state_dir: .var/charlie-work\n",
         encoding="utf-8",
     )
     repo1_state_dir = repo1 / ".var" / "charlie-work"
@@ -1386,7 +1392,7 @@ def test_fleet_loop_real_unknown_config_key_reproduces_incident(
 
     message = result.data["repos"]["owner/repo1"]["message"]
     assert "ConfigError" in message
-    assert "cross_family" in message
+    assert "labels" in message
     assert "totally_unknown_key" in message
 
     # (a) the failure is durably recorded to repo1's own events.db.

@@ -17,7 +17,6 @@ ISSUE_VALUES = {
     "issue_body": "Body text",
     "issue_body_block": fenced_block("Body text", "md"),
     "branch_name": "agent/issue-123-fix-search",
-    "worker_model_tier": "capable",
     "issue_comments": "",
     # Issue #1444: the module-map section value. Empty here because these
     # tests render against a tmp_path with no src/charlie_work tree; the
@@ -146,7 +145,7 @@ def test_rendered_worker_prompts_contain_shared_section_text_and_no_placeholders
         prompt = _render_worker_with_sections(template_name)
 
         assert "- Number: #123" in prompt
-        assert "- Model tier target: capable" in prompt
+        assert "- URL: https://example.test/issues/123" in prompt
         assert "## Scope contract" in prompt
         assert "- Solve only issue #123." in prompt
         assert "If the fix touches security-sensitive behavior" in prompt
@@ -188,7 +187,6 @@ def test_attacker_controlled_placeholders_not_expanded() -> None:
             "This contains $section_scope_contract and $issue_number", "md"
         ),
         "branch_name": "agent/issue-8-test",
-        "worker_model_tier": "capable",
         "issue_comments": "",
         "module_map": "",
         "attachment_budget": "",
@@ -217,7 +215,7 @@ def test_legitimate_partial_placeholders_still_resolve() -> None:
         # These should be resolved from the section partials
         assert "- Number: #123" in prompt
         assert "- Solve only issue #123." in prompt
-        assert "- Model tier target: capable" in prompt
+        assert "- URL: https://example.test/issues/123" in prompt
         # No leftover $section_ placeholders
         assert "$section_" not in prompt
 
@@ -271,7 +269,7 @@ def test_rework_prompt_includes_push_then_verify_final_step() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
         config = OrchestratorConfig(
-            devin=DevinConfig(adapter="manual"),
+            devin=DevinConfig(),
         )
         paths = runtime_paths(tmp_path, config.runtime.state_dir)
         fake_gh = MinimalFakeGitHub()
@@ -538,7 +536,6 @@ def test_assert_no_merge_contract_rejects_flat_override_without_contract(
             "issue_body": "",
             "issue_body_block": "",
             "branch_name": "agent/issue-42-test",
-            "worker_model_tier": "capable",
             "issue_comments": "",
         },
         search_dirs=(override_dir,),
@@ -579,7 +576,6 @@ def test_assert_no_merge_contract_accepts_override_with_contract(
             "issue_body": "",
             "issue_body_block": "",
             "branch_name": "agent/issue-42-test",
-            "worker_model_tier": "capable",
             "issue_comments": "",
         },
         search_dirs=(override_dir,),
@@ -994,16 +990,6 @@ def test_rework_template_severity_aware_required_behavior() -> None:
     assert "a Minor item may be skipped only if you say so explicitly" in normalized
     # The old unconditional imperative must not reappear.
     assert "Address every Critical and Important finding directly" not in normalized
-
-
-def test_cross_family_review_contains_self_report_distrust_rule() -> None:
-    """Verify that cross_family_review.md tells the reviewer a stated rationale never lowers severity."""
-    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
-    text = (prompts_dir / "cross_family_review.md").read_text(encoding="utf-8")
-
-    assert "is the author grading their own work" in text
-    assert "it never by itself lowers a finding's" in text
-    assert "Verify the claim against the code; if it doesn't hold, the finding stands." in text
 
 
 def test_review_rendered_with_populated_test_adequacy_section() -> None:

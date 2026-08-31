@@ -43,7 +43,8 @@ from .config import (
     CLAUDE_CODE_PROMPT_FILENAME,
     ClaudeCodeConfig,
     OrchestratorConfig,
-    ReviewDispatchConfig,
+    ReviewerRoleConfig,
+    _DEFAULT_CLAUDE_MODEL,
 )
 from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
@@ -862,29 +863,40 @@ def _review_effort_arm(pr_number: int, fraction: float, salt: str) -> bool:
 
 def resolve_review_effort(
     pr_number: int,
-    review_dispatch: ReviewDispatchConfig,
+    reviewer: ReviewerRoleConfig,
     claude_code: ClaudeCodeConfig,
 ) -> tuple[str, str | None]:
     """Resolve the ``--effort`` string for a reviewer session, plus which
-    review_effort_experiment arm (if any) the PR was assigned to.
+    effort_experiment arm (if any) the PR was assigned to.
 
     Returns ``(effort, arm)``:
-      - When ``review_dispatch.review_effort_experiment_fraction <= 0.0``
-        (the default), the experiment is disabled: ``arm`` is ``None`` and
-        ``effort`` is ``review_dispatch.review_effort`` when set, else
-        ``claude_code.effort`` — exactly the pre-experiment behavior.
+      - When ``reviewer.effort_experiment_fraction <= 0.0`` (the default),
+        the experiment is disabled: ``arm`` is ``None`` and ``effort`` is
+        ``reviewer.effort`` when set, else ``claude_code.effort`` — exactly
+        the pre-experiment behavior.
       - Otherwise, ``arm`` is ``"treatment"`` or ``"control"`` per
-        ``_review_effort_arm``, and ``effort`` is ``review_dispatch.review_effort``
-        for treatment or ``claude_code.effort`` for control.
+        ``_review_effort_arm``, and ``effort`` is ``reviewer.effort`` for
+        treatment or ``claude_code.effort`` for control.
 
     Only meaningful for reviewer (``review=True``) launches; callers must
     gate on that themselves (worker launches always use ``claude_code.effort``).
+
+    Reads ``reviewer.*`` (``ReviewerRoleConfig``) exclusively -- the legacy
+    ``review_dispatch.review_effort``/``review_effort_experiment_fraction``/
+    ``review_effort_experiment_salt`` fields these mirrored under role-config
+    Phase 1's dual-accept bridge were deleted whole in Phase 2 (Track E), the
+    same deletion that removed the bridge itself. There is no fallback to a
+    ``review_dispatch`` value here for the same reason ``devin.adapter`` was
+    deleted rather than silently ignored: an old key that's still read halfway
+    is worse than one that errors loudly at load (config.py's ``_build_section``
+    already rejects any surviving ``review_dispatch.review_effort*`` key as
+    unknown before this function ever runs).
     """
-    fraction = review_dispatch.review_effort_experiment_fraction
+    fraction = reviewer.effort_experiment_fraction
     if fraction <= 0.0:
-        return (review_dispatch.review_effort or claude_code.effort, None)
-    if _review_effort_arm(pr_number, fraction, review_dispatch.review_effort_experiment_salt):
-        return (review_dispatch.review_effort, "treatment")
+        return (reviewer.effort or claude_code.effort, None)
+    if _review_effort_arm(pr_number, fraction, reviewer.effort_experiment_salt):
+        return (reviewer.effort, "treatment")
     return (claude_code.effort, "control")
 
 
@@ -1055,13 +1067,21 @@ def launch_claude_worker(
     the effort is resolved internally as a fallback.
 
     ``model_override``, when provided, is pinned as the ``--model`` value
-    instead of ``resolved_config.claude_code.model``. The api adapter
+    instead of ``resolved_config.worker.model``. The api adapter
     (``api_worker.launch_api_worker``) passes the resolved provider's model
     here so the ``--model`` flag — which the Claude Code CLI gives precedence
     over ``ANTHROPIC_MODEL`` — selects the provider's model rather than the
-    claude_code section's. When omitted (the default), the claude_code
-    section's model is pinned exactly as before — the single enforcement
-    point stays ``_apply_model_pin``, never an ``adapter_kind`` branch.
+    worker's. The reviewer launch site (``dispatch_reviews``) passes
+    ``resolved_config.reviewer.model`` here for the same reason. When
+    omitted (the default), the worker role's configured model is pinned
+    instead — the single enforcement point stays ``_apply_model_pin``, never
+    an ``adapter_kind`` branch. Model-pin safety (the 2026-07-22 ambient-
+    model outage class): whichever of ``model_override``/
+    ``resolved_config.worker.model`` is used, an empty string is replaced
+    with ``_DEFAULT_CLAUDE_MODEL`` here so ``--model`` is never pinned to an
+    empty value -- an empty ``--model <value>`` would fall through to
+    whatever ambient CLI/global state happens to be active for this
+    headless process, exactly the failure this pin exists to prevent.
 
     ``max_turns_override``, when provided on a ``review=True`` launch, is
     pinned as the ``--max-turns`` value instead of
@@ -1105,13 +1125,16 @@ def launch_claude_worker(
     resolved_config = config or OrchestratorConfig()
     # Issue #1245: the api adapter passes its provider's model so the
     # ``--model`` flag (which the Claude Code CLI prefers over
-    # ``ANTHROPIC_MODEL``) selects the provider's model, not the
-    # claude_code section's. Default to claude_code.model for every other
+    # ``ANTHROPIC_MODEL``) selects the provider's model, not the worker's.
+    # Default to worker.model (role-config Phase 1.5) for every other
     # caller — single enforcement point stays _apply_model_pin, never an
-    # adapter_kind branch.
+    # adapter_kind branch. Model-pin safety (2026-07-22 ambient-model
+    # outage class): an empty resolved value (worker.model/reviewer.model
+    # may be "" -- see WorkerRoleConfig/ReviewerRoleConfig) always falls
+    # back to _DEFAULT_CLAUDE_MODEL here, so --model is never pinned empty.
     pinned_model = (
-        model_override if model_override is not None else resolved_config.claude_code.model
-    )
+        model_override if model_override is not None else resolved_config.worker.model
+    ) or _DEFAULT_CLAUDE_MODEL
     command_template = _apply_model_pin(command_template, pinned_model)
     # Reviewer sessions may pin their own effort independently of worker
     # effort (empty string means fall back to claude_code.effort), optionally
@@ -1126,7 +1149,7 @@ def launch_claude_worker(
             resolved_review_effort
             if resolved_review_effort is not None
             else resolve_review_effort(
-                issue_number, resolved_config.review_dispatch, resolved_config.claude_code
+                issue_number, resolved_config.reviewer, resolved_config.claude_code
             )[0]
         )
     else:

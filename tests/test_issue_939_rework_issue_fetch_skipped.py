@@ -13,7 +13,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from charlie_work.config import DevinConfig, OrchestratorConfig
+from charlie_work.config import DevinConfig, OrchestratorConfig, WorkerRoleConfig
 from charlie_work.github import GitHubError
 from charlie_work.instrumentation import _classify_level
 from charlie_work.paths import runtime_paths
@@ -29,7 +29,6 @@ from _fakes_github import FakeGitHub
 def _make_app(tmp_path: Path, fake_gh: FakeGitHub, **kwargs) -> tuple[OrchestratorApp, object]:
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 "python",
                 "-c",
@@ -37,6 +36,10 @@ def _make_app(tmp_path: Path, fake_gh: FakeGitHub, **kwargs) -> tuple[Orchestrat
                 "{issue_number}",
             ),
         ),
+        # Role-config Phase 1.5: dispatch_rework's manual-adapter skip gate
+        # reads worker.harness, so it must be set to "command" to match the
+        # devin.dispatch_command above.
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.ensure()
@@ -194,7 +197,6 @@ def test_rework_issue_fetch_skipped_lock_busy_does_not_defer_healthy_candidate(
 
     config = OrchestratorConfig(
         devin=DevinConfig(
-            adapter="command",
             dispatch_command=(
                 sys.executable,
                 "-c",
@@ -202,6 +204,7 @@ def test_rework_issue_fetch_skipped_lock_busy_does_not_defer_healthy_candidate(
                 "{issue_number}",
             ),
         ),
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.root.mkdir(parents=True, exist_ok=True)

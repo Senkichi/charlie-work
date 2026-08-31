@@ -55,9 +55,8 @@ def _template_placeholders(template_name: str) -> set[str]:
     ``$section_*`` partials it pulls in.
 
     A partial can itself reference placeholders (e.g. ``issue_metadata.md``
-    references ``$issue_number``/``$issue_title``/``$issue_url``/
-    ``$worker_model_tier``) that the *top-level* template text never
-    mentions directly. ``render_prompt``'s own strict check
+    references ``$issue_number``/``$issue_title``/``$issue_url``) that the
+    *top-level* template text never mentions directly. ``render_prompt``'s own strict check
     (``prompts.py:87-96``) resolves exactly this expanded set against the
     caller's supplied values, so a contract test that only looked at the
     top-level template's own identifiers would miss a partial that drifted
@@ -158,12 +157,20 @@ def test_worker_md_renders_via_real_writer(tmp_path: Path) -> None:
 
 def test_worker_claude_code_md_renders_via_real_writer(tmp_path: Path) -> None:
     """worker_claude_code.md is rendered by the *same* real writer,
-    ``_write_worker_prompt``, with an explicit ``template=`` override --
-    exactly what the api-worker dispatch path (dry-run preview branch) and
-    the matching dispatch-loop path both do, inside
-    ``workflow.py::OrchestratorApp._dispatch_impl``: ``template =
-    self.config.api_worker.worker_template``, then
-    ``self._write_worker_prompt(full_issue, template=template)``.
+    ``_write_worker_prompt`` (``workflow.py::OrchestratorApp._write_worker_prompt``),
+    using its explicit ``template=`` override parameter.
+
+    Post-Phase-2 (role-config Track B deleted per-issue adapter routing),
+    no surviving dispatch call site passes
+    ``template=config.api_worker.worker_template`` any more -- the three
+    live callers (``intake()``, and the dry-run preview and dispatch-loop
+    branches inside ``_dispatch_impl``) all omit the argument and fall
+    through to ``config.dispatch.worker_template`` instead, so this
+    override is currently unreachable at runtime. Tracked for cleanup
+    (dropping the dead parameter outright) in issue #1515. This test is
+    kept as a direct contract test on the override mechanism and on
+    worker_claude_code.md's own placeholder correctness, independent of
+    whether anything wires the override back up.
 
     Rendered under a non-default ``runtime.state_dir`` (issue #737) so the
     companion literal-absence assertion is non-vacuous -- see
@@ -411,9 +418,9 @@ def test_rework_writer_rejects_flat_override_without_execution_contract(
 
 # ---------------------------------------------------------------------------
 # Case B: the real caller is a `render_prompt`/`self._render` call embedded
-# deep inside a large method (`review()`, `_cross_family_for_pr()`,
-# `spec_review()`) that would need extensive GitHub-API and subprocess
-# mocking to invoke end to end. Per the task brief's documented fallback:
+# deep inside a large method (`review()`) that would need extensive
+# GitHub-API and subprocess mocking to invoke end to end. Per the task
+# brief's documented fallback:
 # pin the caller's exact key set as a constant tied to the cited file:line,
 # then (a) assert the template's referenced placeholders are a subset of it
 # -- so the test fails the moment a template outgrows it -- and (b) actually
@@ -432,7 +439,6 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "issue_url",
     "pr_json_path",
     "diff_path",
-    "cross_family_section",
     "janitor_section",
     "test_adequacy_section",
     "static_probe_section",
@@ -443,29 +449,8 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "prior_review_section",
 }
 
-# workflow.py::OrchestratorApp._cross_family_for_pr, the literal `values`
-# dict passed to `self._render("cross_family_review.md", {...})`.
-CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS = {
-    "pr_number",
-    "pr_title",
-    "pr_url",
-    "issue_number",
-    "issue_title",
-    "pr_json_path",
-    "diff_path",
-}
-
-# workflow.py::OrchestratorApp.spec_review, the literal `values` dict
-# passed to `self._render("cross_family_spec_review.md", {...})`.
-CROSS_FAMILY_SPEC_REVIEW_MD_SUPPLIED_KEYS = {
-    "artifact_label",
-    "artifact_text",
-}
-
 _PINNED_KEY_SETS = {
     "review.md": REVIEW_MD_SUPPLIED_KEYS,
-    "cross_family_review.md": CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS,
-    "cross_family_spec_review.md": CROSS_FAMILY_SPEC_REVIEW_MD_SUPPLIED_KEYS,
 }
 
 
@@ -530,7 +515,6 @@ def test_review_md_renders_with_production_paths_and_no_state_dir_literal(
         "issue_url": "https://example.test/issues/7",
         "pr_json_path": pr_dir / "pr.json",
         "diff_path": pr_dir / "diff.patch",
-        "cross_family_section": "",
         "janitor_section": "",
         "test_adequacy_section": "",
         "static_probe_section": "",
@@ -587,7 +571,6 @@ def test_review_md_repo_local_override_render_with_no_state_dir_literal(
         "issue_url": "https://example.test/issues/7",
         "pr_json_path": pr_dir / "pr.json",
         "diff_path": pr_dir / "diff.patch",
-        "cross_family_section": "",
         "janitor_section": "",
         "test_adequacy_section": "",
         "static_probe_section": "",
@@ -693,9 +676,6 @@ def test_every_shipped_template_is_covered_by_this_contract() -> None:
 _CITATION_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     "OrchestratorApp._write_worker_prompt": ("def _write_worker_prompt",),
     "OrchestratorApp.intake": ("self._write_worker_prompt(full_issue",),
-    # Covers both the api-worker dispatch dry-run preview branch and the
-    # matching dispatch-loop branch -- both live inside this one method.
-    "OrchestratorApp._dispatch_impl": ("api_worker.worker_template",),
     "_write_rework_prompt": ("def _write_rework_prompt",),
     "_render_rework_prompt": ("def _render_rework_prompt",),
     "_render_required_changes_section": ("def _render_required_changes_section",),
@@ -703,8 +683,6 @@ _CITATION_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         '"review.md"',
         "pr_dir = self.paths.prs",
     ),
-    "OrchestratorApp._cross_family_for_pr": ('"cross_family_review.md"',),
-    "OrchestratorApp.spec_review": ('"cross_family_spec_review.md"',),
     "OrchestratorApp._render": (
         "render_prompt(template_name, values, search_dirs=self.prompt_dirs)",
     ),

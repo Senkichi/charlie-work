@@ -19,7 +19,9 @@ from charlie_work.config import (
     OrchestratorConfig,
     QuotaProbeConfig,
     ReviewDispatchConfig,
+    ReviewerRoleConfig,
     RuntimeConfig,
+    WorkerRoleConfig,
 )
 from charlie_work.claude_code import (
     ClaudeProgress,
@@ -3064,9 +3066,10 @@ def test_launch_claude_worker_pins_configured_model_by_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Issue #530: a worker launch with no explicit config must still pin
-    ClaudeCodeConfig's default model — never fall back to ambient global CLI
-    state (the 2026-07-22 outage: every reviewer launch silently inherited an
-    interactive session's premium `/model` choice and hit a credits wall)."""
+    the shared default model (``claude_code._DEFAULT_CLAUDE_MODEL``) — never
+    fall back to ambient global CLI state (the 2026-07-22 outage: every
+    reviewer launch silently inherited an interactive session's premium
+    `/model` choice and hit a credits wall)."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
@@ -3082,7 +3085,7 @@ def test_launch_claude_worker_pins_configured_model_by_default(
 
     assert "--model" in record.command
     idx = record.command.index("--model")
-    assert record.command[idx + 1] == ClaudeCodeConfig().model
+    assert record.command[idx + 1] == claude_code._DEFAULT_CLAUDE_MODEL
 
 
 def test_launch_claude_worker_honors_configured_model_override(
@@ -3092,7 +3095,10 @@ def test_launch_claude_worker_honors_configured_model_override(
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
-    config = OrchestratorConfig(claude_code=ClaudeCodeConfig(model="claude-opus-4-8"))
+    # Role-config Phase 1.5: the model-pin fallback (no model_override passed)
+    # reads worker.model, not claude_code.model -- see claude_code.py's single
+    # enforcement point in launch_claude_worker.
+    config = OrchestratorConfig(worker=WorkerRoleConfig(model="claude-opus-4-8"))
 
     record = launch_claude_worker(
         42,
@@ -3108,18 +3114,20 @@ def test_launch_claude_worker_honors_configured_model_override(
     assert record.command[idx + 1] == "claude-opus-4-8"
 
 
-def test_launch_claude_worker_model_override_wins_over_claude_code_model(
+def test_launch_claude_worker_model_override_wins_over_worker_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Issue #1245: an explicit ``model_override`` is pinned as the ``--model``
-    value instead of ``claude_code.model``. This is the seam the api adapter
-    uses to pin the provider's model. The two values deliberately differ so a
-    regression that ignores the override is caught."""
+    value instead of ``worker.model`` (role-config Phase 1.5; formerly
+    ``claude_code.model``). This is the seam the api adapter uses to pin the
+    provider's model, and the reviewer launch site uses to pin
+    ``reviewer.model``. The two values deliberately differ so a regression
+    that ignores the override is caught."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
-    config = OrchestratorConfig(claude_code=ClaudeCodeConfig(model="claude-sonnet-5"))
+    config = OrchestratorConfig(worker=WorkerRoleConfig(model="claude-sonnet-5"))
 
     record = launch_claude_worker(
         42,
@@ -3135,6 +3143,81 @@ def test_launch_claude_worker_model_override_wins_over_claude_code_model(
     idx = record.command.index("--model")
     assert record.command[idx + 1] == "kimi-k3"
     assert record.command[idx + 1] != "claude-sonnet-5"
+
+
+def test_launch_claude_worker_empty_worker_model_falls_back_to_claude_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Model-pin safety (the 2026-07-22 ambient-model outage class): an empty
+    ``worker.model`` must still resolve to ``_DEFAULT_CLAUDE_MODEL`` at the
+    single command-construction point in ``launch_claude_worker`` -- never an
+    empty ``--model`` value, which would fall through to ambient CLI/global
+    state instead of a config-controlled default.
+
+    Constructs ``OrchestratorConfig`` directly (not via ``load_config``) so
+    an empty ``worker.model`` reaches ``launch_claude_worker`` unmodified --
+    this isolates the launch-boundary safety net from any defaulting
+    ``load_config`` itself might apply upstream, so the assertion holds
+    regardless of how (or whether) ``load_config`` fills in a default before
+    the config ever reaches this function.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    config = OrchestratorConfig(
+        worker=WorkerRoleConfig(harness="claude-code", model=""),
+    )
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        config=config,
+    )
+
+    assert record.command.count("--model") == 1
+    idx = record.command.index("--model")
+    assert record.command[idx + 1] == claude_code._DEFAULT_CLAUDE_MODEL
+
+
+def test_launch_claude_worker_empty_reviewer_model_override_falls_back_to_claude_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Same model-pin safety net as
+    ``test_launch_claude_worker_empty_worker_model_falls_back_to_claude_default``,
+    but for the reviewer path: an explicitly empty ``model_override`` (as
+    would result from a raw ``config.reviewer.model`` of ``""`` passed
+    through directly, without the ``or None`` guard the real
+    ``dispatch_reviews`` call site applies) must still resolve to
+    ``_DEFAULT_CLAUDE_MODEL`` rather than pinning ``--model`` to an empty
+    string.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    config = OrchestratorConfig(
+        worker=WorkerRoleConfig(model="claude-should-not-be-read-either"),
+        reviewer=ReviewerRoleConfig(model=""),
+    )
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        config=config,
+        model_override=config.reviewer.model,
+    )
+
+    assert record.command.count("--model") == 1
+    idx = record.command.index("--model")
+    assert record.command[idx + 1] == claude_code._DEFAULT_CLAUDE_MODEL
+    assert record.command[idx + 1] != "claude-should-not-be-read-either"
 
 
 def test_launch_claude_worker_review_pins_configured_model_by_default(
@@ -3157,7 +3240,7 @@ def test_launch_claude_worker_review_pins_configured_model_by_default(
 
     assert "--model" in record.command
     idx = record.command.index("--model")
-    assert record.command[idx + 1] == ClaudeCodeConfig().model
+    assert record.command[idx + 1] == claude_code._DEFAULT_CLAUDE_MODEL
 
 
 def test_launch_claude_worker_review_pins_max_turns_override(tmp_path: Path) -> None:
@@ -3245,15 +3328,15 @@ def test_launch_claude_worker_review_max_turns_override_none_uses_config_default
 
 
 def test_launch_claude_worker_review_uses_review_effort_when_set(tmp_path: Path) -> None:
-    """A reviewer session must pin review_dispatch.review_effort over
-    claude_code.effort when review_effort is explicitly set."""
+    """A reviewer session must pin reviewer.effort over claude_code.effort
+    when reviewer.effort is explicitly set."""
     repo_root = tmp_path / "repo"
     _init_real_repo(repo_root)
     sessions_dir = tmp_path / "reviews"
     head_sha = _repo_head_sha(repo_root)
     config = OrchestratorConfig(
         claude_code=ClaudeCodeConfig(effort="low"),
-        review_dispatch=ReviewDispatchConfig(review_effort="high"),
+        reviewer=ReviewerRoleConfig(effort="high"),
     )
 
     record = launch_claude_worker(
@@ -3275,15 +3358,16 @@ def test_launch_claude_worker_review_uses_review_effort_when_set(tmp_path: Path)
 def test_launch_claude_worker_review_falls_back_to_claude_code_effort_when_unset(
     tmp_path: Path,
 ) -> None:
-    """review_effort empty (the default) must fall back to claude_code.effort,
-    same as any other reviewer launch before this config knob existed."""
+    """reviewer.effort empty (the default) must fall back to
+    claude_code.effort, same as any other reviewer launch before this config
+    knob existed."""
     repo_root = tmp_path / "repo"
     _init_real_repo(repo_root)
     sessions_dir = tmp_path / "reviews"
     head_sha = _repo_head_sha(repo_root)
     config = OrchestratorConfig(
         claude_code=ClaudeCodeConfig(effort="medium"),
-        review_dispatch=ReviewDispatchConfig(review_effort=""),
+        reviewer=ReviewerRoleConfig(effort=""),
     )
 
     record = launch_claude_worker(
@@ -3305,7 +3389,7 @@ def test_launch_claude_worker_review_falls_back_to_claude_code_effort_when_unset
 def test_launch_claude_worker_worker_never_uses_review_effort(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A worker (non-review) launch must never pick up review_effort, even
+    """A worker (non-review) launch must never pick up reviewer.effort, even
     when it's set and differs from claude_code.effort."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -3313,7 +3397,7 @@ def test_launch_claude_worker_worker_never_uses_review_effort(
     _install_fake_create_worktree(monkeypatch, tmp_path)
     config = OrchestratorConfig(
         claude_code=ClaudeCodeConfig(effort="low"),
-        review_dispatch=ReviewDispatchConfig(review_effort="high"),
+        reviewer=ReviewerRoleConfig(effort="high"),
     )
 
     record = launch_claude_worker(
@@ -3368,32 +3452,32 @@ def test_review_effort_arm_distribution_sanity() -> None:
 
 
 def test_resolve_review_effort_disabled_uses_review_effort_unconditionally() -> None:
-    """fraction<=0.0 (default): review_effort, if set, applies to every PR ---
-    exactly the pre-experiment behavior. arm is None (experiment not running)."""
-    review_dispatch = ReviewDispatchConfig(review_effort="high")
+    """fraction<=0.0 (default): reviewer.effort, if set, applies to every PR
+    --- exactly the pre-experiment behavior. arm is None (experiment not
+    running)."""
+    reviewer = ReviewerRoleConfig(effort="high")
     claude_code_cfg = ClaudeCodeConfig(effort="low")
     for pr_number in (1, 2, 3, 4, 5):
-        effort, arm = resolve_review_effort(pr_number, review_dispatch, claude_code_cfg)
+        effort, arm = resolve_review_effort(pr_number, reviewer, claude_code_cfg)
         assert effort == "high"
         assert arm is None
 
 
 def test_resolve_review_effort_disabled_falls_back_when_review_effort_unset() -> None:
-    review_dispatch = ReviewDispatchConfig(review_effort="")
+    reviewer = ReviewerRoleConfig(effort="")
     claude_code_cfg = ClaudeCodeConfig(effort="medium")
-    effort, arm = resolve_review_effort(101, review_dispatch, claude_code_cfg)
+    effort, arm = resolve_review_effort(101, reviewer, claude_code_cfg)
     assert effort == "medium"
     assert arm is None
 
 
 def test_resolve_review_effort_enabled_splits_treatment_and_control() -> None:
-    """fraction=1.0: every PR is treatment and gets review_effort. fraction=0.0-adjacent
-    control case is exercised via a PR known to hash to False for a tiny fraction."""
-    review_dispatch = ReviewDispatchConfig(
-        review_effort="high", review_effort_experiment_fraction=1.0
-    )
+    """fraction=1.0: every PR is treatment and gets reviewer.effort.
+    fraction=0.0-adjacent control case is exercised via a PR known to hash to
+    False for a tiny fraction."""
+    reviewer = ReviewerRoleConfig(effort="high", effort_experiment_fraction=1.0)
     claude_code_cfg = ClaudeCodeConfig(effort="low")
-    effort, arm = resolve_review_effort(777, review_dispatch, claude_code_cfg)
+    effort, arm = resolve_review_effort(777, reviewer, claude_code_cfg)
     assert (effort, arm) == ("high", "treatment")
 
     # A vanishingly small fraction (but > 0.0, so the experiment IS enabled)
@@ -3403,10 +3487,8 @@ def test_resolve_review_effort_enabled_splits_treatment_and_control() -> None:
     tiny_fraction = 1e-9
     salt = ""
     is_treatment = _review_effort_arm(777, tiny_fraction, salt)
-    review_dispatch_tiny = ReviewDispatchConfig(
-        review_effort="high", review_effort_experiment_fraction=tiny_fraction
-    )
-    effort, arm = resolve_review_effort(777, review_dispatch_tiny, claude_code_cfg)
+    reviewer_tiny = ReviewerRoleConfig(effort="high", effort_experiment_fraction=tiny_fraction)
+    effort, arm = resolve_review_effort(777, reviewer_tiny, claude_code_cfg)
     if is_treatment:
         assert (effort, arm) == ("high", "treatment")
     else:
@@ -3417,16 +3499,14 @@ def test_launch_claude_worker_review_experiment_treatment_pins_review_effort(
     tmp_path: Path,
 ) -> None:
     """Experiment enabled (fraction=1.0, so every PR is treatment) --> the
-    reviewer session pins review_effort, same as the always-on case."""
+    reviewer session pins reviewer.effort, same as the always-on case."""
     repo_root = tmp_path / "repo"
     _init_real_repo(repo_root)
     sessions_dir = tmp_path / "reviews"
     head_sha = _repo_head_sha(repo_root)
     config = OrchestratorConfig(
         claude_code=ClaudeCodeConfig(effort="low"),
-        review_dispatch=ReviewDispatchConfig(
-            review_effort="high", review_effort_experiment_fraction=1.0
-        ),
+        reviewer=ReviewerRoleConfig(effort="high", effort_experiment_fraction=1.0),
     )
 
     record = launch_claude_worker(
@@ -3458,9 +3538,7 @@ def test_launch_claude_worker_review_experiment_control_falls_back(tmp_path: Pat
     assert _review_effort_arm(pr_number, tiny_fraction, "") is False
     config = OrchestratorConfig(
         claude_code=ClaudeCodeConfig(effort="low"),
-        review_dispatch=ReviewDispatchConfig(
-            review_effort="high", review_effort_experiment_fraction=tiny_fraction
-        ),
+        reviewer=ReviewerRoleConfig(effort="high", effort_experiment_fraction=tiny_fraction),
     )
 
     record = launch_claude_worker(
@@ -3491,14 +3569,12 @@ def test_launch_claude_worker_review_uses_resolved_review_effort_passthrough(
     _init_real_repo(repo_root)
     sessions_dir = tmp_path / "reviews"
     head_sha = _repo_head_sha(repo_root)
-    # Config alone would resolve to "high" (fraction=1.0, review_effort=high),
+    # Config alone would resolve to "high" (fraction=1.0, reviewer.effort=high),
     # but the passed-through resolved_review_effort deliberately differs so
     # the test can distinguish "used the passthrough" from "recomputed".
     config = OrchestratorConfig(
         claude_code=ClaudeCodeConfig(effort="low"),
-        review_dispatch=ReviewDispatchConfig(
-            review_effort="high", review_effort_experiment_fraction=1.0
-        ),
+        reviewer=ReviewerRoleConfig(effort="high", effort_experiment_fraction=1.0),
     )
 
     record = launch_claude_worker(

@@ -307,9 +307,12 @@ def _escalated_label_needs_repair(
     matches, and the issue's own status decides.
 
     Same three-state ``label_error`` contract #586 established for
-    ``dispatch_reviews``' self-heal sweep. This predicate is the shared
-    definition both that sweep and the cross-family escalation call site now
-    evaluate, so the two cannot drift apart:
+    ``dispatch_reviews``' self-heal sweep (``_repair_escalated_labels``), its
+    sole remaining caller -- the auto-gate cross-family regen-exhaustion
+    escalation that used to be a second caller was deleted along with that
+    subsystem (role-config phase 2, track A). Kept as its own function so any
+    future escalation call site evaluates the identical three states rather
+    than re-deriving them:
 
     - ``None``        -> applied and verified on a prior pass; nothing to do.
                          This is the steady state, and answering it costs one

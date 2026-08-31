@@ -58,6 +58,7 @@ from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
     PostMortemConfig,
+    WorkerRoleConfig,
     WorktreeReclamationConfig,
 )
 from charlie_work.devin_shell import SessionRecord
@@ -139,7 +140,9 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
     test proves R6a's design actually protects a live orphan-sweep call
     site end-to-end.
     """
-    config = OrchestratorConfig(devin=DevinConfig(adapter="devin-shell"))
+    config = OrchestratorConfig(
+        devin=DevinConfig(), worker=WorkerRoleConfig(harness="devin-shell")
+    )
     real_run = subprocess.run
 
     # Positive control: dry_run=False, separate directory, before any
@@ -157,7 +160,11 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
     control_runner, control_calls = _run_recorder(real_run)
     with (
         patch("charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=_control_sweep),
-        patch("charlie_work.workflow.os.name", "nt"),
+        # os.name check lives in dead_worker_reap; patching the os module
+        # directly avoids depending on which module happens to `import os`
+        # into its own namespace (workflow.py no longer does, post routing
+        # deletion).
+        patch("os.name", "nt"),
         patch("charlie_work.devin_shell.is_session_alive", return_value=False),
         patch("subprocess.run", side_effect=control_runner),
     ):
@@ -185,7 +192,7 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
     dry_runner, dry_calls = _run_recorder(real_run)
     with (
         patch("charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=_dry_sweep),
-        patch("charlie_work.workflow.os.name", "nt"),
+        patch("os.name", "nt"),
         patch("charlie_work.devin_shell.is_session_alive", return_value=False),
         patch("subprocess.run", side_effect=dry_runner),
     ):
@@ -216,7 +223,8 @@ def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path
     this function's own conversion are real, not merely that the classify
     lane (test 3 below) is gated."""
     config = OrchestratorConfig(
-        devin=DevinConfig(adapter="devin-shell"),
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
 
     def _seed(root: Path) -> Path:
@@ -245,6 +253,19 @@ def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path
         return paths.state_file
 
     class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.issues.append(
+                {
+                    "number": 207,
+                    "title": "Test issue",
+                    "url": "https://example.test/issues/207",
+                    "body": "",
+                    "labels": [],
+                    "state": "OPEN",
+                }
+            )
+
         def pr_list(self):
             return [
                 {
@@ -359,9 +380,9 @@ def test_classify_dead_sessions_worker_blocked_escalation_dry_run_true_writes_no
                 required_checks=("Tests passed", "Lint & Format", "Pre-commit")
             ),
             devin=DevinConfig(
-                adapter="command",
                 dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
             ),
+            worker=WorkerRoleConfig(harness="command"),
             post_mortem=PostMortemConfig(db_path=str(db_path)),
         )
         paths = runtime_paths(root, config.runtime.state_dir)
@@ -508,9 +529,9 @@ def test_loop_dry_run_true_leaks_no_writes_through_the_three_1311_call_sites(
                 required_checks=("Tests passed", "Lint & Format", "Pre-commit")
             ),
             devin=DevinConfig(
-                adapter="command",
                 dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
             ),
+            worker=WorkerRoleConfig(harness="command"),
             # Issue #1311 scoping: _maybe_deescalate_mechanical and
             # _maybe_reclaim_worktrees (both called later in _loop_body,
             # both unrelated to the three named call sites this test

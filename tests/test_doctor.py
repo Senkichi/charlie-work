@@ -10,15 +10,22 @@ from charlie_work.config import (
     ApiBudgetConfig,
     AutoMergeConfig,
     ClaudeCodeConfig,
-    CrossFamilyConfig,
     DevinConfig,
     OrchestratorConfig,
     RescueConfig,
     ReviewDispatchConfig,
+    ReviewerRoleConfig,
     RuntimeConfig,
+    WorkerRoleConfig,
 )
 from charlie_work.config import ApiProviderConfig, ApiWorkerConfig
-from charlie_work.doctor import _check_name_matches, run_doctor, workflow_job_names
+from charlie_work.doctor import (
+    _check_name_match_kind,
+    _tolerance_match_base_names,
+    run_doctor,
+    workflow_job_matrix_flags,
+    workflow_job_names,
+)
 from charlie_work.instrumentation import log_event
 from charlie_work.paths import runtime_paths
 from charlie_work.subprocess_runner import RunResult
@@ -41,6 +48,19 @@ def _write_workflow(repo_root: Path, body: str) -> None:
     (workflows / "ci.yml").write_text(body, encoding="utf-8")
 
 
+def _write_workflow_named(repo_root: Path, filename: str, body: str) -> None:
+    """Write a workflow file by name, tolerating an existing workflows dir.
+
+    Unlike ``_write_workflow`` (which always writes ``ci.yml`` and would raise
+    on a second ``mkdir``), this lets a test plant several workflow files in
+    one repo -- the multi-workflow scenario the issue #1508 matrix-scoping fix
+    targets.
+    """
+    workflows = repo_root / ".github" / "workflows"
+    workflows.mkdir(parents=True, exist_ok=True)
+    (workflows / filename).write_text(body, encoding="utf-8")
+
+
 def test_workflow_job_names_prefers_name_over_id(tmp_path: Path) -> None:
     _write_workflow(
         tmp_path,
@@ -57,17 +77,67 @@ def test_workflow_job_names_empty_without_workflows(tmp_path: Path) -> None:
     assert workflow_job_names(tmp_path) == set()
 
 
-def test_check_name_matches_exact_and_matrix_prefix() -> None:
-    assert _check_name_matches("Tests passed", {"Tests passed"}) is True
-    # Matrix job configured as "Test"; check runs report "Test (windows-latest)".
-    assert _check_name_matches("Test (windows-latest)", {"Test"}) is True
-    assert _check_name_matches("Test", {"Test (windows-latest)"}) is True
-    assert _check_name_matches("Pre-commit", {"Tests passed", "lint"}) is False
+def test_check_name_match_kind_classifies_exact_tolerance_and_none() -> None:
+    # Issue #1508: the doctor verifier needs to distinguish an exact match
+    # (which the merge gate in checks.py also accepts) from a tolerance-only
+    # match (which the merge gate rejects) so it can flag stale suffixed
+    # required-check entries when no strategy.matrix exists.
+    assert _check_name_match_kind("Tests passed", {"Tests passed"}) == "exact"
+    assert _check_name_match_kind("Test (windows-latest)", {"Test"}) == "tolerance"
+    assert _check_name_match_kind("Test", {"Test (windows-latest)"}) == "tolerance"
+    # Reusable workflow reports as "<caller> / <callee>"; required is the caller.
+    assert _check_name_match_kind("caller", {"caller / callee"}) == "tolerance"
+    assert _check_name_match_kind("Pre-commit", {"Tests passed", "lint"}) is None
+
+
+def test_workflow_job_matrix_flags_scoped_per_job(tmp_path: Path) -> None:
+    # Issue #1508: matrix-ness is a PER-JOB property, not repo-wide. Two
+    # workflows in one repo -- only the second job has strategy.matrix -- so
+    # the flags dict must mark "Matrix job" True and "Plain job" False
+    # independently. The repo-wide predicate (any flag True) stays True (some
+    # job has a matrix), which is exactly the combination the old
+    # global-boolean verifier misused to justify a tolerance match against the
+    # plain job.
+    _write_workflow_named(
+        tmp_path,
+        "plain.yml",
+        "name: Plain\njobs:\n  plain:\n    name: Plain job\n    runs-on: ubuntu-latest\n",
+    )
+    _write_workflow_named(
+        tmp_path,
+        "matrix.yml",
+        "name: Matrix\njobs:\n  mx:\n    name: Matrix job\n    runs-on: ubuntu-latest\n"
+        "    strategy:\n      matrix:\n        os: [ubuntu-latest, windows-latest]\n",
+    )
+
+    flags = workflow_job_matrix_flags(tmp_path)
+
+    assert flags == {"Plain job": False, "Matrix job": True}
+    # The repo-wide predicate is still True (some job has a matrix) -- this is
+    # the trap: a global boolean cannot distinguish which job justified it.
+    assert any(flags.values()) is True
+
+
+def test_workflow_job_matrix_flags_empty_without_workflows(tmp_path: Path) -> None:
+    assert workflow_job_matrix_flags(tmp_path) == {}
+
+
+def test_tolerance_match_base_names_returns_matched_jobs() -> None:
+    # The base names are the workflow job display names the suffix/delimiter
+    # expands from -- the jobs whose own matrix flag decides justification.
+    assert _tolerance_match_base_names("Tests (windows-latest)", {"Tests"}) == ["Tests"]
+    assert _tolerance_match_base_names("Tests", {"Tests (windows-latest)"}) == [
+        "Tests (windows-latest)"
+    ]
+    # Reusable-workflow delimiter: "<caller> / <callee>".
+    assert _tolerance_match_base_names("caller", {"caller / callee"}) == ["caller / callee"]
+    # A bare prefix is NOT a tolerance match.
+    assert _tolerance_match_base_names("Tests passed", {"Tests"}) == []
 
 
 def _config(**kwargs) -> OrchestratorConfig:
-    # The real default (review_dispatch.enabled=False, cross_family.auto_verdict=
-    # False) is exactly the "no automated review-to-verdict path" gap the new
+    # The real default (review_dispatch.enabled=False, rescue.enabled=False)
+    # is exactly the "no automated review-to-verdict path" gap the new
     # doctor check flags -- so every pre-existing test in this module that
     # doesn't care about that check would otherwise trip it incidentally.
     # Default review_dispatch on here; tests that specifically exercise the
@@ -88,6 +158,99 @@ def test_doctor_flags_mismatched_required_check(tmp_path: Path) -> None:
     by_name = {check.name: check for check in checks}
     assert by_name["check name: Test"].ok is True
     assert by_name["check name: Tests passed"].ok is False
+    assert ok is False
+
+
+def test_doctor_flags_tolerance_only_match_when_no_matrix(tmp_path: Path) -> None:
+    # Issue #1508: a suffixed required-check entry ("Tests (windows-latest)")
+    # that matches a non-matrix job ("Tests") only via tolerance is a stale
+    # entry the exact-match merge gate (checks.py) would report `missing`
+    # forever. Doctor must FAIL it, not pass it -- the same trap #1507
+    # corrected in the README.
+    _write_workflow(tmp_path, "jobs:\n  test:\n    name: Tests\n    runs-on: ubuntu-latest\n")
+    config = _config(auto_merge=AutoMergeConfig(required_checks=("Tests (windows-latest)",)))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    check = by_name["check name: Tests (windows-latest)"]
+    assert check.ok is False
+    assert "matrix-suffix tolerance" in check.detail
+    assert "no strategy.matrix" in check.detail
+    assert ok is False
+
+
+def test_doctor_passes_tolerance_match_when_matrix_exists(tmp_path: Path) -> None:
+    # When the workflow actually has a strategy.matrix, the suffix tolerance
+    # is justified by a real matrix expansion, so doctor passes the suffixed
+    # required-check entry.
+    _write_workflow(
+        tmp_path,
+        "jobs:\n  test:\n    name: Tests\n    runs-on: ubuntu-latest\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        os: [ubuntu-latest, windows-latest]\n",
+    )
+    config = _config(auto_merge=AutoMergeConfig(required_checks=("Tests (windows-latest)",)))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    check = by_name["check name: Tests (windows-latest)"]
+    assert check.ok is True
+    assert "matrix-suffix tolerance" in check.detail
+    assert "strategy.matrix" in check.detail
+
+
+def test_doctor_flags_tolerance_match_when_matrix_is_in_a_sibling_workflow(tmp_path: Path) -> None:
+    # Issue #1508 rework: the matrix justification must be scoped to the
+    # SPECIFIC job that produced the tolerance match, not computed repo-wide.
+    # Two workflow files live in the repo: ``plain.yml`` defines a non-matrix
+    # job "Tests", and ``matrix.yml`` defines an UNRELATED matrix job
+    # "Build (matrix)". The repo therefore HAS a strategy.matrix somewhere, so
+    # the old global-boolean verifier passed a tolerance-only required-check
+    # entry ("Tests (windows-latest)") matching the plain "Tests" job -- a
+    # false pass, because the exact-match merge gate (checks.py) would report
+    # "Tests (windows-latest)" missing forever (the "Tests" job has no matrix
+    # to expand into that suffixed name). Doctor must FAIL it.
+    _write_workflow_named(
+        tmp_path,
+        "plain.yml",
+        "name: Plain\njobs:\n  test:\n    name: Tests\n    runs-on: ubuntu-latest\n",
+    )
+    _write_workflow_named(
+        tmp_path,
+        "matrix.yml",
+        "name: Matrix\njobs:\n  build:\n    name: Build (matrix)\n    runs-on: ubuntu-latest\n"
+        "    strategy:\n      matrix:\n        os: [ubuntu-latest, windows-latest]\n",
+    )
+    config = _config(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests (windows-latest)", "Build (matrix) (ubuntu-latest)")
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    # The non-matrix workflow's tolerance-only match MUST fail -- the sibling
+    # workflow's matrix does not justify it.
+    plain_check = by_name["check name: Tests (windows-latest)"]
+    assert plain_check.ok is False
+    assert "matrix-suffix tolerance" in plain_check.detail
+    assert "no strategy.matrix" in plain_check.detail
+    # The matrix workflow's own tolerance match still passes -- scoping works
+    # both ways: a real matrix on the matched job justifies the suffix.
+    matrix_check = by_name["check name: Build (matrix) (ubuntu-latest)"]
+    assert matrix_check.ok is True
+    assert "matrix-suffix tolerance" in matrix_check.detail
+    assert "strategy.matrix" in matrix_check.detail
     assert ok is False
 
 
@@ -140,29 +303,9 @@ def test_doctor_flags_missing_prompts_dir_and_template(tmp_path: Path) -> None:
     assert by_name["worker template: worker.md"].ok is True  # package fallback still resolves
 
 
-def test_doctor_cross_family_missing_binary_is_warning(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(
-        "charlie_work.doctor.shutil.which",
-        lambda name: None if name == "devin" else f"C:/fake/{name}",
-    )
-    config = _config(
-        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        cross_family=CrossFamilyConfig(enabled=True),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    gh = FakeDoctorGitHub(labels=config.labels.all)
-
-    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
-
-    by_name = {check.name: check for check in checks}
-    assert by_name["cross-family binary"].ok is False
-    assert by_name["cross-family binary"].severity == "warning"
-    assert ok is True
-
-
 def test_doctor_flags_no_automated_review_to_verdict_path(tmp_path: Path) -> None:
-    # review_dispatch.enabled=False + cross_family.auto_verdict=False (both
-    # real defaults on OrchestratorConfig) is exactly the 7-day-outage config
+    # review_dispatch.enabled=False + rescue.enabled=False (both real
+    # defaults on OrchestratorConfig) is exactly the 7-day-outage config
     # shape -- no automated path ever calls record_review(). _config()
     # defaults review_dispatch on for the rest of this module, so this test
     # overrides it back off explicitly.
@@ -171,7 +314,7 @@ def test_doctor_flags_no_automated_review_to_verdict_path(tmp_path: Path) -> Non
         review_dispatch=ReviewDispatchConfig(enabled=False),
     )
     assert config.review_dispatch.enabled is False
-    assert config.cross_family.auto_verdict is False
+    assert config.rescue.enabled is False
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
 
@@ -182,17 +325,17 @@ def test_doctor_flags_no_automated_review_to_verdict_path(tmp_path: Path) -> Non
     assert check.ok is False
     assert check.severity == "error"
     assert "review_dispatch.enabled" in check.detail
-    assert "cross_family.auto_verdict" in check.detail
+    assert "rescue.enabled" in check.detail
     assert ok is False
 
 
-def test_doctor_review_to_verdict_path_ok_when_auto_verdict_enabled(tmp_path: Path) -> None:
-    # review_dispatch off, cross_family.auto_verdict on: the check must pass
-    # on auto_verdict alone, independent of review_dispatch.
+def test_doctor_review_to_verdict_path_ok_when_rescue_enabled(tmp_path: Path) -> None:
+    # review_dispatch off, rescue.enabled on: the check must pass on
+    # rescue.enabled alone, independent of review_dispatch.
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         review_dispatch=ReviewDispatchConfig(enabled=False),
-        cross_family=CrossFamilyConfig(auto_verdict=True),
+        rescue=RescueConfig(enabled=True),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -250,7 +393,8 @@ def test_doctor_adapter_probe_runs_devin_probe_and_surfaces_sessions(
 
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -336,7 +480,8 @@ def test_doctor_surfaces_post_mortem_terminal_cause_and_attempt_ref(
     )
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -383,7 +528,8 @@ def test_doctor_surface_post_mortems_absent_degrades_silently(tmp_path: Path, mo
     )
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -404,7 +550,8 @@ def test_doctor_adapter_probe_reports_failed_devin_binary(tmp_path: Path, monkey
     )
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -426,7 +573,8 @@ def test_doctor_adapter_probe_claude_code_probes_claude(tmp_path: Path, monkeypa
     )
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="claude-code", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="claude-code"),
         # Empty venv_source skips the venv-existence check so this test stays
         # scoped to the probe path.
         claude_code=ClaudeCodeConfig(venv_source=""),
@@ -444,7 +592,8 @@ def test_doctor_adapter_probe_claude_code_probes_claude(tmp_path: Path, monkeypa
 def test_doctor_without_adapter_probe_omits_probe_checks(tmp_path: Path) -> None:
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -528,10 +677,10 @@ def test_doctor_adapter_probe_uses_configured_devin_binary(tmp_path: Path, monke
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             shell_command=("my-devin-wrapper", "--prompt-file", "{prompt_path}", "--print"),
         ),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -556,7 +705,8 @@ def test_doctor_adapter_probe_uses_configured_claude_binary(tmp_path: Path, monk
 
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="claude-code", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="claude-code"),
         claude_code=ClaudeCodeConfig(
             command=("my-claude-wrapper", "-p", "--permission-mode", "acceptEdits"),
             venv_source="",
@@ -578,10 +728,10 @@ def test_doctor_reports_config_driven_worker_model(tmp_path: Path) -> None:
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             worker_model="claude-sonnet-4-5",
         ),
+        worker=WorkerRoleConfig(harness="devin-shell", model="claude-sonnet-4-5"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -601,10 +751,10 @@ def test_doctor_reports_cli_default_when_worker_model_empty(tmp_path: Path) -> N
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             worker_model="",
         ),
+        worker=WorkerRoleConfig(harness="devin-shell", model=""),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -625,10 +775,10 @@ def test_doctor_omits_worker_model_check_for_non_devin_shell_adapters(tmp_path: 
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="claude-code",
             sessions_dir="sessions",
             worker_model="claude-sonnet-4-5",
         ),
+        worker=WorkerRoleConfig(harness="claude-code", model="claude-sonnet-4-5"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -651,10 +801,10 @@ def test_worker_github_token_ok_when_configured_devin_shell(tmp_path: Path) -> N
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             worker_env={"GH_TOKEN": "placeholder-not-a-real-token"},
         ),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -676,7 +826,8 @@ def test_worker_github_token_warns_when_missing_devin_shell(tmp_path: Path) -> N
     """
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -696,7 +847,8 @@ def test_worker_github_token_claude_code_adapter_sources_claude_code_worker_env(
 ) -> None:
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="claude-code", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="claude-code"),
         claude_code=ClaudeCodeConfig(worker_env={"GITHUB_TOKEN": "placeholder-not-a-real-token"}),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -720,7 +872,8 @@ def test_worker_github_token_omitted_for_manual_and_command_adapters(tmp_path: P
     for adapter in ("manual", "command"):
         config = _config(
             auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-            devin=DevinConfig(adapter=adapter, sessions_dir="sessions"),
+            devin=DevinConfig(sessions_dir="sessions"),
+            worker=WorkerRoleConfig(harness=adapter),
         )
         paths = runtime_paths(tmp_path, config.runtime.state_dir)
         gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -735,11 +888,13 @@ def test_worker_github_token_omitted_for_manual_and_command_adapters(tmp_path: P
 def test_worker_github_token_api_routed_check_fires_alongside_default_adapter(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """A devin-shell default with api_worker enabled still routes some issues to api.
+    """A devin-shell default with api_worker enabled still has an api-routed subset.
 
-    routing.select_adapter can send individual issues to the api adapter
-    (policy:rework/policy:complexity) whenever api_worker.enabled is True,
-    regardless of the configured default adapter. That subset sources
+    Whenever api_worker.enabled is True, some sessions in a pass may launch
+    via the api harness (Task 3 of this plan removed per-issue *routing*
+    policy, not the api harness itself — api_worker.enabled alone is enough
+    to put api sessions in a pass, e.g. via a future non-routing dispatch
+    path). That subset sources
     claude_code.worker_env — a devin-shell default with a devin.worker_env
     token must not hide a missing claude_code.worker_env token for the
     api-routed subset.
@@ -751,10 +906,10 @@ def test_worker_github_token_api_routed_check_fires_alongside_default_adapter(
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             worker_env={"GH_TOKEN": "placeholder-not-a-real-token"},
         ),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         api_worker=_api_worker_config(enabled=True),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -787,10 +942,10 @@ def test_worker_github_token_rescue_routed_check_fires_when_api_worker_disabled(
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             worker_env={"GH_TOKEN": "placeholder-not-a-real-token"},
         ),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         rescue=RescueConfig(enabled=True),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -816,10 +971,16 @@ def test_worker_github_token_no_secret_in_output(tmp_path: Path) -> None:
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter="devin-shell",
             sessions_dir="sessions",
             worker_env={"GH_TOKEN": secret},
         ),
+        # worker.harness must be set explicitly so the "worker GitHub token"
+        # check actually fires -- doctor.py reads worker.harness, and this
+        # test constructs OrchestratorConfig directly in Python, bypassing
+        # whatever load-time defaulting/validation build_config_from_data
+        # would otherwise perform. Without this the check is silently absent
+        # and the loop below trivially finds no leak in nothing.
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -2352,7 +2513,8 @@ def test_doctor_surfaces_in_progress_corroboration_alive_but_polling(
     )
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
         post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
     )
@@ -2393,7 +2555,8 @@ def test_doctor_in_progress_corroboration_silent_when_no_workers(
     )
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
@@ -2407,3 +2570,40 @@ def test_doctor_in_progress_corroboration_silent_when_no_workers(
     check = by_name["in-progress worker corroboration"]
     assert check.ok is True
     assert "no in-progress workers" in check.detail
+
+
+def test_doctor_reports_role_config_summary(tmp_path: Path) -> None:
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        worker=WorkerRoleConfig(harness="devin-shell", model="claude-sonnet-4-5"),
+        reviewer=ReviewerRoleConfig(harness="claude-code", model="claude-opus-4-1"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    assert "role config" in by_name
+    role_check = by_name["role config"]
+    assert role_check.ok is True
+    assert "worker: harness=devin-shell model=claude-sonnet-4-5" in role_check.detail
+    assert "reviewer: harness=claude-code model=claude-opus-4-1" in role_check.detail
+    assert ok is True
+
+
+def test_doctor_role_config_summary_reports_cross_family_yes_when_models_differ(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        worker=WorkerRoleConfig(harness="devin-shell", model="glm-5-2"),
+        reviewer=ReviewerRoleConfig(harness="claude-code", model="claude-opus-4-1"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    assert "cross-family: yes" in by_name["role config"].detail

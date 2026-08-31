@@ -110,6 +110,7 @@ from .fleet_registry import managed_repo_names
 from .github import (
     GitHubLike,
     PR_CLOSING_ISSUES_FIELDS,
+    build_branch_issue_validator,
     label_names,
     linked_issue_number,
 )
@@ -1759,6 +1760,17 @@ def _classify_dead_sessions_and_update_throttle_state(
     # Fetch open PRs for the "no open PR" guard
     prs = gh.pr_list()
     open_prs_by_issue: dict[int, list[dict[str, Any]]] = {}
+    # Issue #1229: validate branch-name-derived issue numbers against the
+    # open-issue set so a stale branch name (e.g. agent/issue-709-… left over
+    # from a merged PR #709, reused by an unrelated issue-less PR) cannot
+    # populate open_prs_by_issue[<wrong n>]. That map feeds the
+    # escalation/salvage-skip guard below (``w.issue_number not in
+    # open_prs_by_issue``): a stale binding to a dead worker's issue number
+    # would make the guard see a phantom open PR for that issue and skip
+    # escalation/salvage for a session that has no real open PR — the same
+    # "act on the wrong subject" failure class as the rework-episode
+    # collision the issue was filed for.
+    branch_validator = build_branch_issue_validator(gh)
     for pr in prs:
         pr_state = str(pr.get("state") or "").upper()
         if pr_state != "OPEN":
@@ -1767,6 +1779,7 @@ def _classify_dead_sessions_and_update_throttle_state(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=config.dispatch.branch_prefix,
+            branch_issue_validator=branch_validator,
         )
         if issue_number is not None:
             open_prs_by_issue.setdefault(issue_number, []).append(pr)

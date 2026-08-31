@@ -211,13 +211,6 @@ class LabelConfig:
     # via ``_compute_remove``) and of ``all`` (so ``bootstrap_labels``
     # creates it on GitHub).
     operator_queue: str = "agent:operator-queue"
-    # Routing hint, NOT a workflow state (issue #481). Never a member of
-    # ``active``/``terminal``/``workflow_labels`` — it must not affect issue
-    # selection or exclusion. Included in ``all`` so ``bootstrap_labels``
-    # creates it on GitHub with a sensible description. Human-applied at filing
-    # time; read by routing.select_adapter to send a complex first-pass issue to
-    # the api worker instead of the weaker default worker.
-    complexity_high: str = "complexity:high"
 
     @property
     def terminal(self) -> set[str]:
@@ -247,7 +240,6 @@ class LabelConfig:
             self.human_needed,
             self.prose_only_deps,
             self.merge_hold,
-            self.complexity_high,
             self.operator_queue,
         ]
 
@@ -279,7 +271,6 @@ class LabelConfig:
 class DispatchConfig:
     default_limit: int = 3
     branch_prefix: str = "agent/issue"
-    worker_model_tier: str = "capable"
     # Package template rendered for worker prompts. "worker.md" targets Devin
     # sessions (skills-based loop); "worker_claude_code.md" targets Claude Code
     # workers (direct shell loop). A repo-local prompts dir overrides by filename.
@@ -480,6 +471,25 @@ class ReviewConfig:
     # spinning indefinitely on a PR where retriggering mechanically cannot
     # help (e.g. a workflow file itself is broken).
     stale_checks_max_retriggers: int = 3
+    # Issue #1132: a transient GraphQL repo-resolution failure (e.g. during a
+    # ~7-minute network/ISP dip) was classified as a permanent
+    # ``foreign_issue_ref`` park because ``GitHubNotFoundError`` conflates
+    # repository-level resolution failures with issue-level 404s. Two knobs
+    # bound the damage so a wrong park costs hours, not forever:
+    #
+    # ``foreign_issue_ref_confirm_passes``: require this many consecutive
+    # not-found passes before parking durably. A transient window (minutes)
+    # clears before 2 typical 5-minute passes complete. 1 preserves the
+    # original one-pass park behavior (use only if the classification guard
+    # alone is trusted). Legacy markers without a ``confirmations`` field are
+    # treated as already-confirmed so existing parks are not re-processed.
+    foreign_issue_ref_confirm_passes: int = 2
+    # ``foreign_issue_ref_reprobe_hours``: re-probe a parked marker via REST
+    # ``issue_view`` on this cadence; if the issue now resolves, clear the
+    # marker, emit an event, and resume per-PR processing. A wrong park
+    # self-heals in hours instead of sitting forever. 0 disables self-heal
+    # (operator-only remedy via ``charlie unescalate --pr``).
+    foreign_issue_ref_reprobe_hours: int = 24
 
 
 @dataclass(frozen=True)
@@ -694,37 +704,6 @@ class ReviewDispatchConfig:
     # include the full diff guidance). 500 lines is ~12K tokens, a reasonable
     # single-read budget; beyond that the reviewer should read file-by-file.
     diff_line_threshold: int = 500
-    # Effort level pinned via --effort on reviewer session launches. Empty
-    # string means fall back to claude_code.effort (the worker/reviewer
-    # default). Its MEANING depends on review_effort_experiment_fraction below:
-    #   - fraction == 0.0 (default, experiment disabled): review_effort, when
-    #     set, applies to ALL reviewer launches unconditionally — exactly the
-    #     pre-experiment behavior. This is the "just pin reviewer effort"
-    #     knob with no A/B semantics.
-    #   - fraction in (0.0, 1.0]: review_effort becomes the TREATMENT arm's
-    #     effort, applied only to the assigned fraction of PRs (see
-    #     claude_code._review_effort_arm / resolve_review_effort). The
-    #     remaining PRs (control) fall back to claude_code.effort as if
-    #     review_effort were unset. This lets the A/B be compared via the
-    #     per-review session telemetry (review_session_metrics /
-    #     review_effort_arm on record_review) without confounding from
-    #     concurrent pipeline changes (time-windowed A/B was replaced by this
-    #     per-PR randomized assignment for exactly that reason).
-    review_effort: str = ""
-    # Fraction (0.0-1.0) of PRs randomly (but deterministically, see
-    # claude_code._review_effort_arm) assigned to the review_effort
-    # "treatment" arm. 0.0 (default) disables the experiment: review_effort
-    # applies to every review when set, same as before this field existed.
-    # Assignment is a stateless hash of the PR number (+ salt below), so the
-    # same PR always lands in the same arm across rework rounds/re-dispatches
-    # — arm-hopping across rounds would contaminate the per-PR quality
-    # signal the experiment is trying to measure.
-    review_effort_experiment_fraction: float = 0.0
-    # Mixed into the per-PR assignment hash alongside the PR number. Change
-    # this to re-randomize arm assignment for a new experiment epoch (e.g.
-    # after a config change invalidates the current cohort) without needing
-    # to rename or remove the fraction field.
-    review_effort_experiment_salt: str = ""
     # Issue #1439: structure-aware reviewer turn cap. The flat
     # ``review_max_turns`` budget ignores the size of the files a diff touches,
     # so a PR threading a monolith (e.g. workflow.py at ~25k lines) burns the
@@ -1138,14 +1117,16 @@ class RuntimeConfig:
     status_snapshot_ttl_seconds: int = 900
 
 
+# Shared default for every Claude Code model field this refactor touches
+# (ReviewerRoleConfig.model, and claude_code.py's read-site fallback for an
+# empty worker/reviewer model pin) so they cannot silently drift apart --
+# CLAUDE.md's "no hardcoded lists" rule applied to a scalar default instead
+# of a list.
+_DEFAULT_CLAUDE_MODEL: str = "claude-sonnet-5"
+
+
 @dataclass(frozen=True)
 class DevinConfig:
-    # "manual" writes a session manifest for the operator; "command" runs a
-    # blocking dispatch_command per issue; "devin-shell" launches headless
-    # `devin` CLI sessions non-blocking with sidecar tracking (devin_shell.py);
-    # "claude-code" launches Claude Code workers in isolated git worktrees
-    # (claude_code.py, configured under the claude_code section).
-    adapter: str = "manual"
     # Empty string means "derive from runtime.state_dir" (layout.py's
     # session_manifest_default/session_results_default) rather than a fixed
     # literal -- see paths.resolved_layout, the single place that resolves
@@ -1190,18 +1171,20 @@ class DevinConfig:
 
 @dataclass(frozen=True)
 class ClaudeCodeConfig:
-    """Settings for the claude-code worker adapter (devin.adapter: claude-code)."""
+    """Settings for the claude-code worker/reviewer harness (worker.harness:
+    claude-code / reviewer.harness: claude-code). The model launched under
+    this harness is ``worker.model``/``reviewer.model`` -- see
+    ``WorkerRoleConfig``/``ReviewerRoleConfig`` -- not a field here; every
+    worker/reviewer launch pins ``--model`` explicitly from the resolved
+    role config (claude_code._apply_model_pin), falling back to
+    ``_DEFAULT_CLAUDE_MODEL`` only when the role's own model is unset. This
+    keeps a single source of truth instead of an ambient `claude` CLI
+    session's last `/model` choice leaking into headless fleet dispatch
+    (2026-07-22 outage: exactly that leak stalled every PR review fleet-wide
+    with zero backoff signal since the error didn't match the
+    quota-exhaustion classifier).
+    """
 
-    # Every worker/reviewer launch pins this explicitly via `--model` — see
-    # claude_code._apply_model_pin. Without an explicit pin, the spawned
-    # `claude` CLI subprocess falls back to whatever model an interactive
-    # session on this machine last set globally (e.g. via `/model`), which
-    # is never guaranteed to be available/affordable for headless fleet
-    # dispatch (2026-07-22 outage: an operator session's `/model` choice of
-    # a premium tier silently propagated to every reviewer launch and hit a
-    # credits wall, stalling every PR review fleet-wide with zero backoff
-    # signal since the error didn't match the quota-exhaustion classifier).
-    model: str = "claude-sonnet-5"
     # Effort level pinned via ``--effort`` on every worker/reviewer launch —
     # see claude_code._apply_effort_pin. Empty string means no pin (the CLI
     # uses its default effort). Mirrors the model pin: prevents ambient CLI
@@ -1302,7 +1285,6 @@ class ApiWorkerConfig:
         default_factory=lambda: MappingProxyType({})
     )
     budget: ApiBudgetConfig = field(default_factory=ApiBudgetConfig)
-    fallback_adapter: str = "devin-shell"
     worker_template: str = "worker_claude_code.md"
     rework_template: str = "rework.md"
 
@@ -1358,47 +1340,93 @@ class ApiWorkerConfig:
 
 
 @dataclass(frozen=True)
-class CrossFamilyConfig:
-    """Auto cross-family (non-Claude) adversarial pass over specs and PRs.
+class WorkerRoleConfig:
+    """The designated worker: which harness dispatches fresh/rework issues,
+    and which model that harness should use.
 
-    ``enabled`` defaults False so an absent config block is a no-op. Trivially
-    removable: flip ``enabled`` to false (or drop the block) and the
-    orchestrator behaves exactly as before.
+    ``harness`` must be one of ``_VALID_WORKER_HARNESSES`` (``devin-shell`` |
+    ``claude-code`` | ``api`` | ``command`` | ``manual``) -- enforced at the
+    top-level ``worker:`` build site in ``build_config_from_data``, not here
+    in ``__post_init__``, because this same dataclass is reused for
+    ``rescue.worker``/``rescue.reviewer``, and ``rescue.reviewer``'s own
+    documented default harness (``"devin"``) is not a member of that
+    frozenset -- a blanket per-instance check would reject that reuse's own
+    defaults. ``model`` is harness-specific: empty string means "let the
+    harness's own default apply"; ``claude_code.py``'s launch call sites fall
+    back to ``_DEFAULT_CLAUDE_MODEL`` when the resolved worker/reviewer model
+    is empty and the harness is claude-code.
+
+    Kept intentionally minimal (just harness + model). The design spec's
+    example config leaves room for future harness-specific per-role knobs.
     """
 
-    enabled: bool = False
-    model: str = "codex"
-    command: str | tuple[str, ...] = (
-        "devin",
-        "--model",
-        "{model}",
-        "-p",
-        "--prompt-file",
-        "{prompt_path}",
-    )
-    timeout_seconds: int = 300
-    auto_verdict: bool = False
-    # Issue #784: bounds the "content-free verdict -> forced regeneration ->
-    # still content-free" cycle. Counts distinct parse-failure attempts (one
-    # per genuinely new report/head, never per loop-pass re-read of a cached
-    # one) per PR. Once exceeded, the PR is released from the cross-family
-    # gate (recorded as a caveated "approved") instead of looping forever or
-    # escalating to a human — see workflow._record_cross_family_verdicts.
-    max_parse_failures: int = 2
-    # Issue #1081: bounds how many times loop() will force review() to
-    # regenerate an *unusable* cross-family report (a "(UNAVAILABLE)" failure
-    # stub, or one carrying no head SHA) for one unchanged PR head. The bound
-    # is required because regeneration runs the cross-family model
-    # synchronously for up to ``timeout_seconds``; unbounded, a model that is
-    # simply down burns that timeout on every pass and starves the other repo
-    # in the shared sequential loop (#1078).
-    #
-    # This does NOT share max_parse_failures' terminal behaviour, and must not
-    # be "unified" with it. That bound ends in a caveated "approved"; this one
-    # ends in a human_needed escalation, because exhausting it means the head
-    # was never confirmed and approving on an unconfirmed head is precisely the
-    # fail-open #1079 closed.
-    max_regen_attempts: int = 2
+    harness: str = "manual"
+    model: str = ""
+
+
+@dataclass(frozen=True)
+class ReviewerRoleConfig:
+    """The designated reviewer: which harness launches PR review sessions,
+    which model it uses, and the review-effort A/B experiment knobs.
+
+    ``harness`` currently only accepts ``"claude-code"``; any other value is
+    rejected with ``ConfigError`` at load (see ``__post_init__`` -- issue
+    #1513). This dataclass is used exclusively for the single top-level
+    ``config.reviewer`` role (unlike ``WorkerRoleConfig``, which is also
+    reused for ``rescue.worker``/``rescue.reviewer``), so a blanket
+    per-instance check here has no conflicting reuse to worry about. The
+    field exists, rather than the reviewer harness being implicit, so a
+    future non-claude-code reviewer can be added by relaxing this one check.
+    """
+
+    harness: str = "claude-code"
+    model: str = _DEFAULT_CLAUDE_MODEL
+    effort: str = ""
+    effort_experiment_fraction: float = 0.0
+    effort_experiment_salt: str = ""
+
+    def __post_init__(self) -> None:
+        if self.harness != "claude-code":
+            raise ConfigError(
+                "config section 'reviewer' key 'harness' only supports "
+                f"'claude-code'; got {self.harness!r}"
+            )
+        if not isinstance(self.effort, str):
+            raise ConfigError(
+                "config section 'reviewer' key 'effort' must be a string, "
+                f"got {type(self.effort).__name__}"
+            )
+        fraction = self.effort_experiment_fraction
+        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+            raise ConfigError(
+                "config section 'reviewer' key 'effort_experiment_fraction' must be a "
+                f"number, got {type(fraction).__name__}"
+            )
+        if not (0.0 <= fraction <= 1.0):
+            raise ConfigError(
+                "config section 'reviewer' key 'effort_experiment_fraction' must be in "
+                f"[0.0, 1.0], got {fraction}"
+            )
+        if not isinstance(self.effort_experiment_salt, str):
+            raise ConfigError(
+                "config section 'reviewer' key 'effort_experiment_salt' must be a string, "
+                f"got {type(self.effort_experiment_salt).__name__}"
+            )
+        # Cross-field check: a fraction > 0.0 enables the experiment, whose
+        # treatment arm IS effort verbatim (resolve_review_effort returns it
+        # unmodified). Enabling the experiment without a treatment effort
+        # would silently make "treatment" mean "no --effort pin at all" while
+        # "control" still gets claude_code.effort -- a corrupted, undocumented
+        # comparison that would run for the life of the experiment with no
+        # warning. Fail loud at load instead. (Relocated from the deleted
+        # review_dispatch.review_effort_experiment_fraction cross-field check
+        # -- role-config Phase 2 Track E.)
+        if fraction > 0.0 and not self.effort:
+            raise ConfigError(
+                "config section 'reviewer': 'effort_experiment_fraction' is "
+                f"{fraction} but 'effort' is unset -- set 'effort' to the treatment "
+                "effort string (e.g. 'high') before enabling the experiment"
+            )
 
 
 @dataclass(frozen=True)
@@ -1408,7 +1436,8 @@ class RescueConfig:
     Inserts exactly one Opus rework attempt + one cross-family (non-Claude)
     review pass between "cheap-worker cap exhausted" and escalating to a
     human. ``enabled`` defaults False so an absent config block is a no-op —
-    mirrors ``CrossFamilyConfig`` (config.py:236).
+    the same "absent block is a no-op" contract every other optional config
+    section in this module follows.
 
     Only the three verdict-driven caps route through here
     (``max_rework_cycles``, ``max_conflict_rework_attempts``,
@@ -1419,17 +1448,34 @@ class RescueConfig:
 
     The rescue rework reuses the existing claude-code rework-dispatch path
     (``_dispatch_rework_impl`` → ``adapters.dispatch_sessions`` →
-    ``claude_code.launch_claude_worker``) with ``claude_code.model``
-    overridden to ``worker_model`` for that one dispatch — never a parallel
-    launch path. ``worker_adapter`` is currently always ``"claude-code"``;
-    kept as an explicit field so a future adapter can be wired in by config
-    alone, matching the spec's named knobs.
+    ``claude_code.launch_claude_worker``) with ``worker.model`` overridden
+    to ``worker_model`` for that one dispatch (see
+    ``Workflow._rescue_adapter_settings``) — never a parallel launch path.
+    ``worker_adapter`` is currently always ``"claude-code"``; kept as an
+    explicit field so a future adapter can be wired in by config alone,
+    matching the spec's named knobs.
 
-    The rescue review reuses ``cross_family.run_cross_family_review`` (the
+    The rescue review reuses ``rescue_review.run_cross_family_review`` (the
     existing blocking, one-shot cross-family invocation) rather than a new
-    polling worker session — ``reviewer_command`` empty means reuse
-    ``CrossFamilyConfig.command`` with ``model`` overridden to
-    ``reviewer_model``.
+    polling worker session — ``reviewer_command`` defaults to the standard
+    Devin CLI invocation shape; override it only if the rescue tier's
+    reviewer harness differs from that default.
+
+    ``worker``/``reviewer`` below are ``WorkerRoleConfig``-typed nested
+    equivalents of ``worker_adapter``/``worker_model`` and
+    ``reviewer_adapter``/``reviewer_model`` above, parsed directly from
+    ``rescue.worker:``/``rescue.reviewer:`` YAML sections. They are not
+    synced with the flat fields above -- there was a role-config Phase 1
+    dual-accept bridge between the two representations, deleted whole in
+    Phase 2 (Track E) since neither ``src/`` nor any test fixture reads
+    these nested fields; the flat fields remain the only ones consumed at
+    runtime. Both reuse ``WorkerRoleConfig`` (not ``ReviewerRoleConfig``):
+    the rescue reviewer legitimately defaults to a non-claude-code harness
+    (``"devin"``/``"codex"``) and launches through
+    ``rescue_review.run_cross_family_review``, never
+    ``claude_code.launch_claude_worker`` -- so ``ReviewerRoleConfig``'s
+    claude-code-only harness restriction and its effort/experiment fields
+    would both be wrong here.
     """
 
     enabled: bool = False
@@ -1437,10 +1483,23 @@ class RescueConfig:
     worker_model: str = "claude-opus-4-1"
     reviewer_adapter: str = "devin"
     reviewer_model: str = "codex"
-    # Empty means reuse CrossFamilyConfig.command (model still overridden to
-    # reviewer_model above).
-    reviewer_command: str | tuple[str, ...] = ()
+    # Standard Devin CLI invocation shape -- override only if the rescue
+    # tier's reviewer harness differs from that default.
+    reviewer_command: str | tuple[str, ...] = (
+        "devin",
+        "--model",
+        "{model}",
+        "-p",
+        "--prompt-file",
+        "{prompt_path}",
+    )
     reviewer_timeout_seconds: int = 300
+    worker: WorkerRoleConfig = field(
+        default_factory=lambda: WorkerRoleConfig(harness="claude-code", model="claude-opus-4-1")
+    )
+    reviewer: WorkerRoleConfig = field(
+        default_factory=lambda: WorkerRoleConfig(harness="devin", model="codex")
+    )
 
 
 @dataclass(frozen=True)
@@ -1562,8 +1621,8 @@ class WorktreeReclamationConfig:
 class TestAdequacyConfig:
     """Config for the opt-in test-adequacy gate (janitor.check_test_adequacy).
 
-    ``enabled`` defaults False so an absent config block is a no-op — mirrors
-    CrossFamilyConfig (config.py:236). When enabled, ``OrchestratorApp.review()``
+    ``enabled`` defaults False so an absent config block is a no-op. When enabled,
+    ``OrchestratorApp.review()``
     runs the structural check (``janitor.check_test_adequacy``) before packet
     generation: a Tier-1 "pure skip" failure auto-records a ``request_changes``
     decision, and a passing PR gets a test-quality rubric folded into the review
@@ -1617,7 +1676,7 @@ class CoverageProbeConfig:
     probes (``diff_coverage_probe.run_static_probe``, issues #1260/#1261).
 
     ``enabled`` defaults False so an absent config block is a no-op --
-    mirrors ``CrossFamilyConfig``/``TestAdequacyConfig``. This is a new,
+    mirrors ``TestAdequacyConfig``. This is a new,
     independent config section: it does NOT read, gate on, or repurpose any
     field of ``TestAdequacyConfig``, including that class's reserved Tier-3
     ``coverage_enabled``/``coverage_command``/``min_diff_coverage`` fields
@@ -1689,7 +1748,7 @@ class NotifyConfig:
     Detect (supervisor) and escalate (label policy) are separate concerns — this
     section only decides where a digest goes once a needs-attention transition
     has already fired. ``enabled`` defaults False so an absent config block is
-    a no-op — mirrors CrossFamilyConfig (config.py:236).
+    a no-op.
     """
 
     enabled: bool = False
@@ -1707,9 +1766,9 @@ class RunnersConfig:
     """GitHub Actions runner management.
 
     ``cancel_superseded_main_runs`` defaults False so an absent config block is
-    a no-op — mirrors CrossFamilyConfig (config.py:236). When enabled, cancels
-    queued runs on the default branch for the configured workflow, keeping only
-    the newest (its tree contains every earlier merge).
+    a no-op. When enabled, cancels queued runs on the default branch for the
+    configured workflow, keeping only the newest (its tree contains every
+    earlier merge).
 
     ``fleet_autoscale_prologue`` defaults False so an absent config block is
     a no-op. When enabled, runs the autoscale decision before fleet bash-rats.
@@ -1894,8 +1953,9 @@ class OrchestratorConfig:
     devin: DevinConfig = field(default_factory=DevinConfig)
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
-    cross_family: CrossFamilyConfig = field(default_factory=CrossFamilyConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
+    worker: WorkerRoleConfig = field(default_factory=WorkerRoleConfig)
+    reviewer: ReviewerRoleConfig = field(default_factory=ReviewerRoleConfig)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     worktree_reclamation: WorktreeReclamationConfig = field(
         default_factory=WorktreeReclamationConfig
@@ -1968,6 +2028,11 @@ def _build_section(cls: type, name: str, data: dict[str, Any]) -> Any:
             f"(valid: {', '.join(sorted(valid))})"
         )
     return cls(**data)
+
+
+_VALID_WORKER_HARNESSES: frozenset[str] = frozenset(
+    {"devin-shell", "claude-code", "api", "command", "manual"}
+)
 
 
 def known_config_sections() -> frozenset[str]:
@@ -2180,6 +2245,28 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'review' key 'stale_checks_max_retriggers' must not be negative"
             )
+    fir_confirm = review_data.get("foreign_issue_ref_confirm_passes")
+    if fir_confirm is not None:
+        if isinstance(fir_confirm, bool) or not isinstance(fir_confirm, int):
+            raise ConfigError(
+                "config section 'review' key 'foreign_issue_ref_confirm_passes' must be an "
+                f"int, got {type(fir_confirm).__name__}"
+            )
+        if fir_confirm < 1:
+            raise ConfigError(
+                "config section 'review' key 'foreign_issue_ref_confirm_passes' must be >= 1"
+            )
+    fir_reprobe = review_data.get("foreign_issue_ref_reprobe_hours")
+    if fir_reprobe is not None:
+        if isinstance(fir_reprobe, bool) or not isinstance(fir_reprobe, int):
+            raise ConfigError(
+                "config section 'review' key 'foreign_issue_ref_reprobe_hours' must be an "
+                f"int, got {type(fir_reprobe).__name__}"
+            )
+        if fir_reprobe < 0:
+            raise ConfigError(
+                "config section 'review' key 'foreign_issue_ref_reprobe_hours' must not be negative"
+            )
     review = _build_section(ReviewConfig, "review", review_data)
     review_dispatch_data = _section(data, "review_dispatch")
     for rd_bool_key in ("enabled",):
@@ -2290,47 +2377,6 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             raise ConfigError(
                 f"config section 'review_dispatch' key '{_rd_key}' must be >= 0, got {_rd_val}"
             )
-    rd_effort = review_dispatch_data.get("review_effort")
-    if rd_effort is not None and not isinstance(rd_effort, str):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'review_effort' must be a string, "
-            f"got {type(rd_effort).__name__}"
-        )
-    rd_experiment_fraction = review_dispatch_data.get("review_effort_experiment_fraction")
-    if rd_experiment_fraction is not None and (
-        isinstance(rd_experiment_fraction, bool)
-        or not isinstance(rd_experiment_fraction, (int, float))
-    ):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'review_effort_experiment_fraction' "
-            f"must be a number, got {type(rd_experiment_fraction).__name__}"
-        )
-    if rd_experiment_fraction is not None and not (0.0 <= rd_experiment_fraction <= 1.0):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'review_effort_experiment_fraction' "
-            f"must be in [0.0, 1.0], got {rd_experiment_fraction}"
-        )
-    rd_experiment_salt = review_dispatch_data.get("review_effort_experiment_salt")
-    if rd_experiment_salt is not None and not isinstance(rd_experiment_salt, str):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'review_effort_experiment_salt' must be a "
-            f"string, got {type(rd_experiment_salt).__name__}"
-        )
-    # Cross-field check: a fraction > 0.0 enables the experiment, whose
-    # treatment arm IS review_effort verbatim (resolve_review_effort returns
-    # it unmodified). Enabling the experiment without a treatment effort
-    # would silently make "treatment" mean "no --effort pin at all" while
-    # "control" still gets claude_code.effort -- a corrupted, undocumented
-    # comparison that would run for the life of the experiment with no
-    # warning. Fail loud at load instead.
-    effective_fraction = rd_experiment_fraction if rd_experiment_fraction is not None else 0.0
-    effective_effort = rd_effort if rd_effort is not None else ""
-    if effective_fraction > 0.0 and not effective_effort:
-        raise ConfigError(
-            "config section 'review_dispatch': 'review_effort_experiment_fraction' is "
-            f"{effective_fraction} but 'review_effort' is unset -- set 'review_effort' to the "
-            "treatment effort string (e.g. 'high') before enabling the experiment"
-        )
     review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
     quota_probe_data = _section(data, "quota_probe")
     qp_enabled = quota_probe_data.get("enabled")
@@ -2924,7 +2970,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 "config section 'api_worker' key 'max_concurrent_sessions' must be >= 0, "
                 f"got {max_concurrent_sessions}"
             )
-    for str_key in ("fallback_adapter", "worker_template", "rework_template"):
+    for str_key in ("worker_template", "rework_template"):
         str_value = api_worker_data.get(str_key)
         if str_value is not None and not isinstance(str_value, str):
             raise ConfigError(
@@ -3022,19 +3068,6 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         api_worker_data["providers"] = MappingProxyType(built_providers)
 
     api_worker = _build_section(ApiWorkerConfig, "api_worker", api_worker_data)
-    cross_family_data = _section(data, "cross_family")
-    cf_command = cross_family_data.get("command")
-    if isinstance(cf_command, list):
-        cross_family_data["command"] = tuple(str(item) for item in cf_command)
-    # Validate cross_family.command placeholders
-    cf_command = cross_family_data.get("command")
-    if cf_command:
-        _validate_command_placeholders(
-            cf_command,
-            {"prompt_path", "issue_number", "branch", "model"},
-            "cross_family.command",
-        )
-    cross_family = _build_section(CrossFamilyConfig, "cross_family", cross_family_data)
     rescue_data = _section(data, "rescue")
     rescue_enabled = rescue_data.get("enabled")
     if rescue_enabled is not None and not isinstance(rescue_enabled, bool):
@@ -3077,7 +3110,47 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'rescue' key 'reviewer_timeout_seconds' must be >= 0, "
             f"got {rescue_timeout}"
         )
+    # Only construct (and thus override) rescue.worker/.reviewer when the
+    # section actually names that key. If it's absent, leave it out of
+    # rescue_data entirely so _build_section's cls(**data) below does NOT
+    # pass worker=/reviewer= at all -- letting RescueConfig's own
+    # field-level default_factory apply (harness="claude-code",
+    # model="claude-opus-4-1" for worker; harness="devin", model="codex"
+    # for reviewer). Unconditionally constructing a bare WorkerRoleConfig()
+    # here regardless of presence used to silently override those
+    # RescueConfig-specific defaults with WorkerRoleConfig's OWN bare
+    # defaults (harness="manual", model="") any time no rescue.worker/
+    # rescue.reviewer section was configured -- making a loaded (but
+    # rescue-section-absent) config disagree with a bare RescueConfig()
+    # Python construction, which several tests assert must be equivalent
+    # (test_config_provenance.py's "configured-off is indistinguishable
+    # from never-loaded" invariant). Caught during role-config Phase 2
+    # Track E test triage.
+    if "worker" in rescue_data:
+        rescue_worker_data = rescue_data.get("worker") or {}
+        if not isinstance(rescue_worker_data, dict):
+            rescue_worker_data = {}
+        rescue_data["worker"] = WorkerRoleConfig(**rescue_worker_data)
+    if "reviewer" in rescue_data:
+        rescue_reviewer_data = rescue_data.get("reviewer") or {}
+        if not isinstance(rescue_reviewer_data, dict):
+            rescue_reviewer_data = {}
+        rescue_data["reviewer"] = WorkerRoleConfig(**rescue_reviewer_data)
     rescue = _build_section(RescueConfig, "rescue", rescue_data)
+    worker = _build_section(WorkerRoleConfig, "worker", _section(data, "worker"))
+    # Harness membership is enforced here, at the top-level worker build site,
+    # rather than in WorkerRoleConfig.__post_init__: the dataclass is reused
+    # for rescue.worker/rescue.reviewer above, and rescue.reviewer's own
+    # documented default harness ("devin") is not a member of
+    # _VALID_WORKER_HARNESSES -- a blanket per-instance check would reject
+    # that reuse's own defaults. This check only ever applies to the single
+    # top-level worker role.
+    if worker.harness not in _VALID_WORKER_HARNESSES:
+        raise ConfigError(
+            "config section 'worker' key 'harness' must be one of "
+            f"{sorted(_VALID_WORKER_HARNESSES)}, got {worker.harness!r}"
+        )
+    reviewer = _build_section(ReviewerRoleConfig, "reviewer", _section(data, "reviewer"))
     watchdog_data = _section(data, "watchdog")
     terminal_error_markers = watchdog_data.get("terminal_error_markers")
     if terminal_error_markers is not None:
@@ -3560,8 +3633,9 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         devin=devin,
         claude_code=claude_code,
         api_worker=api_worker,
-        cross_family=cross_family,
         rescue=rescue,
+        worker=worker,
+        reviewer=reviewer,
         watchdog=watchdog,
         worktree_reclamation=worktree_reclamation,
         test_adequacy=test_adequacy,

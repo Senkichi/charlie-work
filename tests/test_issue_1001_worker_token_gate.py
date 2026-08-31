@@ -34,6 +34,7 @@ from charlie_work.config import (
     DispatchConfig,
     OrchestratorConfig,
     RescueConfig,
+    WorkerRoleConfig,
 )
 from charlie_work.env_sanitize import (
     STRIPPED_GH_TOKEN_VARS,
@@ -86,10 +87,13 @@ def _config(
     return OrchestratorConfig(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         devin=DevinConfig(
-            adapter=adapter,
             sessions_dir="sessions",
             worker_env=devin_worker_env or {},
         ),
+        # Role-config Phase 1.5: worker_github_token_findings and the
+        # dispatch gate read worker.harness, so it must be set explicitly
+        # to match this helper's `adapter` parameter.
+        worker=WorkerRoleConfig(harness=adapter),
         claude_code=ClaudeCodeConfig(
             worker_env=claude_worker_env or {},
         ),

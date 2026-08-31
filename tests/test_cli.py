@@ -19,7 +19,7 @@ from charlie_work.config import (
 )
 from ci_fleet.charlie_work_adapter import ScaleAction
 from ci_fleet.runners import ScaleDecision
-from charlie_work.cross_family import LEGACY_VACUOUS_SUMMARY
+from charlie_work.rescue_review import LEGACY_VACUOUS_SUMMARY
 from charlie_work import fleet_dispatch
 from charlie_work.fleet_dispatch import ApiWorkerFleetReport, _CiFleetDirtyCheck
 from charlie_work.fleet_paths import fleet_dir
@@ -380,68 +380,6 @@ def test_cli_dry_run_does_not_write_fleet_registry_through_doctor(
         "fleet.json must not be created in dry-run mode (doctor/touch_repo "
         "dropped the dry_run= kwarg)"
     )
-
-
-def test_cli_spec_review_missing_file_exits_nonzero(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Issue #363: a missing --file for spec_review exits 1 with an OS error message."""
-    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
-    repo = _make_repo(tmp_path)
-    missing_spec = repo / "missing-spec.md"
-
-    rc = cli.main(
-        [
-            "--repo",
-            str(repo),
-            "why-charlie-hate-spec",
-            "--file",
-            str(missing_spec),
-        ]
-    )
-
-    assert rc == 1
-    captured = capsys.readouterr()
-    assert "OS error" in captured.out
-    assert "No such file or directory" in captured.out
-    assert not (repo / ".var" / "charlie-work" / "cross-family").exists()
-
-
-def test_cli_spec_review_unreadable_file_json_output(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """With --json, an unreadable --file failure is still a machine-parseable non-zero result."""
-    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
-    repo = _make_repo(tmp_path)
-    unreadable = repo / "unreadable.md"
-    unreadable.write_text("secret", encoding="utf-8")
-
-    orig_read_text = Path.read_text
-
-    def _read_text(self: Path, *args: Any, **kwargs: Any) -> str:
-        if self == unreadable:
-            raise PermissionError(13, "Permission denied", str(self))
-        return orig_read_text(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "read_text", _read_text)
-
-    rc = cli.main(
-        [
-            "--repo",
-            str(repo),
-            "--json",
-            "why-charlie-hate-spec",
-            "--file",
-            str(unreadable),
-        ]
-    )
-
-    assert rc == 1
-    out = capsys.readouterr().out
-    payload = json.loads(out)
-    assert payload["ok"] is False
-    assert "OS error" in payload["message"]
-    assert not (repo / ".var" / "charlie-work" / "cross-family").exists()
 
 
 def test_cli_fleet_supervise_parser() -> None:
@@ -1255,15 +1193,21 @@ def test_run_doctor_command_reports_structured_finding_on_unparseable_config(
     the operator gets nothing to act on. Now the failure is caught locally
     and rendered as a structured, blocking ``DoctorCheck`` finding instead.
 
-    Drives the REAL ``load_layered_config`` (not mocked) against a real
-    unparseable config file on disk, mirroring the exact incident shape used
-    in test_fleet_dispatch.py's
-    test_fleet_loop_real_unknown_config_key_reproduces_incident.
+    The role-config Phase 2 cleanup deleted the dual-accept section
+    tolerance mechanism entirely, so a bare ``cross_family:`` section is no
+    longer specially tolerated -- it is rejected as an unknown top-level
+    section like any other bogus key, the same as the original incident's
+    exact reproduction shape would raise again today. This test instead
+    drives the REAL ``load_layered_config`` (not mocked) against an unknown
+    key inside a section that has always validated its own keys
+    (``labels``), which raises the identical ``ConfigError`` shape the
+    original incident hit -- proving the exception-handling path this test
+    exists for, independent of which section happens to raise.
     """
     monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
     # Deliberately NOT mocking cli.load_layered_config.
     (tmp_path / "orchestrator.config.yaml").write_text(
-        "labels:\n  ready: automated-ready\ncross_family:\n  totally_unknown_key: true\n",
+        "labels:\n  ready: automated-ready\n  totally_unknown_key: true\n",
         encoding="utf-8",
     )
 
@@ -1279,7 +1223,7 @@ def test_run_doctor_command_reports_structured_finding_on_unparseable_config(
     assert check["ok"] is False
     assert check["severity"] == "error", "a config parse failure must be blocking, not a warning"
     assert "totally_unknown_key" in check["detail"]
-    assert "cross_family" in check["detail"]
+    assert "labels" in check["detail"]
 
 
 # --------------------------------------------------------------------------

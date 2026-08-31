@@ -2027,7 +2027,6 @@ def test_issue_910_active_kinds_are_error_or_warning(tmp_path: Path) -> None:
         "review_verdict_missed": "error",
         "review_dispatch_escalated": "error",
         "merge_failed_attempt_alarm": "error",
-        "cross_family_verdict_abandoned": "error",
         "dispatch_blocked_chain_dead": "error",
         "flake_rerun_failed": "warning",
         "quota_probe_failed": "warning",

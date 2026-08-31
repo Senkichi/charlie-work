@@ -14,8 +14,12 @@ from charlie_work.config import (
     ConfigError,
     DispatchConfig,
     OrchestratorConfig,
+    RescueConfig,
+    ReviewerRoleConfig,
     RuntimeConfig,
+    WorkerRoleConfig,
     build_config_from_data,
+    known_config_sections,
     load_config,
 )
 from charlie_work.global_config import load_layered_config
@@ -109,6 +113,10 @@ watchdog:
     assert config.watchdog.worktree_mtime_threshold_minutes == 45
     assert config.watchdog.worktree_mtime_max_depth == 4
     assert config.watchdog.worktree_mtime_exclude_dirs == (".git", ".venv")
+
+
+def test_dispatch_config_has_no_worker_model_tier_field() -> None:
+    assert not hasattr(DispatchConfig(), "worker_model_tier")
 
 
 def test_dispatch_config_injected_paths_default_excludes_injected_files() -> None:
@@ -422,123 +430,127 @@ def test_load_config_quota_probe_prompt_rejects_empty(tmp_path: Path) -> None:
         load_config(config_file)
 
 
-def test_load_config_review_effort_experiment_defaults() -> None:
-    """review_effort_experiment_fraction/salt default to disabled (0.0/'')."""
+def test_load_config_reviewer_effort_experiment_defaults() -> None:
+    """reviewer.effort_experiment_fraction/salt default to disabled (0.0/'').
+
+    Relocated from review_dispatch.review_effort_experiment_* (role-config
+    Phase 2 Track E deleted those ReviewDispatchConfig fields; the
+    equivalent knobs now live on ReviewerRoleConfig)."""
     config = load_config(Path("nonexistent.yaml"))
-    assert config.review_dispatch.review_effort_experiment_fraction == 0.0
-    assert config.review_dispatch.review_effort_experiment_salt == ""
+    assert config.reviewer.effort_experiment_fraction == 0.0
+    assert config.reviewer.effort_experiment_salt == ""
 
 
-def test_load_config_review_effort_experiment_override(tmp_path: Path) -> None:
-    """review_effort_experiment_fraction/salt are read from YAML."""
+def test_load_config_reviewer_effort_experiment_override(tmp_path: Path) -> None:
+    """reviewer.effort/effort_experiment_fraction/salt are read from YAML."""
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
         config_file,
-        """review_dispatch:
-  review_effort: medium
-  review_effort_experiment_fraction: 0.25
-  review_effort_experiment_salt: epoch-2
+        """reviewer:
+  effort: medium
+  effort_experiment_fraction: 0.25
+  effort_experiment_salt: epoch-2
 """,
     )
     config = load_config(config_file)
-    assert config.review_dispatch.review_effort == "medium"
-    assert config.review_dispatch.review_effort_experiment_fraction == 0.25
-    assert config.review_dispatch.review_effort_experiment_salt == "epoch-2"
+    assert config.reviewer.effort == "medium"
+    assert config.reviewer.effort_experiment_fraction == 0.25
+    assert config.reviewer.effort_experiment_salt == "epoch-2"
 
 
-def test_load_config_review_effort_experiment_fraction_rejects_bool(tmp_path: Path) -> None:
+def test_load_config_reviewer_effort_experiment_fraction_rejects_bool(tmp_path: Path) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
         config_file,
-        """review_dispatch:
-  review_effort_experiment_fraction: true
+        """reviewer:
+  effort_experiment_fraction: true
 """,
     )
-    with pytest.raises(ConfigError, match="review_effort_experiment_fraction.*must be a number"):
+    with pytest.raises(ConfigError, match="effort_experiment_fraction.*must be a number"):
         load_config(config_file)
 
 
-def test_load_config_review_effort_experiment_fraction_rejects_non_number(tmp_path: Path) -> None:
+def test_load_config_reviewer_effort_experiment_fraction_rejects_non_number(
+    tmp_path: Path,
+) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
         config_file,
-        """review_dispatch:
-  review_effort_experiment_fraction: "0.5"
+        """reviewer:
+  effort_experiment_fraction: "0.5"
 """,
     )
-    with pytest.raises(ConfigError, match="review_effort_experiment_fraction.*must be a number"):
+    with pytest.raises(ConfigError, match="effort_experiment_fraction.*must be a number"):
         load_config(config_file)
 
 
 @pytest.mark.parametrize("value", [-0.01, 1.01, 2, -1])
-def test_load_config_review_effort_experiment_fraction_rejects_out_of_range(
+def test_load_config_reviewer_effort_experiment_fraction_rejects_out_of_range(
     tmp_path: Path, value: float
 ) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
         config_file,
-        f"""review_dispatch:
-  review_effort_experiment_fraction: {value}
+        f"""reviewer:
+  effort_experiment_fraction: {value}
 """,
     )
-    with pytest.raises(
-        ConfigError, match=r"review_effort_experiment_fraction.*must be in \[0.0, 1.0\]"
-    ):
+    with pytest.raises(ConfigError, match=r"effort_experiment_fraction.*must be in \[0.0, 1.0\]"):
         load_config(config_file)
 
 
-def test_load_config_review_effort_experiment_fraction_without_effort_rejected(
+def test_load_config_reviewer_effort_experiment_fraction_without_effort_rejected(
     tmp_path: Path,
 ) -> None:
-    """fraction > 0.0 with review_effort unset (default '') must fail loud at
+    """fraction > 0.0 with effort unset (default '') must fail loud at
     load time -- treatment would otherwise silently mean 'no --effort pin'."""
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
         config_file,
-        """review_dispatch:
-  review_effort_experiment_fraction: 0.25
+        """reviewer:
+  effort_experiment_fraction: 0.25
 """,
     )
     with pytest.raises(
         ConfigError,
-        match="review_effort_experiment_fraction.*is 0.25 but 'review_effort' is unset",
+        match="effort_experiment_fraction.*is 0.25 but 'effort' is unset",
     ):
         load_config(config_file)
 
 
-def test_load_config_review_effort_experiment_fraction_with_effort_accepted(
+def test_load_config_reviewer_effort_experiment_fraction_with_effort_accepted(
     tmp_path: Path,
 ) -> None:
-    """fraction > 0.0 WITH review_effort set is a valid, accepted config."""
+    """fraction > 0.0 WITH effort set is a valid, accepted config."""
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
         config_file,
-        """review_dispatch:
-  review_effort: high
-  review_effort_experiment_fraction: 0.25
+        """reviewer:
+  effort: high
+  effort_experiment_fraction: 0.25
 """,
     )
     config = load_config(config_file)
-    assert config.review_dispatch.review_effort == "high"
-    assert config.review_dispatch.review_effort_experiment_fraction == 0.25
+    assert config.reviewer.effort == "high"
+    assert config.reviewer.effort_experiment_fraction == 0.25
 
 
-def test_load_config_review_effort_experiment_fraction_zero_without_effort_accepted() -> None:
-    """The default config (fraction=0.0, review_effort unset) must keep loading."""
+def test_load_config_reviewer_effort_experiment_fraction_zero_without_effort_accepted() -> None:
+    """The default config (fraction=0.0, effort unset) must keep loading."""
     config = load_config(Path("nonexistent.yaml"))
-    assert config.review_dispatch.review_effort_experiment_fraction == 0.0
-    assert config.review_dispatch.review_effort == ""
+    assert config.reviewer.effort_experiment_fraction == 0.0
+    assert config.reviewer.effort == ""
 
 
-def test_load_config_review_effort_experiment_salt_rejects_non_str(tmp_path: Path) -> None:
+def test_load_config_reviewer_effort_experiment_salt_rejects_non_str(tmp_path: Path) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
         config_file,
-        """review_dispatch:
-  review_effort_experiment_salt: 123
+        """reviewer:
+  effort_experiment_salt: 123
 """,
     )
-    with pytest.raises(ConfigError, match="review_effort_experiment_salt.*must be a string"):
+    with pytest.raises(ConfigError, match="effort_experiment_salt.*must be a string"):
         load_config(config_file)
 
 
@@ -1024,6 +1036,155 @@ def test_load_config_stale_checks_max_retriggers_accepts_valid_int(tmp_path: Pat
     assert config.review.stale_checks_max_retriggers == 5
 
 
+# ---------------------------------------------------------------------------
+# Issue #1132: foreign_issue_ref_confirm_passes / foreign_issue_ref_reprobe_hours
+# validation-branch unit tests (per-knob quartet, mirroring the
+# stale_checks_max_retriggers precedent above).
+# ---------------------------------------------------------------------------
+
+
+def test_load_config_foreign_issue_ref_confirm_passes_rejects_bool_true(
+    tmp_path: Path,
+) -> None:
+    """YAML boolean true is not a valid integer confirmation count."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_confirm_passes: true
+""",
+    )
+    with pytest.raises(ConfigError, match="foreign_issue_ref_confirm_passes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_foreign_issue_ref_confirm_passes_rejects_bool_false(
+    tmp_path: Path,
+) -> None:
+    """YAML boolean false silently means 0 if treated as int; reject it."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_confirm_passes: false
+""",
+    )
+    with pytest.raises(ConfigError, match="foreign_issue_ref_confirm_passes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_foreign_issue_ref_confirm_passes_rejects_below_one(
+    tmp_path: Path,
+) -> None:
+    """A confirmation count below 1 disables the confirmation gate (parking on
+    the first not-found), which defeats the transient-failure bound the knob
+    exists to provide."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_confirm_passes: 0
+""",
+    )
+    with pytest.raises(ConfigError, match="foreign_issue_ref_confirm_passes.*must be >= 1"):
+        load_config(config_file)
+
+
+def test_load_config_foreign_issue_ref_confirm_passes_accepts_valid_int(
+    tmp_path: Path,
+) -> None:
+    """1 (one-pass park, original behavior) and >=2 (confirmation gate) are
+    both accepted."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_confirm_passes: 1
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.foreign_issue_ref_confirm_passes == 1
+
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_confirm_passes: 3
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.foreign_issue_ref_confirm_passes == 3
+
+
+def test_load_config_foreign_issue_ref_reprobe_hours_rejects_bool_true(
+    tmp_path: Path,
+) -> None:
+    """YAML boolean true is not a valid integer re-probe cadence."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_reprobe_hours: true
+""",
+    )
+    with pytest.raises(ConfigError, match="foreign_issue_ref_reprobe_hours.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_foreign_issue_ref_reprobe_hours_rejects_bool_false(
+    tmp_path: Path,
+) -> None:
+    """YAML boolean false silently means 0 if treated as int; reject it."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_reprobe_hours: false
+""",
+    )
+    with pytest.raises(ConfigError, match="foreign_issue_ref_reprobe_hours.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_foreign_issue_ref_reprobe_hours_rejects_negative(
+    tmp_path: Path,
+) -> None:
+    """A negative re-probe cadence is semantically meaningless."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_reprobe_hours: -1
+""",
+    )
+    with pytest.raises(ConfigError, match="foreign_issue_ref_reprobe_hours.*must not be negative"):
+        load_config(config_file)
+
+
+def test_load_config_foreign_issue_ref_reprobe_hours_accepts_valid_int(
+    tmp_path: Path,
+) -> None:
+    """0 (self-heal disabled, operator-only remedy) and positive cadences are
+    both accepted."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_reprobe_hours: 0
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.foreign_issue_ref_reprobe_hours == 0
+
+    _write_config(
+        config_file,
+        """review:
+  foreign_issue_ref_reprobe_hours: 48
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.foreign_issue_ref_reprobe_hours == 48
+
+
 def test_load_config_stale_checks_defaults_when_absent(tmp_path: Path) -> None:
     """Issue #1274 (W17): an absent `review` section (or absent keys within an
     otherwise-present one) falls back to ReviewConfig's documented defaults --
@@ -1043,7 +1204,6 @@ def test_api_worker_config_defaults() -> None:
     assert config.api_worker.enabled is False
     assert config.api_worker.provider == ""
     assert config.api_worker.max_concurrent_sessions == 1
-    assert config.api_worker.fallback_adapter == "devin-shell"
     assert config.api_worker.worker_template == "worker_claude_code.md"
     assert config.api_worker.rework_template == "rework.md"
     assert isinstance(config.api_worker.providers, MappingProxyType)
@@ -1072,7 +1232,6 @@ API_WORKER_SAMPLE = """api_worker:
     preflight_reserve_usd: 1.00
     max_usd_per_day: 5.00
     lifetime_usd: 15.00
-  fallback_adapter: devin-shell
   worker_template: worker_claude_code.md
   rework_template: rework.md
 """
@@ -1533,61 +1692,6 @@ def test_orchestrator_config_defaults_include_api_worker() -> None:
     assert config.api_worker.enabled is False
 
 
-# ---------------------------------------------------------------------------
-# LabelConfig — complexity:high routing hint (issue #481)
-# ---------------------------------------------------------------------------
-
-
-def test_label_config_complexity_high_default() -> None:
-    from charlie_work.config import LabelConfig
-
-    assert LabelConfig().complexity_high == "complexity:high"
-
-
-def test_label_config_complexity_high_in_all_for_bootstrap() -> None:
-    """The hint is in ``all`` so bootstrap_labels creates it on GitHub."""
-    from charlie_work.config import LabelConfig
-
-    labels = LabelConfig()
-    assert labels.complexity_high in labels.all
-
-
-def test_label_config_complexity_high_not_in_active_set() -> None:
-    """The hint must never affect issue selection/exclusion (not in active)."""
-    from charlie_work.config import LabelConfig
-
-    labels = LabelConfig()
-    assert labels.complexity_high not in labels.active
-
-
-def test_label_config_complexity_high_not_in_terminal_set() -> None:
-    from charlie_work.config import LabelConfig
-
-    labels = LabelConfig()
-    assert labels.complexity_high not in labels.terminal
-
-
-def test_label_config_complexity_high_not_a_workflow_label() -> None:
-    """The hint is a routing hint, not a workflow state — not in workflow_labels."""
-    from charlie_work.config import LabelConfig
-
-    labels = LabelConfig()
-    assert labels.complexity_high not in labels.workflow_labels
-
-
-def test_label_config_complexity_high_is_overridable(tmp_path: Path) -> None:
-    """The hint string is configurable via the labels: section like every other label."""
-    config_file = tmp_path / "orchestrator.config.yaml"
-    _write_config(
-        config_file,
-        """labels:
-  complexity_high: difficulty:hard
-""",
-    )
-    config = load_config(config_file)
-    assert config.labels.complexity_high == "difficulty:hard"
-
-
 def test_label_config_is_frozen() -> None:
     from dataclasses import FrozenInstanceError
 
@@ -1595,7 +1699,7 @@ def test_label_config_is_frozen() -> None:
 
     labels = LabelConfig()
     with pytest.raises(FrozenInstanceError):
-        labels.complexity_high = "x"  # type: ignore[misc]
+        labels.operator_queue = "x"  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -2056,3 +2160,143 @@ def test_provider_suspended_is_deterministic_escalation_failure_kind() -> None:
     from charlie_work.config import DETERMINISTIC_ESCALATION_FAILURE_KINDS
 
     assert "provider_suspended" in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+
+
+def test_worker_role_config_defaults_and_frozen() -> None:
+    cfg = WorkerRoleConfig()
+    assert cfg.harness == "manual"
+    assert cfg.model == ""
+    with pytest.raises(AttributeError):
+        cfg.harness = "claude-code"  # type: ignore[misc]
+
+
+def test_reviewer_role_config_defaults_and_frozen() -> None:
+    cfg = ReviewerRoleConfig()
+    assert cfg.harness == "claude-code"
+    assert cfg.model == "claude-sonnet-5"
+    assert cfg.effort == ""
+    assert cfg.effort_experiment_fraction == 0.0
+    assert cfg.effort_experiment_salt == ""
+    with pytest.raises(AttributeError):
+        cfg.model = "x"  # type: ignore[misc]
+
+
+def test_rescue_config_worker_and_reviewer_role_defaults() -> None:
+    cfg = RescueConfig()
+    assert cfg.worker == WorkerRoleConfig(harness="claude-code", model="claude-opus-4-1")
+    assert cfg.reviewer == WorkerRoleConfig(harness="devin", model="codex")
+    # Legacy fields are untouched by this task -- still their own defaults.
+    assert cfg.worker_adapter == "claude-code"
+    assert cfg.worker_model == "claude-opus-4-1"
+    assert cfg.reviewer_adapter == "devin"
+    assert cfg.reviewer_model == "codex"
+
+
+def test_rescue_config_reviewer_command_default() -> None:
+    """Regression pin (role-config Phase 2 Track E, item 2d)."""
+    assert RescueConfig().reviewer_command == (
+        "devin",
+        "--model",
+        "{model}",
+        "-p",
+        "--prompt-file",
+        "{prompt_path}",
+    )
+
+
+def test_worker_and_reviewer_are_known_config_sections() -> None:
+    sections = known_config_sections()
+    assert "worker" in sections
+    assert "reviewer" in sections
+    # Provenance fields must never be forgeable as a YAML section.
+    assert "sources" not in sections
+
+
+def test_build_config_from_data_rescue_worker_reviewer_are_workerroleconfig_instances() -> None:
+    cfg = build_config_from_data(
+        {"rescue": {"worker": {"harness": "devin-shell", "model": "glm-5-2"}}}
+    )
+    assert isinstance(cfg.rescue.worker, WorkerRoleConfig)
+    assert cfg.rescue.worker == WorkerRoleConfig(harness="devin-shell", model="glm-5-2")
+    assert isinstance(cfg.rescue.reviewer, WorkerRoleConfig)
+    assert cfg.rescue.reviewer == WorkerRoleConfig(harness="devin", model="codex")
+
+
+def test_build_config_from_data_wires_worker_and_reviewer_end_to_end() -> None:
+    """The dual-accept bridge that used to translate ``devin.adapter`` /
+    ``devin.worker_model`` into ``worker.harness`` / ``worker.model`` is gone
+    (role-config Phase 2 Track E) -- config must be written directly in the
+    new ``worker:``/``reviewer:`` shape for it to wire through."""
+    cfg = build_config_from_data(
+        {
+            "worker": {"harness": "devin-shell", "model": "glm-5-2"},
+            "reviewer": {"model": "claude-opus-4-1"},
+        }
+    )
+    assert cfg.worker.harness == "devin-shell"
+    assert cfg.worker.model == "glm-5-2"
+    assert cfg.reviewer.model == "claude-opus-4-1"
+
+
+def test_build_config_from_data_devin_adapter_is_rejected_as_unknown_key() -> None:
+    """``devin.adapter`` used to soft-deprecate into ``worker.harness`` via
+    the now-deleted dual-accept bridge (role-config Phase 2 Track E); with
+    that bridge gone and ``DevinConfig.adapter`` itself deleted, it falls
+    straight through to ``_build_section``'s generic unknown-key rejection."""
+    with pytest.raises(ConfigError, match=r"unknown key\(s\) in config section 'devin'.*adapter"):
+        build_config_from_data({"devin": {"adapter": "devin-shell"}})
+
+
+def test_build_config_from_data_worker_model_tier_key_is_rejected() -> None:
+    """``dispatch.worker_model_tier`` was a pure deletion (Phase 2 Task 2, no
+    migration target), not a dual-accept rename -- so its presence is no
+    longer a soft deprecation warning. It falls straight through to
+    ``_build_section``'s generic unknown-key rejection, same as any other
+    key a section's dataclass doesn't declare."""
+    with pytest.raises(ConfigError, match=r"unknown key\(s\) in config section 'dispatch'"):
+        build_config_from_data({"dispatch": {"worker_model_tier": "capable"}})
+
+
+def test_build_config_from_data_fallback_adapter_is_rejected_as_unknown_key() -> None:
+    """``api_worker.fallback_adapter`` was deleted (role-config Phase 2, Track B);
+    the dual-accept bridge that used to soft-warn on it is gone too (Track E),
+    so it now falls straight through to the generic unknown-key ConfigError."""
+    with pytest.raises(ConfigError, match="fallback_adapter"):
+        build_config_from_data({"api_worker": {"fallback_adapter": "devin-shell"}})
+
+
+def test_build_config_from_data_cross_family_section_is_rejected_as_unknown_section() -> None:
+    with pytest.raises(ConfigError, match="cross_family"):
+        build_config_from_data({"cross_family": {"command": ["devin", "--model", "{model}"]}})
+
+
+def test_build_config_from_data_empty_bodied_cross_family_section_is_rejected() -> None:
+    """An empty-bodied cross_family: {} section used to be specially tolerated
+    by _DEPRECATED_SECTIONS_WITHOUT_A_FIELD; that carve-out is gone (role-config
+    Phase 2 Track E), so an empty body is rejected exactly like a populated one."""
+    with pytest.raises(ConfigError, match="cross_family"):
+        build_config_from_data({"cross_family": {}})
+
+
+def test_build_config_from_data_unknown_worker_key_still_raises_configerror() -> None:
+    with pytest.raises(ConfigError, match="unknown key.*worker.*bogus"):
+        build_config_from_data({"worker": {"bogus": "x"}})
+
+
+def test_build_config_from_data_invalid_worker_harness_is_rejected() -> None:
+    """Harness membership validation moved from the deleted dual-accept
+    resolver to the top-level ``worker = _build_section(...)`` call site
+    (role-config Phase 2 Track E); this pins the relocated check so a future
+    refactor cannot silently drop it."""
+    with pytest.raises(ConfigError, match=r"section 'worker' key 'harness' must be one of"):
+        build_config_from_data({"worker": {"harness": "bogus-harness"}})
+
+
+def test_build_config_from_data_non_claude_reviewer_harness_is_rejected() -> None:
+    """The reviewer-harness-must-be-claude-code constraint (#1513) moved into
+    ``ReviewerRoleConfig.__post_init__`` when the dual-accept resolver was
+    deleted (role-config Phase 2 Track E); this pins the relocated check."""
+    with pytest.raises(
+        ConfigError, match=r"section 'reviewer' key 'harness' only supports 'claude-code'"
+    ):
+        build_config_from_data({"reviewer": {"harness": "devin"}})

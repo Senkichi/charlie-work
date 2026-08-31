@@ -25,6 +25,7 @@ from charlie_work.config import (
     ApiWorkerConfig,
     ClaudeCodeConfig,
     OrchestratorConfig,
+    WorkerRoleConfig,
 )
 from charlie_work.worktree import WorktreeInfo
 
@@ -126,7 +127,6 @@ def _api_worker_config(
         max_concurrent_sessions=1,
         providers={provider_name: provider},
         budget=ApiBudgetConfig(),
-        fallback_adapter="devin-shell",
         worker_template="worker_claude_code.md",
         rework_template="rework.md",
     )
@@ -297,29 +297,31 @@ def test_launch_api_worker_injects_provider_env(
     assert small_fast == "kimi-k3"
 
 
-def test_launch_api_worker_pins_provider_model_not_claude_code_model(
+def test_launch_api_worker_pins_provider_model_not_worker_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Issue #1245: the api worker's ``--model`` flag must equal the provider
-    registry's model, not ``claude_code.model``. The Claude Code CLI gives the
+    registry's model, not ``worker.model``. The Claude Code CLI gives the
     ``--model`` flag precedence over the ``ANTHROPIC_MODEL`` env var, so
     without pinning the provider's model argv-side the provider's model
     selection is dead code (Moonshot served whatever it maps the
     claude-sonnet-5 alias to, not kimi-k3).
 
     Asserts over the recorded sidecar ``command`` (which captures argv) and
-    ``record.command``. Uses a config whose ``claude_code.model`` deliberately
+    ``record.command``. Uses a config whose ``worker.model`` deliberately
     differs from the provider's model so a regression that re-pins
-    ``claude_code.model`` is caught."""
+    ``worker.model`` is caught. (Renamed from ``..._not_claude_code_model``
+    -- role-config Phase 2 Track E deleted ``ClaudeCodeConfig.model``; the
+    model this test pins against now lives on ``WorkerRoleConfig.model``.)"""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
     monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
 
-    # claude_code.model deliberately differs from the provider model (kimi-k3)
+    # worker.model deliberately differs from the provider model (kimi-k3)
     # so the two are distinguishable in the pinned --model value.
-    config = OrchestratorConfig(claude_code=ClaudeCodeConfig(model="claude-sonnet-5"))
+    config = OrchestratorConfig(worker=WorkerRoleConfig(model="claude-sonnet-5"))
 
     record = launch_api_worker(
         1245,
@@ -335,15 +337,15 @@ def test_launch_api_worker_pins_provider_model_not_claude_code_model(
     assert record.ok
     # The provider registry's model is kimi-k3 (from _provider_config default).
     provider_model = "kimi-k3"
-    claude_code_model = "claude-sonnet-5"
+    worker_model = "claude-sonnet-5"
     # The two must differ, otherwise this test cannot discriminate the fix.
-    assert provider_model != claude_code_model
+    assert provider_model != worker_model
 
     # record.command carries the pinned argv.
     assert "--model" in record.command
     idx = record.command.index("--model")
     assert record.command[idx + 1] == provider_model
-    assert record.command[idx + 1] != claude_code_model
+    assert record.command[idx + 1] != worker_model
     # Exactly one --model pin (dedup behavior of _apply_model_pin unchanged).
     assert record.command.count("--model") == 1
 

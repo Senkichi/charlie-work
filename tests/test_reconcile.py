@@ -5146,12 +5146,15 @@ def test_reconcile_dry_run_fix_does_not_mutate_local_state(tmp_path: Path) -> No
 
 
 def test_maybe_reconcile_drift_dry_run_does_not_mutate_local_state(tmp_path: Path) -> None:
-    """Issue #615 (round-2 review): the periodic in-loop auto-fix pass
-    ``_maybe_reconcile_drift`` -- the entry point ``fleet supervise --dry-run``
-    actually uses -- must honour ``app.dry_run`` the same way the operator
-    ``mop-up --fix --dry-run`` path does. With real drift present and
-    ``dry_run=True`` it must NOT remove the review checkout, clear
-    review-dispatch state fields, or write any GitHub labels.
+    """Issue #615 (round-2 review) + issue #1324: the periodic in-loop
+    auto-fix pass ``_maybe_reconcile_drift`` -- the entry point ``fleet
+    supervise --dry-run`` actually uses -- must honour ``app.dry_run`` the
+    same way the operator ``mop-up --fix --dry-run`` path does. With real
+    drift present and ``dry_run=True`` it must NOT remove the review
+    checkout, clear review-dispatch state fields, write any GitHub labels,
+    OR leave any event/state.json footprint (issue #1324: ``_record_event``
+    and the paired ``save_state`` now route through ``self.write_gate``,
+    which performs zero writes under ``dry_run=True``).
 
     Mirrors ``test_reconcile_dry_run_fix_does_not_mutate_local_state`` but
     drives the periodic-loop entry point (``_maybe_reconcile_drift``) rather
@@ -5204,15 +5207,27 @@ def test_maybe_reconcile_drift_dry_run_does_not_mutate_local_state(tmp_path: Pat
     assert gh.labels_added == []
     assert gh.labels_removed == []
 
-    # The pass-level summary event is legitimate bookkeeping (not data-loss
-    # mutation); it must record that drift was detected but NOT fixed, proving
-    # the dry-run gate actually engaged rather than the pass silently no-opping.
+    # Issue #1324: under dry_run=True, _record_event routes through
+    # self.write_gate.record_event (which returns state unchanged with zero
+    # writes), and the paired save_state routes through
+    # self.write_gate.save_state (which also does not write). So no
+    # reconcile_pass_* event may appear in state.json's event ring, and
+    # state.json itself must be byte-identical to the pre-pass seed -- the
+    # WriteGate invariant ("no event at all under dry-run ... exactly the
+    # same events.db/state.json footprint as a caller that never ran at
+    # all"). The _reconcile_locked(dry_run=True) call still detects drift
+    # in-memory (proving the gate engaged rather than the pass silently
+    # no-opping), but that detection must not leak to disk.
     events = after_state.get("events", [])
-    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
-    assert len(completed) == 1
-    assert completed[0]["payload"]["drift_detected"] == 1
-    assert completed[0]["payload"]["drift_fixed"] == 0
-    assert completed[0]["payload"]["drift_remaining"] == 1
+    completed = [e for e in events if str(e.get("kind", "")).startswith("reconcile_pass")]
+    assert completed == [], (
+        f"dry-run reconcile pass must not write any reconcile_pass_* event "
+        f"to state.json (issue #1324 WriteGate invariant), found: {completed}"
+    )
+    assert json.loads(paths.state_file.read_text(encoding="utf-8")) == state, (
+        "dry-run reconcile pass must leave state.json byte-identical to the "
+        "pre-pass seed (issue #1324 WriteGate invariant)"
+    )
 
 
 def test_reconcile_dry_run_without_fix_still_reports_drift(tmp_path: Path) -> None:

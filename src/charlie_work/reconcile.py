@@ -46,6 +46,8 @@ from .github import (
     GraphQLBudgetError,
     PR_CLOSING_ISSUES_FIELDS,
     _LIST_LIMIT,
+    build_branch_issue_validator,
+    build_branch_issue_validator_from_issues,
     label_names,
     linked_issue_number,
 )
@@ -556,6 +558,19 @@ def detect_aviator_stale_blocked(
         if not other_checks_green:
             continue
 
+        # Issue #1229 scoping decision: this call site is deliberately NOT
+        # threaded through branch_issue_validator. The resolved
+        # ``issue_number`` is attached to the ``aviator_stale_blocked`` drift
+        # item for correlation only; ``apply_fixes``'s handling of that kind
+        # is PR-level only (``gh.remove_pr_label``/``gh.add_pr_label`` on
+        # ``blocked``/``mergequeue``, keyed off ``pr_number`` -- see the
+        # ``elif item.kind in ("aviator_stale_blocked", "mergequeue_revoked")``
+        # branch). No issue-label transition or state escalation keys off it,
+        # so a stale branch-name binding can at worst mislabel the drift
+        # item's ``issue_number`` for reporting, not corrupt an issue
+        # lifecycle. Threading the validator would also add an
+        # ``issue_list(state="open")`` call to a detector that is deliberately
+        # kept out of ``detect_drift``'s two-query contract.
         issue_number = linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
@@ -757,6 +772,19 @@ def detect_mergequeue_not_approved(
         if _pr_review_approved_at_head(config, repo_root, pr_number, head_sha):
             continue
 
+        # Issue #1229 scoping decision: this call site is deliberately NOT
+        # threaded through branch_issue_validator. The resolved
+        # ``issue_number`` is attached to the ``mergequeue_revoked`` drift
+        # item for correlation only; ``apply_fixes``'s handling of that kind
+        # is PR-level only (``gh.remove_pr_label`` on ``mergequeue``, keyed
+        # off ``pr_number`` -- shares the
+        # ``elif item.kind in ("aviator_stale_blocked", "mergequeue_revoked")``
+        # branch with the aviator detector). No issue-label transition or
+        # state escalation keys off it, so a stale branch-name binding can at
+        # worst mislabel the drift item's ``issue_number`` for reporting, not
+        # corrupt an issue lifecycle. (Contrast ``detect_mergequeue_wedged``,
+        # whose ``issue_number`` DOES drive ``_escalate_issue`` and is
+        # validator-threaded.)
         issue_number = linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
@@ -871,6 +899,21 @@ def detect_mergequeue_wedged(
     drift: list[DriftItem] = []
     prs_state = state.get("prs", {})
     now = datetime.now(UTC)
+    # Issue #1229: unlike ``detect_aviator_stale_blocked`` and
+    # ``detect_mergequeue_not_approved`` (whose ``issue_number`` is PR-level-
+    # only and safe unvalidated -- see the scoping comments there), this
+    # detector's ``issue_number`` drives an issue-level escalation
+    # (``_escalate_issue`` + ``gh.add_issue_label``/``gh.remove_issue_label``
+    # in ``apply_fixes``'s ``mergequeue_wedged`` branch). A stale branch-name
+    # binding to a closed/nonexistent issue would escalate the WRONG issue, so
+    # the validator is threaded through here. These are OPEN merge-queue PRs
+    # whose linked issue is still OPEN (not yet merged), so an open-issue
+    # validator accepts legitimate bindings and rejects only stale ones -- the
+    # same OPEN-PR/OPEN-issue pairing as the dispatch-claim and dead-session
+    # sweeps. ``build_branch_issue_validator`` returns None on an API outage,
+    # in which case ``linked_issue_number`` preserves the pre-#1229 trust
+    # behavior (fail open) rather than blocking the wedge sweep.
+    branch_validator = build_branch_issue_validator(gh)
     for pr in _fetch_prs(gh):
         if str(pr.get("state") or "").upper() != "OPEN":
             continue
@@ -926,6 +969,7 @@ def detect_mergequeue_wedged(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=config.dispatch.branch_prefix,
+            branch_issue_validator=branch_validator,
         )
         fix_actions: list[str] = [f"remove label {mergequeue_label!r} from PR #{pr_number}"]
         add_labels: tuple[str, ...] = ()
@@ -1154,6 +1198,28 @@ def detect_drift(
     # ``pr_number`` mismatch against real linked PRs rather than trusting a
     # stale ``state.json`` reference (see the function's signal-1 docstring).
     linked_pr_numbers_by_issue: dict[int, set[int]] = {}
+    # Issue #1229: validate branch-name-derived issue numbers against the
+    # open-issue set so a stale branch name (e.g. ``agent/issue-709-…`` left
+    # over from a merged PR #709, reused by an unrelated issue-less PR) cannot
+    # populate ``open_prs_by_issue``/``prs_linking_issue``/
+    # ``linked_pr_numbers_by_issue`` under a closed/nonexistent issue number
+    # and mask the launch_stalled / dead-session relabel guards (``w.issue_number
+    # not in open_prs_by_issue``) or contaminate
+    # ``_closed_pr_superseded_by_newer_session``'s corroboration set. This
+    # mirrors the validator already threaded through the structurally identical
+    # ``pr_by_issue`` constructions in workflow.py and dead_worker_reap.py.
+    #
+    # ``detect_drift``'s contract is exactly two ``gh.run`` list queries (all
+    # PRs, all issues -- enforced by ``test_detect_drift_makes_zero_mutating_calls``),
+    # so the validator is built from the *already-fetched* ``issues`` snapshot
+    # (state=all, filtered to OPEN) via
+    # ``build_branch_issue_validator_from_issues`` rather than re-fetching via
+    # ``build_branch_issue_validator(gh)`` (which would issue a third
+    # ``issue_list(state="open")`` call). The snapshot is in hand, so there is
+    # no fetch-outage fail-open path -- validation always runs.
+    branch_validator = build_branch_issue_validator_from_issues(
+        i for i in issues if _issue_state(i) == "OPEN"
+    )
     for _pr in prs:
         _pr_num = _pr.get("number")
         if _pr_num is None:
@@ -1162,6 +1228,7 @@ def detect_drift(
             _pr,
             is_cross_repository=_pr.get("isCrossRepository"),
             branch_prefix=config.dispatch.branch_prefix,
+            branch_issue_validator=branch_validator,
         )
         if _issue_num is not None:
             linked_pr_numbers_by_issue.setdefault(_issue_num, set()).add(int(_pr_num))
@@ -1187,6 +1254,7 @@ def detect_drift(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=config.dispatch.branch_prefix,
+            branch_issue_validator=branch_validator,
         )
         if issue_number is not None:
             prs_linking_issue.setdefault(issue_number, []).append(pr)

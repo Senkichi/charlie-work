@@ -16,7 +16,6 @@ dispatch:
   # (stale ready-label cleanup). 0 disables finalization.
   finalize_limit: 25
   branch_prefix: agent/issue
-  worker_model_tier: capable
   # Claude Code workers use the direct-shell loop (no Devin session skills).
   worker_template: worker_claude_code.md
   # Dispatch order: "oldest" (default) or "newest" (previous behavior)
@@ -120,13 +119,26 @@ runtime:
   # actual reset. Default 90 seconds.
   # throttle_resume_margin_s: 90
 
-devin:
+worker:
   # claude-code launches each worker headless in an isolated git worktree.
+  # Operational knobs (session bookkeeping paths, venv/worktree overrides)
+  # still live under devin:/claude_code: below — Phase 1 of the role-config
+  # refactor moved only harness/model selection up to worker:/reviewer:.
+  # Fall back to harness: manual to paste prompts from the session manifest
+  # by hand if the claude CLI is unavailable.
+  harness: claude-code
+
+reviewer:
+  # No automated reviewer is dispatched in this profile (review_dispatch is
+  # off below); harness is declared so review_dispatch can be flipped on
+  # later without also needing a config-shape change.
+  harness: claude-code
+
+devin:
   # Each worker cold-builds its own per-worktree `.venv` by default (issue
-  # #274); set `claude_code.venv_source` to a path only if you want to opt
-  # back into the shared-venv junction. Verify with `charlie doctor
-  # --adapter-probe`. Fall back to `adapter: manual` to paste prompts by hand.
-  adapter: claude-code
+  # #274); set claude_code.venv_source to a path only if you want to opt back
+  # into the shared-venv junction. Verify with `charlie doctor
+  # --adapter-probe` before the first wave.
   session_manifest: .var/charlie-work/dispatches/session-manifest.json
   session_results: .var/charlie-work/dispatches/session-results.json
   sessions_dir: .var/charlie-work/dispatches/sessions
@@ -159,7 +171,8 @@ claude_code:
   worker_env:
     PYTEST_XDIST_AUTO_NUM_WORKERS: "2"
 
-# cross_family omitted → disabled (Claude-only review).
+# No cross-model review in this profile: worker and reviewer both use
+# claude-code with no model override, so worker.model == reviewer.model.
 
 supervisor:
   # Foreground poll/sleep loop used by `charlie bash-rats` (per-repo) and

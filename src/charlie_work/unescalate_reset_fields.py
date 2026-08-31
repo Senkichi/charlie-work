@@ -75,12 +75,14 @@ UNESCALATE_PR_RESET_FIELDS = (
     # gives every lane a genuinely fresh dedup slate.
     "escalation_reasons_seen",
     "label_error",
-    # Issue #1099: the per-head cross-family regeneration record holds both
-    # budgets. Leaving it behind makes the re-arm inert -- loop() reads the
-    # spent counters and parks the PR again on the very next pass, so the
-    # operator's unescalate accomplishes nothing without also hand-editing
-    # state.json. That is the same "re-arm does not stick" shape this
-    # command exists to fix.
+    # Issue #1099: the per-head cross-family regeneration record used to hold
+    # both spent-attempt budgets, and leaving it behind made the re-arm inert
+    # (loop() read the spent counters and parked the PR again on the very
+    # next pass). The auto-gate cross-family subsystem that wrote and read
+    # this field was deleted along with cross_family.py (role-config phase 2,
+    # track A); nothing produces or consumes this key anymore. The entry
+    # stays so a re-arm on an old on-disk record still clears the stale key
+    # rather than leaving it behind forever.
     "cross_family_regen",
     # Rescue tier (issue #555): rescue_attempted is the durable "used my
     # one shot" marker. Only charlie unescalate clears it (this tuple) —
@@ -88,6 +90,13 @@ UNESCALATE_PR_RESET_FIELDS = (
     "rescue_attempted",
     "rescue_cause",
     "rescue_dispatched_at",
+    # Issue #1132: ``charlie unescalate --pr`` did NOT clear the
+    # ``foreign_issue_ref`` marker (observed: unescalate flipped
+    # janitor_blocked -> open_passive but left the park in place, so the PR
+    # stayed invisible). The marker is the third hidden layer under salvage
+    # and head-keyed parks; an operator re-arm must clear it so the next
+    # pass re-probes the linked issue instead of skipping with zero events.
+    "foreign_issue_ref",
 )
 # Issue-record equivalents (dispatch-side caps and stale worker bookkeeping).
 UNESCALATE_ISSUE_RESET_FIELDS = (

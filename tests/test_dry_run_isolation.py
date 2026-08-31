@@ -24,7 +24,7 @@ from typing import Any, Callable
 
 import pytest
 
-from charlie_work.cross_family import run_cross_family_review
+from charlie_work.rescue_review import run_cross_family_review
 from charlie_work.subprocess_runner import RunResult
 from charlie_work import supervise
 from charlie_work.supervise import SelfDeployResult, self_deploy
@@ -336,9 +336,10 @@ def _valid_stale_report(head_sha: str) -> str:
     """A report that BOTH ``extract_head_ref_oid`` and ``report_body_is_valid`` accept.
 
     Three conditions are load-bearing here and none of them is guessable:
-    the text must open with the exact orchestrator header (cross_family.py:88), the
-    SHA must sit in an HTML comment ``<!-- PR head SHA: ... -->`` rather than a bare
-    ``HEAD_REF_OID:`` line (cross_family.py:91), and the body after the ``---``
+    the text must open with the exact orchestrator header (rescue_review.py's
+    ``report_body_is_valid``), the SHA must sit in an HTML comment
+    ``<!-- PR head SHA: ... -->`` rather than a bare ``HEAD_REF_OID:`` line
+    (rescue_review.py's ``extract_head_ref_oid``), and the body after the ``---``
     separator must carry a severity marker or a Verdict line or the staleness branch
     treats it as "not a real review" and skips.
 

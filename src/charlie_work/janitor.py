@@ -605,6 +605,17 @@ def _check_linked_issue(
 ) -> None:
     if not config.review.require_issue_link:
         return
+    # Issue #1229 scoping decision: this call site is deliberately NOT
+    # threaded through branch_issue_validator. It only tests whether
+    # ``linked_issue_number`` resolves to *any* issue number (branch name,
+    # title, or body closing keyword) -- the resolved number itself is
+    # discarded. This is a pre-merge gate that verifies the PR author declared
+    # an issue link; a stale branch-name number still indicates that intent,
+    # and no issue-label transition or state write keys off the value here.
+    # A stale binding's only effect is that the "No linked issue found"
+    # failure is not raised -- the pre-#1229 behavior -- which is the safe
+    # (fail-open) direction for a gate whose false positive would block a PR
+    # for the wrong reason.
     if (
         linked_issue_number(
             pr,

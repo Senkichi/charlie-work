@@ -173,11 +173,13 @@ ESCALATION_REASON_CLASS_BY_EVENT_KIND: Mapping[str, str] = MappingProxyType(
         "session_failed_escalated": "mechanical",
         # The review-dispatch attempt cap is an infrastructure-driven limit.
         "review_dispatch_escalated": "mechanical",
-        # Issue #841: an infra-cancelled required check (self-hosted runner
-        # timeout-minutes kill) exhausting its auto-rerun attempt cap is a
-        # pure process/infrastructure limit, unambiguous like the other
-        # attempt-cap kinds above -- no code fix or human judgment call is
-        # involved, only a retry budget running out.
+        # Issue #841: an infra-cancelled required check (a timeout-minutes
+        # kill; on the self-hosted-era runners this reported CANCELLED, on
+        # hosted runners it may report TIMED_OUT -- checks.py classifies both
+        # as infra) exhausting its auto-rerun attempt cap is a pure
+        # process/infrastructure limit, unambiguous like the other attempt-cap
+        # kinds above -- no code fix or human judgment call is involved, only
+        # a retry budget running out.
         "infra_rerun_escalated": "mechanical",
         # Issue #1010: the pre-flight cross-repo gate escalated an issue
         # because every file path it referenced was absent from the target
