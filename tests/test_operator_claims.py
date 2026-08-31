@@ -26,6 +26,7 @@ from charlie_work.worktree import (
     OPERATOR_MARKER_SESSION_ID,
     WorktreeForeignWriterError,
     _check_worktree_writer_marker,
+    _reap_idle_foreign_writer,
     create_worktree,
     read_worktree_marker,
     remove_worktree_marker,
@@ -400,6 +401,178 @@ def test_check_worktree_marker_owned_session_allowed(
     _check_worktree_writer_marker(worktree_path, sessions_dir)
     # Marker should not be removed when the session is owned and live.
     assert read_worktree_marker(worktree_path) is not None
+
+
+def test_reap_idle_foreign_writer_own_session_not_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1443 finding 1: ``_reap_idle_foreign_writer`` is the single
+    enforcement point for the own-live-session guard. A marker that belongs to
+    one of our own live sessions must NOT be reaped here — the stall detector
+    owns reaping our own workers (with worker-death/rework-cap accounting and
+    sidecar/session-state updates). Reaping one as ``foreign_writer_reaped``
+    would bypass that accounting.
+
+    This pins the guard the rework pre-filter previously re-implemented
+    incompletely (stale-PID only) and dropped, so it could reap one of our own
+    idle workers as a foreign writer."""
+    worktree_path = tmp_path / "wt"
+    worktree_path.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    old_started = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    _write_marker_with_started_at(worktree_path, 1234, "owned-session", old_started)
+
+    # A sidecar for the same live session makes the marker "owned", not foreign.
+    sidecar = sessions_dir / "issue-55.json"
+    sidecar.write_text(
+        json.dumps({"session_id": "owned-session", "pid": 1234, "process_start_time": 1.0}),
+        encoding="utf-8",
+    )
+
+    kill_calls: list[tuple[int, float | None]] = []
+    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    monkeypatch.setattr(
+        "charlie_work.worktree.kill_process_tree",
+        lambda pid, st: kill_calls.append((pid, st)) or [pid],
+    )
+    monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
+    monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
+
+    config = OrchestratorConfig()
+    marker = read_worktree_marker(worktree_path)
+    assert marker is not None
+
+    reap = _reap_idle_foreign_writer(worktree_path, marker, config, sessions_dir)
+
+    # Own-session marker is not a reap candidate.
+    assert reap is False
+    # No kill must have occurred.
+    assert kill_calls == []
+    # Marker must still be present (not reaped).
+    assert read_worktree_marker(worktree_path) is not None
+
+
+def test_reap_idle_foreign_writer_operator_marker_not_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1443: operator markers are not foreign-writer reap candidates.
+    Their liveness is derived from state.json (operator_claimed_at), not a PID,
+    and reaping one would misclassify an operator claim. The reap function
+    refuses so every reap path (rework pre-filter, blocked-environment cap)
+    honors the same boundary instead of re-implementing the guard per caller."""
+    worktree_path = tmp_path / "wt"
+    worktree_path.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    write_worktree_marker(worktree_path, 0, OPERATOR_MARKER_SESSION_ID, kind=OPERATOR_MARKER_KIND)
+
+    kill_calls: list[tuple[int, float | None]] = []
+    monkeypatch.setattr(
+        "charlie_work.worktree.kill_process_tree",
+        lambda pid, st: kill_calls.append((pid, st)) or [pid],
+    )
+    monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
+
+    config = OrchestratorConfig()
+    marker = read_worktree_marker(worktree_path)
+    assert marker is not None
+
+    assert _reap_idle_foreign_writer(worktree_path, marker, config, sessions_dir) is False
+    assert kill_calls == []
+    assert read_worktree_marker(worktree_path) is not None
+
+
+def test_reap_idle_foreign_writer_kill_noop_keeps_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1443 finding 2: marker removal and the ``True`` return are gated
+    on the kill actually having terminated the identified process. If
+    ``kill_process_tree`` returns [] (identity verification failed) and the pid
+    is still alive, the marker must NOT be removed and the reap must return
+    ``False`` — removing the marker would admit a second writer into a worktree
+    that still holds a live one (the #400 invariant inverted)."""
+    worktree_path = tmp_path / "wt"
+    worktree_path.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    old_started = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    _write_marker_with_started_at(worktree_path, 1234, "foreign-session", old_started)
+
+    # kill_process_tree returns [] (identity mismatch / kill failed)...
+    monkeypatch.setattr("charlie_work.worktree.kill_process_tree", lambda pid, st: [])
+    # ...and the pid is still alive with the fingerprint, so the writer is
+    # genuinely still there.
+    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
+    monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
+
+    config = OrchestratorConfig()
+    marker = read_worktree_marker(worktree_path)
+    assert marker is not None
+
+    assert _reap_idle_foreign_writer(worktree_path, marker, config, sessions_dir) is False
+    # Marker must still be present (kill did not terminate the writer).
+    assert read_worktree_marker(worktree_path) is not None
+
+
+def test_try_reap_blocked_foreign_writer_derives_pid_from_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1443 finding 2: ``_try_reap_blocked_foreign_writer`` must derive
+    the pid from the marker (single source of truth), not from the failed
+    dispatch result. A mismatched pair (failed_result.pid != marker pid) used
+    to pass the failed_result pid to ``kill_process_tree`` while reading the
+    marker's ``process_start_time`` — a no-op kill while the marker was still
+    deleted, admitting a second writer. Now the reap uses the marker's pid."""
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.workflow import _try_reap_blocked_foreign_writer
+
+    worktree_path = tmp_path / "wt"
+    worktree_path.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    old_started = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    # Marker pid is 9999.
+    _write_marker_with_started_at(worktree_path, 9999, "foreign-session", old_started)
+
+    kill_calls: list[tuple[int, float | None]] = []
+    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    monkeypatch.setattr(
+        "charlie_work.worktree.kill_process_tree",
+        lambda pid, st: kill_calls.append((pid, st)) or [pid],
+    )
+    monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
+    monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
+
+    config = OrchestratorConfig()
+    state_file = tmp_path / "state.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # failed_result.pid (1234) deliberately disagrees with the marker pid (9999).
+    failed_result = SessionDispatchResult(
+        issue_number=42,
+        issue_title="t",
+        prompt_path="p",
+        branch_name="b",
+        adapter="command",
+        ok=False,
+        error="worktree has a live foreign writer",
+        failure_kind="worktree_foreign_writer",
+        pid=1234,
+        worktree_path=str(worktree_path),
+    )
+
+    reap = _try_reap_blocked_foreign_writer(failed_result, config, state_file, 42, sessions_dir)
+    assert reap is True
+    # The kill MUST use the marker's pid (9999), not failed_result.pid (1234).
+    assert kill_calls == [(9999, 1234567890.0)]
+    # Marker removed after a successful reap.
+    assert read_worktree_marker(worktree_path) is None
 
 
 class _MinimalGitHub:
