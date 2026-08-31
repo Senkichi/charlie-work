@@ -158,12 +158,20 @@ def test_worker_md_renders_via_real_writer(tmp_path: Path) -> None:
 
 def test_worker_claude_code_md_renders_via_real_writer(tmp_path: Path) -> None:
     """worker_claude_code.md is rendered by the *same* real writer,
-    ``_write_worker_prompt``, with an explicit ``template=`` override --
-    exactly what the api-worker dispatch path (dry-run preview branch) and
-    the matching dispatch-loop path both do, inside
-    ``workflow.py::OrchestratorApp._dispatch_impl``: ``template =
-    self.config.api_worker.worker_template``, then
-    ``self._write_worker_prompt(full_issue, template=template)``.
+    ``_write_worker_prompt`` (``workflow.py::OrchestratorApp._write_worker_prompt``),
+    using its explicit ``template=`` override parameter.
+
+    Post-Phase-2 (role-config Track B deleted per-issue adapter routing),
+    no surviving dispatch call site passes
+    ``template=config.api_worker.worker_template`` any more -- the three
+    live callers (``intake()``, and the dry-run preview and dispatch-loop
+    branches inside ``_dispatch_impl``) all omit the argument and fall
+    through to ``config.dispatch.worker_template`` instead, so this
+    override is currently unreachable at runtime. Tracked for cleanup
+    (dropping the dead parameter outright) in issue #1515. This test is
+    kept as a direct contract test on the override mechanism and on
+    worker_claude_code.md's own placeholder correctness, independent of
+    whether anything wires the override back up.
 
     Rendered under a non-default ``runtime.state_dir`` (issue #737) so the
     companion literal-absence assertion is non-vacuous -- see
@@ -693,9 +701,6 @@ def test_every_shipped_template_is_covered_by_this_contract() -> None:
 _CITATION_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     "OrchestratorApp._write_worker_prompt": ("def _write_worker_prompt",),
     "OrchestratorApp.intake": ("self._write_worker_prompt(full_issue",),
-    # Covers both the api-worker dispatch dry-run preview branch and the
-    # matching dispatch-loop branch -- both live inside this one method.
-    "OrchestratorApp._dispatch_impl": ("api_worker.worker_template",),
     "_write_rework_prompt": ("def _write_rework_prompt",),
     "_render_rework_prompt": ("def _render_rework_prompt",),
     "_render_required_changes_section": ("def _render_required_changes_section",),
