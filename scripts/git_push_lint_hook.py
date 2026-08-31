@@ -239,9 +239,82 @@ def _deny(reason: str) -> None:
     )
 
 
-def _resolve_cwd(payload: dict[str, Any]) -> Path:
-    """Resolve the working directory from the hook payload, falling back
-    to ``Path.cwd()`` -- same logic as ``worker_stop_gate.main``."""
+def _leading_cd_target(command: str) -> Path | None:
+    """Parse a leading ``cd <path> <sep>`` prefix chain from ``command``.
+
+    Returns the final ``cd`` target -- the last one when several are
+    chained, e.g. ``cd /a && cd /b && git push`` resolves to ``/b`` -- or
+    ``None`` when the command does not start with a ``cd <path> <sep>``
+    prefix, or the prefix is ambiguous (``cd`` with no path, ``cd -`` /
+    ``cd -P /x`` whose effective target we cannot derive, a missing
+    separator, or an unparseable command).
+
+    ``None`` is the deliberate fall-back signal: the caller then trusts
+    ``payload.cwd`` as before, which preserves the fail-closed contract
+    (a wrong-repo lint scope may deny the push, but never silently allows
+    one with lint debt unchecked). This is the fix for #1468: a subagent
+    whose Bash tool resets its cwd to the session default on every call is
+    hooked with ``payload.cwd`` pointing at that default, not the worktree
+    the command text actually ``cd``s into.
+    """
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return None
+
+    target: Path | None = None
+    idx = 0
+    while idx < len(tokens):
+        if tokens[idx] != "cd":
+            break
+        # Need at least ``cd <path> <separator>``.
+        if idx + 2 >= len(tokens):
+            return None
+        path_tok = tokens[idx + 1]
+        sep = tokens[idx + 2]
+        if sep not in _SHELL_SEPARATORS:
+            return None
+        if not path_tok or path_tok.startswith("-"):
+            return None  # ``cd -`` / ``cd -P /x`` -- target not derivable
+        target = Path(path_tok)
+        idx += 3
+    return target
+
+
+def _resolve_cwd(payload: dict[str, Any], command: str = "") -> Path:
+    """Resolve the working directory the ``git push`` actually targets.
+
+    Prefers a leading ``cd <path> <sep>`` prefix parsed from ``command``
+    over ``payload.cwd`` -- see ``_leading_cd_target`` for why (#1468).
+    Falls back to ``payload.cwd`` (and then ``Path.cwd()``) when no
+    unambiguous ``cd`` prefix is present, preserving the original
+    fail-closed behavior.
+
+    A parsed ``cd`` target is trusted only when it is **absolute**. A
+    relative target (``cd ../other && git push``) or a ``~``-prefixed
+    target (``cd ~/x && git push``) resolves against a *base* directory
+    the hook cannot know: the hook is spawned at a fixed project-root cwd
+    (the relative command path in ``settings.json``) while
+    ``payload.cwd`` is dynamic, so a relative target silently resolves
+    against the wrong base -- reintroducing #1468's own defect class for
+    the relative case. ``~`` is never expanded by ``shlex``, so
+    ``Path("~/x")`` is a nonexistent path whose lookup surfaces as a
+    spurious fail-closed deny. Both fall back to ``payload.cwd`` -- the
+    owner's fail-closed-on-ambiguity mandate applied to the non-absolute
+    case, not just to the ``cd -`` / ``cd -P`` forms ``_leading_cd_target``
+    already rejects.
+
+    The absolute check lives here, not in ``_leading_cd_target``:
+    ``_leading_cd_target``'s parametrized unit tests use drive-less
+    POSIX-style paths (``Path('/repo')``) that are not ``is_absolute()``
+    on ``WindowsPath``. The parser's contract is "return the parsed
+    target"; the trust decision is the caller's.
+    """
+    cd_target = _leading_cd_target(command) if command else None
+    if cd_target is not None and cd_target.is_absolute():
+        return cd_target
     cwd_value = payload.get("cwd")
     if isinstance(cwd_value, str) and cwd_value:
         return Path(cwd_value)
@@ -298,7 +371,7 @@ def main() -> int:
 
     # Confirmed git push -- run the scoped-ruff lint check.
     try:
-        reason = _check_push_lint(command, _resolve_cwd(payload))
+        reason = _check_push_lint(command, _resolve_cwd(payload, command))
     except Exception as exc:  # noqa: BLE001 -- fail closed on any error during a push
         _deny(
             f"git push lint hook errored ({type(exc).__name__}: {exc}); "

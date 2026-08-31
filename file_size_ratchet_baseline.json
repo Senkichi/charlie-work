@@ -42,6 +42,7 @@
   "tests/test_fix_janitor_routing.py": 1600,
   "tests/test_fix_reconcile.py": 1600,
   "tests/test_fleet_dispatch.py": 7400,
+  "tests/test_git_push_lint_hook.py": 1000,
   "tests/test_github.py": 1600,
   "tests/test_heartbeat_check.py": 4200,
   "tests/test_instrumentation.py": 2200,
