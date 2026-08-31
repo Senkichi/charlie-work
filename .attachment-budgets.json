@@ -22,7 +22,15 @@
    "file": "src/charlie_work/workflow.py",
    "identity": "OrchestratorApp",
    "kind": "class",
-   "member_count": 134
+   "member_count": 130
+  },
+  {
+   "boundary": 6.0,
+   "bumps": [],
+   "file": "src/charlie_work/write_gate.py",
+   "identity": "WriteGate",
+   "kind": "class",
+   "member_count": 7
   },
   {
    "boundary": 41.0,
@@ -62,7 +70,7 @@
    "file": "tests/test_cli.py",
    "identity": "tests/test_cli.py::module",
    "kind": "test_module",
-   "member_count": 105
+   "member_count": 103
   },
   {
    "boundary": 41.0,
@@ -87,6 +95,14 @@
    "identity": "tests/test_doctor.py::module",
    "kind": "test_module",
    "member_count": 82
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_fix_reconcile.py",
+   "identity": "tests/test_fix_reconcile.py::module",
+   "kind": "test_module",
+   "member_count": 47
   },
   {
    "boundary": 41.0,
@@ -158,7 +174,7 @@
    "file": "tests/test_prompt_sections.py",
    "identity": "tests/test_prompt_sections.py::module",
    "kind": "test_module",
-   "member_count": 59
+   "member_count": 58
   },
   {
    "boundary": 41.0,
@@ -167,14 +183,6 @@
    "identity": "tests/test_reconcile.py::module",
    "kind": "test_module",
    "member_count": 135
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_routing.py",
-   "identity": "tests/test_routing.py::module",
-   "kind": "test_module",
-   "member_count": 42
   },
   {
    "boundary": 41.0,
