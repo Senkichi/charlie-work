@@ -2613,6 +2613,23 @@ def test_build_config_from_data_fallback_adapter_presence_is_deprecated() -> Non
     assert any("api_worker.fallback_adapter is deprecated" in msg for msg in cfg.deprecations)
 
 
+def test_build_config_from_data_fallback_adapter_old_style_config_loads_warn_not_fatal() -> None:
+    # Phase 2 (role-config refactor Track B) deleted ApiWorkerConfig.fallback_adapter
+    # outright -- there is no renamed successor field. An old-style config that
+    # still sets api_worker.fallback_adapter must load with a deprecation warning
+    # rather than a fatal ConfigError, because _resolve_role_dual_accept pops the
+    # key out of api_worker_raw (the same dict object _build_section validates
+    # later) before ApiWorkerConfig's unknown-key check ever sees it. Without that
+    # pop, this call would raise ConfigError("unknown key(s) in config section
+    # 'api_worker': fallback_adapter ...") instead of returning -- so this test,
+    # by not wrapping the call in pytest.raises, asserts the no-longer-fatal half
+    # of the contract as well as the warning-message half.
+    cfg = build_config_from_data(
+        {"api_worker": {"enabled": False, "fallback_adapter": "devin-shell"}}
+    )
+    assert any("api_worker.fallback_adapter is deprecated" in msg for msg in cfg.deprecations)
+
+
 def test_build_config_from_data_cross_family_section_presence_is_deprecated_even_without_enabled() -> (
     None
 ):
