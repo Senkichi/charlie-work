@@ -306,3 +306,31 @@ jobs:
           set -e
           git fetch --depth 1 origin ${{ github.event.pull_request.base.sha }}
           uv run charlie mojibake-check --base ${{ github.event.pull_request.base.sha }}
+      - name: Private-slug ratchet gate (issue 1502)
+        # PR-only: push-to-main has no diff to scan (the branch IS main).
+        #
+        # Same structural rationale as the mojibake gate above: a step of
+        # the existing "Lint" job, not a new job, so it rides the
+        # already-required "Lint" context and becomes a de facto blocking
+        # gate the moment a PR branch includes this workflow change -- no
+        # branch-protection edit, no orchestrator.config.yaml or
+        # .aviator/config.yml change, no separate promotion step.
+        #
+        # Fails when a PR adds net-new mentions of configured private
+        # sibling-repo slugs in tracked files, ratchet-style against
+        # .private-slug-baseline.json. The slug list is config (in the
+        # baseline file), not hardcoded in the check body. Moves (remove +
+        # add) produce zero net-new and do not trigger the gate. A PR that
+        # intentionally adds new mentions must bump the baseline total by
+        # at least the net-new count -- that bump is tamper-evident in diff
+        # review. See src/charlie_work/private_slug_gate.py for the full
+        # rationale.
+        #
+        # The base SHA is already fetched by the mojibake gate step above
+        # (same job, same fetch). shell: bash with set -e for the same
+        # reason as the mojibake gate.
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -e
+          uv run charlie private-slug-check --base ${{ github.event.pull_request.base.sha }}
