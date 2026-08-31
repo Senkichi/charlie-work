@@ -77,7 +77,7 @@ _DEFAULT_QUOTA_COOLDOWN_HOURS = 24
 # the Devin CLI defaults to ``auto`` (read-only tools), stalls on any
 # git/uv/gh call, and exits asking the operator to restart with this flag.
 # {model_args} is a placeholder for config-driven model selection (e.g.
-# "--model claude-sonnet-4-5"). When devin.worker_model is empty, this renders
+# "--model claude-sonnet-4-5"). When worker.model is empty, this renders
 # to an empty string, preserving CLI default behavior.
 DEFAULT_COMMAND_TEMPLATE: tuple[str, ...] = (
     "devin",

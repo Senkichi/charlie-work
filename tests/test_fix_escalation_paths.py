@@ -32,6 +32,7 @@ from charlie_work.config import (
     OrchestratorConfig,
     ReviewDispatchConfig,
     RuntimeConfig,
+    WorkerRoleConfig,
 )
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
@@ -1059,6 +1060,12 @@ def _closed_pr_app(tmp_path: Path) -> tuple[OrchestratorApp, FakeGitHub]:
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        # Role-config Phase 1.5: the manual-adapter manifest-writing branch
+        # in _dispatch_impl reads worker.harness, not devin.adapter. Direct
+        # OrchestratorConfig construction bypasses the dual-accept sync
+        # build_config_from_data would otherwise perform, so worker.harness
+        # must be set to match.
+        worker=WorkerRoleConfig(harness="command"),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()

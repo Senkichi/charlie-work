@@ -4007,17 +4007,25 @@ class OrchestratorApp:
         Mirrors the "claude-code" branch of ``_adapter_settings()`` exactly
         (same venv/worker_env/command resolution), but forces
         ``adapter="claude-code"`` regardless of the primary configured
-        ``devin.adapter`` — the rescue tier always uses the claude-code
-        adapter — and overrides ``claude_code.model`` to
-        ``rescue.worker_model`` via a one-off config copy. This is the
-        "adapter/model overridden from RescueConfig" the rescue rework
-        reuses the existing rework-dispatch path with, never a parallel
-        launch path.
+        ``worker.harness`` — the rescue tier always uses the claude-code
+        adapter — and overrides ``worker.model`` to ``rescue.worker_model``
+        via a one-off config copy. This is the "adapter/model overridden
+        from RescueConfig" the rescue rework reuses the existing
+        rework-dispatch path with, never a parallel launch path.
+
+        Role-config Phase 1.5: ``launch_claude_worker``'s single model-pin
+        enforcement point now reads ``resolved_config.worker.model`` (not
+        ``resolved_config.claude_code.model``) whenever no ``model_override``
+        is passed -- and this call site passes none, same as the primary
+        claude-code dispatch path. The override must therefore land on
+        ``worker.model``, not ``claude_code.model``, or the rescue tier would
+        silently launch with the ordinary worker model instead of the
+        stronger rescue model.
         """
         claude = self.config.claude_code
         rescue_config = dataclasses_replace(
             self.config,
-            claude_code=dataclasses_replace(claude, model=self.config.rescue.worker_model),
+            worker=dataclasses_replace(self.config.worker, model=self.config.rescue.worker_model),
         )
         return AdapterSettings(
             adapter="claude-code",
@@ -6000,7 +6008,7 @@ class OrchestratorApp:
             if not result.ok and result.failure_kind == "worktree_foreign_writer"
         }
         # Second lock: upgrade claim from dispatch_pending to dispatched/dispatch_failed
-        manual = self.config.devin.adapter == "manual"
+        manual = self.config.worker.harness == "manual"
         label_errors: list[int] = []
         label_error_failures: dict[int, str] = {}
         with state_lock(self.paths.state_file):
@@ -19054,7 +19062,7 @@ class OrchestratorApp:
                     True,
                     "rework dispatch deferred: fleet lock held",
                     {
-                        "adapter": self.config.devin.adapter,
+                        "adapter": self.config.worker.harness,
                         "selected_count": 0,
                         "deferred_reason": "fleet_lock_held",
                     },
@@ -19066,7 +19074,7 @@ class OrchestratorApp:
         except StateLockBusy:
             return _state_lock_busy_result(
                 "rework dispatch deferred: state lock held",
-                adapter=self.config.devin.adapter,
+                adapter=self.config.worker.harness,
                 selected_count=0,
                 deferred_reason="state_lock_busy",
             )
@@ -19090,7 +19098,7 @@ class OrchestratorApp:
         state["issues"][n]["status"] == "rework_requested" and it has an open PR.
         The label is used for display only and never for selection.
         """
-        if self.config.devin.adapter == "manual":
+        if self.config.worker.harness == "manual":
             return CommandResult(
                 True,
                 "rework dispatch skipped for manual adapter",
@@ -19228,7 +19236,7 @@ class OrchestratorApp:
                 throttled_until = state.get("throttled_until")
                 # Return immediately with deferral reason
                 data = {
-                    "adapter": self.config.devin.adapter,
+                    "adapter": self.config.worker.harness,
                     "selected_count": 0,
                     "deferred_reason": "provider_throttled",
                     "throttled_until": throttled_until,
@@ -19390,7 +19398,7 @@ class OrchestratorApp:
                 )
 
             data = {
-                "adapter": self.config.devin.adapter,
+                "adapter": self.config.worker.harness,
                 "selected_count": len(dry_session_requests),
                 "attempted_count": len(dry_session_requests),
                 "failed_count": 0,
@@ -19900,7 +19908,7 @@ class OrchestratorApp:
 
         if not selected:
             data = {
-                "adapter": self.config.devin.adapter,
+                "adapter": self.config.worker.harness,
                 "selected_count": 0,
                 "failures": _build_failure_map(
                     [], set(), deferred_by_concurrency_full, rework_limit
@@ -19968,7 +19976,7 @@ class OrchestratorApp:
 
         if not selected_issue_numbers:
             data = {
-                "adapter": self.config.devin.adapter,
+                "adapter": self.config.worker.harness,
                 "selected_count": 0,
                 "failures": _build_failure_map(
                     [], set(), deferred_by_concurrency_full, rework_limit
@@ -20012,7 +20020,7 @@ class OrchestratorApp:
         # rework) already stamped `rescue_attempted` on its PR record instead
         # of escalating. Those issues must launch via the claude-code adapter
         # pinned to `rescue.worker_model`, regardless of the primary
-        # configured `devin.adapter` — tracked separately here so the SAME
+        # configured `worker.harness` — tracked separately here so the SAME
         # candidate-selection/session-request/state-bookkeeping code below
         # handles them, only the final dispatch_sessions() call differs.
         #
@@ -20138,7 +20146,7 @@ class OrchestratorApp:
                 self._write_rework_prompt(pr, issue_number, "")
             # Rescue tier (issue #555): rescue-marked PRs always launch via
             # the claude-code adapter pinned to rescue.worker_model,
-            # regardless of the primary configured devin.adapter.
+            # regardless of the primary configured worker.harness.
             pr_state_for_rescue = rescue_state_snapshot.get("prs", {}).get(str(pr_number), {})
             if pr_state_for_rescue.get("rescue_attempted"):
                 rescue_issue_numbers.add(issue_number)
@@ -20207,7 +20215,7 @@ class OrchestratorApp:
                 )
                 save_state(self.paths.state_file, state)
             data = {
-                "adapter": self.config.devin.adapter,
+                "adapter": self.config.worker.harness,
                 "selected_count": 0,
                 "failures": no_session_failure_map,
                 "deferred_by_concurrency": deferred_by_concurrency,

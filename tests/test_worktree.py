@@ -14,7 +14,13 @@ import pytest
 
 from _sessions_db_fixtures import make_sessions_db
 from _worktree_fixtures import _clone_repo, _git
-from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfig, WatchdogConfig
+from charlie_work.config import (
+    DevinConfig,
+    OrchestratorConfig,
+    PostMortemConfig,
+    WatchdogConfig,
+    WorkerRoleConfig,
+)
 from charlie_work.github import GitHubRunResult
 from charlie_work.process_utils import get_process_start_time
 from charlie_work.subprocess_runner import RunResult
@@ -4896,6 +4902,7 @@ def test_recovery_aborts_on_sessions_db_activity(tmp_path: Path) -> None:
 
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
     )
 
@@ -4948,6 +4955,7 @@ def test_recovery_aborts_on_sessions_db_schema_error_other_source_silent(tmp_pat
     now = datetime.now(UTC).isoformat()
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
     )
 
@@ -4999,6 +5007,7 @@ def test_recovery_aborts_when_all_sources_errored(tmp_path: Path) -> None:
     now = datetime.now(UTC).isoformat()
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
     )
 
@@ -5050,6 +5059,7 @@ def test_recovery_aborts_on_fresh_per_pid_log_despite_sessions_db_error(tmp_path
     now = datetime.now(UTC).isoformat()
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
     )
 
@@ -5112,6 +5122,7 @@ def test_recovery_aborts_on_fresh_per_pid_log_when_sessions_db_confirmed_stale(
 
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
     )
 
@@ -5157,6 +5168,7 @@ def test_recovery_increments_deferral_count_for_permanent_no_match(tmp_path: Pat
     now = datetime.now(UTC).isoformat()
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
     )
@@ -5207,6 +5219,7 @@ def test_recovery_allows_permanent_no_match_after_deferral_cap(tmp_path: Path) -
     now = datetime.now(UTC).isoformat()
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=2),
     )
@@ -5256,6 +5269,7 @@ def test_recovery_allows_reset_when_worker_pid_dead_and_probe_inconclusive(
     now = datetime.now(UTC).isoformat()
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
     )
@@ -5304,6 +5318,7 @@ def test_recovery_aborts_on_transient_probe_error_despite_dead_pid(
     now = datetime.now(UTC).isoformat()
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
     )
@@ -5378,6 +5393,7 @@ def test_recovery_proceeds_when_no_source_errored_and_pid_dead(
 
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(tmp_path / "unused.db")),
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
     )
@@ -5442,6 +5458,7 @@ def test_recovery_proceeds_for_non_devin_worker_despite_devin_source_absence(
     now = datetime.now(UTC).isoformat()
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
     )
@@ -5497,6 +5514,7 @@ def test_recovery_proceeds_for_api_worker_despite_devin_source_absence(
     now = datetime.now(UTC).isoformat()
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
     )
@@ -5548,6 +5566,7 @@ def test_recovery_still_aborts_for_devin_worker_with_devin_source_errors(
     now = datetime.now(UTC).isoformat()
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
     )
@@ -5602,6 +5621,7 @@ def test_recovery_non_devin_worker_with_live_pid_still_aborts(
     now = datetime.now(UTC).isoformat()
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
+        worker=WorkerRoleConfig(harness="devin-shell"),
         post_mortem=PostMortemConfig(db_path=str(db_path)),
         watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=3),
     )
