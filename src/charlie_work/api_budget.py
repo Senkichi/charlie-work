@@ -49,7 +49,6 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
 from .config import ApiBudgetConfig, ApiProviderConfig
-from .routing import BudgetStatus
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +119,20 @@ class Ledger:
     days: Mapping[str, DayBucket] = field(default_factory=lambda: MappingProxyType({}))
     lifetime_usd: float = 0.0
     sessions: tuple[SessionEntry, ...] = ()
+
+
+@dataclass(frozen=True)
+class BudgetStatus:
+    """Spend snapshot consumed by the api-worker preflight.
+
+    Pre-computed booleans so callers stay pure functions of their arguments
+    (no clock or filesystem access needed to recompute headroom).
+    """
+
+    spent_today_usd: float
+    lifetime_spent_usd: float
+    daily_headroom: bool
+    lifetime_headroom: bool
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +267,7 @@ def _daily_reserve(budget_config: ApiBudgetConfig) -> float:
 
 
 def budget_status(ledger: Ledger, budget_config: ApiBudgetConfig, today: str) -> BudgetStatus:
-    """Produce the ``routing.BudgetStatus`` value for the api preflight.
+    """Produce the ``BudgetStatus`` value for the api preflight.
 
     ``today`` is a UTC date string ``YYYY-MM-DD`` (passed in so this function
     stays pure — no clock access inside).

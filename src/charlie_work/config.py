@@ -211,13 +211,6 @@ class LabelConfig:
     # via ``_compute_remove``) and of ``all`` (so ``bootstrap_labels``
     # creates it on GitHub).
     operator_queue: str = "agent:operator-queue"
-    # Routing hint, NOT a workflow state (issue #481). Never a member of
-    # ``active``/``terminal``/``workflow_labels`` — it must not affect issue
-    # selection or exclusion. Included in ``all`` so ``bootstrap_labels``
-    # creates it on GitHub with a sensible description. Human-applied at filing
-    # time; read by routing.select_adapter to send a complex first-pass issue to
-    # the api worker instead of the weaker default worker.
-    complexity_high: str = "complexity:high"
 
     @property
     def terminal(self) -> set[str]:
@@ -247,7 +240,6 @@ class LabelConfig:
             self.human_needed,
             self.prose_only_deps,
             self.merge_hold,
-            self.complexity_high,
             self.operator_queue,
         ]
 
@@ -1328,7 +1320,6 @@ class ApiWorkerConfig:
         default_factory=lambda: MappingProxyType({})
     )
     budget: ApiBudgetConfig = field(default_factory=ApiBudgetConfig)
-    fallback_adapter: str = "devin-shell"
     worker_template: str = "worker_claude_code.md"
     rework_template: str = "rework.md"
 
@@ -2490,10 +2481,20 @@ def _resolve_role_dual_accept(data: dict[str, Any]) -> list[str]:
         )
     if "fallback_adapter" in api_worker_raw:
         deprecations.append(
-            "api_worker.fallback_adapter is deprecated; per-issue adapter "
-            "routing is being removed in Phase 2 of the role-config refactor "
-            "and this key will stop being read"
+            "api_worker.fallback_adapter is deprecated and no longer does "
+            "anything; per-issue adapter routing was removed in Phase 2 of "
+            "the role-config refactor and this key is no longer read"
         )
+        # Phase 2 deleted ApiWorkerConfig.fallback_adapter outright (no
+        # renamed successor field), so _build_section's unknown-key check
+        # would otherwise turn a config that has not migrated yet into a
+        # hard ConfigError instead of a soft warning. Pop it from the same
+        # dict object _build_section validates later (api_worker_raw IS
+        # api_worker_data -- see _role_section's docstring) so the promise
+        # above ("no longer read") holds without breaking an unconverted
+        # config while dual-accept is still in effect (Track E deletes this
+        # whole apparatus last, once every config is expected to be clean).
+        api_worker_raw.pop("fallback_adapter", None)
     if cross_family_raw:
         emergent = effective_worker_model != effective_reviewer_model
         deprecations.append(
@@ -3483,7 +3484,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 "config section 'api_worker' key 'max_concurrent_sessions' must be >= 0, "
                 f"got {max_concurrent_sessions}"
             )
-    for str_key in ("fallback_adapter", "worker_template", "rework_template"):
+    for str_key in ("worker_template", "rework_template"):
         str_value = api_worker_data.get(str_key)
         if str_value is not None and not isinstance(str_value, str):
             raise ConfigError(

@@ -18,6 +18,7 @@ import pytest
 
 from charlie_work import api_budget
 from charlie_work.api_budget import (
+    BudgetStatus,
     DayBucket,
     Ledger,
     SessionEntry,
@@ -32,7 +33,6 @@ from charlie_work.api_budget import (
 )
 from charlie_work.claude_code import iter_claude_events, parse_claude_events
 from charlie_work.config import ApiBudgetConfig, ApiProviderConfig
-from charlie_work.routing import BudgetStatus
 
 
 # ---------------------------------------------------------------------------

@@ -209,9 +209,10 @@ def manifest_adapter_label(kinds: set[str]) -> str:
 
     One kind → that kind (a homogeneous batch is labeled honestly, not as
     ``"mixed"``). More than one kind → ``"mixed"``. This is the single point
-    of label derivation for session manifests (issue #626): both
-    ``_dispatch_partitioned`` and the rework combined-manifest write go through
-    this helper so the label always reflects the actual partition.
+    of label derivation for session manifests (issue #626): the rescue tier's
+    combined-manifest write (normal-tier worker harness + rescue's
+    claude-code) goes through this helper so the label always reflects the
+    actual partition.
     """
     if len(kinds) == 1:
         return next(iter(kinds))
@@ -264,8 +265,10 @@ def _instructions(adapter: str) -> list[str]:
         ]
     if adapter == "mixed":
         return [
-            "This manifest combines sessions routed to multiple worker adapters",
-            "(e.g. api and devin-shell) by per-issue adapter routing (issue #482).",
+            "This manifest combines sessions launched by more than one worker",
+            "harness in the same pass — normally the configured worker harness",
+            "plus the rescue tier's claude-code reviewer-as-rescue-worker",
+            "(issue #626).",
             "Each session's adapter is recorded in the dispatch results file, not in",
             "this manifest's top-level adapter field. Consult the results file for",
             "per-session adapter_kind, provider, and launch status.",
