@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .config import OrchestratorConfig
-from .cross_family import LEGACY_VACUOUS_SUMMARY
+from .rescue_review import LEGACY_VACUOUS_SUMMARY
 from .github import defang_closing_keywords
 from .markdown_fence import fenced_block
 from .prompts import (
@@ -183,7 +183,7 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     summary was used as the findings, i.e. what used to be this function's
     own tier-2 fallback) or ``"vacuous"`` (nothing was derivable -- neither
     an itemized list nor a usable summary -- e.g. the historical
-    cross-family placeholder, ``cross_family.LEGACY_VACUOUS_SUMMARY``, which
+    cross-family placeholder, ``rescue_review.LEGACY_VACUOUS_SUMMARY``, which
     is genuinely non-blank text but carries no reviewer content).
 
     Issue #950: when the PR itself carries verified human or peer-agent
@@ -376,7 +376,7 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
         # reviewer's own summary was vacuous, so an all-crash external-findings
         # set leaves nothing else behind. `summary_text` in that population is
         # exactly the placeholder `record_review` discarded to reach this path
-        # (`cross_family.LEGACY_VACUOUS_SUMMARY`, or blank -- `record_review`
+        # (`rescue_review.LEGACY_VACUOUS_SUMMARY`, or blank -- `record_review`
         # rejects a truly empty summary outright for `request_changes`/
         # `blocked`, so blank can only reach here on an older, hand-edited, or
         # differently-produced record) -- never real reviewer prose, since a

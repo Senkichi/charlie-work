@@ -992,16 +992,6 @@ def test_rework_template_severity_aware_required_behavior() -> None:
     assert "Address every Critical and Important finding directly" not in normalized
 
 
-def test_cross_family_review_contains_self_report_distrust_rule() -> None:
-    """Verify that cross_family_review.md tells the reviewer a stated rationale never lowers severity."""
-    prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
-    text = (prompts_dir / "cross_family_review.md").read_text(encoding="utf-8")
-
-    assert "is the author grading their own work" in text
-    assert "it never by itself lowers a finding's" in text
-    assert "Verify the claim against the code; if it doesn't hold, the finding stands." in text
-
-
 def test_review_rendered_with_populated_test_adequacy_section() -> None:
     """Verify that review.md renders with populated test-adequacy facts when enabled (issue #180)."""
     from charlie_work.janitor import TestAdequacyFacts

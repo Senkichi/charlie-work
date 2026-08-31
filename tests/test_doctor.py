@@ -10,7 +10,6 @@ from charlie_work.config import (
     ApiBudgetConfig,
     AutoMergeConfig,
     ClaudeCodeConfig,
-    CrossFamilyConfig,
     DevinConfig,
     OrchestratorConfig,
     RescueConfig,
@@ -137,8 +136,8 @@ def test_tolerance_match_base_names_returns_matched_jobs() -> None:
 
 
 def _config(**kwargs) -> OrchestratorConfig:
-    # The real default (review_dispatch.enabled=False, cross_family.auto_verdict=
-    # False) is exactly the "no automated review-to-verdict path" gap the new
+    # The real default (review_dispatch.enabled=False, rescue.enabled=False)
+    # is exactly the "no automated review-to-verdict path" gap the new
     # doctor check flags -- so every pre-existing test in this module that
     # doesn't care about that check would otherwise trip it incidentally.
     # Default review_dispatch on here; tests that specifically exercise the
@@ -304,29 +303,9 @@ def test_doctor_flags_missing_prompts_dir_and_template(tmp_path: Path) -> None:
     assert by_name["worker template: worker.md"].ok is True  # package fallback still resolves
 
 
-def test_doctor_cross_family_missing_binary_is_warning(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(
-        "charlie_work.doctor.shutil.which",
-        lambda name: None if name == "devin" else f"C:/fake/{name}",
-    )
-    config = _config(
-        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
-        cross_family=CrossFamilyConfig(enabled=True),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    gh = FakeDoctorGitHub(labels=config.labels.all)
-
-    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
-
-    by_name = {check.name: check for check in checks}
-    assert by_name["cross-family binary"].ok is False
-    assert by_name["cross-family binary"].severity == "warning"
-    assert ok is True
-
-
 def test_doctor_flags_no_automated_review_to_verdict_path(tmp_path: Path) -> None:
-    # review_dispatch.enabled=False + cross_family.auto_verdict=False (both
-    # real defaults on OrchestratorConfig) is exactly the 7-day-outage config
+    # review_dispatch.enabled=False + rescue.enabled=False (both real
+    # defaults on OrchestratorConfig) is exactly the 7-day-outage config
     # shape -- no automated path ever calls record_review(). _config()
     # defaults review_dispatch on for the rest of this module, so this test
     # overrides it back off explicitly.
@@ -335,7 +314,7 @@ def test_doctor_flags_no_automated_review_to_verdict_path(tmp_path: Path) -> Non
         review_dispatch=ReviewDispatchConfig(enabled=False),
     )
     assert config.review_dispatch.enabled is False
-    assert config.cross_family.auto_verdict is False
+    assert config.rescue.enabled is False
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
 
@@ -346,17 +325,17 @@ def test_doctor_flags_no_automated_review_to_verdict_path(tmp_path: Path) -> Non
     assert check.ok is False
     assert check.severity == "error"
     assert "review_dispatch.enabled" in check.detail
-    assert "cross_family.auto_verdict" in check.detail
+    assert "rescue.enabled" in check.detail
     assert ok is False
 
 
-def test_doctor_review_to_verdict_path_ok_when_auto_verdict_enabled(tmp_path: Path) -> None:
-    # review_dispatch off, cross_family.auto_verdict on: the check must pass
-    # on auto_verdict alone, independent of review_dispatch.
+def test_doctor_review_to_verdict_path_ok_when_rescue_enabled(tmp_path: Path) -> None:
+    # review_dispatch off, rescue.enabled on: the check must pass on
+    # rescue.enabled alone, independent of review_dispatch.
     config = _config(
         auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
         review_dispatch=ReviewDispatchConfig(enabled=False),
-        cross_family=CrossFamilyConfig(auto_verdict=True),
+        rescue=RescueConfig(enabled=True),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)

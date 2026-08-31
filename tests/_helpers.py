@@ -14,7 +14,7 @@ import subprocess
 from pathlib import Path
 
 from _fakes_github import FakeGitHub
-from charlie_work.config import CrossFamilyConfig, OrchestratorConfig
+from charlie_work.config import OrchestratorConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
 
@@ -55,8 +55,8 @@ def _init_git_repo(repo_root: Path) -> None:
     run(["git", "commit", "-m", "initial commit"])
 
 
-def _cross_family_app(tmp_path: Path, *, enabled: bool) -> OrchestratorApp:
-    config = OrchestratorConfig(cross_family=CrossFamilyConfig(enabled=enabled))
+def _cross_family_app(tmp_path: Path) -> OrchestratorApp:
+    config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     return OrchestratorApp(tmp_path, paths, config, FakeGitHub())
 

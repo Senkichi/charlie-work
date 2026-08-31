@@ -418,9 +418,9 @@ def test_rework_writer_rejects_flat_override_without_execution_contract(
 
 # ---------------------------------------------------------------------------
 # Case B: the real caller is a `render_prompt`/`self._render` call embedded
-# deep inside a large method (`review()`, `_cross_family_for_pr()`,
-# `spec_review()`) that would need extensive GitHub-API and subprocess
-# mocking to invoke end to end. Per the task brief's documented fallback:
+# deep inside a large method (`review()`) that would need extensive
+# GitHub-API and subprocess mocking to invoke end to end. Per the task
+# brief's documented fallback:
 # pin the caller's exact key set as a constant tied to the cited file:line,
 # then (a) assert the template's referenced placeholders are a subset of it
 # -- so the test fails the moment a template outgrows it -- and (b) actually
@@ -439,7 +439,6 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "issue_url",
     "pr_json_path",
     "diff_path",
-    "cross_family_section",
     "janitor_section",
     "test_adequacy_section",
     "static_probe_section",
@@ -450,29 +449,8 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "prior_review_section",
 }
 
-# workflow.py::OrchestratorApp._cross_family_for_pr, the literal `values`
-# dict passed to `self._render("cross_family_review.md", {...})`.
-CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS = {
-    "pr_number",
-    "pr_title",
-    "pr_url",
-    "issue_number",
-    "issue_title",
-    "pr_json_path",
-    "diff_path",
-}
-
-# workflow.py::OrchestratorApp.spec_review, the literal `values` dict
-# passed to `self._render("cross_family_spec_review.md", {...})`.
-CROSS_FAMILY_SPEC_REVIEW_MD_SUPPLIED_KEYS = {
-    "artifact_label",
-    "artifact_text",
-}
-
 _PINNED_KEY_SETS = {
     "review.md": REVIEW_MD_SUPPLIED_KEYS,
-    "cross_family_review.md": CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS,
-    "cross_family_spec_review.md": CROSS_FAMILY_SPEC_REVIEW_MD_SUPPLIED_KEYS,
 }
 
 
@@ -537,7 +515,6 @@ def test_review_md_renders_with_production_paths_and_no_state_dir_literal(
         "issue_url": "https://example.test/issues/7",
         "pr_json_path": pr_dir / "pr.json",
         "diff_path": pr_dir / "diff.patch",
-        "cross_family_section": "",
         "janitor_section": "",
         "test_adequacy_section": "",
         "static_probe_section": "",
@@ -594,7 +571,6 @@ def test_review_md_repo_local_override_render_with_no_state_dir_literal(
         "issue_url": "https://example.test/issues/7",
         "pr_json_path": pr_dir / "pr.json",
         "diff_path": pr_dir / "diff.patch",
-        "cross_family_section": "",
         "janitor_section": "",
         "test_adequacy_section": "",
         "static_probe_section": "",
@@ -707,8 +683,6 @@ _CITATION_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         '"review.md"',
         "pr_dir = self.paths.prs",
     ),
-    "OrchestratorApp._cross_family_for_pr": ('"cross_family_review.md"',),
-    "OrchestratorApp.spec_review": ('"cross_family_spec_review.md"',),
     "OrchestratorApp._render": (
         "render_prompt(template_name, values, search_dirs=self.prompt_dirs)",
     ),
