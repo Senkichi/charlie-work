@@ -63,8 +63,8 @@ auto_merge:
     - Tests passed
     - Lint & Format
 
-devin:
-  adapter: manual
+worker:
+  harness: manual
 ```
 
 Key knobs, all overridable per-section (see `src/charlie_work/config.py`
@@ -79,7 +79,7 @@ for the full dataclass list and defaults):
 | `auto_merge.merge_flags` | Extra flags appended to `gh pr merge` (e.g., `["--admin"]` for protected-base merges, `["--auto"]` for merge-queue flows). Takes precedence over the legacy `admin` field. Flags must start with `--` and cannot be strategy flags (`--merge`/`--rebase`/`--squash`) or `--delete-branch` (branch deletion is handled separately). |
 | `auto_merge.admin` | Legacy field for `gh pr merge --admin` (required when the base branch is protected and your gh auth has admin on the repo). Superseded by `merge_flags` but preserved for backward compatibility. |
 | `runtime.prompts_dir` | Repo-local directory that overrides package prompt templates **by filename** — drop in your own `worker.md` and everything else keeps the package default. |
-| `devin.adapter` | How a worker is launched: `manual` (write a session manifest for a human to paste), `command` (blocking subprocess via `devin.dispatch_command`), `devin-shell` (non-blocking headless `devin --print`), or `claude-code` (non-blocking headless `claude -p` in an isolated worktree). See [ARCHITECTURE.md](ARCHITECTURE.md#adapter-boundary). |
+| `worker.harness` | How a worker is launched: `manual` (write a session manifest for a human to paste), `command` (blocking subprocess via `devin.dispatch_command`), `devin-shell` (non-blocking headless `devin --print`), or `claude-code` (non-blocking headless `claude -p` in an isolated worktree). See [ARCHITECTURE.md](ARCHITECTURE.md#adapter-boundary). |
 | `watchdog.*` | Supervisor tripwires (stall, wall-clock, loop/no-progress, cost/token budget) and restart-intensity cap. WARN-first by default — see [RUNBOOK.md](RUNBOOK.md#supervisor-worker-health--escalation). |
 | `fleet.global_max_concurrent_sessions` | Cross-repo worker-count budget for `charlie fleet …` (default `0` = unlimited). |
 | `notify.*` | Opt-in needs-attention sink (webhook \| desktop \| shell \| file); `enabled: false` by default. See `examples/notify.config.yaml`. |
@@ -176,7 +176,7 @@ checked it — see [WORKFLOWS.md](WORKFLOWS.md) for the exact scope.
 Two profiles ship in `examples/`, matching the two first-class worker
 runtimes:
 
-| Profile | `dispatch.worker_template` | `devin.adapter` | Notes |
+| Profile | `dispatch.worker_template` | `worker.harness` | Notes |
 |---|---|---|---|
 | `examples/orchestrator.config.devin.yaml` | `worker.md` | `devin-shell` | Skills-based worker loop (`/create-branch`, `/commit`, `/test`, `/preflight`, `/push`, `/create-pr`, `/complete`); no automated reviewer dispatch (`review_dispatch.enabled: false`). |
 | `examples/orchestrator.config.claude-code.yaml` | `worker_claude_code.md` | `claude-code` | Direct-shell worker loop (no Devin skills, plain git/test commands in the prompt); no automated reviewer dispatch (Claude-only review). |

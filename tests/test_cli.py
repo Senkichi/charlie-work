@@ -1193,15 +1193,16 @@ def test_run_doctor_command_reports_structured_finding_on_unparseable_config(
     the operator gets nothing to act on. Now the failure is caught locally
     and rendered as a structured, blocking ``DoctorCheck`` finding instead.
 
-    The role-config Phase 2 cleanup made a bare ``cross_family:`` section
-    itself dual-accept (deprecated but no longer a parse error, regardless
-    of its inner keys -- see ``config._DEPRECATED_SECTIONS_WITHOUT_A_FIELD``),
-    so the original incident's exact reproduction shape no longer raises.
-    This drives the REAL ``load_layered_config`` (not mocked) against an
-    unknown key inside a section that still validates its keys
+    The role-config Phase 2 cleanup deleted the dual-accept section
+    tolerance mechanism entirely, so a bare ``cross_family:`` section is no
+    longer specially tolerated -- it is rejected as an unknown top-level
+    section like any other bogus key, the same as the original incident's
+    exact reproduction shape would raise again today. This test instead
+    drives the REAL ``load_layered_config`` (not mocked) against an unknown
+    key inside a section that has always validated its own keys
     (``labels``), which raises the identical ``ConfigError`` shape the
     original incident hit -- proving the exception-handling path this test
-    exists for, independent of which section happens to still validate.
+    exists for, independent of which section happens to raise.
     """
     monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
     # Deliberately NOT mocking cli.load_layered_config.
