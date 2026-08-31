@@ -53273,6 +53273,7 @@ def test_dispatch_rework_pre_filter_own_live_session_not_reaped_escalated(
             adapter="command",
             dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
         ),
+        worker=WorkerRoleConfig(harness="command"),
         watchdog=WatchdogConfig(
             max_auto_redispatch=2,
             redispatch_window_minutes=240,
