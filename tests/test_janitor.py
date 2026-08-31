@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import re
 import subprocess
 from pathlib import Path
@@ -19,7 +18,6 @@ from charlie_work.janitor import (
     _calculate_patch_id,
     _get_unpushed_commit_info,
     CONVENTIONAL_COMMIT_TYPES,
-    detect_cross_pr_revert,
     is_stale_ci_verdict,
     JANITOR_PR_KEYS,
     JanitorVerdict,
@@ -3250,9 +3248,11 @@ index 0000000..1234567
 
 # --- issue #659: git argv validation (defense-in-depth) -----------------------
 #
-# These tests verify that _check_no_op_rework and detect_cross_pr_revert
-# reject flag-like or malformed SHA/ref values *before* they reach any
-# subprocess argv, and that run_janitor never raises in the process.
+# These tests verify that _check_no_op_rework rejects flag-like or malformed
+# SHA/ref values *before* they reach any subprocess argv, and that run_janitor
+# never raises in the process. The detect_cross_pr_revert ref-validation
+# tests live in tests/test_cross_pr_revert.py (moved with the function when
+# it was extracted to src/charlie_work/cross_pr_revert.py, issue #1068).
 
 
 def test_no_op_rework_warns_on_flag_like_reviewed_head_sha() -> None:
@@ -3550,68 +3550,6 @@ def test_no_op_rework_warns_on_flag_like_base_ref_sha_match(
 
     assert verdict.ok is False
     assert any("_check_no_op_rework base_ref (sha-match)" in w for w in verdict.warnings)
-
-
-def test_detect_cross_pr_revert_skips_invalid_head_ref(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A flag-like headRefName must not reach ``git fetch origin <head> <base>``."""
-    from charlie_work import janitor as janitor_module
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    (repo_root / ".git").mkdir()
-
-    pr = _green_pr(headRefName="--upload-pack=evil")
-
-    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("run_captured should not be called with invalid refs")
-
-    monkeypatch.setattr(janitor_module, "run_captured", _fail_if_called)
-
-    result = detect_cross_pr_revert(pr, repo_root)
-    assert result is None
-
-
-def test_detect_cross_pr_revert_skips_invalid_base_ref(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A flag-like baseRefName must not reach ``git fetch origin <head> <base>``."""
-    from charlie_work import janitor as janitor_module
-
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    (repo_root / ".git").mkdir()
-
-    pr = _green_pr(headRefName="agent/issue-1-fix", baseRefName="--upload-pack=evil")
-
-    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("run_captured should not be called with invalid refs")
-
-    monkeypatch.setattr(janitor_module, "run_captured", _fail_if_called)
-
-    result = detect_cross_pr_revert(pr, repo_root)
-    assert result is None
-
-
-def test_detect_cross_pr_revert_warns_on_invalid_ref(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A ref validation failure must be logged, not silently treated as no revert."""
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    (repo_root / ".git").mkdir()
-
-    pr = _green_pr(headRefName="--upload-pack=evil")
-
-    with caplog.at_level(logging.WARNING, logger="charlie_work.janitor"):
-        result = detect_cross_pr_revert(pr, repo_root)
-
-    assert result is None
-    assert any(
-        "detect_cross_pr_revert" in record.message and "not a valid git ref name" in record.message
-        for record in caplog.records
-    )
 
 
 # --------------------------------------------------------------------------
