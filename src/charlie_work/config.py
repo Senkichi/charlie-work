@@ -2253,6 +2253,7 @@ def _resolve_role_dual_accept(data: dict[str, Any]) -> list[str]:
 
     reviewer_raw = _role_section(data, "reviewer")
     review_dispatch_raw = _role_section(data, "review_dispatch")
+    rescue_raw = _role_section(data, "rescue")
 
     # === reviewer.harness (Phase 1: claude-code only) ===
     effective_reviewer_harness = reviewer_raw.get("harness", "claude-code")
@@ -2385,6 +2386,98 @@ def _resolve_role_dual_accept(data: dict[str, Any]) -> list[str]:
             "reviewer.effort_experiment_salt instead "
             f"(effective value: {role_effective_salt!r})"
         )
+
+    # === rescue.worker / rescue.reviewer <- rescue.worker_adapter/worker_model/
+    # reviewer_adapter/reviewer_model ===
+    rescue_worker_raw = rescue_raw.get("worker")
+    if not isinstance(rescue_worker_raw, dict):
+        rescue_worker_raw = {}
+    rescue_raw["worker"] = rescue_worker_raw
+    rescue_reviewer_raw = rescue_raw.get("reviewer")
+    if not isinstance(rescue_reviewer_raw, dict):
+        rescue_reviewer_raw = {}
+    rescue_raw["reviewer"] = rescue_reviewer_raw
+
+    effective_rescue_worker_harness, rw_h_dep = _resolve_dual_accept(
+        old_present="worker_adapter" in rescue_raw,
+        old_value=rescue_raw.get("worker_adapter"),
+        old_label="rescue.worker_adapter",
+        new_present="harness" in rescue_worker_raw,
+        new_value=rescue_worker_raw.get("harness"),
+        new_label="rescue.worker.harness",
+        default="claude-code",
+    )
+    effective_rescue_worker_model, rw_m_dep = _resolve_dual_accept(
+        old_present="worker_model" in rescue_raw,
+        old_value=rescue_raw.get("worker_model"),
+        old_label="rescue.worker_model",
+        new_present="model" in rescue_worker_raw,
+        new_value=rescue_worker_raw.get("model"),
+        new_label="rescue.worker.model",
+        default="claude-opus-4-1",
+    )
+    effective_rescue_reviewer_harness, rr_h_dep = _resolve_dual_accept(
+        old_present="reviewer_adapter" in rescue_raw,
+        old_value=rescue_raw.get("reviewer_adapter"),
+        old_label="rescue.reviewer_adapter",
+        new_present="harness" in rescue_reviewer_raw,
+        new_value=rescue_reviewer_raw.get("harness"),
+        new_label="rescue.reviewer.harness",
+        default="devin",
+    )
+    effective_rescue_reviewer_model, rr_m_dep = _resolve_dual_accept(
+        old_present="reviewer_model" in rescue_raw,
+        old_value=rescue_raw.get("reviewer_model"),
+        old_label="rescue.reviewer_model",
+        new_present="model" in rescue_reviewer_raw,
+        new_value=rescue_reviewer_raw.get("model"),
+        new_label="rescue.reviewer.model",
+        default="codex",
+    )
+    for rescue_role_label, rescue_role_value in (
+        ("rescue.worker.harness", effective_rescue_worker_harness),
+        ("rescue.worker.model", effective_rescue_worker_model),
+        ("rescue.reviewer.harness", effective_rescue_reviewer_harness),
+        ("rescue.reviewer.model", effective_rescue_reviewer_model),
+    ):
+        if not isinstance(rescue_role_value, str):
+            raise ConfigError(
+                f"config section '{rescue_role_label}' must be a string, "
+                f"got {type(rescue_role_value).__name__}"
+            )
+
+    rescue_raw["worker_adapter"] = effective_rescue_worker_harness
+    rescue_raw["worker_model"] = effective_rescue_worker_model
+    rescue_raw["reviewer_adapter"] = effective_rescue_reviewer_harness
+    rescue_raw["reviewer_model"] = effective_rescue_reviewer_model
+    rescue_worker_raw["harness"] = effective_rescue_worker_harness
+    rescue_worker_raw["model"] = effective_rescue_worker_model
+    rescue_reviewer_raw["harness"] = effective_rescue_reviewer_harness
+    rescue_reviewer_raw["model"] = effective_rescue_reviewer_model
+    for rescue_dep, rescue_msg in (
+        (
+            rw_h_dep,
+            "rescue.worker_adapter is deprecated; set rescue.worker.harness "
+            f"instead (effective value: {effective_rescue_worker_harness!r})",
+        ),
+        (
+            rw_m_dep,
+            "rescue.worker_model is deprecated; set rescue.worker.model "
+            f"instead (effective value: {effective_rescue_worker_model!r})",
+        ),
+        (
+            rr_h_dep,
+            "rescue.reviewer_adapter is deprecated; set rescue.reviewer.harness "
+            f"instead (effective value: {effective_rescue_reviewer_harness!r})",
+        ),
+        (
+            rr_m_dep,
+            "rescue.reviewer_model is deprecated; set rescue.reviewer.model "
+            f"instead (effective value: {effective_rescue_reviewer_model!r})",
+        ),
+    ):
+        if rescue_dep:
+            deprecations.append(rescue_msg)
 
     return deprecations
 
@@ -3518,6 +3611,14 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'rescue' key 'reviewer_timeout_seconds' must be >= 0, "
             f"got {rescue_timeout}"
         )
+    rescue_worker_data = rescue_data.get("worker", {})
+    if not isinstance(rescue_worker_data, dict):
+        rescue_worker_data = {}
+    rescue_data["worker"] = WorkerRoleConfig(**rescue_worker_data)
+    rescue_reviewer_data = rescue_data.get("reviewer", {})
+    if not isinstance(rescue_reviewer_data, dict):
+        rescue_reviewer_data = {}
+    rescue_data["reviewer"] = WorkerRoleConfig(**rescue_reviewer_data)
     rescue = _build_section(RescueConfig, "rescue", rescue_data)
     watchdog_data = _section(data, "watchdog")
     terminal_error_markers = watchdog_data.get("terminal_error_markers")

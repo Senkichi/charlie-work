@@ -2583,3 +2583,58 @@ def test_resolve_role_dual_accept_reviewer_experiment_fraction_conflict_raises()
         "reviewer.effort_experiment_fraction.*0.75",
     ):
         config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_rescue_worker_old_only() -> None:
+    data = {"rescue": {"worker_adapter": "devin-shell", "worker_model": "glm-5-2"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["rescue"]["worker_adapter"] == "devin-shell"
+    assert data["rescue"]["worker_model"] == "glm-5-2"
+    assert data["rescue"]["worker"] == {"harness": "devin-shell", "model": "glm-5-2"}
+
+
+def test_resolve_role_dual_accept_rescue_worker_new_only() -> None:
+    data = {"rescue": {"worker": {"harness": "devin-shell", "model": "glm-5-2"}}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["rescue"]["worker_adapter"] == "devin-shell"
+    assert data["rescue"]["worker_model"] == "glm-5-2"
+
+
+def test_resolve_role_dual_accept_rescue_worker_conflict_raises() -> None:
+    data = {
+        "rescue": {
+            "worker_adapter": "claude-code",
+            "worker": {"harness": "devin-shell"},
+        }
+    }
+    with pytest.raises(
+        ConfigError, match="rescue.worker_adapter.*claude-code.*rescue.worker.harness.*devin-shell"
+    ):
+        config_module._resolve_role_dual_accept(data)
+
+
+def test_resolve_role_dual_accept_rescue_reviewer_old_only() -> None:
+    data = {"rescue": {"reviewer_adapter": "devin", "reviewer_model": "codex"}}
+    config_module._resolve_role_dual_accept(data)
+    assert data["rescue"]["reviewer"] == {"harness": "devin", "model": "codex"}
+
+
+def test_resolve_role_dual_accept_rescue_defaults_preserve_current_rescueconfig_defaults() -> None:
+    data: dict = {}
+    config_module._resolve_role_dual_accept(data)
+    assert data["rescue"]["worker_adapter"] == "claude-code"
+    assert data["rescue"]["worker_model"] == "claude-opus-4-1"
+    assert data["rescue"]["reviewer_adapter"] == "devin"
+    assert data["rescue"]["reviewer_model"] == "codex"
+    assert data["rescue"]["worker"] == {"harness": "claude-code", "model": "claude-opus-4-1"}
+    assert data["rescue"]["reviewer"] == {"harness": "devin", "model": "codex"}
+
+
+def test_build_config_from_data_rescue_worker_reviewer_are_workerroleconfig_instances() -> None:
+    cfg = build_config_from_data(
+        {"rescue": {"worker": {"harness": "devin-shell", "model": "glm-5-2"}}}
+    )
+    assert isinstance(cfg.rescue.worker, WorkerRoleConfig)
+    assert cfg.rescue.worker == WorkerRoleConfig(harness="devin-shell", model="glm-5-2")
+    assert isinstance(cfg.rescue.reviewer, WorkerRoleConfig)
+    assert cfg.rescue.reviewer == WorkerRoleConfig(harness="devin", model="codex")
