@@ -107,14 +107,38 @@ class _CiFleetDirtyCheck:
 def _ci_fleet_module_path() -> Path | None:
     """Resolve the filesystem path of the imported ``ci_fleet`` module.
 
-    Returns None when ``ci_fleet`` is not importable, is a namespace package
-    with no ``__init__.py`` origin, or is installed as a real wheel inside
-    ``site-packages`` with no working tree.
+    Returns None when ``ci_fleet`` is not importable or is a namespace package
+    with no ``__init__.py`` origin. Whether that path is an editable source
+    tree or a wheel install under ``site-packages`` is a separate question --
+    answered by :func:`_is_under_site_packages` at the decision point in
+    :func:`_ci_fleet_worktree_dirty`, not here.
     """
     spec = importlib.util.find_spec("ci_fleet")
     if spec is None or not spec.origin:
         return None
     return Path(spec.origin).resolve()
+
+
+#: Directory names that hold installed (non-editable) packages. An editable
+#: install's ``__file__`` points at the source tree, never inside one of these;
+#: a wheel install's ``__file__`` always does. This is the structural signal
+#: that distinguishes them without reading install metadata (``direct_url.json``
+#: etc.) that is written by the same install command as the package itself and
+#: therefore cannot cross-check the install's own claim.
+_SITE_PACKAGE_DIRS = frozenset({"site-packages", "dist-packages"})
+
+
+def _is_under_site_packages(path: Path) -> bool:
+    """Return True when ``path`` is inside a ``site-packages``/``dist-packages`` directory.
+
+    A wheel install lives under one of these; an editable install's resolved
+    ``__file__`` points at the source tree outside them. This is what lets the
+    dirty-worktree guard tell a real editable ci_fleet checkout from a wheel
+    install that happens to be nested inside a dev worktree's own ``.venv``
+    (issue #1511): the walk-up from the wheel would find the *worktree's* ``.git``
+    and treat the entire active checkout as "the ci_fleet dependency tree".
+    """
+    return any(parent.name in _SITE_PACKAGE_DIRS for parent in path.parents)
 
 
 def _ci_fleet_worktree_dirty(module_file: Path | None = None) -> _CiFleetDirtyCheck:
@@ -133,6 +157,22 @@ def _ci_fleet_worktree_dirty(module_file: Path | None = None) -> _CiFleetDirtyCh
         return _CiFleetDirtyCheck(
             is_dirty=False,
             reason="ci_fleet has no resolvable module origin",
+        )
+
+    # Issue #1511: a wheel install under site-packages -- including one nested
+    # inside a dev worktree's own ``.venv`` -- is not an editable source tree.
+    # The walk-up below would find the worktree's ``.git`` and treat the entire
+    # active checkout as "the ci_fleet dependency tree", flagging it dirty for
+    # any uncommitted ``src/`` file regardless of whether it touches ci_fleet.
+    # Short-circuit to inert per the existing docstring contract: the guard is
+    # only meaningful for an editable install whose working tree IS ci_fleet's.
+    if _is_under_site_packages(module_file):
+        return _CiFleetDirtyCheck(
+            is_dirty=False,
+            reason=(
+                f"ci_fleet is a wheel install under site-packages at "
+                f"{module_file}; editable-source dirty check does not apply"
+            ),
         )
 
     repo_root: Path | None = None
