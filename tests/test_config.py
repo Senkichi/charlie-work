@@ -2292,11 +2292,48 @@ def test_build_config_from_data_invalid_worker_harness_is_rejected() -> None:
         build_config_from_data({"worker": {"harness": "bogus-harness"}})
 
 
-def test_build_config_from_data_non_claude_reviewer_harness_is_rejected() -> None:
-    """The reviewer-harness-must-be-claude-code constraint (#1513) moved into
-    ``ReviewerRoleConfig.__post_init__`` when the dual-accept resolver was
-    deleted (role-config Phase 2 Track E); this pins the relocated check."""
-    with pytest.raises(
-        ConfigError, match=r"section 'reviewer' key 'harness' only supports 'claude-code'"
-    ):
+def test_build_config_from_data_reviewer_harness_accepts_any_registered_harness() -> None:
+    """Issue #1513: reviewer.harness is no longer pinned to claude-code only --
+    it accepts any harness the ``harnesses.HARNESS_REGISTRY`` marks
+    review-capable (currently claude-code, devin-shell, api) and rejects only
+    a harness that isn't registered at all. This replaces the old pinned test
+    that asserted the pre-#1513 claude-code-only asymmetry: that asymmetry is
+    the bug #1513 fixes, not an invariant to protect. ``"devin"`` (the
+    WorkerView.adapter_kind value, not the harness name ``"devin-shell"``) is
+    deliberately used for the rejection case so this test cannot pass merely
+    because a stale/adapter_kind-shaped name was typo'd in place of the real
+    harness name."""
+    config = build_config_from_data({"reviewer": {"harness": "devin-shell"}})
+    assert config.reviewer.harness == "devin-shell"
+
+    with pytest.raises(ConfigError, match=r"section 'reviewer' key 'harness' must be one of"):
         build_config_from_data({"reviewer": {"harness": "devin"}})
+
+
+def test_build_config_from_data_worker_harness_matches_registry() -> None:
+    """Issue #1513: worker-harness validation is derived from
+    ``harnesses.WORKER_HARNESSES`` -- not a second hardcoded list in
+    config.py -- so every currently-registered harness is accepted."""
+    from charlie_work.harnesses import WORKER_HARNESSES
+
+    for harness in WORKER_HARNESSES:
+        config = build_config_from_data({"worker": {"harness": harness}})
+        assert config.worker.harness == harness
+
+    with pytest.raises(ConfigError, match=r"section 'worker' key 'harness' must be one of"):
+        build_config_from_data({"worker": {"harness": "not-a-real-harness"}})
+
+
+def test_build_config_from_data_reviewer_harness_matches_registry() -> None:
+    """Issue #1513: reviewer-harness validation is derived from
+    ``harnesses.REVIEWER_HARNESSES`` -- the same registry worker validation
+    reads and ``adapters.py``'s dispatch table is drift-checked against --
+    not a separate hardcoded set."""
+    from charlie_work.harnesses import REVIEWER_HARNESSES
+
+    for harness in REVIEWER_HARNESSES:
+        config = build_config_from_data({"reviewer": {"harness": harness}})
+        assert config.reviewer.harness == harness
+
+    with pytest.raises(ConfigError, match=r"section 'reviewer' key 'harness' must be one of"):
+        build_config_from_data({"reviewer": {"harness": "not-a-real-harness"}})

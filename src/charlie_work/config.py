@@ -41,6 +41,7 @@ from .capacity_starvation_escalation import (  # noqa: F401  (deliberate re-expo
 )
 
 from . import layout
+from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
 from .issue_comments import DEFAULT_INCLUDED_ASSOCIATIONS as DEFAULT_COMMENT_ASSOCIATIONS
 
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
@@ -1344,8 +1345,8 @@ class WorkerRoleConfig:
     """The designated worker: which harness dispatches fresh/rework issues,
     and which model that harness should use.
 
-    ``harness`` must be one of ``_VALID_WORKER_HARNESSES`` (``devin-shell`` |
-    ``claude-code`` | ``api`` | ``command`` | ``manual``) -- enforced at the
+    ``harness`` must be one of ``harnesses.WORKER_HARNESSES`` (``devin-shell``
+    | ``claude-code`` | ``api`` | ``command`` | ``manual``) -- enforced at the
     top-level ``worker:`` build site in ``build_config_from_data``, not here
     in ``__post_init__``, because this same dataclass is reused for
     ``rescue.worker``/``rescue.reviewer``, and ``rescue.reviewer``'s own
@@ -1369,14 +1370,17 @@ class ReviewerRoleConfig:
     """The designated reviewer: which harness launches PR review sessions,
     which model it uses, and the review-effort A/B experiment knobs.
 
-    ``harness`` currently only accepts ``"claude-code"``; any other value is
-    rejected with ``ConfigError`` at load (see ``__post_init__`` -- issue
-    #1513). This dataclass is used exclusively for the single top-level
-    ``config.reviewer`` role (unlike ``WorkerRoleConfig``, which is also
-    reused for ``rescue.worker``/``rescue.reviewer``), so a blanket
-    per-instance check here has no conflicting reuse to worry about. The
-    field exists, rather than the reviewer harness being implicit, so a
-    future non-claude-code reviewer can be added by relaxing this one check.
+    ``harness`` must be one of ``harnesses.REVIEWER_HARNESSES``; any other
+    value is rejected with ``ConfigError`` at load (see ``__post_init__`` --
+    issue #1513). ``REVIEWER_HARNESSES`` is derived from the same
+    ``harnesses.HARNESS_REGISTRY`` that ``WorkerRoleConfig`` (via
+    ``harnesses.WORKER_HARNESSES``) and ``adapters.dispatch_sessions`` (via
+    its dispatch table) read -- a harness gains reviewer support by flipping
+    one flag in that registry, not by relaxing a check here. This dataclass
+    is used exclusively for the single top-level ``config.reviewer`` role
+    (unlike ``WorkerRoleConfig``, which is also reused for
+    ``rescue.worker``/``rescue.reviewer``), so a blanket per-instance check
+    here has no conflicting reuse to worry about.
     """
 
     harness: str = "claude-code"
@@ -1386,10 +1390,10 @@ class ReviewerRoleConfig:
     effort_experiment_salt: str = ""
 
     def __post_init__(self) -> None:
-        if self.harness != "claude-code":
+        if self.harness not in REVIEWER_HARNESSES:
             raise ConfigError(
-                "config section 'reviewer' key 'harness' only supports "
-                f"'claude-code'; got {self.harness!r}"
+                "config section 'reviewer' key 'harness' must be one of "
+                f"{sorted(REVIEWER_HARNESSES)}, got {self.harness!r}"
             )
         if not isinstance(self.effort, str):
             raise ConfigError(
@@ -2028,11 +2032,6 @@ def _build_section(cls: type, name: str, data: dict[str, Any]) -> Any:
             f"(valid: {', '.join(sorted(valid))})"
         )
     return cls(**data)
-
-
-_VALID_WORKER_HARNESSES: frozenset[str] = frozenset(
-    {"devin-shell", "claude-code", "api", "command", "manual"}
-)
 
 
 def known_config_sections() -> frozenset[str]:
@@ -3142,13 +3141,13 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     # rather than in WorkerRoleConfig.__post_init__: the dataclass is reused
     # for rescue.worker/rescue.reviewer above, and rescue.reviewer's own
     # documented default harness ("devin") is not a member of
-    # _VALID_WORKER_HARNESSES -- a blanket per-instance check would reject
+    # harnesses.WORKER_HARNESSES -- a blanket per-instance check would reject
     # that reuse's own defaults. This check only ever applies to the single
     # top-level worker role.
-    if worker.harness not in _VALID_WORKER_HARNESSES:
+    if worker.harness not in WORKER_HARNESSES:
         raise ConfigError(
             "config section 'worker' key 'harness' must be one of "
-            f"{sorted(_VALID_WORKER_HARNESSES)}, got {worker.harness!r}"
+            f"{sorted(WORKER_HARNESSES)}, got {worker.harness!r}"
         )
     reviewer = _build_section(ReviewerRoleConfig, "reviewer", _section(data, "reviewer"))
     watchdog_data = _section(data, "watchdog")

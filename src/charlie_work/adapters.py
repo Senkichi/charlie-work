@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from . import layout
 from .config import ApiWorkerConfig, OrchestratorConfig
+from .harnesses import WORKER_HARNESSES
 from .subprocess_runner import run_captured
 
 
@@ -122,6 +123,90 @@ class SessionDispatchResult:
         }
 
 
+def _dispatch_manual(
+    repo_root: Path,
+    requests: list[SessionRequest],
+    sessions_dir: Path,
+    settings: AdapterSettings,
+) -> list[SessionDispatchResult]:
+    return [_manual_result(request) for request in requests]
+
+
+def _dispatch_command(
+    repo_root: Path,
+    requests: list[SessionRequest],
+    sessions_dir: Path,
+    settings: AdapterSettings,
+) -> list[SessionDispatchResult]:
+    return [
+        _run_command_adapter(
+            repo_root, request, settings.dispatch_command, settings.command_timeout_seconds
+        )
+        for request in requests
+    ]
+
+
+def _dispatch_devin_shell(
+    repo_root: Path,
+    requests: list[SessionRequest],
+    sessions_dir: Path,
+    settings: AdapterSettings,
+) -> list[SessionDispatchResult]:
+    return _launch_staggered(
+        requests,
+        lambda request: _run_devin_shell_adapter(repo_root, request, sessions_dir, settings),
+        settings.launch_stagger_seconds,
+    )
+
+
+def _dispatch_claude_code(
+    repo_root: Path,
+    requests: list[SessionRequest],
+    sessions_dir: Path,
+    settings: AdapterSettings,
+) -> list[SessionDispatchResult]:
+    return _launch_staggered(
+        requests,
+        lambda request: _run_claude_code_adapter(repo_root, request, sessions_dir, settings),
+        settings.launch_stagger_seconds,
+    )
+
+
+def _dispatch_api(
+    repo_root: Path,
+    requests: list[SessionRequest],
+    sessions_dir: Path,
+    settings: AdapterSettings,
+) -> list[SessionDispatchResult]:
+    return _launch_staggered(
+        requests,
+        lambda request: _run_api_adapter(repo_root, request, sessions_dir, settings),
+        settings.launch_stagger_seconds,
+    )
+
+
+# Single dispatch table keyed by ``worker.harness`` name. This -- not a
+# separate if/elif chain -- is what ``dispatch_sessions`` consumes, and the
+# assertion below fails import if it ever drifts from ``harnesses.py``'s
+# registry (issue #1513: the previous if/elif chain and config.py's
+# hand-maintained allowlist could silently diverge; a harness "valid" per
+# config could be unreachable here, or vice versa).
+_ADAPTER_DISPATCHERS: dict[
+    str, Callable[[Path, list[SessionRequest], Path, AdapterSettings], list[SessionDispatchResult]]
+] = {
+    "manual": _dispatch_manual,
+    "command": _dispatch_command,
+    "devin-shell": _dispatch_devin_shell,
+    "claude-code": _dispatch_claude_code,
+    "api": _dispatch_api,
+}
+
+assert set(_ADAPTER_DISPATCHERS) == WORKER_HARNESSES, (
+    "adapters._ADAPTER_DISPATCHERS must dispatch exactly the harnesses "
+    "harnesses.WORKER_HARNESSES declares valid -- keep both in sync"
+)
+
+
 def dispatch_sessions(
     repo_root: Path,
     manifest_path: Path,
@@ -139,43 +224,20 @@ def dispatch_sessions(
     sessions_dir = settings.sessions_dir or manifest_path.parent / layout.SESSIONS_DIRNAME
     if settings.dry_run:
         results = [_dry_run_result(request, adapter) for request in requests]
-    elif adapter == "manual":
-        results = [_manual_result(request) for request in requests]
-    elif adapter == "command":
-        results = [
-            _run_command_adapter(
-                repo_root, request, settings.dispatch_command, settings.command_timeout_seconds
-            )
-            for request in requests
-        ]
-    elif adapter == "devin-shell":
-        results = _launch_staggered(
-            requests,
-            lambda request: _run_devin_shell_adapter(repo_root, request, sessions_dir, settings),
-            settings.launch_stagger_seconds,
-        )
-    elif adapter == "claude-code":
-        results = _launch_staggered(
-            requests,
-            lambda request: _run_claude_code_adapter(repo_root, request, sessions_dir, settings),
-            settings.launch_stagger_seconds,
-        )
-    elif adapter == "api":
-        results = _launch_staggered(
-            requests,
-            lambda request: _run_api_adapter(repo_root, request, sessions_dir, settings),
-            settings.launch_stagger_seconds,
-        )
     else:
-        results = [
-            _result(
-                request,
-                adapter=adapter,
-                ok=False,
-                error=f"Unsupported Devin adapter: {adapter}",
-            )
-            for request in requests
-        ]
+        dispatcher = _ADAPTER_DISPATCHERS.get(adapter)
+        if dispatcher is None:
+            results = [
+                _result(
+                    request,
+                    adapter=adapter,
+                    ok=False,
+                    error=f"Unsupported Devin adapter: {adapter}",
+                )
+                for request in requests
+            ]
+        else:
+            results = dispatcher(repo_root, requests, sessions_dir, settings)
     write_session_results(results_path, results)
     return results
 

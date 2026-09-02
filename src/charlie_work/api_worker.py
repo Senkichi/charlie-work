@@ -119,6 +119,10 @@ def launch_api_worker(
     recovery: dict[str, Any] | None = None,
     base_ref: str = "",
     config: OrchestratorConfig | None = None,
+    review: bool = False,
+    head_sha: str = "",
+    resolved_review_effort: str | None = None,
+    max_turns_override: int | None = None,
 ) -> ClaudeWorkerRecord:
     """Resolve the active API provider, build its env, and delegate to
     ``claude_code.launch_claude_worker`` with ``adapter_kind="api"``.
@@ -131,6 +135,18 @@ def launch_api_worker(
 
     ``tee_stream_json`` is force-enabled for api sessions (the budget ledger
     depends on events.jsonl), regardless of any caller-supplied preference.
+
+    ``review``/``head_sha``/``resolved_review_effort``/``max_turns_override``
+    (issue #1513) are a pure passthrough to ``launch_claude_worker``, which
+    already fully implements review-mode launches (detached-HEAD checkout via
+    ``worktree.create_review_checkout``, hard-pinned ``--permission-mode
+    plan``): the api adapter is Claude Code itself pointed at a different
+    provider endpoint, so it needs no independent review-mode implementation.
+    ``model_override`` is deliberately NOT forwarded here even for review
+    launches -- an api-routed session always runs the configured provider's
+    pinned model (see the ``model_override=provider.model`` call below),
+    worker or reviewer alike; ``reviewer.model`` has no effect on this
+    harness, the same way ``worker.model`` has none on it today.
 
     Args:
         api_worker_config: The resolved ``ApiWorkerConfig`` registry section.
@@ -249,6 +265,10 @@ def launch_api_worker(
             rework=rework,
             recovery=recovery,
             base_ref=base_ref,
+            review=review,
+            head_sha=head_sha or None,
+            resolved_review_effort=resolved_review_effort,
+            max_turns_override=max_turns_override,
             # Force-enabled: the budget ledger depends on events.jsonl.
             tee_stream_json=True,
             config=config,
