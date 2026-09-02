@@ -152,10 +152,9 @@ def _isolate_ambient_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     to the self-hosted CI runner and every fresh shell. Any test that builds
     an api_worker config without explicitly setting the key (relying on
     "the key is absent, so preflight falls back to devin-shell") silently
-    changed routing: dispatch went to the api adapter instead of the
+    changed dispatch: dispatch went to the api adapter instead of the
     monkeypatched devin-shell path and hit real ``git worktree add`` calls
-    (``test_dispatch_partitioned_homogeneous_batch_labels_with_single_kind``
-    turned main red).
+    (a partitioned-dispatch batch-labels test turned main red).
 
     The deny-set is derived from the naming convention rather than
     enumerated: ``api_worker``'s ``api_key_env`` contract names credential

@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 
 from charlie_work import layout
-from charlie_work.config import OrchestratorConfig, RuntimeConfig
+from charlie_work.config import DispatchConfig, OrchestratorConfig, RuntimeConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.prompt_sections import section_variables
 from charlie_work.prompts import TEMPLATE_DIR, render_prompt, resolve_template
@@ -158,30 +158,29 @@ def test_worker_md_renders_via_real_writer(tmp_path: Path) -> None:
 def test_worker_claude_code_md_renders_via_real_writer(tmp_path: Path) -> None:
     """worker_claude_code.md is rendered by the *same* real writer,
     ``_write_worker_prompt`` (``workflow.py::OrchestratorApp._write_worker_prompt``),
-    using its explicit ``template=`` override parameter.
+    via ``config.dispatch.worker_template`` set to the api-worker template
+    name.
 
-    Post-Phase-2 (role-config Track B deleted per-issue adapter routing),
-    no surviving dispatch call site passes
-    ``template=config.api_worker.worker_template`` any more -- the three
-    live callers (``intake()``, and the dry-run preview and dispatch-loop
-    branches inside ``_dispatch_impl``) all omit the argument and fall
-    through to ``config.dispatch.worker_template`` instead, so this
-    override is currently unreachable at runtime. Tracked for cleanup
-    (dropping the dead parameter outright) in issue #1515. This test is
-    kept as a direct contract test on the override mechanism and on
-    worker_claude_code.md's own placeholder correctness, independent of
-    whether anything wires the override back up.
+    Post-Phase-2 (role-config Track B deleted per-issue adapter routing,
+    and issue #1515 dropped the dead ``template=`` override parameter),
+    ``_write_worker_prompt`` always renders ``config.dispatch.worker_template``
+    -- the three live callers (``intake()``, and the dry-run preview and
+    dispatch-loop branches inside ``_dispatch_impl``) all rely on that
+    config knob. This test sets it to ``worker_claude_code.md`` (the
+    api-worker default) to exercise that template's own placeholder
+    correctness through the real writer.
 
     Rendered under a non-default ``runtime.state_dir`` (issue #737) so the
     companion literal-absence assertion is non-vacuous -- see
     ``test_worker_md_renders_via_real_writer`` for the rationale."""
-    config = OrchestratorConfig(runtime=RuntimeConfig(state_dir="custom-state"))
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(worker_template="worker_claude_code.md"),
+        runtime=RuntimeConfig(state_dir="custom-state"),
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, gh=None)
 
-    prompt_path = app._write_worker_prompt(
-        _fake_issue(), template=config.api_worker.worker_template
-    )
+    prompt_path = app._write_worker_prompt(_fake_issue())
 
     rendered = prompt_path.read_text(encoding="utf-8")
     assert not _unresolved_placeholders_in_output(rendered), (

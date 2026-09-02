@@ -280,9 +280,11 @@ def _check_worker_github_token(add: Any, config: OrchestratorConfig) -> None:
     can still stall a worker mid-pass with no visible finding unless both are
     covered:
 
-    * ``routing.select_adapter`` can route an *individual* issue to the
-      ``api`` adapter (``policy:rework``/``policy:complexity``, gated on
-      ``config.api_worker.enabled``).
+    * ``config.api_worker.enabled`` being ``True`` enables the ``api``
+      adapter tier, which reuses the claude-code launch path
+      (``claude_code.worker_env``) — so a missing ``claude_code`` token
+      can stall an api-adapter worker even when the default
+      ``worker.harness`` is not claude-code.
     * ``_rescue_adapter_settings`` (workflow.py) *always* forces
       ``adapter="claude-code"`` for the bounded rescue tier (issue #555)
       once ``config.rescue.enabled`` is true, independent of

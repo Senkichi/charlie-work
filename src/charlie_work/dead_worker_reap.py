@@ -606,8 +606,8 @@ def _detect_and_handle_stalled_sessions(
         # ``max_usd_per_session`` cap is killed immediately and sidecar-marked
         # ``budget_exceeded``. The killed session then flows through the
         # EXISTING dead-worker reconciliation on the next pass (with-PR ->
-        # review/rework; without-PR -> re-dispatch via select_adapter, whose
-        # preflight naturally decides api-again vs fallback). When the cap is
+        # review/rework; without-PR -> re-dispatch via the default adapter,
+        # whose preflight naturally decides api-again vs fallback). When the cap is
         # 0/unset the check is entirely dormant. Non-api workers are never
         # budget-evaluated. The kill uses the shared ``kill_process_tree``
         # helper (no-console-window discipline on Windows, full process tree

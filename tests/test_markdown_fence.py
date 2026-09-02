@@ -33,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-from charlie_work.config import OrchestratorConfig, RuntimeConfig
+from charlie_work.config import DispatchConfig, OrchestratorConfig, RuntimeConfig
 from charlie_work.markdown_fence import MIN_FENCE_LENGTH, fence_for, fenced_block
 from charlie_work.paths import runtime_paths
 from charlie_work.prompts import TEMPLATE_DIR
@@ -64,9 +64,8 @@ def _app(tmp_path: Path, config: OrchestratorConfig | None = None) -> Orchestrat
 
 
 def _render(tmp_path: Path, issue: dict, template: str) -> str:
-    return (
-        _app(tmp_path)._write_worker_prompt(issue, template=template).read_text(encoding="utf-8")
-    )
+    config = OrchestratorConfig(dispatch=DispatchConfig(worker_template=template))
+    return _app(tmp_path, config)._write_worker_prompt(issue).read_text(encoding="utf-8")
 
 
 # --- the property that makes the fix correct -------------------------------
@@ -164,12 +163,11 @@ def _render_via_pre_change_template(tmp_path: Path, issue: dict, template: str) 
     (prompts_dir / template).write_text(
         shipped.replace("$issue_body_block", "```md\n$issue_body\n```"), encoding="utf-8"
     )
-    config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir=str(prompts_dir)))
-    return (
-        _app(tmp_path / "pre", config)
-        ._write_worker_prompt(issue, template=template)
-        .read_text(encoding="utf-8")
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(worker_template=template),
+        runtime=RuntimeConfig(prompts_dir=str(prompts_dir)),
     )
+    return _app(tmp_path / "pre", config)._write_worker_prompt(issue).read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("template", TEMPLATES)

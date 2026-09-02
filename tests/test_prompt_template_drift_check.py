@@ -228,9 +228,19 @@ def test_worker_prompt_keys_match_real_writer(tmp_path: Path, monkeypatch) -> No
     app = OrchestratorApp(tmp_path, paths, config, gh=None)
 
     app._write_worker_prompt(_fake_issue())
-    app._write_worker_prompt(_fake_issue(), template=config.api_worker.worker_template)
 
-    assert set(captured) == {"worker.md", config.api_worker.worker_template}, (
+    # Render the second shipped worker template (worker_claude_code.md) by
+    # setting dispatch.worker_template — the ``template=`` override parameter
+    # was dropped in issue #1515 (dead after Phase 2 Track B deleted per-issue
+    # adapter routing).
+    api_config = OrchestratorConfig(
+        dispatch=DispatchConfig(worker_template="worker_claude_code.md")
+    )
+    api_paths = runtime_paths(tmp_path, api_config.runtime.state_dir)
+    api_app = OrchestratorApp(tmp_path, api_paths, api_config, gh=None)
+    api_app._write_worker_prompt(_fake_issue())
+
+    assert set(captured) == {"worker.md", "worker_claude_code.md"}, (
         f"expected both worker templates to be rendered; captured: {sorted(captured)}"
     )
     for template_name, keys in captured.items():

@@ -89,12 +89,11 @@ def _render_via_pre_change_template(tmp_path: Path, issue: dict, template: str) 
         f"the template against itself and can no longer detect a regression"
     )
     (prompts_dir / template).write_text(shipped.replace("$issue_comments", ""), encoding="utf-8")
-    config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir=str(prompts_dir)))
-    return (
-        _app(tmp_path / "pre", config)
-        ._write_worker_prompt(issue, template=template)
-        .read_text(encoding="utf-8")
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(worker_template=template),
+        runtime=RuntimeConfig(prompts_dir=str(prompts_dir)),
     )
+    return _app(tmp_path / "pre", config)._write_worker_prompt(issue).read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("template", ["worker.md", "worker_claude_code.md"])
@@ -104,7 +103,9 @@ def test_issue_without_comments_renders_byte_identical_prompt(
     issue = _issue()
 
     after = (
-        _app(tmp_path)._write_worker_prompt(issue, template=template).read_text(encoding="utf-8")
+        _app(tmp_path, OrchestratorConfig(dispatch=DispatchConfig(worker_template=template)))
+        ._write_worker_prompt(issue)
+        .read_text(encoding="utf-8")
     )
     before = _render_via_pre_change_template(tmp_path, issue, template)
 
@@ -119,7 +120,9 @@ def test_issue_whose_comments_are_all_filtered_renders_byte_identical_prompt(
     issue = _issue(comments=[_comment(login="aviator-app", association="NONE")])
 
     after = (
-        _app(tmp_path)._write_worker_prompt(issue, template=template).read_text(encoding="utf-8")
+        _app(tmp_path, OrchestratorConfig(dispatch=DispatchConfig(worker_template=template)))
+        ._write_worker_prompt(issue)
+        .read_text(encoding="utf-8")
     )
     before = _render_via_pre_change_template(tmp_path, issue, template)
 

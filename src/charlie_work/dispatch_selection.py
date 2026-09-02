@@ -423,8 +423,9 @@ def _windowed_orphan_redispatch_at(
     but reads ``entry["orphan_redispatch_at"]`` -- the list of timestamps
     recorded by the orphan-sweep no-open-PR redispatch cap (issue #1243) each
     time it processes an issue whose worker died without leaving an open PR.
-    Unlike ``adapter_history`` (which only grows when ``api_worker.enabled``
-    is ``True``, via ``routing.record_adapter_choice``), this list grows in
+    Unlike ``adapter_history`` (which only grew when ``api_worker.enabled``
+    was ``True``, before the per-issue adapter selector was deleted in
+    Phase 2 Track B), this list grows in
     the default (non-API-routed) configuration too. It is appended once per
     *dead dispatch* (keyed by ``orphan_redispatch_counted_dispatch``), not
     once per sweep pass -- the #417 reclaim leaves the dead-worker record in
