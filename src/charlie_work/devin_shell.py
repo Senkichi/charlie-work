@@ -46,7 +46,9 @@ from .worktree import (
     WorktreeInfo,
     WorktreeProbeFailedError,
     WorktreeUnsafeError,
+    create_review_checkout,
     create_worktree,
+    remove_review_checkout,
     remove_worktree,
     apply_rework_conflict_notice,
     write_worktree_marker,
@@ -96,6 +98,64 @@ DEFAULT_COMMAND_TEMPLATE: tuple[str, ...] = (
     "--respect-workspace-trust",
     "false",
 )
+
+# Review-mode template: omits ``--permission-mode dangerous`` entirely. The
+# Devin CLI's documented default when that flag is absent is ``auto``
+# (read-only tools) -- exactly the posture a reviewer needs, since the review
+# packet built by ``workflow.py`` pre-renders the diff, CI status, and
+# test-adequacy sections directly into the prompt, so a reviewer never needs
+# to shell out to git/uv/gh (the only calls ``auto`` mode stalls on). This is
+# the devin-shell analogue of claude-code's hard-pinned ``--permission-mode
+# plan`` for review launches (see ``claude_code._REVIEW_COMMAND_TEMPLATE`` /
+# ``_sanitize_review_command_template``). Not used directly by
+# ``launch_devin_session`` (which sanitizes whatever template it receives,
+# including a caller-tuned one, via ``_sanitize_review_command_template``
+# below) -- kept as a documented, test-comparable constant for what that
+# sanitization produces from the worker default.
+_REVIEW_COMMAND_TEMPLATE: tuple[str, ...] = (
+    "devin",
+    "{model_args}",
+    "--prompt-file",
+    "{prompt_path}",
+    "--print",
+    "--respect-workspace-trust",
+    "false",
+)
+
+
+def _sanitize_review_command_template(command_template: tuple[str, ...]) -> tuple[str, ...]:
+    """Hard-pin the read-only reviewer posture onto ``command_template``.
+
+    A review launch must never carry ``--permission-mode dangerous`` -- this
+    is an invariant, not a default a caller-supplied (or config-forwarded)
+    ``command_template`` can defeat. ``DevinConfig.command`` is a single field
+    shared with worker dispatch (workers need ``dangerous`` for write
+    access); if an operator's worker-tuning override were honored verbatim
+    for reviewers too, it would silently grant write access, defeating
+    ``create_review_checkout``'s no-write guarantee. Mirrors
+    ``claude_code._sanitize_review_command_template``'s pinning of
+    ``--permission-mode plan`` for the identical reason.
+
+    Every occurrence of ``--permission-mode`` (the flag plus its following
+    value token, and any ``--permission-mode=<value>`` form) is stripped.
+    Unlike claude-code's ``plan`` mode, nothing is appended in its place: the
+    Devin CLI's own default when ``--permission-mode`` is entirely absent
+    from argv is ``auto`` (read-only tools), which is the posture wanted here
+    -- there is no "dangerous-but-read-only" flag value to pin to instead.
+    """
+    filtered: list[str] = []
+    skip_next = False
+    for token in command_template:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--permission-mode":
+            skip_next = True
+            continue
+        if token.startswith("--permission-mode="):
+            continue
+        filtered.append(token)
+    return tuple(filtered)
 
 
 @dataclass(frozen=True)
@@ -378,6 +438,8 @@ def launch_devin_session(
     recovery: dict[str, Any] | None = None,
     base_ref: str = "",
     config: OrchestratorConfig | None = None,
+    review: bool = False,
+    head_sha: str = "",
 ) -> SessionRecord:
     """Launch a headless Devin CLI session for one issue and return immediately.
 
@@ -401,7 +463,22 @@ def launch_devin_session(
     a dead-worker recovery re-dispatch. The worktree layer will inspect the
     leftover worktree/branch and either clean it (no commits) or reuse it (has
     commits/dirty work).
+
+    If ``review`` is True (issue #1513), this launches a PR-reviewer session
+    instead of an issue worker: ``branch``/``worktrees_dir``/``rework``/
+    ``recovery``/``base_ref`` are ignored for worktree purposes and
+    ``sessions_dir`` is expected to be the caller's ``reviews_dir``; a
+    detached-HEAD checkout is created via ``worktree.create_review_checkout``
+    (keyed by ``issue_number`` interpreted as the PR number, at ``head_sha``,
+    which is required) instead of ``create_worktree``, and torn down via
+    ``worktree.remove_review_checkout`` on any launch failure. The command
+    template is sanitized via ``_sanitize_review_command_template`` regardless
+    of what ``command_template`` the caller passed, so no config combination
+    can grant a reviewer write access. ``prompt_path`` is used as-is (devin's
+    prompt file always lives outside the worktree, in both modes).
     """
+    if review:
+        command_template = _sanitize_review_command_template(command_template)
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework)
     session_id = str(uuid.uuid4())
@@ -418,19 +495,31 @@ def launch_devin_session(
 
     # --- worktree creation ---------------------------------------------------
     try:
-        worktree: WorktreeInfo = create_worktree(
-            repo_root,
-            branch,
-            worktrees_dir=worktrees_dir,
-            venv_source=venv_source,
-            materialize_dirs=materialize_dirs,
-            rework=rework,
-            recovery=recovery,
-            base_ref=base_ref,
-            issue_number=issue_number,
-            config=config,
-            sessions_dir=sessions_dir,
-        )
+        if review:
+            if not head_sha:
+                raise ValueError(
+                    f"launch_devin_session(review=True) requires head_sha for PR #{issue_number}"
+                )
+            worktree: WorktreeInfo = create_review_checkout(
+                repo_root,
+                issue_number,
+                head_sha,
+                reviews_dir=sessions_dir,
+            )
+        else:
+            worktree = create_worktree(
+                repo_root,
+                branch,
+                worktrees_dir=worktrees_dir,
+                venv_source=venv_source,
+                materialize_dirs=materialize_dirs,
+                rework=rework,
+                recovery=recovery,
+                base_ref=base_ref,
+                issue_number=issue_number,
+                config=config,
+                sessions_dir=sessions_dir,
+            )
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         if isinstance(exc, WorktreeProbeFailedError):
             # Transient probe contention (e.g. index lock), not a confirmed-dirty
@@ -482,6 +571,14 @@ def launch_devin_session(
         _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
         return record
 
+    def _teardown_worktree() -> None:
+        if review:
+            remove_review_checkout(repo_root, issue_number, reviews_dir=sessions_dir)
+        else:
+            remove_worktree(
+                repo_root, worktree.path, force=True, branch=None if rework else branch
+            )
+
     # A redispatch may have just preserved the prior attempt's branch tip
     # (issue #261) — fold that into whatever post-mortem sidecar already
     # exists for this issue so the ref is discoverable alongside the block
@@ -504,9 +601,7 @@ def launch_devin_session(
                 encoding="utf-8",
             )
         except OSError as exc:
-            remove_worktree(
-                repo_root, worktree.path, force=True, branch=None if rework else branch
-            )
+            _teardown_worktree()
             record = SessionRecord(
                 issue_number=issue_number,
                 branch=branch,
@@ -531,7 +626,7 @@ def launch_devin_session(
             worker_model=worker_model,
         )
     except (KeyError, IndexError, ValueError) as exc:
-        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
+        _teardown_worktree()
         record = SessionRecord(
             issue_number=issue_number,
             branch=branch,
@@ -580,7 +675,7 @@ def launch_devin_session(
         # Capture process creation time immediately after spawn to verify identity later
         process_start_time = _get_process_start_time(pid)
     except OSError as exc:
-        remove_worktree(repo_root, worktree.path, force=True, branch=None if rework else branch)
+        _teardown_worktree()
         error = f"failed to launch devin: {exc}"
 
     if pid is not None and error is None:

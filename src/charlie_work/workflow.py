@@ -27,6 +27,8 @@ from .claude_code import (
     resolve_review_effort,
     run_quota_probe,
 )
+from .api_worker import launch_api_worker
+from .devin_shell import launch_devin_session
 from .checks import (
     CheckSummary,
     is_infra_blocked_check,
@@ -40,6 +42,7 @@ from .citation_check import (
     verify_citations,
 )
 from .config import (
+    ApiWorkerConfig,
     AutoMergeConfig,
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
     DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
@@ -49,6 +52,7 @@ from .config import (
 )
 from .env_sanitize import worker_github_token_findings
 from .file_lock import try_acquire_byte_range_lock
+from .harnesses import REVIEWER_ADAPTER_KINDS, REVIEWER_HARNESSES
 from .fleet_registry import count_fleet_live_sessions, managed_repo_names, try_acquire_fleet_lock
 from . import layout, status_snapshot
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs
@@ -3858,6 +3862,142 @@ def _has_other_open_pr(
         if v.get("status") not in ("merged", "closed"):
             return True
     return False
+
+
+def _launch_review_claude_code(
+    *,
+    pr_number: int,
+    branch: str,
+    prompt_path: Path,
+    prompt_text: str,
+    head_sha: str,
+    repo_root: Path,
+    reviews_dir: Path,
+    config: OrchestratorConfig,
+    worker_env: dict[str, str],
+    materialize_dirs: tuple[str, ...],
+    resolved_review_effort: str | None,
+    max_turns_override: int | None,
+    model_override: str | None,
+    api_worker_config: ApiWorkerConfig | None,
+) -> Any:
+    return launch_claude_worker(
+        issue_number=pr_number,
+        branch=branch,
+        prompt_text=prompt_text,
+        repo_root=repo_root,
+        sessions_dir=reviews_dir,
+        config=config,
+        env=worker_env,
+        materialize_dirs=materialize_dirs,
+        review=True,
+        head_sha=head_sha,
+        # Force-enabled for reviewers: the structured events.jsonl is needed
+        # for verdict fallback parsing (issue #540) and token/turn monitoring.
+        tee_stream_json=True,
+        resolved_review_effort=resolved_review_effort,
+        max_turns_override=max_turns_override,
+        model_override=model_override,
+    )
+
+
+def _launch_review_devin_shell(
+    *,
+    pr_number: int,
+    branch: str,
+    prompt_path: Path,
+    prompt_text: str,
+    head_sha: str,
+    repo_root: Path,
+    reviews_dir: Path,
+    config: OrchestratorConfig,
+    worker_env: dict[str, str],
+    materialize_dirs: tuple[str, ...],
+    resolved_review_effort: str | None,
+    max_turns_override: int | None,
+    model_override: str | None,
+    api_worker_config: ApiWorkerConfig | None,
+) -> Any:
+    # devin_shell has no notion of review-effort/turn-cap resolution (those
+    # are claude-code CLI concepts -- --effort and --max-turns flags); a
+    # devin-routed reviewer runs with the CLI's own defaults for both.
+    return launch_devin_session(
+        pr_number,
+        branch,
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=reviews_dir,
+        config=config,
+        worker_env=worker_env,
+        materialize_dirs=materialize_dirs,
+        review=True,
+        head_sha=head_sha,
+        worker_model=model_override or "",
+    )
+
+
+def _launch_review_api(
+    *,
+    pr_number: int,
+    branch: str,
+    prompt_path: Path,
+    prompt_text: str,
+    head_sha: str,
+    repo_root: Path,
+    reviews_dir: Path,
+    config: OrchestratorConfig,
+    worker_env: dict[str, str],
+    materialize_dirs: tuple[str, ...],
+    resolved_review_effort: str | None,
+    max_turns_override: int | None,
+    model_override: str | None,
+    api_worker_config: ApiWorkerConfig | None,
+) -> Any:
+    # model_override is deliberately unused here: an api-routed reviewer
+    # always runs the configured provider's pinned model (see
+    # api_worker.launch_api_worker's own model_override=provider.model),
+    # the same as an api-routed worker -- reviewer.model has no effect on
+    # this harness.
+    assert api_worker_config is not None  # only None for a non-api harness
+    return launch_api_worker(
+        pr_number,
+        branch,
+        prompt_text,
+        repo_root=repo_root,
+        sessions_dir=reviews_dir,
+        api_worker_config=api_worker_config,
+        worker_env=worker_env,
+        materialize_dirs=materialize_dirs,
+        review=True,
+        head_sha=head_sha,
+        resolved_review_effort=resolved_review_effort,
+        max_turns_override=max_turns_override,
+        config=config,
+    )
+
+
+# Single dispatch table keyed by ``reviewer.harness`` name -- this, not a
+# per-harness if/elif chain, is what ``OrchestratorApp.dispatch_reviews``
+# consumes (issue #1513). Every launcher above shares one keyword-only
+# signature so the call site does not need to know which positional/keyword
+# convention the underlying launch function uses (``launch_claude_worker``/
+# ``launch_api_worker`` take ``prompt_text``; ``launch_devin_session`` takes
+# ``prompt_path``); each returns a record with ``.error``/``.pid``/
+# ``.process_start_time``, which is all the post-launch handling below reads.
+# The assertion is the drift guard: it fails at import time if a harness is
+# ever added to (or removed from) ``harnesses.REVIEWER_HARNESSES`` without a
+# matching entry here, the same pattern ``adapters._ADAPTER_DISPATCHERS``
+# uses for the worker side.
+_REVIEW_LAUNCHERS: dict[str, Callable[..., Any]] = {
+    "claude-code": _launch_review_claude_code,
+    "devin-shell": _launch_review_devin_shell,
+    "api": _launch_review_api,
+}
+
+assert set(_REVIEW_LAUNCHERS) == REVIEWER_HARNESSES, (
+    "workflow._REVIEW_LAUNCHERS must launch exactly the harnesses "
+    "harnesses.REVIEWER_HARNESSES declares review-capable -- keep both in sync"
+)
 
 
 class OrchestratorApp:
@@ -9038,15 +9178,22 @@ class OrchestratorApp:
         """Record verdicts for dead reviewers whose sidecar log contains a valid
         fenced JSON verdict block.
 
-        Iterates claude-code review sidecars. For each reviewer that is no
-        longer alive and still has a ``review_dispatch_dispatched`` claim, parse
-        the log. If a valid verdict block is found, call ``record_review``
-        in-process with the packet head pinned as ``reviewed_head`` so the
-        verdict is attributed to the diff the reviewer actually read. On
-        success ``record_review`` moves the PR to
-        ``review_dispatch_completed``. If parsing fails or the verdict is
-        malformed, the PR is left for ``_detect_and_handle_stalled_reviews`` to
-        retry/backoff using the existing stale-claim path.
+        Iterates review sidecars for every review-capable harness (issue
+        #1513: any ``adapter_kind`` in ``harnesses.REVIEWER_ADAPTER_KINDS`` --
+        currently claude-code, devin ("devin-shell" harness), and api). For
+        each reviewer that is no longer alive and still has a
+        ``review_dispatch_dispatched`` claim, parse the log. If a valid
+        verdict block is found, call ``record_review`` in-process with the
+        packet head pinned as ``reviewed_head`` so the verdict is attributed
+        to the diff the reviewer actually read. On success ``record_review``
+        moves the PR to ``review_dispatch_completed``. If parsing fails or
+        the verdict is malformed, the PR is left for
+        ``_detect_and_handle_stalled_reviews`` to retry/backoff using the
+        existing stale-claim path. Verdict extraction itself
+        (``_parse_review_verdict_from_log``) is already generic (a plain
+        fenced-JSON scan, falling back to a Claude-stream-json-specific
+        decoder only on failure) -- this loop's own harness filter was the
+        one place still hardcoded to claude-code.
 
         Returns a dict with ``recorded`` and ``missed`` verdict info lists for
         the dispatch result and the fleet attention digest.
@@ -9055,7 +9202,7 @@ class OrchestratorApp:
         missed: list[dict[str, Any]] = []
 
         for w in iter_workers(reviews_dir):
-            if w.adapter_kind != "claude-code":
+            if w.adapter_kind not in REVIEWER_ADAPTER_KINDS:
                 continue
             if w.is_alive():
                 continue
@@ -9629,12 +9776,14 @@ class OrchestratorApp:
     def dispatch_reviews(
         self, limit: int | None = None, *, now: datetime | None = None
     ) -> CommandResult:
-        """Launch Claude Code reviewer sessions concurrently for queued PRs.
+        """Launch reviewer sessions concurrently for queued PRs.
 
         Issue #370: a deterministic loop stage that turns ``review_queue()```
         into launched, sidecar-tracked reviewer processes. Reviewers are
-        ``claude_code.launch_claude_worker`` sessions; there is no provider-
-        rate-limit governor here — only an optional local-only process cap
+        launched through whichever harness ``self.config.reviewer.harness``
+        names (issue #1513: claude-code, devin-shell, or api -- see
+        ``_REVIEW_LAUNCHERS`` below); there is no provider-rate-limit
+        governor here — only an optional local-only process cap
         (``max_local_review_processes``) to protect the host from too many
         concurrent reviewer worktrees.
 
@@ -10431,6 +10580,19 @@ class OrchestratorApp:
         # provider's named reset time (issue #612) can be parsed from it
         # after the loop and used for the fleet-wide backoff target.
         quota_hit_error: str | None = None
+        # Issue #1513: which harness launches reviewers is now a config knob,
+        # not always claude-code. ``_adapter_settings`` is the existing
+        # single point that resolves an adapter-specific worker_env (and, for
+        # "api", the ApiWorkerConfig) -- reused here rather than
+        # re-deriving that resolution for reviewer dispatch. Its
+        # worker_model/venv_source fields are NOT reused: both are tuned for
+        # worker dispatch's routed-fallback case and venv_source is moot for
+        # a review checkout (create_review_checkout never materializes a
+        # venv), so the reviewer's model is resolved from
+        # ``self.config.reviewer.model`` below instead, exactly as before.
+        reviewer_harness = self.config.reviewer.harness
+        reviewer_adapter_settings = self._adapter_settings(adapter=reviewer_harness)
+        reviewer_launcher = _REVIEW_LAUNCHERS.get(reviewer_harness)
         for candidate in selected:
             pr_number = candidate["pr"]
             issue_number = candidate["issue"]
@@ -10468,17 +10630,19 @@ class OrchestratorApp:
                     branch = branch.split(":", 1)[1]
 
                 prompt_text = prompt_path.read_text(encoding="utf-8")
-                claude_cfg = self.config.claude_code
                 # Reviewers never use worktrees_dir/venv_source — those key
                 # the worker's branch-slug worktree, which create_review_checkout
                 # (routed to via review=True + head_sha) never touches. Only
                 # repo_root/sessions_dir/env/materialize_dirs/review/head_sha
-                # are meaningful for a reviewer launch. `claude_cfg.command`
-                # is deliberately NOT forwarded here: it is a worker-tuning
-                # field, and launch_claude_worker(review=True, ...) hard-pins
-                # the read-only command template regardless of what is passed
-                # for command_template, so passing it through would be
-                # misleading dead code (PR #397 round-2 review).
+                # are meaningful for a reviewer launch. The harness's own
+                # worker-tuning command-template override (e.g.
+                # ``claude_code.command``/``devin.shell_command``) is
+                # deliberately NOT forwarded here: each launch function
+                # hard-pins its own read-only command template for
+                # ``review=True`` regardless of what is passed for
+                # ``command_template``, so passing one through would be
+                # misleading dead code (PR #397 round-2 review, extended to
+                # devin-shell by issue #1513).
                 #
                 # `config` IS forwarded (unlike the above): launch_claude_worker
                 # falls back to a bare default OrchestratorConfig() whenever
@@ -10490,33 +10654,49 @@ class OrchestratorApp:
                 # an actual dispatch pass. adapters.py's worker-dispatch path
                 # (_run_claude_code_adapter) already forwards config the same
                 # way.
-                launch_kwargs: dict[str, Any] = {
-                    "repo_root": self.repo_root,
-                    "sessions_dir": reviews_dir,
-                    "config": self.config,
-                    "env": claude_cfg.worker_env,
-                    "materialize_dirs": self.config.dispatch.materialize_dirs,
-                    "review": True,
-                    "head_sha": head_sha,
-                    # Force-enabled for reviewers: the structured events.jsonl
-                    # is needed for verdict fallback parsing (issue #540) and
-                    # token/turn monitoring. Unlike workers, reviewers always
-                    # benefit from the structured output because their verdict
-                    # extraction depends on it.
-                    "tee_stream_json": True,
+                if reviewer_launcher is None:
+                    # Unreachable in production: ReviewerRoleConfig.__post_init__
+                    # already restricts reviewer.harness to
+                    # harnesses.REVIEWER_HARNESSES, which _REVIEW_LAUNCHERS'
+                    # keys are asserted equal to at import time. Guarded
+                    # anyway so a config object built directly (bypassing
+                    # validation, e.g. in a test) fails as a per-PR error
+                    # value rather than a raise.
+                    failed.append(
+                        {
+                            "pr": pr_number,
+                            "error": f"unsupported reviewer harness: {reviewer_harness!r}",
+                        }
+                    )
+                    continue
+
+                record = reviewer_launcher(
+                    pr_number=pr_number,
+                    branch=branch,
+                    prompt_path=prompt_path,
+                    prompt_text=prompt_text,
+                    head_sha=head_sha,
+                    repo_root=self.repo_root,
+                    reviews_dir=reviews_dir,
+                    config=self.config,
+                    worker_env=reviewer_adapter_settings.worker_env,
+                    materialize_dirs=self.config.dispatch.materialize_dirs,
                     # The review_effort experiment arm was already resolved
                     # once, above, at claim time (and persisted to state/
-                    # telemetry) -- pass it through so launch_claude_worker
-                    # uses this value directly instead of re-resolving it.
-                    "resolved_review_effort": resolved_review_efforts.get(pr_number),
+                    # telemetry) -- pass it through so the launcher uses this
+                    # value directly instead of re-resolving it. Ignored by
+                    # the devin-shell launcher (no such CLI concept there).
+                    resolved_review_effort=resolved_review_efforts.get(pr_number),
                     # Issue #1439: structure-aware turn cap resolved at claim
                     # time from the packet's structure multiplier + the per-PR
                     # miss streak. Overrides the flat ``review_max_turns`` so a
                     # PR threading a monolith gets a raised budget and a
                     # turn-limit miss escalates the next dispatch's cap.
-                    "max_turns_override": resolved_review_turn_caps.get(pr_number),
+                    # Ignored by the devin-shell launcher (no such CLI concept
+                    # there).
+                    max_turns_override=resolved_review_turn_caps.get(pr_number),
                     # Issue TBD (role-config Phase 1): without this, every
-                    # reviewer launch would fall back to
+                    # claude-code reviewer launch would fall back to
                     # launch_claude_worker's own default model resolution,
                     # which is resolved_config.worker.model (see
                     # _apply_model_pin's caller in claude_code.py) -- so a
@@ -10525,15 +10705,12 @@ class OrchestratorApp:
                     # on the config object but never actually change which
                     # model the reviewer launches with. Passing
                     # resolved_config.reviewer.model explicitly here as
-                    # model_override is the single enforcement point.
-                    "model_override": self.config.reviewer.model or None,
-                }
-
-                record = launch_claude_worker(
-                    issue_number=pr_number,
-                    branch=branch,
-                    prompt_text=prompt_text,
-                    **launch_kwargs,
+                    # model_override is the single enforcement point (used
+                    # verbatim by the devin-shell launcher too; ignored by
+                    # the api launcher, which always pins the provider's own
+                    # model).
+                    model_override=self.config.reviewer.model or None,
+                    api_worker_config=reviewer_adapter_settings.api_worker_config,
                 )
                 if record.error or record.pid is None:
                     error_text = record.error or "launch returned no pid"
