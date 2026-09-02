@@ -18,7 +18,14 @@
   },
   {
    "boundary": 6.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1447",
+     "actor": "worker",
+     "reason": "post-ratchet regression re-crossing the just-locked 130 ceiling, PR #1447; acked reluctantly per operator decision 2026-09-02, issue 1458",
+     "to": 131
+    }
+   ],
    "file": "src/charlie_work/workflow.py",
    "identity": "OrchestratorApp",
    "kind": "class",
@@ -42,7 +49,14 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1522",
+     "actor": "worker",
+     "reason": "role-config migration growth, PRs #1512 #1522 + phase-2 tracks; operator decision 2026-09-02, issue 1458",
+     "to": 1077
+    }
+   ],
    "file": "tests/test_charlie_work.py",
    "identity": "tests/test_charlie_work.py::module",
    "kind": "test_module",
@@ -50,7 +64,14 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1421",
+     "actor": "worker",
+     "reason": "pre-freeze artifact: PR #1421, not shadow-week accretion; operator decision 2026-09-02, issue 1458",
+     "to": 60
+    }
+   ],
    "file": "tests/test_checks.py",
    "identity": "tests/test_checks.py::module",
    "kind": "test_module",
@@ -58,7 +79,14 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1522",
+     "actor": "worker",
+     "reason": "growth from PRs #1522 #1449; operator decision 2026-09-02, issue 1458",
+     "to": 141
+    }
+   ],
    "file": "tests/test_claude_code_adapter.py",
    "identity": "tests/test_claude_code_adapter.py::module",
    "kind": "test_module",
@@ -90,7 +118,14 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1509",
+     "actor": "worker",
+     "reason": "role-config migration growth + PR #1509; operator decision 2026-09-02, issue 1458",
+     "to": 89
+    }
+   ],
    "file": "tests/test_doctor.py",
    "identity": "tests/test_doctor.py::module",
    "kind": "test_module",
@@ -106,11 +141,26 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1531",
+     "actor": "worker",
+     "reason": "growth from PR #1531; operator decision 2026-09-02, issue 1458",
+     "to": 168
+    }
+   ],
    "file": "tests/test_fleet_dispatch.py",
    "identity": "tests/test_fleet_dispatch.py::module",
    "kind": "test_module",
    "member_count": 166
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_git_push_lint_hook.py",
+   "identity": "tests/test_git_push_lint_hook.py::module",
+   "kind": "test_module",
+   "member_count": 42
   },
   {
    "boundary": 41.0,
@@ -122,7 +172,14 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1464",
+     "actor": "worker",
+     "reason": "incident regression tests added by PRs #1429 #1433 #1437 #1440 #1421 #1464; operator decision 2026-09-02, issue 1458",
+     "to": 171
+    }
+   ],
    "file": "tests/test_heartbeat_check.py",
    "identity": "tests/test_heartbeat_check.py::module",
    "kind": "test_module",
@@ -142,11 +199,18 @@
    "file": "tests/test_janitor.py",
    "identity": "tests/test_janitor.py::module",
    "kind": "test_module",
-   "member_count": 159
+   "member_count": 157
   },
   {
    "boundary": 41.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1420",
+     "actor": "worker",
+     "reason": "pre-freeze artifact: PR #1420 merged 08-24, baseline frozen 08-25 stale, not shadow-week accretion; operator decision 2026-09-02, issue 1458",
+     "to": 84
+    }
+   ],
    "file": "tests/test_merge_preflight_hook.py",
    "identity": "tests/test_merge_preflight_hook.py::module",
    "kind": "test_module",
@@ -178,7 +242,14 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1480",
+     "actor": "worker",
+     "reason": "growth from PRs #1480 #1395 #1431; operator decision 2026-09-02, issue 1458",
+     "to": 153
+    }
+   ],
    "file": "tests/test_reconcile.py",
    "identity": "tests/test_reconcile.py::module",
    "kind": "test_module",
@@ -194,7 +265,14 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1486",
+     "actor": "worker",
+     "reason": "growth from PR #1486; operator decision 2026-09-02, issue 1458",
+     "to": 100
+    }
+   ],
    "file": "tests/test_supervise.py",
    "identity": "tests/test_supervise.py::module",
    "kind": "test_module",
@@ -202,7 +280,14 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1449",
+     "actor": "worker",
+     "reason": "growth from PRs #1449 #1412; operator decision 2026-09-02, issue 1458",
+     "to": 52
+    }
+   ],
    "file": "tests/test_worker.py",
    "identity": "tests/test_worker.py::module",
    "kind": "test_module",
@@ -210,7 +295,14 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1426",
+     "actor": "worker",
+     "reason": "pre-freeze artifact: PR #1426, not shadow-week accretion; operator decision 2026-09-02, issue 1458",
+     "to": 59
+    }
+   ],
    "file": "tests/test_worker_health.py",
    "identity": "tests/test_worker_health.py::module",
    "kind": "test_module",
@@ -218,7 +310,14 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1409",
+     "actor": "worker",
+     "reason": "growth from PR #1409 + identifier scrub; operator decision 2026-09-02, issue 1458",
+     "to": 53
+    }
+   ],
    "file": "tests/test_worker_stop_gate.py",
    "identity": "tests/test_worker_stop_gate.py::module",
    "kind": "test_module",
@@ -226,7 +325,14 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [],
+   "bumps": [
+    {
+     "ack": "#1522",
+     "actor": "worker",
+     "reason": "growth from PRs #1522 #1486 #1395; operator decision 2026-09-02, issue 1458",
+     "to": 241
+    }
+   ],
    "file": "tests/test_worktree.py",
    "identity": "tests/test_worktree.py::module",
    "kind": "test_module",
