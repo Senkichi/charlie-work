@@ -115,6 +115,14 @@
   {
    "boundary": 41.0,
    "bumps": [],
+   "file": "tests/test_git_push_lint_hook.py",
+   "identity": "tests/test_git_push_lint_hook.py::module",
+   "kind": "test_module",
+   "member_count": 42
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
    "file": "tests/test_github.py",
    "identity": "tests/test_github.py::module",
    "kind": "test_module",
@@ -142,7 +150,7 @@
    "file": "tests/test_janitor.py",
    "identity": "tests/test_janitor.py::module",
    "kind": "test_module",
-   "member_count": 159
+   "member_count": 157
   },
   {
    "boundary": 41.0,
