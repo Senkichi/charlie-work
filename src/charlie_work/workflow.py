@@ -2778,14 +2778,15 @@ def _detect_and_handle_orphaned_workers(
                 # used by the parallel worker_death_loop cap elsewhere in this
                 # module.
                 # The previous implementation derived the count from
-                # ``len(adapter_history)``, but that list only grows when
-                # ``api_worker.enabled`` is ``True`` (via
-                # ``routing.record_adapter_choice``) -- so in the default
-                # (non-API-routed) configuration the counter never incremented
-                # and the cap never fired, leaving the #709 infinite loop
-                # unbounded in production. The timestamp list is appended on
-                # every sweep pass through this code, regardless of adapter
-                # routing mode.
+                # ``len(adapter_history)``, but that list only grew when
+                # ``api_worker.enabled`` is ``True`` (the per-issue adapter
+                # selector that wrote it was deleted in Phase 2 Track B,
+                # PR #1517) -- so in the default (non-API-routed)
+                # configuration the counter never incremented and the cap
+                # never fired, leaving the #709 infinite loop unbounded in
+                # production. The timestamp list is appended on every sweep
+                # pass through this code, regardless of the configured
+                # adapter.
                 # "No progress" is measured, not assumed: the branch head SHA
                 # (remote ls-remote + local worktree) is compared across
                 # attempts. A moving head is the salvage path's job, not
@@ -2822,7 +2823,8 @@ def _detect_and_handle_orphaned_workers(
                 # -- re-observing the same dead dispatch on a later sweep
                 # pass is not a redispatch attempt. (The timestamp list, not
                 # adapter_history, is still what the count derives from:
-                # adapter_history only grows when api_worker.enabled is True.)
+                # adapter_history only grew when api_worker.enabled was True,
+                # and the writer was deleted in Phase 2 Track B.)
                 orphan_redispatch_at = _windowed_orphan_redispatch_at(
                     entry, window_minutes=config.watchdog.redispatch_window_minutes
                 )
@@ -4012,9 +4014,8 @@ class OrchestratorApp:
             worker_env=worker_env,
             # worker.model is only meaningful for the harness it was resolved
             # against (worker.harness). When `adapter` overrides the
-            # configured harness -- the routed-fallback case, e.g. api
-            # routing falling back to devin-shell for one issue -- fall back
-            # to devin.worker_model instead: role-config Phase 2 (Track E)
+            # configured harness -- a fallback to a different adapter --
+            # fall back to devin.worker_model instead: role-config Phase 2 (Track E)
             # deleted the dual-accept bridge that used to mirror worker.model
             # onto devin.worker_model, so the two are independent config
             # values again. devin.worker_model is now the dedicated,
@@ -20421,7 +20422,7 @@ class OrchestratorApp:
             # manifest_adapter_label, not "mixed" — "mixed" still occurs
             # routinely here whenever the worker harness differs from
             # claude-code (e.g. a devin-shell primary worker + claude-code
-            # rescue), independent of per-issue routing.
+            # rescue).
             combined_kinds = {self.config.worker.harness}
             combined_kinds.add("claude-code")
             write_session_manifest(
@@ -21711,14 +21712,12 @@ class OrchestratorApp:
             return ""
         return _ATTACHMENT_BUDGET_CLAUSE
 
-    def _write_worker_prompt(
-        self, issue: dict[str, Any], *, template: str | None = None, dry_run: bool = False
-    ) -> Path:
+    def _write_worker_prompt(self, issue: dict[str, Any], *, dry_run: bool = False) -> Path:
         issue_number = int(issue["number"])
         issue_dir = self.paths.issues / f"issue-{issue_number}"
         prompt_path = issue_dir / "worker-prompt.md"
         prompt = self._render(
-            template or self.config.dispatch.worker_template,
+            self.config.dispatch.worker_template,
             {
                 "issue_number": issue_number,
                 "issue_title": issue.get("title", ""),

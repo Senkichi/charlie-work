@@ -45060,9 +45060,9 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
         flags (the dispatch clears them on success), and give the dispatch a
         fresh ``dispatched_at`` (a real redispatch always assigns a new
         timestamp). Crucially, this does NOT append to adapter_history -- in
-        the default config (api_worker.enabled=False), record_adapter_choice
-        is never called, so adapter_history never grows. The cap must fire
-        without it.
+        the default config (api_worker.enabled=False), the per-issue adapter
+        selector that wrote it was deleted in Phase 2 Track B (PR #1517), so
+        adapter_history never grows. The cap must fire without it.
         """
         st = load_state(paths.state_file)
         entry = st["issues"]["1243"]
@@ -45451,10 +45451,11 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
 ) -> None:
     """Issue #1243 regression: the redispatch cap must fire in the default
     configuration where ``api_worker.enabled`` is ``False`` (the production
-    default). In that configuration, ``routing.record_adapter_choice`` is
-    never called, so ``adapter_history`` never grows. The previous
-    ``len(adapter_history)``-based counter therefore never incremented and
-    the cap never fired -- leaving the #709 infinite loop unbounded.
+    default). In that configuration, ``adapter_history`` never grows (the
+    per-issue adapter selector that wrote it was deleted in Phase 2 Track B,
+    PR #1517). The previous ``len(adapter_history)``-based counter therefore
+    never incremented and the cap never fired -- leaving the #709 infinite
+    loop unbounded.
 
     This test exercises the real orphan-sweep reclaim -> redispatch cycle
     with ``api_worker`` left at its default (disabled) config, proving:
@@ -45483,7 +45484,8 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
         "worker_process_start_time": 1234567890.0,
         "dispatched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         # adapter_history is empty -- as it would be in production with
-        # api_worker disabled (record_adapter_choice never called).
+        # api_worker disabled (the per-issue adapter selector that wrote it
+        # was deleted in Phase 2 Track B, PR #1517).
     }
     save_state(paths.state_file, state)
 
@@ -45517,12 +45519,13 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
 
     def _simulate_dispatch(dispatch_index: int) -> None:
         """Simulate a real dispatch between sweeps WITHOUT touching
-        adapter_history. In production with api_worker disabled, the dispatch
-        path never calls record_adapter_choice, so adapter_history stays
-        empty. This helper resets the labels and orphan flags that a real
-        dispatch would reset, and assigns a fresh ``dispatched_at`` (as a
-        genuine redispatch always does), which changes the dead-dispatch
-        identity the cap dedupes on.
+        adapter_history. In production with api_worker disabled, the
+        per-issue adapter selector that wrote it was deleted in Phase 2
+        Track B (PR #1517), so adapter_history stays empty. This helper
+        resets the labels and orphan flags that a real dispatch would
+        reset, and assigns a fresh ``dispatched_at`` (as a genuine
+        redispatch always does), which changes the dead-dispatch identity
+        the cap dedupes on.
         """
         st = load_state(paths.state_file)
         entry = st["issues"]["1243"]
@@ -51940,7 +51943,7 @@ def test_dispatch_rework_no_rescue_skips_redundant_manifest_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Issue #626: when a rework pass has only normal (non-rescue) issues, the
-    trailing combined manifest write is skipped — ``_dispatch_partitioned``
+    trailing combined manifest write is skipped — ``dispatch_sessions``
     already wrote the correct manifest. Before #626, the trailing write was
     unconditional, writing the manifest twice per pass with the wrong label.
 
@@ -52013,7 +52016,7 @@ def test_dispatch_rework_no_rescue_skips_redundant_manifest_write(
 
     assert result.ok is True
     # With the fix: one write from dispatch_sessions inside
-    # _dispatch_partitioned. The trailing combined write is skipped because
+    # _dispatch_rework_impl. The trailing combined write is skipped because
     # rescue_requests is empty. Before #626, this was 2 (the trailing write
     # was unconditional).
     assert manifest_write_count == 1

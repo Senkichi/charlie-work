@@ -2877,11 +2877,12 @@ def _is_permanent_no_match_error(error: str | None) -> bool:
 def _worker_kind_from_recovery(recovery: dict[str, Any], config: OrchestratorConfig) -> str | None:
     """Extract the recorded worker adapter kind from a recovery record.
 
-    Returns the most recent ``adapter_history`` entry's ``kind`` (written by
-    ``routing.record_adapter_choice`` when api routing is enabled), falling
-    back to ``config.worker.harness`` when no history is recorded (api routing
-    disabled — every worker uses the repo default adapter). Returns ``None``
-    only when neither source yields a usable string, which causes
+    Returns the most recent ``adapter_history`` entry's ``kind`` (a legacy
+    field written by the per-issue adapter selector that was deleted in
+    Phase 2 Track B, PR #1517 — existing state entries may still carry
+    it), falling back to ``config.worker.harness`` when no history is
+    recorded. Returns ``None`` only when neither source yields a usable
+    string, which causes
     ``real_activity_for_worker`` to consult all sources as before (issue #639).
     """
     history = recovery.get("adapter_history")

@@ -1,93 +1,143 @@
 ## Linked issue
 
-Closes #1444
+Closes #1515
 
 ## What changed
 
-Worker dispatch prompts now carry a **module map** section derived at packet build time from the live `src/charlie_work/` tree. For every `.py` module under the package, the section lists the dotted module name, the first line of its docstring, and its public-surface size (`__all__` length if defined, else the count of top-level names not starting with `_`).
+Phase 2 Track B (PR #1517) deleted the per-issue adapter routing subsystem
+(`routing.py`, `select_adapter`, `_dispatch_partitioned`, `complexity_high`).
+This PR cleans up the residue that was out of Track B's file scope:
 
-This is the generation-time half of the god-file dynamic tracked in #1317 (extraction) and #1442 (CI ratchet stopgap): extraction removes lines, but nothing steered new lines away from the monolith, so it regrew. The map gives a worker a picture of what modules exist and what belongs where, so the largest file no longer wins by default gravity.
+### 1. Dead `template` parameter dropped from `_write_worker_prompt`
 
-### Files
+`OrchestratorApp._write_worker_prompt(..., template: str | None = None)` —
+the only callers that passed `template=` were the deleted routing branches;
+all 3 surviving production callers (`workflow.py:4561`, `5417`, `5997`) omit
+it. The parameter and its `template or self.config.dispatch.worker_template`
+branch are removed; `_write_worker_prompt` now always renders
+`self.config.dispatch.worker_template`.
 
-- **`src/charlie_work/module_map.py`** (new) — `build_module_map(package_dir, src_root)` walks the package directory with `pathlib` and parses each `.py` file with `ast` (zero imports — avoids side effects and heavy deps at packet build time). Returns the full markdown section, or an empty string when the package dir is absent/empty. Raises `OSError`/`SyntaxError`/`ValueError` on parse failures so the caller can record the event and degrade; it does not swallow exceptions itself, keeping the single point of enforcement for "dispatch never fails on a map error" at the call site.
-- **`src/charlie_work/workflow.py`** — `_build_module_map_value(issue_number)` is the fail-soft wrapper: it calls `build_module_map` and, on a parse failure, logs a `worker_module_map_failed` warning event to `events.db` and returns `""` (omitted section). `_write_worker_prompt` passes the result as the `module_map` value. `module_map` is added to `WORKER_PROMPT_KEYS` so the drift check (`check_prompt_template_drift`) stays honest. `log_event` (not `self._record_event`) is used because `_write_worker_prompt` runs outside a state-lock context.
-- **`src/charlie_work/instrumentation.py`** — registers `worker_module_map_failed` at `warning` level in `_LEVEL_BY_KIND`.
-- **`src/charlie_work/prompts/worker.md`** and **`worker_claude_code.md`** — reference `$module_map` between the issue body and the scope contract, so the worker sees the module layout before deciding where to place code.
-- **Tests** — `tests/test_module_map.py` (new, 12 tests); updated `ISSUE_VALUES` in `tests/test_prompt_sections.py` and two render tests in `tests/test_charlie_work.py` to supply the new `module_map` placeholder.
+**Test callers updated** to set `config.dispatch.worker_template` instead of
+passing `template=`:
+- `test_prompt_render_contract.py` — `test_worker_claude_code_md_renders_via_real_writer`
+- `test_prompt_template_drift_check.py` — `test_worker_prompt_keys_match_real_writer`
+- `test_markdown_fence.py` — `_render` helper and `_render_via_pre_change_template`
+- `test_issue_comments.py` — `_render_via_pre_change_template` and two parametrized tests
 
-### Hard constraints (from the issue)
+### 2. Stale comment/prose references reworded
 
-1. **The map is NEVER a hand-maintained list.** `build_module_map` walks the tree with `pathlib.rglob("*.py")` and parses with `ast`. There are zero hardcoded module names in `module_map.py` — verified by `test_newly_added_module_appears_with_no_config_change` (a module added to the tree after the first build appears in the second build with no config change) and `test_build_module_map_lists_modules_with_docstring_and_public_surface`.
-2. **Map generation fails soft.** `_build_module_map_value` catches `OSError`/`SyntaxError`/`ValueError`, logs `worker_module_map_failed`, and returns `""`. Verified by `test_unparseable_file_omits_section_and_logs_warning_event` (a `SyntaxError` file → empty `module_map` + one warning event in `events.db`) and `test_missing_package_dir_omits_section_without_event` (a missing package dir → empty string, no failure event).
+| File | Old reference | Fix |
+|------|--------------|-----|
+| `dead_worker_reap.py:609` | `select_adapter` | "the default adapter" |
+| `dispatch_selection.py:427` | `routing.record_adapter_choice` | historical note about deleted per-issue adapter selector |
+| `doctor.py:283` | `routing.select_adapter` / `policy:complexity` | `config.api_worker.enabled` |
+| `workflow.py:2783` | `routing.record_adapter_choice` | historical note |
+| `workflow.py:2825` | "adapter_history only grows" (present tense) | "only grew" (past tense) + deletion note |
+| `workflow.py:4017` | "api routing falling back to devin-shell for one issue" | "a fallback to a different adapter" |
+| `workflow.py:20426` | "independent of per-issue routing" | phrase dropped |
+| `worktree.py:2881` | `routing.record_adapter_choice` | historical note about legacy `adapter_history` field |
+| `conftest.py:157` | `test_dispatch_partitioned_homogeneous_batch_labels_with_single_kind` | "a partitioned-dispatch batch-labels test" |
+| `test_charlie_work.py:45455` | `routing.record_adapter_choice` | historical note |
+| `test_charlie_work.py:45063` | `record_adapter_choice` (in `_simulate_redispatch` docstring) | reworded to "per-issue adapter selector … deleted in Phase 2 Track B (PR #1517)" |
+| `test_charlie_work.py:45487` | `record_adapter_choice` (inline comment on empty `adapter_history` seed) | same rewording |
+| `test_charlie_work.py:45523` | `record_adapter_choice` (in `_simulate_dispatch` docstring) | same rewording |
+| `test_charlie_work.py:51943` | `_dispatch_partitioned` | `dispatch_sessions` |
+| `test_charlie_work.py:52016` | `_dispatch_partitioned` | `_dispatch_rework_impl` |
 
-### Acceptance criteria
+### 3. QUICKSTART.md
 
-1. **Zero hardcoded module names.** ✅ — derivation is `rglob("*.py")` + `ast.parse`; no module name appears as a literal in `module_map.py`.
-2. **A newly added module appears with no config change.** ✅ — `test_newly_added_module_appears_with_no_config_change`.
-3. **Prompt-size cost measured and reported.** The map for this repo (76 modules) is **7,201 chars / 82 lines**. The base `worker.md` prompt (no map) is 12,710 chars; with the map it is 19,911 chars — a **~56.7% overhead** on the base prompt. The cost is bounded by the module count (one table row per `.py` file) and grows only as the tree grows.
-4. **Event kind + consumer.** ✅ — `worker_module_map_failed` is registered at `warning` in `_LEVEL_BY_KIND`. The consumer is `scripts/heartbeat_check.py::check_warning_events`, which reads every `level='warning'` row from `events.db` (derived from the persisted `level` column, never a hardcoded kind list — see its docstring). Verified by `test_worker_module_map_failed_registered_as_warning`.
+Dropped "plus `complexity:high`" from the bootstrap-labels line — that label
+field was deleted by Track B.
+
+### Preserved (not stale)
+
+- **Historical-context comments** in `api_worker.py:188`,
+  `test_api_worker.py:902`, `instrumentation.py:245` that accurately document
+  the Phase 2 Track B deletion ("the refusal gate that used to live in
+  routing.py before its deletion"). These are historically accurate, not
+  stale descriptions of current behavior.
+- **Legitimate "routing" uses** — rework routing, escalation routing,
+  merge-conflict routing, review routing — are live concepts unrelated to
+  the deleted per-issue adapter routing subsystem. The acceptance grep
+  `\brouting\b` matches ~160 such legitimate uses; they are not touched.
 
 ## Verification
 
 ```
-uv run --extra dev pytest tests/test_module_map.py tests/test_prompt_sections.py tests/test_prompt_template_drift_check.py tests/test_prompt_render_contract.py tests/test_fix_prompt_template_drift.py tests/test_instrumentation.py tests/test_markdown_fence.py tests/test_issue_comments.py tests/test_doctor.py tests/test_janitor.py --tb=short
-455 passed in 249.03s (0:04:09)
+uv run --extra dev pytest tests/test_prompt_render_contract.py tests/test_prompt_template_drift_check.py tests/test_markdown_fence.py tests/test_issue_comments.py tests/test_doctor.py tests/test_worktree.py -q --tb=short
 ```
+Result: 394 passed in 137.69s
+
+```
+uv run --extra dev pytest tests/test_charlie_work.py::test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled tests/test_charlie_work.py::test_dispatch_rework_no_rescue_skips_redundant_manifest_write tests/test_workflow_dead_worker_write_gate.py -q --tb=short
+```
+Result: 6 passed
+
+```
+uv run --extra dev pytest tests/test_dispatch_selection_split.py tests/test_dead_worker_reap_split.py -q --tb=short
+```
+Result: 22 passed
 
 ```
 uv run ruff check .
-All checks passed!
+```
+Result: All checks passed!
 
+```
 uv run ruff format .
-282 files left unchanged
 ```
+Result: 343 files left unchanged
 
-### Mutation check
+### Acceptance grep verification
 
-Reverted each fixed artifact to its merge-base version (`git checkout 87df489 -- <path>`) and confirmed the regression tests fail, then restored the fix and confirmed they pass.
+`rg 'complexity_high|_dispatch_partitioned|select_adapter' src/ tests/` returns
+zero matches — all unambiguous references to the deleted subsystem are removed.
 
-**1. `src/charlie_work/instrumentation.py`** (removed `worker_module_map_failed` from `_LEVEL_BY_KIND`):
-```
-uv run --extra dev pytest tests/test_module_map.py::test_worker_module_map_failed_registered_as_warning --tb=short
-FAILED tests/test_module_map.py::test_worker_module_map_failed_registered_as_warning
-E   AssertionError: assert 'worker_module_map_failed' in mappingproxy({...})
-1 failed
-```
-After restore: `1 passed`.
+`rg 'routing\.record_adapter_choice|routing\.select_adapter|routing\._api_preflight' src/ tests/`
+returns only 2 matches in `api_worker.py:188` and `test_api_worker.py:902` —
+both are historical-context comments that accurately document the deletion
+(preserved deliberately).
 
-**2. `src/charlie_work/workflow.py`** (removed `module_map` from `WORKER_PROMPT_KEYS`, `_build_module_map_value`, and the values dict):
-```
-uv run --extra dev pytest tests/test_module_map.py::test_module_map_is_a_worker_prompt_key tests/test_module_map.py::test_unparseable_file_omits_section_and_logs_warning_event tests/test_module_map.py::test_write_worker_prompt_includes_module_map_from_live_tree --tb=short
-FAILED tests/test_module_map.py::test_module_map_is_a_worker_prompt_key - Ass...
-FAILED tests/test_module_map.py::test_unparseable_file_omits_section_and_logs_warning_event
-FAILED tests/test_module_map.py::test_write_worker_prompt_includes_module_map_from_live_tree
-3 failed
-```
-(The `OrchestratorApp` constructor raised `PromptOverrideDriftError` because the templates reference `$module_map` but the writer no longer supplies it — the drift guard catching the regression at the single point of enforcement.) After restore: `12 passed`.
+`rg 'record_adapter_choice' src/ tests/` returns zero matches — the deleted
+function's name is fully gone from product code and tests (the three stale
+references in `test_charlie_work.py` that the original PR missed were reworded
+in the rework commit).
 
-**3. `src/charlie_work/prompts/worker.md` + `worker_claude_code.md`** (removed `$module_map`):
-```
-uv run --extra dev pytest tests/test_module_map.py::test_write_worker_prompt_includes_module_map_from_live_tree --tb=short
-FAILED tests/test_module_map.py::test_write_worker_prompt_includes_module_map_from_live_tree
-E   AssertionError: assert '## Module map' in '# Devin Worker Task: Issue #1\n...'
-1 failed
-```
-After restore: `12 passed`.
+`rg 'complexity' docs/QUICKSTART.md` returns zero matches.
 
-### Invariant enumeration (fail-soft paths in `_build_module_map_value`)
+The broad `\brouting\b` pattern also matches ~160 legitimate uses (rework
+routing, escalation routing, etc.) that are unrelated to the deleted
+per-issue adapter routing subsystem and are not in scope for this issue.
 
-The fail-soft contract ("dispatch never fails on a map error; omitted section + warning event") has exactly these exit paths in `_build_module_map_value`:
-1. `build_module_map` returns a non-empty string → returned directly (success, no event). ✅
-2. `build_module_map` returns `""` (missing/empty package dir) → returned directly (omitted section, no event — the map is absent, not broken). ✅
-3. `build_module_map` raises `OSError`/`SyntaxError`/`ValueError` → caught, `worker_module_map_failed` logged at `warning`, `""` returned (omitted section + event). ✅
+## Rework (review feedback)
 
-There are no other `return` or `raise` statements between the `try` and the method's end.
+The original PR fixed one stale `record_adapter_choice` reference in the
+`test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled` docstring
+but left three more identical stale references to the same deleted function
+inside the same test function body. This rework commit rewords all three to
+match the accurate phrasing already applied at the docstring head
+("the per-issue adapter selector that wrote it was deleted in Phase 2
+Track B, PR #1517"):
+
+- `_simulate_redispatch` docstring (~`test_charlie_work.py:45063`)
+- inline comment on the empty `adapter_history` seed (~`test_charlie_work.py:45487`)
+- `_simulate_dispatch` docstring (~`test_charlie_work.py:45523`)
+
+After this rework, `rg 'record_adapter_choice' src/ tests/` returns zero
+matches — the symbol name is fully gone from product code and tests. The
+issue #1515 acceptance grep (`complexity_high|_dispatch_partitioned|select_adapter`)
+did not include `record_adapter_choice`, so it could not catch these; they
+were found by the reviewer.
 
 ## Risks / uncertain areas
 
-- **Prompt-size overhead (~57%).** The map adds 7,201 chars to a ~12,710-char base prompt. This is a meaningful per-packet cost. It is bounded by the module count and is the explicit trade-off the issue asks for (placement steering vs. prompt budget). If this becomes a problem for very large repos, a future change could cap the map to the largest N modules or elide modules with a public surface of 0 — but that is out of scope for this issue, which asks for the full map.
-- **`ast.parse` on every packet build.** For this repo (76 modules), `build_module_map` runs in well under a second. It is called once per `_write_worker_prompt` (once per issue at intake/dispatch), not per loop pass. No caching is added; the tree can change between packets by design (a newly added module must appear in the next packet).
-- **Public-surface size is a proxy.** `__all__` length (when defined) or the top-level non-underscore name count is a rough measure of a module's public surface. It does not distinguish re-exports from genuine definitions. This matches the issue's specification exactly.
-
-Generated with [Devin](https://devin.ai)
+- The `template` parameter was keyword-only with a default (`None`), so
+  dropping it can only break callers that explicitly pass `template=`. All
+  such callers (4 test files, 6 call sites) have been updated. A grep for
+  `_write_worker_prompt.*template=` in tests/ returns zero matches.
+- The `_write_worker_prompt` signature change is a private method (`_`
+  prefix); no public API or module re-export is affected.
+- Two historical-context comments referencing `routing.py` by name
+  (`api_worker.py`, `test_api_worker.py`) were deliberately preserved as
+  accurate history. If the reviewer prefers these reworded too, they can be
+  addressed in a follow-up.
