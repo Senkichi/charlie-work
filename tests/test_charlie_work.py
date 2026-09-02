@@ -45060,9 +45060,9 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
         flags (the dispatch clears them on success), and give the dispatch a
         fresh ``dispatched_at`` (a real redispatch always assigns a new
         timestamp). Crucially, this does NOT append to adapter_history -- in
-        the default config (api_worker.enabled=False), record_adapter_choice
-        is never called, so adapter_history never grows. The cap must fire
-        without it.
+        the default config (api_worker.enabled=False), the per-issue adapter
+        selector that wrote it was deleted in Phase 2 Track B (PR #1517), so
+        adapter_history never grows. The cap must fire without it.
         """
         st = load_state(paths.state_file)
         entry = st["issues"]["1243"]
@@ -45484,7 +45484,8 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
         "worker_process_start_time": 1234567890.0,
         "dispatched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         # adapter_history is empty -- as it would be in production with
-        # api_worker disabled (record_adapter_choice never called).
+        # api_worker disabled (the per-issue adapter selector that wrote it
+        # was deleted in Phase 2 Track B, PR #1517).
     }
     save_state(paths.state_file, state)
 
@@ -45518,12 +45519,13 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
 
     def _simulate_dispatch(dispatch_index: int) -> None:
         """Simulate a real dispatch between sweeps WITHOUT touching
-        adapter_history. In production with api_worker disabled, the dispatch
-        path never calls record_adapter_choice, so adapter_history stays
-        empty. This helper resets the labels and orphan flags that a real
-        dispatch would reset, and assigns a fresh ``dispatched_at`` (as a
-        genuine redispatch always does), which changes the dead-dispatch
-        identity the cap dedupes on.
+        adapter_history. In production with api_worker disabled, the
+        per-issue adapter selector that wrote it was deleted in Phase 2
+        Track B (PR #1517), so adapter_history stays empty. This helper
+        resets the labels and orphan flags that a real dispatch would
+        reset, and assigns a fresh ``dispatched_at`` (as a genuine
+        redispatch always does), which changes the dead-dispatch identity
+        the cap dedupes on.
         """
         st = load_state(paths.state_file)
         entry = st["issues"]["1243"]
