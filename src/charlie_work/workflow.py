@@ -65,7 +65,7 @@ from .rescue_review import (
     extract_report_body,
     run_cross_family_review,
 )
-from .cross_repo_gate import cross_repo_gate, cross_repo_scope_gate
+from .cross_repo_gate import CrossRepoGateResult, cross_repo_gate, cross_repo_scope_gate
 from .github import (
     GitHub,
     GitHubError,
@@ -6109,7 +6109,7 @@ class OrchestratorApp:
         # escalated too — their deliverables live in that repo, not this one,
         # so the dispatching lane can never finalize them.  The managed-repo
         # set is derived from the fleet registry, never a hardcoded list.
-        cross_repo_escalated: dict[int, str] = {}
+        cross_repo_escalated: dict[int, CrossRepoGateResult] = {}
         fleet_repos = managed_repo_names(self.fleet_dir_override)
         dispatching_repo_name = _dispatching_repo_name(self.gh, self.repo_root)
         for issue_number in selected_issue_numbers:
@@ -6121,7 +6121,7 @@ class OrchestratorApp:
             # code does not exist in this repo (issue #1010).
             gate_result = cross_repo_gate(str(full_issue.get("body") or ""), self.repo_root)
             if not gate_result.passed:
-                cross_repo_escalated[issue_number] = gate_result.reason
+                cross_repo_escalated[issue_number] = gate_result
                 continue
 
             # Pre-flight scope gate: refuse to dispatch when the issue's title
@@ -6133,7 +6133,7 @@ class OrchestratorApp:
                 fleet_repos,
             )
             if not scope_result.passed:
-                cross_repo_escalated[issue_number] = scope_result.reason
+                cross_repo_escalated[issue_number] = scope_result
                 continue
 
             prompt_path = self._write_worker_prompt(full_issue)
@@ -6633,7 +6633,8 @@ class OrchestratorApp:
             # shared checkout. Escalate to human-needed with a cross_repo_target
             # reason and record the event — the issue stays in the dispatch
             # pool's state as escalated, not dispatch_pending.
-            for issue_number, reason in sorted(cross_repo_escalated.items()):
+            for issue_number, gate_result in sorted(cross_repo_escalated.items()):
+                reason = gate_result.reason
                 prev_entry = state["issues"].get(str(issue_number), {})
                 entry = {
                     **prev_entry,
@@ -6650,12 +6651,22 @@ class OrchestratorApp:
                     reason_class="mechanical",
                     issue_extra=entry,
                 )
+                # Issue #1583: report ``neutral_paths`` and ``missing_paths``
+                # in the event payload so the operator can see from the
+                # event alone which citation tripped the gate (today the
+                # payload carried only the count, embedded in ``reason``).
+                # For the cross-repo *scope* gate (issue #1244) both tuples
+                # are empty by construction -- the scope gate does not deal
+                # in file paths -- so the fields are present but empty,
+                # which is accurate.
                 state = append_event(
                     state,
                     "dispatch_cross_repo_escalated",
                     {
                         "issue_number": issue_number,
                         "reason": reason,
+                        "neutral_paths": list(gate_result.neutral_paths),
+                        "missing_paths": list(gate_result.missing_paths),
                     },
                     state_path=self.paths.state_file,
                 )
