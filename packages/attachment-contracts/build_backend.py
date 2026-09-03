@@ -48,7 +48,6 @@ _HERE = Path(__file__).resolve().parent
 _SDIST_SRC_DIR = _HERE / "src" / "charlie_work" / "attachment_contracts"
 _REPO_SRC_DIR = _HERE.parent.parent / "src" / "charlie_work" / "attachment_contracts"
 _SRC_DIR = _SDIST_SRC_DIR if _SDIST_SRC_DIR.is_dir() else _REPO_SRC_DIR
-_DIST_INFO = "charlie_work_attachment_contracts-0.1.1.dist-info"
 
 
 def _read_project() -> dict:
@@ -62,6 +61,20 @@ def _normalize_name(name: str) -> str:
 
 def _wheel_filename(name: str, version: str) -> str:
     return f"{_normalize_name(name).replace('-', '_')}-{version}-py3-none-any.whl"
+
+
+def _dist_info_dir(name: str, version: str) -> str:
+    """Return the ``.dist-info`` directory name for the wheel.
+
+    Per the wheel spec, the dist-info directory is
+    ``{normalized_name_with_underscores}-{version}.dist-info`` -- the same
+    name normalization as :func:`_wheel_filename`.  Deriving it from the
+    project name/version (read via :func:`_read_project`) keeps the
+    dist-info directory name in sync with the wheel filename on every
+    version bump; a hardcoded constant would silently desync and produce a
+    spec-non-compliant wheel (round-2 review finding).
+    """
+    return f"{_normalize_name(name).replace('-', '_')}-{version}.dist-info"
 
 
 def _metadata_payload(project: dict) -> str:
@@ -104,6 +117,7 @@ def build_wheel(
     name = project["name"]
     version = project["version"]
     filename = _wheel_filename(name, version)
+    dist_info = _dist_info_dir(name, version)
     wheel_path = os.path.join(wheel_directory, filename)
 
     records: list[list[str]] = []
@@ -117,7 +131,7 @@ def build_wheel(
 
     # dist-info metadata files.
     metadata = _metadata_payload(project).encode()
-    all_entries.append((f"{_DIST_INFO}/METADATA", metadata))
+    all_entries.append((f"{dist_info}/METADATA", metadata))
 
     wheel_meta = (
         "Wheel-Version: 1.0\n"
@@ -125,12 +139,12 @@ def build_wheel(
         "Root-Is-Purelib: true\n"
         "Tag: py3-none-any\n"
     ).encode()
-    all_entries.append((f"{_DIST_INFO}/WHEEL", wheel_meta))
+    all_entries.append((f"{dist_info}/WHEEL", wheel_meta))
 
     license_text = project["license"]["text"]
     all_entries.append(
         (
-            f"{_DIST_INFO}/LICENSE",
+            f"{dist_info}/LICENSE",
             f"MIT License\n\nCopyright (c) 2026 Senkichi\n\n{license_text}\n".encode(),
         )
     )
@@ -139,12 +153,12 @@ def build_wheel(
     for arcname, data in all_entries:
         h, size = _record_hash(data)
         records.append([arcname, h, size])
-    records.append([f"{_DIST_INFO}/RECORD", "", ""])
+    records.append([f"{dist_info}/RECORD", "", ""])
 
     record_data = io.StringIO()
     writer = csv.writer(record_data, lineterminator="\n")
     writer.writerows(records)
-    all_entries.append((f"{_DIST_INFO}/RECORD", record_data.getvalue().encode()))
+    all_entries.append((f"{dist_info}/RECORD", record_data.getvalue().encode()))
 
     # Write the wheel ZIP.
     os.makedirs(wheel_directory, exist_ok=True)

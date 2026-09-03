@@ -267,3 +267,109 @@ def test_wheel_built_from_sdist_contains_source_files(tmp_path: Path) -> None:
     finally:
         sys.path.remove(str(prefix_root))
         sys.modules.pop("build_backend", None)
+
+
+@pytest.mark.skipif(
+    not (_PKG_DIR / "build_backend.py").is_file(),
+    reason="build_backend.py not present",
+)
+def test_wheel_dist_info_dir_matches_version(tmp_path: Path) -> None:
+    """The wheel's ``.dist-info`` directory name tracks the project version.
+
+    Round-2 review finding: ``build_backend`` previously hardcoded
+    ``_DIST_INFO = "charlie_work_attachment_contracts-0.1.1.dist-info"``, so
+    the dist-info directory name would silently desync from the wheel filename
+    on the next version bump, producing a spec-non-compliant wheel with no test
+    to catch it.
+
+    This test builds a wheel from a temp copy of the package with the version
+    bumped to ``0.1.2`` and asserts the resulting dist-info directory name is
+    ``charlie_work_attachment_contracts-0.1.2.dist-info`` -- i.e. derived from
+    the project name/version via the same normalization as the wheel filename,
+    not from a hardcoded constant.
+
+    Mutation control: reverting ``_dist_info_dir`` to the hardcoded
+    ``charlie_work_attachment_contracts-0.1.1.dist-info`` constant makes the
+    dist-info directory name ``...-0.1.1.dist-info`` regardless of the bumped
+    pyproject version, so the ``...-0.1.2.dist-info`` assertion fails.
+    """
+    import shutil
+    import zipfile
+
+    # 1. Lay out a temp package dir in the sdist layout (build_backend.py +
+    #    pyproject.toml + src/...) so _SRC_DIR detects the sdist layout
+    #    (_HERE / "src" / ...).
+    tmp_pkg = tmp_path / "pkg"
+    tmp_pkg.mkdir()
+    shutil.copy2(_PKG_DIR / "build_backend.py", tmp_pkg / "build_backend.py")
+    src_dst = tmp_pkg / "src" / "charlie_work" / "attachment_contracts"
+    src_dst.mkdir(parents=True)
+    for py_file in _SRC_DIR.glob("*.py"):
+        shutil.copy2(py_file, src_dst / py_file.name)
+
+    # 2. Write a pyproject.toml with the version bumped to 0.1.2.
+    import tomllib
+
+    with (_PKG_DIR / "pyproject.toml").open("rb") as f:
+        project = tomllib.load(f)["project"]
+    project["version"] = "0.1.2"
+    # Re-serialize the [project] table into a minimal pyproject.toml the
+    # backend's _read_project() can parse.
+    import json
+
+    readme_text = (
+        project["readme"]["text"] if isinstance(project["readme"], dict) else project["readme"]
+    )
+    readme_ct = (
+        project["readme"].get("content-type", "text/plain")
+        if isinstance(project["readme"], dict)
+        else "text/plain"
+    )
+    lines = [
+        "[project]",
+        f'name = "{project["name"]}"',
+        f'version = "{project["version"]}"',
+        f"description = {json.dumps(project['description'])}",
+        f'readme = {{ text = {json.dumps(readme_text)}, content-type = "{readme_ct}" }}',
+        f'requires-python = "{project["requires-python"]}"',
+        f'license = {{ text = "{project["license"]["text"]}" }}',
+        f"keywords = {json.dumps(project['keywords'])}",
+        "classifiers = [",
+    ]
+    for cls in project["classifiers"]:
+        lines.append(f'    "{cls}",')
+    lines.append("]")
+    (tmp_pkg / "pyproject.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # 3. Import the backend from the temp package and build a wheel.
+    sys.path.insert(0, str(tmp_pkg))
+    try:
+        sys.modules.pop("build_backend", None)
+        import build_backend  # imported from the temp package
+
+        wheel_dir = tmp_path / "wheel"
+        wheel_dir.mkdir()
+        filename = build_backend.build_wheel(str(wheel_dir))
+        whl_path = wheel_dir / filename
+        assert whl_path.is_file(), f"wheel not found: {whl_path}"
+
+        # 4. The wheel filename must reflect the bumped version...
+        assert "0.1.2" in filename, f"wheel filename must contain 0.1.2: {filename}"
+
+        names = zipfile.ZipFile(whl_path).namelist()
+        dist_info_dirs = sorted({n.split("/")[0] for n in names if ".dist-info" in n})
+        assert dist_info_dirs == ["charlie_work_attachment_contracts-0.1.2.dist-info"], (
+            f"dist-info dir must track the bumped version, got {dist_info_dirs} -- "
+            f"_DIST_INFO is hardcoded instead of derived from project version"
+        )
+        # The four expected dist-info entries live under that directory.
+        expected = {
+            "charlie_work_attachment_contracts-0.1.2.dist-info/METADATA",
+            "charlie_work_attachment_contracts-0.1.2.dist-info/WHEEL",
+            "charlie_work_attachment_contracts-0.1.2.dist-info/LICENSE",
+            "charlie_work_attachment_contracts-0.1.2.dist-info/RECORD",
+        }
+        assert expected.issubset(set(names)), f"missing dist-info entries: {expected - set(names)}"
+    finally:
+        sys.path.remove(str(tmp_pkg))
+        sys.modules.pop("build_backend", None)
