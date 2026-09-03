@@ -389,21 +389,38 @@ def test_provenance_marker_word_alone_neutralizes(tmp_path: Path) -> None:
     assert "abstaining" in result.reason
 
 
-def test_origin_marker_word_alone_neutralizes(tmp_path: Path) -> None:
-    """Issue #1583 fix part 2: ``origin`` in a candidate's own clause
-    neutralizes it, mirroring ``provenance``."""
+def test_origin_git_remote_usage_does_not_neutralize_dispatch_target(
+    tmp_path: Path,
+) -> None:
+    """Review finding (PR #1584 round 1): ``origin`` was removed from
+    ``_EVIDENCE_MARKER_RE`` because it is an ordinary git-remote name
+    (``origin/main``, ``git push origin``) that appears constantly in issue
+    bodies near genuine dispatch targets. A body where ``origin`` appears in
+    the same clause as a genuinely missing repo-shaped path must still
+    escalate -- the ``origin`` mention must NOT neutralize the dispatch
+    target. This is the exact false-negative (cross-repo contamination) the
+    module exists to prevent.
+
+    The body deliberately puts ``origin/main`` in the same clause (no
+    clause-boundary punctuation before the path) as the dispatch target, so
+    the old unscoped ``origin`` marker would have neutralized it. With
+    ``origin`` removed from ``_EVIDENCE_MARKER_RE`` the candidate survives
+    and the gate escalates."""
     repo = tmp_path / "repo"
     _init_git_repo_with_var_gitignore(repo)
-    evidence_path = "llibrary/docs/analyses/note.json"
-    body = f"Origin: {evidence_path}"
+    (repo / "src").mkdir()  # real, non-ignored top-level dir -- keeps the
+    # candidate genuinely repo-shaped-but-missing rather than tripping the
+    # single-candidate ambiguous-fragment exception.
+    dispatch_target = "src/charlie_work/nonexistent.py"
+    body = f"After merging origin/main the bug in `{dispatch_target}` still reproduces."
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is True
-    assert result.referenced_paths == ()
-    assert result.missing_paths == ()
-    assert result.neutral_paths == (evidence_path,)
-    assert "abstaining" in result.reason
+    assert result.passed is False
+    assert result.referenced_paths == (dispatch_target,)
+    assert result.missing_paths == (dispatch_target,)
+    assert result.neutral_paths == ()
+    assert "cross_repo_target" in result.reason
 
 
 def test_non_citation_heading_does_not_neutralize(tmp_path: Path) -> None:
@@ -422,3 +439,33 @@ def test_non_citation_heading_does_not_neutralize(tmp_path: Path) -> None:
     assert result.passed is False
     assert result.referenced_paths == ("src/charlie_work/nonexistent.py",)
     assert result.neutral_paths == ()
+
+
+def test_heading_containing_citation_word_as_substring_does_not_neutralize(
+    tmp_path: Path,
+) -> None:
+    """Review finding (PR #1584 round 1): the citation-section heading regex
+    is anchored so a heading that merely *contains* a citation word as a
+    substring does NOT neutralize paths under it. ``## Code References That
+    Must Change`` contains ``references`` as a word, but the heading's core
+    meaning is about code that must change -- the paths listed under it are
+    genuine dispatch targets, not citations. The old unanchored
+    ``\\b...\\b`` search regex would have neutralized them; the anchored
+    ``^...$`` regex does not."""
+    repo = tmp_path / "repo"
+    _init_git_repo_with_var_gitignore(repo)
+    (repo / "src").mkdir()  # real, non-ignored top-level dir -- keeps the
+    # candidate genuinely repo-shaped-but-missing rather than tripping the
+    # single-candidate ambiguous-fragment exception.
+    dispatch_target = "src/charlie_work/nonexistent.py"
+    body = (
+        f"## Code References That Must Change\n\nThe primary fix target is `{dispatch_target}`.\n"
+    )
+
+    result = cross_repo_gate(body, repo)
+
+    assert result.passed is False
+    assert result.referenced_paths == (dispatch_target,)
+    assert result.missing_paths == (dispatch_target,)
+    assert result.neutral_paths == ()
+    assert "cross_repo_target" in result.reason

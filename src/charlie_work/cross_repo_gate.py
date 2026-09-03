@@ -58,16 +58,19 @@ production:
   the same signal by construction — nothing under a gitignored path is a
   dispatch target in the first place.
 - **Citation-section headings** (issue #1583) — a candidate whose nearest
-  preceding markdown ``#``-heading matches ``provenance``, ``references``,
-  ``sources``, or ``see also`` is being cited as evidence, not named as
-  code to edit. A bullet list under a ``## Provenance`` heading is this
-  fleet's house style for exactly this kind of citation
+  preceding markdown ``#``-heading *is* (not merely contains) ``provenance``,
+  ``references``, ``sources``, or ``see also`` is being cited as evidence,
+  not named as code to edit. A bullet list under a ``## Provenance`` heading
+  is this fleet's house style for exactly this kind of citation
   (``- Numbers: raw/analyses/.../foo.json (live)``), and none of the
   clause-local marker words appear in a typical provenance bullet — so the
   most common citation shape in this repo's own issues was invisible to the
   neutral classifier and escalated at campaign scale. Section scope is a
   stronger signal than a clause-local word and is derived from the body's
-  own structure rather than from prose.
+  own structure rather than from prose. The heading match is anchored so a
+  heading like ``## Code References That Must Change`` (which contains
+  ``references`` as a substring) does NOT neutralize the genuine dispatch
+  targets listed under it.
 
 All three shapes are classified **neutral**: excluded from the pass/escalate
 decision and reported separately (``CrossRepoGateResult.neutral_paths``)
@@ -173,15 +176,24 @@ _GLOB_METACHAR = re.compile(r"[*?\[\]]")
 # are unambiguously about *authority/rationale for the issue*, never about
 # *where the bug lives*, stay in this list.
 #
-# Issue #1583: ``provenance`` and ``origin`` were added. A bullet under a
-# ``## Provenance`` heading is this fleet's house style for citing the
-# evidence behind an issue (``- Evidence: raw/analyses/.../foo.json``), and
-# ``provenance``/``origin`` are the clause-local words that introduce such a
-# citation when the heading itself is not present. They are not words a bug
-# report uses to pinpoint code the worker must edit, so they do not open the
-# false-negative direction the way "see"/"per" do.
+# Issue #1583: ``provenance`` was added. A bullet under a ``## Provenance``
+# heading is this fleet's house style for citing the evidence behind an issue
+# (``- Evidence: raw/analyses/.../foo.json``), and ``provenance`` is the
+# clause-local word that introduces such a citation when the heading itself
+# is not present. It is not a word a bug report uses to pinpoint code the
+# worker must edit, so it does not open the false-negative direction the way
+# "see"/"per" do.
+#
+# ``origin`` was considered and rejected: it is an ordinary git-remote name
+# (``origin/main``, ``git push origin``) that appears constantly in issue
+# bodies near genuine dispatch targets. Adding it as a clause-local marker
+# false-positives on that usage and neutralizes a real cross-repo target --
+# the exact false-negative this module exists to prevent. The
+# citation-section heading (``## Provenance`` / ``## References`` / ``## Sources``
+# / ``## See Also``) and the ``provenance`` clause-local marker already cover
+# the #1583 citation shape; ``origin`` is redundant with them and unsafe.
 _EVIDENCE_MARKER_RE = re.compile(
-    r"\b(?:authority|evidence|cited\s+in|rationale|provenance|origin)\b",
+    r"\b(?:authority|evidence|cited\s+in|rationale|provenance)\b",
     re.IGNORECASE,
 )
 
@@ -241,15 +253,24 @@ _CLAUSE_BOUNDARY_RE = re.compile(r"[.;,()]")
 _HEADING_LINE_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$", re.MULTILINE)
 
 # Citation-section heading vocabulary (issue #1583): a candidate whose
-# nearest preceding ``#``-heading matches one of these words is neutral.
-# These are the fleet's house-style headings for evidence/reference sections
-# (``## Provenance``, ``## References``, ``## Sources``, ``## See Also``) --
-# a path under such a heading is being cited, not named as code to edit.
+# nearest preceding ``#``-heading is essentially one of these phrases is
+# neutral. These are the fleet's house-style headings for evidence/reference
+# sections (``## Provenance``, ``## References``, ``## Sources``, ``## See Also``)
+# -- a path under such a heading is being cited, not named as code to edit.
 # ``see also`` is two words and is matched as a phrase so a heading like
 # ``## See Also`` (the fleet's cross-ref section) is caught but a heading
 # like ``## See the bug`` is not.
+#
+# The regex is anchored with ``^...$`` so it matches only when the heading
+# text *is* the citation phrase (optionally with a trailing ``:`` or ``.``),
+# not when the heading merely *contains* one of the words as a substring.
+# An unanchored ``\b...\b`` search would false-positive on headings like
+# ``## Code References That Must Change`` -- neutralizing genuine dispatch
+# targets listed under them -- which is the exact cross-repo-contamination
+# risk this module exists to prevent. Review finding (PR #1584 round 1):
+# the original unanchored regex substring-matched inside any heading text.
 _CITATION_SECTION_HEADING_RE = re.compile(
-    r"\b(?:provenance|references|sources|see\s+also)\b",
+    r"^\s*(?:provenance|references|sources|see\s+also)\s*[:.]?\s*$",
     re.IGNORECASE,
 )
 
@@ -289,16 +310,21 @@ def _is_in_citation_section(text_before_in_body: str) -> bool:
     """Return ``True`` when the candidate's enclosing markdown section is a
     citation section (issue #1583).
 
-    A citation section is one whose nearest preceding ``#``-heading matches
-    the citation-heading vocabulary (``provenance``, ``references``,
-    ``sources``, ``see also``). Section scope is a stronger signal than a
-    clause-local marker word: a bullet under ``## Provenance`` is being
-    cited as evidence regardless of whether ``provenance``/``evidence``
-    appears in the bullet's own clause, because the heading itself declares
-    the section's purpose. The signal is derived from the body's own
-    structure rather than from prose, so it catches the fleet's house-style
-    citation shape (``- Numbers: raw/analyses/.../foo.json (live)``) that
-    no clause-local marker word introduces.
+    A citation section is one whose nearest preceding ``#``-heading *is*
+    (not merely contains) one of the citation-heading phrases
+    (``provenance``, ``references``, ``sources``, ``see also``), optionally
+    with a trailing ``:`` or ``.``. The heading regex is anchored so a
+    heading like ``## Code References That Must Change`` -- which contains
+    ``references`` as a substring -- does NOT match: the paths under it are
+    genuine dispatch targets, not citations. Section scope is a stronger
+    signal than a clause-local marker word: a bullet under ``## Provenance``
+    is being cited as evidence regardless of whether
+    ``provenance``/``evidence`` appears in the bullet's own clause, because
+    the heading itself declares the section's purpose. The signal is derived
+    from the body's own structure rather than from prose, so it catches the
+    fleet's house-style citation shape (``- Numbers:
+    raw/analyses/.../foo.json (live)``) that no clause-local marker word
+    introduces.
     """
     heading = _nearest_preceding_heading(text_before_in_body)
     if heading is None:
