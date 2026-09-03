@@ -31,6 +31,7 @@ from .api_worker import launch_api_worker
 from .devin_shell import launch_devin_session
 from .checks import (
     CheckSummary,
+    compute_ratchetable_points,
     is_infra_blocked_check,
     summarize_checks,
 )
@@ -88,15 +89,11 @@ from .markdown_fence import fenced_block
 from .module_map import build_module_map
 from .attachment_contracts import baseline as attachment_baseline
 from .attachment_contracts import hook_entry as attachment_hook_entry
-from .attachment_contracts.archetypes import scan_tree as _scan_tree
-from .attachment_contracts.excludes import load_excludes as _load_excludes
 from .attachment_contracts.model import AdvisoryRecord
 from .attachment_contracts.review_delta import (
     BudgetSection,
     build_budget_findings,
-    compute_ratchetable,
     reconstruct_baseline_head_text,
-    RatchetablePoint,
 )
 
 # LOAD-BEARING RE-EXPORT -- NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -14401,9 +14398,11 @@ class OrchestratorApp:
             # reflects PR-head member counts, not the base checkout's.
             # Advisory-only: any failure degrades to no ratchetable rows,
             # never raises -- mirroring the existing baseline-load
-            # try/except above.
-            ratchetable = self._compute_ratchetable_points(
-                diff, head_baseline_text, hosts_baselined, changed_files
+            # try/except above. Lives in ``checks.py`` (the attachment-
+            # contracts tool's redirect destination) to keep
+            # ``OrchestratorApp`` at its baselined member-count ceiling.
+            ratchetable = compute_ratchetable_points(
+                self.repo_root, diff, head_baseline_text, hosts_baselined, changed_files
             )
             section = build_budget_findings(
                 base_baseline_text=base_baseline_text,
@@ -14415,55 +14414,6 @@ class OrchestratorApp:
             )
 
         return render_attachment_budget_section(section)
-
-    def _compute_ratchetable_points(
-        self,
-        diff: str,
-        head_baseline_text: str | None,
-        hosts_baselined: set[str],
-        changed_files: frozenset[str],
-    ) -> tuple[RatchetablePoint, ...]:
-        """Compute ratchetable attachment points for the review packet (#1539).
-
-        For each touched baselined host file, reconstructs the PR-head source
-        from the base file on disk + the diff hunks, then runs a scan with
-        ``content_overrides`` so the scan reflects PR-head member counts.
-        Points whose live member count is strictly below their frozen baseline
-        are ratchetable -- the review packet renders a remedy row instructing
-        the worker to run ``baseline --ratchet`` and commit the tightening.
-
-        Advisory-only: any failure (missing file, reconstruction mismatch,
-        parse error, tamper-guard trip) degrades to an empty tuple, never
-        raises -- the rest of the budget section still renders.
-        """
-        try:
-            content_overrides: dict[str, str] = {}
-            diff_hunks_by_name = {
-                name: (is_new, hunks) for name, is_new, hunks in iter_diff_files(diff)
-            }
-            for host_file in hosts_baselined:
-                entry = diff_hunks_by_name.get(host_file)
-                if entry is None:
-                    continue
-                is_new, hunks = entry
-                if is_new:
-                    base_content: str | None = None
-                else:
-                    try:
-                        base_content = (self.repo_root / host_file).read_text(encoding="utf-8")
-                    except OSError:
-                        continue
-                head_content = reconstruct_baseline_head_text(base_content, "\n".join(hunks))
-                if head_content is not None:
-                    content_overrides[host_file] = head_content
-            if not content_overrides:
-                return ()
-            excludes = _load_excludes(self.repo_root)
-            scan = _scan_tree(self.repo_root, excludes, content_overrides=content_overrides)
-            head_document = attachment_baseline.loads(head_baseline_text)
-            return compute_ratchetable(scan.points, head_document, changed_files)
-        except Exception:
-            return ()
 
     def _build_prior_review_section(
         self,

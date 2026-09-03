@@ -4,7 +4,17 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from .attachment_contracts import baseline as attachment_baseline
+from .attachment_contracts.archetypes import scan_tree
+from .attachment_contracts.excludes import load_excludes
+from .attachment_contracts.review_delta import (
+    RatchetablePoint,
+    compute_ratchetable,
+    reconstruct_baseline_head_text,
+)
 
 if TYPE_CHECKING:
     from .config import InfraBlockedConfig
@@ -643,3 +653,68 @@ def classify_infra_failures(
         infra_rerun_attempts=attempts_state,
         definitive_failed=tuple(definitive_failed),
     )
+
+
+def compute_ratchetable_points(
+    repo_root: Path,
+    diff: str,
+    head_baseline_text: str | None,
+    hosts_baselined: set[str],
+    changed_files: frozenset[str],
+) -> tuple[RatchetablePoint, ...]:
+    """Compute ratchetable attachment points for the review packet (#1539).
+
+    Redirected here from ``OrchestratorApp`` (issue #1539 rework) to keep
+    ``OrchestratorApp`` at or below its baselined member-count ceiling --
+    ``attachment_contracts.review_delta`` is pure-only by its own module
+    contract (no I/O, no AST), and this function does both (reads base host
+    files from disk and runs an AST scan), so ``checks.py`` -- the
+    attachment-contracts tool's own redirect destination -- is the correct
+    home. ``repo_root`` is a parameter so the function is self-contained and
+    testable without an ``OrchestratorApp`` instance.
+
+    For each touched baselined host file, reconstructs the PR-head source
+    from the base file on disk + the diff hunks, then runs a scan with
+    ``content_overrides`` so the scan reflects PR-head member counts.
+    Points whose live member count is strictly below their frozen baseline
+    are ratchetable -- the review packet renders a remedy row instructing
+    the worker to run ``baseline --ratchet`` and commit the tightening.
+
+    Advisory-only: any failure (missing file, reconstruction mismatch,
+    parse error, tamper-guard trip) degrades to an empty tuple, never
+    raises -- the rest of the budget section still renders.
+
+    ``iter_diff_files`` is imported lazily because ``janitor`` imports from
+    this module at load time (``checks`` -> ``janitor`` -> ``checks`` would
+    cycle); by the time this function runs, ``janitor`` is fully loaded.
+    """
+    try:
+        from .janitor import iter_diff_files  # deferred: janitor imports from checks
+
+        content_overrides: dict[str, str] = {}
+        diff_hunks_by_name = {
+            name: (is_new, hunks) for name, is_new, hunks in iter_diff_files(diff)
+        }
+        for host_file in hosts_baselined:
+            entry = diff_hunks_by_name.get(host_file)
+            if entry is None:
+                continue
+            is_new, hunks = entry
+            if is_new:
+                base_content: str | None = None
+            else:
+                try:
+                    base_content = (repo_root / host_file).read_text(encoding="utf-8")
+                except OSError:
+                    continue
+            head_content = reconstruct_baseline_head_text(base_content, "\n".join(hunks))
+            if head_content is not None:
+                content_overrides[host_file] = head_content
+        if not content_overrides:
+            return ()
+        excludes = load_excludes(repo_root)
+        scan = scan_tree(repo_root, excludes, content_overrides=content_overrides)
+        head_document = attachment_baseline.loads(head_baseline_text)
+        return compute_ratchetable(scan.points, head_document, changed_files)
+    except Exception:
+        return ()
