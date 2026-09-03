@@ -61,6 +61,16 @@ the robust bound against a retry loop, not this stdin flag; (b) the
 ``.venv`` is missing -- a missing interpreter is treated as fail-OPEN (the
 Stop hook simply cannot launch), which is the intentionally safe direction
 for an environment-setup failure that is not this gate's job to diagnose.
+That command line anchors both the interpreter and this script to
+``$CLAUDE_PROJECT_DIR`` (the harness-exported project root) rather than
+the hook process's cwd: Claude Code runs hooks from the session's
+*current* directory, which drifts whenever a compound command ``cd``s
+into a worktree, and a cwd-relative ``.venv/...`` then resolves against a
+tree that has no venv and dies with bash's "No such file or directory" on
+every subsequent turn (observed 2026-09-03 in job-cannon, which ports
+this gate). ``tests/test_worker_stop_gate.py`` pins that invariant: every
+path token in the command must be absolute once ``$CLAUDE_PROJECT_DIR``
+is expanded.
 A third, empirically-confirmed limitation (review round, #1259; resolved as
 #1306): scoping ruff to "changed" files did not distinguish a file this
 session just wrote from pre-existing untracked debris sitting in a
