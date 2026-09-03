@@ -329,7 +329,16 @@ def _test_module_point(tree: ast.Module, path: str) -> AttachmentPoint:
         if _is_def(node) and node.name.startswith("test_"):
             members.append(node.name)
         elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-            members.append(node.name)
+            # Each test-prefixed direct FunctionDef/AsyncFunctionDef child of
+            # a top-level Test* class counts as one member (lexical, no MRO
+            # walk), consistent with the `class` archetype's own semantics at
+            # `_class_points` (line 276: every direct def in a class body).
+            # The old rule contributed exactly one member -- the class's own
+            # name -- and never inspected its methods, so a Test* class with
+            # 40 test methods counted the same as an empty one (issue #1540).
+            for child in node.body:
+                if _is_def(child) and child.name.startswith("test_"):
+                    members.append(child.name)
     return AttachmentPoint(
         kind="test_module", identity=f"{path}::module", file=path, members=tuple(members)
     )
