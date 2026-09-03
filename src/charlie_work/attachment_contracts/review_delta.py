@@ -20,7 +20,13 @@ from charlie_work.attachment_contracts.baseline import (
     loads,
     new_bumps,
 )
-from charlie_work.attachment_contracts.model import AdvisoryRecord, BaselineEntry, Bump
+from charlie_work.attachment_contracts.model import (
+    AdvisoryRecord,
+    AttachmentPoint,
+    BaselineEntry,
+    Bump,
+    Kind,
+)
 
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -99,6 +105,27 @@ def reconstruct_baseline_head_text(base_text: str | None, file_diff: str) -> str
 
 
 @dataclass(frozen=True)
+class RatchetablePoint:
+    """A baselined attachment point whose live member count is strictly below
+    its frozen baseline (issue #1539).
+
+    The review packet renders a ratchet-remedy row for each such point,
+    instructing the worker to run ``baseline --ratchet`` and commit the
+    resulting ``.attachment-budgets.json`` tightening in the same PR. A
+    lowered count is a ratchet, not a bump -- G4 (workers may not self-ack
+    bumps) governs raises only; CI re-verifies ``actual <= baseline``
+    deterministically from the scan, so there is nothing for a worker to
+    launder by self-committing a decrease.
+    """
+
+    kind: Kind
+    identity: str
+    file: str
+    baseline_members: int
+    live_count: int
+
+
+@dataclass(frozen=True)
 class BudgetSection:
     """Structured findings for the ``$attachment_budget_section`` packet block."""
 
@@ -106,6 +133,7 @@ class BudgetSection:
     blocking_bumps: tuple[tuple[BaselineEntry, Bump], ...]
     saturated_touched: tuple[BaselineEntry, ...]
     redirects_not_taken: tuple[AdvisoryRecord, ...]
+    ratchetable: tuple[RatchetablePoint, ...] = ()
     head_unreadable: bool = False
     advisories_unavailable: bool = False
 
@@ -117,6 +145,7 @@ def build_budget_findings(
     changed_files: frozenset[str],
     baseline_touched: bool,
     advisories: tuple[AdvisoryRecord, ...] | None = None,
+    ratchetable: tuple[RatchetablePoint, ...] = (),
 ) -> BudgetSection:
     """Build the structured findings for the review packet's budget section.
 
@@ -131,6 +160,12 @@ def build_budget_findings(
     ``advisories is None`` means the advisories log was unavailable for this
     PR -- ``advisories_unavailable`` is set and redirects-not-taken is left
     empty (it cannot be computed without the log).
+
+    ``ratchetable`` (issue #1539) is the pre-computed tuple of baselined
+    points whose live member count is strictly below their frozen baseline.
+    The caller (``_build_attachment_budget_section`` in ``workflow.py``)
+    computes this from a PR-head scan -- this function stays pure (no AST,
+    no scan) and just passes the tuple through to the ``BudgetSection``.
     """
 
     def _load(text: str | None) -> dict[str, object]:
@@ -183,6 +218,47 @@ def build_budget_findings(
         blocking_bumps=blocking_bumps,
         saturated_touched=saturated_touched,
         redirects_not_taken=redirects_not_taken,
+        ratchetable=ratchetable,
         head_unreadable=False,
         advisories_unavailable=advisories_unavailable,
     )
+
+
+def compute_ratchetable(
+    scan_points: tuple[AttachmentPoint, ...],
+    head_document: dict[str, object],
+    changed_files: frozenset[str],
+) -> tuple[RatchetablePoint, ...]:
+    """Compute the ratchetable-point tuple for the review packet (issue #1539).
+
+    Pure: takes already-scanned ``AttachmentPoint`` objects (the caller in
+    ``workflow.py`` runs the scan with PR-head ``content_overrides`` for
+    touched baselined hosts) and the head baseline document, returns every
+    baselined point whose live member count is strictly below its frozen
+    baseline AND whose host file is in ``changed_files`` -- a shrink that
+    happened in this PR, not a stale un-ratcheted point from a prior PR.
+
+    Member counts only -- no line-count arithmetic of any kind (this
+    package's binding operator constraint).
+    """
+    baseline_by_key: dict[tuple[str, str, str], BaselineEntry] = {
+        (e.kind, e.file, e.identity): e for e in entries_of(head_document)
+    }
+    result: list[RatchetablePoint] = []
+    for point in scan_points:
+        entry = baseline_by_key.get((point.kind, point.file, point.identity))
+        if entry is None:
+            continue
+        if point.file not in changed_files:
+            continue
+        if point.member_count < entry.member_count:
+            result.append(
+                RatchetablePoint(
+                    kind=point.kind,
+                    identity=point.identity,
+                    file=point.file,
+                    baseline_members=entry.member_count,
+                    live_count=point.member_count,
+                )
+            )
+    return tuple(sorted(result, key=lambda r: (r.kind, r.file, r.identity)))

@@ -31,6 +31,7 @@ from .api_worker import launch_api_worker
 from .devin_shell import launch_devin_session
 from .checks import (
     CheckSummary,
+    compute_ratchetable_points,
     is_infra_blocked_check,
     summarize_checks,
 )
@@ -14391,12 +14392,25 @@ class OrchestratorApp:
                 advisories = attachment_hook_entry.read_advisories(self.repo_root)
             else:
                 advisories = None
+            # Issue #1539: compute ratchetable points (live member count
+            # below baseline) for touched baselined hosts. The scan runs
+            # with content_overrides for the touched host files so it
+            # reflects PR-head member counts, not the base checkout's.
+            # Advisory-only: any failure degrades to no ratchetable rows,
+            # never raises -- mirroring the existing baseline-load
+            # try/except above. Lives in ``checks.py`` (the attachment-
+            # contracts tool's redirect destination) to keep
+            # ``OrchestratorApp`` at its baselined member-count ceiling.
+            ratchetable = compute_ratchetable_points(
+                self.repo_root, diff, head_baseline_text, hosts_baselined, changed_files
+            )
             section = build_budget_findings(
                 base_baseline_text=base_baseline_text,
                 head_baseline_text=head_baseline_text,
                 changed_files=changed_files,
                 baseline_touched=baseline_touched,
                 advisories=advisories,
+                ratchetable=ratchetable,
             )
 
         return render_attachment_budget_section(section)
