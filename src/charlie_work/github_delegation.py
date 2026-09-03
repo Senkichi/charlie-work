@@ -91,6 +91,13 @@ def _build_routes() -> tuple[dict[str, str], dict[str, Callable[..., Any]]]:
     signature_source: dict[str, Callable[..., Any]] = {}
     for collab_attr, collab_cls in _COLLABORATORS:
         for name, member in _routable_members(collab_cls):
+            if name in routes:
+                raise ValueError(
+                    f"capability routing collision: {name!r} is declared by both "
+                    f"{routes[name]!r} and {collab_attr!r}; each routed member must "
+                    f"belong to exactly one collaborator (last-writer-wins would "
+                    f"silently drop one route otherwise)"
+                )
             routes[name] = collab_attr
             signature_source[name] = member
     return routes, signature_source

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import charlie_work.github as _github_module
+import charlie_work.github_capabilities as _github_capabilities
 from charlie_work.github import GitHub, GitHubLike, _make_delegate, _ROUTES
 from charlie_work.github_capabilities import (
     ChecksLike,
@@ -308,3 +309,33 @@ def test_make_delegate_preserves_signature_and_forwards_call(
     assert calls == [("world", True)]
 
     _compatible_signature(inspect.signature(_FakeSource.greet), inspect.signature(delegate))
+
+
+def test_every_capability_module_declares_future_annotations() -> None:
+    """Every ``github_capabilities`` module must have ``from __future__ import
+    annotations`` (design doc Section 3.1).
+
+    Delegate signature fidelity depends on it: the future import keeps a moved
+    method's annotations as *strings*, so ``inspect.signature(GitHub.<name>)``
+    (copied verbatim by ``_make_delegate``) matches the sub-protocol's
+    stringized annotation under ``_compatible_signature``. Drop the import from
+    a future collaborator module and its annotations become live objects,
+    silently breaking the L02+ conformance path (the failure mode is a
+    ``'None'``-vs-``None`` return-annotation mismatch). Nothing else enforces
+    this, so assert it structurally across the whole package.
+    """
+    pkg_dir = Path(_github_capabilities.__file__).parent
+    modules = sorted(pkg_dir.glob("*.py"))
+    assert modules, "no github_capabilities modules found to check"
+    for path in modules:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        has_future_annotations = any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "__future__"
+            and any(alias.name == "annotations" for alias in node.names)
+            for node in tree.body
+        )
+        assert has_future_annotations, (
+            f"{path.name} is missing `from __future__ import annotations` "
+            f"(required by design doc Section 3.1 for delegate signature fidelity)"
+        )
