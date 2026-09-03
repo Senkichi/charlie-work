@@ -116,6 +116,20 @@ def render_attachment_budget_section(section: BudgetSection | None) -> str:
             f"{record.message}"
         )
 
+    for point in section.ratchetable:
+        lines.append(
+            f"- {point.identity} ({point.file}): live member count "
+            f"{point.live_count} is below baseline {point.baseline_members} -- "
+            "a ratchet, not a bump. Run `python -m charlie_work.attachment_contracts "
+            "baseline --ratchet` and commit the resulting `.attachment-budgets.json` "
+            "tightening in this PR -- the command is lower-only (it never raises a "
+            "baseline entry), so it is safe to run mid-PR. A lowered count is a "
+            "ratchet, not tamper: G4 (workers may not self-ack bumps) governs raises "
+            "only -- CI re-verifies `actual <= baseline` deterministically from the "
+            "scan, so there is nothing for a worker to launder by self-committing a "
+            "decrease."
+        )
+
     if section.head_unreadable:
         lines.append(
             "- NOTE: could not evaluate .attachment-budgets.json at PR head; "

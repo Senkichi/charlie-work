@@ -101,6 +101,19 @@ flagging an over-cap addition.
 
 $over_cap_section
 
+## Attachment-point ratchet
+
+A lowered attachment-point member count in a PR is a ratchet, not tamper --
+do not block or flag it for review. The `baseline --ratchet` command is
+lower-only (it never raises a baseline entry), so a worker committing a
+`.attachment-budgets.json` tightening alongside a shrink is doing exactly
+what the ratchet remedy instructs (#1539, mirroring the file-size ratchet
+remedy from #1496/#1528). G4 (workers may not self-ack bumps) governs
+raises only -- CI re-verifies `actual <= baseline` deterministically from
+the scan, so there is nothing for a worker to launder by self-committing a
+decrease. If the `$attachment_budget_section` below renders a ratchet row
+for a shrunk point, treat it as expected cleanup, not a finding.
+
 $attachment_budget_section
 
 ## Approval criteria
