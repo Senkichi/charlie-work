@@ -19,6 +19,7 @@ from typing import Any
 from .ast_equivalence_gate import (
     GateResult,
     StaleShim,
+    derive_copied_symbols,
     derive_moved_symbols,
     extract_symbols,
     find_stale_facade_shims,
@@ -153,6 +154,59 @@ def _build_symbol_maps(
     return base_maps, head_maps
 
 
+def _merge_unchanged_src_symbols(
+    base_maps: dict[str, dict[str, str]],
+    head_maps: dict[str, dict[str, str]],
+    repo_root: Path,
+    changed_files: list[str],
+) -> None:
+    """Merge unchanged ``src/**/*.py`` files into both symbol maps in place.
+
+    ``derive_moved_symbols`` only needs changed files (a move is a
+    removal+addition, both visible in the changed set).  But
+    ``derive_copied_symbols`` matches an ADDED symbol against the SURVIVING
+    original, which lives in an UNCHANGED file (the two-copy extraction
+    pattern: the original is retained, so it never appears in the diff).  The
+    #1544 Stage 1 extraction is exactly this -- ``no_console_window_kwargs`` is
+    copied into ``attachment_contracts/_windows.py`` while
+    ``charlie_work/subprocess_runner.py`` keeps its copy unchanged -- so
+    without the unchanged files in the maps, the gate reports zero copied
+    symbols for the very diff it was built to self-prove against (round-1
+    review finding #4).
+
+    For an unchanged file, base == head == the working-tree version, so a
+    single read populates both maps identically (no ``git show`` needed).
+    Unchanged files contribute no removals and no additions, so they do not
+    perturb ``derive_moved_symbols`` (a symbol present in both base and head of
+    the same file is neither removed nor added).
+    """
+    changed_set = set(changed_files)
+    src_root = repo_root / "src"
+    if not src_root.is_dir():
+        return
+    for py_file in src_root.rglob("*.py"):
+        rel = py_file.relative_to(repo_root).as_posix()
+        if rel in changed_set:
+            continue  # already in the maps via _build_symbol_maps
+        if _is_under_excluded_dir(py_file.relative_to(repo_root).parts):
+            continue
+        source = _read_working_tree_file(repo_root, rel)
+        if source is None:
+            continue
+        try:
+            syms = extract_symbols(source, filename=rel)
+        except SyntaxError:
+            continue
+        base_maps.setdefault(rel, syms)
+        head_maps.setdefault(rel, syms)
+
+
+def _is_under_excluded_dir(rel_parts: tuple[str, ...]) -> bool:
+    """Skip non-source directory components (mirrors the gate's vulture sweep)."""
+    _EXCLUDED = frozenset({".venv", ".git", "__pycache__", "build", "dist"})
+    return any(part in _EXCLUDED for part in rel_parts[:-1])
+
+
 def _generate_shim_files(moved: list, repo_root: Path, out_dir: str) -> list[str]:
     """Generate PEP 562 facade shims for each module symbols moved OUT of.
 
@@ -218,6 +272,17 @@ def run_ast_equivalence_check_command(
 
     moved = derive_moved_symbols(base_maps, head_maps)
 
+    # Copy detection (round-1 review finding #4): ``derive_moved_symbols``
+    # only sees removal+addition pairs, so a two-copy extraction (original
+    # retained, e.g. #1544 Stage 1) produces zero moved symbols.  Merge the
+    # UNCHANGED src/ files into the maps so ``derive_copied_symbols`` can
+    # match added symbols against surviving originals in unchanged files.
+    # This is what evidences the gate's self-proving requirement (graft G) for
+    # the #1544 extraction.  Unchanged files do not perturb ``moved`` (no
+    # removals/additions), so this is safe to do unconditionally.
+    _merge_unchanged_src_symbols(base_maps, head_maps, ctx.repo_root, changed_files)
+    copied = derive_copied_symbols(base_maps, head_maps)
+
     # PEP 562 facade shim generation (production call site for
     # generate_pep562_shim_source). On-demand: the relocation PR author passes
     # --generate-shims DIR to emit compat shims for each module symbols moved
@@ -248,6 +313,7 @@ def run_ast_equivalence_check_command(
         moved_symbols=tuple(moved),
         stale_shims=tuple(stale),
         base=base,
+        copied_symbols=tuple(copied),
     )
 
     packet = render_review_packet(result)
@@ -291,17 +357,32 @@ def run_ast_equivalence_check_command(
             }
             for s in result.stale_shims
         ],
+        "copied_symbols": [
+            {
+                "name": s.name,
+                "source_file": s.source_file,
+                "dest_file": s.dest_file,
+                "source_class": s.source_class,
+                "dest_class": s.dest_class,
+                "equivalent": s.equivalent,
+            }
+            for s in result.copied_symbols
+        ],
         "generated_shims": generated_shims,
     }
 
     # Always ok=True: the packet is evidence, not enforcement (graft C).
     eq = len(result.equivalent_moves)
     neq = len(result.non_equivalent_moves)
+    cpy_eq = len(result.equivalent_copies)
+    cpy_neq = len(result.non_equivalent_copies)
     stale_count = len(result.stale_shims)
     shim_count = len(generated_shims)
     message = (
         f"ast-equivalence-check: {eq} equivalent move(s), "
-        f"{neq} non-equivalent move(s), {stale_count} stale shim(s), "
+        f"{neq} non-equivalent move(s), "
+        f"{cpy_eq} verbatim copy(ies), {cpy_neq} non-equivalent copy(ies), "
+        f"{stale_count} stale shim(s), "
         f"{shim_count} shim(s) generated (diff against {base})"
     )
     return CommandResult(True, message, data)

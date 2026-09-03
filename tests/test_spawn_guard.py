@@ -12,7 +12,37 @@ from pathlib import Path
 import charlie_work
 
 HELPER_NAMES = {"no_console_window_kwargs", "hidden_console_kwargs"}
+# Module name components from which the spawn helpers may be imported via a
+# ``from <module> import <helper>``.  A from-import of a ``HELPER_NAMES`` entry
+# is only recognized as a helper reference when the module matches one of
+# these components on a dotted boundary -- accepting the helper name from ANY
+# module (the prior round-1 relaxation) would let an unrelated ``from foo import
+# no_console_window_kwargs`` silently satisfy the guard (issue #1544 review:
+# narrow the relaxation back to the two modules that actually define the
+# helper: ``charlie_work.subprocess_runner`` and the inlined
+# ``charlie_work.attachment_contracts._windows``).
+#
+# Matching is a dotted-boundary check, NOT a raw string ``endswith``: a module
+# is accepted only when it equals the component exactly or ends with
+# ``"." + component``.  This rejects look-alike modules such as
+# ``evil_subprocess_runner`` whose name merely ends with the literal suffix
+# but is separated by an underscore, not a dot (issue #1544 round-2 review).
+HELPER_MODULE_SUFFIXES = ("subprocess_runner", "attachment_contracts._windows")
 ALLOWLIST_RE = re.compile(r"#\s*spawn-guard:\s*allow")
+
+
+def _module_matches_helper_suffix(module: str) -> bool:
+    """Return True if ``module`` matches a helper module on a dotted boundary.
+
+    A raw ``str.endswith`` would accept ``evil_subprocess_runner`` as matching
+    the ``subprocess_runner`` suffix.  The dotted-boundary check requires the
+    character preceding the suffix (if any) to be a ``.``, so only
+    ``subprocess_runner`` or ``<pkg>.subprocess_runner`` style names match.
+    """
+    return any(
+        module == suffix or module.endswith("." + suffix) for suffix in HELPER_MODULE_SUFFIXES
+    )
+
 
 SPAWN_ATTRS: dict[str, set[str]] = {
     "subprocess": {"run", "Popen", "check_output", "check_call", "call"},
@@ -72,7 +102,7 @@ def _collect_aliases(
                 bound = alias.asname if alias.asname else alias.name
                 if module in ("subprocess", "os") and _is_target_attr(module, alias.name):
                     func_aliases[bound] = (module, alias.name)
-                if module.endswith("subprocess_runner") and alias.name in HELPER_NAMES:
+                if alias.name in HELPER_NAMES and _module_matches_helper_suffix(module):
                     helper_names.add(bound)
                 if module == "charlie_work" and alias.name == "subprocess_runner":
                     module_aliases[bound] = "charlie_work.subprocess_runner"
@@ -354,3 +384,100 @@ def test_guard_allowlist_comment(tmp_path: Path) -> None:
     )
     violations = find_spawn_guard_violations(source_dir)
     assert violations == []
+
+
+def test_guard_accepts_helper_from_attachment_contracts_windows(tmp_path: Path) -> None:
+    """A spawn site routing through ``attachment_contracts._windows`` is accepted.
+
+    The inlined ``no_console_window_kwargs`` lives in
+    ``charlie_work.attachment_contracts._windows`` (issue #1544 Stage 1), so the
+    guard must recognize a from-import of the helper from that module suffix.
+    Without this, the in-repo ``backtest.py`` / ``__main__.py`` spawn sites
+    would be falsely flagged.
+    """
+    source_dir = tmp_path / "pkg"
+    source_dir.mkdir()
+    (source_dir / "good.py").write_text(
+        "import subprocess\n"
+        "from charlie_work.attachment_contracts._windows import "
+        "no_console_window_kwargs\n"
+        "subprocess.run(['echo'], **no_console_window_kwargs())\n",
+        encoding="utf-8",
+    )
+    violations = find_spawn_guard_violations(source_dir)
+    assert violations == [], (
+        f"helper from attachment_contracts._windows must be accepted: {violations}"
+    )
+
+
+def test_guard_rejects_helper_name_from_unrelated_module(tmp_path: Path) -> None:
+    """A helper name imported from an unrelated module does NOT satisfy the guard.
+
+    Round-1 review finding #3: the prior relaxation
+    (``if alias.name in HELPER_NAMES:`` with no module check) accepted the
+    helper name from ANY module, so ``from some.unrelated.pkg import
+    no_console_window_kwargs`` would silently satisfy the guard even though
+    that name is not the real console-suppression helper.  The narrowed check
+    only accepts the helper from modules ending in ``subprocess_runner`` or
+    ``attachment_contracts._windows``; an import from any other module is NOT
+    recognized, so the spawn site is flagged.
+
+    Mutation control: reverting to ``if alias.name in HELPER_NAMES:`` (no
+    module suffix check) makes this test fail -- the spawn site is no longer
+    flagged because the unrelated import is accepted as a helper.
+    """
+    source_dir = tmp_path / "pkg"
+    source_dir.mkdir()
+    (source_dir / "sneaky.py").write_text(
+        "import subprocess\n"
+        "from some.unrelated.pkg import no_console_window_kwargs\n"
+        "subprocess.run(['echo'], **no_console_window_kwargs())\n",
+        encoding="utf-8",
+    )
+    violations = find_spawn_guard_violations(source_dir)
+    assert len(violations) == 1, (
+        f"helper name from an unrelated module must NOT satisfy the guard; "
+        f"got {len(violations)} violation(s): {violations}"
+    )
+    assert "sneaky.py" in violations[0]
+    assert "subprocess.run" in violations[0]
+
+
+def test_guard_rejects_helper_name_from_suffix_colliding_module(tmp_path: Path) -> None:
+    """A helper name imported from a module whose name ends with the literal
+    suffix but is NOT the real allowed module does NOT satisfy the guard.
+
+    Round-2 review finding #3: the round-1 narrowing used a raw
+    ``module.endswith(HELPER_MODULE_SUFFIXES)``, which accepted
+    ``evil_subprocess_runner`` because its name ends with the literal string
+    ``subprocess_runner`` even though the separator is an underscore, not a
+    dot.  The dotted-boundary match (``module == suffix or
+    module.endswith("." + suffix)``) rejects this look-alike, so the spawn
+    site is correctly flagged.
+
+    Unlike ``test_guard_rejects_helper_name_from_unrelated_module`` (whose
+    ``some.unrelated.pkg`` module fails under both the old suffix-match and
+    the new dotted-boundary match), this test uses a module name that the old
+    raw ``endswith`` would ACCEPT -- so it proves the narrowing actually
+    rejects the suffix-collision case.
+
+    Mutation control: reverting ``_module_matches_helper_suffix`` to a raw
+    ``module.endswith(HELPER_MODULE_SUFFIXES)`` makes this test fail -- the
+    spawn site is no longer flagged because ``evil_subprocess_runner`` is
+    accepted as a helper module.
+    """
+    source_dir = tmp_path / "pkg"
+    source_dir.mkdir()
+    (source_dir / "evil.py").write_text(
+        "import subprocess\n"
+        "from evil_subprocess_runner import no_console_window_kwargs\n"
+        "subprocess.run(['echo'], **no_console_window_kwargs())\n",
+        encoding="utf-8",
+    )
+    violations = find_spawn_guard_violations(source_dir)
+    assert len(violations) == 1, (
+        f"helper name from a suffix-colliding module must NOT satisfy the guard; "
+        f"got {len(violations)} violation(s): {violations}"
+    )
+    assert "evil.py" in violations[0]
+    assert "subprocess.run" in violations[0]

@@ -38,7 +38,7 @@ from charlie_work.attachment_contracts.check import check_file, check_tree
 from charlie_work.attachment_contracts.excludes import load_excludes
 from charlie_work.attachment_contracts.model import Finding
 from charlie_work.attachment_contracts.outliers import FLOOR, saturate_all
-from charlie_work.subprocess_runner import no_console_window_kwargs
+from charlie_work.attachment_contracts._windows import no_console_window_kwargs
 
 PACKAGE_VERSION = "0.1.1"
 
