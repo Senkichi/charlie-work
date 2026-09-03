@@ -334,3 +334,34 @@ jobs:
         run: |
           set -e
           uv run charlie private-slug-check --base ${{ github.event.pull_request.base.sha }}
+      - name: AST-equivalence gate (issue 1541)
+        # PR-only: push-to-main has no diff to scan (the branch IS main).
+        #
+        # Same structural rationale as the mojibake/private-slug gates above:
+        # a step of the existing "Lint" job, not a new job, so it rides the
+        # already-required "Lint" context. No branch-protection edit, no
+        # orchestrator.config.yaml or .aviator/config.yml change, no separate
+        # promotion step.
+        #
+        # This gate is EVIDENCE, NOT ENFORCEMENT (graft C, #1538): the
+        # review packet it renders is advisory for the human reviewer.
+        # Enforcement stays in the required_checks list. The step always
+        # exits 0 (the gate command returns ok=True unconditionally) -- it
+        # only produces a step summary + stdout for the reviewer to read.
+        #
+        # Detects symbols moved between files in the PR diff and verifies
+        # each is a verbatim relocation by comparing
+        # ast.dump(node, include_attributes=False) at base vs head. Also
+        # runs a vulture stale-shim sweep against any --shim-file args.
+        # See src/charlie_work/ast_equivalence_gate.py for the full
+        # rationale, including the diff-derived moved-symbol set (graft E,
+        # rule #9) and the self-proving requirement (graft G).
+        #
+        # The base SHA is already fetched by the mojibake gate step above
+        # (same job, same fetch). shell: bash with set -e for the same
+        # reason as the mojibake gate.
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -e
+          uv run charlie ast-equivalence-check --base ${{ github.event.pull_request.base.sha }}

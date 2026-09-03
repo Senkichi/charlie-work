@@ -125,3 +125,60 @@ def test_no_pr_body_scratch_files_are_tracked() -> None:
         name for name in tracked if name.startswith("PR_BODY_") and name.endswith(".md")
     )
     assert not tracked_pr_body, f"PR-body scratch files tracked as source: {tracked_pr_body}"
+
+
+# The ad-hoc PR-body spellings worktree.py's _LAUNCHER_OWNED_PR_BODY_RE already
+# recognizes (issue #1391) but .gitignore did not, so a `_pr_body.md` (issue
+# #1541 rework) or `.pr_body_<issue>.md` (issue #1418) scratch file slipped
+# past `git add`. Each entry is (glob_in_gitignore, concrete_sample_for_check_ignore).
+_PR_BODY_VARIANT_GLOBS = (
+    ("_pr_body*.md", "_pr_body.md"),
+    (".pr_body*.md", ".pr_body_1418.md"),
+    (".worker-pr-body*.md", ".worker-pr-body.md"),
+)
+
+
+def test_pr_body_variant_globs_are_gitignored() -> None:
+    """Every ad-hoc PR-body spelling the launcher-owned regex recognizes must
+    also be gitignored.
+
+    The dirty-check regex (``_LAUNCHER_OWNED_PR_BODY_RE``) already ignores
+    these for the unsafe/dirty path, but .gitignore is a separate layer. Issue
+    #1541 committed ``_pr_body.md`` because the glob was missing here; this
+    pins the ignore-layer coverage so the same class cannot recur via ``git
+    add``.
+    """
+    gitignore = (_REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+    missing = [glob for glob, _ in _PR_BODY_VARIANT_GLOBS if glob not in gitignore]
+    assert not missing, f"PR-body variant globs not in .gitignore: {missing}"
+
+
+def test_pr_body_variant_globs_are_ignored_by_git_check_ignore() -> None:
+    """``git check-ignore`` must resolve a concrete name for each variant glob.
+
+    Exercises git's actual ignore resolution (not a substring match), so a
+    malformed pattern that fails to match is caught.
+    """
+    samples = [sample for _, sample in _PR_BODY_VARIANT_GLOBS]
+    result = subprocess.run(
+        ["git", "check-ignore", *samples],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    ignored = set(result.stdout.splitlines())
+    not_ignored = sorted(set(samples) - ignored)
+    assert not not_ignored, f"git check-ignore did not match: {not_ignored}"
+
+
+def test_no_pr_body_variant_scratch_files_are_tracked() -> None:
+    """No PR-body scratch file in any ad-hoc spelling may be tracked.
+
+    Positive control for the ``git rm`` half of the #1541 rework fix: the
+    ``_pr_body.md`` that was committed is removed, and this fails the moment
+    any variant spelling reappears as a tracked file.
+    """
+    tracked = set(_git("ls-files").splitlines())
+    samples = {sample for _, sample in _PR_BODY_VARIANT_GLOBS}
+    leaked = sorted(tracked & samples)
+    assert not leaked, f"PR-body variant scratch files tracked as source: {leaked}"
