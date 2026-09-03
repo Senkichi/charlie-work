@@ -20,6 +20,7 @@ verifies the test fails against the unfixed code.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import importlib
 import sys
@@ -605,25 +606,38 @@ def _make_run_result(stdout: str = "", ok: bool = True) -> RunResult:
     )
 
 
-def test_cli_ast_equivalence_check_detects_verbatim_move(monkeypatch, tmp_path: Path) -> None:
-    """The CLI command detects a verbatim move via git diff + AST comparison."""
+def _apply_cli_mocks(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    diff_stdout: str,
+    base_old_source: str | None,
+    generate_shims: str | None = None,
+    create_files: bool = True,
+) -> "argparse.Namespace":
+    """Apply the common ``ast-equivalence-check`` CLI mocks and return the
+    args namespace.
+
+    The four CLI tests below share an identical mock scaffold (``run_captured``
+    + ``bootstrap_command`` + working-tree files + ``argparse.Namespace``);
+    only ``diff_stdout``, ``base_old_source``, ``generate_shims`` and whether
+    working-tree files are created differ. Centralizing the scaffold keeps the
+    test file under the file-size ratchet cap without losing coverage. The
+    command reads only ``ctx.repo_root`` (never ``ctx.paths``), so the
+    bootstrap mock's ``paths`` value is immaterial.
+    """
     from charlie_work import cli as cli_module
 
     func_source = "def moved_func():\n    return 42\n"
 
-    # Mock git diff --name-only: one file removed, one added.
-    # Mock git show: base version of old.py has the function, new.py doesn't exist at base.
-    # Mock working tree reads: old.py is empty at head, new.py has the function.
-
     def mock_run_captured(cmd, cwd, timeout_seconds=60, **kw):
         if "diff" in cmd and "--name-only" in cmd:
-            return _make_run_result(stdout="src/old.py\nsrc/new.py\n")
+            return _make_run_result(stdout=diff_stdout)
         if "show" in cmd:
             ref = cmd[cmd.index("show") + 1]
             path = ref.split(":", 1)[1] if ":" in ref else ""
-            if "old.py" in path and "base" in ref:
-                return _make_run_result(stdout=func_source)
-            # new.py doesn't exist at base
+            if "old.py" in path and "base" in ref and base_old_source is not None:
+                return _make_run_result(stdout=base_old_source)
             return _make_run_result(stdout="", ok=False)
         return _make_run_result(stdout="", ok=False)
 
@@ -635,29 +649,38 @@ def test_cli_ast_equivalence_check_detects_verbatim_move(monkeypatch, tmp_path: 
         return cli_module.CommandContext(
             repo_root=tmp_path,
             config=OrchestratorConfig(),
-            paths=RuntimePaths.__new__(RuntimePaths),  # minimal
+            paths=RuntimePaths.__new__(RuntimePaths),
             gh=GitHub(repo_root=tmp_path, runtime=None, dry_run=True),
         )
 
-    # Create the working tree files.
-    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "src" / "old.py").write_text("# moved out\n", encoding="utf-8")
-    (tmp_path / "src" / "new.py").write_text(func_source, encoding="utf-8")
+    if create_files:
+        (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "src" / "old.py").write_text("# moved out\n", encoding="utf-8")
+        (tmp_path / "src" / "new.py").write_text(func_source, encoding="utf-8")
 
     monkeypatch.setattr(cli_module, "run_captured", mock_run_captured)
     monkeypatch.setattr(cli_module, "bootstrap_command", mock_bootstrap)
 
-    import argparse
-
-    args = argparse.Namespace(
+    return argparse.Namespace(
         command="ast-equivalence-check",
         base="base",
         shim_file=None,
         output=None,
+        generate_shims=generate_shims,
         repo=None,
         config=None,
         fleet_dir=None,
         dry_run=True,
+    )
+
+
+def test_cli_ast_equivalence_check_detects_verbatim_move(monkeypatch, tmp_path: Path) -> None:
+    """The CLI command detects a verbatim move via git diff + AST comparison."""
+    args = _apply_cli_mocks(
+        monkeypatch,
+        tmp_path,
+        diff_stdout="src/old.py\nsrc/new.py\n",
+        base_old_source="def moved_func():\n    return 42\n",
     )
     result = run_ast_equivalence_check_command(args)
     assert result.ok is True
@@ -668,38 +691,12 @@ def test_cli_ast_equivalence_check_detects_verbatim_move(monkeypatch, tmp_path: 
 
 def test_cli_ast_equivalence_check_always_ok(monkeypatch, tmp_path: Path) -> None:
     """The gate always returns ok=True (evidence, not enforcement -- graft C)."""
-    from charlie_work import cli as cli_module
-
-    def mock_run_captured(cmd, cwd, timeout_seconds=60, **kw):
-        if "diff" in cmd and "--name-only" in cmd:
-            return _make_run_result(stdout="")
-        return _make_run_result(stdout="", ok=False)
-
-    def mock_bootstrap(args):
-        from charlie_work.config import OrchestratorConfig
-        from charlie_work.github import GitHub
-
-        return cli_module.CommandContext(
-            repo_root=tmp_path,
-            config=OrchestratorConfig(),
-            paths=None,
-            gh=GitHub(repo_root=tmp_path, runtime=None, dry_run=True),
-        )
-
-    monkeypatch.setattr(cli_module, "run_captured", mock_run_captured)
-    monkeypatch.setattr(cli_module, "bootstrap_command", mock_bootstrap)
-
-    import argparse
-
-    args = argparse.Namespace(
-        command="ast-equivalence-check",
-        base="base",
-        shim_file=None,
-        output=None,
-        repo=None,
-        config=None,
-        fleet_dir=None,
-        dry_run=True,
+    args = _apply_cli_mocks(
+        monkeypatch,
+        tmp_path,
+        diff_stdout="",
+        base_old_source=None,
+        create_files=False,
     )
     result = run_ast_equivalence_check_command(args)
     # Even with no moves, the gate is ok=True (evidence, not enforcement).
@@ -716,52 +713,12 @@ def test_cli_ast_equivalence_check_generate_shims(monkeypatch, tmp_path: Path) -
     resolving. The generated file must contain a module-level ``__getattr__``
     re-exporting the moved symbol from its new module.
     """
-    from charlie_work import cli as cli_module
-
-    func_source = "def moved_func():\n    return 42\n"
-
-    def mock_run_captured(cmd, cwd, timeout_seconds=60, **kw):
-        if "diff" in cmd and "--name-only" in cmd:
-            return _make_run_result(stdout="src/old.py\nsrc/new.py\n")
-        if "show" in cmd:
-            ref = cmd[cmd.index("show") + 1]
-            path = ref.split(":", 1)[1] if ":" in ref else ""
-            if "old.py" in path and "base" in ref:
-                return _make_run_result(stdout=func_source)
-            return _make_run_result(stdout="", ok=False)
-        return _make_run_result(stdout="", ok=False)
-
-    def mock_bootstrap(args):
-        from charlie_work.config import OrchestratorConfig
-        from charlie_work.github import GitHub
-        from charlie_work.paths import RuntimePaths
-
-        return cli_module.CommandContext(
-            repo_root=tmp_path,
-            config=OrchestratorConfig(),
-            paths=RuntimePaths.__new__(RuntimePaths),
-            gh=GitHub(repo_root=tmp_path, runtime=None, dry_run=True),
-        )
-
-    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "src" / "old.py").write_text("# moved out\n", encoding="utf-8")
-    (tmp_path / "src" / "new.py").write_text(func_source, encoding="utf-8")
-
-    monkeypatch.setattr(cli_module, "run_captured", mock_run_captured)
-    monkeypatch.setattr(cli_module, "bootstrap_command", mock_bootstrap)
-
-    import argparse
-
-    args = argparse.Namespace(
-        command="ast-equivalence-check",
-        base="base",
-        shim_file=None,
-        output=None,
+    args = _apply_cli_mocks(
+        monkeypatch,
+        tmp_path,
+        diff_stdout="src/old.py\nsrc/new.py\n",
+        base_old_source="def moved_func():\n    return 42\n",
         generate_shims="shims",
-        repo=None,
-        config=None,
-        fleet_dir=None,
-        dry_run=True,
     )
     result = run_ast_equivalence_check_command(args)
     assert result.ok is True
@@ -781,52 +738,11 @@ def test_cli_ast_equivalence_check_no_generate_shims_by_default(
     monkeypatch, tmp_path: Path
 ) -> None:
     """Without ``--generate-shims``, no shim files are written and the list is empty."""
-    from charlie_work import cli as cli_module
-
-    func_source = "def moved_func():\n    return 42\n"
-
-    def mock_run_captured(cmd, cwd, timeout_seconds=60, **kw):
-        if "diff" in cmd and "--name-only" in cmd:
-            return _make_run_result(stdout="src/old.py\nsrc/new.py\n")
-        if "show" in cmd:
-            ref = cmd[cmd.index("show") + 1]
-            path = ref.split(":", 1)[1] if ":" in ref else ""
-            if "old.py" in path and "base" in ref:
-                return _make_run_result(stdout=func_source)
-            return _make_run_result(stdout="", ok=False)
-        return _make_run_result(stdout="", ok=False)
-
-    def mock_bootstrap(args):
-        from charlie_work.config import OrchestratorConfig
-        from charlie_work.github import GitHub
-        from charlie_work.paths import RuntimePaths
-
-        return cli_module.CommandContext(
-            repo_root=tmp_path,
-            config=OrchestratorConfig(),
-            paths=RuntimePaths.__new__(RuntimePaths),
-            gh=GitHub(repo_root=tmp_path, runtime=None, dry_run=True),
-        )
-
-    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "src" / "old.py").write_text("# moved out\n", encoding="utf-8")
-    (tmp_path / "src" / "new.py").write_text(func_source, encoding="utf-8")
-
-    monkeypatch.setattr(cli_module, "run_captured", mock_run_captured)
-    monkeypatch.setattr(cli_module, "bootstrap_command", mock_bootstrap)
-
-    import argparse
-
-    args = argparse.Namespace(
-        command="ast-equivalence-check",
-        base="base",
-        shim_file=None,
-        output=None,
-        generate_shims=None,
-        repo=None,
-        config=None,
-        fleet_dir=None,
-        dry_run=True,
+    args = _apply_cli_mocks(
+        monkeypatch,
+        tmp_path,
+        diff_stdout="src/old.py\nsrc/new.py\n",
+        base_old_source="def moved_func():\n    return 42\n",
     )
     result = run_ast_equivalence_check_command(args)
     assert result.ok is True
