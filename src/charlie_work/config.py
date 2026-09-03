@@ -272,6 +272,19 @@ class LabelConfig:
 class DispatchConfig:
     default_limit: int = 3
     branch_prefix: str = "agent/issue"
+    # Issue #1598: issue labels that mark a bound PR as human-merged — the
+    # fleet never queues or merges such a PR itself. When the bound issue
+    # carries any label in this tuple at merge-decision time, the PR is
+    # excluded from merge-train candidates, the mergequeue label / direct
+    # merge is skipped, and the issue is transitioned to
+    # ``agent:operator-queue`` with ``reason_class="policy"`` and a single
+    # orchestrator-generated PR comment saying the PR is approved and awaits
+    # a human merge. Default empty so current behaviour is unchanged until
+    # the operator opts in. The check reads the live issue labels at decision
+    # time (same source the merge-hold check uses), not a cached snapshot,
+    # so an operator adding or removing the label mid-flight takes effect on
+    # the next pass.
+    human_merge_labels: tuple[str, ...] = ()
     # Package template rendered for worker prompts. "worker.md" targets Devin
     # sessions (skills-based loop); "worker_claude_code.md" targets Claude Code
     # workers (direct shell loop). A repo-local prompts dir overrides by filename.
@@ -382,6 +395,7 @@ class DispatchConfig:
         for field_name in (
             "worker_prompt_comment_associations",
             "worker_prompt_excluded_comment_authors",
+            "human_merge_labels",
         ):
             value = getattr(self, field_name)
             normalized = (str(value),) if isinstance(value, str) else tuple(str(v) for v in value)
@@ -2183,6 +2197,21 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                         f"strings, got element of type {type(item).__name__}"
                     )
             dispatch_data[_seq_key] = tuple(str(item) for item in _seq_value)
+    # Issue #1598: validate human_merge_labels as a list of strings.
+    _hml = dispatch_data.get("human_merge_labels")
+    if _hml is not None:
+        if not isinstance(_hml, list):
+            raise ConfigError(
+                "config section 'dispatch' key 'human_merge_labels' must be a list of "
+                f"strings, got {type(_hml).__name__}"
+            )
+        for item in _hml:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    "config section 'dispatch' key 'human_merge_labels' must be a list of "
+                    f"strings, got element of type {type(item).__name__}"
+                )
+        dispatch_data["human_merge_labels"] = tuple(str(item) for item in _hml)
     for _int_key in ("worker_prompt_max_comments", "worker_prompt_max_comment_chars"):
         _int_value = dispatch_data.get(_int_key)
         if _int_value is not None:
