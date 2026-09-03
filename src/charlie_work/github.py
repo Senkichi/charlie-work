@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import functools
-import inspect
 import json
 import logging
 import random
@@ -41,22 +39,16 @@ from ci_fleet.github import GitHubError  # noqa: F401  (deliberate re-export)
 
 from .checks import _run_id_from_link
 from .github_capabilities import (
-    Checks,
     ChecksLike,
-    Comments,
     CommentsLike,
-    Issues,
     IssuesLike,
-    Labels,
     LabelsLike,
-    MergeBranch,
     MergeBranchLike,
-    PullRequests,
     PullRequestsLike,
-    RepoMeta,
     RepoMetaLike,
-    Transport,
 )
+from .github_delegation import _COLLABORATORS, _install_delegates
+from .github_delegation import _ROUTES, _SIGNATURE_SOURCE, _make_delegate  # noqa: F401 (deliberate re-export)
 from .subprocess_runner import no_console_window_kwargs
 
 logger = logging.getLogger(__name__)
@@ -323,121 +315,6 @@ def _job_id_from_link(link: str | None) -> int | None:
     if not match:
         return None
     return int(match.group(1))
-
-
-# --- Capability delegation seam (Track 2, issue #1585) --------------------
-#
-# `GitHub` is being decomposed into capability collaborators living in
-# `charlie_work.github_capabilities` (design doc
-# docs/design/2026-09-03-github-class-mikado-graph-and-protocol-segmentation.md,
-# Section 3.3). This block is pure infrastructure: it derives a routing table
-# from what the collaborator classes actually declare and installs one
-# forwarding delegate per routed name onto `GitHub`. In L01 every collaborator
-# class is still empty, so `_ROUTES` is empty and this block installs nothing
-# -- `GitHub`'s lexical member surface (and therefore its member_count ratchet
-# entry) is unchanged. Later leaves move one method's *body* at a time out of
-# `GitHub` into a collaborator class; the moment a method leaves `GitHub`,
-# this same machinery (unchanged) picks it up and re-installs it as a
-# forwarding delegate automatically.
-#
-# `_COLLABORATORS` is the one declarative seed: which collaborator classes
-# exist and what owner attribute each is stored under. It is not a list of
-# *GitHubLike members* (that would be the hardcoded list CLAUDE.md rule 9
-# forbids) -- `_ROUTES`/`_SIGNATURE_SOURCE` below are derived from it by
-# introspecting the collaborator classes, never hand-typed per member.
-_COLLABORATORS: tuple[tuple[str, type], ...] = (
-    ("_comments", Comments),
-    ("_labels", Labels),
-    ("_checks", Checks),
-    ("_repo_meta", RepoMeta),
-    ("_pull_requests", PullRequests),
-    ("_issues", Issues),
-    ("_merge_branch", MergeBranch),
-    ("_transport", Transport),
-)
-
-
-def _routable_members(collab_cls: type) -> Iterator[tuple[str, Callable[..., Any]]]:
-    """Yield ``(name, function)`` for every callable ``collab_cls`` declares directly.
-
-    Iterates ``vars(collab_cls)`` rather than ``dir()``/``inspect.getmembers``
-    so only names the collaborator class itself declares are seen -- the
-    ``__init__``/``__getattr__`` inherited from ``CapabilityCollaborator``
-    never appear here. That is what keeps ``_ROUTES`` empty while every
-    collaborator class is still an empty subclass (L01), with no
-    L01-specific special-casing: the same introspection that yields nothing
-    now yields the real routing table once a leaf adds a method to a
-    collaborator class.
-
-    Dunder names are excluded (never GitHubLike/internal members to route);
-    single-underscore internals (``_run_bool``, ``_max_retries``, etc.) are
-    included deliberately -- moved method bodies still call them by name via
-    ``self.<name>``, and the owner has no ``__getattr__`` fallback to catch
-    them (design doc Section 3.3).
-    """
-    for name, member in vars(collab_cls).items():
-        if name.startswith("__") and name.endswith("__"):
-            continue
-        if not callable(member):
-            continue
-        yield name, member
-
-
-def _build_routes() -> tuple[dict[str, str], dict[str, Callable[..., Any]]]:
-    routes: dict[str, str] = {}
-    signature_source: dict[str, Callable[..., Any]] = {}
-    for collab_attr, collab_cls in _COLLABORATORS:
-        for name, member in _routable_members(collab_cls):
-            routes[name] = collab_attr
-            signature_source[name] = member
-    return routes, signature_source
-
-
-_ROUTES, _SIGNATURE_SOURCE = _build_routes()
-
-
-def _make_delegate(name: str, collab_attr: str) -> Callable[..., Any]:
-    """Build a class-level forwarding delegate for a routed member.
-
-    ``functools.wraps`` + an explicit ``__signature__`` make
-    ``inspect.signature(GitHub.<name>)`` return the *source* method's exact
-    signature, including its string return annotation (every
-    ``github_capabilities`` module starts with
-    ``from __future__ import annotations``) -- exactly what the GitHubLike
-    conformance test compares
-    (``tests/test_githublike_protocol.py::_compatible_signature``). A plain
-    ``*args, **kwargs`` delegate would satisfy ``isinstance`` but fail that
-    signature comparison (design doc Section 8.3).
-
-    Both the collaborator (``getattr(self, collab_attr)``) and the target
-    method (``getattr(collab, name)``) are resolved fresh on every call,
-    never cached -- required so ``monkeypatch.setattr(GitHub, "run", ...)``
-    and other per-call patches still intercept through the collaborator
-    (design doc Section 3.3, the 134-patch-site invariant).
-    """
-
-    def _delegate(self: GitHub, *args: Any, **kwargs: Any) -> Any:
-        collab = getattr(self, collab_attr)
-        return getattr(collab, name)(*args, **kwargs)
-
-    src_fn = _SIGNATURE_SOURCE[name]
-    src_fn = getattr(src_fn, "__func__", src_fn)
-    functools.wraps(src_fn)(_delegate)
-    _delegate.__signature__ = inspect.signature(src_fn)
-    return _delegate
-
-
-def _install_delegates() -> None:
-    """Install one forwarding delegate per ``_ROUTES`` entry onto ``GitHub``.
-
-    Skips any name already lexically defined on ``GitHub``: a method not yet
-    moved out of the class body always wins over a delegate for the same
-    name, so a partially-completed leaf never shadows a real implementation.
-    """
-    for name, collab_attr in _ROUTES.items():
-        if name in GitHub.__dict__:
-            continue
-        setattr(GitHub, name, _make_delegate(name, collab_attr))
 
 
 @dataclass(frozen=True)
@@ -2161,7 +2038,7 @@ class GitHub:
 # defined. `_ROUTES` is empty in L01 (every collaborator class is still
 # empty), so this is a no-op: it installs nothing and `GitHub`'s lexical
 # member surface is unchanged.
-_install_delegates()
+_install_delegates(GitHub)
 
 
 @runtime_checkable
