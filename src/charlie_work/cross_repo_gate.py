@@ -57,8 +57,19 @@ production:
   ``.gitignore`` via ``git check-ignore``, never a hardcoded name list) is
   the same signal by construction — nothing under a gitignored path is a
   dispatch target in the first place.
+- **Citation-section headings** (issue #1583) — a candidate whose nearest
+  preceding markdown ``#``-heading matches ``provenance``, ``references``,
+  ``sources``, or ``see also`` is being cited as evidence, not named as
+  code to edit. A bullet list under a ``## Provenance`` heading is this
+  fleet's house style for exactly this kind of citation
+  (``- Numbers: raw/analyses/.../foo.json (live)``), and none of the
+  clause-local marker words appear in a typical provenance bullet — so the
+  most common citation shape in this repo's own issues was invisible to the
+  neutral classifier and escalated at campaign scale. Section scope is a
+  stronger signal than a clause-local word and is derived from the body's
+  own structure rather than from prose.
 
-Both shapes are classified **neutral**: excluded from the pass/escalate
+All three shapes are classified **neutral**: excluded from the pass/escalate
 decision and reported separately (``CrossRepoGateResult.neutral_paths``)
 rather than folded into ``referenced_paths``/``missing_paths``. When every
 extracted candidate is neutral, the gate abstains (``passed=True``) — the
@@ -161,8 +172,16 @@ _GLOB_METACHAR = re.compile(r"[*?\[\]]")
 # sibling checkout, not just one manual triage action). Only markers that
 # are unambiguously about *authority/rationale for the issue*, never about
 # *where the bug lives*, stay in this list.
+#
+# Issue #1583: ``provenance`` and ``origin`` were added. A bullet under a
+# ``## Provenance`` heading is this fleet's house style for citing the
+# evidence behind an issue (``- Evidence: raw/analyses/.../foo.json``), and
+# ``provenance``/``origin`` are the clause-local words that introduce such a
+# citation when the heading itself is not present. They are not words a bug
+# report uses to pinpoint code the worker must edit, so they do not open the
+# false-negative direction the way "see"/"per" do.
 _EVIDENCE_MARKER_RE = re.compile(
-    r"\b(?:authority|evidence|cited\s+in|rationale)\b",
+    r"\b(?:authority|evidence|cited\s+in|rationale|provenance|origin)\b",
     re.IGNORECASE,
 )
 
@@ -214,6 +233,26 @@ _PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t]*\n")
 # from the clause search, defeating the exact pattern it exists to catch.
 _CLAUSE_BOUNDARY_RE = re.compile(r"[.;,()]")
 
+# A markdown ATX heading line: 1-6 ``#`` followed by whitespace and heading
+# text. Used to derive the enclosing section of a candidate from the body's
+# own structure (issue #1583) -- a citation under a ``## Provenance``
+# heading is neutral regardless of whether a clause-local marker word
+# introduces it, because the heading itself is the citation signal.
+_HEADING_LINE_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+
+# Citation-section heading vocabulary (issue #1583): a candidate whose
+# nearest preceding ``#``-heading matches one of these words is neutral.
+# These are the fleet's house-style headings for evidence/reference sections
+# (``## Provenance``, ``## References``, ``## Sources``, ``## See Also``) --
+# a path under such a heading is being cited, not named as code to edit.
+# ``see also`` is two words and is matched as a phrase so a heading like
+# ``## See Also`` (the fleet's cross-ref section) is caught but a heading
+# like ``## See the bug`` is not.
+_CITATION_SECTION_HEADING_RE = re.compile(
+    r"\b(?:provenance|references|sources|see\s+also)\b",
+    re.IGNORECASE,
+)
+
 
 def _current_clause(text_before_in_paragraph: str) -> str:
     """Return the text since the last clause-boundary punctuation mark in
@@ -226,6 +265,45 @@ def _current_clause(text_before_in_paragraph: str) -> str:
     if not boundaries:
         return text_before_in_paragraph
     return text_before_in_paragraph[boundaries[-1].end() :]
+
+
+def _nearest_preceding_heading(text_before_in_body: str) -> str | None:
+    """Return the text of the nearest markdown ATX heading preceding the
+    candidate's position, or ``None`` when no heading precedes it.
+
+    *text_before_in_body* is the full stripped body up to (but not
+    including) the candidate. The last heading match in that span is the
+    section the candidate lives under -- markdown section scope runs from a
+    heading until the next heading of the same or higher level, and a
+    candidate's enclosing section is the most recent heading regardless of
+    level (a ``### Sub`` under ``## Provenance`` is still in the Provenance
+    section).
+    """
+    last: str | None = None
+    for match in _HEADING_LINE_RE.finditer(text_before_in_body):
+        last = match.group(1)
+    return last
+
+
+def _is_in_citation_section(text_before_in_body: str) -> bool:
+    """Return ``True`` when the candidate's enclosing markdown section is a
+    citation section (issue #1583).
+
+    A citation section is one whose nearest preceding ``#``-heading matches
+    the citation-heading vocabulary (``provenance``, ``references``,
+    ``sources``, ``see also``). Section scope is a stronger signal than a
+    clause-local marker word: a bullet under ``## Provenance`` is being
+    cited as evidence regardless of whether ``provenance``/``evidence``
+    appears in the bullet's own clause, because the heading itself declares
+    the section's purpose. The signal is derived from the body's own
+    structure rather than from prose, so it catches the fleet's house-style
+    citation shape (``- Numbers: raw/analyses/.../foo.json (live)``) that
+    no clause-local marker word introduces.
+    """
+    heading = _nearest_preceding_heading(text_before_in_body)
+    if heading is None:
+        return False
+    return bool(_CITATION_SECTION_HEADING_RE.search(heading))
 
 
 @dataclass(frozen=True)
@@ -559,9 +637,10 @@ def _split_survivors_and_neutral(issue_body: str, repo_root: Path) -> tuple[list
     """Partition extracted candidates into survivors and neutral candidates.
 
     Survivors are the candidates that still count toward the pass/escalate
-    decision. Neutral candidates (gitignored runtime artifacts or
-    evidence/authority citations — see the module docstring) are excluded
-    entirely; :func:`cross_repo_gate` reports them separately via
+    decision. Neutral candidates (gitignored runtime artifacts,
+    evidence/authority citations, or candidates under a citation-section
+    heading — see the module docstring) are excluded entirely;
+    :func:`cross_repo_gate` reports them separately via
     ``CrossRepoGateResult.neutral_paths``.
     """
     candidates, stripped = _iter_candidate_matches(issue_body)
@@ -569,7 +648,11 @@ def _split_survivors_and_neutral(issue_body: str, repo_root: Path) -> tuple[list
     neutral: list[str] = []
     for raw, start, end in candidates:
         before, after = _paragraph_span(stripped, start, end)
-        if _is_context_neutral(before, after) or _is_gitignored(raw, repo_root):
+        if (
+            _is_context_neutral(before, after)
+            or _is_in_citation_section(stripped[:start])
+            or _is_gitignored(raw, repo_root)
+        ):
             neutral.append(raw)
         else:
             survivors.append(raw)
@@ -625,8 +708,8 @@ def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
             missing_paths=(),
             reason=(
                 "abstaining: every referenced path was an evidence/authority "
-                "citation or a gitignored runtime artifact, not a dispatch "
-                "target"
+                "citation, a citation-section heading, or a gitignored "
+                "runtime artifact, not a dispatch target"
             ),
             neutral_paths=tuple(neutral),
         )
