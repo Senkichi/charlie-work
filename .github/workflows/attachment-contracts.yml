@@ -71,3 +71,55 @@ jobs:
           fi
           uv run python -m charlie_work.attachment_contracts check-tree \
             --report-only --github-annotations --base-ref "$base_ref"
+
+  # Build the charlie-work-attachment-contracts wheel from the single in-tree
+  # source and attach it as a workflow artifact (issue #1544 Stage 1).
+  #
+  # The wheel is built by a custom PEP 517 backend (build_backend.py) because
+  # both hatchling and setuptools reject ``..`` in package paths.  The backend
+  # module lives in the project directory, so PYTHONPATH must be set to make it
+  # importable under --no-build-isolation.  No publish step -- the operator
+  # uploads manually (same as ci-fleet's precedent).
+  BuildWheel:
+    name: Build attachment-contracts wheel
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+      # `build` is the PEP 517 build frontend used to build the
+      # attachment-contracts wheel.  It is not a runtime or test dependency of
+      # charlie-work itself, so it is installed here rather than added to the
+      # root pyproject.toml dev extras (avoids a lockfile churn PR).
+      - name: Install build frontend
+        run: uv pip install build
+      - name: Build wheel
+        shell: bash
+        run: |
+          set -e
+          export PYTHONPATH="$PWD/packages/attachment-contracts"
+          uv run python -m build --wheel --no-isolation \
+            --outdir packages/attachment-contracts/dist \
+            packages/attachment-contracts
+      - name: Verify wheel contents
+        shell: bash
+        run: |
+          set -e
+          uv run python -c "
+          import zipfile, sys
+          whl = 'packages/attachment-contracts/dist/charlie_work_attachment_contracts-0.1.1-py3-none-any.whl'
+          names = zipfile.ZipFile(whl).namelist()
+          py_files = [n for n in names if n.endswith('.py') and 'dist-info' not in n]
+          assert len(py_files) == 14, f'expected 14 .py files, got {len(py_files)}: {py_files}'
+          assert 'charlie_work/__init__.py' not in names, 'wheel must NOT include charlie_work/__init__.py (namespace package)'
+          assert 'charlie_work/attachment_contracts/_windows.py' in names, 'wheel must include _windows.py'
+          print(f'Wheel OK: {len(py_files)} .py files, no charlie_work/__init__.py')
+          "
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: charlie-work-attachment-contracts-wheel
+          path: packages/attachment-contracts/dist/*.whl
+          retention-days: 30

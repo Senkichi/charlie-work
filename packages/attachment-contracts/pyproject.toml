@@ -1,0 +1,49 @@
+# Distribution definition for charlie-work-attachment-contracts (issue #1544 Stage 1).
+#
+# This is a SEPARATE distribution from the root ``charlie-work`` pyproject.toml.
+# It builds a wheel from the SINGLE in-tree source at
+# ``src/charlie_work/attachment_contracts/`` -- no second copy of the 13 modules
+# exists anywhere in this repo.  The import package is unchanged
+# (``charlie_work.attachment_contracts``), so the global hook's hardcoded module
+# path keeps working.
+#
+# ``charlie_work`` is an implicit namespace package in this wheel (no
+# ``charlie_work/__init__.py`` is included): downstream consumers install this
+# distribution WITHOUT ``charlie-work``, and the namespace-package mechanism
+# makes ``charlie_work.attachment_contracts`` importable.  charlie-work itself
+# keeps its regular ``charlie_work/__init__.py`` in-tree and does not consume
+# the published wheel during Stage 1 (the two-copy window, tracked by #1545).
+#
+# Publish target: public PyPI (same as ci-fleet).  The PR builds the wheel in
+# CI and attaches the artifact; the operator uploads manually (no publish
+# credentials exist in this repo).
+#
+# The build uses a custom PEP 517 backend (``build_backend.py``) because both
+# hatchling and setuptools reject ``..`` in package paths (paths must be
+# relative to the project root and cannot escape it).  The backend builds the
+# wheel directly from ``src/charlie_work/attachment_contracts/*.py`` -- no
+# second copy of the 13 modules exists anywhere in this repo.  The CI workflow
+# sets ``PYTHONPATH`` to this directory so the backend is importable, then
+# runs ``uv build --no-build-isolation`` (or ``python -m build --no-isolation``).
+
+[project]
+name = "charlie-work-attachment-contracts"
+version = "0.1.1"
+description = "Attachment-Point Contracts: derived god-object fitness function (extracted from charlie-work)."
+readme = { text = "Attachment-Point Contracts: derived god-object fitness function. Gates on bound-member count per derived attachment point, ratcheted against the repo's own archetype distribution. Extracted from charlie-work as an installable distribution (issue #1544 Stage 1).", content-type = "text/plain" }
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["static-analysis", "code-quality", "attachment-points"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[build-system]
+requires = []
+build-backend = "build_backend"

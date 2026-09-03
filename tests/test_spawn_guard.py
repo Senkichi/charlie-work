@@ -72,7 +72,7 @@ def _collect_aliases(
                 bound = alias.asname if alias.asname else alias.name
                 if module in ("subprocess", "os") and _is_target_attr(module, alias.name):
                     func_aliases[bound] = (module, alias.name)
-                if module.endswith("subprocess_runner") and alias.name in HELPER_NAMES:
+                if alias.name in HELPER_NAMES:
                     helper_names.add(bound)
                 if module == "charlie_work" and alias.name == "subprocess_runner":
                     module_aliases[bound] = "charlie_work.subprocess_runner"

@@ -24,7 +24,7 @@ from pathlib import Path
 from charlie_work.attachment_contracts.excludes import Excludes, load_excludes
 from charlie_work.attachment_contracts.model import AttachmentPoint, Kind, ScanResult
 from charlie_work.attachment_contracts.outliers import saturate
-from charlie_work.subprocess_runner import no_console_window_kwargs
+from charlie_work.attachment_contracts._windows import no_console_window_kwargs
 
 # The three explicit anchor SHAs named in the spec (Deliverable 0, G1).
 ANCHOR_SHAS: tuple[str, ...] = ("1ead858", "7373d47", "9de0b9f")
