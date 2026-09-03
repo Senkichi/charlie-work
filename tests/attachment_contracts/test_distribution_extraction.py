@@ -182,3 +182,88 @@ def test_wheel_builds_and_contains_expected_files(tmp_path: Path) -> None:
     finally:
         sys.path.remove(str(_PKG_DIR))
         sys.modules.pop("build_backend", None)
+
+
+@pytest.mark.skipif(
+    not (_PKG_DIR / "build_backend.py").is_file(),
+    reason="build_backend.py not present",
+)
+def test_wheel_built_from_sdist_contains_source_files(tmp_path: Path) -> None:
+    """A wheel built FROM the sdist contains the source ``.py`` files.
+
+    Round-1 review finding #2: ``build_backend._SRC_DIR`` previously used
+    ``_HERE.parent.parent / "src" / ...`` unconditionally, which is correct for
+    the in-repo layout but wrong for the sdist layout.  ``build_sdist`` places
+    ``build_backend.py`` at ``<prefix>/build_backend.py`` and bundles the source
+    at ``<prefix>/src/charlie_work/attachment_contracts/`` -- one level DOWN
+    from ``_HERE``, not two levels UP.  A wheel built from the sdist therefore
+    resolved a non-existent source directory and silently contained zero
+    ``.py`` files.
+
+    This test exercises the sdist->wheel path: build the sdist from the in-repo
+    layout, extract it, import the backend from the extracted prefix, and build
+    a wheel.  The wheel MUST contain the 14 source ``.py`` files -- without the
+    layout detection in ``_SRC_DIR``, it contains none and this test fails.
+
+    Mutation control: reverting ``_SRC_DIR`` to
+    ``_HERE.parent.parent / "src" / ...`` makes the extracted-prefix backend
+    resolve ``<prefix>/../src/...`` (nonexistent), so ``build_wheel`` packages
+    zero ``.py`` files and the ``len(py_files) == 14`` assertion fails.
+    """
+    import tarfile
+    import zipfile
+
+    sys.path.insert(0, str(_PKG_DIR))
+    try:
+        import build_backend as in_repo_backend
+
+        # 1. Build the sdist from the in-repo layout.
+        sdist_dir = tmp_path / "sdist"
+        sdist_dir.mkdir()
+        sdist_name = in_repo_backend.build_sdist(str(sdist_dir))
+        sdist_path = sdist_dir / sdist_name
+        assert sdist_path.is_file(), f"sdist not found: {sdist_path}"
+
+        # 2. Extract the sdist into a clean directory -- this is what an
+        #    isolated build frontend does before calling build_wheel.
+        prefix_dir = tmp_path / "extracted"
+        prefix_dir.mkdir()
+        with tarfile.open(sdist_path, "r:gz") as tar:
+            tar.extractall(prefix_dir, filter="data")  # noqa: S202 -- trusted local build output
+        # The sdist top-level dir is ``<name>-<version>``.
+        extracted_roots = [p for p in prefix_dir.iterdir() if p.is_dir()]
+        assert len(extracted_roots) == 1, f"expected one top-level dir, got {extracted_roots}"
+        prefix_root = extracted_roots[0]
+        assert (prefix_root / "build_backend.py").is_file(), "backend must be in the sdist prefix"
+        assert (prefix_root / "src" / "charlie_work" / "attachment_contracts").is_dir(), (
+            "sdist must bundle the source under <prefix>/src/"
+        )
+    finally:
+        sys.path.remove(str(_PKG_DIR))
+        sys.modules.pop("build_backend", None)
+
+    # 3. Import the backend FROM the extracted sdist prefix and build a wheel.
+    #    The backend's ``_HERE`` is now the prefix root, so ``_SRC_DIR`` must
+    #    detect the sdist layout (``_HERE / "src" / ...``).
+    sys.path.insert(0, str(prefix_root))
+    try:
+        sys.modules.pop("build_backend", None)
+        import build_backend  # imported from the extracted prefix
+
+        wheel_dir = tmp_path / "wheel"
+        wheel_dir.mkdir()
+        filename = build_backend.build_wheel(str(wheel_dir))
+        whl_path = wheel_dir / filename
+        assert whl_path.is_file(), f"wheel from sdist not found: {whl_path}"
+
+        names = zipfile.ZipFile(whl_path).namelist()
+        py_files = sorted(n for n in names if n.endswith(".py") and "dist-info" not in n)
+        assert len(py_files) == 14, (
+            f"wheel built from sdist must contain 14 .py files, got {len(py_files)}: "
+            f"{py_files} -- sdist layout detection in _SRC_DIR is broken"
+        )
+        assert "charlie_work/attachment_contracts/_windows.py" in names
+        assert "charlie_work/__init__.py" not in names
+    finally:
+        sys.path.remove(str(prefix_root))
+        sys.modules.pop("build_backend", None)

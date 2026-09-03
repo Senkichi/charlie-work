@@ -26,8 +26,28 @@ import zipfile
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-_REPO_ROOT = _HERE.parent.parent
-_SRC_DIR = _REPO_ROOT / "src" / "charlie_work" / "attachment_contracts"
+# The source tree lives at ``src/charlie_work/attachment_contracts/`` but its
+# location relative to this backend module depends on which layout the build
+# is running from:
+#
+# * in-repo layout: this file is at ``packages/attachment-contracts/build_backend.py``
+#   and the source is at ``<repo>/src/charlie_work/attachment_contracts/`` (two
+#   levels up from ``_HERE``).
+# * sdist layout: ``build_sdist`` places this file at ``<prefix>/build_backend.py``
+#   and bundles the source at ``<prefix>/src/charlie_work/attachment_contracts/``
+#   (one level down from ``_HERE``).  A wheel built FROM the sdist (the default
+#   ``python -m build`` / ``uv build`` flow, and the standard PEP 517 isolated
+#   build) runs the backend from the extracted sdist prefix, so the source is
+#   ``_HERE / "src" / ...`` -- NOT ``_HERE.parent.parent / "src" / ...``.
+#
+# The prior code unconditionally used ``_HERE.parent.parent / "src" / ...``,
+# which is correct for the in-repo layout but WRONG for the sdist layout: a
+# wheel built from the sdist silently contained zero ``.py`` files because the
+# resolved source directory did not exist (round-1 review finding).  Detecting
+# the layout by existence picks the right one in both cases.
+_SDIST_SRC_DIR = _HERE / "src" / "charlie_work" / "attachment_contracts"
+_REPO_SRC_DIR = _HERE.parent.parent / "src" / "charlie_work" / "attachment_contracts"
+_SRC_DIR = _SDIST_SRC_DIR if _SDIST_SRC_DIR.is_dir() else _REPO_SRC_DIR
 _DIST_INFO = "charlie_work_attachment_contracts-0.1.1.dist-info"
 
 
@@ -142,7 +162,16 @@ def build_sdist(
     sdist_directory: str,
     config_settings: dict | None = None,
 ) -> str:
-    """Build the source distribution (a tarball of pyproject.toml + setup.py + sources)."""
+    """Build the source distribution (a tarball of pyproject.toml + backend + sources).
+
+    The sdist bundles ``pyproject.toml``, ``build_backend.py``, ``PKG-INFO``, and
+    the source ``.py`` files under ``<prefix>/src/charlie_work/attachment_contracts/``.
+    A wheel built FROM this sdist (the default ``python -m build`` / ``uv build``
+    flow) extracts the prefix and runs ``build_wheel`` there, where
+    ``_SRC_DIR`` detects the sdist layout (``_HERE / "src" / ...``) and finds the
+    bundled source -- without the layout detection, the wheel would silently
+    contain zero ``.py`` files (round-1 review finding).
+    """
     project = _read_project()
     name = project["name"]
     version = project["version"]

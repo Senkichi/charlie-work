@@ -22,9 +22,16 @@
 # hatchling and setuptools reject ``..`` in package paths (paths must be
 # relative to the project root and cannot escape it).  The backend builds the
 # wheel directly from ``src/charlie_work/attachment_contracts/*.py`` -- no
-# second copy of the 13 modules exists anywhere in this repo.  The CI workflow
-# sets ``PYTHONPATH`` to this directory so the backend is importable, then
-# runs ``uv build --no-build-isolation`` (or ``python -m build --no-isolation``).
+# second copy of the 13 modules exists anywhere in this repo.
+#
+# ``backend-path`` makes the backend importable under standard PEP 517 build
+# isolation: the frontend adds this directory to ``sys.path`` before importing
+# ``build_backend``, so ``python -m build`` / ``uv build`` / ``pip install``
+# work without ``--no-build-isolation`` or a manual ``PYTHONPATH`` workaround
+# (round-1 review finding).  The wheel is built from the sdist (the default
+# ``python -m build`` / ``uv build`` flow), and the sdist bundles the source
+# tree under ``src/``, so an isolated ``build_wheel`` finds the source via the
+# sdist layout (see ``build_backend._SRC_DIR`` detection).
 
 [project]
 name = "charlie-work-attachment-contracts"
@@ -47,3 +54,4 @@ classifiers = [
 [build-system]
 requires = []
 build-backend = "build_backend"
+backend-path = ["."]

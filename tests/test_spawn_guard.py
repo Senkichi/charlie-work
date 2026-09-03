@@ -12,6 +12,16 @@ from pathlib import Path
 import charlie_work
 
 HELPER_NAMES = {"no_console_window_kwargs", "hidden_console_kwargs"}
+# Module suffixes from which the spawn helpers may be imported via a
+# ``from <module> import <helper>``.  A from-import of a ``HELPER_NAMES`` entry
+# is only recognized as a helper reference when the module ends with one of
+# these suffixes -- accepting the helper name from ANY module (the prior
+# round-1 relaxation) would let an unrelated ``from foo import
+# no_console_window_kwargs`` silently satisfy the guard (issue #1544 review:
+# narrow the relaxation back to the two modules that actually define the
+# helper: ``charlie_work.subprocess_runner`` and the inlined
+# ``charlie_work.attachment_contracts._windows``).
+HELPER_MODULE_SUFFIXES = ("subprocess_runner", "attachment_contracts._windows")
 ALLOWLIST_RE = re.compile(r"#\s*spawn-guard:\s*allow")
 
 SPAWN_ATTRS: dict[str, set[str]] = {
@@ -72,7 +82,7 @@ def _collect_aliases(
                 bound = alias.asname if alias.asname else alias.name
                 if module in ("subprocess", "os") and _is_target_attr(module, alias.name):
                     func_aliases[bound] = (module, alias.name)
-                if alias.name in HELPER_NAMES:
+                if alias.name in HELPER_NAMES and module.endswith(HELPER_MODULE_SUFFIXES):
                     helper_names.add(bound)
                 if module == "charlie_work" and alias.name == "subprocess_runner":
                     module_aliases[bound] = "charlie_work.subprocess_runner"
@@ -354,3 +364,60 @@ def test_guard_allowlist_comment(tmp_path: Path) -> None:
     )
     violations = find_spawn_guard_violations(source_dir)
     assert violations == []
+
+
+def test_guard_accepts_helper_from_attachment_contracts_windows(tmp_path: Path) -> None:
+    """A spawn site routing through ``attachment_contracts._windows`` is accepted.
+
+    The inlined ``no_console_window_kwargs`` lives in
+    ``charlie_work.attachment_contracts._windows`` (issue #1544 Stage 1), so the
+    guard must recognize a from-import of the helper from that module suffix.
+    Without this, the in-repo ``backtest.py`` / ``__main__.py`` spawn sites
+    would be falsely flagged.
+    """
+    source_dir = tmp_path / "pkg"
+    source_dir.mkdir()
+    (source_dir / "good.py").write_text(
+        "import subprocess\n"
+        "from charlie_work.attachment_contracts._windows import "
+        "no_console_window_kwargs\n"
+        "subprocess.run(['echo'], **no_console_window_kwargs())\n",
+        encoding="utf-8",
+    )
+    violations = find_spawn_guard_violations(source_dir)
+    assert violations == [], (
+        f"helper from attachment_contracts._windows must be accepted: {violations}"
+    )
+
+
+def test_guard_rejects_helper_name_from_unrelated_module(tmp_path: Path) -> None:
+    """A helper name imported from an unrelated module does NOT satisfy the guard.
+
+    Round-1 review finding #3: the prior relaxation
+    (``if alias.name in HELPER_NAMES:`` with no module check) accepted the
+    helper name from ANY module, so ``from some.unrelated.pkg import
+    no_console_window_kwargs`` would silently satisfy the guard even though
+    that name is not the real console-suppression helper.  The narrowed check
+    only accepts the helper from modules ending in ``subprocess_runner`` or
+    ``attachment_contracts._windows``; an import from any other module is NOT
+    recognized, so the spawn site is flagged.
+
+    Mutation control: reverting to ``if alias.name in HELPER_NAMES:`` (no
+    module suffix check) makes this test fail -- the spawn site is no longer
+    flagged because the unrelated import is accepted as a helper.
+    """
+    source_dir = tmp_path / "pkg"
+    source_dir.mkdir()
+    (source_dir / "sneaky.py").write_text(
+        "import subprocess\n"
+        "from some.unrelated.pkg import no_console_window_kwargs\n"
+        "subprocess.run(['echo'], **no_console_window_kwargs())\n",
+        encoding="utf-8",
+    )
+    violations = find_spawn_guard_violations(source_dir)
+    assert len(violations) == 1, (
+        f"helper name from an unrelated module must NOT satisfy the guard; "
+        f"got {len(violations)} violation(s): {violations}"
+    )
+    assert "sneaky.py" in violations[0]
+    assert "subprocess.run" in violations[0]

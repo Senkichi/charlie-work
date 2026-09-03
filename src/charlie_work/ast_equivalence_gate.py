@@ -68,6 +68,34 @@ class MovedSymbol:
 
 
 @dataclass(frozen=True)
+class CopiedSymbol:
+    """A symbol ADDED to a file that is a verbatim copy of a surviving original.
+
+    A *copy* (not a :class:`MovedSymbol`) is the extraction pattern where a
+    symbol is duplicated into a new location while the original REMAINS in its
+    source file -- the two-copy window issue #1544 Stage 1 explicitly uses for
+    ``no_console_window_kwargs`` (inlined into ``attachment_contracts._windows``
+    while ``charlie_work.subprocess_runner`` keeps its copy).  ``derive_moved``
+    only detects removal+addition pairs, so it reports zero moved symbols for a
+    pure copy; ``derive_copied_symbols`` fills that gap so the gate's
+    self-proving requirement (graft G: prove the #1544 extraction is verbatim)
+    is actually evidenced.
+
+    ``source_file`` is the file where the SURVIVING original lives (present at
+    both base and head); ``dest_file`` is the file the copy was added to.
+    ``equivalent`` is ``True`` when the copy's ``ast.dump`` matches the
+    surviving original's ``ast.dump`` at head -- a verbatim copy.
+    """
+
+    name: str
+    source_file: str
+    dest_file: str
+    source_class: str | None
+    dest_class: str | None
+    equivalent: bool
+
+
+@dataclass(frozen=True)
 class StaleShim:
     """A facade re-export entry that nobody imports any more (vulture sweep).
 
@@ -86,13 +114,20 @@ class GateResult:
     """The full output of the AST-equivalence gate for one PR diff.
 
     ``moved_symbols`` is the diff-derived set of symbols that moved between
-    files.  ``stale_shims`` is the vulture sweep's findings.  The review
-    packet (:func:`render_review_packet`) renders both for the human reviewer.
+    files (removal+addition pairs).  ``copied_symbols`` is the diff-derived
+    set of symbols ADDED to a file that are verbatim copies of a surviving
+    original (the two-copy extraction pattern, e.g. issue #1544 Stage 1) --
+    ``derive_moved`` alone reports zero moved symbols for a pure copy, so
+    ``copied_symbols`` is what evidences the gate's self-proving requirement
+    (graft G) for the #1544 extraction.  ``stale_shims`` is the vulture
+    sweep's findings.  The review packet (:func:`render_review_packet`)
+    renders all three for the human reviewer.
     """
 
     moved_symbols: tuple[MovedSymbol, ...]
     stale_shims: tuple[StaleShim, ...]
     base: str
+    copied_symbols: tuple[CopiedSymbol, ...] = ()
 
     @property
     def equivalent_moves(self) -> tuple[MovedSymbol, ...]:
@@ -103,6 +138,16 @@ class GateResult:
     def non_equivalent_moves(self) -> tuple[MovedSymbol, ...]:
         """Moved symbols whose AST differs -- flagged for human review."""
         return tuple(s for s in self.moved_symbols if not s.equivalent)
+
+    @property
+    def equivalent_copies(self) -> tuple[CopiedSymbol, ...]:
+        """Copied symbols whose AST matches the surviving original (verbatim)."""
+        return tuple(s for s in self.copied_symbols if s.equivalent)
+
+    @property
+    def non_equivalent_copies(self) -> tuple[CopiedSymbol, ...]:
+        """Copied symbols whose AST differs from the surviving original."""
+        return tuple(s for s in self.copied_symbols if not s.equivalent)
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +267,78 @@ def derive_moved_symbols(
                 break  # first match wins; one removal -> one move
 
     return moved
+
+
+def derive_copied_symbols(
+    base_symbols_by_file: dict[str, dict[str, str]],
+    head_symbols_by_file: dict[str, dict[str, str]],
+) -> list[CopiedSymbol]:
+    """Derive symbols ADDED to a file that are copies of a surviving original.
+
+    A symbol is a *copy* (the two-copy extraction pattern, e.g. issue #1544
+    Stage 1) when:
+
+    1. It is ADDED to file B at head: present in ``head_symbols_by_file[B]``
+       but absent in ``base_symbols_by_file[B]`` (B is new, or the symbol is
+       new in B), **and**
+    2. The same bare name exists in a DIFFERENT file A that is a SURVIVING
+       original: present in ``base_symbols_by_file[A]`` AND present in
+       ``head_symbols_by_file[A]`` (the original was not removed -- this is
+       what distinguishes a copy from a :func:`derive_moved_symbols` move,
+       which requires the original to be removed), **and**
+    3. The ``ast.dump`` of the added copy (head[B]) matches the surviving
+       original's ``ast.dump`` (head[A]) -> equivalent (verbatim copy), or
+       differs -> non-equivalent (flagged for human review).
+
+    The comparison is against the surviving original AT HEAD (its current
+    state), not at base: a verbatim copy must match the authoritative original
+    the repo keeps, which is the head version.  Matching is by bare name, so a
+    method copied into a different class is detected.
+
+    This fills the gap ``derive_moved_symbols`` cannot: a pure copy (original
+    retained) produces zero moved symbols, so without this function the gate's
+    self-proving requirement (graft G: prove the #1544 extraction verbatim) is
+    unevidenced -- the gate would report zero findings for the very diff it
+    was built to self-prove against (round-1 review finding #4).
+    """
+    copied: list[CopiedSymbol] = []
+
+    # Surviving originals: bare name -> list of (file, qualified_name, dump at
+    # head).  A surviving original is present in BOTH base and head of the same
+    # file (not removed).  This is the index copies are matched against.
+    survivors_by_name: dict[str, list[tuple[str, str, str]]] = {}
+    for path_a, head_syms_a in head_symbols_by_file.items():
+        base_syms_a = base_symbols_by_file.get(path_a, {})
+        for qname_a, dump_a in head_syms_a.items():
+            if qname_a in base_syms_a:
+                bare_a, _ = _split_qualified(qname_a)
+                survivors_by_name.setdefault(bare_a, []).append((path_a, qname_a, dump_a))
+
+    # Added symbols: present at head, absent at base in the same file.  Match
+    # each against surviving originals of the same bare name in a DIFFERENT file.
+    for path_b, head_syms_b in head_symbols_by_file.items():
+        base_syms_b = base_symbols_by_file.get(path_b, {})
+        for qname_b, dump_b in head_syms_b.items():
+            if qname_b in base_syms_b:
+                continue  # not an addition -- not a copy candidate
+            bare_b, cls_b = _split_qualified(qname_b)
+            for path_a, qname_a, dump_a in survivors_by_name.get(bare_b, []):
+                if path_a == path_b:
+                    continue  # same file -- not a copy
+                _, cls_a = _split_qualified(qname_a)
+                copied.append(
+                    CopiedSymbol(
+                        name=bare_b,
+                        source_file=path_a,
+                        dest_file=path_b,
+                        source_class=cls_a,
+                        dest_class=cls_b,
+                        equivalent=(dump_a == dump_b),
+                    )
+                )
+                break  # first surviving original wins; one addition -> one copy
+
+    return copied
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +649,30 @@ def render_review_packet(result: GateResult) -> str:
         lines.append("")
     else:
         lines.append("No symbols moved between files in this PR.")
+        lines.append("")
+
+    if result.copied_symbols:
+        lines.append("### Copied symbols (two-copy extraction, e.g. #1544 Stage 1)")
+        lines.append("")
+        lines.append("| Symbol | Surviving original | Copy destination | Equivalent |")
+        lines.append("|--------|--------------------|------------------|------------|")
+        for sym in result.copied_symbols:
+            src = sym.source_file
+            dst = sym.dest_file
+            if sym.source_class:
+                src = f"{src}::{sym.source_class}"
+            if sym.dest_class:
+                dst = f"{dst}::{sym.dest_class}"
+            status = "yes (verbatim)" if sym.equivalent else "**NO -- review**"
+            lines.append(f"| `{sym.name}` | `{src}` | `{dst}` | {status} |")
+        lines.append("")
+
+        eq = len(result.equivalent_copies)
+        neq = len(result.non_equivalent_copies)
+        lines.append(f"**Summary:** {eq} verbatim copy(ies), {neq} non-equivalent.")
+        lines.append("")
+    else:
+        lines.append("No symbols copied (original retained) in this PR.")
         lines.append("")
 
     if result.stale_shims:

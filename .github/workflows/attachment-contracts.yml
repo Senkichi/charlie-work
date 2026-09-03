@@ -77,8 +77,14 @@ jobs:
   #
   # The wheel is built by a custom PEP 517 backend (build_backend.py) because
   # both hatchling and setuptools reject ``..`` in package paths.  The backend
-  # module lives in the project directory, so PYTHONPATH must be set to make it
-  # importable under --no-build-isolation.  No publish step -- the operator
+  # is made importable under standard PEP 517 build isolation via
+  # ``backend-path = ["."]`` in the distribution's ``[build-system]`` table
+  # (round-1 review finding #1), so no ``--no-build-isolation`` or manual
+  # ``PYTHONPATH`` workaround is needed.  ``python -m build`` builds the sdist
+  # first, then builds the wheel FROM the sdist (its default flow), which is
+  # what makes the isolated build reach the source: the sdist bundles the
+  # source under ``src/`` and ``build_backend._SRC_DIR`` detects the sdist
+  # layout (round-1 review finding #2).  No publish step -- the operator
   # uploads manually (same as ci-fleet's precedent).
   BuildWheel:
     name: Build attachment-contracts wheel
@@ -95,12 +101,14 @@ jobs:
       # root pyproject.toml dev extras (avoids a lockfile churn PR).
       - name: Install build frontend
         run: uv pip install build
+      # Standard isolated build: sdist first, then wheel from the sdist.
+      # ``backend-path`` makes ``build_backend`` importable in isolation; the
+      # sdist bundles the source so the isolated ``build_wheel`` finds it.
       - name: Build wheel
         shell: bash
         run: |
           set -e
-          export PYTHONPATH="$PWD/packages/attachment-contracts"
-          uv run python -m build --wheel --no-isolation \
+          uv run python -m build \
             --outdir packages/attachment-contracts/dist \
             packages/attachment-contracts
       - name: Verify wheel contents
