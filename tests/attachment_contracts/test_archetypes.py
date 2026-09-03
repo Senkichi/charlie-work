@@ -425,7 +425,11 @@ def helper():
 """
 
 
-def test_test_module_counts_functions_and_test_classes_as_one_member_each() -> None:
+def test_test_module_counts_functions_and_test_class_methods_individually() -> None:
+    # Issue #1540: a top-level Test* class contributes each of its
+    # test-prefixed direct methods as one member (lexical, no MRO walk),
+    # consistent with the `class` archetype's own semantics -- not just
+    # the class name as a single member.
     points = scan_source(TEST_MODULE_SRC, "tests/test_sample.py")
     by_kind = {p.kind: p for p in points}
     assert set(by_kind) == {"class", "test_module"}
@@ -436,7 +440,63 @@ def test_test_module_counts_functions_and_test_classes_as_one_member_each() -> N
 
     module_point = by_kind["test_module"]
     assert module_point.identity == "tests/test_sample.py::module"
-    assert module_point.members == ("test_one", "test_two", "TestGroup")
+    assert module_point.members == ("test_one", "test_two", "test_a", "test_b")
+
+
+# Issue #1540: the test_module archetype must count each test-prefixed direct
+# method of a top-level Test* class as one member, not the class name. This
+# is the positive-control regression test for the counting-rule change.
+TEST_MODULE_CLASS_METHODS_SRC = """
+import pytest
+
+def test_top_level():
+    ...
+
+class TestAlpha:
+    def test_a(self):
+        ...
+    def test_b(self):
+        ...
+    async def test_c(self):
+        ...
+    def helper(self):       # non-test method -- must NOT be counted
+        ...
+
+class TestBeta:
+    def test_d(self):
+        ...
+
+class NotTestClass:         # does not start with "Test" -- not a Test* class
+    def test_e(self):
+        ...
+"""
+
+
+def test_test_module_counts_test_prefixed_methods_inside_test_classes() -> None:
+    points = scan_source(TEST_MODULE_CLASS_METHODS_SRC, "tests/test_classes.py")
+    module_point = next(p for p in points if p.kind == "test_module")
+    # test_top_level + TestAlpha's test_a/test_b/test_c (async counted) +
+    # TestBeta's test_d. NotTestClass's test_e is NOT counted (not a Test*
+    # class), and TestAlpha's helper is NOT counted (not test-prefixed).
+    assert module_point.members == ("test_top_level", "test_a", "test_b", "test_c", "test_d")
+    assert module_point.member_count == 5
+
+
+def test_test_module_empty_test_class_contributes_zero_members() -> None:
+    # A Test* class with no test-prefixed methods contributes nothing under
+    # the new rule (the old rule would have contributed the class name as
+    # one member).
+    src = """
+class TestEmpty:
+    def setUp(self):
+        ...
+    def helper(self):
+        ...
+"""
+    points = scan_source(src, "tests/test_empty_class.py")
+    module_point = next(p for p in points if p.kind == "test_module")
+    assert module_point.members == ()
+    assert module_point.member_count == 0
 
 
 MULTI_AP_SRC = """

@@ -40,7 +40,7 @@ from charlie_work.attachment_contracts.model import Finding
 from charlie_work.attachment_contracts.outliers import FLOOR, saturate_all
 from charlie_work.subprocess_runner import no_console_window_kwargs
 
-PACKAGE_VERSION = "0.1.0"
+PACKAGE_VERSION = "0.1.1"
 
 
 def _finding_to_dict(f: Finding) -> dict[str, object]:

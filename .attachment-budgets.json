@@ -258,6 +258,14 @@
   {
    "boundary": 41.0,
    "bumps": [],
+   "file": "tests/test_safe_ref.py",
+   "identity": "tests/test_safe_ref.py::module",
+   "kind": "test_module",
+   "member_count": 44
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
    "file": "tests/test_state_dir_migration.py",
    "identity": "tests/test_state_dir_migration.py::module",
    "kind": "test_module",
@@ -340,7 +348,7 @@
   }
  ],
  "floor": 4,
- "generated_at": "2026-08-25T06:12:35.790112+00:00",
- "generated_by": "charlie_work.attachment_contracts 0.1.0",
+ "generated_at": "2026-09-03T04:40:19.069543+00:00",
+ "generated_by": "charlie_work.attachment_contracts 0.1.1",
  "version": 1
 }
