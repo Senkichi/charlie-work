@@ -18,6 +18,10 @@ from .ast_equivalence_gate_command import (
     register_ast_equivalence_check_subparser,
     run_ast_equivalence_check_command,
 )
+from .collect_only_gate_command import (
+    register_collect_only_check_subparser,
+    run_collect_only_check_command,
+)
 from .private_slug_check_command import (
     register_private_slug_check_subparser,
     run_private_slug_check_command,
@@ -486,6 +490,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     register_private_slug_check_subparser(subparsers)
     register_ast_equivalence_check_subparser(subparsers)
+    register_collect_only_check_subparser(subparsers)
 
     migrate_parser = subparsers.add_parser(
         "migrate-state-dir",
@@ -2635,6 +2640,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_private_slug_check_command(args)
         elif args.command == "ast-equivalence-check":
             result = run_ast_equivalence_check_command(args)
+        elif args.command == "collect-only-check":
+            result = run_collect_only_check_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)

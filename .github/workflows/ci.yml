@@ -365,3 +365,83 @@ jobs:
         run: |
           set -e
           uv run charlie ast-equivalence-check --base ${{ github.event.pull_request.base.sha }}
+
+  Collect-only gate:
+    name: Collect-only gate
+    # PR-only: the gate compares base vs head collect-only output, which only
+    # makes sense for a PR (push-to-main has no base to compare against).
+    #
+    # UNLIKE the mojibake/private-slug/ast-equivalence gates (steps of the
+    # existing "Lint" job, riding the already-required "Lint" context), this
+    # gate is a SEPARATE JOB with its own required-check name. The issue
+    # (#1538) explicitly requires the new job's name to be added to
+    # required_checks in .aviator/config.yml, the deployed
+    # orchestrator.config.yaml, and Aviator's external required-checks config
+    # -- a coordinated three-place change. A step of an existing job would
+    # avoid the three-place change but would also make the gate advisory (it
+    # would ride "Lint"'s required-check context, not its own), which defeats
+    # the gate's purpose: it is ENFORCEMENT, not evidence (unlike the
+    # AST-equivalence gate, #1541, which is evidence-only and always exits 0).
+    #
+    # The gate compares leaf-name multisets (function name + class name(s) +
+    # parametrize id, module-path stripped) from `pytest --collect-only -q`
+    # output at base and head. A verbatim test relocation (same leaf name,
+    # different module path) passes; a rename, addition, deletion, or
+    # class-wrapping dodge does not. See src/charlie_work/collect_only_gate.py
+    # for the full rationale, including graft K (the leaf-name multiset fix)
+    # and graft E (diff-derived inputs, never hand-typed).
+    runs-on: windows-latest
+    timeout-minutes: 30
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+      - name: Collect tests at head
+        # Capture stdout (node IDs) to a file. `|| true` prevents the step
+        # from failing on collection errors -- the gate command will detect
+        # a failed collection from the output (no node IDs) and fail with a
+        # clear message instead of a bare CI step failure. stderr (warnings,
+        # errors) goes to the CI log for diagnostics.
+        #
+        # NOTE: ``--collect-only`` WITHOUT ``-q``. In pytest >= 8, ``-q``
+        # changes the output to a compact ``file: count`` format that does
+        # not include individual node IDs -- the gate cannot extract leaf
+        # names from that format. The issue (#1538) says ``--collect-only
+        # -q`` because it was written against an older pytest where ``-q``
+        # still produced one-node-ID-per-line; this repo's pytest (9.x in
+        # uv.lock) changed that. ``--collect-only`` (no ``-q``) produces the
+        # one-node-ID-per-line format the gate's parser expects.
+        run: uv run pytest --collect-only > head_collect.txt || true
+      - name: Collect tests at base
+        # Create a git worktree at the base ref, sync deps, and run
+        # collect-only there. The worktree is cleaned up in the same step
+        # (a `finally`-style `||` + `git worktree remove --force`).
+        #
+        # `uv sync` in the base worktree creates its own .venv from the
+        # shared uv cache -- fast (seconds) on a hosted runner with a warm
+        # cache. The alternative (sharing the head .venv via
+        # UV_PROJECT_ENVIRONMENT) would avoid the second sync but requires
+        # an env var that run_captured does not support; the second sync is
+        # the simpler, more robust choice.
+        #
+        # Same ``--collect-only`` (no ``-q``) note as the head step above.
+        shell: bash
+        run: |
+          set -e
+          git fetch --depth 1 origin ${{ github.event.pull_request.base.sha }}
+          git worktree add ./base-tree ${{ github.event.pull_request.base.sha }}
+          trap 'git worktree remove --force ./base-tree' EXIT
+          cd ./base-tree
+          uv sync --frozen --all-extras
+          uv run pytest --collect-only > ../base_collect.txt || true
+      - name: Run collect-only gate
+        # The gate command reads the two collect files and runs the pure
+        # comparison logic. It exits non-zero (fails the required check)
+        # when the leaf-name multisets differ or a removed leaf did not
+        # reappear in a sibling under tests/.
+        run: |
+          uv run charlie collect-only-check \
+            --base-collect base_collect.txt \
+            --head-collect head_collect.txt
