@@ -242,11 +242,16 @@ def _make_delegate(name, collab_attr):
 
 `functools.wraps` + explicit `__signature__` make `inspect.signature(GitHub.foo)`
 return the source method's signature, including the string return annotation
-(`from __future__ import annotations` is in force in `github.py`), which is what
+(`from __future__ import annotations` is in force in the source method's module
+-- the destination module's future import, per the mandatory invariant of
+Section 3.1, not `github.py`'s own), which is what
 the conformance test compares (Section 8.1). The routing table is derived, not
 hand-maintained per member: `_ROUTES` is built by iterating each collaborator
-class's public members at import time (CLAUDE.md rule 9 -- no hardcoded lists),
-with the sub-protocol membership as the authority. `_ROUTES` covers **all** moved members -- both the
+class's **non-dunder** members at import time (CLAUDE.md rule 9 -- no hardcoded
+lists) -- protocol methods and underscore-prefixed internals alike, across every
+collaborator class including `Transport` (which is not a sub-protocol, Section
+3.2, so its internals would be missed by a public-members-only or
+sub-protocol-authority rule). `_ROUTES` covers **all** moved members -- both the
 public sub-protocol methods and the underscore-prefixed internals (`_run_bool`,
 `_max_retries`, `_timeout_seconds`, etc.), because `run` and the moved bodies call
 internals by name and the owner has no `__getattr__` fallthrough to catch them.
