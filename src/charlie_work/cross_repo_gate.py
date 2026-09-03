@@ -250,7 +250,22 @@ _CLAUSE_BOUNDARY_RE = re.compile(r"[.;,()]")
 # own structure (issue #1583) -- a citation under a ``## Provenance``
 # heading is neutral regardless of whether a clause-local marker word
 # introduces it, because the heading itself is the citation signal.
-_HEADING_LINE_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+#
+# The leading-whitespace class is ``[ \t]*`` (any amount) only because the
+# fence/indented-code filtering in :func:`_nearest_preceding_heading` strips
+# code-block lines before this regex ever sees them; a real ATX heading
+# cannot be indented 4+ spaces (that is an indented code block in CommonMark),
+# and the function skips such lines before matching.
+_HEADING_LINE_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$")
+
+# A fenced-code-block delimiter (CommonMark): 0-3 leading spaces, then 3+
+# backticks or 3+ tildes. An opener may carry an info string after the marker
+# (e.g. `````python````); a closer is the marker alone (plus optional
+# trailing whitespace). Used by :func:`_nearest_preceding_heading` to skip
+# ``#``-prefixed lines inside a fenced block -- a code sample containing the
+# literal line ``# References`` is not a structural heading and must not
+# shadow a real preceding heading (review finding, PR #1584 round 3).
+_FENCE_DELIM_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 
 # Citation-section heading vocabulary (issue #1583): a candidate whose
 # nearest preceding ``#``-heading is essentially one of these phrases is
@@ -299,10 +314,54 @@ def _nearest_preceding_heading(text_before_in_body: str) -> str | None:
     candidate's enclosing section is the most recent heading regardless of
     level (a ``### Sub`` under ``## Provenance`` is still in the Provenance
     section).
+
+    The walk is fence/indented-code aware (review finding, PR #1584 round
+    3): a ``#``-prefixed line inside a fenced code block (between
+    ``\\`\\`\\``` / ``~~~`` delimiters) or an indented code block (4+ leading
+    spaces or a tab) is code content, not a structural heading. Without
+    this, a code sample containing the literal line ``# References`` would
+    shadow a real preceding heading and wrongly neutralize a genuine
+    dispatch target elsewhere in the body -- the same cross-repo-
+    contamination risk class the gate exists to prevent. A real ATX
+    heading is never indented 4+ spaces (that is an indented code block in
+    CommonMark), so skipping such lines can only remove false positives,
+    never a genuine heading.
     """
     last: str | None = None
-    for match in _HEADING_LINE_RE.finditer(text_before_in_body):
-        last = match.group(1)
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    for line in text_before_in_body.splitlines():
+        delim = _FENCE_DELIM_RE.match(line)
+        if delim:
+            marker = delim.group(1)
+            char = marker[0]
+            length = len(marker)
+            if not in_fence:
+                # Opener: enter the fence. An info string may follow the
+                # marker (e.g. ```python); it is code, not prose.
+                in_fence = True
+                fence_char = char
+                fence_len = length
+            elif char == fence_char and length >= fence_len:
+                # Closer: same fence character, at least as long as the
+                # opener, and nothing but whitespace after the marker.
+                if line[delim.end() :].strip() == "":
+                    in_fence = False
+                    fence_char = ""
+                    fence_len = 0
+            continue
+        if in_fence:
+            # Inside a fenced block: every line is code, regardless of '#'.
+            continue
+        # Indented code block (CommonMark): 4+ leading spaces or a leading
+        # tab is code, not prose -- a '# References' line so indented is a
+        # code sample, not a heading.
+        if line.startswith("    ") or line.startswith("\t"):
+            continue
+        match = _HEADING_LINE_RE.match(line)
+        if match:
+            last = match.group(1)
     return last
 
 

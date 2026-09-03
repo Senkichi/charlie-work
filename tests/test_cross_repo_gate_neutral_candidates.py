@@ -469,3 +469,76 @@ def test_heading_containing_citation_word_as_substring_does_not_neutralize(
     assert result.missing_paths == (dispatch_target,)
     assert result.neutral_paths == ()
     assert "cross_repo_target" in result.reason
+
+
+def test_fenced_code_block_citation_heading_does_not_neutralize(
+    tmp_path: Path,
+) -> None:
+    """Review finding (PR #1584 round 3): a ``#``-prefixed line inside a
+    fenced code block is code content, not a structural markdown heading.
+    A code sample containing the literal line ``# References`` must NOT
+    shadow the real preceding ``## Changes`` heading and neutralize the
+    genuine dispatch target listed after the code block. The old
+    ``_HEADING_LINE_RE.finditer`` walk matched every ``#``-prefixed line
+    regardless of context, so the fenced ``# References`` became the
+    "nearest preceding heading" and the dispatch target was wrongly
+    neutralized -- the same cross-repo-contamination risk class round 1
+    already blocked twice, reopened via a third vector."""
+    repo = tmp_path / "repo"
+    _init_git_repo_with_var_gitignore(repo)
+    (repo / "src").mkdir()  # real, non-ignored top-level dir -- keeps the
+    # candidate genuinely repo-shaped-but-missing rather than tripping the
+    # single-candidate ambiguous-fragment exception.
+    dispatch_target = "src/charlie_work/nonexistent.py"
+    body = (
+        "## Changes\n\n"
+        "Reproducer:\n\n"
+        "```python\n"
+        "# References\n"
+        "import foo\n"
+        "```\n\n"
+        f"The fix is in `{dispatch_target}`.\n"
+    )
+
+    result = cross_repo_gate(body, repo)
+
+    assert result.passed is False
+    assert result.referenced_paths == (dispatch_target,)
+    assert result.missing_paths == (dispatch_target,)
+    assert result.neutral_paths == ()
+    assert "cross_repo_target" in result.reason
+
+
+def test_indented_code_block_citation_heading_does_not_neutralize(
+    tmp_path: Path,
+) -> None:
+    """Review finding (PR #1584 round 3): a ``#``-prefixed line inside an
+    indented code block (4+ leading spaces, per CommonMark) is code
+    content, not a structural heading. A code sample containing the
+    literal line ``    # References`` must NOT shadow the real preceding
+    ``## Changes`` heading and neutralize the genuine dispatch target
+    listed after it. The old ``_HEADING_LINE_RE`` allowed arbitrary
+    leading whitespace, so the indented ``# References`` matched as a
+    heading and became the nearest preceding heading -- neutralizing the
+    dispatch target."""
+    repo = tmp_path / "repo"
+    _init_git_repo_with_var_gitignore(repo)
+    (repo / "src").mkdir()  # real, non-ignored top-level dir -- keeps the
+    # candidate genuinely repo-shaped-but-missing rather than tripping the
+    # single-candidate ambiguous-fragment exception.
+    dispatch_target = "src/charlie_work/nonexistent.py"
+    body = (
+        "## Changes\n\n"
+        "Reproducer:\n\n"
+        "    # References\n"
+        "    import foo\n\n"
+        f"The fix is in `{dispatch_target}`.\n"
+    )
+
+    result = cross_repo_gate(body, repo)
+
+    assert result.passed is False
+    assert result.referenced_paths == (dispatch_target,)
+    assert result.missing_paths == (dispatch_target,)
+    assert result.neutral_paths == ()
+    assert "cross_repo_target" in result.reason
