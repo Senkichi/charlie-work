@@ -14,6 +14,10 @@ import yaml
 from . import CLI_NAME
 from .closing_keyword_gate import find_unexpected_closing_references
 from .mojibake_gate import find_mojibake_in_diff
+from .ast_equivalence_gate_command import (
+    register_ast_equivalence_check_subparser,
+    run_ast_equivalence_check_command,
+)
 from .private_slug_check_command import (
     register_private_slug_check_subparser,
     run_private_slug_check_command,
@@ -481,6 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     register_private_slug_check_subparser(subparsers)
+    register_ast_equivalence_check_subparser(subparsers)
 
     migrate_parser = subparsers.add_parser(
         "migrate-state-dir",
@@ -2628,6 +2633,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_mojibake_check_command(args)
         elif args.command == "private-slug-check":
             result = run_private_slug_check_command(args)
+        elif args.command == "ast-equivalence-check":
+            result = run_ast_equivalence_check_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)
