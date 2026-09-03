@@ -255,22 +255,65 @@ def test_generate_module_level_shim() -> None:
     assert "importlib" in shim
 
 
-def test_generate_class_level_shim() -> None:
-    """Class-level __getattr__ is generated for moved class members."""
+def test_generate_class_level_shim_resolves_through_dest_class(tmp_path: Path) -> None:
+    """A generated class-level facade resolves a moved member to the dest class.
+
+    Functional acceptance test for class-member shims (round-2 review finding):
+    the generated shim must define a real ``class {source_class}:`` with
+    ``__getattr__`` bound to it, and the lookup must resolve through the
+    destination *class* (``getattr(getattr(mod, dest_class), name)``) using the
+    captured ``MovedSymbol.dest_class`` -- not the destination module's
+    namespace.  The prior generator emitted a free function never bound to any
+    class and no class definition at all, so ``OldClass().moved_method`` raised
+    NameError; even if bound it read the module namespace instead of the class.
+    """
+    pkg = tmp_path / "shim_test_cls_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "new_module.py").write_text(
+        textwrap.dedent("""
+            class NewClass:
+                def moved_method(self):
+                    return 42
+        """),
+        encoding="utf-8",
+    )
+
     moved = [
         MovedSymbol(
             name="moved_method",
-            source_file="src/charlie_work/old_module.py",
-            dest_file="src/charlie_work/new_module.py",
+            source_file="shim_test_cls_pkg/old_module.py",
+            dest_file="shim_test_cls_pkg/new_module.py",
             source_class="OldClass",
             dest_class="NewClass",
             equivalent=True,
         ),
     ]
-    shim = generate_pep562_shim_source("src/charlie_work/old_module.py", moved)
-    assert "OldClass" in shim
-    assert "moved_method" in shim
-    assert "charlie_work.new_module" in shim
+    shim_source = generate_pep562_shim_source(
+        "shim_test_cls_pkg/old_module.py", moved, src_root=""
+    )
+    (pkg / "old_module.py").write_text(shim_source, encoding="utf-8")
+
+    sys.path.insert(0, str(tmp_path))
+    try:
+        old_mod = importlib.import_module("shim_test_cls_pkg.old_module")
+        new_mod = importlib.import_module("shim_test_cls_pkg.new_module")
+        OldClass = old_mod.OldClass
+        NewClass = new_mod.NewClass
+
+        # The moved member resolves through the old class path to the exact
+        # object on the destination class -- not a module-level attribute
+        # (which does not exist on new_module), proving the lookup went
+        # through the class via dest_class, not getattr(mod, name).
+        resolved = OldClass().moved_method
+        assert resolved is NewClass.moved_method
+        assert resolved(NewClass()) == 42
+        assert not hasattr(new_mod, "moved_method")
+    finally:
+        sys.path.remove(str(tmp_path))
+        for mod_name in list(sys.modules):
+            if mod_name.startswith("shim_test_cls_pkg"):
+                del sys.modules[mod_name]
 
 
 def test_generate_shim_no_moves() -> None:

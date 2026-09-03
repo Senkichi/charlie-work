@@ -273,7 +273,16 @@ def generate_pep562_shim_source(
 
     # Partition into module-level and class-level shims.
     module_shims: dict[str, str] = {}  # name -> dest_module
-    class_shims: dict[str, dict[str, str]] = {}  # class -> {name: dest_module}
+    # class -> {name: (dest_module, dest_class)}.  ``dest_class`` is captured
+    # from ``MovedSymbol.dest_class`` (not discarded) so the generated class
+    # ``__getattr__`` resolves through the destination *class* -- e.g.
+    # ``getattr(getattr(mod, dest_class), name)`` -- rather than reading the
+    # destination module's namespace, which would resolve the wrong (or
+    # nonexistent) attribute.  ``dest_class`` is ``None`` only when a class
+    # member was relocated to a top-level symbol instead of another class; the
+    # generated ``__getattr__`` falls back to a module-level lookup in that
+    # case.
+    class_shims: dict[str, dict[str, tuple[str, str | None]]] = {}
 
     for sym in moved_symbols:
         if sym.source_file != facade_module_path:
@@ -282,7 +291,10 @@ def generate_pep562_shim_source(
         if sym.source_class is None:
             module_shims[sym.name] = dest_module
         else:
-            class_shims.setdefault(sym.source_class, {})[sym.name] = dest_module
+            class_shims.setdefault(sym.source_class, {})[sym.name] = (
+                dest_module,
+                sym.dest_class,
+            )
 
     lines: list[str] = [
         f'"""PEP 562 facade shim for symbols moved out of {facade_module}.',
@@ -317,16 +329,31 @@ def generate_pep562_shim_source(
             lines.append(f"# Class-level facade for members moved out of {cls_name}.")
             lines.append(f"_CLS_REEXPORTS_{cls_name} = {{")
             for name in sorted(shims):
-                lines.append(f"    {name!r}: {shims[name]!r},")
+                dest_module, dest_class = shims[name]
+                lines.append(f"    {name!r}: ({dest_module!r}, {dest_class!r}),")
             lines.append("}")
             lines.append("")
-            lines.append(f"def _cls_getattr_{cls_name}(self, name):")
-            lines.append('    """Re-export moved members from their new classes."""')
-            lines.append(f"    if name in _CLS_REEXPORTS_{cls_name}:")
-            lines.append(f"        mod = importlib.import_module(_CLS_REEXPORTS_{cls_name}[name])")
-            lines.append("        return getattr(mod, name)")
+            lines.append("")
+            # Emit a real class definition with __getattr__ bound to it, so
+            # ``OldClass().moved_method`` actually resolves (the prior shape
+            # emitted a free function never bound to any class and no class
+            # definition at all, so the generated module raised NameError on
+            # the very access its own docstring promised).  The lookup
+            # resolves through the destination *class* on the destination
+            # module via the captured ``dest_class``, not the module namespace.
+            lines.append(f"class {cls_name}:")
+            lines.append('    """Facade for members moved to other classes (auto-generated)."""')
+            lines.append("")
+            lines.append("    def __getattr__(self, name):")
+            lines.append('        """Re-export moved members from their new classes."""')
+            lines.append(f"        if name in _CLS_REEXPORTS_{cls_name}:")
+            lines.append(f"            dest_module, dest_class = _CLS_REEXPORTS_{cls_name}[name]")
+            lines.append("            mod = importlib.import_module(dest_module)")
+            lines.append("            if dest_class is not None:")
+            lines.append("                return getattr(getattr(mod, dest_class), name)")
+            lines.append("            return getattr(mod, name)")
             lines.append(
-                "    raise AttributeError("
+                "        raise AttributeError("
                 'f"{type(self).__name__!r} object has no attribute {name!r}")'
             )
             lines.append("")
