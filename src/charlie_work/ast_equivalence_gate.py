@@ -346,6 +346,20 @@ def generate_pep562_shim_source(
 _SHIM_MAPPING_RE = re.compile(r"^(\w+)\s*=\s*\{", re.MULTILINE)
 _SHIM_ENTRY_RE = re.compile(r"^\s*['\"](\w+)['\"]\s*:", re.MULTILINE)
 
+# Non-source directories excluded from the vulture sweep's ``rglob('*.py')``
+# walk. ``uv run`` materializes ``.venv`` inside ``repo_root`` before this
+# command runs, so an unfiltered walk would scan the entire installed
+# environment -- thousands of third-party ``.py`` files whose import edges are
+# irrelevant to whether a *charlie_work* facade shim is stale, and which can
+# produce false negatives (a third-party module importing the re-exported name
+# would mask a genuinely-stale shim). The set is declarative and overridable
+# via ``find_stale_facade_shims(exclude_dirs=...)``; it names directory
+# *components*, matched against any path part, so a nested ``__pycache__`` or a
+# ``.venv`` at any depth is skipped.
+_DEFAULT_EXCLUDE_DIRS: frozenset[str] = frozenset(
+    {".venv", ".git", "__pycache__", "build", "dist", ".tox", ".eggs"}
+)
+
 
 def parse_shim_mapping(source: str) -> list[str]:
     """Extract re-exported names from a PEP 562 shim module's source.
@@ -373,18 +387,37 @@ def parse_shim_mapping(source: str) -> list[str]:
     return names
 
 
+def _is_under_excluded_dir(rel_parts: tuple[str, ...], exclude_dirs: frozenset[str]) -> bool:
+    """Return True if any path component of *rel_parts* is in *exclude_dirs*.
+
+    Matches directory *names* at any depth (``rel_parts`` excludes the final
+    filename), so a nested ``__pycache__`` or a ``.venv`` anywhere under
+    ``repo_root`` is skipped without enumerating every possible parent path.
+    """
+    return any(part in exclude_dirs for part in rel_parts[:-1])
+
+
 def find_stale_facade_shims(
     facade_file: str,
     facade_source: str,
     repo_root: Path,
     exclude_paths: frozenset[str] = frozenset(),
+    exclude_dirs: frozenset[str] = _DEFAULT_EXCLUDE_DIRS,
 ) -> list[StaleShim]:
     """Vulture sweep: flag facade re-export entries nobody imports any more.
 
     For each name in the shim's ``_REEXPORTS`` mapping, check whether any
-    ``.py`` file under *repo_root* (excluding the facade file itself and any
-    *exclude_paths*) still imports that name from the facade module.  If not,
+    source ``.py`` file under *repo_root* (excluding the facade file itself,
+    any *exclude_paths*, and any file beneath a directory named in
+    *exclude_dirs*) still imports that name from the facade module.  If not,
     the shim has outlived its need and is pure dead-code bloat.
+
+    Non-source directories (``.venv``, ``.git``, ``__pycache__``, ``build``,
+    ``dist``, …) are excluded from the walk by default: ``uv run`` materializes
+    ``.venv`` inside ``repo_root`` at the point this command runs, and scanning
+    the installed environment is both slow and a source of false negatives (a
+    third-party module importing the re-exported name would mask a genuinely
+    stale shim).  Pass ``exclude_dirs=frozenset()`` to walk everything.
 
     This is the "forgotten facade" sweep paired with the shim generator (issue
     #1541).  It runs as part of the same gate, not a separate manual chore.
@@ -399,8 +432,11 @@ def find_stale_facade_shims(
     # Build a set of all names imported from the facade module across the repo.
     imported_names: set[str] = set()
     for py_file in repo_root.rglob("*.py"):
-        rel = py_file.relative_to(repo_root).as_posix()
+        rel_parts = py_file.relative_to(repo_root).parts
+        rel = "/".join(rel_parts)
         if rel == facade_file or rel in exclude_paths:
+            continue
+        if _is_under_excluded_dir(rel_parts, exclude_dirs):
             continue
         try:
             tree = ast.parse(

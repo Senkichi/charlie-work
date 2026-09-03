@@ -46,6 +46,15 @@ test_marker*.txt
 # #1197 committed PR_BODY_1010.md to main this way (issue #1204). The glob
 # closes the class: any issue number, present or future, is covered.
 PR_BODY_*.md
+# The remaining variants mirror worktree.py's _LAUNCHER_OWNED_PR_BODY_RE
+# (issue #1391), which the dirty-check already recognizes but .gitignore did
+# not -- so a `_pr_body.md` (issue #1541 rework) or `.pr_body_<issue>.md`
+# (issue #1418) scratch file slipped past `git add` and got committed. These
+# globs close the same class at the ignore layer so the ad-hoc spellings the
+# regex already governs cannot recur via `git add`.
+_pr_body*.md
+.pr_body*.md
+.worker-pr-body*.md
 
 # Session planning/handoff documents are machine-local working notes, often
 # containing host paths and operational detail that must not ship in the

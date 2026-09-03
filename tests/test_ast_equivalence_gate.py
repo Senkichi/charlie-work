@@ -407,6 +407,103 @@ def test_no_stale_shims_when_all_imported(tmp_path: Path) -> None:
     assert stale == []
 
 
+def test_stale_shim_detected_despite_venv_import_mask(tmp_path: Path) -> None:
+    """A stale shim is flagged even when a ``.venv`` file imports it (issue #1541 review).
+
+    ``uv run`` materializes ``.venv`` inside ``repo_root`` before this command
+    runs. An unfiltered ``rglob('*.py')`` walk would scan the installed
+    environment and a third-party file importing the re-exported name would
+    mask a genuinely-stale shim (false negative). The default
+    ``exclude_dirs`` skips ``.venv`` (and ``.git``, ``__pycache__``, ``build``,
+    ``dist``), so the stale entry is still flagged.
+
+    Mutation control: reverting the directory exclusion (passing
+    ``exclude_dirs=frozenset()``) makes ``stale_name`` appear imported from the
+    ``.venv`` file, so it is NOT flagged -- the test's ``stale_name in
+    stale_names`` assertion fails. This proves the exclusion is load-bearing.
+    """
+    facade_source = textwrap.dedent("""
+        import importlib
+
+        _REEXPORTS = {
+            'stale_name': 'some.other.module',
+            'used_name': 'some.other.module',
+        }
+
+        def __getattr__(name):
+            if name in _REEXPORTS:
+                mod = importlib.import_module(_REEXPORTS[name])
+                return getattr(mod, name)
+            raise AttributeError(name)
+    """)
+    (tmp_path / "facade.py").write_text(facade_source, encoding="utf-8")
+
+    # A real source consumer imports 'used_name' only.
+    (tmp_path / "consumer.py").write_text("from facade import used_name\n", encoding="utf-8")
+
+    # A .venv file imports 'stale_name' -- this must NOT mask the stale entry.
+    venv_dir = tmp_path / ".venv" / "lib" / "site-packages"
+    venv_dir.mkdir(parents=True, exist_ok=True)
+    (venv_dir / "third_party.py").write_text("from facade import stale_name\n", encoding="utf-8")
+
+    # Default exclude_dirs skips .venv -> stale_name is flagged.
+    stale = find_stale_facade_shims(
+        facade_file="facade.py",
+        facade_source=facade_source,
+        repo_root=tmp_path,
+        exclude_paths=frozenset({"facade.py"}),
+    )
+    stale_names = {s.name for s in stale}
+    assert "stale_name" in stale_names, (
+        "stale_name was masked by a .venv import -- directory exclusion is missing"
+    )
+
+    # Mutation control: with exclusion disabled, the .venv file IS scanned and
+    # masks stale_name, so it is NOT flagged (proving the exclusion is what
+    # catches it).
+    stale_unfiltered = find_stale_facade_shims(
+        facade_file="facade.py",
+        facade_source=facade_source,
+        repo_root=tmp_path,
+        exclude_paths=frozenset({"facade.py"}),
+        exclude_dirs=frozenset(),
+    )
+    assert "stale_name" not in {s.name for s in stale_unfiltered}, (
+        "mutation control failed: stale_name should be masked when .venv is scanned"
+    )
+
+
+def test_stale_shim_excludes_pycache_and_build_dirs(tmp_path: Path) -> None:
+    """``__pycache__`` and ``build`` files do not mask a stale shim.
+
+    Same false-negative class as the ``.venv`` case: generated/cached files
+    under non-source directories must not count as real importers.
+    """
+    facade_source = textwrap.dedent("""
+        import importlib
+        _REEXPORTS = {'stale_name': 'some.module'}
+        def __getattr__(name):
+            if name in _REEXPORTS:
+                mod = importlib.import_module(_REEXPORTS[name])
+                return getattr(mod, name)
+            raise AttributeError(name)
+    """)
+    (tmp_path / "facade.py").write_text(facade_source, encoding="utf-8")
+
+    for sub in ("__pycache__", "build", "dist", ".git"):
+        d = tmp_path / sub
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "mask.py").write_text("from facade import stale_name\n", encoding="utf-8")
+
+    stale = find_stale_facade_shims(
+        facade_file="facade.py",
+        facade_source=facade_source,
+        repo_root=tmp_path,
+        exclude_paths=frozenset({"facade.py"}),
+    )
+    assert {s.name for s in stale} == {"stale_name"}
+
+
 def test_parse_shim_mapping_extracts_names() -> None:
     source = textwrap.dedent("""
         _REEXPORTS = {
@@ -608,3 +705,130 @@ def test_cli_ast_equivalence_check_always_ok(monkeypatch, tmp_path: Path) -> Non
     # Even with no moves, the gate is ok=True (evidence, not enforcement).
     assert result.ok is True
     assert result.data["moved_symbols"] == []
+
+
+def test_cli_ast_equivalence_check_generate_shims(monkeypatch, tmp_path: Path) -> None:
+    """``--generate-shims DIR`` writes a PEP 562 facade shim per moved-from module.
+
+    This is the production call site for ``generate_pep562_shim_source``
+    (issue #1541 review finding): the relocation PR author runs the gate with
+    ``--generate-shims`` to emit compat shims that keep old import paths
+    resolving. The generated file must contain a module-level ``__getattr__``
+    re-exporting the moved symbol from its new module.
+    """
+    from charlie_work import cli as cli_module
+
+    func_source = "def moved_func():\n    return 42\n"
+
+    def mock_run_captured(cmd, cwd, timeout_seconds=60, **kw):
+        if "diff" in cmd and "--name-only" in cmd:
+            return _make_run_result(stdout="src/old.py\nsrc/new.py\n")
+        if "show" in cmd:
+            ref = cmd[cmd.index("show") + 1]
+            path = ref.split(":", 1)[1] if ":" in ref else ""
+            if "old.py" in path and "base" in ref:
+                return _make_run_result(stdout=func_source)
+            return _make_run_result(stdout="", ok=False)
+        return _make_run_result(stdout="", ok=False)
+
+    def mock_bootstrap(args):
+        from charlie_work.config import OrchestratorConfig
+        from charlie_work.github import GitHub
+        from charlie_work.paths import RuntimePaths
+
+        return cli_module.CommandContext(
+            repo_root=tmp_path,
+            config=OrchestratorConfig(),
+            paths=RuntimePaths.__new__(RuntimePaths),
+            gh=GitHub(repo_root=tmp_path, runtime=None, dry_run=True),
+        )
+
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "old.py").write_text("# moved out\n", encoding="utf-8")
+    (tmp_path / "src" / "new.py").write_text(func_source, encoding="utf-8")
+
+    monkeypatch.setattr(cli_module, "run_captured", mock_run_captured)
+    monkeypatch.setattr(cli_module, "bootstrap_command", mock_bootstrap)
+
+    import argparse
+
+    args = argparse.Namespace(
+        command="ast-equivalence-check",
+        base="base",
+        shim_file=None,
+        output=None,
+        generate_shims="shims",
+        repo=None,
+        config=None,
+        fleet_dir=None,
+        dry_run=True,
+    )
+    result = run_ast_equivalence_check_command(args)
+    assert result.ok is True
+    # The facade module symbols moved out of was src/old.py.
+    assert result.data["generated_shims"] == ["src/old.py"]
+    # The shim file was written under shims/src/old.py.
+    shim_file = tmp_path / "shims" / "src" / "old.py"
+    assert shim_file.exists(), "shim file was not written"
+    shim_source = shim_file.read_text(encoding="utf-8")
+    assert "def __getattr__(name):" in shim_source
+    assert "moved_func" in shim_source
+    # The shim re-exports from the new module. src/new.py -> module "new".
+    assert "'new'" in shim_source
+
+
+def test_cli_ast_equivalence_check_no_generate_shims_by_default(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Without ``--generate-shims``, no shim files are written and the list is empty."""
+    from charlie_work import cli as cli_module
+
+    func_source = "def moved_func():\n    return 42\n"
+
+    def mock_run_captured(cmd, cwd, timeout_seconds=60, **kw):
+        if "diff" in cmd and "--name-only" in cmd:
+            return _make_run_result(stdout="src/old.py\nsrc/new.py\n")
+        if "show" in cmd:
+            ref = cmd[cmd.index("show") + 1]
+            path = ref.split(":", 1)[1] if ":" in ref else ""
+            if "old.py" in path and "base" in ref:
+                return _make_run_result(stdout=func_source)
+            return _make_run_result(stdout="", ok=False)
+        return _make_run_result(stdout="", ok=False)
+
+    def mock_bootstrap(args):
+        from charlie_work.config import OrchestratorConfig
+        from charlie_work.github import GitHub
+        from charlie_work.paths import RuntimePaths
+
+        return cli_module.CommandContext(
+            repo_root=tmp_path,
+            config=OrchestratorConfig(),
+            paths=RuntimePaths.__new__(RuntimePaths),
+            gh=GitHub(repo_root=tmp_path, runtime=None, dry_run=True),
+        )
+
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "old.py").write_text("# moved out\n", encoding="utf-8")
+    (tmp_path / "src" / "new.py").write_text(func_source, encoding="utf-8")
+
+    monkeypatch.setattr(cli_module, "run_captured", mock_run_captured)
+    monkeypatch.setattr(cli_module, "bootstrap_command", mock_bootstrap)
+
+    import argparse
+
+    args = argparse.Namespace(
+        command="ast-equivalence-check",
+        base="base",
+        shim_file=None,
+        output=None,
+        generate_shims=None,
+        repo=None,
+        config=None,
+        fleet_dir=None,
+        dry_run=True,
+    )
+    result = run_ast_equivalence_check_command(args)
+    assert result.ok is True
+    assert result.data["generated_shims"] == []
+    assert not (tmp_path / "shims").exists()
