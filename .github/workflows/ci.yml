@@ -128,6 +128,26 @@ jobs:
       # same published artifact.
       - name: Install dependencies
         run: uv sync --frozen --all-extras
+      - name: Collect tests
+        # Recorded-vs-collected assertion (issue #1621): capture the
+        # collected-test count ONCE, before the run, so the post-run step can
+        # fail the job when the junit <testcase> count falls short of it.
+        # Under load a full `pytest --junit-xml` run can exit 0 with zero
+        # failures yet write a junit file that silently omits a contiguous
+        # alphabetic tail of tests/ (issue #1621: three observed runs
+        # recorded 5959/5269/5937 vs 6227/6245/6245 collected); nothing in
+        # the repo previously asserted recorded == collected.
+        #
+        # `--collect-only -q` (NOT `--collect-only` alone): pytest 9.x's -q
+        # produces a compact `file: count` format whose per-file counts the
+        # gate sums (there is no `N tests collected` summary line in -q
+        # mode). `--collect-only` without -q would also work (the gate reads
+        # the summary line), but -q is far cheaper to capture and is what
+        # the issue names. `|| true` keeps the step green on a collection
+        # error so the gate command (not a bare CI step failure) surfaces a
+        # clear `empty_collect` finding -- matching the collect-only gate's
+        # (#1538) fail-with-a-message philosophy.
+        run: uv run pytest --collect-only -q > collected.txt || true
       - name: Run tests
         # -n auto (pytest-xdist): the self-hosted era pinned -n 2 purely as
         # box-sharing discipline -- CI shared 8 physical cores with a second
@@ -150,7 +170,30 @@ jobs:
         # stacking a second -q silently drops pytest's final "N passed"
         # summary line -- exit code unaffected, but CI logs become
         # unreadable for a human skimming a pass.
-        run: uv run pytest --tb=short -n auto --dist=load
+        # --junit-xml (issue #1621): write a junit report so the
+        # recorded-vs-collected step can count <testcase> elements and
+        # compare to the collected count. pytest-xdist combines all workers
+        # into a single <testsuites> document, so one file holds the full
+        # recorded set. The file is a CI artifact only (not uploaded) -- the
+        # gate fails the step in-process; a human reads the gate's stdout.
+        run: uv run pytest --tb=short -n auto --dist=load --junit-xml=pytest-junit.xml
+      - name: Recorded-vs-collected check (issue #1621)
+        # Fail the job when the junit <testcase> count differs from the
+        # collected count -- the load-truncation failure mode where pytest
+        # exits 0 with zero failures but silently omits a tail of tests/.
+        # A step of the already-required "Tests" job (NOT a new job), so no
+        # new required-check name and no coordinated three-place config edit
+        # -- a failed step fails the "Tests" check directly.
+        # `if: always()` so the count check runs even when the Run tests step
+        # failed: a failed run that also truncated its junit would otherwise
+        # skip this step and hide the truncation behind the test failure.
+        # (When Run tests fails, the job is already red; this step can only
+        # add a second, more specific signal, never turn red green.)
+        if: always()
+        run: |
+          uv run charlie junit-recorded-check \
+            --junit pytest-junit.xml \
+            --collect collected.txt
 
   Lint:
     name: Lint
