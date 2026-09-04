@@ -47,17 +47,20 @@ from .github_capabilities import (
     LabelsLike,
     MergeBranchLike,
     PR_CHECKS_FIELDS,
+    PR_LIST_FIELDS,
+    PR_VIEW_FIELDS,
     PullRequestsLike,
     RepoMetaLike,
+    _LIST_LIMIT,
+    _is_mutating,
 )
 from .github_capabilities import _job_id_from_link  # noqa: F401  (deliberate re-export)
+from .github_capabilities import _pr_number_from_url  # noqa: F401  (deliberate re-export)
 from .github_delegation import _COLLABORATORS, _install_delegates
 from .github_delegation import _ROUTES, _SIGNATURE_SOURCE, _make_delegate  # noqa: F401 (deliberate re-export)
 from .subprocess_runner import no_console_window_kwargs
 
 logger = logging.getLogger(__name__)
-
-_LIST_LIMIT = 500
 
 # Defaults used when GitHub is constructed without a RuntimeConfig (tests and
 # legacy callers). Production code should pass config.runtime so these are
@@ -119,8 +122,6 @@ ISSUE_LIST_FIELDS = "number,title,url,body,labels,author,createdAt,updatedAt,sta
 ISSUE_VIEW_FIELDS = (
     "number,title,url,body,labels,assignees,author,comments,createdAt,updatedAt,state"
 )
-PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,mergeable,state"
-PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
 PR_VIEW_MERGED_FIELDS = "state,mergedAt,headRefOid"
 # The field contract for every merged-PR listing. Two producers must satisfy
 # it identically: merged_prs_for_issue() queries these fields directly, and
@@ -240,31 +241,6 @@ class MergedPRSearchResult(list):
 
 
 _MergedPRSearchResult = MergedPRSearchResult
-
-
-# Matches the PR-number segment of a pull-request URL, e.g.
-# https://github.com/OWNER/REPO/pull/123
-_PR_URL_RE = re.compile(r"/pull/(\d+)")
-
-
-def _pr_number_from_url(output: str) -> int | None:
-    """Extract a PR number from ``gh pr create`` output.
-
-    ``gh pr create`` prints the created PR's URL on stdout; it has no ``--json``
-    flag, so this is the only machine-readable channel it offers.
-
-    The *last* match wins, not the first. ``gh`` may precede the URL with
-    progress chatter ("Creating pull request for X into main in OWNER/REPO"),
-    and a caller-supplied title or body echoed into that preamble could contain
-    a ``/pull/N`` link of its own -- a PR body that says "supersedes
-    .../pull/900" is ordinary. The URL gh appends last is the one it created.
-
-    Never raises; returns None when no PR URL is present.
-    """
-    match = None
-    for match in _PR_URL_RE.finditer(output):  # noqa: B007 - last match wins
-        pass
-    return int(match.group(1)) if match is not None else None
 
 
 @dataclass(frozen=True)
@@ -523,69 +499,6 @@ class GitHub:
             error=error,
         )
 
-    def pr_create(
-        self,
-        head: str,
-        base: str,
-        title: str,
-        body: str,
-    ) -> int | None:
-        """Create a GitHub PR for ``head`` into ``base``.
-
-        Returns the new PR number, or ``None`` if creation failed. Errors are
-        returned as values, never raised.
-
-        ``gh pr create`` has no ``--json`` flag -- unlike ``gh pr view``/``list``,
-        it is a mutation and reports the created PR by printing its URL. Passing
-        ``--json number`` made ``gh`` exit non-zero at argument parsing
-        ("unknown flag: --json") *before* contacting the API, so this method
-        could never succeed and no PR was ever created. It failed in the most
-        expensive possible way: the caller's error string said "gh pr create
-        failed", which reads as a rejection by GitHub, so the natural next step
-        was to investigate permissions and branch state rather than the command
-        we sent. The number is therefore parsed out of the URL, which is the
-        only channel this subcommand offers.
-        """
-        if self.dry_run:
-            return 0
-        result = self.run(
-            [
-                "pr",
-                "create",
-                "--head",
-                head,
-                "--base",
-                base,
-                "--title",
-                title,
-                "--body",
-                body,
-            ],
-            allow_failure=True,
-        )
-        if not result.ok:
-            # Logged here rather than left to the caller: the caller sees only
-            # ``None`` and cannot say whether gh was missing, unauthenticated,
-            # rejected by the API, or handed a bad flag -- the ambiguity that
-            # hid this bug.
-            logger.warning(
-                "gh pr create failed (head=%s base=%s rc=%s): %s",
-                head,
-                base,
-                result.returncode,
-                (result.stderr or "").strip()[:500] or "(no stderr)",
-            )
-            return None
-        number = _pr_number_from_url(str(result.value or ""))
-        if number is None:
-            logger.warning(
-                "gh pr create reported success for head=%s but no PR URL was found "
-                "in its output: %r",
-                head,
-                str(result.value or "")[:500],
-            )
-        return number
-
     def _run_bool(self, args: list[str]) -> bool:
         """Run a gh command and return True iff returncode == 0.
 
@@ -663,78 +576,6 @@ class GitHub:
         )
         return result if isinstance(result, dict) else {}
 
-    def pr_list(self) -> list[dict[str, Any]]:
-        cache_key = ("pr_list",)
-        cached = self._list_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        result = self._list_json(
-            [
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--limit",
-                str(_LIST_LIMIT),
-                "--json",
-                PR_LIST_FIELDS,
-            ],
-            limit=_LIST_LIMIT,
-            kind="open PRs",
-        )
-        self._list_cache[cache_key] = result
-        return result
-
-    def merged_pr_list(self) -> list[dict[str, Any]]:
-        """List recently merged PRs using the REST API to avoid the expensive
-        GraphQL query that gh pr list --state merged issues.
-
-        Paginates through closed PRs (most recently updated first) and filters
-        to merged PRs, returning up to _LIST_LIMIT (500) items.
-        """
-        cache_key = ("merged_pr_list",)
-        cached = self._list_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        merged: list[dict[str, Any]] = []
-        max_pages = (_LIST_LIMIT // 100) + 1
-        for page in range(1, max_pages + 1):
-            result = self.run(
-                [
-                    "api",
-                    f"repos/{{owner}}/{{repo}}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}",
-                ],
-                json_output=True,
-            )
-            # run() returns None when gh exits 0 with empty stdout. A genuine
-            # empty page comes back as the JSON array ``[]`` (a list), so a
-            # non-list result means the call produced nothing parseable — an
-            # unusable response, not "no more results". Silently coercing that
-            # to [] makes an empty fetch indistinguishable from a failed one,
-            # which would arm consumers like the #502 post-merge tripwire with
-            # an empty baseline and leave them permanently blind to the merges
-            # they never saw. Surface it as an error so callers can tell
-            # "fetch failed" from "fetch succeeded and found nothing" (#633).
-            if not isinstance(result, list):
-                raise GitHubError(
-                    "merged_pr_list: gh api returned no parseable list for "
-                    f"page {page}; cannot distinguish empty result from unusable response"
-                )
-            page_prs = result
-            if not page_prs:
-                break
-            for pr in page_prs:
-                if pr.get("merged_at"):
-                    merged.append(self._normalize_rest_pr(pr))
-                if len(merged) >= _LIST_LIMIT:
-                    break
-            if len(merged) >= _LIST_LIMIT:
-                break
-
-        self._list_cache[cache_key] = merged
-        return merged
-
     def merged_prs_for_issue(
         self,
         issue_number: int,
@@ -794,35 +635,6 @@ class GitHub:
             if bound == issue_number:
                 matched.append(pr)
         return MergedPRSearchResult(matched, ok=True)
-
-    def pr_view(self, number: int, *, fields: str = PR_VIEW_FIELDS) -> dict[str, Any]:
-        """Fetch a PR via ``gh pr view --json <fields>``.
-
-        ``fields`` defaults to the general-purpose ``PR_VIEW_FIELDS`` (CI/review/
-        label state included). Callers that only need a narrow slice -- e.g.
-        the closing-keyword-check gate, which never touches CI status and
-        must not risk `statusCheckRollup`'s token-scope failure (see
-        `CLOSING_KEYWORD_PR_FIELDS`) -- should pass their own narrower field
-        list rather than filtering the wide result after the fact, so the gh
-        invocation itself never requests a field it doesn't need.
-        """
-        result = self.run(
-            [
-                "pr",
-                "view",
-                str(number),
-                "--json",
-                fields,
-            ],
-            json_output=True,
-        )
-        return result if isinstance(result, dict) else {}
-
-    def pr_diff(self, number: int) -> str:
-        result = self.run(["pr", "diff", str(number)], allow_failure=True)
-        if isinstance(result, GitHubRunResult):
-            return result.value if result.ok else ""
-        return result if isinstance(result, str) else ""
 
     def _pr_checks_fallback(self, number: int) -> list[dict[str, Any]] | None:
         """Disambiguate a ``gh pr checks`` failure via ``statusCheckRollup`` (issue #846).
@@ -910,32 +722,6 @@ class GitHub:
                 }
             )
         return mapped
-
-    def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
-        """Fetch a PR's commits via the REST ``pulls/{number}/commits`` endpoint.
-
-        Each item's ``commit.message`` is the exact, untruncated raw commit
-        message text (subject + blank line + body), matching ``git show
-        --format=%B``. Deliberately NOT ``gh pr view --json commits``: that
-        GraphQL field set truncates ``messageHeadline`` at a fixed length
-        (~70 chars observed) and splits the remainder into ``messageBody``
-        without preserving the original text — verified on PR #788's own
-        commit, where the GraphQL fields split the subject line mid-word
-        ("defang o" / "utbound reviewer prose...") and would silently corrupt
-        the very "keyword #N" text `closing_keyword_gate` (issue #790) needs
-        to scan intact. ``per_page=100`` covers every PR this codebase
-        produces (worker branches are single- or few-commit); a PR with more
-        commits than that is outside this project's workflow. Returns
-        ``None`` on failure — errors are returned as values, never raised.
-        """
-        result = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/pulls/{number}/commits?per_page=100"],
-            json_output=True,
-            allow_failure=True,
-        )
-        if isinstance(result, GitHubRunResult):
-            return result.value if result.ok and isinstance(result.value, list) else None
-        return result if isinstance(result, list) else None
 
     def branch_protection(self, base: str) -> dict[str, Any] | None:
         """Return branch protection settings for ``base``, or None on failure.
@@ -1131,26 +917,6 @@ class GitHub:
             return True
         except GitHubError:
             return False
-
-    def pr_ready(self, number: int) -> GitHubRunResult:
-        """Mark a draft PR as ready for review via ``gh pr ready`` (issue #818).
-
-        Returns a structured result so callers can distinguish success from
-        failure without inferring from output shape -- errors from external
-        processes come back as values here, never exceptions. Dry-run mode
-        returns a synthetic ok=True result (the operation would succeed if not
-        for dry-run); this mirrors ``_run_bool``'s explicit guard because
-        ``.run()`` itself returns a bare string under dry-run, not a
-        ``GitHubRunResult``.
-        """
-        args = ["pr", "ready", str(number)]
-        if self.dry_run and _is_mutating(args):
-            return GitHubRunResult(
-                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
-            )
-        result = self.run(args, allow_failure=True)
-        assert isinstance(result, GitHubRunResult)
-        return result
 
     def pr_close(self, number: int) -> GitHubRunResult:
         """Close a PR via ``gh pr close`` (issue #1274, W17).
@@ -2140,117 +1906,6 @@ def _should_retry(args: list[str], error: str, is_mutating: bool) -> bool:
     if not is_mutating:
         return True
     return _is_pre_connection_error(error)
-
-
-def _graphql_field_value(args: list[str], field: str) -> str | None:
-    """Return the raw value of a `gh api graphql -f/--field name=value` pair.
-
-    Handles detached (`-f query=...`), attached shorthand (`-fquery=...`),
-    and `--field=query=...` spellings (#919). Returns `None` if the field is
-    absent or its value is missing.
-    """
-    for i, arg in enumerate(args):
-        if arg in ("-f", "--raw-field", "-F", "--field"):
-            next_arg = args[i + 1] if i + 1 < len(args) else ""
-            if "=" in next_arg and next_arg.split("=", 1)[0] == field:
-                return next_arg.split("=", 1)[1]
-        elif arg.startswith("-f") and len(arg) > 2:
-            rest = arg[2:].lstrip("=")
-            if "=" in rest and rest.split("=", 1)[0] == field:
-                return rest.split("=", 1)[1]
-        elif arg.startswith(("--field=", "--raw-field=")):
-            rest = arg.split("=", 1)[1]
-            if "=" in rest and rest.split("=", 1)[0] == field:
-                return rest.split("=", 1)[1]
-    return None
-
-
-def _is_graphql_query(args: list[str]) -> bool:
-    """A `gh api graphql -f query='query { ... }'` is a read-only query.
-
-    `args` is the argv after the leading `gh` token, so a GraphQL call looks
-    like `["api", "graphql", "-f", "query=..."]`.
-
-    Fails closed: only an operation that *starts* with the GraphQL `query`
-    keyword is treated as read-only. `mutation` or anything unparseable is
-    classified as mutating so a stray write never runs under `--dry-run`.
-    """
-    if len(args) < 2 or args[0] != "api" or args[1] != "graphql":
-        return False
-    query = _graphql_field_value(args, "query")
-    if not query:
-        return False
-    return query.lstrip()[:5].lower() == "query"
-
-
-def _api_is_mutating(args: list[str]) -> bool:
-    """Classify a `gh api` invocation, for the --dry-run gate.
-
-    `gh api` defaults to GET, so a bare `gh api <path>` is read-only and MUST stay
-    runnable under --dry-run — roughly a dozen call sites (rate_limit, commits/{sha},
-    check-runs, compare, branches/*/protection, `fleet_registry.py`) depend on that.
-    Blanket-denying `api` would turn --dry-run from "observes without mutating" into
-    "cannot observe", so the classification keys off whether a method is *named*.
-
-    Structured on flag PRESENCE rather than on enumerating accepted spellings, and
-    fails CLOSED when a method flag is present but its value cannot be extracted.
-    The previous version enumerated `--method`/`--method=` only and fell through to
-    False for everything else, so `-X DELETE` — the form `delete_branch` builds —
-    classified as read-only and a --dry-run really deleted PR head branches
-    (#914, #917). Enumeration is the wrong shape here: it silently fails open on
-    each spelling nobody thought of (`-X`, `-X=`, `-XDELETE`, a trailing `--method`
-    with no value).
-
-    Read-only `gh api graphql -f query='query { ... }'` is an exception: it is a
-    GraphQL query and must be runnable under `--dry-run` so `fleet status` can
-    batch issue dependency/state lookups in a single subprocess (#923).
-    """
-    if _is_graphql_query(args):
-        return False
-
-    for i, arg in enumerate(args):
-        if arg in ("-X", "--method"):
-            method = args[i + 1] if i + 1 < len(args) else ""
-        elif arg.startswith("--method="):
-            method = arg.split("=", 1)[1]
-        elif arg.startswith("-X"):
-            # pflag shorthand accepts an attached value: `-XDELETE` and `-X=DELETE`.
-            method = arg[2:].lstrip("=")
-        else:
-            continue
-        # A named-but-unparseable method is not evidence of a read; fail closed.
-        return not method or method.upper() not in ("GET", "HEAD")
-    # No explicit method. gh switches GET -> POST when request parameters are added
-    # ("adding request parameters will automatically switch the request method to
-    # POST" -- gh api --help). Prefix-matched, not membership-tested, for the same
-    # reason as the method arm: pflag accepts both the detached (`-f title=x`,
-    # `--field=labels[]=bug`) and the attached (`-ftitle=x`) spelling, and a
-    # membership test sees only the detached one (#919). `--field`/`--raw-field`/
-    # `--input` are prefixes rather than exact matches so the bare and `=` forms
-    # collapse into one condition.
-    param_prefixes = ("--raw-field", "--field", "--input")
-    return any(arg.startswith(param_prefixes) or arg[:2] in ("-f", "-F") for arg in args)
-
-
-def _is_mutating(args: list[str]) -> bool:
-    if not args:
-        return False
-    text = " ".join(args)
-    # `gh api` defaults to GET and is read-only unless a mutating method is given.
-    # run() passes args without the leading "gh" token.
-    if text.startswith("api"):
-        return _api_is_mutating(args)
-    readonly_prefixes = (
-        "issue list",
-        "issue view",
-        "pr list",
-        "pr view",
-        "pr diff",
-        "pr checks",
-        "label list",
-        "auth status",
-    )
-    return not any(text.startswith(prefix) for prefix in readonly_prefixes)
 
 
 # Blocker declaration patterns for dependency gate

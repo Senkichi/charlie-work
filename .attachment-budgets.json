@@ -6,7 +6,7 @@
    "file": "src/charlie_work/github.py",
    "identity": "GitHub",
    "kind": "class",
-   "member_count": 34
+   "member_count": 27
   },
   {
    "boundary": 6.0,
@@ -149,10 +149,26 @@
   {
    "boundary": 41.0,
    "bumps": [],
+   "file": "tests/test_git_push_lint_hook.py",
+   "identity": "tests/test_git_push_lint_hook.py::module",
+   "kind": "test_module",
+   "member_count": 42
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
    "file": "tests/test_github.py",
    "identity": "tests/test_github.py::module",
    "kind": "test_module",
    "member_count": 55
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_githublike_protocol.py",
+   "identity": "tests/test_githublike_protocol.py::module",
+   "kind": "test_module",
+   "member_count": 42
   },
   {
    "boundary": 41.0,
