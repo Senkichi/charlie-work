@@ -2117,6 +2117,47 @@ def test_bootstrap_command_returns_frozen_context_with_all_four_fields(
     assert isinstance(ctx.gh, _FakeGitHub)
 
 
+def test_bootstrap_command_forwards_redirect_to_main_worktree_false(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #1600: ``bootstrap_command`` must forward
+    ``redirect_to_main_worktree`` to ``find_repo_root``.
+
+    The existing ``test_bootstrap_command_returns_frozen_context_with_all_four_fields``
+    stubs ``find_repo_root`` with a ``**kw``-swallowing lambda, so nothing
+    would catch a regression in the 3-line forwarding hunk (cli.py) — the exact
+    line implementing this issue's fix.  This test exercises the *real*
+    ``bootstrap_command`` with a *captured* ``find_repo_root`` and asserts the
+    kwarg is actually forwarded, both for the opt-out (False) and the default
+    (True) so a dropped or renamed kwarg fails loudly.
+    """
+    repo = _fake_repo(tmp_path / "charlie-work")
+    config = OrchestratorConfig()
+
+    captured: dict[str, object] = {}
+
+    def capturing_find_repo_root(cwd, *, explicit=False, redirect_to_main_worktree=True):
+        captured["cwd"] = cwd
+        captured["explicit"] = explicit
+        captured["redirect_to_main_worktree"] = redirect_to_main_worktree
+        return repo
+
+    monkeypatch.setattr(cli, "find_repo_root", capturing_find_repo_root)
+    monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+
+    args = cli.build_parser().parse_args(["--repo", str(repo), "roll-call"])
+
+    # Opt-out path (#1600): the kwarg must reach find_repo_root as False.
+    cli.bootstrap_command(args, redirect_to_main_worktree=False)
+    assert captured["redirect_to_main_worktree"] is False
+
+    # Default path: the kwarg must reach find_repo_root as True.
+    cli.bootstrap_command(args)
+    assert captured["redirect_to_main_worktree"] is True
+
+
 def test_command_context_is_frozen(tmp_path: Path) -> None:
     """CommandContext must be a frozen dataclass (CLAUDE.md invariant)."""
     import dataclasses
