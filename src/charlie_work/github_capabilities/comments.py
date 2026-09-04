@@ -24,6 +24,14 @@ class CommentsLike(Protocol):
 class Comments(CapabilityCollaborator):
     """Issue/PR comment capability collaborator.
 
-    Empty in L01 (pure infrastructure leaf) -- methods move here in later
-    leaves per the Mikado graph (design doc Section 5).
+    Moved from ``GitHub`` verbatim (Track 2, issue #1586; design doc Section
+    5, L02). Bodies still say ``self.run(...)``, which resolves through
+    ``CapabilityCollaborator.__getattr__`` to the owner's ``run`` (design doc
+    Section 3.3).
     """
+
+    def issue_comment(self, number: int, body_file: Path) -> None:
+        self.run(["issue", "comment", str(number), "--body-file", str(body_file)])
+
+    def pr_comment(self, number: int, body_file: Path) -> None:
+        self.run(["pr", "comment", str(number), "--body-file", str(body_file)])
