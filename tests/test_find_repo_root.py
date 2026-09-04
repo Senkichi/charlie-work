@@ -148,6 +148,53 @@ def test_find_repo_root_from_subdirectory_of_linked_worktree(tmp_path: Path) -> 
         )
 
 
+def test_find_repo_root_no_redirect_honors_linked_worktree(tmp_path: Path) -> None:
+    """Issue #1600: ``find_repo_root(..., redirect_to_main_worktree=False)`` from
+    inside a linked git worktree must return the linked worktree's own root, not
+    the shared main root.  Read-only diagnostics (e.g. ``ast-equivalence-check``)
+    need to inspect the worktree they were invoked from, not the main checkout.
+    The default (``redirect_to_main_worktree=True``) still redirects for
+    state-mutating commands — that behaviour is covered by
+    ``test_find_repo_root_resolves_shared_root_from_linked_worktree`` above."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    linked_wt = tmp_path / "wt-no-redirect"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "agent/issue-1600", str(linked_wt), "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        resolved = find_repo_root(linked_wt, redirect_to_main_worktree=False)
+        # Must resolve to the linked worktree's own root, NOT the main root.
+        assert resolved == linked_wt.resolve()
+        assert resolved != repo_root.resolve()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(linked_wt)],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_find_repo_root_no_redirect_in_main_worktree_unchanged(tmp_path: Path) -> None:
+    """Issue #1600: ``redirect_to_main_worktree=False`` in the *main* worktree
+    must still return the main root — the opt-out only matters for linked
+    worktrees, and must not perturb the main-worktree path."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    resolved = find_repo_root(repo_root, redirect_to_main_worktree=False)
+    assert resolved == repo_root.resolve()
+
+
 def test_find_repo_root_separate_git_dir_main_worktree(tmp_path: Path) -> None:
     """Issue #648 review MAJOR 1: a --separate-git-dir repo's main worktree
     must resolve to the *working tree* root (where the code lives), not the

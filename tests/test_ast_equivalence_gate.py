@@ -684,7 +684,7 @@ def _apply_cli_mocks(
             return _make_run_result(stdout="", ok=False)
         return _make_run_result(stdout="", ok=False)
 
-    def mock_bootstrap(args):
+    def mock_bootstrap(args, **kwargs):
         from charlie_work.config import OrchestratorConfig
         from charlie_work.github import GitHub
         from charlie_work.paths import RuntimePaths

@@ -257,7 +257,13 @@ def run_ast_equivalence_check_command(
     """
     from . import cli  # deferred: see module docstring (circular-import / -m guard)
 
-    ctx = cli.bootstrap_command(args)
+    # Issue #1600: this is a read-only diagnostic, not a state-mutating
+    # command.  bootstrap_command defaults to redirecting a linked-worktree
+    # cwd to the shared main worktree root (issue #648 state-safety), but
+    # that redirect makes the gate silently inspect the main worktree's diff
+    # instead of the worktree it was invoked from.  Pass
+    # redirect_to_main_worktree=False so the gate honors the invoking worktree.
+    ctx = cli.bootstrap_command(args, redirect_to_main_worktree=False)
     base = getattr(args, "base", "origin/main")
 
     changed_files, err = _git_changed_py_files(cli.run_captured, ctx.repo_root, base)
