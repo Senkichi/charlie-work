@@ -6,8 +6,14 @@ no test re-derives its expectation from the module under test.
 
 from __future__ import annotations
 
-from charlie_work.attachment_contracts.model import AttachmentPoint
-from charlie_work.attachment_contracts.outliers import FLOOR, saturate, saturate_all
+from charlie_work.attachment_contracts.model import AttachmentPoint, KindStats
+from charlie_work.attachment_contracts.outliers import (
+    FLOOR,
+    saturate,
+    saturate_all,
+    saturate_all_with_fences,
+    saturate_with_fence,
+)
 
 
 def _point(
@@ -197,3 +203,127 @@ def test_saturate_all_concatenates_across_kinds() -> None:
     saturated_idents = {v.point.identity for v in verdicts if v.saturated}
     assert saturated_idents == {"a4", "b4"}
     assert len(verdicts) == 8
+
+
+# ---------------------------------------------------------------------------
+# saturate_with_fence / saturate_all_with_fences (issue #1614): frozen fence
+# ---------------------------------------------------------------------------
+
+
+def test_saturate_with_fence_uses_frozen_boundary_not_live_population() -> None:
+    # Issue #1614 positive control: a population whose LIVE fence would move
+    # when a median point is added, but the FROZEN fence must not.
+    #
+    # Freeze-time population (n=8): counts sorted = [1,2,3,4,6,8,16,20].
+    #   q1 rank = ceil(0.25*8) = 2 -> sorted[1] = 2
+    #   q3 rank = ceil(0.75*8) = 6 -> sorted[5] = 8
+    #   iqr = 6; boundary = 8 + 1.5*6 = 17
+    #   P (16) is NOT saturated (16 > 17 is False); big (20) IS saturated.
+    freeze_points = (
+        _point("a", 1),
+        _point("b", 2),
+        _point("c", 3),
+        _point("d", 4),
+        _point("e", 6),
+        _point("f", 8),
+        _point("P", 16),
+        _point("big", 20),
+    )
+    live_verdicts = {v.point.identity: v for v in saturate(freeze_points, "class")}
+    assert live_verdicts["big"].saturated is True
+    assert live_verdicts["P"].saturated is False
+    assert live_verdicts["P"].boundary == 17.0
+
+    frozen = KindStats(kind="class", q3=8.0, iqr=6.0, boundary=17.0, population=8)
+
+    # After adding one median-sized module (count=8, at the old q3), the LIVE
+    # fence drops: n=9, sorted=[1,2,3,4,6,8,8,16,20],
+    #   q1 rank = ceil(2.25) = 3 -> sorted[2] = 3
+    #   q3 rank = ceil(6.75) = 7 -> sorted[6] = 8
+    #   iqr = 5; boundary = 8 + 7.5 = 15.5  ->  P (16) IS saturated live.
+    augmented = freeze_points + (_point("median", 8),)
+    live_aug = {v.point.identity: v for v in saturate(augmented, "class")}
+    assert live_aug["P"].saturated is True, "positive control: live fence moved and saturated P"
+    assert live_aug["P"].boundary == 15.5
+
+    # The FROZEN fence must NOT move: P stays not-saturated against boundary=17.
+    frozen_verdicts = {
+        v.point.identity: v for v in saturate_with_fence(augmented, "class", frozen)
+    }
+    assert frozen_verdicts["P"].saturated is False
+    assert frozen_verdicts["P"].boundary == 17.0
+    assert frozen_verdicts["P"].population == 8  # frozen population, not live 9
+    assert frozen_verdicts["big"].saturated is True
+    # The newly-added median module is tested against the frozen fence too.
+    assert frozen_verdicts["median"].saturated is False
+
+
+def test_saturate_with_fence_reproduces_floor_guard_against_frozen_population() -> None:
+    # A kind that was below FLOOR at freeze time saturates nothing against the
+    # frozen fence, even once the live population has grown past FLOOR -- the
+    # frozen decision was "no meaningful fence", and only a refreeze revisits
+    # it. (population=3 < FLOOR=4 -> boundary=0, nothing saturated.)
+    frozen = KindStats(kind="class", q3=0.0, iqr=0.0, boundary=0.0, population=3)
+    points = (
+        _point("a", 1),
+        _point("b", 2),
+        _point("c", 3),
+        _point("d", 4),
+        _point("big", 50),
+    )
+    verdicts = saturate_with_fence(points, "class", frozen)
+    # boundary=0.0 would naively saturate everything with member_count >= 1
+    # via `> 0.0`; the frozen-population FLOOR guard must prevent that.
+    assert all(v.saturated is False for v in verdicts)
+    assert all(v.boundary == 0.0 for v in verdicts)
+
+
+def test_saturate_with_fence_reproduces_degenerate_iqr_guard() -> None:
+    # A kind that was degenerate (iqr==0) at freeze time saturates nothing
+    # against the frozen fence, even if a live point now exceeds the frozen
+    # boundary -- the frozen decision was "no spread, no tolerance".
+    frozen = KindStats(kind="class", q3=4.0, iqr=0.0, boundary=4.0, population=4)
+    points = (
+        _point("a", 4),
+        _point("b", 4),
+        _point("c", 4),
+        _point("d", 4),
+        _point("e", 5),  # 5 > frozen boundary 4, but degenerate guard blocks it
+    )
+    verdicts = {v.point.identity: v for v in saturate_with_fence(points, "class", frozen)}
+    assert all(v.saturated is False for v in verdicts.values())
+    assert verdicts["e"].boundary == 4.0
+
+
+def test_saturate_with_fence_excludes_ledger_and_trivial_like_saturate() -> None:
+    # Eligibility is shared with saturate (_eligible_points): ledger and
+    # structurally-trivial points get no verdict under the frozen fence too.
+    frozen = KindStats(kind="class", q3=3.0, iqr=2.0, boundary=6.0, population=4)
+    real = (_point("a", 1), _point("b", 2), _point("c", 3), _point("d", 10))
+    ledger = _point("ledger", 50, ledger=True)
+    trivial = _point("trivial", 1, trivial=True)
+    verdicts = {
+        v.point.identity: v for v in saturate_with_fence(real + (ledger, trivial), "class", frozen)
+    }
+    assert "ledger" not in verdicts
+    assert "trivial" not in verdicts
+    assert verdicts["d"].saturated is True  # 10 > 6
+
+
+def test_saturate_all_with_fences_only_yields_verdicts_for_frozen_kinds() -> None:
+    # A kind present in the live tree but absent from kind_stats (a brand-new
+    # archetype since the last freeze) gets no verdict -- it has no frozen
+    # target to test against and cannot produce a block finding until a
+    # refreeze records its fence.
+    fences = {"class": KindStats(kind="class", q3=3.0, iqr=2.0, boundary=6.0, population=4)}
+    points = (
+        _point("a", 1, kind="class"),
+        _point("b", 2, kind="class"),
+        _point("c", 3, kind="class"),
+        _point("d", 10, kind="class"),
+        _point("newkind", 100, kind="typer_app"),
+    )
+    verdicts = saturate_all_with_fences(points, fences)
+    idents = {v.point.identity for v in verdicts}
+    assert "newkind" not in idents
+    assert {v.point.kind for v in verdicts} == {"class"}
