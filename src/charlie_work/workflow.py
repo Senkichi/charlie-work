@@ -7280,6 +7280,21 @@ class OrchestratorApp:
         # must cost zero review tokens. Most failures don't move labels — they
         # are the worker's/CI's to fix. A definitive required-check failure on
         # a linked-issue PR is routed to rework so the worker can push a fix.
+        # Issue #1598: pass the bound issue's live labels so the janitor can
+        # surface a human-merge-label warning in the verdict. Only fetched
+        # when human_merge_labels is configured (default empty → skipped).
+        _hm_issue_labels: set[str] | None = None
+        if self.config.dispatch.human_merge_labels:
+            _hm_issue_num = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=self.config.dispatch.branch_prefix,
+            )
+            if _hm_issue_num is not None:
+                try:
+                    _hm_issue_labels = label_names(self.gh.issue_view(_hm_issue_num))
+                except (GitHubError, ValueError):
+                    _hm_issue_labels = None
         verdict = run_janitor(
             pr,
             checks,
@@ -7288,6 +7303,7 @@ class OrchestratorApp:
             repo_root=self.repo_root,
             pr_diff=diff,
             review_decision=self._review_decision(pr_number),
+            issue_labels=_hm_issue_labels,
         )
 
         # Issue #1116: the stale-CI skip let a reworked-but-unchanged PR
@@ -13300,6 +13316,64 @@ class OrchestratorApp:
         # branches above can each write a new status for this PR/issue
         # mid-call, so only a read taken at this exact point is trustworthy
         # (same pattern as the head_moved branch's escalation read above).
+        # Issue #1598: human-merge-labels gate. When the bound issue carries
+        # any label in ``dispatch.human_merge_labels``, the PR is never
+        # queued or merged by the fleet. Detection (issue fetch,
+        # malformed-dict handling, label intersection) is shared with
+        # ``_merge_ready_dry_run`` via ``_human_merge_hold_check`` so the two
+        # paths cannot drift. The check reads live issue labels at decision
+        # time (same source the merge-hold check below uses), so an operator
+        # adding or removing the label mid-flight takes effect on the next
+        # pass. If the issue was previously escalated with
+        # ``reason_class="policy"`` but the label has been removed, the
+        # escalation is cleared here so the PR becomes fleet-mergeable again
+        # — ``charlie unescalate`` is not required.
+        human_merge_hold, human_merge_check_unavailable = self._human_merge_hold_check(
+            issue_number
+        )
+        # De-escalation: the operator removed the human-merge label after a
+        # previous hand-off. Clear the ``"policy"`` escalation so the merge
+        # block below is not gated by ``escalated_merge_hold`` and the PR can
+        # be fleet-merged. Skipped entirely when human_merge_labels is
+        # unconfigured or the PR has no bound issue (zero overhead, matching
+        # the pre-refactor guard), and when the check was unavailable (no
+        # reliable signal to de-escalate on).
+        if (
+            self.config.dispatch.human_merge_labels
+            and issue_number is not None
+            and not human_merge_hold
+            and not human_merge_check_unavailable
+        ):
+            _hm_snap = load_state_locked(self.paths.state_file)
+            _hm_issue_entry = _hm_snap.get("issues", {}).get(str(issue_number), {})
+            if (
+                isinstance(_hm_issue_entry, dict)
+                and _hm_issue_entry.get("status") == "escalated"
+                and _hm_issue_entry.get("reason_class") == "policy"
+            ):
+                with state_lock(self.paths.state_file):
+                    _hm_state = load_state(self.paths.state_file)
+                    _hm_entry = _hm_state["issues"].get(str(issue_number), {})
+                    if (
+                        isinstance(_hm_entry, dict)
+                        and _hm_entry.get("status") == "escalated"
+                        and _hm_entry.get("reason_class") == "policy"
+                    ):
+                        _hm_entry["status"] = PASSIVE_OPEN_STATUS
+                        clear_escalation(_hm_entry)
+                        _hm_entry.pop("label_error", None)
+                        _hm_state["issues"][str(issue_number)] = _hm_entry
+                        clear_escalation_on_issue_prs(_hm_state, issue_number)
+                        _reset_linked_pr_status_to_passive_open(_hm_state, pr_number)
+                        _hm_state = self._record_event(
+                            _hm_state,
+                            "human_merge_label_removed",  # event-consumer: audit-only -- records the policy de-escalation when an operator removes a human-merge label (issue #1598); consumed by tests/test_human_merge_labels_1598.py.
+                            {
+                                "pr_number": pr_number,
+                                "issue_number": issue_number,
+                            },
+                        )
+                        save_state(self.paths.state_file, _hm_state)
         _escalation_snap = load_state_locked(self.paths.state_file)
         _pr_escalated, _issue_escalated = _escalation_flags(
             _escalation_snap.get("prs", {}).get(str(pr_number), {}),
@@ -13320,7 +13394,13 @@ class OrchestratorApp:
         mergequeue_label_applied: bool | None = None
         merge_hold: bool = False
         merge_hold_check_unavailable: bool = False
-        if can_merge and should_merge and not escalated_merge_hold:
+        if (
+            can_merge
+            and should_merge
+            and not escalated_merge_hold
+            and not human_merge_hold
+            and not human_merge_check_unavailable
+        ):
             mergequeue_label = self.config.auto_merge.mergequeue_label
             if mergequeue_label:
                 # Aviator MergeQueue handoff (task #10): apply the trigger
@@ -13478,6 +13558,77 @@ class OrchestratorApp:
                         self.gh,
                         self.config.runners.default_branch,
                         self.config.runners.workflow_name,
+                    )
+        # Issue #1598: human-merge hand-off. When the bound issue carries a
+        # configured human_merge_labels label and the PR is merge-ready
+        # (approved, checks green, no conflicts), the fleet does NOT merge or
+        # queue it. Instead it transitions the issue to agent:operator-queue
+        # via the ``human_merge_required`` edge, escalates with
+        # ``reason_class="policy"``, and posts one orchestrator-generated PR
+        # comment saying the PR is approved and awaits a human merge. The
+        # comment is posted once (tracked via the PR state field
+        # ``human_merge_comment_posted``), not every pass. On subsequent
+        # passes ``escalated_merge_hold`` is True (the issue is now
+        # escalated), so this block does not re-run — the merge block above
+        # is also gated by ``escalated_merge_hold`` and stays skipped.
+        # ``charlie unescalate`` is not required after the human merges: the
+        # existing merged-PR reconcile path closes out the issue as it does
+        # today, and the de-escalation block above clears a ``"policy"``
+        # escalation if the operator removes the label without merging.
+        human_merge_label_error: dict[str, Any] | None = None
+        human_merge_comment_posted = False
+        if human_merge_hold and can_merge and should_merge and not escalated_merge_hold:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                _existing_pr = state["prs"].get(str(pr_number), {})
+                human_merge_comment_posted = bool(_existing_pr.get("human_merge_comment_posted"))
+                state = _escalate_issue(
+                    state,
+                    issue_number,
+                    reason="human_merge_required",
+                    reason_class="policy",
+                    pr_number=pr_number,
+                    pr_extra={"human_merge_comment_posted": True},
+                )
+                state = self._record_event(
+                    state,
+                    "human_merge_required",  # event-consumer: audit-only -- records the human-merge hand-off (issue #1598); consumed by tests/test_human_merge_labels_1598.py.
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "comment_posted": not human_merge_comment_posted,
+                    },
+                )
+                save_state(self.paths.state_file, state)
+            # Transition labels (operator_queue via the human_merge_required
+            # edge). Done outside the state lock because transition() makes
+            # its own GitHub calls and does not touch state.json.
+            if issue_number is not None:
+                result = transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "human_merge_required",
+                )
+                if result.outcome != TransitionOutcome.APPLIED:
+                    human_merge_label_error = {
+                        "edge": "human_merge_required",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    }
+            # Post the PR comment once (not every pass).
+            if not human_merge_comment_posted and issue_number is not None:
+                try:
+                    self._comment_pr(
+                        pr_number,
+                        "This PR is approved and all checks are green, but the linked "
+                        "issue carries a human-merge label. The fleet will not auto-merge "
+                        "it — a human merge is required.",
+                    )
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "human_merge comment post failed pr=%d", pr_number, exc_info=True
                     )
         # Aviator MergeQueue handoff (task #10): the label add IS the handoff
         # — a failed add_pr_label must be treated as a genuine unmergeable
@@ -13781,6 +13932,8 @@ class OrchestratorApp:
                 and merge_output is None
                 and not mergequeue_handoff_failed
                 and not merge_hold_check_unavailable
+                and not human_merge_hold
+                and not human_merge_check_unavailable
             ):
                 # merge=False / auto_merge.enabled=False: can_merge recovered but no
                 # merge was attempted. Clear the merge alert so a subsequent
@@ -13834,6 +13987,8 @@ class OrchestratorApp:
                     "merged": bool(merge_output),
                     "merge_hold": merge_hold,
                     "merge_hold_check_unavailable": merge_hold_check_unavailable,
+                    "human_merge_hold": human_merge_hold,
+                    "human_merge_check_unavailable": human_merge_check_unavailable,
                     "cancel_superseded_runs_results": cancel_results,
                     # Issue #1060: persist the Aviator handoff outcome so a
                     # query for it is no longer vacuously 0 for every PR. This
@@ -13898,6 +14053,9 @@ class OrchestratorApp:
             "mergequeue_label_applied": mergequeue_label_applied,
             "merge_hold": merge_hold,
             "merge_hold_check_unavailable": merge_hold_check_unavailable,
+            "human_merge_hold": human_merge_hold,
+            "human_merge_check_unavailable": human_merge_check_unavailable,
+            "human_merge_label_error": human_merge_label_error,
             "escalated_merge_hold": escalated_merge_hold,
             # Issue #1060: surface the gate inputs in the in-memory verdict
             # too, for diagnostic parity with the persisted event.
@@ -13915,6 +14073,12 @@ class OrchestratorApp:
             message = "checks unavailable (gh failure)"
         elif escalated_merge_hold:
             message += " (escalated — merge held while agent:human-needed is up)"
+        elif human_merge_hold:
+            message += " (human-merge label on issue — fleet will not auto-merge)"
+        elif human_merge_check_unavailable:
+            message += (
+                f" (human-merge label check unavailable for issue #{issue_number} — not merged)"
+            )
         elif merge_hold_check_unavailable:
             message += f" (merge-hold check unavailable for issue #{issue_number} — not handed off to Aviator)"
         elif merge_hold:
@@ -14166,10 +14330,26 @@ class OrchestratorApp:
         should_merge = self.config.auto_merge.enabled if merge is None else merge
         mergequeue_label = self.config.auto_merge.mergequeue_label
 
+        # Issue #1598: mirror the real path's human-merge-labels gate so the
+        # dry-run preview accurately reports "would be held for human merge"
+        # instead of "would merge" when the bound issue carries a configured
+        # human_merge_labels label. Detection is shared with ``merge_ready``
+        # via ``_human_merge_hold_check`` so the two paths cannot drift.
+        # Read-only (no de-escalation writes in dry-run).
+        human_merge_hold, human_merge_check_unavailable = self._human_merge_hold_check(
+            issue_number
+        )
+
         # Read-only merge-hold check (same condition as the real path).
         merge_hold = False
         merge_hold_check_unavailable = False
-        if can_merge and should_merge and not escalated_merge_hold:
+        if (
+            can_merge
+            and should_merge
+            and not escalated_merge_hold
+            and not human_merge_hold
+            and not human_merge_check_unavailable
+        ):
             merge_hold = self.config.labels.merge_hold in label_names(pr)
             if not merge_hold and issue_number is not None:
                 try:
@@ -14188,13 +14368,24 @@ class OrchestratorApp:
 
         # Describe what *would* happen so the preview is actionable.
         message = "dry-run: merge readiness evaluated"
-        if can_merge and should_merge and not merge_hold and not escalated_merge_hold:
+        if (
+            can_merge
+            and should_merge
+            and not merge_hold
+            and not escalated_merge_hold
+            and not human_merge_hold
+            and not human_merge_check_unavailable
+        ):
             if mergequeue_label:
                 message += f" (would hand off to mergequeue label {mergequeue_label!r})"
             else:
                 message += " (would merge)"
         elif escalated_merge_hold:
             message += " (escalated — would hold merge while agent:human-needed is up)"
+        elif human_merge_hold:
+            message += " (human-merge label on issue — would not auto-merge)"
+        elif human_merge_check_unavailable:
+            message += f" (human-merge label check unavailable for issue #{issue_number})"
         elif merge_hold:
             message += (
                 f" (merge-hold label {self.config.labels.merge_hold!r} present"
@@ -14215,7 +14406,9 @@ class OrchestratorApp:
             message += f" (merge-hold check unavailable for issue #{issue_number})"
 
         return CommandResult(
-            not (checks_unavailable or merge_hold_check_unavailable),
+            not (
+                checks_unavailable or merge_hold_check_unavailable or human_merge_check_unavailable
+            ),
             message,
             {
                 "pr": pr_number,
@@ -14248,6 +14441,8 @@ class OrchestratorApp:
                 "mergequeue_label_applied": None,
                 "merge_hold": merge_hold,
                 "merge_hold_check_unavailable": merge_hold_check_unavailable,
+                "human_merge_hold": human_merge_hold,
+                "human_merge_check_unavailable": human_merge_check_unavailable,
                 "escalated_merge_hold": escalated_merge_hold,
                 # Issue #1060: surface the gate inputs in the dry-run preview
                 # too, for diagnostic parity with the persisted event.
@@ -16643,6 +16838,64 @@ class OrchestratorApp:
         candidates = self._merge_train_candidates(prs=prs)
         return candidates[0][1] if candidates else None
 
+    def _human_merge_hold_check(self, issue_number: int | None) -> tuple[bool, bool]:
+        """Return ``(human_merge_hold, human_merge_check_unavailable)`` for the bound issue.
+
+        Issue #1598. The single shared detection routine used by both
+        ``merge_ready`` (real path) and ``_merge_ready_dry_run`` so the two
+        paths cannot drift. Reads the live issue labels at decision time via
+        ``issue_view`` (same source the merge-hold check uses), not a cached
+        snapshot. When ``human_merge_labels`` is empty (default) or the PR
+        has no resolvable linked issue, returns ``(False, False)`` — the
+        check is skipped entirely with zero overhead. When the issue fetch
+        fails or returns a malformed payload (not a dict, or missing
+        ``labels``), returns ``(False, True)`` so callers fail closed (block
+        the merge) rather than silently proceeding. The de-escalation write
+        when the label is absent is the real path's responsibility, not
+        this helper's — dry-run is read-only.
+        """
+        if not self.config.dispatch.human_merge_labels or issue_number is None:
+            return (False, False)
+        try:
+            _hm_issue = self.gh.issue_view(issue_number)
+        except (GitHubError, ValueError):
+            return (False, True)
+        if not isinstance(_hm_issue, dict) or "labels" not in _hm_issue:
+            return (False, True)
+        _hm_labels = label_names(_hm_issue)
+        human_merge_hold = bool(set(self.config.dispatch.human_merge_labels) & _hm_labels)
+        return (human_merge_hold, False)
+
+    def _pr_bound_issue_has_human_merge_label(
+        self, pr: dict[str, Any], branch_prefix: str
+    ) -> bool:
+        """Return True if ``pr``'s bound issue carries a configured human-merge label.
+
+        Issue #1598. Reads the live issue labels at decision time via
+        ``issue_view`` (same source the merge-hold check uses), not a cached
+        snapshot. Returns False when the PR has no resolvable linked issue or
+        when the issue fetch fails — ``merge_ready``'s inline check is the
+        authoritative enforcement point and handles the unavailable case
+        fail-closed (blocks the merge). This helper is the cheaper
+        merge-train-candidate filter: a false negative here merely lets the
+        PR become merge-train head, and ``merge_ready`` catches it on the
+        actual merge attempt.
+        """
+        issue_number = linked_issue_number(
+            pr,
+            is_cross_repository=pr.get("isCrossRepository"),
+            branch_prefix=branch_prefix,
+        )
+        if issue_number is None:
+            return False
+        try:
+            issue = self.gh.issue_view(issue_number)
+        except (GitHubError, ValueError):
+            return False
+        if not isinstance(issue, dict) or "labels" not in issue:
+            return False
+        return bool(set(self.config.dispatch.human_merge_labels) & label_names(issue))
+
     def _merge_train_candidates(
         self,
         prs: list[dict[str, Any]] | None = None,
@@ -16656,6 +16909,7 @@ class OrchestratorApp:
             prs = self.gh.pr_list()
 
         branch_prefix = self.config.dispatch.branch_prefix
+        human_merge_labels = self.config.dispatch.human_merge_labels
         # Aviator MergeQueue handoff (task #10): a PR already parked in
         # Aviator's queue (state status "mergequeue") must never occupy
         # charlie's merge-train head — Aviator now owns serialization for it.
@@ -16687,6 +16941,17 @@ class OrchestratorApp:
             reviewed_head_sha = decision.get("reviewed_head_sha")
             live_head_sha = pr.get("headRefOid")
             if reviewed_head_sha is None or live_head_sha != reviewed_head_sha:
+                continue
+            # Issue #1598: a bound PR whose issue carries a configured
+            # human_merge_labels label is never a merge-train candidate —
+            # it is human-merged, not fleet-merged. The check reads live
+            # issue labels at decision time so an operator adding or
+            # removing the label mid-flight takes effect on the next pass.
+            # Skipped entirely when human_merge_labels is empty (default),
+            # preserving current behaviour with zero overhead.
+            if human_merge_labels and self._pr_bound_issue_has_human_merge_label(
+                pr, branch_prefix
+            ):
                 continue
             reviewed_at = decision.get("reviewed_at") or pr.get("updatedAt") or ""
             candidates.append((str(reviewed_at), pr_number, pr, decision, head))

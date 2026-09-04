@@ -256,6 +256,18 @@ public sub-protocol methods and the underscore-prefixed internals (`_run_bool`,
 `_max_retries`, `_timeout_seconds`, etc.), because `run` and the moved bodies call
 internals by name and the owner has no `__getattr__` fallthrough to catch them.
 
+Where the machinery lives (L01 finding, PR #1596): not inline in `github.py`. That file
+sat at 3173 lines against the file-size ratchet's 3200-line high-water mark (#1442,
+`tests/test_file_size_ratchet.py`, `file_size_ratchet_baseline.json`), so adding the
+~150 lines of `_make_delegate` / `_ROUTES` / `_install_delegates` there would have
+tripped a second, unrelated ratchet. The machinery is `src/charlie_work/github_delegation.py`,
+with `_install_delegates(owner_cls)` taking the owner class as a parameter (no circular
+import); `github.py` calls it once after the class body. Each sub-protocol is colocated
+with its collaborator module under `src/charlie_work/github_capabilities/`, and
+`_build_routes` raises `ValueError` on a cross-collaborator name collision instead of
+letting the last writer win. Later leaves shrink `github.py`, so this constraint only
+bites L01.
+
 ### 3.4 `_list_cache` strategy
 
 `_list_cache` is shared mutable state touched by 8 members across clusters
