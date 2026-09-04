@@ -140,6 +140,15 @@ CLOSING_KEYWORD_PR_FIELDS = "title,body,headRefName,isCrossRepository"
 # narrow as `CLOSING_KEYWORD_PR_FIELDS` for the same reason: no CI/review
 # state is needed, so no `statusCheckRollup` token-scope risk.
 PR_CLOSING_ISSUES_FIELDS = "closingIssuesReferences"
+# The single ``number`` field used by doctor.py's probe helpers
+# (``_find_pr_number``/``_find_issue_number``) to discover a real item number
+# for the live field-list validation pass. Kept as a constant rather than an
+# inline literal so the field-list lint (tests/test_doctor.py::
+# test_gh_field_lists_use_constants_no_inline_literals) covers the
+# single-positional-list ``gh.run([...], json_output=True)`` call shape too
+# (issue #1609). Named generically because the same field list serves both the
+# PR and issue probes.
+PROBE_NUMBER_FIELDS = "number"
 # RECONCILE_PR_FIELDS/RECONCILE_ISSUE_FIELDS moved to
 # github_capabilities/transport.py alongside validate_field_lists (Track 2,
 # issue #1593; design doc Section 5, L09), imported above as a pure
