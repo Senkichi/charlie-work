@@ -22681,41 +22681,54 @@ def test_cli_main_maps_yaml_error_to_exit_2(tmp_path: Path, monkeypatch, capsys)
     assert "YAML error: malformed YAML" in capsys.readouterr().err
 
 
-def test_github_are_issues_open_normalizes_uppercase_state(tmp_path: Path) -> None:
-    """Issue #173: Regression test for GitHub.are_issues_open with realistic uppercase state.
+def test_github_are_issues_open_normalizes_uppercase_state(monkeypatch, tmp_path: Path) -> None:
+    """Issue #173: Regression test for are_issues_open with realistic uppercase state.
 
-    This test directly exercises the production GitHub.are_issues_open method with
-    realistic uppercase state field values (as returned by the real GitHub API).
-    It ensures the .upper() normalization in github.py:326 is tested and cannot
-    silently regress.
+    Exercises the production ``are_issues_open`` per-issue fallback path with
+    realistic uppercase state field values (as returned by the real GitHub API),
+    ensuring the ``.upper()`` normalization cannot silently regress.
+
+    Post-L07 (issue #1591) ``are_issues_open`` lives on the ``Issues`` capability
+    collaborator, and its thread-pool fallback closure resolves ``self.issue_view``
+    on that collaborator -- so a GitHub *subclass* override of ``issue_view`` no
+    longer intercepts that internal call (the disclosed interception-path
+    relocation). The mock is therefore installed at the ``run`` layer, which
+    ``issue_view`` forwards to through the collaborator->owner seam, and the
+    batched GraphQL path is forced to fail so the per-issue fallback -- the code
+    performing the ``.upper()`` normalization -- is the path under test.
     """
     from charlie_work.github import GitHub as RealGitHub
+    from charlie_work.github import GitHubError
 
-    # Create a subclass that overrides issue_view to return realistic uppercase state values
-    class RealGitHubWithMockedIssueView(RealGitHub):
-        def issue_view(self, number: int) -> dict:
-            if number == 100:
-                return {"number": 100, "state": "OPEN"}  # Uppercase as from real API
-            elif number == 200:
-                return {"number": 200, "state": "CLOSED"}  # Uppercase as from real API
-            elif number == 300:
-                return {"number": 300, "state": "OPEN"}  # Uppercase as from real API
-            elif number == 400:
-                return {
-                    "number": 400,
-                    "state": "open",
-                }  # Lowercase (should still work due to .upper())
-            else:
-                raise ValueError(f"Unexpected issue number: {number}")
+    # Realistic API states: uppercase from the real API, plus one lowercase (400)
+    # that must still count as open via the ``.upper()`` normalization.
+    states = {100: "OPEN", 200: "CLOSED", 300: "OPEN", 400: "open"}
 
-    # Create an instance of the subclass
-    real_gh = RealGitHubWithMockedIssueView(repo_root=tmp_path)
+    def _fail_graphql(self, numbers):
+        # Force are_issues_open onto its per-issue ``issue_view`` fallback.
+        raise GitHubError("forced batched-state failure -> per-issue fallback")
+
+    def _fake_run(self, args, **kwargs):
+        # issue_view builds ["issue", "view", str(number), "--json", ISSUE_VIEW_FIELDS];
+        # args[2] is the issue number. Raise ValueError (not KeyError) for an
+        # unexpected number so the failure mode matches the original mock: the
+        # fallback's ``except (GitHubError, ValueError, TypeError)`` swallows it to
+        # ``is_open=False`` rather than propagating out of ``pool.map``.
+        number = int(args[2])
+        if number not in states:
+            raise ValueError(f"Unexpected issue number: {number}")
+        return {"number": number, "state": states[number]}
+
+    monkeypatch.setattr(RealGitHub, "_graphql_issue_states", _fail_graphql)
+    monkeypatch.setattr(RealGitHub, "run", _fake_run)
+
+    real_gh = RealGitHub(repo_root=tmp_path)
 
     # Call are_issues_open with a mix of open/closed issues
     result = real_gh.are_issues_open([100, 200, 300, 400])
 
-    # Assert that only the OPEN-state issues (100, 300, and 400) are returned
-    # 200 is CLOSED and should not be in the result
+    # Only the OPEN-state issues are returned: 100 and 300 (uppercase OPEN) and
+    # 400 (lowercase "open", normalized via .upper()). 200 is CLOSED.
     assert result == {100, 300, 400}, f"Expected {{100, 300, 400}}, got {result}"
 
 
@@ -37575,7 +37588,11 @@ def test_github_dependencies_transient_error_fail_open(tmp_path: Path) -> None:
 
     fake_gh = FakeGitHubWithTransientError()
 
-    with patch("charlie_work.github.logger") as mock_logger:
+    # get_github_issue_dependencies moved to charlie_work.github_capabilities.issues
+    # in L07 (issue #1591); its module logger moved with it, so the patch target
+    # follows the symbol. The function object is still re-exported from
+    # charlie_work.github (imported above), only its logger binding relocated.
+    with patch("charlie_work.github_capabilities.issues.logger") as mock_logger:
         result = get_github_issue_dependencies(fake_gh, 123)
         assert result == []
         # Should have logged a warning about the transient error
@@ -37661,7 +37678,9 @@ def test_github_dependencies_unexpected_type_fail_open(tmp_path: Path) -> None:
 
     fake_gh = FakeGitHubWithUnexpectedType()
 
-    with patch("charlie_work.github.logger") as mock_logger:
+    # See the transient-error test above: the moved function's logger now lives
+    # at charlie_work.github_capabilities.issues.logger (L07, issue #1591).
+    with patch("charlie_work.github_capabilities.issues.logger") as mock_logger:
         result = get_github_issue_dependencies(fake_gh, 123)
         assert result == []
         # Should have logged a warning about the unexpected type
