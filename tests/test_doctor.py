@@ -1025,11 +1025,15 @@ def test_gh_field_lists_use_constants_no_inline_literals() -> None:
         assert isinstance(value, str), f"{const} must be a string"
         assert value, f"{const} must not be empty"
 
-    # Scan all Python files in src/charlie_work/ for gh.run() calls with --json
+    # Scan all Python files in src/charlie_work/, recursively (Track 2 issue
+    # #1588: github_capabilities/ now holds relocated field-list constants
+    # and moved method bodies alongside them, e.g. PR_CHECKS_FIELDS in
+    # github_capabilities/checks.py -- a non-recursive glob left that whole
+    # subpackage, and any other src/charlie_work subpackage, unscanned).
     src_dir = Path(__file__).parent.parent / "src" / "charlie_work"
     violations: list[tuple[str, int, str]] = []
 
-    for py_file in src_dir.glob("*.py"):
+    for py_file in src_dir.rglob("*.py"):
         if py_file.name == "github.py":
             # Constant definitions are allowed in github.py
             continue
