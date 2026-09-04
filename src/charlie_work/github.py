@@ -38,6 +38,17 @@ if TYPE_CHECKING:
 from ci_fleet.github import GitHubError  # noqa: F401  (deliberate re-export)
 
 from .checks import _run_id_from_link
+from .github_capabilities import (
+    ChecksLike,
+    CommentsLike,
+    IssuesLike,
+    LabelsLike,
+    MergeBranchLike,
+    PullRequestsLike,
+    RepoMetaLike,
+)
+from .github_delegation import _COLLABORATORS, _install_delegates
+from .github_delegation import _ROUTES, _SIGNATURE_SOURCE, _make_delegate  # noqa: F401 (deliberate re-export)
 from .subprocess_runner import no_console_window_kwargs
 
 logger = logging.getLogger(__name__)
@@ -335,6 +346,14 @@ class GitHub:
         # filed issues and freshly opened/merged PRs stay invisible until the
         # process restarts.
         object.__setattr__(self, "_list_cache", {})
+        # Capability collaborators (Track 2, issue #1585, design doc
+        # Section 3.3): each is constructed with a back-reference to this
+        # instance and reached through the delegates _install_delegates()
+        # installs on the class below. Built from the same _COLLABORATORS
+        # registry _ROUTES is derived from, so adding a cluster only touches
+        # that one registry, not this loop.
+        for collab_attr, collab_cls in _COLLABORATORS:
+            object.__setattr__(self, collab_attr, collab_cls(self))
 
     def invalidate_list_cache(self) -> None:
         """Drop cached list results so the next call refetches from GitHub.
@@ -2015,13 +2034,39 @@ class GitHub:
         return result
 
 
+# Install the capability delegates now that `GitHub`'s class body is fully
+# defined. `_ROUTES` is empty in L01 (every collaborator class is still
+# empty), so this is a no-op: it installs nothing and `GitHub`'s lexical
+# member surface is unchanged.
+_install_delegates(GitHub)
+
+
 @runtime_checkable
-class GitHubLike(Protocol):
+class GitHubLike(
+    CommentsLike,
+    LabelsLike,
+    ChecksLike,
+    RepoMetaLike,
+    PullRequestsLike,
+    IssuesLike,
+    MergeBranchLike,
+    Protocol,
+):
     """Structural interface for the GitHub surface the orchestrator calls.
 
     Production functions accept ``gh: GitHubLike`` instead of the concrete
     ``GitHub`` class so test doubles can satisfy the contract structurally
     without subclassing the frozen dataclass (issue #593).
+
+    Redeclared (Track 2, issue #1585; design doc Section 4.1) as the union of
+    the seven capability sub-protocols plus the two members that stay on the
+    owner (``dry_run``, ``run``). Five members below are *also* inherited
+    from a sub-protocol but are redeclared directly in this body: Protocol
+    inheritance puts an inherited member in the *sub-protocol's* ``__dict__``,
+    not the union's, and five existing tests assert
+    ``name in GitHubLike.__dict__`` by name (below). Redeclaring costs
+    nothing on the member_count metric (``_is_protocol_base`` excludes
+    Protocol subclasses entirely).
     """
 
     # Declared as a read-only property, not a settable attribute, so the
@@ -2039,92 +2084,20 @@ class GitHubLike(Protocol):
         self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
     ) -> Any: ...
 
-    def check_graphql_rate_limit(self, threshold: int = ...) -> tuple[bool, int, int | None]: ...
-
-    def invalidate_list_cache(self) -> None: ...
-
-    def issue_list(self, labels: Any = None, state: Any = None) -> list[dict[str, Any]]: ...
-
-    def issue_view(self, number: int) -> dict[str, Any]: ...
-
-    def pr_list(self) -> list[dict[str, Any]]: ...
-
-    def merged_pr_list(self) -> list[dict[str, Any]]: ...
-
-    def merged_prs_for_issue(self, issue_number: int, branch_prefix: str) -> MergedPRSearchResult:
-        """Return merged PRs binding to ``issue_number``.
-
-        The returned object is list-like and carries an ``ok`` flag. Callers
-        must check ``ok`` before treating an empty result as "no merged PRs";
-        ``ok=False`` means the search itself failed (rate limit, etc.).
-        """
-        ...
-
-    def pr_view(self, number: int, *, fields: str = ...) -> dict[str, Any]: ...
-
-    def pr_diff(self, number: int) -> str: ...
-
-    def pr_checks(self, number: int) -> list[dict[str, Any]] | None: ...
-
-    def actions_job(self, job_id: int) -> dict[str, Any] | None: ...
-
-    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]: ...
-
-    def commit(self, sha: str) -> GitHubRunResult: ...
-
-    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None: ...
-
-    def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None: ...
-
-    def pr_commits(self, number: int) -> list[dict[str, Any]] | None: ...
-
-    def compare(self, base: str, head: str) -> dict[str, Any] | None: ...
-
+    # Redeclared directly (see class docstring): inherited from MergeBranchLike.
     def branch_protection(self, base: str) -> dict[str, Any] | None: ...
 
-    def compare_diff(self, base: str, head: str) -> str | None: ...
-
-    def add_issue_label(self, number: int, label: str) -> bool: ...
-
-    def remove_issue_label(self, number: int, label: str) -> bool: ...
-
-    def add_pr_label(self, number: int, label: str) -> bool: ...
-
-    def remove_pr_label(self, number: int, label: str) -> bool: ...
-
-    def close_issue(self, number: int) -> bool: ...
-
-    def issue_comment(self, number: int, body_file: Path) -> None: ...
-
-    def pr_comment(self, number: int, body_file: Path) -> None: ...
-
-    def label_list(self) -> list[dict[str, Any]]: ...
-
-    def label_create(self, label: str, color: str, description: str) -> None: ...
-
-    def merge_pr(
-        self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()
-    ) -> str: ...
-
-    def delete_branch(self, branch: str) -> bool: ...
-
-    def pr_update_branch(self, pr_number: int) -> bool: ...
-
+    # Redeclared directly (see class docstring): inherited from PullRequestsLike.
     def pr_ready(self, number: int) -> GitHubRunResult: ...
 
+    # Redeclared directly (see class docstring): inherited from MergeBranchLike.
     def pr_close(self, number: int) -> GitHubRunResult: ...
 
+    # Redeclared directly (see class docstring): inherited from MergeBranchLike.
     def pr_reopen(self, number: int) -> GitHubRunResult: ...
 
+    # Redeclared directly (see class docstring): inherited from MergeBranchLike.
     def push_empty_commit(self, branch: str) -> GitHubRunResult: ...
-
-    def are_issues_open(self, issue_numbers: list[int]) -> set[int]: ...
-
-    def issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]: ...
-
-    def name_with_owner(self) -> str: ...
-
-    def pr_create(self, head: str, base: str, title: str, body: str) -> int | None: ...
 
 
 def label_names(item: dict[str, Any]) -> set[str]:

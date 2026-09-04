@@ -16,6 +16,11 @@ dispatch:
   # (stale ready-label cleanup). 0 disables finalization.
   finalize_limit: 25
   branch_prefix: agent/issue
+  # Issue #1598: issue labels that mark a bound PR as human-merged. When the
+  # bound issue carries any label here at merge-decision time, the fleet never
+  # queues or merges the PR — it transitions the issue to agent:operator-queue
+  # and posts a PR comment asking a human to merge. Default empty (off).
+  # human_merge_labels: [needs-design]
   # Claude Code workers use the direct-shell loop (no Devin session skills).
   worker_template: worker_claude_code.md
   # Dispatch order: "oldest" (default) or "newest" (previous behavior)
