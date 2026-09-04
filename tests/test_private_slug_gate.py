@@ -380,7 +380,7 @@ def _setup_cli_mocks(
     base_baseline_exists=True,
 ) -> None:
     """Wire up the common CLI mocks for private-slug-check tests."""
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
 
     def fake_run_captured(command, **kwargs):
@@ -536,7 +536,7 @@ def test_cli_check_uses_two_dot_diff(monkeypatch, tmp_path) -> None:
             return _mock_git_diff("")
         return RunResult(returncode=0, stdout="", stderr="", error=None)
 
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
     monkeypatch.setattr(cli_module, "run_captured", fake_run_captured)
 
@@ -585,7 +585,7 @@ def test_cli_check_fails_on_missing_baseline_file(monkeypatch, tmp_path) -> None
     # The command itself raises ConfigError; the test verifies it propagates.
     from charlie_work.config import ConfigError
 
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
 
     with pytest.raises(ConfigError, match="baseline file not found"):
@@ -608,7 +608,7 @@ def test_cli_check_fails_on_empty_slugs_list(monkeypatch, tmp_path) -> None:
 def test_cli_regenerate_with_existing_baseline(monkeypatch, tmp_path) -> None:
     _write_baseline(tmp_path, total=10)
     # Simulate git ls-files returning a few files, one of which mentions a slug.
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
 
     def fake_run_captured(command, **kwargs):
@@ -642,7 +642,7 @@ def test_cli_regenerate_with_existing_baseline(monkeypatch, tmp_path) -> None:
 
 
 def test_cli_regenerate_with_slugs_arg_when_no_baseline(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
 
     def fake_run_captured(command, **kwargs):
@@ -665,7 +665,7 @@ def test_cli_regenerate_with_slugs_arg_when_no_baseline(monkeypatch, tmp_path) -
 
 
 def test_cli_regenerate_without_slugs_and_no_baseline_fails(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
     monkeypatch.setattr(
         cli_module,
