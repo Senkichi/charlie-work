@@ -108,7 +108,12 @@ def _main_worktree_root(start: Path) -> Path | None:
     return parent
 
 
-def find_repo_root(cwd: Path | None = None, *, explicit: bool = False) -> Path:
+def find_repo_root(
+    cwd: Path | None = None,
+    *,
+    explicit: bool = False,
+    redirect_to_main_worktree: bool = True,
+) -> Path:
     """Return the git work-tree root for *cwd* (defaults to ``Path.cwd()``).
 
     When *explicit* is True the caller supplied ``cwd`` directly from a
@@ -127,6 +132,14 @@ def find_repo_root(cwd: Path | None = None, *, explicit: bool = False) -> Path:
     ``--git-common-dir``) the shared-root resolution returns None and
     ``--show-toplevel`` is used, which is correct for normal and
     ``--separate-git-dir`` repos alike.
+
+    When *redirect_to_main_worktree* is False the shared-root redirect is
+    skipped and ``--show-toplevel`` is used directly, so a caller inside a
+    linked worktree receives that worktree's own root.  This is the opt-out
+    for read-only diagnostics (e.g. ``ast-equivalence-check``, issue #1600)
+    that must inspect the worktree they were invoked from rather than the
+    main checkout -- the redirect exists for state-safety (issue #648) and
+    state-mutating commands must keep the default ``True``.
     """
     start = (cwd or Path.cwd()).resolve()
     if explicit:
@@ -138,9 +151,12 @@ def find_repo_root(cwd: Path | None = None, *, explicit: bool = False) -> Path:
     # --repo) inside a linked worktree does not resolve to that worktree's
     # own toplevel (which would point at a phantom state dir). Returns None
     # in the main worktree, where --show-toplevel is already correct.
-    main_root = _main_worktree_root(start)
-    if main_root is not None:
-        return main_root
+    # Read-only diagnostics pass redirect_to_main_worktree=False to honor the
+    # invoking worktree (issue #1600).
+    if redirect_to_main_worktree:
+        main_root = _main_worktree_root(start)
+        if main_root is not None:
+            return main_root
     result = run_captured(
         ["git", "rev-parse", "--show-toplevel"],
         cwd=start,

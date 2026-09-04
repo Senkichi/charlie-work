@@ -726,7 +726,11 @@ class CommandContext:
     gh: GitHub
 
 
-def bootstrap_command(args: argparse.Namespace) -> CommandContext:
+def bootstrap_command(
+    args: argparse.Namespace,
+    *,
+    redirect_to_main_worktree: bool = True,
+) -> CommandContext:
     """Run the four-call CLI bootstrap once, returning a frozen context.
 
     This is the single shared entry point for the
@@ -742,8 +746,18 @@ def bootstrap_command(args: argparse.Namespace) -> CommandContext:
     ``build_app``.  ``run_runners_allocate`` is the one exception: it uses
     ``require_global=True`` with custom error handling and cannot use this
     helper.
+
+    When *redirect_to_main_worktree* is False the linked-worktree redirect in
+    :func:`find_repo_root` is skipped, so a read-only diagnostic invoked from
+    a linked worktree bootstraps against that worktree's own root (issue
+    #1600).  State-mutating commands must keep the default ``True`` so their
+    state resolves to the shared ``.var/charlie-work/`` directory (issue #648).
     """
-    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    repo_root = find_repo_root(
+        args.repo,
+        explicit=args.repo is not None,
+        redirect_to_main_worktree=redirect_to_main_worktree,
+    )
     _assert_config_repo_matches(args.config, repo_root)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
