@@ -5,6 +5,7 @@
   "src/charlie_work/cli.py": 3000,
   "src/charlie_work/config.py": 4200,
   "src/charlie_work/cross_family.py": 1000,
+  "src/charlie_work/cross_repo_gate.py": 1000,
   "src/charlie_work/dead_worker_reap.py": 3000,
   "src/charlie_work/devin_shell.py": 1000,
   "src/charlie_work/doctor.py": 1600,

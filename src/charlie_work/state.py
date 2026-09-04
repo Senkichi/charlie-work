@@ -151,6 +151,13 @@ PASSIVE_OPEN_STATUS = "open_passive"
 #   "judgment" -- a human product or security decision, an unimplementable
 #     acceptance criterion, or a reviewer's explicit "blocked" verdict. Stays
 #     terminal; only a human running ``charlie unescalate`` may clear it.
+#   "policy" -- an operator-configured policy decision (issue #1598): the
+#     bound issue carries a ``dispatch.human_merge_labels`` label, so the PR
+#     must be human-merged rather than fleet-merged. Like ``"judgment"`` it is
+#     NOT auto-cleared by the mechanical de-escalation sweep (the human must
+#     actually merge the PR), but unlike ``"judgment"`` the merged-PR
+#     reconcile path closes it out automatically once the human merges —
+#     ``charlie unescalate`` is not required.
 #
 # A legacy escalation recorded with no ``reason_class`` at all may be
 # backfilled by ``workflow._maybe_deescalate_mechanical`` from the most
@@ -158,7 +165,7 @@ PASSIVE_OPEN_STATUS = "open_passive"
 # event kind unambiguously denotes a process failure. Ambiguous or
 # deliberately-preserved kinds stay fail-closed: ``reason_class`` remains
 # absent and the issue stays terminal.
-ESCALATION_REASON_CLASSES: frozenset[str] = frozenset({"mechanical", "judgment"})
+ESCALATION_REASON_CLASSES: frozenset[str] = frozenset({"mechanical", "judgment", "policy"})
 
 # Issue #797: legacy escalations may lack ``reason_class`` because the field
 # was added later. The backfill derives the class from the escalation event
@@ -253,10 +260,11 @@ DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS: frozenset[str] = frozenset(
 def escalation_reason_class(reason_class: str) -> str:
     """Validate an escalation ``reason_class`` value before it is persisted.
 
-    Raises ``ValueError`` on anything other than ``"mechanical"`` or
-    ``"judgment"`` so a typo at a call site fails loudly at write time
-    instead of silently producing an escalation the de-escalation sweep can
-    never recognize as mechanical (a safe-but-pointless failure direction).
+    Raises ``ValueError`` on anything other than ``"mechanical"``,
+    ``"judgment"``, or ``"policy"`` so a typo at a call site fails loudly at
+    write time instead of silently producing an escalation the de-escalation
+    sweep can never recognize as mechanical (a safe-but-pointless failure
+    direction).
     """
     if reason_class not in ESCALATION_REASON_CLASSES:
         raise ValueError(f"invalid escalation reason_class: {reason_class!r}")
