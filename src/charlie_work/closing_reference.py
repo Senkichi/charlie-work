@@ -39,6 +39,7 @@ from typing import Any, Protocol
 # rewrite needs to preserve one). Duplicating the keyword vocabulary as a
 # short, self-contained pattern keeps this module free of a github.py import
 # it does not otherwise need.
+# (`_CLOSING_KEYWORDS_ALT` now lives in `issue_linking.py`, re-exported through `github.py` -- Track 2, issue #1613 -- but the reasoning above is unchanged.)
 _CLOSING_KEYWORDS_ALT = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
 # A whole closing-reference line: keyword, then an optional `owner/repo`
 # qualifier, then `#N`. Anchored to the whole line (MULTILINE + $) so a

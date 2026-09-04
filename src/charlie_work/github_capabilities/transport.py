@@ -46,14 +46,13 @@ from ci_fleet.github import GitHubError
 from ._base import (
     CapabilityCollaborator,
     GitHubRunResult,
-    MERGED_PR_LIST_FIELDS,
     RUN_LIST_FIELDS,
     _is_mutating,
 )
 from .checks import PR_CHECKS_FIELDS
 from .issues import ISSUE_LIST_FIELDS, ISSUE_VIEW_FIELDS
 from .labels import LABEL_LIST_FIELDS
-from .pull_requests import PR_LIST_FIELDS, PR_VIEW_FIELDS
+from .pull_requests import MERGED_PR_LIST_FIELDS, PR_LIST_FIELDS, PR_VIEW_FIELDS
 from ..subprocess_runner import no_console_window_kwargs
 
 logger = logging.getLogger(__name__)
