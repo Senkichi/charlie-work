@@ -42,10 +42,13 @@ _DEFAULT_GRAPHQL_RATE_LIMIT_THRESHOLD = 1500
 # name, so it must be bound in *this* module's globals (see the rationale in
 # ``labels.py``'s ``LABEL_LIST_FIELDS`` comment). Re-exported through
 # ``github_capabilities/__init__.py`` and re-imported into ``github.py``
-# (which still uses it directly in ``validate_field_lists``, a Transport
-# internal not yet moved, and is also read by ``doctor.py`` and tests via
-# ``charlie_work.github.PR_CHECKS_FIELDS``) -- the same re-export pattern
-# already used there for ``GitHubError`` and ``LABEL_LIST_FIELDS``.
+# (nothing there uses it directly anymore now that ``validate_field_lists``
+# moved to ``transport.py`` in L09, but it is also read by ``doctor.py`` and
+# tests via ``charlie_work.github.PR_CHECKS_FIELDS``) and directly into
+# ``transport.py`` (Track 2, issue #1593; design doc Section 5, L09), which
+# imports it from here rather than re-deriving a second copy -- the same
+# re-export pattern already used there for ``GitHubError`` and
+# ``LABEL_LIST_FIELDS``.
 PR_CHECKS_FIELDS = "name,state,bucket,link"
 
 # Matches the job-id segment of a GitHub Actions check link, e.g.

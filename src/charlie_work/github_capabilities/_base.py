@@ -97,17 +97,20 @@ _LIST_LIMIT = 500
 # Moved from ``github.py`` (Track 2, issue #1590; design doc Section 5, L06),
 # alongside ``_LIST_LIMIT`` above. ``_is_mutating`` (and its private helper
 # chain ``_api_is_mutating``/``_is_graphql_query``/``_graphql_field_value``)
-# is referenced as a bare global by ``PullRequests.pr_ready`` (moved below)
-# AND by ``GitHub.run``/``_run_bool``/``pr_close``/``pr_reopen`` (not yet
-# moved -- ``pr_close``/``pr_reopen`` are slated for L08, ``run``/
-# ``_run_bool`` for L09) -- the same cross-cutting shape as ``_LIST_LIMIT``,
-# so it lives here rather than in ``pull_requests.py`` to avoid L08/L09
-# re-relocating it a second time or importing it sideways from a PR-domain
-# module. Only ``_is_mutating`` itself is referenced outside this chain (by
-# name, from ``github.py``); the three helper functions have no consumer
-# beyond ``_is_mutating``'s own body, so only ``_is_mutating`` is re-exported
-# through ``github_capabilities/__init__.py`` and re-imported into
-# ``github.py``. Bodies are unchanged from their former ``github.py`` copies.
+# is referenced as a bare global by ``PullRequests.pr_ready``,
+# ``MergeBranch.pr_close``/``pr_reopen`` (moved in L08), ``Transport._run_bool``
+# (moved in L09), and ``GitHub.run`` itself -- the one consumer that never
+# relocates, since ``run`` is the interception seam and stays on the owner by
+# design (design doc Section 3.2). This cross-cutting shape (one helper,
+# consumers scattered across every leaf plus the owner) is why it lives here
+# rather than in any single capability module -- re-relocating it leaf by leaf
+# or importing it sideways from a PR-domain module would just move the same
+# problem around. Only ``_is_mutating`` itself is referenced outside this
+# chain (by name, from ``github.py``); the three helper functions have no
+# consumer beyond ``_is_mutating``'s own body, so only ``_is_mutating`` is
+# re-exported through ``github_capabilities/__init__.py`` and re-imported
+# into ``github.py``. Bodies are unchanged from their former ``github.py``
+# copies.
 def _graphql_field_value(args: list[str], field: str) -> str | None:
     """Return the raw value of a `gh api graphql -f/--field name=value` pair.
 
@@ -196,6 +199,55 @@ def _api_is_mutating(args: list[str]) -> bool:
     # collapse into one condition.
     param_prefixes = ("--raw-field", "--field", "--input")
     return any(arg.startswith(param_prefixes) or arg[:2] in ("-f", "-F") for arg in args)
+
+
+# Moved from ``github.py`` (Track 2, issue #1593; design doc Section 5, L09).
+# ``MERGED_PR_LIST_FIELDS`` is referenced as a bare global by
+# ``GitHub.merged_prs_for_issue`` (stays on the owner -- not a Transport
+# internal) AND by ``Transport.validate_field_lists`` (moved below), the same
+# cross-cutting shape that put ``GitHubRunResult``/``_LIST_LIMIT`` here rather
+# than in a single capability module: no capability module "owns" it, and
+# ``_base.py`` is the one place both ``github.py`` and every collaborator
+# module can already reach without a circular import. Re-exported through
+# ``github_capabilities/__init__.py`` and re-imported into ``github.py``
+# (still used directly there in ``merged_prs_for_issue``, and read externally
+# by ``tests/test_github.py`` via
+# ``charlie_work.github.MERGED_PR_LIST_FIELDS``), mirroring the
+# ``GitHubRunResult``/``_LIST_LIMIT`` re-exports above. The field contract
+# itself (see the original ``github.py`` comment, preserved verbatim below)
+# is also satisfied by ``_normalize_rest_pr``'s REST-path mapping (moved to
+# ``Transport`` in this leaf) -- both producers are enforced identical by
+# ``test_normalize_rest_pr_satisfies_merged_pr_list_field_contract``.
+#
+# The field contract for every merged-PR listing. Two producers must satisfy
+# it identically: merged_prs_for_issue() queries these fields directly, and
+# merged_pr_list() goes through the REST endpoint and must reproduce this exact
+# key set via _normalize_rest_pr() (enforced by
+# test_normalize_rest_pr_satisfies_merged_pr_list_field_contract).
+#
+# Consumers: workflow._merged_pr_referenced_issue_numbers() (via
+# linked_issue_number()/issue_numbers_mentioned_by_pr()) reads the identity and
+# branch fields; post-merge audit paths additionally need `headRefOid` to tell
+# *which commit* was merged, not merely that a merge happened.
+#
+# Deliberately narrower than PR_LIST_FIELDS: merged PRs don't need current
+# CI/review/label state, and `statusCheckRollup` in particular forces gh's
+# GraphQL query to walk each PR's check-run connection -- expensive across up
+# to 500 merged PRs and the cause of intermittent gateway 502s on this query
+# (issue #361). `headRefOid` carries no such cost: it is a scalar on the PR
+# object, and on the REST path it is already present in the payload as
+# head.sha, so adding it costs neither an extra request nor a graph walk.
+MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,headRefOid"
+
+# Moved from ``github.py`` (Track 2, issue #1593; design doc Section 5, L09).
+# ``RUN_LIST_FIELDS`` is referenced as a bare global by the module-level
+# ``cancel_superseded_runs`` (a ``GitHubLike``-typed helper function, not a
+# ``GitHub`` member, so it stays in ``github.py`` untouched by this leaf) AND
+# by ``Transport.validate_field_lists`` (moved below) -- the same
+# staying-plus-moving-consumer shape as ``MERGED_PR_LIST_FIELDS`` above.
+# Re-exported through ``github_capabilities/__init__.py`` and re-imported
+# into ``github.py`` (still used directly there in ``cancel_superseded_runs``).
+RUN_LIST_FIELDS = "databaseId,status,createdAt,headBranch"
 
 
 def _is_mutating(args: list[str]) -> bool:

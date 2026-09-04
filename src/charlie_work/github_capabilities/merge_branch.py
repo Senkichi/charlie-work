@@ -43,9 +43,10 @@ from ci_fleet.github import GitHubError
 #
 # ``_is_mutating`` also lives in ``_base.py`` (Track 2, issue #1590; design
 # doc Section 5, L06) -- see ``_base.py``'s own comment for the cross-cutting
-# rationale (shared with ``GitHub.run``/``_run_bool``, which stay on the
-# owner until L09). ``pr_close``/``pr_reopen`` (moved below) reference it as
-# a bare global for their dry-run synthetic-result guard.
+# rationale (shared with ``GitHub.run``, which stays on the owner
+# permanently, and ``Transport._run_bool``, moved in L09).
+# ``pr_close``/``pr_reopen`` (moved below) reference it as a bare global for
+# their dry-run synthetic-result guard.
 from ._base import CapabilityCollaborator, GitHubRunResult, _is_mutating
 
 # Flag constants for merge_pr -- single source of truth for both argv

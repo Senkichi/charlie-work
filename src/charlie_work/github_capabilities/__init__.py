@@ -15,7 +15,13 @@ the (still monolithic) ``GitHub`` implementation. No method body has moved.
 
 from __future__ import annotations
 
-from ._base import GitHubRunResult, _is_mutating, _LIST_LIMIT
+from ._base import (
+    GitHubRunResult,
+    MERGED_PR_LIST_FIELDS,
+    RUN_LIST_FIELDS,
+    _is_mutating,
+    _LIST_LIMIT,
+)
 from .checks import PR_CHECKS_FIELDS, Checks, ChecksLike, _job_id_from_link
 from .comments import Comments, CommentsLike
 from .issues import (
@@ -35,7 +41,7 @@ from .pull_requests import (
     _pr_number_from_url,
 )
 from .repo_meta import RepoMeta, RepoMetaLike
-from .transport import Transport
+from .transport import RECONCILE_ISSUE_FIELDS, RECONCILE_PR_FIELDS, Transport
 
 __all__ = [
     "Checks",
@@ -50,6 +56,7 @@ __all__ = [
     "LABEL_LIST_FIELDS",
     "Labels",
     "LabelsLike",
+    "MERGED_PR_LIST_FIELDS",
     "MergeBranch",
     "MergeBranchLike",
     "PR_CHECKS_FIELDS",
@@ -57,6 +64,9 @@ __all__ = [
     "PR_VIEW_FIELDS",
     "PullRequests",
     "PullRequestsLike",
+    "RECONCILE_ISSUE_FIELDS",
+    "RECONCILE_PR_FIELDS",
+    "RUN_LIST_FIELDS",
     "RepoMeta",
     "RepoMetaLike",
     "Transport",
