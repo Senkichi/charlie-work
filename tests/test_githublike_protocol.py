@@ -674,6 +674,261 @@ def test_pr_checks_delegate_forwards_through_run(
     ]
 
 
+def test_github_isinstance_repometalike(tmp_path: Path) -> None:
+    """``GitHub`` must satisfy ``RepoMetaLike`` at runtime after the L05 move.
+
+    Duplicates part of ``test_github_satisfies_repometalike`` deliberately: a
+    standalone ``isinstance`` assertion so this specific claim (survives the
+    L05 move of the five repo-metadata members off ``GitHub``) has its own
+    named test independent of the broader signature-conformance loop.
+    """
+    assert isinstance(GitHub(tmp_path), RepoMetaLike)
+
+
+def test_repometa_members_are_not_lexical_github_defs() -> None:
+    """``GitHub`` must no longer lexically define any of the five RepoMeta members.
+
+    Track 2 L05 (issue #1589) moved ``name_with_owner``, ``compare``,
+    ``compare_diff``, ``commit``, and ``invalidate_list_cache`` to
+    ``RepoMeta``; the names are now served on ``GitHub`` by L01 generated
+    delegates (class-level assignments, not ``def``s). Mirrors
+    ``test_checks_members_are_not_lexical_github_defs``'s approach for L04 --
+    walk the AST of ``GitHub``'s own class body and assert none of the five
+    names appears as a lexical ``FunctionDef``/``AsyncFunctionDef`` there.
+    """
+    lexical = _lexical_github_defs()
+    moved_names = [
+        "name_with_owner",
+        "compare",
+        "compare_diff",
+        "commit",
+        "invalidate_list_cache",
+    ]
+    for name in moved_names:
+        assert name not in lexical, f"{name} is still a lexical GitHub def"
+    # And confirm the names *are* still resolvable, as delegates.
+    for name in moved_names:
+        assert hasattr(getattr(GitHub, name), "__wrapped__"), (
+            f"GitHub.{name} does not look like an installed delegate"
+        )
+
+
+def test_repometa_routes_point_at_the_repo_meta_collaborator() -> None:
+    """``_ROUTES`` must route all five moved names to the ``_repo_meta`` collaborator.
+
+    Forward-compatible: asserts only the five entries this leaf (L05) adds,
+    not the full ``_ROUTES`` contents, so it keeps holding unmodified once
+    later leaves (L06+) populate more of the table.
+    """
+    for name in (
+        "name_with_owner",
+        "compare",
+        "compare_diff",
+        "commit",
+        "invalidate_list_cache",
+    ):
+        assert _ROUTES[name] == "_repo_meta"
+
+
+def test_invalidate_list_cache_delegate_forwards_to_owner_shared_cache(
+    tmp_path: Path,
+) -> None:
+    """Calling ``gh.invalidate_list_cache()`` through the delegate must clear
+    the OWNER's ``_list_cache`` dict, not some copy on the collaborator.
+
+    Unlike every other moved member, ``invalidate_list_cache`` never calls
+    ``self.run`` -- it only touches ``self._list_cache`` directly. Per the
+    design doc (Section 3.4) and issue #1589's shared-state note, the
+    ``_list_cache`` dict itself STAYS on the owner; the ``RepoMeta``
+    collaborator's ``self._list_cache`` resolves through
+    ``CapabilityCollaborator.__getattr__`` to the *same* owner dict, so a
+    ``.clear()`` from the collaborator side is visible to the owner and every
+    other collaborator. This test proves that behaviourally: populate the
+    owner's cache directly, invoke the delegate, and assert the owner's own
+    dict (the identical object) is now empty.
+    """
+    gh = GitHub(tmp_path)
+    gh._list_cache["probe"] = "stale-value"
+    assert gh._list_cache  # sanity: population landed on the owner
+
+    gh.invalidate_list_cache()
+
+    assert gh._list_cache == {}, "invalidate_list_cache must clear the owner's shared _list_cache"
+    # And confirm the collaborator never got a _list_cache of its own -- it
+    # forwarded through __getattr__ to the identical owner dict throughout.
+    assert gh._repo_meta.__dict__.get("_list_cache") is None
+
+
+def test_commit_delegate_forwards_through_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Calling ``gh.commit(sha)`` through the delegate must reach the patched
+    class-level ``GitHub.run`` with the same argv the moved body produces,
+    and must recognize a real ``GitHubRunResult`` returned across the
+    collaborator boundary via ``isinstance`` -- the same
+    ``github_capabilities/_base.py``-defined, ``github.py``-re-exported
+    mechanism L04 introduced for ``Checks``.
+
+    The expected argv is transcribed by reading the moved ``RepoMeta.commit``
+    body directly, not derived by calling the same code under test.
+    """
+    calls: list[tuple[list[str], bool, bool]] = []
+
+    def fake_run(
+        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> _github_module.GitHubRunResult:
+        calls.append((args, json_output, allow_failure))
+        return _github_module.GitHubRunResult(
+            ok=True,
+            returncode=0,
+            stdout="",
+            stderr="",
+            value={"sha": "abc123", "parents": []},
+        )
+
+    monkeypatch.setattr(GitHub, "run", fake_run)
+
+    gh = GitHub(tmp_path)
+    result = gh.commit("abc123")
+
+    assert isinstance(result, _github_module.GitHubRunResult)
+    assert result.ok is True
+    assert result.value == {"sha": "abc123", "parents": []}
+    assert calls == [
+        (["api", "repos/{owner}/{repo}/commits/abc123"], True, True),
+    ]
+
+
+def test_compare_delegate_forwards_through_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Calling ``gh.compare(base, head)`` through the delegate must reach the
+    patched class-level ``GitHub.run`` with the same argv the moved body
+    produces, unwrapping a ``GitHubRunResult`` to its ``.value`` dict.
+
+    The expected argv is transcribed by reading the moved ``RepoMeta.compare``
+    body directly.
+    """
+    calls: list[tuple[list[str], bool, bool]] = []
+
+    def fake_run(
+        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> _github_module.GitHubRunResult:
+        calls.append((args, json_output, allow_failure))
+        return _github_module.GitHubRunResult(
+            ok=True,
+            returncode=0,
+            stdout="",
+            stderr="",
+            value={"base_commit": {"sha": "base1"}, "merge_base_commit": {"sha": "mb1"}},
+        )
+
+    monkeypatch.setattr(GitHub, "run", fake_run)
+
+    gh = GitHub(tmp_path)
+    result = gh.compare("main", "feature")
+
+    assert result == {"base_commit": {"sha": "base1"}, "merge_base_commit": {"sha": "mb1"}}
+    assert calls == [
+        (["api", "repos/{owner}/{repo}/compare/main...feature"], True, True),
+    ]
+
+
+def test_compare_diff_delegate_forwards_through_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Calling ``gh.compare_diff(base, head)`` through the delegate must reach
+    the patched class-level ``GitHub.run`` with the same argv (including the
+    ``Accept: application/vnd.github.v3.diff`` header) the moved body
+    produces, unwrapping a ``GitHubRunResult`` to its ``.value`` string.
+
+    The expected argv is transcribed by reading the moved
+    ``RepoMeta.compare_diff`` body directly.
+    """
+    calls: list[tuple[list[str], bool, bool]] = []
+    diff_text = "diff --git a/x b/x\n+added line\n"
+
+    def fake_run(
+        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> _github_module.GitHubRunResult:
+        calls.append((args, json_output, allow_failure))
+        return _github_module.GitHubRunResult(
+            ok=True, returncode=0, stdout=diff_text, stderr="", value=diff_text
+        )
+
+    monkeypatch.setattr(GitHub, "run", fake_run)
+
+    gh = GitHub(tmp_path)
+    result = gh.compare_diff("main", "feature")
+
+    assert result == diff_text
+    assert calls == [
+        (
+            [
+                "api",
+                "repos/{owner}/{repo}/compare/main...feature",
+                "-H",
+                "Accept: application/vnd.github.v3.diff",
+            ],
+            False,
+            True,
+        ),
+    ]
+
+
+def test_name_with_owner_delegate_forwards_through_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Calling ``gh.name_with_owner()`` through the delegate must reach the
+    patched class-level ``GitHub.run`` with the same argv the moved body
+    produces, and return the parsed ``nameWithOwner`` string.
+
+    The expected argv is transcribed by reading the moved
+    ``RepoMeta.name_with_owner`` body directly.
+    """
+    calls: list[tuple[list[str], bool, bool]] = []
+
+    def fake_run(
+        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> dict[str, str]:
+        calls.append((args, json_output, allow_failure))
+        return {"nameWithOwner": "Senkichi/charlie-work"}
+
+    monkeypatch.setattr(GitHub, "run", fake_run)
+
+    gh = GitHub(tmp_path)
+    result = gh.name_with_owner()
+
+    assert result == "Senkichi/charlie-work"
+    assert calls == [
+        (["repo", "view", "--json", "nameWithOwner"], True, False),
+    ]
+
+
+def test_name_with_owner_delegate_raises_githuberror_on_bad_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``name_with_owner`` must still raise ``GitHubError`` (not some
+    RepoMeta-local, unrelated exception type) when ``gh repo view`` returns an
+    unparseable shape, exercising the identity-sensitive
+    ``ci_fleet.github.GitHubError`` import this leaf adds to ``repo_meta.py``
+    (see that module's import block: a local re-declaration would be a
+    structurally identical but unrelated type that no ``except GitHubError``
+    handler in the rest of the codebase would catch).
+    """
+
+    def fake_run(
+        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> dict[str, str]:
+        return {"unexpected": "shape"}
+
+    monkeypatch.setattr(GitHub, "run", fake_run)
+
+    gh = GitHub(tmp_path)
+    with pytest.raises(_github_module.GitHubError):
+        gh.name_with_owner()
+
+
 def test_every_capability_module_declares_future_annotations() -> None:
     """Every ``github_capabilities`` module must have ``from __future__ import
     annotations`` (design doc Section 3.1).
