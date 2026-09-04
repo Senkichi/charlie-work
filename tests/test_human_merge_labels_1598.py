@@ -36,6 +36,7 @@ from charlie_work.config import (
     OrchestratorConfig,
     load_config,
 )
+from charlie_work.github import GitHubError
 from charlie_work.janitor import run_janitor
 from charlie_work.labels import _edges
 from charlie_work.paths import runtime_paths
@@ -404,6 +405,232 @@ def test_merge_ready_human_merge_live_label_change_between_passes(
     second = app.merge_ready(456, merge=True)
     assert second.data["human_merge_hold"] is True
     assert second.data["mergequeue_label_applied"] is None
+
+
+# ---------------------------------------------------------------------------
+# merge_ready — fail-closed human_merge_check_unavailable branch
+# ---------------------------------------------------------------------------
+
+
+def test_merge_ready_human_merge_check_unavailable_issue_view_raises(
+    tmp_path: Path,
+) -> None:
+    """When ``issue_view`` raises while checking the human-merge label, the
+    fleet fails closed: the PR is neither merged nor queued, and the
+    unavailable flag is surfaced in the result. This is the safety/policy
+    enforcement branch that had zero coverage before.
+    """
+    config = _human_merge_config(mergequeue=True)
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [
+        {"name": "automated-ready"},
+        {"name": "needs-design"},
+    ]
+    # Force the bound-issue fetch to fail so the human-merge check cannot
+    # determine whether the label is present.
+    _raise = GitHubError("simulated gh outage")
+
+    def _failing_issue_view(number: int):
+        raise _raise
+
+    fake_gh.issue_view = _failing_issue_view  # type: ignore[method-assign]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["human_merge_hold"] is False
+    assert result.data["human_merge_check_unavailable"] is True
+    # Fail closed: no merge, no mergequeue label.
+    assert fake_gh.merged == []
+    assert fake_gh.pr_labels_added == []
+    assert result.data["mergequeue_label_applied"] is None
+
+
+def test_merge_ready_human_merge_check_unavailable_malformed_issue(
+    tmp_path: Path,
+) -> None:
+    """When ``issue_view`` returns a payload missing ``labels`` (malformed
+    dict), the human-merge check fails closed the same way as a raise — the
+    PR is not merged. Covers the second arm of the unavailable branch.
+    """
+    config = _human_merge_config(mergequeue=True)
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # Return a dict without a 'labels' key to trip the malformed-payload arm.
+    def _malformed_issue_view(number: int):
+        return {"number": number, "title": "no labels here"}
+
+    fake_gh.issue_view = _malformed_issue_view  # type: ignore[method-assign]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["human_merge_check_unavailable"] is True
+    assert fake_gh.merged == []
+    assert fake_gh.pr_labels_added == []
+
+
+# ---------------------------------------------------------------------------
+# _merge_ready_dry_run — human-merge-labels mirror
+# ---------------------------------------------------------------------------
+
+
+def test_merge_ready_dry_run_human_merge_label_hold(tmp_path: Path) -> None:
+    """The dry-run preview mirrors the real path: when the bound issue
+    carries a configured human-merge label, it reports ``human_merge_hold``
+    and a 'would not auto-merge' message instead of 'would merge'."""
+    config = _human_merge_config(mergequeue=True)
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [
+        {"name": "automated-ready"},
+        {"name": "needs-design"},
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    result = app._merge_ready_dry_run(456, merge=True)
+
+    assert result.data["human_merge_hold"] is True
+    assert result.data["human_merge_check_unavailable"] is False
+    assert "would not auto-merge" in result.message
+    # Dry-run never merges.
+    assert result.data["merged"] is False
+    assert fake_gh.merged == []
+
+
+def test_merge_ready_dry_run_human_merge_check_unavailable(tmp_path: Path) -> None:
+    """The dry-run preview fails closed when the human-merge label check is
+    unavailable (issue_view raises): ``ok`` is False and the unavailable
+    flag is surfaced."""
+    config = _human_merge_config(mergequeue=True)
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    def _failing_issue_view(number: int):
+        raise GitHubError("simulated gh outage")
+
+    fake_gh.issue_view = _failing_issue_view  # type: ignore[method-assign]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    result = app._merge_ready_dry_run(456, merge=True)
+
+    assert result.data["human_merge_hold"] is False
+    assert result.data["human_merge_check_unavailable"] is True
+    # ok is False because a check was unavailable (fail-closed preview).
+    assert result.ok is False
+    assert "human-merge label check unavailable" in result.message
+
+
+def test_merge_ready_dry_run_default_empty_preserves_behavior(
+    tmp_path: Path,
+) -> None:
+    """Default empty ``human_merge_labels`` preserves the dry-run preview:
+    no hold, no unavailable flag, even when the issue carries a label that
+    would be a human-merge label if configured."""
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [
+        {"name": "automated-ready"},
+        {"name": "needs-design"},
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    result = app._merge_ready_dry_run(456, merge=True)
+
+    assert result.data["human_merge_hold"] is False
+    assert result.data["human_merge_check_unavailable"] is False
+
+
+# ---------------------------------------------------------------------------
+# review() — issue-label-fetch glue (end-to-end)
+# ---------------------------------------------------------------------------
+
+
+def test_review_issue_label_fetch_glue_passes_live_labels_to_janitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``review()`` fetches the bound issue's live labels via
+    ``issue_view`` and passes them to ``run_janitor`` as the
+    ``issue_labels`` kwarg. This exercises the glue end-to-end (the live
+    fetch + hand-off), rather than only unit-testing ``run_janitor`` with a
+    hand-built ``issue_labels`` kwarg.
+
+    The PR is marked draft so the janitor verdict blocks (``ok=False``) and
+    ``review()`` returns at the janitor gate — keeping the test bounded
+    while still running the real ``run_janitor`` with the glue-fetched
+    labels. The human-merge warning is informational and surfaces
+    regardless of ``verdict.ok``.
+    """
+    config = _human_merge_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [
+        {"name": "automated-ready"},
+        {"name": "needs-design"},
+    ]
+    # A draft PR makes the janitor block (is_draft_only_block) so review()
+    # returns at the gate without dispatching a reviewer, while the
+    # human-merge warning still surfaces in the verdict.
+    fake_gh.prs[0]["isDraft"] = True
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    captured: dict[str, object] = {}
+    real_run_janitor = run_janitor
+
+    def _spy_run_janitor(pr, checks, cfg, **kwargs):
+        captured["issue_labels"] = kwargs.get("issue_labels")
+        verdict = real_run_janitor(pr, checks, cfg, **kwargs)
+        captured["warnings"] = list(verdict.warnings)
+        return verdict
+
+    monkeypatch.setattr("charlie_work.workflow.run_janitor", _spy_run_janitor)
+    app.review(456)
+
+    # The glue fetched the live issue labels and passed them through.
+    assert captured["issue_labels"] is not None
+    assert "needs-design" in captured["issue_labels"]  # type: ignore[operator]
+    # The labels flowed through to the janitor's human-merge warning.
+    assert any("human-merge" in w for w in captured["warnings"])  # type: ignore[arg-type]
+
+
+def test_review_issue_label_fetch_glue_skipped_when_unconfigured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``human_merge_labels`` is empty (default), ``review()`` skips
+    the issue-label fetch entirely and passes ``issue_labels=None`` to the
+    janitor — zero overhead, matching the merge-path guard."""
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [
+        {"name": "automated-ready"},
+        {"name": "needs-design"},
+    ]
+    fake_gh.prs[0]["isDraft"] = True
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    captured: dict[str, object] = {}
+    real_run_janitor = run_janitor
+
+    def _spy_run_janitor(pr, checks, cfg, **kwargs):
+        captured["issue_labels"] = kwargs.get("issue_labels")
+        return real_run_janitor(pr, checks, cfg, **kwargs)
+
+    monkeypatch.setattr("charlie_work.workflow.run_janitor", _spy_run_janitor)
+    app.review(456)
+
+    assert captured["issue_labels"] is None
 
 
 # ---------------------------------------------------------------------------
