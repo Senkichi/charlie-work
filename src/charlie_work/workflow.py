@@ -12322,6 +12322,23 @@ class OrchestratorApp:
                     snapshot_new_issue.get("status"),
                 ]
 
+        # Issue #1602: capture the in-window blocked-environment count from
+        # the pre-lock snapshot so the ``unescalated`` event records what the
+        # release cleared. ``blocked_environment_at`` is popped by
+        # ``_apply_issue_reset`` (via ``UNESCALATE_ISSUE_RESET_FIELDS``), so
+        # without this the audit trail would not show why a subsequent
+        # rework pass dispatched instead of re-escalating.
+        prior_blocked_environment_count = (
+            len(
+                _windowed_blocked_environment_at(
+                    issue_state,
+                    window_minutes=self.config.watchdog.redispatch_window_minutes,
+                )
+            )
+            if isinstance(issue_state, dict)
+            else 0
+        )
+
         if dry_run:
             return CommandResult(
                 True,
@@ -12332,6 +12349,8 @@ class OrchestratorApp:
                     "issue": issue_number,
                     "transitions": transitions,
                     "label_edge": label_edge,
+                    "blocked_environment_at_reset": prior_blocked_environment_count > 0,
+                    "blocked_environment_at_prior_count": prior_blocked_environment_count,
                     "changed": False,
                 },
             )
@@ -12358,6 +12377,8 @@ class OrchestratorApp:
                     "issue_number": issue_number,
                     "transitions": transitions,
                     "label_edge": label_edge,
+                    "blocked_environment_at_reset": prior_blocked_environment_count > 0,
+                    "blocked_environment_at_prior_count": prior_blocked_environment_count,
                 },
             )
             save_state(self.paths.state_file, state)
