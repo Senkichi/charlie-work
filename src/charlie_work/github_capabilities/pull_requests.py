@@ -20,7 +20,16 @@ if TYPE_CHECKING:
     # GitHubLike union); inspect.signature does not evaluate annotations
     # (eval_str=False by default), so the bare string name is all the
     # conformance test's signature comparison needs.
-    from charlie_work.github import GitHubRunResult, MergedPRSearchResult
+    #
+    # GitHubRunResult itself lives in _base.py, not charlie_work.github (Track
+    # 2, issue #1588/#1589; design doc Section 5, L04/L05 review finding):
+    # repointed here for single-source consistency even though this leaf's
+    # own members haven't moved yet -- a one-line, no-behaviour change (the
+    # annotation stays a string either way under `from __future__ import
+    # annotations`).
+    from charlie_work.github import MergedPRSearchResult
+
+    from ._base import GitHubRunResult
 
 
 @runtime_checkable

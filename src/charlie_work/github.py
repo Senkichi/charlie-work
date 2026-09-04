@@ -305,14 +305,6 @@ class GitHub:
         for collab_attr, collab_cls in _COLLABORATORS:
             object.__setattr__(self, collab_attr, collab_cls(self))
 
-    def invalidate_list_cache(self) -> None:
-        """Drop cached list results so the next call refetches from GitHub.
-
-        Called at the start of every orchestrator pass (``loop()``); the
-        cache dedupes list calls within one pass, never across passes.
-        """
-        self._list_cache.clear()
-
     def _normalize_rest_pr(self, pr: dict[str, Any]) -> dict[str, Any]:
         """Map a PR object from the REST pulls endpoint to the shape expected
         by consumers of merged_pr_list().
@@ -919,44 +911,6 @@ class GitHub:
             )
         return mapped
 
-    def commit(self, sha: str) -> GitHubRunResult:
-        """Fetch a single commit's metadata by SHA.
-
-        Wraps ``gh api repos/{owner}/{repo}/commits/{sha}``. Returns a
-        ``GitHubRunResult`` whose ``value`` is the parsed JSON response
-        (including ``parents`` and ``committer``/``commit.committer``) on
-        success, or ``None`` with ``error`` set on failure. Errors are
-        returned as values, never raised.
-
-        Callers that only want the dict can use
-        ``result.value if result.ok and isinstance(result.value, dict) else None``;
-        callers that need the failure reason (e.g. for event payloads, issue
-        #1140) read ``result.error``. Returning the full ``GitHubRunResult``
-        rather than collapsing to ``None`` preserves the transport/API error
-        (TLS blip vs rate limit vs auth vs 404) at the boundary that most
-        needs it, consistent with this repo's errors-as-values invariant.
-        """
-        result = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/commits/{sha}"],
-            json_output=True,
-            allow_failure=True,
-        )
-        if isinstance(result, GitHubRunResult):
-            return result
-        # Dry-run short-circuit or an unexpected double that returned a raw
-        # value instead of a GitHubRunResult. Normalize so the contract is
-        # uniform -- callers never need to branch on the return type.
-        if isinstance(result, dict):
-            return GitHubRunResult(ok=True, returncode=0, stdout="", stderr="", value=result)
-        return GitHubRunResult(
-            ok=False,
-            returncode=0,
-            stdout="",
-            stderr="",
-            value=None,
-            error=f"unexpected response from gh.run: {type(result).__name__}",
-        )
-
     def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
         """Fetch a PR's commits via the REST ``pulls/{number}/commits`` endpoint.
 
@@ -982,23 +936,6 @@ class GitHub:
         if isinstance(result, GitHubRunResult):
             return result.value if result.ok and isinstance(result.value, list) else None
         return result if isinstance(result, list) else None
-
-    def compare(self, base: str, head: str) -> dict[str, Any] | None:
-        """Compare two commits and return the comparison metadata.
-
-        Wraps ``gh api repos/{owner}/{repo}/compare/{base}...{head}``. Returns
-        the parsed JSON response, including ``base_commit`` and
-        ``merge_base_commit``, or ``None`` on failure. Errors are returned as
-        values, never raised.
-        """
-        result = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/compare/{base}...{head}"],
-            json_output=True,
-            allow_failure=True,
-        )
-        if isinstance(result, GitHubRunResult):
-            return result.value if result.ok and isinstance(result.value, dict) else None
-        return result if isinstance(result, dict) else None
 
     def branch_protection(self, base: str) -> dict[str, Any] | None:
         """Return branch protection settings for ``base``, or None on failure.
@@ -1034,30 +971,6 @@ class GitHub:
             value = result
         self._list_cache[cache_key] = value
         return value
-
-    def compare_diff(self, base: str, head: str) -> str | None:
-        """Return the plain unified-diff text between two commits (three-dot compare).
-
-        Wraps the same ``gh api repos/{owner}/{repo}/compare/{base}...{head}``
-        endpoint as :meth:`compare`, but requests the ``application/vnd.github.
-        v3.diff`` media type so the response body is a ready-to-write unified
-        diff (like :meth:`pr_diff`) instead of JSON compare metadata. Tolerates
-        a rebased/diverged/GC'd ``base`` the same way GitHub's three-dot
-        compare does. Returns ``None`` on any failure (404, API error, gh not
-        installed) — errors are returned as values, never raised.
-        """
-        result = self.run(
-            [
-                "api",
-                f"repos/{{owner}}/{{repo}}/compare/{base}...{head}",
-                "-H",
-                "Accept: application/vnd.github.v3.diff",
-            ],
-            allow_failure=True,
-        )
-        if isinstance(result, GitHubRunResult):
-            return result.value if result.ok and isinstance(result.value, str) else None
-        return result if isinstance(result, str) else None
 
     def validate_field_lists(self) -> None:
         """Validate the compile-time ``--json`` field lists against ``gh``.
@@ -1509,23 +1422,6 @@ class GitHub:
                             open_issues.add(number)
 
         return open_issues
-
-    def name_with_owner(self) -> str:
-        """Return the repository's nameWithOwner (e.g., "owner/repo").
-
-        Uses `gh repo view --json nameWithOwner`. Raises GitHubError on failure
-        (offline, not a GitHub repo, gh missing, etc.).
-
-        Returns:
-            The repository's nameWithOwner string.
-        """
-        result = self.run(["repo", "view", "--json", "nameWithOwner"], json_output=True)
-        if not isinstance(result, dict):
-            raise GitHubError("Expected dict from gh repo view")
-        name_with_owner = result.get("nameWithOwner")
-        if not isinstance(name_with_owner, str):
-            raise GitHubError("Expected nameWithOwner string in gh repo view output")
-        return name_with_owner
 
     def _repo_owner_name(self) -> tuple[str, str]:
         """Resolve the repository owner and name from the local git remote.
