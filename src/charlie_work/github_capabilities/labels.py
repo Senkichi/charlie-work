@@ -19,9 +19,11 @@ from ._base import CapabilityCollaborator
 # is called from -- ``self.<attr>`` forwarding through
 # ``CapabilityCollaborator.__getattr__`` only covers attribute access, not
 # bare-name globals). Re-exported through ``github_capabilities/__init__.py``
-# and re-imported into ``github.py`` (which still uses it directly in
-# ``validate_field_lists``, a Transport internal not yet moved) --  the same
-# re-export pattern already used there for ``GitHubError`` and
+# and re-imported into ``github.py`` (nothing there uses it directly anymore
+# now that ``validate_field_lists`` moved to ``transport.py`` in L09) and
+# directly into ``transport.py`` (Track 2, issue #1593; design doc Section 5,
+# L09), which imports it from here rather than re-deriving a second copy --
+# the same re-export pattern already used there for ``GitHubError`` and
 # ``_ROUTES``/``_SIGNATURE_SOURCE``/``_make_delegate``.
 LABEL_LIST_FIELDS = "name"
 

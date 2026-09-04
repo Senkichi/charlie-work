@@ -69,14 +69,20 @@ def test_issues_routes_point_at_the_issues_collaborator() -> None:
 
     Forward-compatible: asserts only the five entries this leaf (L07) adds, not
     the full ``_ROUTES`` contents, so it keeps holding unmodified once later
-    leaves populate more of the table. ``_graphql_issue_dependencies`` /
-    ``_graphql_issue_states`` must NOT be routed -- they stay lexical owner
-    methods until L09.
+    leaves populate more of the table.
+
+    ``_graphql_issue_dependencies``/``_graphql_issue_states`` were NOT routed
+    at L07 time -- they stayed lexical owner methods until Track 2 L09 (issue
+    #1593), which moved them to the ``Transport`` collaborator. Updated here
+    (rather than asserting the now-false "not in _ROUTES") because L09's move
+    of these two names directly falsifies the original assertion; L09's own
+    PR body (tests/test_githublike_protocol_l09.py) covers them as first-class
+    members of that leaf.
     """
     for name in ISSUES_MOVED_MEMBERS:
         assert _ROUTES[name] == "_issues"
-    assert "_graphql_issue_dependencies" not in _ROUTES
-    assert "_graphql_issue_states" not in _ROUTES
+    assert _ROUTES["_graphql_issue_dependencies"] == "_transport"
+    assert _ROUTES["_graphql_issue_states"] == "_transport"
 
 
 def test_issues_members_signature_compatible() -> None:

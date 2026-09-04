@@ -3,10 +3,10 @@
   {
    "boundary": 8.5,
    "bumps": [],
-   "file": "src/charlie_work/github.py",
-   "identity": "GitHub",
+   "file": "src/charlie_work/github_capabilities/transport.py",
+   "identity": "Transport",
    "kind": "class",
-   "member_count": 15
+   "member_count": 12
   },
   {
    "boundary": 6.0,

@@ -63,11 +63,14 @@ logger = logging.getLogger(__name__)
 # ``ISSUE_LIST_FIELDS`` and ``issue_view``'s body references
 # ``ISSUE_VIEW_FIELDS`` as bare globals, so both must be bound in this module's
 # globals. Re-exported through ``github_capabilities/__init__.py`` and
-# re-imported into ``github.py`` (still used directly there in
-# ``validate_field_lists``, a Transport internal not yet moved, and read by
-# ``doctor.py``/``test_github.py``/``test_doctor.py`` via
-# ``charlie_work.github.ISSUE_LIST_FIELDS``/``ISSUE_VIEW_FIELDS``) -- the same
-# re-export pattern already used for ``PR_LIST_FIELDS``/``LABEL_LIST_FIELDS``.
+# re-imported into ``github.py`` (nothing there uses them directly anymore
+# now that ``validate_field_lists`` moved to ``transport.py`` in L09, but
+# ``doctor.py``/``test_github.py``/``test_doctor.py`` still read them via
+# ``charlie_work.github.ISSUE_LIST_FIELDS``/``ISSUE_VIEW_FIELDS``) and
+# directly into ``transport.py`` (Track 2, issue #1593; design doc Section 5,
+# L09), which imports them from here rather than re-deriving a second copy --
+# the same re-export pattern already used for
+# ``PR_LIST_FIELDS``/``LABEL_LIST_FIELDS``.
 ISSUE_LIST_FIELDS = "number,title,url,body,labels,author,createdAt,updatedAt,state"
 ISSUE_VIEW_FIELDS = (
     "number,title,url,body,labels,assignees,author,comments,createdAt,updatedAt,state"
