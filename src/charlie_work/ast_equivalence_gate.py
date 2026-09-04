@@ -202,6 +202,79 @@ def _split_qualified(name: str) -> tuple[str, str | None]:
     return name, None
 
 
+def _has_top_level_comma(s: str) -> bool:
+    """Return True if *s* has a comma at bracket depth 0 (a list-element separator).
+
+    Tracks both ``()`` and ``[]`` nesting so a comma inside a call's argument
+    list (e.g. ``Call(func=..., args=[...])``) is not mistaken for a
+    top-level list separator. String-literal contents are not tracked, but a
+    comma inside a string constant is always nested inside ``Constant(...)``
+    parentheses (depth > 0), so it cannot reach depth 0 in a well-formed dump.
+    """
+    depth = 0
+    for ch in s:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            return True
+    return False
+
+
+def _is_trivial_stub_dump(dump: str) -> bool:
+    """Return True if an ``ast.dump`` string is a function/class with a stub body.
+
+    A trivial stub body is exactly one statement that is ``...`` (Ellipsis),
+    ``pass``, or a bare docstring -- the body of a ``Protocol`` method stub or
+    abstract placeholder, never the body of a real moved method. When
+    :func:`derive_moved_symbols` has multiple same-bare-name candidates in one
+    destination file (a ``Protocol`` stub and a concrete implementation added
+    together, issue #1607), preferring the non-stub candidate avoids a false
+    negative: the stub's dump never equals a real method body's dump, so
+    first-in-file-order can report ``equivalent=False`` for a byte-identical
+    move.
+
+    Detection operates on the dump string: the first ``body=[`` in a
+    ``FunctionDef``/``ClassDef`` dump is the node's own body list
+    (``ast.arguments`` has no ``body=`` field), so we extract that list's
+    balanced-bracket content and check it is a single trivial element. A
+    nested function whose own body is trivial does not cause a false positive:
+    it is not the first ``body=[``, and at the outer level it is one of
+    several statements separated by a top-level comma (caught by
+    :func:`_has_top_level_comma`).
+    """
+    marker = "body=["
+    idx = dump.find(marker)
+    if idx < 0:
+        return False
+    start = idx + len(marker)
+    depth = 1
+    i = start
+    while i < len(dump) and depth > 0:
+        ch = dump[i]
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        i += 1
+    if depth != 0:
+        return False  # malformed / unbalanced brackets (e.g. inside a string)
+    body = dump[start : i - 1]
+    # A stub body has exactly one statement; a top-level comma separates
+    # multiple statements.
+    if _has_top_level_comma(body):
+        return False
+    if body == "Pass()":
+        return True
+    if body == "Expr(value=Constant(value=Ellipsis))":
+        return True
+    # A bare docstring: Expr(value=Constant(value='...')) or double-quoted.
+    return (body.startswith("Expr(value=Constant(value='") and body.endswith("'))")) or (
+        body.startswith('Expr(value=Constant(value="') and body.endswith('"))')
+    )
+
+
 # ---------------------------------------------------------------------------
 # Diff-derived moved-symbol set (graft E, rule #9)
 # ---------------------------------------------------------------------------
@@ -229,6 +302,15 @@ def derive_moved_symbols(
     method moving from ``class A`` in file_a.py to ``class B`` in file_b.py is
     detected.  The ``ast.dump`` comparison determines whether the move is
     verbatim (equivalent) or modified (non-equivalent).
+
+    When multiple added candidates share a bare name (e.g. a ``Protocol`` stub
+    and a concrete implementation added to the same destination file in one
+    diff), the first **non-stub** candidate is preferred over the first in
+    file order (issue #1607): a ``Protocol`` stub's body (``...``) never
+    equals a real method body's dump, so first-in-order can report
+    ``equivalent=False`` for a byte-identical move. If every candidate is a
+    stub, the first candidate is used (preserving the one-removal-one-move
+    invariant when no better target exists).
     """
     moved: list[MovedSymbol] = []
 
@@ -250,9 +332,25 @@ def derive_moved_symbols(
                 continue  # still present in A -- not a move
             bare_a, cls_a = _split_qualified(qname_a)
             candidates = added_by_name.get(bare_a, [])
+            # Among same-bare-name candidates in a different file, prefer a
+            # non-stub destination over the first in file order. A Protocol
+            # stub (body ``...``) and a concrete implementation can both be
+            # ADDED in the same diff (issue #1607); first-in-order can pick
+            # the stub and report equivalent=False for a byte-identical move.
+            # Pick the first non-stub candidate; fall back to the first
+            # candidate if all are stubs (preserves prior behavior when no
+            # better target exists).
+            chosen: tuple[str, str, str] | None = None
             for path_b, qname_b, dump_b in candidates:
                 if path_b == path_a:
                     continue
+                if chosen is None:
+                    chosen = (path_b, qname_b, dump_b)
+                if not _is_trivial_stub_dump(dump_b):
+                    chosen = (path_b, qname_b, dump_b)
+                    break
+            if chosen is not None:
+                path_b, qname_b, dump_b = chosen
                 _, cls_b = _split_qualified(qname_b)
                 moved.append(
                     MovedSymbol(
@@ -264,7 +362,6 @@ def derive_moved_symbols(
                         equivalent=(dump_a == dump_b),
                     )
                 )
-                break  # first match wins; one removal -> one move
 
     return moved
 

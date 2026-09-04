@@ -190,6 +190,126 @@ def test_multiple_symbols_moved() -> None:
     assert all(m.equivalent for m in moved)
 
 
+def test_derive_moved_prefers_concrete_impl_over_protocol_stub() -> None:
+    """A Protocol stub and concrete impl added together: prefer the impl (issue #1607).
+
+    When a destination file adds both a ``Protocol`` stub (body ``...``) and a
+    concrete class with the real moved method body, both sharing the same bare
+    method name, ``derive_moved_symbols`` must pick the concrete implementation
+    as the move target -- not the Protocol stub, whose ``...`` body never
+    equals a real method body's dump (a false negative on a byte-identical
+    move).
+
+    Positive control from issue #1607: a synthetic diff whose head adds
+    ``class FooLike(Protocol)`` with a stub ``foo`` AND ``class Foo`` with the
+    moved ``foo`` body, from a base that has neither (the L01 facade-leaf
+    shape: Protocol and implementation introduced together).
+    """
+    base_source = textwrap.dedent("""
+        class GitHub:
+            def foo(self):
+                return 42
+    """)
+    head_old_source = textwrap.dedent("""
+        class GitHub:
+            pass
+    """)
+    head_new_source = textwrap.dedent("""
+        from typing import Protocol
+
+        class FooLike(Protocol):
+            def foo(self) -> int: ...
+
+        class Foo:
+            def foo(self):
+                return 42
+    """)
+    base = {"src/github.py": extract_symbols(base_source, "github.py")}
+    head = {
+        "src/github.py": extract_symbols(head_old_source, "github.py"),
+        "src/foo.py": extract_symbols(head_new_source, "foo.py"),
+    }
+    moved = derive_moved_symbols(base, head)
+    foo_moves = [m for m in moved if m.name == "foo"]
+    assert len(foo_moves) == 1
+    # The concrete implementation (Foo) is the move target, not the Protocol
+    # stub (FooLike) which is first in file order.
+    assert foo_moves[0].dest_class == "Foo"
+    assert foo_moves[0].dest_file == "src/foo.py"
+    # The move is byte-identical (same body) -> equivalent, not a false negative.
+    assert foo_moves[0].equivalent is True
+
+
+def test_derive_moved_falls_back_to_stub_when_only_candidate() -> None:
+    """When the only candidate is a stub, it is still used (issue #1607).
+
+    The non-stub preference never drops a move: if the sole added candidate is
+    a Protocol stub, it is reported as the destination (with whatever
+    equivalence the dump comparison yields) rather than silently recording no
+    move. This preserves the one-removal-one-move invariant.
+    """
+    base_source = textwrap.dedent("""
+        class GitHub:
+            def foo(self):
+                return 42
+    """)
+    head_old_source = textwrap.dedent("""
+        class GitHub:
+            pass
+    """)
+    head_new_source = textwrap.dedent("""
+        from typing import Protocol
+
+        class FooLike(Protocol):
+            def foo(self) -> int: ...
+    """)
+    base = {"src/github.py": extract_symbols(base_source, "github.py")}
+    head = {
+        "src/github.py": extract_symbols(head_old_source, "github.py"),
+        "src/foo.py": extract_symbols(head_new_source, "foo.py"),
+    }
+    moved = derive_moved_symbols(base, head)
+    foo_moves = [m for m in moved if m.name == "foo"]
+    assert len(foo_moves) == 1
+    assert foo_moves[0].dest_class == "FooLike"
+    # Stub body (...) != real body -> non-equivalent (correctly flagged).
+    assert foo_moves[0].equivalent is False
+
+
+def test_is_trivial_stub_dump_detects_each_stub_shape() -> None:
+    """``_is_trivial_stub_dump`` recognizes ``...``, ``pass``, and docstring stubs.
+
+    And it does NOT classify a real method (including one with a nested
+    trivial-body function) as a stub -- the nested ``body=[Pass()]`` is not
+    the first ``body=[`` in the dump, and the outer body has a top-level comma.
+    """
+    from charlie_work.ast_equivalence_gate import _is_trivial_stub_dump
+
+    assert _is_trivial_stub_dump(
+        extract_symbols("class C:\n    def m(self): ...\n", "t.py")["C.m"]
+    )
+    assert _is_trivial_stub_dump(
+        extract_symbols("class C:\n    def m(self):\n        pass\n", "t.py")["C.m"]
+    )
+    assert _is_trivial_stub_dump(
+        extract_symbols('class C:\n    def m(self):\n        """stub"""\n', "t.py")["C.m"]
+    )
+    # A real method is not a stub.
+    assert not _is_trivial_stub_dump(
+        extract_symbols("class C:\n    def m(self):\n        return 42\n", "t.py")["C.m"]
+    )
+    # A real method with a nested trivial-body function is not a stub: the
+    # nested body=[Pass()] is not the first body=[, and the outer body has a
+    # top-level comma separating the nested def from the return.
+    nested = (
+        "class C:\n    def m(self):\n        def inner():\n            pass\n        return 42\n"
+    )
+    assert not _is_trivial_stub_dump(extract_symbols(nested, "t.py")["C.m"])
+    # A docstring followed by a real statement is not a stub (multi-statement).
+    multi = 'class C:\n    def m(self):\n        """doc"""\n        return 42\n'
+    assert not _is_trivial_stub_dump(extract_symbols(multi, "t.py")["C.m"])
+
+
 # ---------------------------------------------------------------------------
 # Rule #9 compliance: no hardcoded symbol-name list in the gate source
 # ---------------------------------------------------------------------------
