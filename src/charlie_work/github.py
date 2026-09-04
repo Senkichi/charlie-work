@@ -1416,12 +1416,6 @@ class GitHub:
         except GitHubError:
             return False
 
-    def issue_comment(self, number: int, body_file: Path) -> None:
-        self.run(["issue", "comment", str(number), "--body-file", str(body_file)])
-
-    def pr_comment(self, number: int, body_file: Path) -> None:
-        self.run(["pr", "comment", str(number), "--body-file", str(body_file)])
-
     def label_list(self) -> list[dict[str, Any]]:
         result = self.run(
             ["label", "list", "--limit", "200", "--json", LABEL_LIST_FIELDS], json_output=True
