@@ -103,6 +103,21 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
             (labels.operator_queue,),
             _compute_remove((labels.operator_queue,)),
         ),
+        # Issue #1598: a bound PR whose issue carries a configured
+        # ``dispatch.human_merge_labels`` label is human-merged, never
+        # fleet-merged. When the PR reaches merge-ready state (approved,
+        # checks green, no conflicts), the fleet transitions the issue to
+        # ``agent:operator-queue`` via this edge and escalates with
+        # ``reason_class="policy"`` — distinct from ``"mechanical"`` (the
+        # de-escalation sweep must NOT auto-clear it) and from
+        # ``"judgment"`` (``charlie unescalate`` is not required — the
+        # merged-PR reconcile path closes it out once the human merges).
+        # Same label as ``operator_queued`` but a distinct named edge so the
+        # transition is attributable in events.db.
+        "human_merge_required": (
+            (labels.operator_queue,),
+            _compute_remove((labels.operator_queue,)),
+        ),
         # Operator re-arm (`charlie unescalate`) for an issue whose PR is
         # still open: drop human-needed (and any other stale workflow state)
         # and return to the passive pr-open state pending a fresh review.
