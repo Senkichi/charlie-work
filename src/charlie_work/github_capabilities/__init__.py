@@ -18,7 +18,13 @@ from __future__ import annotations
 from ._base import GitHubRunResult, _is_mutating, _LIST_LIMIT
 from .checks import PR_CHECKS_FIELDS, Checks, ChecksLike, _job_id_from_link
 from .comments import Comments, CommentsLike
-from .issues import Issues, IssuesLike
+from .issues import (
+    ISSUE_LIST_FIELDS,
+    ISSUE_VIEW_FIELDS,
+    Issues,
+    IssuesLike,
+    get_github_issue_dependencies,
+)
 from .labels import LABEL_LIST_FIELDS, Labels, LabelsLike
 from .merge_branch import MergeBranch, MergeBranchLike
 from .pull_requests import (
@@ -37,6 +43,8 @@ __all__ = [
     "Comments",
     "CommentsLike",
     "GitHubRunResult",
+    "ISSUE_LIST_FIELDS",
+    "ISSUE_VIEW_FIELDS",
     "Issues",
     "IssuesLike",
     "LABEL_LIST_FIELDS",
@@ -56,4 +64,5 @@ __all__ = [
     "_is_mutating",
     "_job_id_from_link",
     "_pr_number_from_url",
+    "get_github_issue_dependencies",
 ]

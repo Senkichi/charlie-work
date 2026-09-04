@@ -7,7 +7,6 @@ import re
 import subprocess
 import time
 from collections.abc import Callable, Iterable, Iterator
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -42,6 +41,8 @@ from .github_capabilities import (
     ChecksLike,
     CommentsLike,
     GitHubRunResult,
+    ISSUE_LIST_FIELDS,
+    ISSUE_VIEW_FIELDS,
     IssuesLike,
     LABEL_LIST_FIELDS,
     LabelsLike,
@@ -51,11 +52,21 @@ from .github_capabilities import (
     PR_VIEW_FIELDS,
     PullRequestsLike,
     RepoMetaLike,
-    _LIST_LIMIT,
     _is_mutating,
 )
+
+# ``_LIST_LIMIT`` is no longer referenced inside ``github.py`` itself -- its
+# last internal consumer, ``issue_list``, moved to the ``Issues`` collaborator
+# in this leaf (Track 2, issue #1591; design doc Section 5, L07). It stays a
+# deliberate re-export because ``reconcile.py`` (``from .github import
+# _LIST_LIMIT``) and the test suite (``test_reconcile.py``/``test_charlie_work.py``
+# via ``charlie_work.github._LIST_LIMIT``) still read it from here.
+from .github_capabilities import _LIST_LIMIT  # noqa: F401  (deliberate re-export)
 from .github_capabilities import _job_id_from_link  # noqa: F401  (deliberate re-export)
 from .github_capabilities import _pr_number_from_url  # noqa: F401  (deliberate re-export)
+from .github_capabilities import (  # noqa: F401  (deliberate re-export)
+    get_github_issue_dependencies,
+)
 from .github_delegation import _COLLABORATORS, _install_delegates
 from .github_delegation import _ROUTES, _SIGNATURE_SOURCE, _make_delegate  # noqa: F401 (deliberate re-export)
 from .subprocess_runner import no_console_window_kwargs
@@ -72,13 +83,6 @@ _DEFAULT_GH_TIMEOUT_SECONDS = 120.0
 # A TimeoutExpired carries no returncode of its own, and callers that branch on
 # returncode must not see a 0 that reads as success.
 _TIMEOUT_RETURNCODE = 124
-
-# Bound on concurrent `gh` subprocesses spawned by are_issues_open() for a
-# single batch of cache misses. Each `gh` call is I/O-bound (process spawn +
-# network round trip, ~1-7s observed), so this is a fan-out width, not a CPU
-# budget -- picked to keep well clear of GitHub's secondary rate limits while
-# still cutting a serial N x ~2s loop down substantially. See issue #870.
-_MAX_ISSUE_STATE_WORKERS = 8
 
 # How many issue numbers to pack into one batched `gh api graphql` query.
 # Kept conservative to stay under the ~32KB Windows command-line limit and
@@ -118,10 +122,6 @@ def _parse_git_remote_url(url: str) -> tuple[str, str] | None:
 # Module-level constants for gh --json field lists.
 # These are the single source of truth for all JSON field queries to GitHub.
 # All call sites must use these constants — no inline field-list literals.
-ISSUE_LIST_FIELDS = "number,title,url,body,labels,author,createdAt,updatedAt,state"
-ISSUE_VIEW_FIELDS = (
-    "number,title,url,body,labels,assignees,author,comments,createdAt,updatedAt,state"
-)
 PR_VIEW_MERGED_FIELDS = "state,mergedAt,headRefOid"
 # The field contract for every merged-PR listing. Two producers must satisfy
 # it identically: merged_prs_for_issue() queries these fields directly, and
@@ -527,55 +527,6 @@ class GitHub:
             )
         return items
 
-    def issue_list(self, labels=None, state=None) -> list[dict[str, Any]]:
-        # Normalize labels for caching and arg building; support legacy str signature.
-        if isinstance(labels, str):
-            label_tuple = (labels,)
-        elif labels is None:
-            label_tuple = ()
-        else:
-            label_tuple = tuple(labels)
-        effective_state = state or "open"
-        cache_key = ("issue_list", effective_state, label_tuple)
-        cached = self._list_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        args = [
-            "issue",
-            "list",
-            "--limit",
-            str(_LIST_LIMIT),
-            "--state",
-            effective_state,
-            "--json",
-            ISSUE_LIST_FIELDS,
-        ]
-        for label in label_tuple:
-            args.extend(["--label", label])
-
-        label_str = ", ".join(label_tuple) if label_tuple else "all"
-        result = self._list_json(
-            args,
-            limit=_LIST_LIMIT,
-            kind=f"issues (labels={label_str}, state={effective_state})",
-        )
-        self._list_cache[cache_key] = result
-        return result
-
-    def issue_view(self, number: int) -> dict[str, Any]:
-        result = self.run(
-            [
-                "issue",
-                "view",
-                str(number),
-                "--json",
-                ISSUE_VIEW_FIELDS,
-            ],
-            json_output=True,
-        )
-        return result if isinstance(result, dict) else {}
-
     def merged_prs_for_issue(
         self,
         issue_number: int,
@@ -853,19 +804,6 @@ class GitHub:
                     f"gh does not support field(s) for {name}: {', '.join(unsupported)}"
                 )
 
-    def close_issue(self, number: int) -> bool:
-        """Close an issue. Idempotent — returns True even if already closed.
-
-        Uses `gh issue close`. Returns True on success, False on failure.
-        Never raises — per-issue failures are reported as values and must not
-        abort a batch operation.
-        """
-        try:
-            self.run(["issue", "close", str(number)])
-            return True
-        except GitHubError:
-            return False
-
     def merge_pr(
         self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()
     ) -> str:
@@ -1127,68 +1065,6 @@ class GitHub:
             )
         return ref_update
 
-    def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
-        """Check which of the given issue numbers are currently open.
-
-        Returns a set of issue numbers that are open. Issues that don't exist
-        or are closed are not included in the result. This is used for the
-        dependency gate to check if blocker issues are still open.
-
-        Per-issue-number results are cached in the pass-scoped ``_list_cache``
-        (keyed ``("issue_open", number)``). Cache misses are first resolved in
-        a single batched GraphQL query (one subprocess for the whole set); only
-        if the batch fails do we fall back to the previous parallel
-        per-``issue_view`` fetch.
-
-        Args:
-            issue_numbers: List of issue numbers to check
-
-        Returns:
-            Set of issue numbers that are currently open
-        """
-        if not issue_numbers:
-            return set()
-
-        open_issues: set[int] = set()
-        uncached: list[int] = []
-        for number in issue_numbers:
-            cached = self._list_cache.get(("issue_open", number))
-            if cached is None:
-                uncached.append(number)
-            elif cached:
-                open_issues.add(number)
-
-        if uncached:
-            try:
-                states = self._graphql_issue_states(uncached)
-                for number, is_open in states.items():
-                    self._list_cache[("issue_open", number)] = is_open
-                    if is_open:
-                        open_issues.add(number)
-            except (GitHubError, OSError, ValueError, TypeError):
-                logger.warning(
-                    "Batched issue state query failed, falling back to per-issue view",
-                    exc_info=True,
-                )
-
-                # Fallback to the previous parallel per-issue view fetch.
-                def _fetch_state(number: int) -> tuple[int, bool]:
-                    try:
-                        issue = self.issue_view(number)
-                        is_open = str(issue.get("state") or "").upper() == "OPEN"
-                    except (GitHubError, ValueError, TypeError):
-                        is_open = False
-                    return number, is_open
-
-                max_workers = min(_MAX_ISSUE_STATE_WORKERS, len(uncached))
-                with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                    for number, is_open in pool.map(_fetch_state, uncached):
-                        self._list_cache[("issue_open", number)] = is_open
-                        if is_open:
-                            open_issues.add(number)
-
-        return open_issues
-
     def _repo_owner_name(self) -> tuple[str, str]:
         """Resolve the repository owner and name from the local git remote.
 
@@ -1394,35 +1270,6 @@ class GitHub:
                 self._list_cache[("issue_dependencies", number)] = blocked_by
 
         return deps_by_number
-
-    def issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]:
-        """Fetch GitHub-native blocked-by relationships for a list of issues.
-
-        Uses a single batched GraphQL query (or a small number of chunked
-        queries for large backlogs) instead of one REST API call per issue.
-        Mirrors the fail-open contract of ``get_github_issue_dependencies``:
-        if the batched query cannot be built or fails, falls back to the
-        original per-issue REST calls and returns whatever was successfully
-        resolved.
-        """
-        if not issue_numbers:
-            return {}
-
-        try:
-            return self._graphql_issue_dependencies(issue_numbers)
-        except (GitHubError, OSError, ValueError, TypeError):
-            logger.warning(
-                "Batched issue dependency query failed, falling back to per-issue REST",
-                exc_info=True,
-            )
-
-        # Fallback to the original per-issue REST endpoint, preserving the
-        # warm-cache contract for callers that later call get_github_issue_dependencies.
-        result: dict[int, list[int]] = {}
-        for number in issue_numbers:
-            deps = get_github_issue_dependencies(self, number)
-            result[number] = deps
-        return result
 
 
 # Install the capability delegates now that `GitHub`'s class body is fully
@@ -2214,99 +2061,6 @@ def detect_prose_only_dependencies(text: str) -> bool:
         return True
 
     return False
-
-
-def get_github_issue_dependencies(gh: GitHubLike, issue_number: int) -> list[int]:
-    """Fetch GitHub's native issue dependencies (blocked_by relationships).
-
-    Uses the GitHub API to check for issue dependencies. Tolerates 404/410 errors
-    for repos that don't have the feature enabled. Returns an empty list on any
-    error (fail-open for compatibility).
-
-    Successful resolutions (a real dependency list, including a legitimate
-    empty one, and the 404/410 "feature not available" case) are cached in
-    ``gh``'s pass-scoped ``_list_cache`` keyed ``("issue_dependencies",
-    issue_number)`` -- issue #870 found this call, made once per ready issue
-    with zero caching, serial and uncached, was the single largest cost of
-    `fleet status` (~140s of a ~184s run for 62 issues). Transient failures
-    are deliberately NOT cached: caching a fail-open `[]` would silently
-    erase a real dependency edge for the rest of this pass, which is a
-    correctness change, not just a performance one -- so a transient error
-    is retried on the next lookup within the same pass instead of being
-    locked in.
-
-    Args:
-        gh: GitHub client instance. Duck-typed test doubles without a
-            ``_list_cache`` attribute (several exist in tests/test_charlie_work.py,
-            predating this cache) are tolerated -- caching is simply skipped
-            for them rather than raising.
-        issue_number: The issue number to check dependencies for
-
-    Returns:
-        List of issue numbers that block this issue via GitHub's native API
-    """
-    cache = getattr(gh, "_list_cache", None)
-    cache_key = ("issue_dependencies", issue_number)
-    if cache is not None:
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-    result = gh.run(
-        [
-            "api",
-            f"repos/{{owner}}/{{repo}}/issues/{issue_number}/dependencies/blocked_by",
-        ],
-        json_output=True,
-        allow_failure=True,
-    )
-
-    # Handle different return types from allow_failure=True
-    if isinstance(result, GitHubRunResult):
-        if not result.ok:
-            # Transient error or gh not available — fail open with warning.
-            # Not cached: see docstring.
-            logger.warning(
-                "GitHub dependencies API failed for issue #%d: %s - treating as no dependencies",
-                issue_number,
-                result.error,
-            )
-            return []
-        value = result.value
-    else:
-        value = result
-
-    if value is None:
-        # Legacy FakeGitHub may return None for an allow_failure=True call; in
-        # production gh.run returns a GitHubRunResult with ok=False and error.
-        # Not cached: indistinguishable from a transient failure here.
-        logger.warning(
-            "GitHub dependencies API returned None for issue #%d - treating as no dependencies",
-            issue_number,
-        )
-        return []
-    elif isinstance(value, dict):
-        # 404/410 error response — feature not available on this repo. This
-        # is a stable, successful resolution (not a transient error), so it's
-        # safe and correct to cache.
-        if cache is not None:
-            cache[cache_key] = []
-        return []
-    elif isinstance(value, list):
-        # Extract issue numbers from the dependency list — a real, successful
-        # resolution, cached.
-        deps = [int(dep.get("number", 0)) for dep in value if dep.get("number")]
-        if cache is not None:
-            cache[cache_key] = deps
-        return deps
-    else:
-        # Unexpected type — fail open with warning. Not cached.
-        logger.warning(
-            "GitHub dependencies API returned unexpected type %s for issue #%d - treating as no dependencies",
-            type(value),
-            issue_number,
-        )
-        return []
 
 
 def cancel_superseded_runs(
