@@ -47173,6 +47173,18 @@ def test_dispatch_cross_repo_gate_escalates_when_all_paths_absent(tmp_path: Path
     assert len(escalated_events) == 1
     assert escalated_events[0]["payload"]["issue_number"] == 123
     assert "cross_repo_target" in escalated_events[0]["payload"]["reason"]
+    # Issue #1583: the event payload also carries ``neutral_paths`` and
+    # ``missing_paths`` so the operator can see from the event alone which
+    # citation tripped the gate. This body has no neutral candidates (every
+    # referenced path is a plain missing dispatch target), so neutral_paths
+    # is empty and missing_paths is the non-empty survivor set.
+    payload = escalated_events[0]["payload"]
+    assert isinstance(payload["neutral_paths"], list)
+    assert isinstance(payload["missing_paths"], list)
+    # escalated => every survivor is missing; this body has no neutral
+    # candidates, so neutral_paths is empty and missing_paths is non-empty.
+    assert payload["neutral_paths"] == []
+    assert payload["missing_paths"]
 
     # The issue is terminal in state, not left dispatch_pending.
     assert state["issues"]["123"]["status"] == "escalated"
