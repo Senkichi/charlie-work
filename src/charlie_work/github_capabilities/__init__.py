@@ -18,7 +18,7 @@ from __future__ import annotations
 from .checks import Checks, ChecksLike
 from .comments import Comments, CommentsLike
 from .issues import Issues, IssuesLike
-from .labels import Labels, LabelsLike
+from .labels import LABEL_LIST_FIELDS, Labels, LabelsLike
 from .merge_branch import MergeBranch, MergeBranchLike
 from .pull_requests import PullRequests, PullRequestsLike
 from .repo_meta import RepoMeta, RepoMetaLike
@@ -31,6 +31,7 @@ __all__ = [
     "CommentsLike",
     "Issues",
     "IssuesLike",
+    "LABEL_LIST_FIELDS",
     "Labels",
     "LabelsLike",
     "MergeBranch",
