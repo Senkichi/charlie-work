@@ -26,7 +26,7 @@ from .issues import (
     get_github_issue_dependencies,
 )
 from .labels import LABEL_LIST_FIELDS, Labels, LabelsLike
-from .merge_branch import MergeBranch, MergeBranchLike
+from .merge_branch import _ADMIN_FLAG, _STRATEGY_FLAGS, MergeBranch, MergeBranchLike
 from .pull_requests import (
     PR_LIST_FIELDS,
     PR_VIEW_FIELDS,
@@ -60,7 +60,9 @@ __all__ = [
     "RepoMeta",
     "RepoMetaLike",
     "Transport",
+    "_ADMIN_FLAG",
     "_LIST_LIMIT",
+    "_STRATEGY_FLAGS",
     "_is_mutating",
     "_job_id_from_link",
     "_pr_number_from_url",
