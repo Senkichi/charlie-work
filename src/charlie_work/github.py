@@ -42,6 +42,7 @@ from .github_capabilities import (
     ChecksLike,
     CommentsLike,
     IssuesLike,
+    LABEL_LIST_FIELDS,
     LabelsLike,
     MergeBranchLike,
     PullRequestsLike,
@@ -185,7 +186,6 @@ PR_CLOSING_ISSUES_FIELDS = "closingIssuesReferences"
 # injected back into each check dict as "databaseId", so downstream consumers
 # (workflow.py) see an unchanged contract.
 PR_CHECKS_FIELDS = "name,state,bucket,link"
-LABEL_LIST_FIELDS = "name"
 # Minimal field lists for drift detection (reconcile.py)
 # headRefOid is a plain scalar (like state/title) -- NOT a per-item graph walk
 # like statusCheckRollup (see the PR_CHECKS_FIELDS note above and issue #361);
@@ -1378,31 +1378,6 @@ class GitHub:
                     f"gh does not support field(s) for {name}: {', '.join(unsupported)}"
                 )
 
-    def add_issue_label(self, number: int, label: str) -> bool:
-        return self._run_bool(["issue", "edit", str(number), "--add-label", label])
-
-    def remove_issue_label(self, number: int, label: str) -> bool:
-        return self._run_bool(["issue", "edit", str(number), "--remove-label", label])
-
-    def add_pr_label(self, number: int, label: str) -> bool:
-        """Add a label to a PR (PR-scoped, not the linked issue).
-
-        Used for the Aviator MergeQueue handoff (task #10): the trigger label
-        must land on the PR itself, and issue_number may be None for
-        cross-repository PRs. Idempotent (gh's addLabels is a no-op if the
-        label is already present) and never raises — see ``_run_bool``.
-        """
-        return self._run_bool(["pr", "edit", str(number), "--add-label", label])
-
-    def remove_pr_label(self, number: int, label: str) -> bool:
-        """Remove a label from a PR (PR-scoped, not the linked issue).
-
-        Mirrors ``add_pr_label``. Used to clear Aviator's ``blocked`` label
-        once it has gone stale (reconcile.py's ``aviator_stale_blocked`` drift
-        kind). Idempotent and never raises — see ``_run_bool``.
-        """
-        return self._run_bool(["pr", "edit", str(number), "--remove-label", label])
-
     def close_issue(self, number: int) -> bool:
         """Close an issue. Idempotent — returns True even if already closed.
 
@@ -1415,28 +1390,6 @@ class GitHub:
             return True
         except GitHubError:
             return False
-
-    def issue_comment(self, number: int, body_file: Path) -> None:
-        self.run(["issue", "comment", str(number), "--body-file", str(body_file)])
-
-    def pr_comment(self, number: int, body_file: Path) -> None:
-        self.run(["pr", "comment", str(number), "--body-file", str(body_file)])
-
-    def label_list(self) -> list[dict[str, Any]]:
-        result = self.run(
-            ["label", "list", "--limit", "200", "--json", LABEL_LIST_FIELDS], json_output=True
-        )
-        return result if isinstance(result, list) else []
-
-    def label_create(self, label: str, color: str, description: str) -> None:
-        # --force makes this update-or-create: bootstrap must be idempotent, and
-        # without it `gh label create` errors on a pre-existing label and the
-        # colour/description drift silently. `--force` is a mutation but stays
-        # read-only-safe under dry-run via `_is_mutating`.
-        self.run(
-            ["label", "create", label, "--force", "--color", color, "--description", description],
-            allow_failure=True,
-        )
 
     def merge_pr(
         self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()

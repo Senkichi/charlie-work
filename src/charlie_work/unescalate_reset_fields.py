@@ -135,6 +135,18 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     "worker_pid",
     "worker_process_start_time",
     "dispatched_at",
+    # Issue #1602: an operator unescalate is the statement "the environment
+    # is fixed" -- the same semantics a successful foreign-writer reap
+    # already encodes by setting ``blocked_environment_at`` to ``[]`` at
+    # the guard sites. Without clearing it here, the rework pre-check in
+    # ``_dispatch_rework_impl`` (``_windowed_blocked_environment_at`` >=
+    # ``max_auto_redispatch``) re-escalates with ``dispatch_blocked_environment``
+    # on the very next ``rework_requested`` pass using the stale
+    # timestamps from the released episode, never attempting a single new
+    # dispatch. Popped (not set to ``[]``) for consistency with the other
+    # windowed list fields above (``dispatch_failed_at`` etc.), whose
+    # readers treat a missing key as an empty window.
+    "blocked_environment_at",
 )
 # Issue #1093: the de-escalation sweep's once-per-episode rework-budget
 # reset must zero the per-mechanism PR counter that ACTUALLY gates the

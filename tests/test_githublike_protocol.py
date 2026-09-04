@@ -311,6 +311,214 @@ def test_make_delegate_preserves_signature_and_forwards_call(
     _compatible_signature(inspect.signature(_FakeSource.greet), inspect.signature(delegate))
 
 
+def test_github_isinstance_commentslike(tmp_path: Path) -> None:
+    """``GitHub`` must satisfy ``CommentsLike`` at runtime after the L02 move.
+
+    Duplicates part of ``test_github_satisfies_commentslike`` deliberately: a
+    standalone ``isinstance`` assertion so this specific claim (survives the
+    L02 move of ``issue_comment``/``pr_comment`` off ``GitHub``) has its own
+    named test independent of the broader signature-conformance loop.
+    """
+    assert isinstance(GitHub(tmp_path), CommentsLike)
+
+
+def test_issue_comment_and_pr_comment_are_not_lexical_github_defs() -> None:
+    """``GitHub`` must no longer lexically define ``issue_comment``/``pr_comment``.
+
+    Track 2 L02 (issue #1586) moved both bodies to ``Comments``; the names
+    are now served on ``GitHub`` by L01 generated delegates (class-level
+    assignments, not ``def``s). Checking ``"issue_comment" not in
+    GitHub.__dict__`` would be the wrong test here -- the installed delegate
+    *is* in ``GitHub.__dict__`` (that's how ``getattr(GitHub, name)``
+    resolves it). Instead walk the AST of ``GitHub``'s own class body and
+    assert neither name appears as a lexical ``FunctionDef``/
+    ``AsyncFunctionDef`` there.
+    """
+    lexical = _lexical_github_defs()
+    assert "issue_comment" not in lexical
+    assert "pr_comment" not in lexical
+    # And confirm the names *are* still resolvable, as delegates.
+    assert hasattr(GitHub.issue_comment, "__wrapped__")
+    assert hasattr(GitHub.pr_comment, "__wrapped__")
+
+
+def test_comments_routes_point_at_the_comments_collaborator() -> None:
+    """``_ROUTES`` must route both moved names to the ``_comments`` collaborator.
+
+    Forward-compatible: asserts only the two entries this leaf (L02) adds,
+    not the full ``_ROUTES`` contents, so it keeps holding unmodified once
+    later leaves (L03+) populate more of the table.
+    """
+    assert _ROUTES["issue_comment"] == "_comments"
+    assert _ROUTES["pr_comment"] == "_comments"
+
+
+def test_issue_comment_delegate_forwards_through_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Calling ``gh.issue_comment(...)`` through the delegate must reach the
+    patched class-level ``GitHub.run`` with the same argv the moved body
+    produces.
+
+    The expected argv is transcribed by reading the moved
+    ``Comments.issue_comment``/``pr_comment`` bodies directly (both are two
+    -line wrappers around ``self.run([...])``), not derived by calling the
+    same code under test -- calling it twice would make this a circular
+    assertion that could not catch a body that silently changed.
+    """
+    calls: list[tuple[list[str], bool, bool]] = []
+
+    def fake_run(
+        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> None:
+        calls.append((args, json_output, allow_failure))
+        return None
+
+    monkeypatch.setattr(GitHub, "run", fake_run)
+
+    gh = GitHub(tmp_path)
+    body_file = Path("comment-body.md")
+    gh.issue_comment(7, body_file)
+    gh.pr_comment(9, body_file)
+
+    assert calls == [
+        (["issue", "comment", "7", "--body-file", "comment-body.md"], False, False),
+        (["pr", "comment", "9", "--body-file", "comment-body.md"], False, False),
+    ]
+
+
+def test_github_isinstance_labelslike(tmp_path: Path) -> None:
+    """``GitHub`` must satisfy ``LabelsLike`` at runtime after the L03 move.
+
+    Duplicates part of ``test_github_satisfies_labelslike`` deliberately: a
+    standalone ``isinstance`` assertion so this specific claim (survives the
+    L03 move of the six label members off ``GitHub``) has its own named test
+    independent of the broader signature-conformance loop.
+    """
+    assert isinstance(GitHub(tmp_path), LabelsLike)
+
+
+def test_labels_members_are_not_lexical_github_defs() -> None:
+    """``GitHub`` must no longer lexically define any of the six Labels members.
+
+    Track 2 L03 (issue #1587) moved ``add_issue_label``, ``remove_issue_label``,
+    ``add_pr_label``, ``remove_pr_label``, ``label_list``, and ``label_create``
+    to ``Labels``; the names are now served on ``GitHub`` by L01 generated
+    delegates (class-level assignments, not ``def``s). Checking
+    ``"add_issue_label" not in GitHub.__dict__`` would be the wrong test here
+    -- the installed delegate *is* in ``GitHub.__dict__`` (that's how
+    ``getattr(GitHub, name)`` resolves it). Instead walk the AST of
+    ``GitHub``'s own class body and assert none of the six names appears as a
+    lexical ``FunctionDef``/``AsyncFunctionDef`` there.
+    """
+    lexical = _lexical_github_defs()
+    moved_names = [
+        "add_issue_label",
+        "remove_issue_label",
+        "add_pr_label",
+        "remove_pr_label",
+        "label_list",
+        "label_create",
+    ]
+    for name in moved_names:
+        assert name not in lexical, f"{name} is still a lexical GitHub def"
+    # And confirm the names *are* still resolvable, as delegates.
+    for name in moved_names:
+        assert hasattr(getattr(GitHub, name), "__wrapped__"), (
+            f"GitHub.{name} does not look like an installed delegate"
+        )
+
+
+def test_labels_routes_point_at_the_labels_collaborator() -> None:
+    """``_ROUTES`` must route all six moved names to the ``_labels`` collaborator.
+
+    Forward-compatible: asserts only the six entries this leaf (L03) adds,
+    not the full ``_ROUTES`` contents, so it keeps holding unmodified once
+    later leaves (L04+) populate more of the table.
+    """
+    for name in (
+        "add_issue_label",
+        "remove_issue_label",
+        "add_pr_label",
+        "remove_pr_label",
+        "label_list",
+        "label_create",
+    ):
+        assert _ROUTES[name] == "_labels"
+
+
+def test_add_issue_label_delegate_forwards_through_run_bool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Calling ``gh.add_issue_label(...)`` through the delegate must reach the
+    patched class-level ``GitHub.run`` with the same argv the moved body
+    produces, via the ``self._run_bool`` -> ``self.run`` chain.
+
+    This exercises a strictly deeper resolution chain than the comments/
+    label_list tests: delegate -> ``Labels`` collaborator -> collaborator
+    ``__getattr__`` (for ``_run_bool``, still a lexical ``GitHub`` method
+    until L09) -> owner ``_run_bool`` -> owner ``run``. The expected argv is
+    transcribed by reading the moved ``Labels.add_issue_label`` body directly
+    (a one-line wrapper around ``self._run_bool([...])``, which itself is a
+    one-line wrapper around ``self.run(args, allow_failure=True)``), not
+    derived by calling the same code under test -- calling it twice would
+    make this a circular assertion that could not catch a body that silently
+    changed.
+    """
+    calls: list[tuple[list[str], bool, bool]] = []
+
+    def fake_run(
+        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> _github_module.GitHubRunResult:
+        calls.append((args, json_output, allow_failure))
+        return _github_module.GitHubRunResult(ok=True, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(GitHub, "run", fake_run)
+
+    gh = GitHub(tmp_path)
+    result = gh.add_issue_label(7, "bug")
+
+    assert result is True
+    assert calls == [
+        (["issue", "edit", "7", "--add-label", "bug"], False, True),
+    ]
+
+
+def test_label_list_delegate_forwards_through_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Calling ``gh.label_list()`` through the delegate must reach the patched
+    class-level ``GitHub.run`` with the same argv the moved body produces,
+    including the ``LABEL_LIST_FIELDS`` constant resolved from the
+    collaborator's own module globals (not re-derived from the constant here
+    -- the literal ``"name"`` is asserted directly, since importing
+    ``LABEL_LIST_FIELDS`` to build the expectation would re-derive it from
+    the same code under test and could not catch the constant failing to
+    resolve at all, e.g. a ``NameError`` from a missing module-level binding).
+
+    The expected argv is transcribed by reading the moved
+    ``Labels.label_list`` body directly, mirroring
+    ``test_issue_comment_delegate_forwards_through_run``'s approach for L02.
+    """
+    calls: list[tuple[list[str], bool, bool]] = []
+
+    def fake_run(
+        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> list[dict[str, str]]:
+        calls.append((args, json_output, allow_failure))
+        return [{"name": "bug"}]
+
+    monkeypatch.setattr(GitHub, "run", fake_run)
+
+    gh = GitHub(tmp_path)
+    result = gh.label_list()
+
+    assert result == [{"name": "bug"}]
+    assert calls == [
+        (["label", "list", "--limit", "200", "--json", "name"], True, False),
+    ]
+
+
 def test_every_capability_module_declares_future_annotations() -> None:
     """Every ``github_capabilities`` module must have ``from __future__ import
     annotations`` (design doc Section 3.1).
