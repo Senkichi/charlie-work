@@ -519,6 +519,161 @@ def test_label_list_delegate_forwards_through_run(
     ]
 
 
+def test_github_isinstance_checkslike(tmp_path: Path) -> None:
+    """``GitHub`` must satisfy ``ChecksLike`` at runtime after the L04 move.
+
+    Duplicates part of ``test_github_satisfies_checkslike`` deliberately: a
+    standalone ``isinstance`` assertion so this specific claim (survives the
+    L04 move of the six CI check/run members off ``GitHub``) has its own
+    named test independent of the broader signature-conformance loop.
+    """
+    assert isinstance(GitHub(tmp_path), ChecksLike)
+
+
+def test_checks_members_are_not_lexical_github_defs() -> None:
+    """``GitHub`` must no longer lexically define any of the six Checks members.
+
+    Track 2 L04 (issue #1588) moved ``pr_checks``, ``check_run_annotations``,
+    ``commit_check_runs``, ``actions_job``, ``workflow_runs_for_head``, and
+    ``check_graphql_rate_limit`` to ``Checks``; the names are now served on
+    ``GitHub`` by L01 generated delegates (class-level assignments, not
+    ``def``s). Mirrors ``test_labels_members_are_not_lexical_github_defs``'s
+    approach for L03 -- walk the AST of ``GitHub``'s own class body and
+    assert none of the six names appears as a lexical
+    ``FunctionDef``/``AsyncFunctionDef`` there.
+    """
+    lexical = _lexical_github_defs()
+    moved_names = [
+        "pr_checks",
+        "check_run_annotations",
+        "commit_check_runs",
+        "actions_job",
+        "workflow_runs_for_head",
+        "check_graphql_rate_limit",
+    ]
+    for name in moved_names:
+        assert name not in lexical, f"{name} is still a lexical GitHub def"
+    # And confirm the names *are* still resolvable, as delegates.
+    for name in moved_names:
+        assert hasattr(getattr(GitHub, name), "__wrapped__"), (
+            f"GitHub.{name} does not look like an installed delegate"
+        )
+
+
+def test_checks_routes_point_at_the_checks_collaborator() -> None:
+    """``_ROUTES`` must route all six moved names to the ``_checks`` collaborator.
+
+    Forward-compatible: asserts only the six entries this leaf (L04) adds,
+    not the full ``_ROUTES`` contents, so it keeps holding unmodified once
+    later leaves (L05+) populate more of the table.
+    """
+    for name in (
+        "pr_checks",
+        "check_run_annotations",
+        "commit_check_runs",
+        "actions_job",
+        "workflow_runs_for_head",
+        "check_graphql_rate_limit",
+    ):
+        assert _ROUTES[name] == "_checks"
+
+
+def test_check_graphql_rate_limit_delegate_forwards_through_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Calling ``gh.check_graphql_rate_limit()`` through the delegate must reach
+    the patched class-level ``GitHub.run`` with the same argv the moved body
+    produces, and must recognize a real ``GitHubRunResult`` returned across
+    the collaborator boundary via ``isinstance`` -- the mechanism this leaf
+    introduces (``GitHubRunResult`` is now defined in
+    ``github_capabilities/_base.py`` and re-exported through ``github.py``,
+    not defined in ``github.py`` itself; see ``_base.py`` for why).
+
+    The expected argv and default-threshold arithmetic are transcribed by
+    reading the moved ``Checks.check_graphql_rate_limit`` body directly, not
+    derived by calling the same code under test.
+    """
+    calls: list[tuple[list[str], bool, bool]] = []
+
+    def fake_run(
+        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> _github_module.GitHubRunResult:
+        calls.append((args, json_output, allow_failure))
+        return _github_module.GitHubRunResult(
+            ok=True,
+            returncode=0,
+            stdout="",
+            stderr="",
+            value={"resources": {"graphql": {"remaining": 5000, "reset": 1699999999}}},
+        )
+
+    monkeypatch.setattr(GitHub, "run", fake_run)
+
+    gh = GitHub(tmp_path)
+    result = gh.check_graphql_rate_limit()
+
+    assert result == (True, 5000, 1699999999)
+    assert calls == [
+        (["api", "rate_limit"], True, True),
+    ]
+
+
+def test_pr_checks_delegate_forwards_through_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Calling ``gh.pr_checks(...)`` through the delegate must reach the
+    patched class-level ``GitHub.run`` with the same argv the moved body
+    produces, resolving ``PR_CHECKS_FIELDS`` from the collaborator's own
+    module globals (not re-derived from the constant here, mirroring
+    ``test_label_list_delegate_forwards_through_run``'s rationale for why the
+    literal is asserted directly), and must derive ``databaseId``/``runId``
+    via ``_job_id_from_link``/``_run_id_from_link`` -- the former relocated
+    alongside ``PR_CHECKS_FIELDS`` into ``github_capabilities/checks.py``,
+    the latter still imported from the top-level ``charlie_work.checks``
+    module, exactly as the moved body does.
+
+    This exercises the deepest new resolution chain this leaf introduces:
+    delegate -> ``Checks`` collaborator -> a real ``GitHubRunResult``
+    instance (built in ``_base.py``, re-exported through ``github.py``) ->
+    two bare-global helper functions resolved from ``checks.py``'s own
+    module namespace. The expected argv and output shape are transcribed by
+    reading the moved ``Checks.pr_checks`` body directly.
+    """
+    calls: list[tuple[list[str], bool, bool]] = []
+    link = "https://github.com/o/r/actions/runs/1/job/42"
+
+    def fake_run(
+        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> _github_module.GitHubRunResult:
+        calls.append((args, json_output, allow_failure))
+        return _github_module.GitHubRunResult(
+            ok=True,
+            returncode=0,
+            stdout="",
+            stderr="",
+            value=[{"name": "build", "state": "SUCCESS", "bucket": "pass", "link": link}],
+        )
+
+    monkeypatch.setattr(GitHub, "run", fake_run)
+
+    gh = GitHub(tmp_path)
+    result = gh.pr_checks(5)
+
+    assert result == [
+        {
+            "name": "build",
+            "state": "SUCCESS",
+            "bucket": "pass",
+            "link": link,
+            "databaseId": 42,
+            "runId": 1,
+        }
+    ]
+    assert calls == [
+        (["pr", "checks", "5", "--json", "name,state,bucket,link"], True, True),
+    ]
+
+
 def test_every_capability_module_declares_future_annotations() -> None:
     """Every ``github_capabilities`` module must have ``from __future__ import
     annotations`` (design doc Section 3.1).

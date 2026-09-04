@@ -37,17 +37,20 @@ if TYPE_CHECKING:
 # suite rather than degrading silently. Fix the seam, never the assertion.
 from ci_fleet.github import GitHubError  # noqa: F401  (deliberate re-export)
 
-from .checks import _run_id_from_link
+from .checks import _run_id_from_link  # noqa: F401  (deliberate re-export)
 from .github_capabilities import (
     ChecksLike,
     CommentsLike,
+    GitHubRunResult,
     IssuesLike,
     LABEL_LIST_FIELDS,
     LabelsLike,
     MergeBranchLike,
+    PR_CHECKS_FIELDS,
     PullRequestsLike,
     RepoMetaLike,
 )
+from .github_capabilities import _job_id_from_link  # noqa: F401  (deliberate re-export)
 from .github_delegation import _COLLABORATORS, _install_delegates
 from .github_delegation import _ROUTES, _SIGNATURE_SOURCE, _make_delegate  # noqa: F401 (deliberate re-export)
 from .subprocess_runner import no_console_window_kwargs
@@ -66,7 +69,6 @@ _DEFAULT_GH_TIMEOUT_SECONDS = 120.0
 # A TimeoutExpired carries no returncode of its own, and callers that branch on
 # returncode must not see a 0 that reads as success.
 _TIMEOUT_RETURNCODE = 124
-_DEFAULT_GRAPHQL_RATE_LIMIT_THRESHOLD = 1500
 
 # Bound on concurrent `gh` subprocesses spawned by are_issues_open() for a
 # single batch of cache misses. Each `gh` call is I/O-bound (process spawn +
@@ -173,23 +175,11 @@ CLOSING_KEYWORD_PR_FIELDS = "title,body,headRefName,isCrossRepository"
 # narrow as `CLOSING_KEYWORD_PR_FIELDS` for the same reason: no CI/review
 # state is needed, so no `statusCheckRollup` token-scope risk.
 PR_CLOSING_ISSUES_FIELDS = "closingIssuesReferences"
-# NOTE: "databaseId" is NOT a valid `gh pr checks --json` field (unlike `gh run
-# list --json`, which does support it) — installed gh CLIs reject it with
-# 'Unknown JSON field: "databaseId"' and exit non-zero. Because pr_checks() calls
-# run(..., allow_failure=True) and treats a non-list result as "no checks", adding
-# it here silently returns [] from every pr_checks() call, which makes
-# summarize_checks() report all required checks "missing" and merge_ready()
-# compute can_merge=False for every PR — the entire auto-merge lane goes
-# silently dead (regression introduced 2026-07-10, fixed same day). The GitHub
-# Actions job id (needed for infrastructure-failure classification, issue #210)
-# is instead derived from "link" by pr_checks() via _job_id_from_link() and
-# injected back into each check dict as "databaseId", so downstream consumers
-# (workflow.py) see an unchanged contract.
-PR_CHECKS_FIELDS = "name,state,bucket,link"
 # Minimal field lists for drift detection (reconcile.py)
 # headRefOid is a plain scalar (like state/title) -- NOT a per-item graph walk
-# like statusCheckRollup (see the PR_CHECKS_FIELDS note above and issue #361);
-# safe to include unconditionally. Needed by detect_aviator_stale_blocked's
+# like statusCheckRollup (see the PR_CHECKS_FIELDS note in
+# github_capabilities/checks.py and issue #361); safe to include
+# unconditionally. Needed by detect_aviator_stale_blocked's
 # commit_check_runs(sha) lookup.
 RECONCILE_PR_FIELDS = "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository,headRefOid,closedAt"
 RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels,state"
@@ -236,23 +226,6 @@ class GraphQLBudgetError(GitHubError):
         )
 
 
-@dataclass(frozen=True)
-class GitHubRunResult:
-    """Result of a ``gh`` invocation when ``allow_failure=True``.
-
-    Errors stay as values: callers check ``ok`` and ``error`` and only use
-    ``value`` when ``ok`` is True. ``value`` is the parsed JSON (when
-    ``json_output=True``) or the captured stdout (when ``json_output=False``).
-    """
-
-    ok: bool
-    returncode: int
-    stdout: str
-    stderr: str
-    value: Any | None = None
-    error: str | None = None
-
-
 class MergedPRSearchResult(list):
     """List-like result from ``merged_prs_for_issue`` with an ``ok`` flag.
 
@@ -268,11 +241,6 @@ class MergedPRSearchResult(list):
 
 _MergedPRSearchResult = MergedPRSearchResult
 
-
-# Matches the job-id segment of a GitHub Actions check link, e.g.
-# https://github.com/OWNER/REPO/actions/runs/RUN_ID/job/JOB_ID (optionally
-# followed by a query string or #fragment, e.g. "?check_suite_focus=true").
-_ACTIONS_JOB_LINK_RE = re.compile(r"/actions/runs/\d+/job/(\d+)")
 
 # Matches the PR-number segment of a pull-request URL, e.g.
 # https://github.com/OWNER/REPO/pull/123
@@ -297,24 +265,6 @@ def _pr_number_from_url(output: str) -> int | None:
     for match in _PR_URL_RE.finditer(output):  # noqa: B007 - last match wins
         pass
     return int(match.group(1)) if match is not None else None
-
-
-def _job_id_from_link(link: str | None) -> int | None:
-    """Derive a GitHub Actions job id from a check's ``link`` field.
-
-    ``gh pr checks --json`` has no ``databaseId`` field, so the job id (needed
-    to call ``actions_job``/``check_run_annotations`` for infrastructure-failure
-    classification, issue #210) must be parsed out of the check's link. Only
-    GitHub Actions check links match; external status checks may have
-    arbitrary or empty links. Never raises — returns None for anything that
-    doesn't match.
-    """
-    if not link:
-        return None
-    match = _ACTIONS_JOB_LINK_RE.search(link)
-    if not match:
-        return None
-    return int(match.group(1))
 
 
 @dataclass(frozen=True)
@@ -657,45 +607,6 @@ class GitHub:
         result = self.run(args, allow_failure=True)
         return result.ok
 
-    def check_graphql_rate_limit(
-        self, threshold: int = _DEFAULT_GRAPHQL_RATE_LIMIT_THRESHOLD
-    ) -> tuple[bool, int, int | None]:
-        """Return (sufficient, remaining, reset_at) from ``gh api rate_limit``.
-
-        Uses the REST ``rate_limit`` endpoint to inspect
-        ``resources.graphql.remaining`` before starting a quota-heavy phase.
-        If the endpoint cannot be reached or the response is malformed, the
-        guard defaults to ``sufficient=True`` so a transient check failure does
-        not wedge the fleet; callers that need strict enforcement raise
-        ``GraphQLBudgetError`` when this returns ``sufficient=False``.
-        """
-        result = self.run(["api", "rate_limit"], json_output=True, allow_failure=True)
-        data: dict[str, Any] | None = None
-        if isinstance(result, GitHubRunResult):
-            if not result.ok or not isinstance(result.value, dict):
-                return (True, 0, None)
-            data = result.value
-        elif isinstance(result, dict):
-            data = result
-        else:
-            return (True, 0, None)
-
-        resources = data.get("resources")
-        if not isinstance(resources, dict):
-            return (True, 0, None)
-        graphql = resources.get("graphql")
-        if not isinstance(graphql, dict):
-            return (True, 0, None)
-
-        try:
-            remaining = int(graphql.get("remaining", 0))
-            reset_at = graphql.get("reset")
-            reset_at = int(reset_at) if reset_at is not None else None
-        except (TypeError, ValueError):
-            return (True, 0, None)
-
-        return (remaining >= threshold, remaining, reset_at)
-
     def _list_json(self, args: list[str], *, limit: int, kind: str) -> list[dict[str, Any]]:
         # run() now applies the fleet-wide bounded retry policy for transient
         # failures, so _list_json no longer needs its own ad-hoc retry loop.
@@ -921,60 +832,6 @@ class GitHub:
             return result.value if result.ok else ""
         return result if isinstance(result, str) else ""
 
-    def pr_checks(self, number: int) -> list[dict[str, Any]] | None:
-        result = self.run(
-            ["pr", "checks", str(number), "--json", PR_CHECKS_FIELDS],
-            json_output=True,
-            allow_failure=True,
-        )
-        if isinstance(result, GitHubRunResult):
-            # gh pr checks exits non-zero both when the command itself fails (e.g.
-            # an unsupported JSON field) and when checks are failing. The
-            # difference is in the value: a command failure yields no parseable
-            # list, while genuinely failing checks still produce a list of results.
-            if isinstance(result.value, list):
-                checks = result.value
-            elif result.ok and result.value is None:
-                # Empty successful response (no checks reported) is legitimate.
-                return []
-            else:
-                # gh pr checks ALSO exits non-zero -- with empty stdout, so
-                # result.value is None here too -- when the PR simply has no
-                # checks reported yet (issue #846, measured against this repo:
-                # `gh pr checks 700 ...` -> exit 1, stderr "no checks reported
-                # on the '...' branch", no JSON). That is indistinguishable
-                # from a genuine command failure (unsupported JSON field,
-                # GraphQL error, transient outage) using result.ok/result.value
-                # alone, so disambiguate with a second, different endpoint
-                # rather than guessing from the exit code or stderr text.
-                fallback = self._pr_checks_fallback(number)
-                if fallback is None:
-                    # Fallback also failed (or returned an unmappable shape):
-                    # genuine unavailability. Preserves pr_checks' existing
-                    # None contract -- callers/loop still count this as an
-                    # infrastructure error.
-                    return None
-                if not fallback:
-                    return []
-                checks = fallback
-        else:
-            # Legacy pre-result-object fallback
-            checks = result if isinstance(result, list) else []
-        # gh pr checks --json has no databaseId/runId fields; derive both the
-        # GitHub Actions job id and the workflow run id from "link" and inject
-        # them so downstream consumers keep reading check.get("databaseId") and
-        # check.get("runId") unchanged. This also normalizes the fallback path
-        # above: its mapped entries carry a "link" field in the same URL shape
-        # (Actions job URL), so the same regex-based derivation applies.
-        return [
-            {
-                **check,
-                "databaseId": _job_id_from_link(check.get("link")),
-                "runId": _run_id_from_link(check.get("link")),
-            }
-            for check in checks
-        ]
-
     def _pr_checks_fallback(self, number: int) -> list[dict[str, Any]] | None:
         """Disambiguate a ``gh pr checks`` failure via ``statusCheckRollup`` (issue #846).
 
@@ -986,9 +843,10 @@ class GitHub:
         in this repo: ``{"statusCheckRollup":[]}``, exit 0).
 
         This field carries its own risk -- it is a per-item GraphQL graph walk
-        that can fail on token scope (see the PR_CHECKS_FIELDS note above and
-        issue #361) -- but any failure here simply falls through to this
-        function's ``None`` return, which is exactly pr_checks' pre-existing
+        that can fail on token scope (see the PR_CHECKS_FIELDS note in
+        github_capabilities/checks.py and issue #361) -- but any failure here
+        simply falls through to this function's ``None`` return, which is
+        exactly pr_checks' pre-existing
         "unavailable" behavior. This call can never make pr_checks' result
         worse than it was before issue #846's fix, only better (turning some
         `None`s into accurate `[]`s).
@@ -1018,7 +876,8 @@ class GitHub:
         - ``bucket`` is intentionally NOT mapped: it is a `gh`-CLI-side
           classification (pass/fail/pending/cancel/skipping) computed from
           state, with no GraphQL equivalent to read it back from (see the
-          PR_CHECKS_FIELDS note above). Every consumer that reads "bucket"
+          PR_CHECKS_FIELDS note in github_capabilities/checks.py). Every
+          consumer that reads "bucket"
           (checks.py, workflow.py) only uses it as an `or` alternative to
           "state" (e.g. ``state == "SUCCESS" or bucket == "pass"``), never as
           an independent requirement, so an absent bucket does not change
@@ -1060,42 +919,6 @@ class GitHub:
             )
         return mapped
 
-    def actions_job(self, job_id: int) -> dict[str, Any] | None:
-        """Fetch a single GitHub Actions job by ID.
-
-        Returns job data including steps[]. Used to detect infrastructure failures
-        via step counts. Returns None on failure (allow_failure=True).
-        """
-        result = self.run(
-            [
-                "api",
-                f"repos/{{owner}}/{{repo}}/actions/jobs/{job_id}",
-            ],
-            json_output=True,
-            allow_failure=True,
-        )
-        if isinstance(result, GitHubRunResult):
-            return result.value if result.ok and isinstance(result.value, dict) else None
-        return result if isinstance(result, dict) else None
-
-    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
-        """Fetch annotations for a specific check run.
-
-        Returns a flat list of annotation objects. Used to detect infrastructure
-        failures via billing/runner messages. Returns empty list on failure.
-        """
-        result = self.run(
-            [
-                "api",
-                f"repos/{{owner}}/{{repo}}/check-runs/{check_run_id}/annotations",
-            ],
-            json_output=True,
-            allow_failure=True,
-        )
-        if isinstance(result, GitHubRunResult):
-            return result.value if result.ok and isinstance(result.value, list) else []
-        return result if isinstance(result, list) else []
-
     def commit(self, sha: str) -> GitHubRunResult:
         """Fetch a single commit's metadata by SHA.
 
@@ -1133,53 +956,6 @@ class GitHub:
             value=None,
             error=f"unexpected response from gh.run: {type(result).__name__}",
         )
-
-    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
-        """Fetch the GitHub Check Runs attached to a commit SHA.
-
-        Wraps ``gh api repos/{owner}/{repo}/commits/{sha}/check-runs`` and
-        returns its ``check_runs`` array, or ``None`` on failure. Distinct
-        from ``pr_checks()``/``PR_CHECKS_FIELDS``: ``gh pr checks --json``
-        exposes only Commit-Status-shaped fields (its ``description`` field
-        is always empty for App-created Check Runs like Aviator's
-        ``aviator/checks`` -- Check Runs carry their message in
-        ``output.summary``/``output.title`` instead, which ``gh pr checks``
-        does not surface at all). This is the only way to read that message.
-        Errors are returned as values, never raised.
-        """
-        result = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/commits/{sha}/check-runs"],
-            json_output=True,
-            allow_failure=True,
-        )
-        value = result.value if isinstance(result, GitHubRunResult) and result.ok else None
-        if not isinstance(value, dict):
-            return None
-        check_runs = value.get("check_runs")
-        return check_runs if isinstance(check_runs, list) else None
-
-    def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None:
-        """Fetch GitHub Actions workflow runs created for a head commit SHA.
-
-        Wraps ``gh api repos/{owner}/{repo}/actions/runs?head_sha=<sha>`` and
-        returns its ``workflow_runs`` array, or ``None`` on failure. Used to
-        distinguish "CI never created a run for this head" from "CI is still
-        pending": ``gh pr checks``/``statusCheckRollup`` can simply omit a
-        required check that never started, which is indistinguishable from
-        one still queued using check data alone. An empty (non-None) list
-        means the query succeeded and GitHub genuinely has zero run objects
-        for this SHA. Errors are returned as values, never raised.
-        """
-        result = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/actions/runs?head_sha={head_sha}"],
-            json_output=True,
-            allow_failure=True,
-        )
-        value = result.value if isinstance(result, GitHubRunResult) and result.ok else None
-        if not isinstance(value, dict):
-            return None
-        runs = value.get("workflow_runs")
-        return runs if isinstance(runs, list) else None
 
     def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
         """Fetch a PR's commits via the REST ``pulls/{number}/commits`` endpoint.

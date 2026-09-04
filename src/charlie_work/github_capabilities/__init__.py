@@ -15,7 +15,8 @@ the (still monolithic) ``GitHub`` implementation. No method body has moved.
 
 from __future__ import annotations
 
-from .checks import Checks, ChecksLike
+from ._base import GitHubRunResult
+from .checks import PR_CHECKS_FIELDS, Checks, ChecksLike, _job_id_from_link
 from .comments import Comments, CommentsLike
 from .issues import Issues, IssuesLike
 from .labels import LABEL_LIST_FIELDS, Labels, LabelsLike
@@ -29,6 +30,7 @@ __all__ = [
     "ChecksLike",
     "Comments",
     "CommentsLike",
+    "GitHubRunResult",
     "Issues",
     "IssuesLike",
     "LABEL_LIST_FIELDS",
@@ -36,9 +38,11 @@ __all__ = [
     "LabelsLike",
     "MergeBranch",
     "MergeBranchLike",
+    "PR_CHECKS_FIELDS",
     "PullRequests",
     "PullRequestsLike",
     "RepoMeta",
     "RepoMetaLike",
     "Transport",
+    "_job_id_from_link",
 ]

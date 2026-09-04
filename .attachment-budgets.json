@@ -1,12 +1,12 @@
 {
  "entries": [
   {
-   "boundary": 6.0,
+   "boundary": 8.5,
    "bumps": [],
    "file": "src/charlie_work/github.py",
    "identity": "GitHub",
    "kind": "class",
-   "member_count": 45
+   "member_count": 39
   },
   {
    "boundary": 6.0,
@@ -30,14 +30,6 @@
    "identity": "OrchestratorApp",
    "kind": "class",
    "member_count": 130
-  },
-  {
-   "boundary": 6.0,
-   "bumps": [],
-   "file": "src/charlie_work/write_gate.py",
-   "identity": "WriteGate",
-   "kind": "class",
-   "member_count": 7
   },
   {
    "boundary": 41.0,

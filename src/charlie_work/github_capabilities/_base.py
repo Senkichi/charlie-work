@@ -23,10 +23,56 @@ seam relies on:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from charlie_work.github import GitHub
+
+
+# Moved from ``github.py`` (Track 2, issue #1588; design doc Section 5, L04).
+# All six ``Checks`` members constructed in this leaf perform a real runtime
+# ``isinstance(result, GitHubRunResult)`` check -- not just a type annotation
+# -- so a ``TYPE_CHECKING``-only import (the pattern ``repo_meta.py``/
+# ``pull_requests.py``/``merge_branch.py`` already use for their own
+# not-yet-populated sub-protocols) cannot work here. Nor can it stay defined
+# in ``github.py`` and be imported normally: ``github.py`` imports
+# ``github_capabilities`` (and therefore ``checks.py``) before its own
+# ``GitHubRunResult`` definition, so a plain top-level import from
+# ``charlie_work.github`` into ``checks.py`` would hit a partially
+# initialized module. ``_base.py`` has no dependency on ``github.py`` at
+# runtime (only the ``TYPE_CHECKING``-only ``GitHub`` import above), so it is
+# the one place every collaborator module can already reach unconditionally
+# -- the same role it plays for ``CapabilityCollaborator`` itself.
+#
+# Re-exported through ``github_capabilities/__init__.py`` back into
+# ``github.py``'s import block, mirroring the existing ``GitHubError``
+# re-export (``github.py`` line ~38): identity must stay single because the
+# class is ``isinstance``-checked and constructed pervasively both inside
+# ``github.py`` (``commit``, ``pr_diff``, ``_pr_checks_fallback``, and more)
+# and by 12+ other modules/tests that import it from ``charlie_work.github``.
+# This is a disclosed design-gap resolution (design doc Section 3.3 covers
+# only ``self.<attr>`` forwarding, not bare-global runtime symbols in moved
+# bodies) that later leaves L05 (``RepoMeta.commit``), L06
+# (``PullRequests.pr_ready``), and L08 (``MergeBranch.pr_close``/
+# ``pr_reopen``/``push_empty_commit``) will hit identically -- they should
+# import ``GitHubRunResult`` from here too rather than re-deriving a second
+# answer to the same problem.
+@dataclass(frozen=True)
+class GitHubRunResult:
+    """Result of a ``gh`` invocation when ``allow_failure=True``.
+
+    Errors stay as values: callers check ``ok`` and ``error`` and only use
+    ``value`` when ``ok`` is True. ``value`` is the parsed JSON (when
+    ``json_output=True``) or the captured stdout (when ``json_output=False``).
+    """
+
+    ok: bool
+    returncode: int
+    stdout: str
+    stderr: str
+    value: Any | None = None
+    error: str | None = None
 
 
 class CapabilityCollaborator:
