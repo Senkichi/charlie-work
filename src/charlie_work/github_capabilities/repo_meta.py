@@ -34,6 +34,18 @@ from ci_fleet.github import GitHubError
 # ``checks.py``'s L04 promotion of the same import for the same reason.
 from ._base import CapabilityCollaborator, GitHubRunResult
 
+# Narrow field list for ``gh repo view --json nameWithOwner`` (issue #1609):
+# ``name_with_owner`` needs only the repository's ``nameWithOwner`` scalar, so
+# it must not go through a broader field list. Kept as a module-level constant
+# rather than an inline literal so the field-list lint
+# (tests/test_doctor.py::test_gh_field_lists_use_constants_no_inline_literals)
+# covers the single-positional-list ``self.run([...], json_output=True)`` call
+# shape this body uses -- the matcher's third branch, added by #1609, inspects
+# that shape; before the fix this call was skipped entirely because it lived in
+# ``github.py`` (the file the lint skips by design). It moved here with the
+# RepoMeta body (Track 2, issue #1589, L05), exposing it to the lint.
+REPO_NAME_WITH_OWNER_FIELDS = "nameWithOwner"
+
 
 @runtime_checkable
 class RepoMetaLike(Protocol):
@@ -171,7 +183,9 @@ class RepoMeta(CapabilityCollaborator):
         Returns:
             The repository's nameWithOwner string.
         """
-        result = self.run(["repo", "view", "--json", "nameWithOwner"], json_output=True)
+        result = self.run(
+            ["repo", "view", "--json", REPO_NAME_WITH_OWNER_FIELDS], json_output=True
+        )
         if not isinstance(result, dict):
             raise GitHubError("Expected dict from gh repo view")
         name_with_owner = result.get("nameWithOwner")

@@ -32,6 +32,7 @@ from .github import (
     PR_CHECKS_FIELDS,
     PR_LIST_FIELDS,
     PR_VIEW_FIELDS,
+    PROBE_NUMBER_FIELDS,
     RECONCILE_ISSUE_FIELDS,
     RECONCILE_PR_FIELDS,
 )
@@ -957,7 +958,7 @@ def _validate_gh_field_lists(add: Any, gh: GitHubLike) -> None:
         """Find a real PR number to probe, or None if no PRs exist."""
         try:
             result = gh.run(
-                ["pr", "list", "--state", "all", "--limit", "1", "--json", "number"],
+                ["pr", "list", "--state", "all", "--limit", "1", "--json", PROBE_NUMBER_FIELDS],
                 json_output=True,
             )
             if result and isinstance(result, list) and result:
@@ -970,7 +971,7 @@ def _validate_gh_field_lists(add: Any, gh: GitHubLike) -> None:
         """Find a real issue number to probe, or None if no issues exist."""
         try:
             result = gh.run(
-                ["issue", "list", "--state", "all", "--limit", "1", "--json", "number"],
+                ["issue", "list", "--state", "all", "--limit", "1", "--json", PROBE_NUMBER_FIELDS],
                 json_output=True,
             )
             if result and isinstance(result, list) and result:
