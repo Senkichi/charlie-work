@@ -80,10 +80,10 @@ from .github import (
     get_github_issue_dependencies,
     issue_numbers_mentioned_by_pr,
     label_names,
-    linked_issue_number,
     parse_blockers,
     is_transient_repo_resolution_failure,
 )
+from .issue_linking import linked_issue_number
 from .issue_comments import render_issue_comments
 from .markdown_fence import fenced_block
 from .module_map import build_module_map

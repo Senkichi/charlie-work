@@ -435,29 +435,44 @@ def test_pr_ready_delegate_returns_synthetic_result_on_dry_run(tmp_path: Path) -
 
 
 def test_l06b_reexports_have_cold_import_identity() -> None:
-    """Every name relocated in this leaf must resolve to the SAME object
-    whether reached through ``charlie_work.github`` or through its new home.
+    """Names still re-exported through ``charlie_work.github`` after the L06b
+    follow-up (issue #1627) must resolve to the SAME object whether reached
+    through ``charlie_work.github`` or through their new home.
 
-    27 external call sites (``workflow.py``, ``reconcile.py``, ``janitor.py``,
-    ``cli.py``, ``dead_worker_reap.py``, ``backlog_reachability.py``,
-    ``worktree.py``, plus tests) still do ``from .github import
-    linked_issue_number``/``from charlie_work.github import
-    linked_issue_number`` -- not repointed in this leaf (deferred follow-up)
-    -- so this identity, not merely behavioral equivalence, is load-bearing.
+    ``linked_issue_number``, ``iter_unnegated_closing_keyword_matches`` and
+    ``_CLOSING_KEYWORD_REF`` used to be re-exported here too, but every
+    importer was repointed to ``charlie_work.issue_linking`` directly in
+    issue #1627 and the re-exports were dropped -- their non-exposure is
+    asserted by ``test_l06b_repointed_names_no_longer_exposed_by_github``
+    below. ``_CLOSING_KEYWORDS_ALT`` stays a real (not re-export-only) import
+    because ``github._CLOSING_KEYWORD_DEFANG_RE`` references it as a bare
+    global, so its cold-import identity is still load-bearing.
     """
     import charlie_work.issue_linking as _issue_linking_module
     from charlie_work.github_capabilities import pull_requests as _pull_requests_module
 
-    assert _github_module.linked_issue_number is _issue_linking_module.linked_issue_number
-    assert (
-        _github_module.iter_unnegated_closing_keyword_matches
-        is _issue_linking_module.iter_unnegated_closing_keyword_matches
-    )
     assert _github_module._CLOSING_KEYWORDS_ALT is _issue_linking_module._CLOSING_KEYWORDS_ALT
-    assert _github_module._CLOSING_KEYWORD_REF is _issue_linking_module._CLOSING_KEYWORD_REF
     assert _github_module.MergedPRSearchResult is _pull_requests_module.MergedPRSearchResult
     assert _github_module._MergedPRSearchResult is _pull_requests_module.MergedPRSearchResult
     assert _github_module.MERGED_PR_LIST_FIELDS is _pull_requests_module.MERGED_PR_LIST_FIELDS
+
+
+def test_l06b_repointed_names_no_longer_exposed_by_github() -> None:
+    """``charlie_work.github`` must no longer expose the names repointed to
+    ``charlie_work.issue_linking`` in the L06b follow-up (issue #1627).
+
+    Before issue #1627, ``linked_issue_number``,
+    ``iter_unnegated_closing_keyword_matches`` and ``_CLOSING_KEYWORD_REF``
+    were re-exported through ``charlie_work.github`` so that 27+ external
+    call sites could keep importing them from there. Once every importer was
+    repointed to ``charlie_work.issue_linking`` directly, the re-exports
+    became dead surface and were dropped. This test guards against an
+    accidental reintroduction: if someone re-adds the re-export lines, the
+    names reappear on ``charlie_work.github`` and this assertion fails.
+    """
+    assert not hasattr(_github_module, "linked_issue_number")
+    assert not hasattr(_github_module, "iter_unnegated_closing_keyword_matches")
+    assert not hasattr(_github_module, "_CLOSING_KEYWORD_REF")
 
 
 def test_merged_prs_for_issue_behavior_through_fake_owner() -> None:
