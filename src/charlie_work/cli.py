@@ -44,8 +44,8 @@ from .github import (
     GitHub,
     GitHubError,
     defang_closing_keywords,
-    linked_issue_number,
 )
+from .issue_linking import linked_issue_number
 from . import layout
 from .dirty_tree import check_working_tree_clean
 from .logging_setup import configure_logging

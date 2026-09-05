@@ -35,7 +35,7 @@ from charlie_work.checks import (
     classify_infra_failures,
     summarize_checks,
 )
-from charlie_work.github import linked_issue_number
+from charlie_work.issue_linking import linked_issue_number
 from charlie_work.safe_ref import require_valid_ref_name, require_valid_sha
 from charlie_work.subprocess_runner import run_captured
 
