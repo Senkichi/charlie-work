@@ -26,6 +26,15 @@ Two design points distinguish this from ``github_delegation.py``:
   removal, and silently overwriting the real method (``setattr`` runs after the
   class body, so it would win) would be worse than loud failure.
 
+Adapter deferral note: the ``property`` / ``staticmethod`` adapter mechanism
+(marker attribute + ``as_property`` / ``as_staticmethod`` decorators + the
+``_adapt`` wrapper) is scoped to the L09 leaf (design Section 3.3), which is the
+first leaf to move a ``@property`` / ``@staticmethod`` member. It is intentionally
+**not** landed here: L00 moves zero members, so the adapter surface would have
+zero production callers in this diff. L09 reintroduces it alongside its first
+real consumer (``layout``, ``_is_dead_blocker``, ``_write_json``). Until then
+every routed function is a plain ``def`` installed unwrapped.
+
 Signature note (rule-9 / #1631 reconciliation): ``_build_routes(modules)`` owns
 the cross-module collision check; ``_install_delegates(owner_cls, modules)`` owns
 the owner-shadow check, because only it is handed the owner class. #1631's prose
@@ -48,12 +57,6 @@ from collections.abc import Iterator
 from types import ModuleType
 from typing import Any, Callable
 
-# Attribute a destination function may carry to request adapter wrapping at
-# install time (the L09 property/staticmethod leaf, design Section 3.3). Set it
-# with the ``as_property`` / ``as_staticmethod`` decorators below rather than by
-# hand. A function with no such attribute installs as a plain method.
-DELEGATE_ADAPTER_ATTR = "__delegate_adapter__"
-
 # Records, per owner class, the set of names this installer has attached. Lets a
 # repeated ``_install_delegates`` call be idempotent (re-attaching a name it
 # already owns is a no-op) while still raising on a genuine lexical shadow -- a
@@ -61,28 +64,6 @@ DELEGATE_ADAPTER_ATTR = "__delegate_adapter__"
 # ``setattr`` after class creation, so it is a plain class attribute (an
 # ``Assign``), never a ``FunctionDef``: it does not change the APC member count.
 _INSTALLED_MARKER = "__delegate_installed_names__"
-
-_ADAPTER_PROPERTY = "property"
-_ADAPTER_STATICMETHOD = "staticmethod"
-
-
-def as_property(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Mark a destination function to be installed as a ``property`` (L09).
-
-    Returns the function unchanged except for the marker attribute, so the AST
-    the equivalence gate hashes is still a plain ``FunctionDef`` and the body
-    moves verbatim. The wrapping into ``property(fn)`` happens in
-    ``_install_delegates``, keeping the destination module free of any
-    ``OrchestratorApp`` coupling.
-    """
-    setattr(fn, DELEGATE_ADAPTER_ATTR, _ADAPTER_PROPERTY)
-    return fn
-
-
-def as_staticmethod(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Mark a destination function to be installed as a ``staticmethod`` (L09)."""
-    setattr(fn, DELEGATE_ADAPTER_ATTR, _ADAPTER_STATICMETHOD)
-    return fn
 
 
 def _routable_defs(module: ModuleType) -> Iterator[tuple[str, Callable[..., Any]]]:
@@ -96,11 +77,13 @@ def _routable_defs(module: ModuleType) -> Iterator[tuple[str, Callable[..., Any]
     ``obj.__module__ == module.__name__`` rather than by any name list.
 
     A top-level ``property`` / ``staticmethod`` / ``classmethod`` *object* is a
-    hard error, not a silent skip: it is a member a leaf author meant to route
-    but reached for the builtin decorator instead of the ``as_property`` /
-    ``as_staticmethod`` marker. Silently dropping it would surface late as an
-    ``AttributeError`` at ``app.<name>`` (a design Section 9 stop condition), so
-    it is caught here at install time with an actionable message.
+    hard error, not a silent skip: such an object is not introspectable as a
+    routable ``def`` (``inspect.isfunction`` is false for it), so it would be
+    silently dropped and surface late as an ``AttributeError`` at
+    ``app.<name>`` (a design Section 9 stop condition). A routed member must be a
+    plain ``def``; the L09 leaf (design Section 3.3) reintroduces the
+    ``as_property`` / ``as_staticmethod`` markers for the property/staticmethod
+    cases, but until then a bare decorator object is always a mistake.
     """
     for name, obj in vars(module).items():
         if name.startswith("__") and name.endswith("__"):
@@ -108,9 +91,10 @@ def _routable_defs(module: ModuleType) -> Iterator[tuple[str, Callable[..., Any]
         if isinstance(obj, (property, staticmethod, classmethod)):
             raise TypeError(
                 f"{module.__name__}.{name} is a bare "
-                f"{type(obj).__name__} object; a routed adapter member must be a "
-                f"plain function tagged with as_property/as_staticmethod (the "
-                f"builtin decorator is not introspectable as a routable def)"
+                f"{type(obj).__name__} object; a routed member must be a plain "
+                f"function (def), not a decorator-applied object -- the builtin "
+                f"decorator is not introspectable as a routable def and would be "
+                f"silently dropped"
             )
         if not inspect.isfunction(obj):
             continue
@@ -145,22 +129,6 @@ def _build_routes(modules: tuple[ModuleType, ...]) -> dict[str, ModuleType]:
     return routes
 
 
-def _adapt(fn: Callable[..., Any]) -> Any:
-    """Wrap ``fn`` per its adapter marker for class installation.
-
-    No marker -> the plain function (installed unwrapped, binds as a method).
-    ``property`` / ``staticmethod`` markers -> the corresponding descriptor, so
-    the member drops from the APC ``FunctionDef`` count while ``app.<name>`` /
-    ``Owner.<name>(...)`` keep working (design Section 3.3).
-    """
-    adapter = getattr(fn, DELEGATE_ADAPTER_ATTR, None)
-    if adapter == _ADAPTER_PROPERTY:
-        return property(fn)
-    if adapter == _ADAPTER_STATICMETHOD:
-        return staticmethod(fn)
-    return fn
-
-
 def _install_delegates(owner_cls: type, modules: tuple[ModuleType, ...]) -> None:
     """Install one class attribute per route onto ``owner_cls``.
 
@@ -182,7 +150,7 @@ def _install_delegates(owner_cls: type, modules: tuple[ModuleType, ...]) -> None
                 f"that moves a body must remove the lexical def from the class in "
                 f"the same PR before the installer can attach the delegate"
             )
-        setattr(owner_cls, name, _adapt(getattr(module, name)))
+        setattr(owner_cls, name, getattr(module, name))
         installed.add(name)
     setattr(owner_cls, _INSTALLED_MARKER, frozenset(installed))
 

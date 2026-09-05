@@ -3,9 +3,16 @@
 L00 moves zero members: it lands ``charlie_work.workflow_delegation`` (the
 derived installer) and the empty ``charlie_work.orchestration`` package. These
 tests exercise the installer's route derivation, collision/shadow errors, the
-method-binding and patch-seam guarantees a moved body will rely on, the L09
-property/staticmethod adapters, and the L00 no-op invariants (``OrchestratorApp``
-still has 133 lexical defs; the package is empty and workflow-/gh-free).
+method-binding and patch-seam guarantees a moved body will rely on, the
+bare-decorator-object guard, and the L00 no-op invariants
+(``OrchestratorApp`` still has 133 lexical defs; the package is empty and
+workflow-/gh-free).
+
+The ``property`` / ``staticmethod`` adapter mechanism (``as_property`` /
+``as_staticmethod`` markers + ``_adapt`` wrapper) is deferred to the L09 leaf
+(design Section 3.3), the first leaf to move a ``@property`` / ``@staticmethod``
+member, so it has no tests here. L00 installs every routed function as a plain
+unwrapped ``def``.
 
 Route/binding behavior is tested against synthetic modules built with
 ``types.ModuleType`` -- never real domain code -- so the tests describe the
@@ -89,8 +96,10 @@ def test_routable_defs_positive_control_excludes_dunder_and_imported() -> None:
 
 
 def test_routable_defs_bare_property_object_raises() -> None:
-    """A top-level builtin ``property`` object is a hard error (a leaf author
-    used the builtin decorator instead of the ``as_property`` marker).
+    """A top-level builtin ``property`` object is a hard error: it is not
+    introspectable as a routable ``def`` and would be silently dropped (a
+    design Section 9 stop condition). The adapter markers that would make a
+    property routable land at L09, not here.
     """
 
     def layout(self) -> str:  # noqa: ARG001
@@ -101,7 +110,8 @@ def test_routable_defs_bare_property_object_raises() -> None:
 
     with pytest.raises(TypeError) as exc_info:
         list(wd._routable_defs(module))
-    assert "as_property" in str(exc_info.value)
+    assert "property" in str(exc_info.value)
+    assert "plain function" in str(exc_info.value)
 
 
 def test_routable_defs_bare_staticmethod_object_raises() -> None:
@@ -111,8 +121,10 @@ def test_routable_defs_bare_staticmethod_object_raises() -> None:
     module = _make_module("synthetic_bad_static")
     module.helper = staticmethod(helper)
 
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError) as exc_info:
         list(wd._routable_defs(module))
+    assert "staticmethod" in str(exc_info.value)
+    assert "plain function" in str(exc_info.value)
 
 
 # --------------------------------------------------------------------------
@@ -286,39 +298,24 @@ def test_subclass_override_intercepts() -> None:
 
 
 # --------------------------------------------------------------------------
-# L09 adapters
+# Adapter deferral: the property/staticmethod marker surface is NOT landed at L00
 # --------------------------------------------------------------------------
 
 
-def test_property_adapter_installs_as_property() -> None:
-    @wd.as_property
-    def layout(self) -> str:  # noqa: ARG001
-        return "the-layout"
-
-    module = _make_module("synthetic_prop", layout=layout)
-
-    class _Owner:
-        pass
-
-    wd._install_delegates(_Owner, (module,))
-    assert isinstance(_Owner.__dict__["layout"], property)
-    assert _Owner().layout == "the-layout"
-
-
-def test_staticmethod_adapter_installs_as_staticmethod() -> None:
-    @wd.as_staticmethod
-    def _write_json(value: int) -> int:
-        return value + 1
-
-    module = _make_module("synthetic_static", _write_json=_write_json)
-
-    class _Owner:
-        pass
-
-    wd._install_delegates(_Owner, (module,))
-    assert isinstance(_Owner.__dict__["_write_json"], staticmethod)
-    assert _Owner._write_json(41) == 42
-    assert _Owner()._write_json(41) == 42
+def test_adapter_markers_deferred_to_l09() -> None:
+    """The ``as_property`` / ``as_staticmethod`` decorators, the
+    ``DELEGATE_ADAPTER_ATTR`` marker constant, and the ``_adapt`` wrapper are
+    scoped to the L09 leaf (design Section 3.3) -- the first leaf with a real
+    ``@property`` / ``@staticmethod`` consumer. L00 moves zero members, so
+    landing them here would mean new public, tested functions with zero
+    production callers (PR #1641 review finding). They must be absent from the
+    module until L09 reintroduces them alongside that consumer.
+    """
+    for absent in ("as_property", "as_staticmethod", "_adapt", "DELEGATE_ADAPTER_ATTR"):
+        assert not hasattr(wd, absent), (
+            f"{absent!r} is present on workflow_delegation; the adapter surface "
+            f"was deferred to L09 (design Section 3.3) and must not land at L00"
+        )
 
 
 # --------------------------------------------------------------------------
