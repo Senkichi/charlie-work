@@ -50,9 +50,11 @@ a cycle.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import inspect
 import pkgutil
+import textwrap
 from collections.abc import Iterator
 from types import ModuleType
 from typing import Any, Callable
@@ -129,21 +131,109 @@ def _build_routes(modules: tuple[ModuleType, ...]) -> dict[str, ModuleType]:
     return routes
 
 
+def _reserved_init_attrs(owner_cls: type) -> frozenset[str]:
+    """Return the instance-attribute names ``owner_cls.__init__`` assigns to self.
+
+    Derived by AST-parsing ``inspect.getsource(owner_cls.__init__)`` and
+    collecting every ``self.<name> = ...`` target: plain ``Assign``, annotated
+    ``AnnAssign``, augmented ``AugAssign``, and names bound through tuple/list
+    unpacking (``self.a, self.b = ...``). The self-parameter name is read from
+    the ``__init__`` signature rather than assumed, and the whole body is walked
+    so assignments nested in ``if`` / ``for`` / ``with`` / ``try`` are seen too.
+    No hand-typed name list is used anywhere (CLAUDE.md rule 9): the set is
+    entirely a function of the owner's own source.
+
+    A delegate whose name is in this set must be rejected: a plain function
+    installed as a class attribute is a non-data descriptor, so an instance
+    attribute of the same name set in ``__init__`` wins at lookup and permanently
+    masks the delegate (surfacing as a silent wrong-value bug, not an error).
+
+    Limit: only *statically* visible ``self.<name> = ...`` assignments are
+    derivable. Dynamic forms (``setattr(self, name, ...)``,
+    ``object.__setattr__(self, name, ...)``) are intentionally not caught. If
+    ``__init__`` is inherited from ``object`` or its source is unavailable, the
+    reserved set is empty (nothing to check).
+    """
+    init = owner_cls.__init__
+    if init is object.__init__:
+        return frozenset()
+    try:
+        source = textwrap.dedent(inspect.getsource(init))
+    except (OSError, TypeError):
+        # No retrievable source (C-level, exec'd, or stripped) -- treat as empty.
+        return frozenset()
+    func = next(
+        (
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "__init__"
+        ),
+        None,
+    )
+    if func is None:
+        return frozenset()
+    self_name = func.args.args[0].arg if func.args.args else "self"
+    reserved: set[str] = set()
+
+    def _collect(target: ast.expr) -> None:
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == self_name
+        ):
+            reserved.add(target.attr)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                _collect(elt)
+        elif isinstance(target, ast.Starred):
+            _collect(target.value)
+
+    for node in ast.walk(func):
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                _collect(tgt)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            _collect(node.target)
+    return frozenset(reserved)
+
+
 def _install_delegates(owner_cls: type, modules: tuple[ModuleType, ...]) -> None:
     """Install one class attribute per route onto ``owner_cls``.
 
     Raises ``ValueError`` if a routed name already exists on ``owner_cls`` as
     something this installer did not put there -- a genuine lexical ``def`` the
-    move-PR failed to remove. Re-installing a name this installer already owns is
-    an idempotent no-op (safe under module re-import / a direct second call), not
-    a raise: the first-install marker (``_INSTALLED_MARKER``) distinguishes the
-    two. At L00 ``modules`` is empty, so the route table is empty and this is a
-    pure no-op.
+    move-PR failed to remove -- or collides with an instance attribute the owner's
+    ``__init__`` assigns (``_reserved_init_attrs``): such a delegate would install
+    as a class attribute but be permanently masked by the instance attribute.
+
+    Re-installing a name this installer already owns is a genuine no-op: the loop
+    ``continue``s before any ``setattr``, so a second run never overwrites
+    whatever currently sits on the class (including an active
+    ``mock.patch.object``). This is safe because ``pkgutil`` / ``import_module``
+    return cached modules, so a repeated run sees the identical function objects
+    it already installed; an ``importlib.reload(workflow)`` instead builds a NEW
+    class object whose ``_INSTALLED_MARKER`` set is empty, so it installs fresh
+    rather than colliding. At L00 ``modules`` is empty, so the route table is
+    empty and this is a pure no-op (no ``__init__`` is even parsed).
     """
     routes = _build_routes(modules)
+    reserved = _reserved_init_attrs(owner_cls) if routes else frozenset()
     installed: set[str] = set(owner_cls.__dict__.get(_INSTALLED_MARKER, frozenset()))
     for name, module in routes.items():
-        if name in owner_cls.__dict__ and name not in installed:
+        if name in installed:
+            # Genuine no-op: never re-setattr a name this installer already owns,
+            # so a reinstall cannot clobber the current class attribute.
+            continue
+        if name in reserved:
+            raise ValueError(
+                f"delegate {name!r} (from {module.__name__!r}) collides with the "
+                f"instance attribute 'self.{name}' assigned in "
+                f"{owner_cls.__name__}.__init__; a class-level function of that "
+                f"name installs but is permanently masked by the instance "
+                f"attribute at runtime -- rename the moved member or the attribute"
+            )
+        if name in owner_cls.__dict__:
             raise ValueError(
                 f"delegate {name!r} (from {module.__name__!r}) would shadow an "
                 f"existing member already defined on {owner_cls.__name__}; a leaf "
@@ -163,6 +253,11 @@ def discover_delegate_modules(package: ModuleType) -> tuple[ModuleType, ...]:
     to ``charlie_work.orchestration`` without editing the install line in
     ``workflow.py``). At L00 the package has no submodules, so this returns an
     empty tuple. Sub-packages are skipped -- destinations are flat modules.
+
+    Fail-loud by design: because this runs during ``import charlie_work.workflow``,
+    an import or syntax error in any ``charlie_work.orchestration`` submodule
+    propagates out of ``importlib.import_module`` here and fails importing
+    ``workflow`` at import time, rather than silently dropping the broken module.
     """
     modules: list[ModuleType] = []
     for info in sorted(pkgutil.iter_modules(package.__path__), key=lambda i: i.name):

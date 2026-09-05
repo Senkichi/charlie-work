@@ -234,6 +234,72 @@ def test_install_delegates_is_idempotent() -> None:
     assert _Owner().again() == "ok"
 
 
+def test_reinstall_during_active_patch_preserves_patch() -> None:
+    """Re-running the installer while a class-level ``mock.patch.object`` is
+    active must NOT clobber the patch: the already-installed name is a genuine
+    no-op (``continue`` before ``setattr``), and after the context exits the
+    original delegate is restored. Exact reproduction from the PR #1641 review,
+    inverted to assert the fix (finding [1])."""
+
+    def act(self) -> str:  # noqa: ARG001
+        return "real"
+
+    module = _make_module("synthetic_reinstall_patch", act=act)
+
+    class _Owner:
+        pass
+
+    wd._install_delegates(_Owner, (module,))
+    with mock.patch.object(_Owner, "act", return_value="patched"):
+        assert _Owner().act() == "patched"
+        wd._install_delegates(_Owner, (module,))  # reinstall must not clobber
+        assert _Owner().act() == "patched"  # patch still in place
+    assert _Owner().act() == "real"  # original delegate restored on ctx exit
+
+
+def test_install_delegates_reserved_instance_attr_raises() -> None:
+    """A routed name matching a ``self.<name> = ...`` assignment in the owner's
+    __init__ raises: the class attribute would install but be permanently masked
+    by the instance attribute (PR #1641 finding [2]). A non-colliding name on the
+    same owner is the positive control -- it installs fine."""
+
+    def status(self) -> str:  # noqa: ARG001
+        return "delegated"
+
+    def other(self) -> str:  # noqa: ARG001
+        return "delegated"
+
+    class _Owner:
+        def __init__(self) -> None:
+            self.status = "instance-data"
+
+    colliding = _make_module("synthetic_reserved", status=status)
+    with pytest.raises(ValueError) as exc_info:
+        wd._install_delegates(_Owner, (colliding,))
+    assert "status" in str(exc_info.value)
+
+    ok = _make_module("synthetic_reserved_ok", other=other)
+    wd._install_delegates(_Owner, (ok,))  # non-colliding name installs
+    assert _Owner().other() == "delegated"
+
+
+def test_install_delegates_object_init_owner_installs() -> None:
+    """An owner whose __init__ is inherited from ``object`` has an empty reserved
+    set, so a routed delegate installs with no false collision (PR #1641 finding
+    [2] boundary case)."""
+
+    def act(self) -> str:  # noqa: ARG001
+        return "ok"
+
+    module = _make_module("synthetic_object_init", act=act)
+
+    class _Owner:
+        pass
+
+    wd._install_delegates(_Owner, (module,))
+    assert _Owner().act() == "ok"
+
+
 # --------------------------------------------------------------------------
 # patch seams (Tier A / Tier B / subclass) all intercept
 # --------------------------------------------------------------------------
