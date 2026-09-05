@@ -1,20 +1,31 @@
-"""Track 2 L06 (issue #1590): PullRequests capability move regression tests.
+"""Track 2 L06 (issue #1590) + L06b (issue #1613): PullRequests capability
+move regression tests.
 
 New file, not appended to ``test_githublike_protocol.py`` (deliberate test-
 layout change for this leaf) -- shares the AST/signature helpers via
 ``tests/_githublike_protocol_helpers.py`` (issue #1284 sanctions bare-name
 ``tests/_*.py`` modules for this kind of cross-file sharing).
 
-Covers seven of Cluster E's eight members: ``pr_create``, ``pr_list``,
+L06 moved seven of Cluster E's eight members: ``pr_create``, ``pr_list``,
 ``merged_pr_list``, ``pr_view``, ``pr_diff``, ``pr_commits``, ``pr_ready``.
-``merged_prs_for_issue`` deliberately does NOT move in this leaf (see
-``github_capabilities/pull_requests.py``'s module docstring for the full
-``linked_issue_number`` circular-dependency rationale) and so is intentionally
-absent from every list below.
+``merged_prs_for_issue`` deliberately did NOT move in that leaf -- its
+verbatim body called ``linked_issue_number(...)`` as a bare global, and that
+utility (plus its closing-keyword dependency chain) still lived in
+``github.py`` with dozens of external call sites, so relocating it would have
+been a second, much larger Mikado leaf of its own.
+
+L06b (issue #1613; design doc Section 5, L06b) is that follow-up leaf:
+``linked_issue_number`` and its dependency chain moved to a neutral
+``issue_linking.py`` module with no ``charlie_work.github``/``gh`` coupling,
+and ``merged_prs_for_issue`` moves here alongside the other seven Cluster E
+members, importing ``linked_issue_number`` from ``issue_linking`` instead.
+``PULL_REQUESTS_MOVED_MEMBERS`` below now covers all eight.
 """
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -22,6 +33,7 @@ import pytest
 import charlie_work.github as _github_module
 from charlie_work.github import GitHub, _ROUTES
 from charlie_work.github_capabilities import PullRequestsLike
+from charlie_work.github_capabilities.pull_requests import PullRequests
 
 from _githublike_protocol_helpers import _lexical_github_defs
 
@@ -33,6 +45,7 @@ PULL_REQUESTS_MOVED_MEMBERS = (
     "pr_diff",
     "pr_commits",
     "pr_ready",
+    "merged_prs_for_issue",
 )
 
 
@@ -49,43 +62,42 @@ def test_github_isinstance_pullrequestslike(tmp_path: Path) -> None:
 
 
 def test_pullrequests_members_are_not_lexical_github_defs() -> None:
-    """``GitHub`` must no longer lexically define any of the seven moved
+    """``GitHub`` must no longer lexically define any of the eight moved
     PullRequests members.
 
     Track 2 L06 (issue #1590) moved ``pr_create``, ``pr_list``,
     ``merged_pr_list``, ``pr_view``, ``pr_diff``, ``pr_commits``, and
-    ``pr_ready`` to ``PullRequests``; the names are now served on ``GitHub``
-    by L01 generated delegates (class-level assignments, not ``def``s).
-    ``merged_prs_for_issue`` is deliberately excluded from this list -- it
-    stays a lexical ``GitHub`` method in this leaf (see the module docstring
-    of ``github_capabilities/pull_requests.py``).
+    ``pr_ready`` to ``PullRequests``; L06b (issue #1613) moved the eighth,
+    ``merged_prs_for_issue``, once ``linked_issue_number`` had its own
+    neutral home. All eight names are now served on ``GitHub`` by generated
+    delegates (class-level assignments, not ``def``s) carrying
+    ``__wrapped__`` pointers back to the exact ``PullRequests`` method object.
     """
     lexical = _lexical_github_defs()
     for name in PULL_REQUESTS_MOVED_MEMBERS:
         assert name not in lexical, f"{name} is still a lexical GitHub def"
-    # And confirm the names *are* still resolvable, as delegates.
+    # And confirm the names *are* still resolvable, as delegates, and that
+    # each delegate's __wrapped__ points at the exact PullRequests method
+    # object (not merely "something with a __wrapped__ attribute").
     for name in PULL_REQUESTS_MOVED_MEMBERS:
-        assert hasattr(getattr(GitHub, name), "__wrapped__"), (
+        delegate = getattr(GitHub, name)
+        assert hasattr(delegate, "__wrapped__"), (
             f"GitHub.{name} does not look like an installed delegate"
         )
-    # merged_prs_for_issue is the disclosed exception: it must remain a real
-    # lexical def, not a delegate, in this leaf.
-    assert "merged_prs_for_issue" in lexical, (
-        "merged_prs_for_issue must remain a lexical GitHub method in L06"
-    )
+        assert delegate.__wrapped__ is vars(PullRequests)[name], (
+            f"GitHub.{name}.__wrapped__ does not point at PullRequests.{name}"
+        )
 
 
 def test_pullrequests_routes_point_at_the_pull_requests_collaborator() -> None:
-    """``_ROUTES`` must route all seven moved names to the ``_pull_requests`` collaborator.
+    """``_ROUTES`` must route all eight moved names to the ``_pull_requests`` collaborator.
 
-    Forward-compatible: asserts only the seven entries this leaf (L06) adds,
-    not the full ``_ROUTES`` contents, so it keeps holding unmodified once
-    later leaves populate more of the table.
+    Forward-compatible: asserts only the eight entries these two leaves (L06
+    + L06b) add, not the full ``_ROUTES`` contents, so it keeps holding
+    unmodified once later leaves populate more of the table.
     """
     for name in PULL_REQUESTS_MOVED_MEMBERS:
         assert _ROUTES[name] == "_pull_requests"
-    # merged_prs_for_issue must NOT be routed -- it stays lexical on GitHub.
-    assert "merged_prs_for_issue" not in _ROUTES
 
 
 def test_pr_create_delegate_forwards_through_run(
@@ -138,9 +150,13 @@ def test_pr_create_delegate_forwards_through_run(
     ]
 
 
-def test_pr_create_delegate_returns_none_on_dry_run(tmp_path: Path) -> None:
+def test_pr_create_delegate_returns_zero_on_dry_run(tmp_path: Path) -> None:
     """``pr_create`` returns ``0`` under dry-run without calling ``run`` at all --
     transcribed directly from the moved body's ``if self.dry_run: return 0`` guard.
+
+    Renamed from ``test_pr_create_delegate_returns_none_on_dry_run`` (Track 2,
+    issue #1613, L06b) -- the old name said "none" but the assertion below has
+    always checked ``== 0``, matching the body's actual ``return 0``.
     """
     gh = GitHub(tmp_path, dry_run=True)
     result = gh.pr_create("feature-branch", "main", "title", "body")
@@ -410,3 +426,178 @@ def test_pr_ready_delegate_returns_synthetic_result_on_dry_run(tmp_path: Path) -
     assert isinstance(result, _github_module.GitHubRunResult)
     assert result.ok is True
     assert result.value is None
+
+
+# ---------------------------------------------------------------------------
+# L06b (issue #1613): merged_prs_for_issue moves; linked_issue_number and its
+# closing-keyword chain relocate to a neutral issue_linking.py module.
+# ---------------------------------------------------------------------------
+
+
+def test_l06b_reexports_have_cold_import_identity() -> None:
+    """Every name relocated in this leaf must resolve to the SAME object
+    whether reached through ``charlie_work.github`` or through its new home.
+
+    27 external call sites (``workflow.py``, ``reconcile.py``, ``janitor.py``,
+    ``cli.py``, ``dead_worker_reap.py``, ``backlog_reachability.py``,
+    ``worktree.py``, plus tests) still do ``from .github import
+    linked_issue_number``/``from charlie_work.github import
+    linked_issue_number`` -- not repointed in this leaf (deferred follow-up)
+    -- so this identity, not merely behavioral equivalence, is load-bearing.
+    """
+    import charlie_work.issue_linking as _issue_linking_module
+    from charlie_work.github_capabilities import pull_requests as _pull_requests_module
+
+    assert _github_module.linked_issue_number is _issue_linking_module.linked_issue_number
+    assert (
+        _github_module.iter_unnegated_closing_keyword_matches
+        is _issue_linking_module.iter_unnegated_closing_keyword_matches
+    )
+    assert _github_module._CLOSING_KEYWORDS_ALT is _issue_linking_module._CLOSING_KEYWORDS_ALT
+    assert _github_module._CLOSING_KEYWORD_REF is _issue_linking_module._CLOSING_KEYWORD_REF
+    assert _github_module.MergedPRSearchResult is _pull_requests_module.MergedPRSearchResult
+    assert _github_module._MergedPRSearchResult is _pull_requests_module.MergedPRSearchResult
+    assert _github_module.MERGED_PR_LIST_FIELDS is _pull_requests_module.MERGED_PR_LIST_FIELDS
+
+
+def test_merged_prs_for_issue_behavior_through_fake_owner() -> None:
+    """``merged_prs_for_issue``, called directly on a bare ``PullRequests``
+    collaborator constructed with a minimal fake owner (not a real ``GitHub``
+    instance), proves the moved body's only sibling call (``self.run(...)``)
+    forwards correctly through ``CapabilityCollaborator.__getattr__`` -- no
+    subclass-override bypass hazard applies here (``run`` is never itself a
+    routed/collaborator-side member, unlike L07's ``are_issues_open`` calling
+    ``self.issue_view``) -- and that ``linked_issue_number`` (imported from
+    ``issue_linking.py``, not ``charlie_work.github``) correctly filters
+    search results down to PRs actually bound to the requested issue via
+    both the branch-name and closing-keyword paths.
+    """
+    calls: list[list[str]] = []
+
+    class _FakeOwner:
+        def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
+            calls.append(args)
+            return [
+                {
+                    # No agent/issue-N branch match -> falls through to the
+                    # closing-keyword path, which binds via the title.
+                    "number": 10,
+                    "title": "Fixes #42",
+                    "body": "",
+                    "headRefName": "worker-branch-no-issue-pattern",
+                    "isCrossRepository": False,
+                    "state": "MERGED",
+                    "headRefOid": "abc123",
+                },
+                {
+                    # Branch name binds this one to issue 7, not 42 -- must
+                    # be excluded even though nothing in title/body mentions
+                    # 42 or 7.
+                    "number": 11,
+                    "title": "unrelated change",
+                    "body": "",
+                    "headRefName": "agent/issue-7-something",
+                    "isCrossRepository": False,
+                    "state": "MERGED",
+                    "headRefOid": "def456",
+                },
+            ]
+
+    pull_requests = PullRequests(_FakeOwner())
+    result = pull_requests.merged_prs_for_issue(42, branch_prefix="agent/issue")
+
+    assert isinstance(result, _github_module.MergedPRSearchResult)
+    assert result.ok is True
+    assert [pr["number"] for pr in result] == [10]
+    assert calls == [
+        [
+            "pr",
+            "list",
+            "--state",
+            "merged",
+            "--search",
+            '"#42"',
+            "--limit",
+            "20",
+            "--json",
+            _github_module.MERGED_PR_LIST_FIELDS,
+        ]
+    ]
+
+
+def test_merged_prs_for_issue_returns_not_ok_on_search_failure_through_fake_owner() -> None:
+    """A failed search (``GitHubRunResult`` with ``ok=False``) must produce an
+    empty, ``ok=False`` ``MergedPRSearchResult`` -- transcribed directly from
+    the moved body's ``if not result.ok: return MergedPRSearchResult([], ok=False)``
+    guard -- exercised through the same bare-collaborator construction as
+    above rather than a full ``GitHub`` instance.
+    """
+
+    class _FakeOwner:
+        def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
+            return _github_module.GitHubRunResult(
+                ok=False,
+                returncode=1,
+                stdout="",
+                stderr="rate limited",
+                value=None,
+                error="rate limited",
+            )
+
+    pull_requests = PullRequests(_FakeOwner())
+    result = pull_requests.merged_prs_for_issue(42, branch_prefix="agent/issue")
+
+    assert isinstance(result, _github_module.MergedPRSearchResult)
+    assert result.ok is False
+    assert list(result) == []
+
+
+def test_issue_linking_imports_without_charlie_work_github() -> None:
+    """``issue_linking.py`` must have zero import-time coupling to
+    ``charlie_work.github``/``charlie_work.github_capabilities``.
+
+    This is the whole point of relocating ``linked_issue_number`` here (Track
+    2, issue #1613): so ``pull_requests.py`` can import it without cycling
+    back through ``github.py``, which imports ``github_capabilities`` at
+    module load time. Run in a fresh subprocess so the check is not
+    contaminated by whatever this test session's own import order already
+    put into ``sys.modules``.
+    """
+    script = (
+        "import sys\n"
+        "import charlie_work.issue_linking\n"
+        "assert 'charlie_work.github' not in sys.modules, sorted(sys.modules)\n"
+        "assert 'charlie_work.github_capabilities' not in sys.modules, sorted(sys.modules)\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "OK"
+
+
+def test_github_direct_def_count_is_two() -> None:
+    """L06b drops ``GitHub`` from 3 direct defs (L09's final count) to
+    exactly 2 (``__post_init__``, ``run``), by moving ``merged_prs_for_issue``
+    off ``GitHub`` too, once ``linked_issue_number`` had its own neutral home.
+
+    Uses a direct, unfiltered AST walk (matching the attachment-contracts
+    ``member_count`` ratchet's own counting rule: every direct
+    ``FunctionDef``/``AsyncFunctionDef`` child of ``ClassDef.body``, dunders
+    included) rather than the shared ``_lexical_github_defs()`` helper, which
+    deliberately excludes dunders for its own (protocol-conformance) purpose.
+    """
+    import ast
+
+    source = Path(_github_module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    (github_cls,) = [
+        n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "GitHub"
+    ]
+    all_defs = {
+        child.name
+        for child in github_cls.body
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert all_defs == {"__post_init__", "run"}, all_defs
