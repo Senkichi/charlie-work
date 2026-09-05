@@ -276,6 +276,8 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
     _is_review_dispatchable,
     _select_review_dispatch_candidates,
 )
+from . import orchestration as _orchestration
+from .workflow_delegation import _install_delegates, discover_delegate_modules
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
@@ -23448,3 +23450,12 @@ class OrchestratorApp:
             json.dump(value, handle, indent=2, sort_keys=True)
             handle.write("\n")
         tmp_path.replace(path)
+
+
+# Track 2 Phase B delegation install (#1631, umbrella #1582). Every submodule of
+# `charlie_work.orchestration` contributes its top-level `def`s as delegates on
+# `OrchestratorApp`; later leaves add submodules there without editing this line.
+# At L00 the package is empty, so `_DELEGATE_MODULES` is empty and the install is
+# a no-op -- `OrchestratorApp`'s lexical member surface is unchanged.
+_DELEGATE_MODULES = discover_delegate_modules(_orchestration)
+_install_delegates(OrchestratorApp, _DELEGATE_MODULES)
