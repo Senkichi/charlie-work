@@ -442,3 +442,39 @@ def test_extraction_remedy_names_refresh_script() -> None:
         "the safety rationale (lower-only, never raises) must travel with the "
         "instruction so it is not stripped as a risky mid-PR side effect"
     )
+
+
+def test_workflow_py_baseline_mark_is_tight_after_shrink() -> None:
+    """Regression guard for the L01 b1 review finding (PR #1643): a leaf PR that
+    cross-bucket-shrinks ``workflow.py`` must tighten its high-water mark in the
+    same PR via ``scripts/refresh_file_size_ratchet.py``. The first L01 b1 leaf
+    shipped a ~2000-line shrink (23461 -> 22158 lines) without lowering the mark
+    (24200 -> 22200), leaving the tightening unclaimed, because the design doc
+    incorrectly stated ``workflow.py``'s line count had no CI gate (corrected in
+    the same PR; the gate IS this file's keystone).
+
+    This pins ``workflow.py``'s mark to the quantized live count
+    (``ceil(live / MARK_QUANTUM) * MARK_QUANTUM``, the same formula
+    ``_quantize_mark`` in ``scripts/refresh_file_size_ratchet.py`` uses) so a
+    cross-bucket shrink without a baseline refresh fails CI. Same-bucket shrinks
+    produce no baseline diff and pass unchanged (both live and mark round to the
+    same bucket). The assertion is ``workflow.py``-specific because
+    ``workflow.py`` is the monolith issue #1442 created the ratchet for and the
+    active shrink target of the L01-L09 delegation campaign; a general tightness
+    assertion would false-trip on the pre-existing stale-high marks of other
+    over-cap files, which is a passing state by design (module docstring,
+    "stale-HIGH mark between refreshes is a passing state, not an error").
+    """
+    baseline = _load_baseline()
+    path = "src/charlie_work/workflow.py"
+    assert path in baseline, "workflow.py must be in the baseline (AC1)"
+    live = _tracked_py_line_counts(_REPO_ROOT)[path]
+    expected_mark = -(-live // MARK_QUANTUM) * MARK_QUANTUM
+    assert baseline[path] == expected_mark, (
+        f"workflow.py's baseline mark ({baseline[path]}) is not tight against "
+        f"the live line count ({live}); the quantized mark should be "
+        f"{expected_mark}. A cross-bucket shrink must run "
+        f"`python scripts/refresh_file_size_ratchet.py` and commit the lowered "
+        f"mark in the same PR (review on PR #1643; design doc Section 3.2 "
+        f"'Effect on workflow.py's own size')."
+    )
