@@ -53,8 +53,14 @@ TRANSPORT_MOVED_MEMBERS = (
     "validate_field_lists",
 )
 
-# The three members that stay lexically on GitHub after this (final) leaf.
-GITHUB_STAYING_MEMBERS = ("__post_init__", "run", "merged_prs_for_issue")
+# The members that stay lexically on GitHub after this leaf. Originally three
+# (this leaf was written as "the final Track 2 leaf"); Track 2, issue #1613
+# (design doc Section 5, L06b) moved ``merged_prs_for_issue`` off GitHub too,
+# once its ``linked_issue_number`` dependency had its own neutral home
+# (``issue_linking.py``), leaving these two as the true final set. Updated
+# here (not in L06b's own test file) because this tuple and the direct-def-
+# count test below are this file's own assertions, broken by that leaf.
+GITHUB_STAYING_MEMBERS = ("__post_init__", "run")
 
 
 def test_github_isinstance_githublike(tmp_path: Path) -> None:
@@ -91,7 +97,7 @@ def test_transport_members_are_not_lexical_github_defs() -> None:
     # not a delegate. ``_lexical_github_defs()`` deliberately excludes
     # dunder-shaped names (including hand-written ones like ``__post_init__``)
     # -- see its own docstring -- so dunders are checked separately below via
-    # a direct, unfiltered AST walk in ``test_github_direct_def_count_is_three``.
+    # a direct, unfiltered AST walk in ``test_github_direct_def_count_is_two``.
     for name in GITHUB_STAYING_MEMBERS:
         if name.startswith("__"):
             continue
@@ -101,8 +107,13 @@ def test_transport_members_are_not_lexical_github_defs() -> None:
         )
 
 
-def test_github_direct_def_count_is_three() -> None:
-    """L09 is the final leaf: ``GitHub`` drops from 15 to exactly 3 direct defs.
+def test_github_direct_def_count_is_two() -> None:
+    """L09 dropped ``GitHub`` from 15 to exactly 3 direct defs; Track 2, issue
+    #1613 (design doc Section 5, L06b) dropped it once more, to exactly 2
+    (``__post_init__``, ``run``), by moving ``merged_prs_for_issue`` off
+    ``GitHub`` too. Kept as this file's own test (not moved to L06b's test
+    file) because it is this file's own assertion about ``GitHub``'s final
+    shape after L09, now updated for the later leaf that revised it.
 
     Uses a direct, unfiltered AST walk (matching the attachment-contracts
     ``member_count`` ratchet's own counting rule: every direct

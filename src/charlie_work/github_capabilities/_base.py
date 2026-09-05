@@ -201,43 +201,13 @@ def _api_is_mutating(args: list[str]) -> bool:
     return any(arg.startswith(param_prefixes) or arg[:2] in ("-f", "-F") for arg in args)
 
 
-# Moved from ``github.py`` (Track 2, issue #1593; design doc Section 5, L09).
-# ``MERGED_PR_LIST_FIELDS`` is referenced as a bare global by
-# ``GitHub.merged_prs_for_issue`` (stays on the owner -- not a Transport
-# internal) AND by ``Transport.validate_field_lists`` (moved below), the same
-# cross-cutting shape that put ``GitHubRunResult``/``_LIST_LIMIT`` here rather
-# than in a single capability module: no capability module "owns" it, and
-# ``_base.py`` is the one place both ``github.py`` and every collaborator
-# module can already reach without a circular import. Re-exported through
-# ``github_capabilities/__init__.py`` and re-imported into ``github.py``
-# (still used directly there in ``merged_prs_for_issue``, and read externally
-# by ``tests/test_github.py`` via
-# ``charlie_work.github.MERGED_PR_LIST_FIELDS``), mirroring the
-# ``GitHubRunResult``/``_LIST_LIMIT`` re-exports above. The field contract
-# itself (see the original ``github.py`` comment, preserved verbatim below)
-# is also satisfied by ``_normalize_rest_pr``'s REST-path mapping (moved to
-# ``Transport`` in this leaf) -- both producers are enforced identical by
-# ``test_normalize_rest_pr_satisfies_merged_pr_list_field_contract``.
-#
-# The field contract for every merged-PR listing. Two producers must satisfy
-# it identically: merged_prs_for_issue() queries these fields directly, and
-# merged_pr_list() goes through the REST endpoint and must reproduce this exact
-# key set via _normalize_rest_pr() (enforced by
-# test_normalize_rest_pr_satisfies_merged_pr_list_field_contract).
-#
-# Consumers: workflow._merged_pr_referenced_issue_numbers() (via
-# linked_issue_number()/issue_numbers_mentioned_by_pr()) reads the identity and
-# branch fields; post-merge audit paths additionally need `headRefOid` to tell
-# *which commit* was merged, not merely that a merge happened.
-#
-# Deliberately narrower than PR_LIST_FIELDS: merged PRs don't need current
-# CI/review/label state, and `statusCheckRollup` in particular forces gh's
-# GraphQL query to walk each PR's check-run connection -- expensive across up
-# to 500 merged PRs and the cause of intermittent gateway 502s on this query
-# (issue #361). `headRefOid` carries no such cost: it is a scalar on the PR
-# object, and on the REST path it is already present in the payload as
-# head.sha, so adding it costs neither an extra request nor a graph walk.
-MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,headRefOid"
+# MERGED_PR_LIST_FIELDS moved on from here to
+# github_capabilities/pull_requests.py (Track 2, issue #1613; design doc
+# Section 5, L06b), alongside merged_prs_for_issue -- its one remaining
+# ``GitHub``-side bare-global consumer once that method moved too.
+# Transport.validate_field_lists (below) now imports it from pull_requests.py
+# instead of from here. See pull_requests.py for the full field-contract
+# rationale (unchanged).
 
 # Moved from ``github.py`` (Track 2, issue #1593; design doc Section 5, L09).
 # ``RUN_LIST_FIELDS`` is referenced as a bare global by the module-level
