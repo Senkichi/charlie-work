@@ -62,6 +62,7 @@ This file covers:
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 from collections import Counter
 from pathlib import Path
@@ -652,11 +653,18 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
 # a single string.
 # ---------------------------------------------------------------------------
 
+# issue #1645 (L01 batch 2): _process_rescue_review moved verbatim out of
+# workflow.py into orchestration/state_rescue.py, so the record_review() call
+# site it encloses now reports state_rescue.py as its module. This is an
+# address change of a known site, not a new or lost one -- the total_sites == 7
+# positive control below is the load-bearing evidence of that (the call count
+# and its "rescue_review" literal are unchanged; only (file, func)'s file
+# moved). The scanner already discovers this via _SRC_ROOT.rglob("*.py").
 _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE: dict[tuple[str, str], Counter[str]] = {
     ("workflow.py", "review"): Counter({"ci_gate_auto_reject": 2, "test_adequacy_auto_reject": 1}),
     ("workflow.py", "_reap_review_verdicts"): Counter({"fresh_llm_review": 1}),
     ("workflow.py", "_reconcile_stranded_verdicts"): Counter({"stranded_reconciliation": 1}),
-    ("workflow.py", "_process_rescue_review"): Counter({"rescue_review": 1}),
+    ("state_rescue.py", "_process_rescue_review"): Counter({"rescue_review": 1}),
     ("cli.py", "run_command"): Counter({"operator_manual": 1}),
 }
 
@@ -724,9 +732,14 @@ def _find_function_def(tree: ast.AST, name: str) -> ast.FunctionDef:
 
 
 def test_record_review_verdict_provenance_has_no_default_in_the_ast() -> None:
-    tree = ast.parse(
-        (_SRC_ROOT / "workflow.py").read_text(encoding="utf-8"), filename="workflow.py"
-    )
+    # issue #1645 (L01 batch 2): record_review moved out of workflow.py into a
+    # delegation submodule. Locate its defining module through the live
+    # OrchestratorApp attribute (design 4.1 guards-follow-members locator)
+    # rather than hard-coding workflow.py's path, so this AST check follows the
+    # member wherever future batches relocate it.
+    host_module = inspect.getmodule(OrchestratorApp.record_review)
+    host_path = Path(host_module.__file__)
+    tree = ast.parse(host_path.read_text(encoding="utf-8"), filename=host_path.name)
     func = _find_function_def(tree, "record_review")
 
     positional_names = [a.arg for a in func.args.posonlyargs + func.args.args]
