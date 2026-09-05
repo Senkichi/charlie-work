@@ -17,7 +17,7 @@ from charlie_work.attachment_contracts import baseline as baseline_mod
 from charlie_work.attachment_contracts.archetypes import scan_tree
 from charlie_work.attachment_contracts.excludes import load_excludes
 from charlie_work.attachment_contracts.model import Finding, ScanResult
-from charlie_work.attachment_contracts.outliers import saturate_all
+from charlie_work.attachment_contracts.outliers import saturate_all, saturate_all_with_fences
 from charlie_work.attachment_contracts.redirect import suggest
 
 _SEVERITY_RANK: dict[str, int] = {"error": 0, "block": 1, "advise": 2}
@@ -71,6 +71,14 @@ def check_tree(
     baseline as an independent reference point) because the per-edit hook
     path has no git context and should stay cheap.
 
+    Issue #1614: when the committed baseline carries frozen per-kind Tukey
+    statistics (``kind_stats``), live points are saturated against the FROZEN
+    fence (``saturate_all_with_fences``) instead of recomputing it from the
+    current population. A PR that adds or removes one ordinary module can no
+    longer churn baseline entries for files it never touched. Baselines
+    written before #1614 (no ``kind_stats``) fall back to live recomputation
+    -- the migration is a one-time ``baseline`` / ``baseline --refreeze``.
+
     Returns an empty list when the tree is clean. Absence of a committed
     baseline is not itself a Finding (freeze-on-adopt has not happened yet in
     this repo) — only parse failures and, once a baseline exists, block/tamper
@@ -80,9 +88,6 @@ def check_tree(
     scan = scan_tree(root, excludes, content_overrides=content_overrides)
 
     findings: list[Finding] = [_parse_failure_finding(pf) for pf in scan.parse_failures]
-
-    kinds = sorted({p.kind for p in scan.points})
-    verdicts = saturate_all(scan.points, kinds)
 
     baseline_path = root / baseline_mod.BASELINE_FILENAME
     if baseline_path.is_file():
@@ -99,6 +104,16 @@ def check_tree(
                 )
             )
         else:
+            # Issue #1614: prefer the frozen per-kind fence when the baseline
+            # carries one; otherwise fall back to live recomputation (the
+            # pre-#1614 behavior) so old baselines keep working until a
+            # one-time re-baseline / --refreeze records kind_stats.
+            kind_stats = baseline_mod.kind_stats_of(document)
+            if kind_stats:
+                verdicts = saturate_all_with_fences(scan.points, kind_stats)
+            else:
+                kinds = sorted({p.kind for p in scan.points})
+                verdicts = saturate_all(scan.points, kinds)
             compare_findings, _ratcheted = baseline_mod.compare(verdicts, document)
             findings.extend(
                 _enrich_with_redirect(f, scan) if f.severity == "block" else f

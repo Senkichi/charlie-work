@@ -28,7 +28,9 @@ from charlie_work.attachment_contracts.baseline import (
     TamperError,
     compare,
     dump,
+    kind_stats_of,
     load,
+    with_kind_stats,
 )
 from charlie_work.attachment_contracts.baseline import (
     generate as generate_baseline,
@@ -37,7 +39,11 @@ from charlie_work.attachment_contracts.baseline import loads as load_baseline_te
 from charlie_work.attachment_contracts.check import check_file, check_tree
 from charlie_work.attachment_contracts.excludes import load_excludes
 from charlie_work.attachment_contracts.model import Finding
-from charlie_work.attachment_contracts.outliers import FLOOR, saturate_all
+from charlie_work.attachment_contracts.outliers import (
+    FLOOR,
+    saturate_all,
+    saturate_all_with_fences,
+)
 from charlie_work.attachment_contracts._windows import no_console_window_kwargs
 
 PACKAGE_VERSION = "0.1.1"
@@ -94,20 +100,48 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     excludes = load_excludes(root)
     scan = scan_tree(root, excludes)
-    kinds = sorted({p.kind for p in scan.points})
-    verdicts = saturate_all(scan.points, kinds)
     baseline_path = root / BASELINE_FILENAME
+
+    # ``--refreeze`` (issue #1614): ratchet the entries against a LIVE fence
+    # AND recompute the frozen per-kind statistics. It is the only ratchet-
+    # shaped path that may raise the frozen boundary (a full ``baseline``
+    # regen is the other). ``--ratchet`` alone uses the FROZEN fence and
+    # preserves kind_stats verbatim -- it may lower entries and may not raise
+    # the frozen boundary.
+    if args.refreeze:
+        if not baseline_path.is_file():
+            print(f"error: no baseline at {baseline_path} to refreeze", file=sys.stderr)
+            return 1
+        document = load(baseline_path)
+        kinds = sorted({p.kind for p in scan.points})
+        verdicts = saturate_all(scan.points, kinds)
+        _findings, ratcheted = compare(verdicts, document)
+        ratcheted = with_kind_stats(ratcheted, verdicts)
+        dump(ratcheted, baseline_path)
+        print(f"refrozen baseline written: {baseline_path} ({len(ratcheted['entries'])} entries)")
+        return 0
 
     if args.ratchet:
         if not baseline_path.is_file():
             print(f"error: no baseline at {baseline_path} to ratchet", file=sys.stderr)
             return 1
         document = load(baseline_path)
+        # Issue #1614: saturate against the frozen fence when present so a
+        # ratchet cannot churn entries for files the PR never touched. Fall
+        # back to live recomputation for pre-#1614 baselines (no kind_stats).
+        kind_stats = kind_stats_of(document)
+        if kind_stats:
+            verdicts = saturate_all_with_fences(scan.points, kind_stats)
+        else:
+            kinds = sorted({p.kind for p in scan.points})
+            verdicts = saturate_all(scan.points, kinds)
         _findings, ratcheted = compare(verdicts, document)
         dump(ratcheted, baseline_path)
         print(f"ratcheted baseline written: {baseline_path} ({len(ratcheted['entries'])} entries)")
         return 0
 
+    kinds = sorted({p.kind for p in scan.points})
+    verdicts = saturate_all(scan.points, kinds)
     generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     document = generate_baseline(
         verdicts,
@@ -191,6 +225,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_baseline = sub.add_parser("baseline", help="Generate or ratchet .attachment-budgets.json.")
     p_baseline.add_argument("--root", default=".")
     p_baseline.add_argument("--ratchet", action="store_true")
+    p_baseline.add_argument(
+        "--refreeze",
+        action="store_true",
+        help=(
+            "Ratchet entries against a LIVE fence and recompute the frozen "
+            "per-kind Tukey statistics (issue #1614). The only ratchet-shaped "
+            "path that may raise the frozen boundary; a plain --ratchet uses "
+            "the frozen fence and preserves it verbatim."
+        ),
+    )
     p_baseline.set_defaults(func=_cmd_baseline)
 
     p_check_file = sub.add_parser("check-file", help="Check a single file against the baseline.")

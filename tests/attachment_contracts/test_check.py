@@ -184,3 +184,108 @@ def test_check_tree_tamper_detects_hand_raised_baseline(tmp_path: Path) -> None:
 
     tamper_findings = [f for f in findings if f.severity == "error" and "tamper" in f.message]
     assert len(tamper_findings) == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #1614: freeze the per-kind Tukey fence per baseline
+# ---------------------------------------------------------------------------
+
+
+def _class_source(name: str, count: int) -> str:
+    # Method names deliberately do NOT end in a bare digit (`mNx`, not `mN`) --
+    # a `<prefix><int>` sequence would be structurally reclassified as a
+    # linear-ledger migration_runner by ledger.py and become exempt.
+    methods = "\n".join(f"    def m{i}x(self): pass" for i in range(count))
+    return f"\nclass {name}:\n{methods}\n"
+
+
+def _build_freeze_repo(root: Path) -> None:
+    """Eight class APs with member counts [1,2,3,4,6,8,16,20].
+
+    Hand-computed freeze-time fence (n=8, nearest-rank quartiles):
+      q1 rank = ceil(0.25*8) = 2 -> sorted[1] = 2
+      q3 rank = ceil(0.75*8) = 6 -> sorted[5] = 8
+      iqr = 6; boundary = 8 + 1.5*6 = 17
+    So ``Big`` (20) saturates and is baselined; ``P`` (16) does NOT saturate
+    (16 > 17 is False) and has no baseline entry.
+    """
+    (root / "src" / "pkg").mkdir(parents=True)
+    for name, count in (
+        ("A", 1),
+        ("B", 2),
+        ("C", 3),
+        ("D", 4),
+        ("E", 6),
+        ("F", 8),
+        ("P", 16),
+        ("Big", 20),
+    ):
+        (root / "src" / "pkg" / f"{name.lower()}.py").write_text(
+            _class_source(name, count), encoding="utf-8"
+        )
+
+
+def test_check_tree_frozen_fence_keeps_findings_stable_when_median_module_added(
+    tmp_path: Path,
+) -> None:
+    # Issue #1614: adding one median-sized module must NOT churn baseline
+    # entries for files the PR never touched. With the fence FROZEN at the
+    # baseline value (17), ``P`` (16, unchanged) stays not-saturated and
+    # produces no finding. The positive control below shows the LIVE
+    # recomputation WOULD move the fence and surface a spurious block.
+    _build_freeze_repo(tmp_path)
+    _freeze_baseline(tmp_path)
+
+    # Sanity: the frozen baseline carries kind_stats and Big is the only entry.
+    document = load(tmp_path / BASELINE_FILENAME)
+    assert "kind_stats" in document
+    assert document["kind_stats"]["class"]["boundary"] == 17.0
+    assert [e["identity"] for e in document["entries"]] == ["Big"]
+
+    # Add one median-sized module (count=8, at the old q3). The LIVE fence
+    # drops to 15.5 (n=9: q1=3, q3=8, iqr=5, boundary=15.5), which would
+    # newly saturate the UNCHANGED ``P`` (16). The FROZEN fence must not.
+    (tmp_path / "src" / "pkg" / "median.py").write_text(
+        _class_source("Median", 8), encoding="utf-8"
+    )
+
+    findings = check_tree(tmp_path)
+
+    block_findings = [f for f in findings if f.severity == "block"]
+    assert block_findings == [], (
+        "frozen fence must not surface a block finding for the unchanged P "
+        f"(got {[f.identity for f in block_findings]})"
+    )
+
+
+def test_check_tree_live_fence_positive_control_when_kind_stats_absent(
+    tmp_path: Path,
+) -> None:
+    # Positive control for the bug (issue #1614): the SAME augmented repo,
+    # but with a pre-#1614 baseline that carries NO kind_stats, falls back to
+    # LIVE recomputation. The live fence drops to 15.5 and the UNCHANGED ``P``
+    # (16) is newly saturated with no baseline entry -> a spurious block
+    # finding. This is exactly the churn the freeze eliminates, and it proves
+    # the frozen-fence test above is exercising the fix (not a vacuous pass).
+    _build_freeze_repo(tmp_path)
+    _freeze_baseline(tmp_path)
+
+    # Strip kind_stats to simulate a pre-#1614 baseline (live fallback path).
+    document = load(tmp_path / BASELINE_FILENAME)
+    document.pop("kind_stats", None)
+    dump(document, tmp_path / BASELINE_FILENAME)
+
+    # Add the same median module as the frozen-fence test.
+    (tmp_path / "src" / "pkg" / "median.py").write_text(
+        _class_source("Median", 8), encoding="utf-8"
+    )
+
+    findings = check_tree(tmp_path)
+
+    block_findings = [f for f in findings if f.severity == "block"]
+    p_findings = [f for f in block_findings if f.identity == "P"]
+    assert len(p_findings) == 1, (
+        "positive control: live recomputation must surface a spurious block "
+        "for the unchanged P when the fence is not frozen"
+    )
+    assert p_findings[0].file == "src/pkg/p.py"
