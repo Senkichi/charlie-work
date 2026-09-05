@@ -393,10 +393,17 @@ picks one and defends it:
 - **(B) a derived installer** `_install_delegates(OrchestratorApp)` in a new
   module `src/charlie_work/workflow_delegation.py` (the analog of the merged
   `github_delegation.py`) that **introspects each destination domain module's
-  public top-level `def`s**, builds a `name -> module` route table, raises on any
-  cross-module name collision, and installs each function as a class attribute
-  (wrapping the property/staticmethod adapters, Section 3.3). `workflow.py` calls
-  `_install_delegates(OrchestratorApp)` once after the class body.
+  non-dunder top-level `def`s** (single-underscore private names included, dunders
+  excluded -- exactly `github_delegation.py::_routable_members`, lines 63-86, which
+  iterates `vars(cls)` and skips only `__dunder__` names), builds a `name -> module`
+  route table, raises on any cross-module name collision, and installs each function
+  as a class attribute (wrapping the property/staticmethod adapters, Section 3.3).
+  `workflow.py` calls `_install_delegates(OrchestratorApp)` once after the class
+  body. The predicate must be non-dunder, **not** public: 111 of the 133 members
+  are single-underscore private (`_dispatch_impl`, `_route_to_rework`, ...) and
+  moved bodies still call each other by name via `self._name(...)`, so a
+  `public`-only predicate would install about 21 of 133 and the first private call
+  would raise `AttributeError`.
 
 **Decision: (B), the derived installer, kept in its own module.** Rationale:
 the route table is *derived from the destination modules' own contents* (rule 9's
@@ -522,7 +529,11 @@ zero-risk conversions.
   (`_make_delegate` adapter helpers, the introspective `_build_routes` with
   collision detection, `_install_delegates(OrchestratorApp)`), an empty
   `src/charlie_work/orchestration/` package skeleton, and the post-class install
-  call in `workflow.py`. Ratchet delta 0 (still 133). Blast radius: import surface
+  call in `workflow.py`. Ratchet delta 0 -- L00 makes **no** baseline change:
+  `baseline --ratchet` cannot raise the committed 130/131 to the live 133
+  (`baseline.py:366-380`), so the pre-existing +2 gap (#1617) stays an
+  informational block finding under shadow-mode CI and self-resolves at the first
+  L01 batch-ratchet (Section 9). Blast radius: import surface
   only. Revert: delete the module + the install call.
   - Tier A/B sites: none. Tier D names: none. Destination module: 1 (machinery,
     well under cap).
@@ -834,19 +845,38 @@ positive result with the control noted:
 
 ## 9. Ratchet, gate, and stop-conditions
 
-- **Baseline-vs-live gap the first PR must reconcile.** The committed
+- **Baseline-vs-live gap, and why L00 makes no baseline change.** The committed
   `.attachment-budgets.json` OrchestratorApp entry is member_count **130** with a
   bump to **131** (effective ceiling 131), while the live scanner reads **133**
   (`reconcile.py`). The tree is thus already **2 over** its committed ceiling --
-  a pre-existing drift, not created by this plan. L00 (machinery, moves 0) must
-  therefore first **re-baseline the committed value to the true live 133** (a
-  `baseline --ratchet` that records reality) before any leaf ratchets it *down*;
-  otherwise the first move-PR's "lower to the post-move value" starts from a stale
-  130/131 that does not match live. After L00 re-baselines to 133, every leaf
-  ratchets down from there (133 -> 95 -> ... -> 7). The operator should read the
-  umbrella text as: the exit criterion is the **committed ratchet baseline value**
-  (which only descends after L00's one-time reality-sync), not the umbrella's
-  originally-written "strictly under 6.0 live" -- see the fence-target note below.
+  a pre-existing drift (#1617), not created by this plan. **L00 makes no baseline
+  change (ratchet delta 0); it cannot raise the committed ceiling.** `compare()`
+  (`baseline.py:366-380`) blocks and leaves the entry unchanged when live (133)
+  exceeds the ceiling -- it emits a `severity="block"` finding and re-appends the
+  *unchanged* entry (member_count stays 130); its only upward-touching branch is a
+  strictly-*lower* ratchet-down (`baseline.py:381-391`, guarded `point.member_count
+  < baseline_entry.member_count`). `check_ratchet_tamper` (`baseline.py:414-463`)
+  independently flags *any* upward rise of a frozen `member_count` as
+  `severity="error"` tamper, so even a hand-edit to 133 is the tamper case, not a
+  sanctioned path. Running `baseline --ratchet` at HEAD (`__main__.py:101-109`)
+  therefore discards the findings, writes back the unchanged 130, and exits 0. The
+  only sanctioned way to raise 131 -> 133 is an acked bump PR (the #1599 shape),
+  which L00 -- moving 0 members and filing no bump -- does not author; **do not add
+  a bump PR for this.** So the pre-existing +2 gap stays as a block finding through
+  L00. It is **informational, not merge-blocking**: the attachment-contracts CI job
+  is in Week-1 shadow mode (`.github/workflows/attachment-contracts.yml:55-73`,
+  `check-tree --report-only`, exit 0 unconditionally). **The gap self-resolves at
+  the first L01 batch-PR** that drops live member_count below the committed raw 130
+  (e.g. 133 -> ~123 after batch 1): that trips `compare()`'s ratchet-down branch
+  (`baseline.py:381-391`), which rewrites the entry *down* and drops the stale `to:
+  131` bump in the same step -- straight past the 130/131 ceiling on the first
+  batch, with no upward re-baseline needed or possible. (If the Week-2 enforce flip
+  lands before L01, the OA-over-ceiling finding blocks until L01 ratchets it down or
+  an acked bump to >=133 is landed; the fix stays a doc/bump action, never a change
+  to L00.) The operator should read the umbrella text as: the exit criterion is the
+  **committed ratchet baseline value** (which descends monotonically from the first
+  L01 down-ratchet onward), not the umbrella's originally-written "strictly under
+  6.0 live" -- see the fence-target note below.
 - **Fence-target reconciliation (review Finding 5).** Umbrella #1582's Phase B
   exit was written as "strictly under 6.0 live." The live `class` fence is now
   **8.5** (`fence_probe.py`, Section 2.4), because the eligible `class` population
