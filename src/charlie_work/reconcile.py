@@ -49,8 +49,8 @@ from .github import (
     build_branch_issue_validator,
     build_branch_issue_validator_from_issues,
     label_names,
-    linked_issue_number,
 )
+from .issue_linking import linked_issue_number
 from .instrumentation import log_event, query_events
 from .labels import TransitionOutcome, _edges, transition
 from .paths import resolved_layout, runtime_paths
