@@ -8,7 +8,7 @@ the ``workflow_delegation`` installer re-attaches each ``def`` onto the class.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Sequence
 
 from charlie_work.labels import TransitionOutcome
 import charlie_work.workflow as _wf
@@ -582,3 +582,52 @@ def _check_janitor_rework_stall(
             **stall_skip_summary,
         },
     )
+
+
+def _emit_stale_ci_verdict_requeued(
+    self,
+    pr_number: int,
+    issue_number: int | None,
+    reviewed_head_sha: str | None,
+    live_head_sha: str,
+    required_changes: Sequence[str] | None,
+) -> None:
+    """Emit ``stale_ci_verdict_requeued`` once per PR/head transition.
+
+    Issue #1120: ``review_queue()`` can be called multiple times per loop
+    pass (``dispatch_reviews()`` itself has more than one call site, e.g.
+    its dry-run-preview and real-dispatch branches), so without dedup the
+    event double-fires for the same PR within a single pass -- ~30s apart, the
+    second emission landing after review_dispatch has already claimed and
+    launched the PR. The dispatch itself is deduped by
+    ``review_dispatch_claim``, so the only impact is log noise, but the
+    pattern is the same missing-dedup family as the PR #1117 round-1
+    review finding on ``stale_ci_verdict_gate_pass``.
+
+    Mirrors the ``stale_ci_gate_pass_head`` fix: key the emission on a
+    stored head field (``stale_ci_verdict_requeued_head`` in the PR state
+    entry) so only the first queue evaluation per head transition emits,
+    rather than every evaluation that sees the stale verdict.
+    """
+    if self.dry_run:
+        return
+    with _wf.state_lock(self.paths.state_file):
+        state = _wf.load_state(self.paths.state_file)
+        existing_pr_state = state["prs"].get(str(pr_number), {})
+        if existing_pr_state.get("stale_ci_verdict_requeued_head") == live_head_sha:
+            return
+        state["prs"][str(pr_number)] = {
+            **existing_pr_state,
+            "stale_ci_verdict_requeued_head": live_head_sha,
+        }
+        state = self._record_event(
+            state,
+            "stale_ci_verdict_requeued",
+            {
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+                "reviewed_head_sha": reviewed_head_sha,
+                "required_changes": list(required_changes or []),
+            },
+        )
+        _wf.save_state(self.paths.state_file, state)
