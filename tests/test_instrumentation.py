@@ -1473,13 +1473,17 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
-        path="workflow.py",
+        path="orchestration/state_rework_routing.py",
         scope="_route_to_rework",
         source="event_kind",
         reason=(
             "_route_to_rework forwards its own `event_kind` parameter to "
             "self._record_event. Every self._route_to_rework(...) call site "
-            "is scanned (it is in _WRAPPER_FUNCS, 5th positional argument)."
+            "is scanned (it is in _WRAPPER_FUNCS, 5th positional argument). "
+            "Moved out of workflow.py to charlie_work.orchestration."
+            "state_rework_routing by leaf L01 b1 (#1632); the allow-list key "
+            "follows the member to its new module -- scope/source/reason "
+            "unchanged."
         ),
     ),
     _UnresolvedKindSite(
