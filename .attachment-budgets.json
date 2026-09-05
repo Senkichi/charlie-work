@@ -98,7 +98,7 @@
    "file": "tests/test_config.py",
    "identity": "tests/test_config.py::module",
    "kind": "test_module",
-   "member_count": 118
+   "member_count": 114
   },
   {
    "boundary": 41.0,
