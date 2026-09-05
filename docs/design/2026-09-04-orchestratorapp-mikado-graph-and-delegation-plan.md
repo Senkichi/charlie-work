@@ -477,6 +477,30 @@ Each round is a distinct gate (verification-ladder taxonomy in parentheses):
 The audit's outstanding-issue count is taken from each round's structured grep
 result, not re-derived from a report file (verification-ladder stall rule).
 
+### 4.1 Location-coupled guards (companion changes, from L01 b1)
+
+Some suite guards inspect a member's source, event kinds, or primitive-call
+count. When a leaf moves that member the guard must follow it: locate the source
+through the object or package (`inspect.getmodule` of the attribute, or `pkgutil`
+over `charlie_work.orchestration`), never the physical `workflow.py` path.
+Location-keyed allow-list entries repoint to the new module, reason unchanged;
+per-module ratchets redistribute total-preserving. Fixes ride the move-PR in a
+separate `test:` commit. L01 b1 touched six, one per shape:
+
+- Member count: assert lexical defs == committed `.attachment-budgets`
+  `member_count` and lexical + installed == 133 (one constant), not a hardcoded
+  count; the budget entry is legitimately file-keyed.
+- WriteGate ratchet: lower `workflow.py` by the raw calls that left and add a
+  per-module entry per destination; the baseline-dict sum is unchanged.
+- Event-kind allow-list: repoint the `(path, scope, source)` entry's path; the
+  key is path+function+source, not a line.
+- Detector fence: scan both members' host modules so the cross-member absence
+  assertion stays in scope.
+- Escalation-kind scan: union `workflow.py` and every orchestration submodule on
+  one shared call graph, so the escalators closure resolves across boundaries.
+
+Still `workflow.py`-keyed until its member moves: `test_exactly_one_workflow_runs_for_head...`.
+
 
 ## 5. Ordered leaf list (the Mikado leaves)
 
