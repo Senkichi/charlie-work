@@ -147,6 +147,14 @@ jobs:
         # error so the gate command (not a bare CI step failure) surfaces a
         # clear `empty_collect` finding -- matching the collect-only gate's
         # (#1538) fail-with-a-message philosophy.
+        #
+        # `shell: bash`: the `|| true` idiom is bash, not PowerShell. On
+        # windows-latest the default shell is pwsh, where `||` works (pwsh 7)
+        # but `true` is not a recognised command -- a collection failure
+        # would run `true`, fail to find it, and turn the step red instead of
+        # staying green for the gate to surface `empty_collect`. Bash is
+        # always available on GitHub-hosted Windows runners (Git Bash).
+        shell: bash
         run: uv run pytest --collect-only -q > collected.txt || true
       - name: Run tests
         # -n auto (pytest-xdist): the self-hosted era pinned -n 2 purely as
@@ -189,7 +197,15 @@ jobs:
         # skip this step and hide the truncation behind the test failure.
         # (When Run tests fails, the job is already red; this step can only
         # add a second, more specific signal, never turn red green.)
+        #
+        # `shell: bash`: the multi-line `run: |` block uses bash `\` line
+        # continuations, which pwsh cannot parse -- a `\` at end of line is a
+        # literal backslash, not a continuation, so pwsh sees `--junit` on the
+        # next line as a bare unary `--` operator and throws ParserError
+        # (the #1624 CI failure). Bash is always available on GitHub-hosted
+        # Windows runners (Git Bash).
         if: always()
+        shell: bash
         run: |
           uv run charlie junit-recorded-check \
             --junit pytest-junit.xml \

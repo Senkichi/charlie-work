@@ -23,6 +23,8 @@ import argparse
 import ast
 from pathlib import Path
 
+import yaml
+
 from charlie_work.junit_recorded_gate import (
     compare_recorded_vs_collected,
     count_collected_tests,
@@ -418,4 +420,51 @@ def test_no_hardcoded_test_count_in_gate_source() -> None:
     assert big_literals == [], (
         f"gate source contains large integer literals {big_literals} -- "
         f"a hardcoded test count would be brittle (rule #9)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CI workflow shell compatibility (issue #1621 / PR #1624 rework)
+# ---------------------------------------------------------------------------
+
+_CI_YML = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+
+
+def test_ci_gate_steps_use_bash_shell() -> None:
+    """The recorded-vs-collected CI steps must declare ``shell: bash``.
+
+    The ``Collect tests`` step uses the bash ``|| true`` idiom and the
+    ``Recorded-vs-collected check`` step uses bash ``\\`` line continuations
+    in a multi-line ``run: |`` block.  The CI job runs on ``windows-latest``,
+    whose default shell is pwsh -- pwsh cannot parse ``\\`` at end of line
+    (it treats it as a literal backslash, then sees ``--junit`` on the next
+    line as a bare unary ``--`` operator and throws ``ParserError``), and
+    ``true`` is not a pwsh command.  Both steps must therefore explicitly
+    set ``shell: bash`` (Git Bash is always available on GitHub-hosted
+    Windows runners).
+
+    This is the mutation-checkable regression guard for the #1624 rework:
+    reverting either ``shell: bash`` line makes the test fail.
+    """
+    assert _CI_YML.exists(), f"ci.yml not found at {_CI_YML}"
+    workflow = yaml.safe_load(_CI_YML.read_text(encoding="utf-8"))
+
+    tests_job = workflow["jobs"]["Tests"]
+    steps = tests_job["steps"]
+    by_name = {s["name"]: s for s in steps if "name" in s}
+
+    collect_step = by_name["Collect tests"]
+    assert collect_step.get("shell") == "bash", (
+        "ci.yml 'Collect tests' step must set shell: bash -- the "
+        "|| true idiom is bash, not pwsh (true is not a pwsh command)"
+    )
+
+    # The step name in the YAML source is "Recorded-vs-collected check
+    # (issue #1621)", but YAML strips the "#1621)" as a comment, so the
+    # parsed name is "Recorded-vs-collected check (issue".  Match by prefix.
+    gate_step = next(s for n, s in by_name.items() if n.startswith("Recorded-vs-collected check"))
+    assert gate_step.get("shell") == "bash", (
+        "ci.yml 'Recorded-vs-collected check' step must set shell: bash -- "
+        "the multi-line run block uses bash \\ line continuations that pwsh "
+        "cannot parse (ParserError: Missing expression after unary '--')"
     )
