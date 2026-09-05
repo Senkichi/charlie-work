@@ -214,7 +214,9 @@ def _api_is_mutating(args: list[str]) -> bool:
 # ``cancel_superseded_runs`` (a ``GitHubLike``-typed helper function, not a
 # ``GitHub`` member, so it stays in ``github.py`` untouched by this leaf) AND
 # by ``Transport.validate_field_lists`` (moved below) -- the same
-# staying-plus-moving-consumer shape as ``MERGED_PR_LIST_FIELDS`` above.
+# staying-plus-moving-consumer shape as ``MERGED_PR_LIST_FIELDS`` (which moved
+# on from here to ``github_capabilities/pull_requests.py`` in L06b; see the
+# comment above).
 # Re-exported through ``github_capabilities/__init__.py`` and re-imported
 # into ``github.py`` (still used directly there in ``cancel_superseded_runs``).
 RUN_LIST_FIELDS = "databaseId,status,createdAt,headBranch"

@@ -24206,7 +24206,7 @@ def test_record_review_request_changes_updates_issue_status_to_rework_requested(
 ) -> None:
     """Issue #72: request_changes (non-escalated) updates issue status to rework_requested
     so dispatch_rework can select it."""
-    from charlie_work.github import linked_issue_number
+    from charlie_work.issue_linking import linked_issue_number
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -49701,7 +49701,8 @@ def test_defang_closing_keywords_strips_live_keyword_but_keeps_number_legible() 
     # closing-keyword regex (so it can no longer auto-close or falsely bind
     # via linked_issue_number), but the issue number stays legible to a
     # human reader.
-    from charlie_work.github import _CLOSING_KEYWORD_REF, defang_closing_keywords
+    from charlie_work.github import defang_closing_keywords
+    from charlie_work.issue_linking import _CLOSING_KEYWORD_REF
 
     text = "does not fix #649"
     defanged = defang_closing_keywords(text)
@@ -49730,7 +49731,7 @@ def test_render_required_changes_section_defangs_live_keyword_in_list_tier() -> 
     # not carry a live closing keyword into the rendered brief -- a worker
     # reads this brief and writes its own PR body from it, a boundary
     # linked_issue_number's hijack-safety check never sees.
-    from charlie_work.github import _CLOSING_KEYWORD_REF
+    from charlie_work.issue_linking import _CLOSING_KEYWORD_REF
 
     decision = {
         "decision": "request_changes",
@@ -49746,7 +49747,7 @@ def test_render_required_changes_section_defangs_live_keyword_in_list_tier() -> 
 
 def test_render_required_changes_section_defangs_live_keyword_in_summary_tier() -> None:
     # Same guarantee for the summary-fallback tier (tier 2).
-    from charlie_work.github import _CLOSING_KEYWORD_REF
+    from charlie_work.issue_linking import _CLOSING_KEYWORD_REF
 
     decision = {
         "decision": "request_changes",

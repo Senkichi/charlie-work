@@ -77,31 +77,20 @@ from .github_capabilities import (  # noqa: F401  (deliberate re-export)
 from .github_delegation import _COLLABORATORS, _install_delegates
 from .github_delegation import _ROUTES, _SIGNATURE_SOURCE, _make_delegate  # noqa: F401 (deliberate re-export)
 
-# linked_issue_number and its closing-keyword chain moved to issue_linking.py
-# (Track 2, issue #1613; design doc Section 5, L06b) -- a neutral module with
-# no ``charlie_work.github``/``gh`` coupling, so ``pull_requests.py``
-# (``merged_prs_for_issue``, moved there in this same leaf) can import
-# ``linked_issue_number`` from it without cycling back through this module.
-# ``_CLOSING_KEYWORDS_ALT`` is imported as a real (not re-export-only) name:
-# ``_CLOSING_KEYWORD_DEFANG_RE`` below still references it as a bare global
-# and stays in this module (only the ``#N``-matching half of the vocabulary
-# moved; the defang/rewrite half did not, per issue #1613's own scope).
-# ``iter_unnegated_closing_keyword_matches``/``linked_issue_number``/
-# ``_CLOSING_KEYWORD_REF`` are pure re-exports: ``closing_keyword_gate.py``,
-# 27 external call sites (across ``workflow.py``, ``reconcile.py``,
-# ``janitor.py``, ``cli.py``, ``dead_worker_reap.py``,
-# ``backlog_reachability.py``, ``worktree.py``, plus tests), and
-# ``test_charlie_work.py``/``test_external_findings_pointer.py`` (which import
-# ``_CLOSING_KEYWORD_REF`` directly) still do ``from .github import ...``/
-# ``from charlie_work.github import ...`` and are not repointed to import from
-# ``issue_linking`` directly in this leaf (deferred follow-up, same as issue
-# #1613 itself allows).
-from .issue_linking import (
-    _CLOSING_KEYWORD_REF,  # noqa: F401  (deliberate re-export; test_charlie_work.py et al.)
-    _CLOSING_KEYWORDS_ALT,
-    iter_unnegated_closing_keyword_matches,  # noqa: F401  (deliberate re-export)
-    linked_issue_number,  # noqa: F401  (deliberate re-export)
-)
+# ``_CLOSING_KEYWORDS_ALT`` is imported from ``issue_linking.py`` (Track 2,
+# issue #1613; design doc Section 5, L06b) as a real (not re-export-only)
+# name: ``_CLOSING_KEYWORD_DEFANG_RE`` below still references it as a bare
+# global and stays in this module (only the ``#N``-matching half of the
+# vocabulary moved to ``issue_linking``; the defang/rewrite half did not, per
+# issue #1613's own scope). ``linked_issue_number``,
+# ``iter_unnegated_closing_keyword_matches`` and ``_CLOSING_KEYWORD_REF`` used
+# to be re-exported here too, but every importer (``workflow.py``,
+# ``reconcile.py``, ``janitor.py``, ``cli.py``, ``dead_worker_reap.py``,
+# ``backlog_reachability.py``, ``worktree.py``, ``closing_keyword_gate.py``,
+# ``closing_reference.py``, plus tests) now imports them directly from
+# ``issue_linking`` (issue #1627), so the re-exports are gone -- the names are
+# no longer reachable through ``charlie_work.github``.
+from .issue_linking import _CLOSING_KEYWORDS_ALT
 from .subprocess_runner import no_console_window_kwargs
 
 logger = logging.getLogger(__name__)
@@ -662,12 +651,11 @@ def build_branch_issue_validator_from_issues(
 
 
 # linked_issue_number moved to issue_linking.py alongside the rest of the
-# closing-keyword chain (Track 2, issue #1613; design doc Section 5, L06b),
-# imported above -- kept as a plain re-export because 27 external call sites
-# (workflow.py, reconcile.py, janitor.py, cli.py, dead_worker_reap.py,
-# backlog_reachability.py, worktree.py, plus tests) still do
-# ``from .github import linked_issue_number``/``from charlie_work.github
-# import linked_issue_number``.
+# closing-keyword chain (Track 2, issue #1613; design doc Section 5, L06b).
+# It is no longer re-exported through this module: every importer was
+# repointed to ``from .issue_linking import linked_issue_number`` directly
+# (issue #1627), so the name is not reachable through
+# ``charlie_work.github``.
 
 # Explicit issue-reference pattern: the word "issue" or "issues" followed by
 # an optional space and then "#N".  This is deliberately narrower than a bare
