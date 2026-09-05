@@ -22,6 +22,10 @@ from .private_slug_check_command import (
     register_private_slug_check_subparser,
     run_private_slug_check_command,
 )
+from .junit_recorded_gate_command import (
+    register_junit_recorded_check_subparser,
+    run_junit_recorded_check_command,
+)
 from .config import ConfigError, OrchestratorConfig, find_config_path
 from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import (
@@ -486,6 +490,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     register_private_slug_check_subparser(subparsers)
     register_ast_equivalence_check_subparser(subparsers)
+    register_junit_recorded_check_subparser(subparsers)
 
     migrate_parser = subparsers.add_parser(
         "migrate-state-dir",
@@ -2649,6 +2654,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_private_slug_check_command(args)
         elif args.command == "ast-equivalence-check":
             result = run_ast_equivalence_check_command(args)
+        elif args.command == "junit-recorded-check":
+            result = run_junit_recorded_check_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)
