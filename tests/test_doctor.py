@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+from _field_list_lint import _find_gh_field_list_violations
 from _script_loader import load_script_module
 from charlie_work.config import (
     ApiBudgetConfig,
@@ -1000,10 +1002,16 @@ def test_gh_field_lists_use_constants_no_inline_literals() -> None:
     constant from github.py rather than a string literal. This prevents the contract
     drift issue described in #64 by ensuring all field lists are centralized and not
     scattered as inline strings.
-    """
-    import ast
-    from pathlib import Path
 
+    The matcher recognises three call shapes (issue #1609 added the third):
+
+    1. separate positional string arguments:
+       ``gh.run("pr", "list", "--json", "number")``
+    2. an ``args=`` keyword whose value is a list:
+       ``gh.run(args=["pr", "list", "--json", "number"])``
+    3. a single positional list argument:
+       ``gh.run(["pr", "list", "--json", "number"], json_output=True)``
+    """
     import charlie_work.github as github_module
 
     # Get the expected constant names from github.py
@@ -1025,11 +1033,15 @@ def test_gh_field_lists_use_constants_no_inline_literals() -> None:
         assert isinstance(value, str), f"{const} must be a string"
         assert value, f"{const} must not be empty"
 
-    # Scan all Python files in src/charlie_work/ for gh.run() calls with --json
+    # Scan all Python files in src/charlie_work/, recursively (Track 2 issue
+    # #1588: github_capabilities/ now holds relocated field-list constants
+    # and moved method bodies alongside them, e.g. PR_CHECKS_FIELDS in
+    # github_capabilities/checks.py -- a non-recursive glob left that whole
+    # subpackage, and any other src/charlie_work subpackage, unscanned).
     src_dir = Path(__file__).parent.parent / "src" / "charlie_work"
     violations: list[tuple[str, int, str]] = []
 
-    for py_file in src_dir.glob("*.py"):
+    for py_file in src_dir.rglob("*.py"):
         if py_file.name == "github.py":
             # Constant definitions are allowed in github.py
             continue
@@ -1039,54 +1051,7 @@ def test_gh_field_lists_use_constants_no_inline_literals() -> None:
         except (OSError, SyntaxError):
             continue
 
-        # Walk the AST to find gh.run() calls
-        for node in ast.walk(tree):
-            # Look for Call nodes where the function is gh.run
-            if isinstance(node, ast.Call):
-                # Check if this is a call to something named 'run'
-                if isinstance(node.func, ast.Attribute) and node.func.attr == "run":
-                    # Look for --json in the arguments and check the next argument
-                    args = node.args
-                    for i, arg in enumerate(args):
-                        # Handle string constants (Python 3.8+)
-                        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                            if arg.value == "--json" and i + 1 < len(args):
-                                # Check if the next argument is a string literal (violation)
-                                next_arg = args[i + 1]
-                                if isinstance(next_arg, ast.Constant) and isinstance(
-                                    next_arg.value, str
-                                ):
-                                    # This is a field list as a string literal - violation
-                                    violations.append(
-                                        (str(py_file), next_arg.lineno, next_arg.value)
-                                    )
-                                elif isinstance(next_arg, ast.JoinedStr):
-                                    # f-string field list - violation
-                                    violations.append(
-                                        (str(py_file), next_arg.lineno, "f-string field list")
-                                    )
-                    # Also check keyword arguments with list values
-                    for keyword in node.keywords:
-                        if keyword.arg in ("args",) and isinstance(keyword.value, ast.List):
-                            list_items = keyword.value.elts
-                            for i, item in enumerate(list_items):
-                                if isinstance(item, ast.Constant) and isinstance(item.value, str):
-                                    if item.value == "--json" and i + 1 < len(list_items):
-                                        next_item = list_items[i + 1]
-                                        if isinstance(next_item, ast.Constant) and isinstance(
-                                            next_item.value, str
-                                        ):
-                                            violations.append(
-                                                (str(py_file), next_item.lineno, next_item.value)
-                                            )
-                                        elif isinstance(next_item, ast.JoinedStr):
-                                            violations.append(
-                                                (
-                                                    str(py_file),
-                                                    next_item.lineno,
-                                                    "f-string field list",
-                                                )
-                                            )
+        violations.extend(_find_gh_field_list_violations(tree, py_file))
 
     if violations:
         violation_msg = "\n".join(
@@ -1097,6 +1062,13 @@ def test_gh_field_lists_use_constants_no_inline_literals() -> None:
             f"{violation_msg}\n"
             f"Use the constants from github.py instead (e.g., ISSUE_LIST_FIELDS)."
         )
+
+
+# Regression tests for the single-positional-list call shape (issue #1609)
+# live in tests/test_field_list_lint.py -- placed there to respect the
+# attachment-contracts ceiling on this module (test_doctor.py::module was at
+# its baselined member count). They share the matcher with this repo-wide scan
+# via tests/_field_list_lint.py.
 
 
 def test_fake_github_payloads_align_with_field_constants() -> None:

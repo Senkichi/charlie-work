@@ -40,6 +40,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .ast_equivalence_stub_detection import _is_trivial_stub_dump
+
 
 # ---------------------------------------------------------------------------
 # Data model (frozen, per CLAUDE.md invariant)
@@ -229,6 +231,15 @@ def derive_moved_symbols(
     method moving from ``class A`` in file_a.py to ``class B`` in file_b.py is
     detected.  The ``ast.dump`` comparison determines whether the move is
     verbatim (equivalent) or modified (non-equivalent).
+
+    When multiple added candidates share a bare name (e.g. a ``Protocol`` stub
+    and a concrete implementation added to the same destination file in one
+    diff), the first **non-stub** candidate is preferred over the first in
+    file order (issue #1607): a ``Protocol`` stub's body (``...``) never
+    equals a real method body's dump, so first-in-order can report
+    ``equivalent=False`` for a byte-identical move. If every candidate is a
+    stub, the first candidate is used (preserving the one-removal-one-move
+    invariant when no better target exists).
     """
     moved: list[MovedSymbol] = []
 
@@ -250,9 +261,25 @@ def derive_moved_symbols(
                 continue  # still present in A -- not a move
             bare_a, cls_a = _split_qualified(qname_a)
             candidates = added_by_name.get(bare_a, [])
+            # Among same-bare-name candidates in a different file, prefer a
+            # non-stub destination over the first in file order. A Protocol
+            # stub (body ``...``) and a concrete implementation can both be
+            # ADDED in the same diff (issue #1607); first-in-order can pick
+            # the stub and report equivalent=False for a byte-identical move.
+            # Pick the first non-stub candidate; fall back to the first
+            # candidate if all are stubs (preserves prior behavior when no
+            # better target exists).
+            chosen: tuple[str, str, str] | None = None
             for path_b, qname_b, dump_b in candidates:
                 if path_b == path_a:
                     continue
+                if chosen is None:
+                    chosen = (path_b, qname_b, dump_b)
+                if not _is_trivial_stub_dump(dump_b):
+                    chosen = (path_b, qname_b, dump_b)
+                    break
+            if chosen is not None:
+                path_b, qname_b, dump_b = chosen
                 _, cls_b = _split_qualified(qname_b)
                 moved.append(
                     MovedSymbol(
@@ -264,7 +291,6 @@ def derive_moved_symbols(
                         equivalent=(dump_a == dump_b),
                     )
                 )
-                break  # first match wins; one removal -> one move
 
     return moved
 

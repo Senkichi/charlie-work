@@ -39,9 +39,9 @@ from .github import (
     get_github_issue_dependencies,
     issue_numbers_mentioned_by_pr,
     label_names,
-    linked_issue_number,
     parse_blockers,
 )
+from .issue_linking import linked_issue_number
 from .state import load_state_locked
 
 

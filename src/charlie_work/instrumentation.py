@@ -514,6 +514,16 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # merge.
         "merge_authorized": "info",
         "merge_ready": "info",
+        # Issue #1598: a bound PR whose issue carries a configured
+        # human_merge_labels label is handed off to a human for merging
+        # instead of being fleet-merged. ``human_merge_required`` is the
+        # hand-off event (issue escalated to agent:operator-queue with
+        # reason_class="policy"); ``human_merge_label_removed`` is the
+        # de-escalation event that fires when the operator removes the
+        # label without merging, restoring the PR to the normal
+        # queue/merge path. Both are info-level audit events.
+        "human_merge_required": "info",
+        "human_merge_label_removed": "info",
         # Issue #747: the merge lane emitted events for every outcome except
         # success, so merge throughput was unobservable from events.db. This
         # is the terminal success event, fired exactly once on the fleet's own

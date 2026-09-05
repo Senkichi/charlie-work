@@ -267,7 +267,7 @@ def test_cli_emits_copied_symbol_for_1544_layout(monkeypatch, tmp_path: Path) ->
         # git show base:<new file> -> file did not exist at base -> empty/ok=False
         return _make_run_result(stdout="", ok=False)
 
-    def mock_bootstrap(args):
+    def mock_bootstrap(args, **kwargs):
         from charlie_work.config import OrchestratorConfig
         from charlie_work.github import GitHub
         from charlie_work.paths import RuntimePaths

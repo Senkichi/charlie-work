@@ -1094,7 +1094,7 @@ def test_run_runners_allocate_loud_on_absent_global_layer(
     ``find_repo_root`` is stubbed so the command does not require a real git
     work tree at cwd; the config load fails before any network/runner work.
     """
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
     # Deliberately NOT mocking cli.load_layered_config.
 
     args = cli.build_parser().parse_args(["--fleet-dir", str(tmp_path), "runners", "allocate"])
@@ -1139,7 +1139,7 @@ def test_run_runners_allocate_forces_dry_run_when_ci_fleet_is_dirty(
     proves this CLI path is covered by that single enforcement point rather
     than a second, independently-written copy of the check.
     """
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
     config = OrchestratorConfig(
         runner_scaling=RunnerScalingConfig(managed_root=str(tmp_path)),
         runner_allocation=RunnerAllocationConfig(enabled=True),
@@ -1204,7 +1204,7 @@ def test_run_doctor_command_reports_structured_finding_on_unparseable_config(
     original incident hit -- proving the exception-handling path this test
     exists for, independent of which section happens to raise.
     """
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
     # Deliberately NOT mocking cli.load_layered_config.
     (tmp_path / "orchestrator.config.yaml").write_text(
         "labels:\n  ready: automated-ready\n  totally_unknown_key: true\n",
@@ -1249,7 +1249,7 @@ def test_run_runners_autoscale_up_forwards_affinity_knobs(
     currently installed, independent of whether #92 has merged yet.
     """
     monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
 
     config = OrchestratorConfig(
         runner_scaling=RunnerScalingConfig(enabled=True, managed_root=str(tmp_path)),
@@ -1315,7 +1315,7 @@ def test_run_runners_ensure_started_refuses_when_allocation_enabled(
     burning a full ``demand_idle_samples`` hysteresis window reconverging.
     The guard refuses and points at the single controller.
     """
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
     monkeypatch.setattr(
         cli,
         "load_layered_config",
@@ -1362,7 +1362,7 @@ def test_run_runners_ensure_started_force_bypasses_allocation_guard(
     """
     managed_root = tmp_path / "runners"
     managed_root.mkdir()
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
     monkeypatch.setattr(
         cli,
         "load_layered_config",
@@ -1397,7 +1397,7 @@ def test_run_runners_ensure_started_proceeds_when_allocation_disabled(
     """
     managed_root = tmp_path / "runners"
     managed_root.mkdir()
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
     monkeypatch.setattr(
         cli,
         "load_layered_config",
@@ -2100,7 +2100,7 @@ def test_bootstrap_command_returns_frozen_context_with_all_four_fields(
     repo = _fake_repo(tmp_path / "charlie-work")
     config = OrchestratorConfig()
 
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo_arg, explicit=False: repo)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo_arg, explicit=False, **kw: repo)
     monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: config)
     monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
 
@@ -2372,7 +2372,7 @@ def test_explicit_repo_skips_sibling_clone_guard(
         raise AssertionError("guard should not fire when --repo is explicit")
 
     monkeypatch.setattr(cli, "_assert_not_sibling_clone", _guard_should_not_fire)
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: sibling)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: sibling)
     monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: config)
     monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
     monkeypatch.setattr(cli, "touch_repo", lambda *a, **k: {})
@@ -2475,7 +2475,7 @@ def test_read_only_command_skips_guard(monkeypatch: pytest.MonkeyPatch, tmp_path
         raise AssertionError("guard should not fire for read-only commands")
 
     monkeypatch.setattr(cli, "_assert_not_sibling_clone", _guard_should_not_fire)
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: sibling)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: sibling)
     monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: config)
     monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
     monkeypatch.setattr(cli, "touch_repo", lambda *a, **k: {})
@@ -2806,7 +2806,7 @@ def _shadow_status_setup(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     fleet_directory = tmp_path / "fleet"
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: repo_root)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: repo_root)
     monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: OrchestratorConfig())
     args = cli.build_parser().parse_args(
         ["--fleet-dir", str(fleet_directory), "runners", "shadow-status"]
@@ -3303,7 +3303,7 @@ def test_run_runners_provision_refuses_when_scaling_disabled(
     ``provision_runner`` — it must short-circuit immediately, exactly like
     ``runners status`` and ``runners autoscale`` do.
     """
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
     monkeypatch.setattr(
         cli, "load_layered_config", lambda *a, **k: _provision_config(scaling_enabled=False)
     )
@@ -3323,7 +3323,7 @@ def test_run_runners_provision_inert_when_demand_within_capacity(
     available or no queue). The provision command must report the decision
     and not call ``provision_runner``.
     """
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
     monkeypatch.setattr(
         cli, "load_layered_config", lambda *a, **k: _provision_config(managed_root=str(tmp_path))
     )
@@ -3355,7 +3355,7 @@ def test_run_runners_provision_inert_at_max_runners(
     not call ``provision_runner``. This test pins the guardrail so a future
     change cannot silently remove it.
     """
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
     monkeypatch.setattr(
         cli,
         "load_layered_config",
@@ -3393,7 +3393,7 @@ def test_run_runners_provision_invokes_provision_runner_on_scale_up(
     the end-to-end actuator test — not just that the decision is UP, but
     that the provisioning engine is reached.
     """
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
     monkeypatch.setattr(
         cli, "load_layered_config", lambda *a, **k: _provision_config(managed_root=str(tmp_path))
     )
@@ -3437,7 +3437,7 @@ def test_run_runners_provision_forwards_affinity_knobs(
     the provision command. The knobs are sourced from
     ``config.runner_allocation``, never hardcoded.
     """
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
 
     config = OrchestratorConfig(
         runner_scaling=RunnerScalingConfig(enabled=True, managed_root=str(tmp_path)),
@@ -3476,7 +3476,7 @@ def test_run_runners_provision_refuses_scale_down(
     safety property that distinguishes ``provision`` from ``autoscale`` —
     provision is an "add capacity" button, never a second scale-down path.
     """
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
     monkeypatch.setattr(
         cli, "load_layered_config", lambda *a, **k: _provision_config(managed_root=str(tmp_path))
     )
@@ -3508,7 +3508,7 @@ def test_run_runners_provision_dry_run_does_not_execute(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """--dry-run returns the decision without calling provision_runner."""
-    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False, **kw: tmp_path)
     monkeypatch.setattr(
         cli, "load_layered_config", lambda *a, **k: _provision_config(managed_root=str(tmp_path))
     )

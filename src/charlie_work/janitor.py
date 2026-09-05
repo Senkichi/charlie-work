@@ -35,7 +35,7 @@ from charlie_work.checks import (
     classify_infra_failures,
     summarize_checks,
 )
-from charlie_work.github import linked_issue_number
+from charlie_work.issue_linking import linked_issue_number
 from charlie_work.safe_ref import require_valid_ref_name, require_valid_sha
 from charlie_work.subprocess_runner import run_captured
 
@@ -352,6 +352,7 @@ def run_janitor(
     repo_root: Path | None = None,
     pr_diff: str | None = None,
     review_decision: Mapping[str, Any] | None = None,
+    issue_labels: set[str] | None = None,
 ) -> JanitorVerdict:
     """Run deterministic pre-review checks over ``pr``/``checks`` data.
 
@@ -367,6 +368,14 @@ def run_janitor(
     can pass and the packet/fresh-review machinery can run. ``None`` (or any
     non-stale decision) preserves the existing behavior — the predicate fails
     closed on red, pending, missing, or unavailable checks.
+
+    ``issue_labels`` (issue #1598) is the set of live labels on the PR's
+    bound issue, when the caller already has them. When provided and any
+    label in ``config.dispatch.human_merge_labels`` is present, a warning
+    (not a failure) is appended so the review packet surfaces that the PR
+    will require a human merge. Review, rework, and label lifecycle continue
+    as today — this is informational only. ``None`` (the default) preserves
+    the existing behavior.
     """
     failures: list[str] = []
     warnings: list[str] = []
@@ -394,6 +403,10 @@ def run_janitor(
     _check_title_conventional(pr, warnings)
     _check_diff_size(pr, warnings)
     _check_base_movement(pr, config, warnings)
+    # Issue #1598: informational warning (not a failure) when the bound
+    # issue carries a configured human-merge label. Review continues as
+    # today; the merge gate in merge_ready is the enforcement point.
+    _check_human_merge_labels(config, issue_labels, warnings)
 
     if pr_diff is not None:
         _check_external_api_fixtures(pr, pr_diff, config, warnings)
@@ -683,6 +696,30 @@ def _check_base_movement(
     merge_status = pr.get("mergeStateStatus")
     if merge_status == "BEHIND":
         warnings.append("Base branch has moved since branch (mergeStateStatus=BEHIND)")
+
+
+def _check_human_merge_labels(
+    config: OrchestratorConfig,
+    issue_labels: set[str] | None,
+    warnings: list[str],
+) -> None:
+    """Append a warning when the bound issue carries a configured human-merge label.
+
+    Issue #1598. Informational only — never a failure. Review, rework, and
+    label lifecycle continue as today; the merge gate in ``merge_ready`` is
+    the enforcement point. The janitor surfaces the marker early so the
+    reviewer packet and any operator looking at the verdict can see the PR
+    will require a human merge even before approval.
+    """
+    if not config.dispatch.human_merge_labels or issue_labels is None:
+        return
+    present = sorted(set(config.dispatch.human_merge_labels) & issue_labels)
+    if not present:
+        return
+    warnings.append(
+        "Bound issue carries a human-merge label "
+        f"({', '.join(present)}); fleet will not auto-merge this PR"
+    )
 
 
 def _check_external_api_fixtures(

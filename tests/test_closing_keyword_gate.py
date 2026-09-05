@@ -34,9 +34,8 @@ from charlie_work.github import (
     CLOSING_KEYWORD_PR_FIELDS,
     GitHub,
     GitHubRunResult,
-    iter_unnegated_closing_keyword_matches,
 )
-from charlie_work.github import linked_issue_number
+from charlie_work.issue_linking import iter_unnegated_closing_keyword_matches, linked_issue_number
 
 # --- find_unexpected_closing_references: core scanning behavior ---
 
@@ -271,7 +270,7 @@ def _cli_args(pr: int) -> argparse.Namespace:
 
 
 def test_cli_closing_keyword_check_fails_on_unexpected_reference(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
     monkeypatch.setattr(cli_module, "GitHub", _FakeGitHubForCLI)
 
@@ -290,7 +289,7 @@ def test_cli_closing_keyword_check_passes_when_clean(monkeypatch, tmp_path) -> N
         def pr_commits(self, number: int):
             return [{"commit": {"message": "fix: unrelated cleanup\n\nFixes #999999 as well"}}]
 
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
     monkeypatch.setattr(cli_module, "GitHub", FakeGitHubClean)
 
@@ -305,7 +304,7 @@ def test_cli_closing_keyword_check_reports_fetch_failure(monkeypatch, tmp_path) 
         def pr_commits(self, number: int):
             return None
 
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
     monkeypatch.setattr(cli_module, "GitHub", FakeGitHubNoCommits)
 
@@ -370,7 +369,7 @@ def test_cli_closing_keyword_check_queries_narrow_pr_view_fields_end_to_end(
         raise AssertionError(f"unexpected gh invocation in this test: {args}")
 
     monkeypatch.setattr(GitHub, "run", fake_run)
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
     # Deliberately NOT monkeypatching cli_module.GitHub here -- the real
     # GitHub class must be constructed so its real pr_view()/pr_commits()

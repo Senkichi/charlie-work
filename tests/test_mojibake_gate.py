@@ -303,7 +303,7 @@ def _mock_git_diff(stdout: str, ok: bool = True) -> RunResult:
 
 
 def test_cli_mojibake_check_fails_on_corrupted_diff(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
     diff_output = _make_diff("src/example.py", ["# bad " + _MOJIBAKE_EM_DASH + " line"])
     monkeypatch.setattr(
@@ -321,7 +321,7 @@ def test_cli_mojibake_check_fails_on_corrupted_diff(monkeypatch, tmp_path) -> No
 
 
 def test_cli_mojibake_check_passes_on_clean_diff(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
     diff_output = _make_diff("src/example.py", ["# clean line with " + _EM_DASH + " dash"])
     monkeypatch.setattr(
@@ -338,7 +338,7 @@ def test_cli_mojibake_check_passes_on_clean_diff(monkeypatch, tmp_path) -> None:
 
 
 def test_cli_mojibake_check_reports_git_failure(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
     monkeypatch.setattr(
         cli_module,
@@ -363,7 +363,7 @@ def test_cli_mojibake_check_passes_base_to_git_diff(monkeypatch, tmp_path) -> No
         captured_args.append(command)
         return _mock_git_diff("")
 
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
     monkeypatch.setattr(cli_module, "run_captured", fake_run_captured)
 
@@ -386,7 +386,7 @@ def test_cli_mojibake_check_uses_two_dot_not_three_dot(monkeypatch, tmp_path) ->
         captured_args.append(command)
         return _mock_git_diff("")
 
-    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
     monkeypatch.setattr(cli_module, "run_captured", fake_run_captured)
 

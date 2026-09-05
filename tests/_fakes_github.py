@@ -23,7 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work import github as github_module
-from charlie_work.github import _job_id_from_link, _run_id_from_link, linked_issue_number
+from charlie_work.github import _job_id_from_link, _run_id_from_link
+from charlie_work.issue_linking import linked_issue_number
 
 
 class FakeGitHub:

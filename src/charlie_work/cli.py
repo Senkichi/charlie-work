@@ -26,6 +26,10 @@ from .private_slug_check_command import (
     register_private_slug_check_subparser,
     run_private_slug_check_command,
 )
+from .junit_recorded_gate_command import (
+    register_junit_recorded_check_subparser,
+    run_junit_recorded_check_command,
+)
 from .config import ConfigError, OrchestratorConfig, find_config_path
 from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import (
@@ -48,8 +52,8 @@ from .github import (
     GitHub,
     GitHubError,
     defang_closing_keywords,
-    linked_issue_number,
 )
+from .issue_linking import linked_issue_number
 from . import layout
 from .dirty_tree import check_working_tree_clean
 from .logging_setup import configure_logging
@@ -491,6 +495,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_private_slug_check_subparser(subparsers)
     register_ast_equivalence_check_subparser(subparsers)
     register_collect_only_check_subparser(subparsers)
+    register_junit_recorded_check_subparser(subparsers)
 
     migrate_parser = subparsers.add_parser(
         "migrate-state-dir",
@@ -731,7 +736,11 @@ class CommandContext:
     gh: GitHub
 
 
-def bootstrap_command(args: argparse.Namespace) -> CommandContext:
+def bootstrap_command(
+    args: argparse.Namespace,
+    *,
+    redirect_to_main_worktree: bool = True,
+) -> CommandContext:
     """Run the four-call CLI bootstrap once, returning a frozen context.
 
     This is the single shared entry point for the
@@ -747,8 +756,18 @@ def bootstrap_command(args: argparse.Namespace) -> CommandContext:
     ``build_app``.  ``run_runners_allocate`` is the one exception: it uses
     ``require_global=True`` with custom error handling and cannot use this
     helper.
+
+    When *redirect_to_main_worktree* is False the linked-worktree redirect in
+    :func:`find_repo_root` is skipped, so a read-only diagnostic invoked from
+    a linked worktree bootstraps against that worktree's own root (issue
+    #1600).  State-mutating commands must keep the default ``True`` so their
+    state resolves to the shared ``.var/charlie-work/`` directory (issue #648).
     """
-    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    repo_root = find_repo_root(
+        args.repo,
+        explicit=args.repo is not None,
+        redirect_to_main_worktree=redirect_to_main_worktree,
+    )
     _assert_config_repo_matches(args.config, repo_root)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
@@ -2642,6 +2661,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_ast_equivalence_check_command(args)
         elif args.command == "collect-only-check":
             result = run_collect_only_check_command(args)
+        elif args.command == "junit-recorded-check":
+            result = run_junit_recorded_check_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)

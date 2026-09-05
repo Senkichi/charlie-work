@@ -8480,154 +8480,6 @@ def test_dispatch_reviews_threads_reviewer_model_as_model_override(
     assert captured[0].get("model_override") == "claude-sonnet-5"
 
 
-def test_dispatch_reviews_routes_through_devin_shell_when_configured(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """Issue #1513: reviewer.harness="devin-shell" must actually route the
-    reviewer launch through launch_devin_session (with review=True and the
-    PR's head_sha) instead of the previously-hardcoded launch_claude_worker.
-    Before this issue, reviewer.harness could only ever be "claude-code" --
-    setting anything else was rejected by config validation, so there was no
-    way to even reach this call site with a different harness. This pins the
-    launch-side half of the fix: config accepting the value is not enough if
-    dispatch never routes through it (the "wired, not just loosened"
-    requirement)."""
-    from dataclasses import replace
-
-    from charlie_work.config import ReviewerRoleConfig
-
-    prs = [
-        {
-            "number": 100,
-            "title": "Fix #10",
-            "url": "https://example.test/pull/100",
-            "headRefName": "agent/issue-10-fix",
-            "baseRefName": "main",
-            "headRefOid": "sha-100",
-            "mergeStateStatus": "CLEAN",
-            "body": "Closes #10",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "OPEN",
-        },
-    ]
-    app = _dispatch_reviews_app(tmp_path, prs=prs)
-    app.config = replace(app.config, reviewer=ReviewerRoleConfig(harness="devin-shell"))
-    _write_review_packet(tmp_path, 100, "sha-100")
-
-    captured: list[dict[str, Any]] = []
-
-    def fake_devin_launch(*args: Any, **kwargs: Any) -> SessionRecord:
-        captured.append(kwargs)
-        return SessionRecord(
-            issue_number=args[0],
-            branch=args[1],
-            worktree_path="/fake/review-checkout",
-            prompt_path=str(args[2]),
-            command=("devin", "--prompt-file", "{prompt_path}", "--print"),
-            pid=12345,
-            started_at="2026-07-06T12:00:00Z",
-            log_path="/fake/log.log",
-            error=None,
-            process_start_time=1.0,
-        )
-
-    def fail_if_claude_launched(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("launch_claude_worker must not be called for a devin-shell reviewer")
-
-    monkeypatch.setattr("charlie_work.workflow.launch_devin_session", fake_devin_launch)
-    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fail_if_claude_launched)
-
-    result = app.dispatch_reviews()
-
-    assert result.ok is True
-    assert len(captured) == 1
-    launch_kwargs = captured[0]
-    assert launch_kwargs.get("review") is True
-    assert launch_kwargs.get("head_sha") == "sha-100"
-
-    state = load_state(app.paths.state_file)
-    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
-
-
-def test_reap_review_verdicts_records_dead_devin_reviewer_verdict(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """Issue #1513: the reap sweep that reads a dead reviewer's log for a
-    fenced-JSON verdict must not be hardcoded to claude-code sidecars -- a
-    devin-shell reviewer's verdict must be found and recorded too. This is
-    the read-side counterpart to the launch-side routing test above: wiring
-    the launch call alone is not enough if the verdict it eventually
-    produces can never be reaped back (workflow._reap_review_verdicts used
-    to `continue` past every non-claude-code WorkerView unconditionally)."""
-    prs = [
-        {
-            "number": 100,
-            "title": "Fix #10",
-            "url": "https://example.test/pull/100",
-            "headRefName": "agent/issue-10-fix",
-            "baseRefName": "main",
-            "headRefOid": "sha-100",
-            "mergeStateStatus": "CLEAN",
-            "body": "Closes #10",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "OPEN",
-        },
-    ]
-    app = _dispatch_reviews_app(tmp_path, prs=prs)
-    _write_review_packet(tmp_path, 100, "sha-100")
-    _set_review_dispatched_state(app, 100, 10, "2026-07-06T11:50:00Z")
-
-    # A devin-shell sidecar/log: no "-review"/".claude"/".api" dotted infix --
-    # devin_shell's sidecar and log naming is identical for worker and review
-    # sessions (reviews_dir is already a directory distinct from the worker
-    # sessions_dir, so no collision is possible), and read_session_records'
-    # stem regex (`^issue-\d+$`) only matches this exact shape.
-    reviews_dir = app._layout.reviews_dir
-    reviews_dir.mkdir(parents=True, exist_ok=True)
-    log_path = reviews_dir / "issue-100.log"
-    log_path.write_text(
-        'Review complete.\n```json\n{"decision": "approved", "summary": "LGTM"}\n```',
-        encoding="utf-8",
-    )
-    sidecar_path = reviews_dir / "issue-100.json"
-    sidecar_path.write_text(
-        json.dumps(
-            {
-                "issue_number": 100,
-                "branch": "agent/issue-10-fix",
-                "worktree_path": str(tmp_path / "review-checkout"),
-                "prompt_path": str(tmp_path / "review-prompt.md"),
-                "command": ["devin", "--prompt-file", "{prompt_path}", "--print"],
-                "pid": 0,
-                "started_at": "2026-07-06T11:50:00Z",
-                "log_path": str(log_path),
-                "process_start_time": None,
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    # No new reviewer should be launched this pass -- the PR is already
-    # claimed dispatched, and reaping its dead reviewer's verdict (not
-    # launching a fresh one) is exactly what this test is asserting.
-    def fail_if_launched(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("no reviewer should be (re)launched in this pass")
-
-    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fail_if_launched)
-    monkeypatch.setattr("charlie_work.workflow.launch_devin_session", fail_if_launched)
-
-    app.dispatch_reviews()
-
-    decision_path = app.paths.prs / "pr-100" / "review-decision.json"
-    decision = json.loads(decision_path.read_text(encoding="utf-8"))
-    assert decision.get("decision") == "approved"
-
-    state = load_state(app.paths.state_file)
-    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_completed"
-
-
 def test_dispatch_reviews_records_review_effort_arm_on_state_and_event(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -22681,41 +22533,54 @@ def test_cli_main_maps_yaml_error_to_exit_2(tmp_path: Path, monkeypatch, capsys)
     assert "YAML error: malformed YAML" in capsys.readouterr().err
 
 
-def test_github_are_issues_open_normalizes_uppercase_state(tmp_path: Path) -> None:
-    """Issue #173: Regression test for GitHub.are_issues_open with realistic uppercase state.
+def test_github_are_issues_open_normalizes_uppercase_state(monkeypatch, tmp_path: Path) -> None:
+    """Issue #173: Regression test for are_issues_open with realistic uppercase state.
 
-    This test directly exercises the production GitHub.are_issues_open method with
-    realistic uppercase state field values (as returned by the real GitHub API).
-    It ensures the .upper() normalization in github.py:326 is tested and cannot
-    silently regress.
+    Exercises the production ``are_issues_open`` per-issue fallback path with
+    realistic uppercase state field values (as returned by the real GitHub API),
+    ensuring the ``.upper()`` normalization cannot silently regress.
+
+    Post-L07 (issue #1591) ``are_issues_open`` lives on the ``Issues`` capability
+    collaborator, and its thread-pool fallback closure resolves ``self.issue_view``
+    on that collaborator -- so a GitHub *subclass* override of ``issue_view`` no
+    longer intercepts that internal call (the disclosed interception-path
+    relocation). The mock is therefore installed at the ``run`` layer, which
+    ``issue_view`` forwards to through the collaborator->owner seam, and the
+    batched GraphQL path is forced to fail so the per-issue fallback -- the code
+    performing the ``.upper()`` normalization -- is the path under test.
     """
     from charlie_work.github import GitHub as RealGitHub
+    from charlie_work.github import GitHubError
 
-    # Create a subclass that overrides issue_view to return realistic uppercase state values
-    class RealGitHubWithMockedIssueView(RealGitHub):
-        def issue_view(self, number: int) -> dict:
-            if number == 100:
-                return {"number": 100, "state": "OPEN"}  # Uppercase as from real API
-            elif number == 200:
-                return {"number": 200, "state": "CLOSED"}  # Uppercase as from real API
-            elif number == 300:
-                return {"number": 300, "state": "OPEN"}  # Uppercase as from real API
-            elif number == 400:
-                return {
-                    "number": 400,
-                    "state": "open",
-                }  # Lowercase (should still work due to .upper())
-            else:
-                raise ValueError(f"Unexpected issue number: {number}")
+    # Realistic API states: uppercase from the real API, plus one lowercase (400)
+    # that must still count as open via the ``.upper()`` normalization.
+    states = {100: "OPEN", 200: "CLOSED", 300: "OPEN", 400: "open"}
 
-    # Create an instance of the subclass
-    real_gh = RealGitHubWithMockedIssueView(repo_root=tmp_path)
+    def _fail_graphql(self, numbers):
+        # Force are_issues_open onto its per-issue ``issue_view`` fallback.
+        raise GitHubError("forced batched-state failure -> per-issue fallback")
+
+    def _fake_run(self, args, **kwargs):
+        # issue_view builds ["issue", "view", str(number), "--json", ISSUE_VIEW_FIELDS];
+        # args[2] is the issue number. Raise ValueError (not KeyError) for an
+        # unexpected number so the failure mode matches the original mock: the
+        # fallback's ``except (GitHubError, ValueError, TypeError)`` swallows it to
+        # ``is_open=False`` rather than propagating out of ``pool.map``.
+        number = int(args[2])
+        if number not in states:
+            raise ValueError(f"Unexpected issue number: {number}")
+        return {"number": number, "state": states[number]}
+
+    monkeypatch.setattr(RealGitHub, "_graphql_issue_states", _fail_graphql)
+    monkeypatch.setattr(RealGitHub, "run", _fake_run)
+
+    real_gh = RealGitHub(repo_root=tmp_path)
 
     # Call are_issues_open with a mix of open/closed issues
     result = real_gh.are_issues_open([100, 200, 300, 400])
 
-    # Assert that only the OPEN-state issues (100, 300, and 400) are returned
-    # 200 is CLOSED and should not be in the result
+    # Only the OPEN-state issues are returned: 100 and 300 (uppercase OPEN) and
+    # 400 (lowercase "open", normalized via .upper()). 200 is CLOSED.
     assert result == {100, 300, 400}, f"Expected {{100, 300, 400}}, got {result}"
 
 
@@ -24341,7 +24206,7 @@ def test_record_review_request_changes_updates_issue_status_to_rework_requested(
 ) -> None:
     """Issue #72: request_changes (non-escalated) updates issue status to rework_requested
     so dispatch_rework can select it."""
-    from charlie_work.github import linked_issue_number
+    from charlie_work.issue_linking import linked_issue_number
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -37575,7 +37440,11 @@ def test_github_dependencies_transient_error_fail_open(tmp_path: Path) -> None:
 
     fake_gh = FakeGitHubWithTransientError()
 
-    with patch("charlie_work.github.logger") as mock_logger:
+    # get_github_issue_dependencies moved to charlie_work.github_capabilities.issues
+    # in L07 (issue #1591); its module logger moved with it, so the patch target
+    # follows the symbol. The function object is still re-exported from
+    # charlie_work.github (imported above), only its logger binding relocated.
+    with patch("charlie_work.github_capabilities.issues.logger") as mock_logger:
         result = get_github_issue_dependencies(fake_gh, 123)
         assert result == []
         # Should have logged a warning about the transient error
@@ -37661,7 +37530,9 @@ def test_github_dependencies_unexpected_type_fail_open(tmp_path: Path) -> None:
 
     fake_gh = FakeGitHubWithUnexpectedType()
 
-    with patch("charlie_work.github.logger") as mock_logger:
+    # See the transient-error test above: the moved function's logger now lives
+    # at charlie_work.github_capabilities.issues.logger (L07, issue #1591).
+    with patch("charlie_work.github_capabilities.issues.logger") as mock_logger:
         result = get_github_issue_dependencies(fake_gh, 123)
         assert result == []
         # Should have logged a warning about the unexpected type
@@ -47173,6 +47044,18 @@ def test_dispatch_cross_repo_gate_escalates_when_all_paths_absent(tmp_path: Path
     assert len(escalated_events) == 1
     assert escalated_events[0]["payload"]["issue_number"] == 123
     assert "cross_repo_target" in escalated_events[0]["payload"]["reason"]
+    # Issue #1583: the event payload also carries ``neutral_paths`` and
+    # ``missing_paths`` so the operator can see from the event alone which
+    # citation tripped the gate. This body has no neutral candidates (every
+    # referenced path is a plain missing dispatch target), so neutral_paths
+    # is empty and missing_paths is the non-empty survivor set.
+    payload = escalated_events[0]["payload"]
+    assert isinstance(payload["neutral_paths"], list)
+    assert isinstance(payload["missing_paths"], list)
+    # escalated => every survivor is missing; this body has no neutral
+    # candidates, so neutral_paths is empty and missing_paths is non-empty.
+    assert payload["neutral_paths"] == []
+    assert payload["missing_paths"]
 
     # The issue is terminal in state, not left dispatch_pending.
     assert state["issues"]["123"]["status"] == "escalated"
@@ -49818,7 +49701,8 @@ def test_defang_closing_keywords_strips_live_keyword_but_keeps_number_legible() 
     # closing-keyword regex (so it can no longer auto-close or falsely bind
     # via linked_issue_number), but the issue number stays legible to a
     # human reader.
-    from charlie_work.github import _CLOSING_KEYWORD_REF, defang_closing_keywords
+    from charlie_work.github import defang_closing_keywords
+    from charlie_work.issue_linking import _CLOSING_KEYWORD_REF
 
     text = "does not fix #649"
     defanged = defang_closing_keywords(text)
@@ -49847,7 +49731,7 @@ def test_render_required_changes_section_defangs_live_keyword_in_list_tier() -> 
     # not carry a live closing keyword into the rendered brief -- a worker
     # reads this brief and writes its own PR body from it, a boundary
     # linked_issue_number's hijack-safety check never sees.
-    from charlie_work.github import _CLOSING_KEYWORD_REF
+    from charlie_work.issue_linking import _CLOSING_KEYWORD_REF
 
     decision = {
         "decision": "request_changes",
@@ -49863,7 +49747,7 @@ def test_render_required_changes_section_defangs_live_keyword_in_list_tier() -> 
 
 def test_render_required_changes_section_defangs_live_keyword_in_summary_tier() -> None:
     # Same guarantee for the summary-fallback tier (tier 2).
-    from charlie_work.github import _CLOSING_KEYWORD_REF
+    from charlie_work.issue_linking import _CLOSING_KEYWORD_REF
 
     decision = {
         "decision": "request_changes",

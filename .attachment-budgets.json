@@ -1,12 +1,12 @@
 {
  "entries": [
   {
-   "boundary": 6.0,
+   "boundary": 8.5,
    "bumps": [],
-   "file": "src/charlie_work/github.py",
-   "identity": "GitHub",
+   "file": "src/charlie_work/github_capabilities/transport.py",
+   "identity": "Transport",
    "kind": "class",
-   "member_count": 53
+   "member_count": 12
   },
   {
    "boundary": 6.0,
@@ -30,14 +30,6 @@
    "identity": "OrchestratorApp",
    "kind": "class",
    "member_count": 130
-  },
-  {
-   "boundary": 6.0,
-   "bumps": [],
-   "file": "src/charlie_work/write_gate.py",
-   "identity": "WriteGate",
-   "kind": "class",
-   "member_count": 7
   },
   {
    "boundary": 41.0,
@@ -106,7 +98,7 @@
    "file": "tests/test_config.py",
    "identity": "tests/test_config.py::module",
    "kind": "test_module",
-   "member_count": 118
+   "member_count": 114
   },
   {
    "boundary": 41.0,
@@ -169,6 +161,14 @@
    "identity": "tests/test_github.py::module",
    "kind": "test_module",
    "member_count": 55
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_githublike_protocol.py",
+   "identity": "tests/test_githublike_protocol.py::module",
+   "kind": "test_module",
+   "member_count": 42
   },
   {
    "boundary": 41.0,

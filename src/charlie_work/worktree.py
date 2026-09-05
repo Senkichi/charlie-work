@@ -34,7 +34,8 @@ from .config import (
     WRITER_MARKER_FILENAME,
 )
 from . import git_pull_blockers
-from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
+from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS
+from .issue_linking import linked_issue_number
 from .janitor import _calculate_patch_id
 from . import layout
 from .paths import runtime_paths
