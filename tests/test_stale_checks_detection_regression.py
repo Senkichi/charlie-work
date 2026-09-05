@@ -41,8 +41,10 @@ production code:
 from __future__ import annotations
 
 import ast
+import inspect
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 from charlie_work.config import AutoMergeConfig, OrchestratorConfig
@@ -53,7 +55,6 @@ from charlie_work.workflow import OrchestratorApp
 from _fakes_github import FakeGitHub
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "charlie_work"
-_WORKFLOW_PY = _SRC_ROOT / "workflow.py"
 
 
 class _FakeGitHubWithRuns(FakeGitHub):
@@ -167,8 +168,24 @@ def test_runs_pending_not_missing_does_not_trigger(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _parse_workflow_py() -> ast.Module:
-    return ast.parse(_WORKFLOW_PY.read_text(encoding="utf-8"), filename=str(_WORKFLOW_PY))
+def _guard_member_modules() -> tuple[ModuleType, ...]:
+    """The distinct modules that host the two members this fence spans -- the
+    retrigger (which reads ``stale_checks_grace_minutes``) and the detector
+    (which must not). Both are located through ``OrchestratorApp`` so the scan
+    follows each member to whatever module a later leaf moves it into, instead
+    of hard-coding ``workflow.py``. Deduped by module object: before any leaf
+    splits them they share one module, afterwards they may differ.
+    """
+    modules: list[ModuleType] = []
+    for member in (
+        OrchestratorApp._attempt_stale_checks_retrigger,
+        OrchestratorApp._detect_ci_run_never_created,
+    ):
+        module = inspect.getmodule(member)
+        assert module is not None, f"could not locate module for {member!r}"
+        if module not in modules:
+            modules.append(module)
+    return tuple(modules)
 
 
 def _build_parent_map(tree: ast.AST) -> dict[int, ast.AST]:
@@ -197,24 +214,25 @@ def test_stale_checks_grace_minutes_never_referenced_inside_the_detector() -> No
     being threaded in under any call shape, not just a literal string match
     for "grace".
     """
-    tree = _parse_workflow_py()
-    parents = _build_parent_map(tree)
-
     referencing_functions: set[str | None] = set()
     total_references = 0
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr == "stale_checks_grace_minutes":
-            total_references += 1
-            referencing_functions.add(_enclosing_function_name(node, parents))
+    for module in _guard_member_modules():
+        source = inspect.getsource(module)
+        tree = ast.parse(source, filename=getattr(module, "__file__", module.__name__))
+        parents = _build_parent_map(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "stale_checks_grace_minutes":
+                total_references += 1
+                referencing_functions.add(_enclosing_function_name(node, parents))
 
-    # Positive control: the field IS referenced somewhere in workflow.py
+    # Positive control: the field IS referenced somewhere in the scanned source
     # (the retrigger-wait logic) -- an empty result here would mean the scan
-    # itself is broken (wrong attribute name, wrong file), not that the
+    # itself is broken (wrong attribute name, wrong module), not that the
     # invariant holds.
     assert total_references > 0, (
-        "expected at least one reference to stale_checks_grace_minutes in "
-        "workflow.py (the retrigger-wait logic) -- scan found none, which "
-        "means this test isn't actually exercising the field"
+        "expected at least one reference to stale_checks_grace_minutes in the "
+        "retrigger's module (the retrigger-wait logic) -- scan found none, "
+        "which means this test isn't actually exercising the field"
     )
     assert "_detect_ci_run_never_created" not in referencing_functions
     assert referencing_functions == {"_attempt_stale_checks_retrigger"}

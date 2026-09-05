@@ -863,7 +863,20 @@ _RATCHET_BASELINE: dict[str, int] = {
     # no self.write_gate receiver, matching the existing raw pattern in this
     # area. The ratchet holds at the new count until _loop_body's full
     # conversion wave.
-    "workflow.py": 198,
+    # Issue #1632 (Track 2 Phase B leaf L01 batch 1): verbatim extraction of
+    # the rework-routing and stale-checks member families out of workflow.py
+    # into two new charlie_work.orchestration submodules (bodies moved, write
+    # paths unchanged apart from the #1627 ``_wf.`` namespace rebind). 16 raw
+    # sites relocated out of workflow.py -- 8 into state_rework_routing.py and
+    # 8 into state_stale_checks.py -- so workflow.py's entry drops by exactly
+    # that 16 (198 -> 182) and each new module gets its own entry equal to its
+    # relocated count. This is the same total-preserving redistribution #1317
+    # sanctioned above ("only the newly-introduced module needs its own entry")
+    # for a byte-identical move that carried raw sites into a fresh module; the
+    # baseline-dict sum is unchanged, so no ratchet ceiling is loosened.
+    "workflow.py": 182,
+    "orchestration/state_rework_routing.py": 8,
+    "orchestration/state_stale_checks.py": 8,
     "dead_worker_reap.py": 11,
     # Issue #1423: +2 raw primitives in _reap_idle_foreign_writer (log_event
     # for the foreign_writer_reaped instrumentation event, and kill_orphan_pid

@@ -103,8 +103,9 @@ free functions and then deleting the shims -- the expensive part, calibrated
 against #1449 (27 names over 11 days) and deferred as a follow-on. Two further
 residuals the operator accepts: **zero new attachment points, but ~23 destination
 modules of which three exceed the repo's 800-line file convention** (Section 8.2,
-residual 4 -- there is no CI gate on file length, so this is a convention debt,
-disclosed not hidden), and the standard attribute-surface / hot-path / legibility
+residual 4 -- no CI check forces a file under 800, so this is a convention debt,
+disclosed not hidden; file length is still CI-gated by the high-water-mark
+ratchet, Section 2.4), and the standard attribute-surface / hot-path / legibility
 residuals. This document recommends the metric-exit-with-named-residual as
 Phase B's landing point and scopes the full-exit as an explicit follow-on, rather
 than presenting 7 as "god object dismantled."
@@ -236,11 +237,25 @@ the same 15 names wrapped in a class scan to **1** `class` point saturated at 8.
 This is why the free-function shape sizes against the repo's **800-line file
 convention** (a line count), not against a fence -- and APC deliberately never
 measures lines: `model.py:5-6` states "No line count is ever read anywhere in
-this package (binding operator constraint)." There is no file-length gate in
-charlie-work (`pyproject.toml`'s `line-length = 99` is ruff's per-line character
-width, not a file cap; no hook or CI check enforces file length). Destination
-module sizing (Section 5) is therefore a **repo convention with no CI backstop**;
-Section 8.2 residual 4 discloses where the plan exceeds it.
+this package (binding operator constraint)." The 800-line *convention* has no
+CI backstop (`pyproject.toml`'s `line-length = 99` is ruff's per-line character
+width, not a file cap; no hook or CI check forces a file under 800). File
+length **is** CI-gated, but by the file-size high-water-mark ratchet
+(`tests/test_file_size_ratchet.py::test_over_cap_files_do_not_exceed_high_water_mark`,
+issue #1442), not by the 800-convention: every tracked `*.py` file over the
+800-line cap has a per-file mark recorded in
+`file_size_ratchet_baseline.json` (repo root), and CI fails any PR whose tree
+leaves an over-cap file with MORE physical lines than its recorded mark. The
+mark only ever descends -- a shrink PR must run
+`python scripts/refresh_file_size_ratchet.py` (the sole baseline writer) and
+commit the lowered, quantized mark in the same PR; a growth PR must raise the
+mark by an explicit reviewed edit. The ratchet does NOT enforce the 800-line
+convention: an already-over-cap file like `workflow.py` (mark ~24k) is free to
+sit anywhere up to its mark, so destination module sizing against the 800-line
+convention (Section 5) remains a **repo convention with no CI backstop**, and
+Section 8.2 residual 4 discloses where the plan exceeds it. The two are
+distinct: the ratchet gates *growth past the recorded high-water mark*; the
+800-convention gates *nothing in CI*.
 
 **Fence stability under OA's own reduction (`fence_probe.py`):** as OA's count
 falls 133 -> 1 the fence is **invariant at 8.5** at every step (OA is a single
@@ -415,14 +430,26 @@ modules to see what `OrchestratorApp` exposes). That cost is disclosed as part o
 the legibility residual (Section 8.2, residual 3); it does not change the metric.
 
 **Effect on `workflow.py`'s own size.** The first draft worried about
-"`workflow.py`'s size ratchet." There is no such ratchet: `workflow.py` is a
-module, not an attachment point (Section 2.4), and APC reads no line counts, so
-`workflow.py`'s line count is governed only by the same 800-line *convention*,
-which it already vastly exceeds and which has no CI gate. Under this plan
-`workflow.py` **shrinks** substantially: ~14.6k lines of moved bodies leave (the
-19,288 total member lines minus the 4,635 residual lines that stay), replaced by
-one `_install_delegates(...)` call. The installer living in its own module keeps
-that one call, not 126 assignment lines, in `workflow.py`.
+"`workflow.py`'s size ratchet" and concluded there was none. That conclusion
+was wrong, and it caused the L01 b1 leaf to ship a ~2000-line shrink without
+tightening the baseline (review on PR #1643). `workflow.py` is a module, not an
+attachment point (Section 2.4), and APC reads no line counts -- but `workflow.py`'s
+line count IS CI-gated by the file-size high-water-mark ratchet
+(`tests/test_file_size_ratchet.py::test_over_cap_files_do_not_exceed_high_water_mark`,
+issue #1442), which records `workflow.py`'s mark in
+`file_size_ratchet_baseline.json` and fails any PR where `workflow.py` grows past
+it. The mark only descends. What has no CI gate is the 800-line *convention*
+(Section 2.4): the ratchet does not force `workflow.py` under 800, it only caps
+growth at the recorded high-water mark. Under this plan `workflow.py` **shrinks**
+substantially: ~14.6k lines of moved bodies leave (the 19,288 total member lines
+minus the 4,635 residual lines that stay), replaced by one
+`_install_delegates(...)` call. The installer living in its own module keeps that
+one call, not 126 assignment lines, in `workflow.py`. **Every move leaf that
+shrinks `workflow.py` MUST run `python scripts/refresh_file_size_ratchet.py` and
+commit the lowered, quantized mark in the same PR** -- otherwise the tightening
+goes unclaimed and the next leaf's growth headroom is looser than it should be.
+L01 b1 lowers the mark 24200 -> 22200 (live 22158, quantized up to the next
+multiple of 200).
 
 ### 3.3 Adapters (property / staticmethod)
 
@@ -476,6 +503,30 @@ Each round is a distinct gate (verification-ladder taxonomy in parentheses):
 
 The audit's outstanding-issue count is taken from each round's structured grep
 result, not re-derived from a report file (verification-ladder stall rule).
+
+### 4.1 Location-coupled guards (companion changes, from L01 b1)
+
+Some suite guards inspect a member's source, event kinds, or primitive-call
+count. When a leaf moves that member the guard must follow it: locate the source
+through the object or package (`inspect.getmodule` of the attribute, or `pkgutil`
+over `charlie_work.orchestration`), never the physical `workflow.py` path.
+Location-keyed allow-list entries repoint to the new module, reason unchanged;
+per-module ratchets redistribute total-preserving. Fixes ride the move-PR in a
+separate `test:` commit. L01 b1 touched six, one per shape:
+
+- Member count: assert lexical defs == committed `.attachment-budgets`
+  `member_count` and lexical + installed == 133 (one constant), not a hardcoded
+  count; the budget entry is legitimately file-keyed.
+- WriteGate ratchet: lower `workflow.py` by the raw calls that left and add a
+  per-module entry per destination; the baseline-dict sum is unchanged.
+- Event-kind allow-list: repoint the `(path, scope, source)` entry's path; the
+  key is path+function+source, not a line.
+- Detector fence: scan both members' host modules so the cross-member absence
+  assertion stays in scope.
+- Escalation-kind scan: union `workflow.py` and every orchestration submodule on
+  one shared call graph, so the escalators closure resolves across boundaries.
+
+Still `workflow.py`-keyed until its member moves: `test_exactly_one_workflow_runs_for_head...`.
 
 
 ## 5. Ordered leaf list (the Mikado leaves)
@@ -758,17 +809,23 @@ The operator is accepting four residuals:
    (Section 3.2 decision B) -- the surface is not statically visible in
    `workflow.py`; a reader must follow `_install_delegates` and the
    `orchestration/` modules to find an implementation.
-4. **Module-size-convention residual (no CI gate).** The move creates ~23 new
-   `orchestration/` modules. There is no `module` fence and no file-length gate
-   (Section 2.4), so none is an enforcement violation -- but **three modules
-   exceed the repo's 800-line file convention** because a single relocated body
-   does: the `_dispatch_impl` module (1795 loc), the `state_*` module housing
+4. **Module-size-convention residual (800-convention has no CI gate).** The
+   move creates ~23 new `orchestration/` modules. There is no `module` fence and
+   no CI check forces a file under the 800-line convention (Section 2.4), so
+   exceeding 800 is not an enforcement violation -- but **three modules exceed
+   the repo's 800-line file convention** because a single relocated body does:
+   the `_dispatch_impl` module (1795 loc), the `state_*` module housing
    `_dispatch_rework_impl` (1648 loc), and the `state_*` module housing
-   `record_review` (923 loc). A verbatim move cannot split a body, so these cannot
-   be brought under 800 at move time without a separate refactor of the method
-   itself (out of scope for a delegation PR). Disclosed as convention debt, not
-   hidden; the alternative (editing the body to split it during the move) would
-   violate the AST verbatim-move gate.
+   `record_review` (923 loc). File length IS CI-gated by the file-size
+   high-water-mark ratchet (Section 2.4): each new over-cap module requires an
+   explicit, reviewed baseline entry in `file_size_ratchet_baseline.json`, and
+   any later growth past that mark fails CI -- so these three over-800 modules
+   are convention debt (no gate forces 800), not ratchet-exempt (growth past
+   their recorded mark is still gated). A verbatim move cannot split a body, so
+   these cannot be brought under 800 at move time without a separate refactor of
+   the method itself (out of scope for a delegation PR). Disclosed as convention
+   debt, not hidden; the alternative (editing the body to split it during the
+   move) would violate the AST verbatim-move gate.
 
 ### 8.3 The full-exit path (recommended as a scoped follow-on, not Phase B)
 
