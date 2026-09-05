@@ -18,18 +18,11 @@
   },
   {
    "boundary": 6.0,
-   "bumps": [
-    {
-     "ack": "#1447",
-     "actor": "worker",
-     "reason": "post-ratchet regression re-crossing the just-locked 130 ceiling, PR #1447; acked reluctantly per operator decision 2026-09-02, issue 1458",
-     "to": 131
-    }
-   ],
+   "bumps": [],
    "file": "src/charlie_work/workflow.py",
    "identity": "OrchestratorApp",
    "kind": "class",
-   "member_count": 130
+   "member_count": 124
   },
   {
    "boundary": 41.0,
