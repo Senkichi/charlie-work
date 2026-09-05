@@ -124,6 +124,21 @@ def _parse_git_remote_url(url: str) -> tuple[str, str] | None:
 RECONCILE_PR_FIELDS = "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository,headRefOid,closedAt"
 RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels,state"
 
+# Narrow field list for ``_pr_checks_fallback``'s ``gh pr view --json
+# statusCheckRollup`` probe (issue #1609): the fallback needs only the rollup
+# to distinguish "no checks" from "checks unavailable", so it must not go
+# through the broader PR_VIEW_FIELDS (whose ``statusCheckRollup`` forces a
+# per-item GraphQL graph walk -- see the PR_CHECKS_FIELDS note in checks.py
+# and issue #361). Kept as a module-level constant rather than an inline
+# literal so the field-list lint
+# (tests/test_doctor.py::test_gh_field_lists_use_constants_no_inline_literals)
+# covers the single-positional-list ``self.run([...], json_output=True)`` call
+# shape this body uses -- the matcher's third branch, added by #1609, inspects
+# that shape; before the fix this call was skipped entirely because it lived in
+# ``github.py`` (the file the lint skips by design). It moved here with the
+# Transport body (Track 2, issue #1593, L09), exposing it to the lint.
+PR_STATUS_CHECK_ROLLUP_FIELDS = "statusCheckRollup"
+
 
 class Transport(CapabilityCollaborator):
     """Shared low-level transport capability collaborator.
@@ -304,7 +319,7 @@ class Transport(CapabilityCollaborator):
           warns against doing at this boundary.
         """
         result = self.run(
-            ["pr", "view", str(number), "--json", "statusCheckRollup"],
+            ["pr", "view", str(number), "--json", PR_STATUS_CHECK_ROLLUP_FIELDS],
             json_output=True,
             allow_failure=True,
         )
