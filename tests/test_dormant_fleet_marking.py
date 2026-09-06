@@ -115,7 +115,26 @@ def _sibling_imports(path: Path) -> set[str]:
 
 
 def _graph() -> dict[str, set[str]]:
-    return {p.stem: _sibling_imports(p) for p in sorted(SRC.glob("*.py"))}
+    graph = {p.stem: _sibling_imports(p) for p in sorted(SRC.glob("*.py"))}
+    # Track 2 Phase B (#1582): OrchestratorApp method bodies now live in
+    # `orchestration/*.py` delegate modules, re-attached onto the class at
+    # `charlie_work.workflow` import time by `workflow_delegation._install_delegates`
+    # (pkgutil discovery imports every submodule). A sibling module that a moved
+    # body is the sole top-level importer of would otherwise fall out of the
+    # reachability walk and be flagged false-dormant (issue #1671; L05/#1636 hit
+    # this on `module_map` when `_build_module_map_value` moved). The delegates ARE
+    # `workflow`'s methods in every sense that matters to reachability, so fold
+    # their sibling imports into the `workflow` node. This is the targeted
+    # `orchestration/` glob (top-level + orchestration/), NOT a recursive `rglob`:
+    # a plain rglob would pull in sibling subpackages and collide on shared
+    # basenames (`checks.py` / `labels.py` / `__main__.py`).
+    orchestration = SRC / "orchestration"
+    if orchestration.is_dir():
+        for path in sorted(orchestration.glob("*.py")):
+            if path.stem == "__init__":
+                continue
+            graph["workflow"] |= _sibling_imports(path)
+    return graph
 
 
 def _live_modules() -> set[str]:
