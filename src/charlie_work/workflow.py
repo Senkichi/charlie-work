@@ -5,13 +5,12 @@ import json
 import logging
 import re
 import time
-from dataclasses import asdict, dataclass, field, replace as dataclasses_replace
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .adapters import (
-    AdapterSettings,
     SessionDispatchResult,
     SessionRequest,
     cleanup_stale_session_tmp_files,
@@ -28,7 +27,6 @@ from .api_worker import launch_api_worker
 from .devin_shell import launch_devin_session
 from .checks import (
     CheckSummary,
-    compute_ratchetable_points,
     is_infra_blocked_check,
     summarize_checks,
 )
@@ -83,13 +81,6 @@ from .issue_comments import render_issue_comments
 from .markdown_fence import fenced_block
 from .module_map import build_module_map
 from .attachment_contracts import baseline as attachment_baseline
-from .attachment_contracts import hook_entry as attachment_hook_entry
-from .attachment_contracts.model import AdvisoryRecord
-from .attachment_contracts.review_delta import (
-    BudgetSection,
-    build_budget_findings,
-    reconstruct_baseline_head_text,
-)
 
 # LOAD-BEARING RE-EXPORT -- NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
@@ -115,7 +106,6 @@ from .janitor import (
     check_operator_containment,
     check_test_adequacy,
     is_stale_ci_verdict,
-    iter_diff_files,
     required_check_citation_names,
     run_janitor,
     DiffContentSignature,
@@ -4078,105 +4068,6 @@ class OrchestratorApp:
 
     def _render(self, template_name: str, values: dict[str, Any]) -> str:
         return render_prompt(template_name, values, search_dirs=self.prompt_dirs)
-
-    def _adapter_settings(self, *, adapter: str | None = None) -> AdapterSettings:
-        claude = self.config.claude_code
-        devin = self.config.devin
-        worker = self.config.worker
-        api_worker = self.config.api_worker
-        resolved_adapter = adapter if adapter is not None else worker.harness
-        # Use adapter-specific venv_source and worker_env
-        if resolved_adapter == "devin-shell":
-            venv_source = self._resolve(devin.venv_source) if devin.venv_source else None
-            worker_env = devin.worker_env
-        elif resolved_adapter == "claude-code":
-            venv_source = self._resolve(claude.venv_source) if claude.venv_source else None
-            worker_env = claude.worker_env
-        elif resolved_adapter == "api":
-            # api workers are Claude Code CLI processes with provider env
-            # injected, so they reuse the claude-code venv/env resolution
-            # (shared venv junction, worker_env overrides). The provider
-            # routing vars (ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL) are merged
-            # inside launch_api_worker, over any worker_env values, so an
-            # operator's worker_env cannot accidentally override the provider.
-            venv_source = self._resolve(claude.venv_source) if claude.venv_source else None
-            worker_env = claude.worker_env
-        else:
-            venv_source = None
-            worker_env = {}
-        return AdapterSettings(
-            adapter=resolved_adapter,
-            dispatch_command=devin.dispatch_command,
-            command_timeout_seconds=devin.command_timeout_seconds,
-            sessions_dir=self._layout.sessions_dir,
-            shell_command=devin.shell_command,
-            claude_command=claude.command,
-            worktrees_dir=self._layout.worktrees,
-            venv_source=venv_source,
-            worker_env=worker_env,
-            # worker.model is only meaningful for the harness it was resolved
-            # against (worker.harness). When `adapter` overrides the
-            # configured harness -- a fallback to a different adapter --
-            # fall back to devin.worker_model instead: role-config Phase 2 (Track E)
-            # deleted the dual-accept bridge that used to mirror worker.model
-            # onto devin.worker_model, so the two are independent config
-            # values again. devin.worker_model is now the dedicated,
-            # separately-configured model for a devin-shell fallback launch
-            # (set it explicitly if a routed fallback should pin a model);
-            # it is never overwritten by worker.model regardless of what the
-            # primary configured harness is.
-            worker_model=(
-                worker.model if resolved_adapter == worker.harness else devin.worker_model
-            ),
-            materialize_dirs=self.config.dispatch.materialize_dirs,
-            dry_run=self.dry_run,
-            base_ref=self.config.dispatch.base_ref,
-            tee_stream_json=claude.tee_stream_json,
-            launch_stagger_seconds=self.config.dispatch.launch_stagger_seconds,
-            api_worker_config=api_worker if resolved_adapter == "api" else None,
-            config=self.config,
-        )
-
-    def _rescue_adapter_settings(self) -> AdapterSettings:
-        """AdapterSettings for a rescue-tier rework dispatch (issue #555).
-
-        Mirrors the "claude-code" branch of ``_adapter_settings()`` exactly
-        (same venv/worker_env/command resolution), but forces
-        ``adapter="claude-code"`` regardless of the primary configured
-        ``worker.harness`` — the rescue tier always uses the claude-code
-        adapter — and overrides ``worker.model`` to ``rescue.worker_model``
-        via a one-off config copy. This is the "adapter/model overridden
-        from RescueConfig" the rescue rework reuses the existing
-        rework-dispatch path with, never a parallel launch path.
-
-        Role-config Phase 1.5: ``launch_claude_worker``'s single model-pin
-        enforcement point now reads ``resolved_config.worker.model`` (not
-        ``resolved_config.claude_code.model``) whenever no ``model_override``
-        is passed -- and this call site passes none, same as the primary
-        claude-code dispatch path. The override must therefore land on
-        ``worker.model``, not ``claude_code.model``, or the rescue tier would
-        silently launch with the ordinary worker model instead of the
-        stronger rescue model.
-        """
-        claude = self.config.claude_code
-        rescue_config = dataclasses_replace(
-            self.config,
-            worker=dataclasses_replace(self.config.worker, model=self.config.rescue.worker_model),
-        )
-        return AdapterSettings(
-            adapter="claude-code",
-            sessions_dir=self._layout.sessions_dir,
-            claude_command=claude.command,
-            worktrees_dir=self._layout.worktrees,
-            venv_source=self._resolve(claude.venv_source) if claude.venv_source else None,
-            worker_env=claude.worker_env,
-            materialize_dirs=self.config.dispatch.materialize_dirs,
-            dry_run=self.dry_run,
-            base_ref=self.config.dispatch.base_ref,
-            tee_stream_json=claude.tee_stream_json,
-            launch_stagger_seconds=self.config.dispatch.launch_stagger_seconds,
-            config=rescue_config,
-        )
 
     def _apply_concurrency_governor(
         self,
@@ -12250,262 +12141,6 @@ class OrchestratorApp:
             },
         )
 
-    def _build_attachment_budget_section(self, diff: str, pr_number: int) -> str:
-        """Build ``$attachment_budget_section`` for the review packet (#1460).
-
-        Cheap gate first: if `.attachment-budgets.json` is absent, or this
-        diff touches neither the baseline file itself nor any file that
-        currently hosts a baselined attachment point, the section renders
-        ``""`` -- the vast majority of PRs never approach this feature at
-        all, so nothing past the gate (diff-hunk reconstruction, advisories
-        read) runs for them.
-
-        Once gated in: the base-commit baseline text is read best-effort
-        (a ``TamperError``/``OSError`` degrades to "no entries", same as a
-        missing file -- this section is advisory-only and must never raise);
-        the PR-head text is reconstructed from the diff (or read straight off
-        disk when the baseline file itself isn't part of this diff); a
-        reconstruction failure sets ``head_unreadable`` rather than guessing.
-
-        Advisories are read best-effort, with "log file doesn't exist"
-        (``advisory_log_exists`` False) distinguished from "log exists but
-        has nothing relevant" -- only the former sets
-        ``advisories_unavailable``.
-
-        Issue #1466: the advisories source is now a two-tier fallback. The
-        PR-comment channel is tried FIRST -- the worker publishes a single
-        machine-readable PR comment (marker ``ADVISORY_COMMENT_MARKER`` +
-        fenced JSON array of its ``AdvisoryRecord`` entries) at PR-open time
-        and on subsequent pushes, because the worker's worktree-local
-        ``.var/attachment-contracts/advisories.jsonl`` is generally invisible
-        to the orchestrator's ``repo_root``. When a marker comment is present
-        (``parse_advisories_comment`` returns a tuple, even ``()``), that
-        channel wins and the local log is not consulted. Only when NO marker
-        comment exists does the builder fall back to the local advisories
-        file; and only when NEITHER channel is available does
-        ``advisories_unavailable`` fire the "log not available" NOTE.
-        """
-        marker_path = self.repo_root / attachment_baseline.BASELINE_FILENAME
-        if not marker_path.is_file():
-            return ""
-
-        changed_files = _diff_content_signature(diff).changed_files
-        baseline_touched = attachment_baseline.BASELINE_FILENAME in changed_files
-
-        try:
-            base_document = attachment_baseline.load(marker_path)
-            base_entries = attachment_baseline.entries_of(base_document)
-        except (attachment_baseline.TamperError, OSError):
-            base_entries = ()
-        hosts_baselined = changed_files & {entry.file for entry in base_entries}
-
-        if not (baseline_touched or hosts_baselined):
-            return ""
-
-        try:
-            base_baseline_text: str | None = marker_path.read_text(encoding="utf-8")
-        except OSError:
-            base_baseline_text = None
-
-        if baseline_touched:
-            file_diff_lines: list[str] = []
-            is_new_baseline_file = False
-            for name, is_new, hunks in iter_diff_files(diff):
-                if name == attachment_baseline.BASELINE_FILENAME:
-                    file_diff_lines = hunks
-                    is_new_baseline_file = is_new
-                    break
-            head_baseline_text = reconstruct_baseline_head_text(
-                None if is_new_baseline_file else base_baseline_text,
-                "\n".join(file_diff_lines),
-            )
-        else:
-            # Baseline file itself untouched by this diff: its head content
-            # is its base content.
-            head_baseline_text = base_baseline_text
-
-        if baseline_touched and head_baseline_text is None:
-            section = BudgetSection(
-                bumps=(),
-                blocking_bumps=(),
-                saturated_touched=(),
-                redirects_not_taken=(),
-                head_unreadable=True,
-                advisories_unavailable=False,
-            )
-        else:
-            advisories: tuple[AdvisoryRecord, ...] | None
-            # Issue #1466: prefer the worker-published PR-comment channel.
-            # ``_read_advisories_from_pr_comment`` returns ``None`` when no
-            # marker comment is present (fall back to the local log) and a
-            # tuple (possibly ``()``) when one is (that channel wins, even
-            # if empty -- a present marker with no records is a clean pass,
-            # not an unavailable channel).
-            pr_comment_advisories = self._read_advisories_from_pr_comment(pr_number)
-            if pr_comment_advisories is not None:
-                advisories = pr_comment_advisories
-            elif attachment_hook_entry.advisory_log_exists(self.repo_root):
-                advisories = attachment_hook_entry.read_advisories(self.repo_root)
-            else:
-                advisories = None
-            # Issue #1539: compute ratchetable points (live member count
-            # below baseline) for touched baselined hosts. The scan runs
-            # with content_overrides for the touched host files so it
-            # reflects PR-head member counts, not the base checkout's.
-            # Advisory-only: any failure degrades to no ratchetable rows,
-            # never raises -- mirroring the existing baseline-load
-            # try/except above. Lives in ``checks.py`` (the attachment-
-            # contracts tool's redirect destination) to keep
-            # ``OrchestratorApp`` at its baselined member-count ceiling.
-            ratchetable = compute_ratchetable_points(
-                self.repo_root, diff, head_baseline_text, hosts_baselined, changed_files
-            )
-            section = build_budget_findings(
-                base_baseline_text=base_baseline_text,
-                head_baseline_text=head_baseline_text,
-                changed_files=changed_files,
-                baseline_touched=baseline_touched,
-                advisories=advisories,
-                ratchetable=ratchetable,
-            )
-
-        return render_attachment_budget_section(section)
-
-    def _build_prior_review_section(
-        self,
-        pr_dir: Path,
-        prior_decision: dict[str, Any],
-        new_head_sha: str | None,
-    ) -> str:
-        """Render ``$prior_review_section`` for a round-2+ review packet.
-
-        Called when the prior decision is a terminal, non-pending verdict
-        with a recorded ``reviewed_head_sha``. Issue #1270 (W13): surfaces
-        EVERY archived round, not only the single most recent one -- a
-        finding raised in round 1, dropped in round 2, and reintroduced in
-        round 3 must be visible as such, not silently collapsed into "the
-        latest decision". Round content is read exclusively from the
-        ``rounds/round-K`` archive W11 built (``_round_history_entries`` in
-        ``rework_prompts.py``) -- never events.db, never
-        ``request_changes_count`` -- per the binding decision on #1270.
-        ``prior_decision`` (the flat, latest-verdict mirror the caller
-        already read) is consulted only as a fallback when the archive is
-        empty -- see ``_round_history_entries``'s docstring.
-
-        Two cases, the same distinction the pre-W13 single-round renderer
-        drew, now keyed off the MOST RECENT archived round instead of the
-        one ``prior_decision`` argument (which, once at least one round is
-        archived, is always exactly that round's own payload -- writer and
-        flat mirror are the same ``record_review`` call):
-
-        - **Moved head** (latest round's head != live head): a genuine
-          rework round. Every prior round's findings are listed, oldest
-          first, followed by an interdiff (latest reviewed head -> new
-          head) so the reviewer has somewhere to start, without losing
-          sight of the full diff: the interdiff is "start here," never
-          "only look here" -- the full diff stays attached and remains
-          authoritative for findings outside it.
-        - **Same head** (latest round's head == live head, issue #632
-          defect 3): a PR parked on ``agent:human-needed`` whose head has
-          not advanced, or an operator-corrected verdict. The diff is
-          identical, so no interdiff is generated; every round's findings
-          are still surfaced so a re-review can verify whether they still
-          apply or whether the verdict was corrected. Without this branch
-          the corrected verdict was invisible to the reviewer (the #510
-          case).
-
-        Fail-safe posture mirrors janitor.py's patch-id carry-forward
-        (``_calculate_patch_id``/``_check_no_op_rework``): every I/O call
-        here (``compare_diff``) already returns errors as values (``None``),
-        never raises, so a failed/unavailable comparison (404, GC'd SHA,
-        rebase/divergence, gh failure) just omits the interdiff and says so
-        -- it never blocks packet generation.
-        """
-        rounds_dir = pr_dir / "rounds"
-        entries = _round_history_entries(rounds_dir, fallback_decision=prior_decision)
-        if not entries:
-            return ""
-
-        latest_decision = entries[-1][1]
-        prior_head_sha = latest_decision.get("reviewed_head_sha")
-        same_head = bool(prior_head_sha) and prior_head_sha == new_head_sha
-        round_word = "round" if len(entries) == 1 else "rounds"
-
-        lines = ["", f"## Prior review{' (same head)' if same_head else ''}", ""]
-        if same_head:
-            lines.append(
-                f"A prior review of this head (`{prior_head_sha}`) recorded decision "
-                f"**{latest_decision.get('decision') or 'unknown'}**. The diff has not "
-                "changed since that review. Findings from every prior "
-                f"{round_word} are listed below, oldest first -- verify whether "
-                "each still applies or whether the verdict was corrected (e.g. "
-                "by an operator hand-edit)."
-            )
-        else:
-            lines.append(
-                f"This PR has {len(entries)} prior review {round_word}. Findings "
-                "from EVERY round are listed below, oldest first -- a finding "
-                "raised in an earlier round is still in scope even if a later "
-                "round's summary did not repeat it."
-            )
-        lines.append("")
-
-        for round_number, round_decision in entries:
-            decision_label = round_decision.get("decision") or "unknown"
-            round_head = round_decision.get("reviewed_head_sha") or "unknown"
-            lines.append(
-                f"### Round {round_number} (decision: {decision_label}, head `{round_head}`)"
-            )
-            lines.append("")
-            findings = _render_round_findings(round_decision)
-            lines.append(findings if findings else "_No findings recorded for this round._")
-            lines.append("")
-
-        # #1270 (W13): `_render_round_findings` strips
-        # `_EXTERNAL_FINDINGS_POINTER` from each round's rendering -- its
-        # wording is worker-brief-framed ("...none of which reach this
-        # brief") and, unlike the brief (rendered once per PR), a
-        # round-history section would otherwise repeat it once per round.
-        # One reviewer-framed reminder for the whole section replaces it.
-        lines.append(
-            "The findings above come from the orchestrator's own reviewer, "
-            "across every round. They are not necessarily the only ones -- "
-            "a human or a peer agent may have posted verified findings as "
-            "PR comments, review bodies, or inline review threads. Read the "
-            "PR's review comments and review threads on GitHub before you "
-            "start, and address what you find there too."
-        )
-        lines.append("")
-
-        if same_head:
-            lines.append(
-                "No interdiff is needed -- the head is unchanged. Re-examine "
-                "the full diff and confirm or overturn the prior verdict."
-            )
-            lines.append("")
-            return "\n".join(lines)
-
-        interdiff_text = None
-        if prior_head_sha and new_head_sha:
-            interdiff_text = self.gh.compare_diff(str(prior_head_sha), str(new_head_sha))
-        if interdiff_text and interdiff_text.strip():
-            interdiff_path = pr_dir / "interdiff.patch"
-            interdiff_path.write_text(interdiff_text, encoding="utf-8")
-            lines.append(
-                f"Interdiff (most recent reviewed head to this head): `{interdiff_path}`. "
-                "Verify the findings above are addressed there first -- but the "
-                "full diff remains authoritative; findings outside the interdiff "
-                "are still in scope."
-            )
-        else:
-            lines.append(
-                "Prior-head comparison was unavailable (rebase, divergence, or an "
-                "API error) -- no interdiff could be generated. Review the full "
-                "diff as usual, with the findings above in mind."
-            )
-        lines.append("")
-        return "\n".join(lines)
-
     def reconcile(
         self,
         *,
@@ -14330,19 +13965,6 @@ class OrchestratorApp:
             if fleet_lock is not None:
                 fleet_lock.release()
 
-    def _merged_pr_referenced_issue_numbers(
-        self,
-        issues: list[dict[str, Any]],
-        merged_prs: list[dict[str, Any]],
-    ) -> tuple[set[int], set[int], set[int], dict[int, list[int]]]:
-        """Thin wrapper for ``scan_merged_pr_references`` (issue #1337 moved
-        the implementation to ``backlog_reachability.py`` so the mention-PR
-        tracking it added does not grow the monolith past its ratchet
-        high-water mark). See ``scan_merged_pr_references``'s docstring for
-        the return-tuple semantics.
-        """
-        return scan_merged_pr_references(issues, merged_prs, self.config.dispatch.branch_prefix)
-
     def _mention_rearmed_issue_numbers(
         self,
         mention_only: set[int],
@@ -14611,22 +14233,6 @@ class OrchestratorApp:
         if all_blockers:
             self.gh.are_issues_open(sorted(all_blockers))
 
-    def _get_open_blockers(self, issue: dict[str, Any]) -> tuple[list[int], list[int]]:
-        """Check if an issue has any open blocker issues.
-
-        Parses the issue body for blocker declarations and checks GitHub's
-        native issue dependencies. Returns both declared blockers and open blockers.
-
-        Args:
-            issue: The issue dict from GitHub API
-
-        Returns:
-            Tuple of (declared_blockers, open_blockers). Both are lists of issue numbers.
-            declared_blockers includes all blockers mentioned in the issue body or
-            GitHub dependencies. open_blockers is the subset that are currently open.
-        """
-        return _get_open_blockers_for_issue(self.gh, issue)
-
     @staticmethod
     def _is_dead_blocker(
         blocker_number: int,
@@ -14890,34 +14496,6 @@ class OrchestratorApp:
             issue_dir.mkdir(parents=True, exist_ok=True)
             prompt_path.write_text(prompt, encoding="utf-8")
         return prompt_path
-
-    def _write_rework_prompt(
-        self, pr: dict[str, Any], issue_number: int | None, dispatch_note: str
-    ) -> Path:
-        return _write_rework_prompt(
-            self.paths.state_file,
-            pr,
-            issue_number,
-            dispatch_note,
-            self.config,
-            repo_root=self.repo_root,
-        )
-
-    def _fetch_commit_retrying(self, sha: str, *, leg: str) -> tuple[dict[str, Any] | None, str]:
-        """Thin delegate to ``queue_sync_coverage._fetch_commit_retrying``.
-
-        Kept as a bound method (rather than inlining the free-function call
-        at each call site) so any existing or future monkeypatch of
-        ``self._fetch_commit_retrying`` keeps working, mirroring
-        ``_write_rework_prompt``'s wrapper shape.
-        """
-        return _fetch_commit_retrying(self.gh, sha, leg=leg)
-
-    def _fetch_compare_retrying(
-        self, base: str, head: str, *, leg: str
-    ) -> tuple[dict[str, Any] | None, str]:
-        """Thin delegate to ``queue_sync_coverage._fetch_compare_retrying``."""
-        return _fetch_compare_retrying(self.gh, base, head, leg=leg)
 
     def _queue_sync_merge_covered(
         self,
