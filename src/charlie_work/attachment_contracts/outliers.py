@@ -12,10 +12,12 @@ outlier fence) over that kind's own population.
 from __future__ import annotations
 
 import math
+from typing import Mapping
 
 from charlie_work.attachment_contracts.model import (
     AttachmentPoint,
     Kind,
+    KindStats,
     SaturationVerdict,
 )
 
@@ -53,13 +55,14 @@ def _quartiles(counts: list[int]) -> tuple[float, float]:
     return q1, q3
 
 
-def saturate(points: tuple[AttachmentPoint, ...], kind: Kind) -> tuple[SaturationVerdict, ...]:
-    """Compute saturation verdicts for every non-ledger AttachmentPoint of `kind`.
+def _eligible_points(
+    points: tuple[AttachmentPoint, ...], kind: Kind
+) -> tuple[AttachmentPoint, ...]:
+    """Same-kind, non-ledger, non-trivial, >=1-member attachment points.
 
-    Ledger attachment points (is_linear_ledger=True) are excluded from the
-    distribution entirely (they never contribute to Q1/Q3) and are never
-    saturated themselves — they get no verdict at all. Points of other kinds
-    are not in this call's population; call once per kind.
+    Shared by ``saturate`` (live fence) and ``saturate_with_fence`` (frozen
+    fence): eligibility is a property of the points, not of which fence is
+    applied, so the two paths must filter identically (issue #1614).
     """
     same_kind = tuple(p for p in points if p.kind == kind)
     # An AP with zero bound members is not evidence about the god-object
@@ -79,11 +82,28 @@ def saturate(points: tuple[AttachmentPoint, ...], kind: Kind) -> tuple[Saturatio
     # empty @dataclass shells, Fake*/Test* doubles -- see archetypes.py) are
     # excluded from the population the same way ledgers are, regardless of
     # their member count.
-    eligible = tuple(
+    return tuple(
         p
         for p in same_kind
         if not p.is_linear_ledger and not p.is_structurally_trivial and p.member_count >= 1
     )
+
+
+def saturate(points: tuple[AttachmentPoint, ...], kind: Kind) -> tuple[SaturationVerdict, ...]:
+    """Compute saturation verdicts for every non-ledger AttachmentPoint of `kind`.
+
+    Ledger attachment points (is_linear_ledger=True) are excluded from the
+    distribution entirely (they never contribute to Q1/Q3) and are never
+    saturated themselves — they get no verdict at all. Points of other kinds
+    are not in this call's population; call once per kind.
+
+    This is the LIVE fence: ``boundary = q3 + 1.5*iqr`` is derived from the
+    CURRENT population. ``check_tree`` and ``compare`` use
+    ``saturate_with_fence`` against a frozen ``KindStats`` instead (issue
+    #1614); this function remains the recomputation path used by
+    ``generate``, ``--refreeze``, ``backtest``, and ``redirect.suggest``.
+    """
+    eligible = _eligible_points(points, kind)
     counts = [p.member_count for p in eligible]
     population = len(counts)
 
@@ -136,6 +156,53 @@ def saturate(points: tuple[AttachmentPoint, ...], kind: Kind) -> tuple[Saturatio
     )
 
 
+def saturate_with_fence(
+    points: tuple[AttachmentPoint, ...], kind: Kind, stats: KindStats
+) -> tuple[SaturationVerdict, ...]:
+    """Saturate live points of ``kind`` against a FROZEN ``KindStats`` (issue #1614).
+
+    Eligibility is filtered exactly as in ``saturate`` (via ``_eligible_points``)
+    so the frozen and live paths cannot drift on which points enter the test.
+    The fence itself is NOT recomputed: every verdict carries the frozen
+    ``q3``/``iqr``/``boundary``/``population``. The FLOOR and degenerate-fence
+    (iqr==0) guards are reproduced against the FROZEN decision (``stats``
+    captures the population/iqr at freeze time), so a kind that was below FLOOR
+    or degenerate at freeze time saturates nothing until an explicit
+    ``--refreeze`` -- even if the live population has since grown past FLOOR.
+    That is the intended freeze semantics: the exit criterion for shrinking a
+    saturated class is a frozen target, not a moving one.
+    """
+    eligible = _eligible_points(points, kind)
+
+    if stats.population < FLOOR or stats.iqr == 0.0:
+        # Frozen decision was "no meaningful fence" -- nothing of this kind
+        # saturates regardless of how the live population has shifted, until
+        # an explicit re-baseline / --refreeze recomputes the statistics.
+        return tuple(
+            SaturationVerdict(
+                point=p,
+                saturated=False,
+                q3=stats.q3,
+                iqr=stats.iqr,
+                boundary=stats.boundary,
+                population=stats.population,
+            )
+            for p in eligible
+        )
+
+    return tuple(
+        SaturationVerdict(
+            point=p,
+            saturated=p.member_count > stats.boundary,
+            q3=stats.q3,
+            iqr=stats.iqr,
+            boundary=stats.boundary,
+            population=stats.population,
+        )
+        for p in eligible
+    )
+
+
 def saturate_all(
     points: tuple[AttachmentPoint, ...], kinds: tuple[Kind, ...]
 ) -> tuple[SaturationVerdict, ...]:
@@ -148,4 +215,24 @@ def saturate_all(
     verdicts: list[SaturationVerdict] = []
     for kind in kinds:
         verdicts.extend(saturate(points, kind))
+    return tuple(verdicts)
+
+
+def saturate_all_with_fences(
+    points: tuple[AttachmentPoint, ...], kind_stats: Mapping[Kind, KindStats]
+) -> tuple[SaturationVerdict, ...]:
+    """Run ``saturate_with_fence`` across every frozen kind, concatenating verdicts.
+
+    Only kinds present in ``kind_stats`` receive verdicts -- a kind that
+    appeared in the live tree but has no frozen statistics (e.g. a brand-new
+    archetype since the last freeze) gets no verdict at all, so it cannot
+    produce a block finding until an explicit re-baseline / ``--refreeze``
+    records its fence. That is the intended freeze semantics (issue #1614):
+    the fence is a frozen target, and a kind with no frozen target has no
+    target to test against. ``kind_stats`` is iterated in sorted-key order
+    for deterministic output.
+    """
+    verdicts: list[SaturationVerdict] = []
+    for kind in sorted(kind_stats):
+        verdicts.extend(saturate_with_fence(points, kind, kind_stats[kind]))
     return tuple(verdicts)

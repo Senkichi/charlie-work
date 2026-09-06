@@ -66,6 +66,28 @@ class SaturationVerdict:
 
 
 @dataclass(frozen=True)
+class KindStats:
+    """Frozen per-kind Tukey fence statistics (issue #1614).
+
+    The fence (``boundary = q3 + 1.5*iqr``) is computed once at baseline /
+    ``--refreeze`` time over the then-current eligible population and persisted
+    into the baseline document. ``check_tree`` and ``compare`` saturate live
+    points against this frozen boundary instead of recomputing it on every
+    scan, so a PR that adds or removes one ordinary module can no longer churn
+    baseline entries for files it never touched. ``population`` and ``iqr``
+    are stored alongside ``boundary`` so the FLOOR and degenerate-fence
+    (iqr==0) guards can be reproduced against the frozen decision rather than
+    a live population.
+    """
+
+    kind: Kind
+    q3: float
+    iqr: float
+    boundary: float
+    population: int
+
+
+@dataclass(frozen=True)
 class Finding:
     """One actionable result from check_file / check_tree."""
 
