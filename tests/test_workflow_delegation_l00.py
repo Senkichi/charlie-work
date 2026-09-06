@@ -281,6 +281,25 @@ def test_install_delegates_is_idempotent() -> None:
     assert _Owner().again() == "ok"
 
 
+def test_install_delegates_empty_routes_is_noop() -> None:
+    """An empty modules tuple installs nothing and does not raise -- the
+    degenerate case the old L00 discovery test covered against the then-empty
+    ``charlie_work.orchestration`` package (``_install_delegates(_Owner, ())``).
+    That assertion was dropped in batch 1 once the real package became non-empty;
+    re-added here as a self-contained synthetic one-liner (batch-1 review finding
+    [2], #1645) so the installer's no-work path stays covered independent of the
+    live package's contents."""
+
+    class _Owner:
+        pass
+
+    wd._install_delegates(_Owner, ())  # empty routes must not raise
+    # The installer stamps its ``_INSTALLED_MARKER`` bookkeeping set, but it is
+    # empty and no delegate methods land on the owner.
+    assert frozenset(vars(_Owner).get(wd._INSTALLED_MARKER, frozenset())) == frozenset()
+    assert not [name for name in vars(_Owner) if not name.startswith("__")]
+
+
 def test_reinstall_during_active_patch_preserves_patch() -> None:
     """Re-running the installer while a class-level ``mock.patch.object`` is
     active must NOT clobber the patch: the already-installed name is a genuine

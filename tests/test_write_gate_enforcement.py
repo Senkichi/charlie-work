@@ -874,9 +874,33 @@ _RATCHET_BASELINE: dict[str, int] = {
     # sanctioned above ("only the newly-introduced module needs its own entry")
     # for a byte-identical move that carried raw sites into a fresh module; the
     # baseline-dict sum is unchanged, so no ratchet ceiling is loosened.
-    "workflow.py": 182,
+    #
+    # Issue #1645 (Track 2 Phase B leaf L01 batch 2): verbatim extraction of ten
+    # more OrchestratorApp members (review-recording, rework-dispatch,
+    # rework-to-review routing, rescue, mechanical de-escalation, unauthorized-
+    # merge baseline, and the stale-CI verdict-requeue emitter) into six new
+    # charlie_work.orchestration submodules plus an append to state_stale_checks.
+    # Bodies moved byte-identically apart from the #1627 ``_wf.`` namespace
+    # rebind. 47 raw sites relocated out of workflow.py -- 5 into
+    # state_record_review.py, 36 into state_dispatch_rework.py, 2 into
+    # state_rework_review.py, 2 into state_rescue.py, 1 into
+    # state_unauthorized_merge.py, and 1 appended to state_stale_checks.py (8 ->
+    # 9); state_mechanical.py carries zero raw sites so needs no entry. As in
+    # #1632/#1317, this is a total-preserving redistribution: workflow.py's entry
+    # drops by exactly that 47 (182 -> 135) and each destination gains its
+    # relocated count, so the baseline-dict sum is unchanged and no ratchet
+    # ceiling is loosened. (workflow.py's measured raw count at this PR's base is
+    # 178, i.e. 4 below the recorded 182; that pre-existing slack is carried
+    # forward here rather than tightened, keeping this a pure move commit's
+    # guard update.)
+    "workflow.py": 135,
     "orchestration/state_rework_routing.py": 8,
-    "orchestration/state_stale_checks.py": 8,
+    "orchestration/state_stale_checks.py": 9,
+    "orchestration/state_record_review.py": 5,
+    "orchestration/state_dispatch_rework.py": 36,
+    "orchestration/state_rework_review.py": 2,
+    "orchestration/state_rescue.py": 2,
+    "orchestration/state_unauthorized_merge.py": 1,
     "dead_worker_reap.py": 11,
     # Issue #1423: +2 raw primitives in _reap_idle_foreign_writer (log_event
     # for the foreign_writer_reaped instrumentation event, and kill_orphan_pid

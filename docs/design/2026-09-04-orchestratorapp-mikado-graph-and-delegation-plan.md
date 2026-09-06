@@ -512,7 +512,7 @@ through the object or package (`inspect.getmodule` of the attribute, or `pkgutil
 over `charlie_work.orchestration`), never the physical `workflow.py` path.
 Location-keyed allow-list entries repoint to the new module, reason unchanged;
 per-module ratchets redistribute total-preserving. Fixes ride the move-PR in a
-separate `test:` commit. L01 b1 touched six, one per shape:
+separate `test:` commit. L01 b1 touched five, one per shape:
 
 - Member count: assert lexical defs == committed `.attachment-budgets`
   `member_count` and lexical + installed == 133 (one constant), not a hardcoded

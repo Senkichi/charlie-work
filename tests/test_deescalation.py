@@ -44,6 +44,7 @@ from __future__ import annotations
 import ast
 import importlib
 import importlib.util
+import inspect
 import pkgutil
 from pathlib import Path
 
@@ -917,17 +918,26 @@ def test_pass_event_records_why_each_candidate_was_skipped(
 # ---------------------------------------------------------------------------
 
 
-def _workflow_ast() -> ast.Module:
-    spec = importlib.util.find_spec("charlie_work.workflow")
-    assert spec is not None and spec.origin is not None
-    return ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
-
-
 def _deescalate_issue_func() -> ast.FunctionDef:
-    for node in ast.walk(_workflow_ast()):
-        if isinstance(node, ast.FunctionDef) and node.name == "_deescalate_mechanical_issue":
+    # Locate ``_deescalate_mechanical_issue`` through its installed delegate on
+    # ``OrchestratorApp`` and parse whatever module now hosts it, so this
+    # structural guard follows the member wherever a leaf moves it (Track 2
+    # Phase B leaf L01 batch 2, #1645, relocated it into
+    # ``charlie_work.orchestration.state_mechanical``) instead of hard-coding
+    # ``workflow.py``. Mirrors the member-following scan pattern batch 1
+    # introduced in test_stale_checks_detection_regression.py's
+    # ``_guard_member_modules``.
+    member = OrchestratorApp._deescalate_mechanical_issue
+    module = inspect.getmodule(member)
+    assert module is not None and getattr(module, "__file__", None) is not None
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_deescalate_mechanical_issue"
+        ):
             return node
-    raise AssertionError("_deescalate_mechanical_issue not found in workflow.py")
+    raise AssertionError(f"_deescalate_mechanical_issue not found in {module.__name__}")
 
 
 def test_deescalate_mechanical_issue_never_returns_none() -> None:
@@ -969,8 +979,14 @@ def test_skip_reason_vocabulary_is_derived_from_the_branches() -> None:
         node.args[0].value
         for node in ast.walk(func)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "_deescalation_skip"
+        # Match both the bare ``_deescalation_skip(...)`` call (as written when
+        # this member lived in workflow.py) and the ``_wf._deescalation_skip(...)``
+        # attribute form produced by leaf L01's #1627 namespace rebind once the
+        # member moved into a charlie_work.orchestration submodule (#1645).
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == "_deescalation_skip")
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == "_deescalation_skip")
+        )
         and node.args
         and isinstance(node.args[0], ast.Constant)
     ]
