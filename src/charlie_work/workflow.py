@@ -27,15 +27,10 @@ from .api_worker import launch_api_worker
 from .devin_shell import launch_devin_session
 from .checks import (
     CheckSummary,
-    is_infra_blocked_check,
     summarize_checks,
 )
 from .citation_check import (
     CitationVerdict,
-    drift_fingerprint as citation_drift_fingerprint,
-    drifted_verdicts as drifted_citation_verdicts,
-    format_verdict_status_cell,
-    verify_citations,
 )
 from .config import (
     ApiWorkerConfig,
@@ -53,7 +48,6 @@ from .fleet_registry import count_fleet_live_sessions, managed_repo_names, try_a
 from . import layout, status_snapshot
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 from .notify import AttentionDigest, AttentionEntry, emit_digest
-from .subprocess_runner import run_captured
 from .rescue_review import (
     LEGACY_VACUOUS_SUMMARY,
     run_cross_family_review,  # noqa: F401  (deliberate re-export; patched on the workflow module in tests)
@@ -68,7 +62,6 @@ from .github import (
     GraphQLBudgetError,
     build_branch_issue_validator,
     cancel_superseded_runs,
-    defang_closing_keywords,
     detect_prose_only_dependencies,
     get_github_issue_dependencies,
     issue_numbers_mentioned_by_pr,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
@@ -77,7 +70,6 @@ from .github import (
     is_transient_repo_resolution_failure,
 )
 from .issue_linking import linked_issue_number
-from .issue_comments import render_issue_comments
 from .markdown_fence import fenced_block
 from .module_map import build_module_map
 from .attachment_contracts import baseline as attachment_baseline
@@ -101,12 +93,11 @@ from .cross_pr_revert import (  # noqa: F401  (deliberate re-export)
     detect_cross_pr_revert,
 )
 from .janitor import (
-    _calculate_patch_id,
-    _diff_content_signature,
+    _calculate_patch_id,  # noqa: F401  (deliberate re-export; patched on the workflow module in tests)
+    _diff_content_signature,  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/state_record_review.py)
     check_operator_containment,
     check_test_adequacy,
     is_stale_ci_verdict,
-    required_check_citation_names,
     run_janitor,
     DiffContentSignature,
     JanitorVerdict,
@@ -137,7 +128,6 @@ from .reconcile import (
 )
 from .review_decision import (
     record_decision,
-    resolve_decision_payload,
     review_decision,
 )
 from .safe_ref import require_valid_sha
@@ -6416,56 +6406,6 @@ class OrchestratorApp:
             data,
         )
 
-    def _enrich_checks_infra_blocked(
-        self, checks: list[dict[str, Any]] | None, required: tuple[str, ...]
-    ) -> list[dict[str, Any]]:
-        """Reclassify FAILURE required checks as ``INFRA_BLOCKED`` at the
-        check-ingestion data boundary (issue #1383).
-
-        Single point of enforcement for the infra_blocked classification: a
-        required check whose FAILED job shows structural evidence of a
-        non-started job (zero non-setup steps / instant-fail) or a
-        config-listed billing annotation is rewritten to the
-        ``INFRA_BLOCKED`` marker state before ``summarize_checks`` (and
-        therefore the janitor gate / rework-routing decision) ever sees it.
-        ``summarize_checks`` then routes it to ``CheckSummary.infra_blocked``
-        rather than ``failed``, so it never enters the "required checks
-        failed -> dispatch rework" path and never burns a rework attempt.
-
-        Kept as an OrchestratorApp method (not a pure function in
-        ``checks.py``) because the structural + annotation signals require
-        two ``gh`` API calls per FAILURE check (``actions_job`` /
-        ``check_run_annotations``) -- I/O that the pure
-        ``summarize_checks``/``is_infra_blocked_check`` layer must not
-        perform. Both API methods return safe empty values (``None`` / ``[]``)
-        on any GitHub failure and never raise, so an unenrichable check
-        degrades to ordinary ``failed`` routing rather than crashing
-        ingestion -- mirroring the existing ``merge_ready`` enrichment this
-        replaces.
-
-        Called before the janitor gate in ``review()`` (the rework-routing
-        path) and in ``merge_ready()`` (the merge-execution path) so both
-        paths classify budget-failed checks identically.
-        """
-        if not checks or not required:
-            return list(checks or [])
-        cfg = self.config.auto_merge.infra_blocked
-        if not cfg.enabled:
-            return list(checks)
-        required_set = set(required)
-        enriched: list[dict[str, Any]] = []
-        for check in checks:
-            name = str(check.get("name") or "")
-            if name in required_set and str(check.get("state") or "").upper() == "FAILURE":
-                check_run_id = check.get("databaseId")
-                if isinstance(check_run_id, int):
-                    job = self.gh.actions_job(check_run_id)
-                    annotations = self.gh.check_run_annotations(check_run_id)
-                    if job is not None and is_infra_blocked_check(job, annotations, cfg):
-                        check = {**check, "state": "INFRA_BLOCKED"}
-            enriched.append(check)
-        return enriched
-
     @_guard_state_lock
     def review(
         self,
@@ -12626,41 +12566,6 @@ class OrchestratorApp:
 
         return results
 
-    def _merge_not_ready_result(
-        self,
-        pr_number: int,
-        issue_number: int | None,
-        decision: dict[str, Any],
-        existing_pr_state: dict[str, Any],
-    ) -> CommandResult:
-        """Return a non-mergeable result for an approved PR that is not the train head."""
-        return CommandResult(
-            True,
-            f"PR #{pr_number} is not the head of the merge-train queue",
-            {
-                "pr": pr_number,
-                "issue": issue_number,
-                "can_merge": False,
-                "auto_merge_enabled": self.config.auto_merge.enabled,
-                "merged": False,
-                "merge_output": None,
-                "branch_deleted": None,
-                "review_decision": decision,
-                "checks": asdict(summarize_checks([], self.config.auto_merge.required_checks)),
-                "checks_unavailable": False,
-                "label_error": None,
-                "update_open_prs_results": None,
-                "cancel_superseded_runs_results": None,
-                "containment_warnings": [],
-                "consecutive_failed_merge_attempts": existing_pr_state.get(
-                    "consecutive_failed_merge_attempts", 0
-                ),
-                "merge_attempt_alarm": False,
-                "merge_attempt_warning": None,
-                "merge_conflict": False,
-            },
-        )
-
     def _detect_ci_run_never_created(
         self,
         pr: dict[str, Any],
@@ -12782,148 +12687,6 @@ class OrchestratorApp:
         if not isinstance(issue, dict) or "labels" not in issue:
             return False
         return bool(set(self.config.dispatch.human_merge_labels) & label_names(issue))
-
-    def _is_stale_ci_request_changes(self, pr_number: int, decision: dict[str, Any]) -> bool:
-        """True when ``decision`` is a request_changes verdict whose only
-        findings cite required checks that are all green on the live head
-        (issue #1111 staleness predicate, network half).
-
-        The pure text-shape check (``required_check_citation_names``) runs
-        first so ``gh pr checks`` is only fetched for the small set of
-        verdicts that could possibly be stale. Checks-unavailable (``None``)
-        fails closed to False — the verdict keeps its normal lifecycle.
-        """
-        required = self.config.auto_merge.required_checks
-        if not required:
-            return False
-        if required_check_citation_names(decision, required) is None:
-            return False
-        checks = self.gh.pr_checks(pr_number)
-        if checks is None:
-            return False
-        return is_stale_ci_verdict(decision, summarize_checks(checks, required))
-
-    def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> CarryForwardCheck:
-        """Determine whether ``decision``'s verdict can carry forward to the
-        PR's live head, and via which tier (issues #411/#412, #414).
-
-        Tier 1 (fast path): the live diff's stable patch-id equals the
-        recorded ``reviewed_patch_id``. Issue #1187: ``git patch-id --stable``
-        strips leading whitespace from ``+``/``-`` content lines, so two
-        diffs that differ ONLY in indentation depth produce the identical
-        patch-id — and in an indentation-sensitive language (Python) an
-        indentation-only change can alter control flow (e.g. moving a
-        ``return`` into or out of an ``if`` block). A tier-1 patch-id match
-        alone is therefore NOT sufficient to carry forward a verdict: when
-        a tier-2 line-content signature (which preserves whitespace verbatim)
-        was recorded at review time, it is also validated and must match.
-        If the tier-2 signatures differ — a whitespace-only change that
-        patch-id collapsed — the check fails closed to stale rather than
-        carrying forward an approved verdict across a semantically
-        different, unreviewed head. Decisions that predate tier-2 (no
-        signature stored) have no tier-2 baseline to consult and preserve
-        #412's original patch-id-only carry-forward behavior. The tier-2
-        binary eligibility gate does NOT apply here: patch-id already
-        proved binary content identity, and tier-2 is consulted only for
-        its text-line view, which is unaffected by binary payloads.
-
-        Tier 2 (line-content, issue #414): patch-ids differ — which happens
-        on every ordinary main advance, since ``git patch-id --stable``
-        hashes hunk-boundary context and the merge-base moves whenever main
-        does — but the ordered ``+``/``-`` line stream and changed-file set
-        recorded at review time are identical to the live diff's. Reordered,
-        added, removed, or altered lines, or a changed file set, are real
-        content changes and do NOT carry forward. Tier 2 is INELIGIBLE
-        whenever either side's diff touched a binary file: a binary payload
-        emits no ``+``/``-`` lines, so the signature is blind to it — two
-        diffs with genuinely different binary content at the same path
-        would otherwise compare equal (review follow-up on issue #414).
-
-        Fails closed (``tier=None``) on any missing data, diff-fetch
-        failure, or binary content: a decision recorded before tier-2
-        existed (no signature stored), a PR whose diff cannot be fetched,
-        a binary file on either side, or a genuine content difference all
-        report "cannot carry forward" — never carry forward on
-        uncertainty. Tier 2 is pure string parsing of the diff text already
-        fetched for tier 1 — it needs no additional git/gh calls and so has
-        no failure mode of its own beyond that shared fetch.
-
-        Eligibility for BOTH tiers is gated on ``reviewed_patch_id`` being
-        recorded at all (matching #412's original behavior exactly): a
-        "blocked" verdict, or any other decision that never computed one,
-        has no baseline to compare against, full stop. A pure-rename or
-        mode-only diff also has an empty ``reviewed_patch_id`` (no ``@@``
-        hunk) despite having a valid tier-2 signature on file — that
-        specific case is intentionally left conservative (stays stale)
-        rather than gating on the signature fields' presence instead, which
-        was tried and reverted: ``record_review`` unconditionally records a
-        (possibly trivially-empty) signature for every approved/
-        request_changes decision, so gating on "signature present" instead
-        of "patch-id present" made an unrelated placeholder/no-op diff look
-        like a valid tier-2 baseline and wrongly carried forward verdicts
-        whose head had genuinely moved to unrelated content. Tracked as a
-        narrow follow-up, not fixed here.
-        """
-        live_diff = self.gh.pr_diff(pr_number) or ""
-        if not live_diff:
-            return CarryForwardCheck(None, "", DiffContentSignature((), frozenset()))
-
-        live_patch_id = _calculate_patch_id(live_diff)
-        live_signature = _diff_content_signature(live_diff)
-
-        reviewed_patch_id = decision.get("reviewed_patch_id") or ""
-        if not reviewed_patch_id:
-            # No baseline recorded at all (e.g. a "blocked" verdict never
-            # computes a patch-id) — nothing to compare against.
-            return CarryForwardCheck(None, live_patch_id, live_signature)
-
-        if live_patch_id and live_patch_id == reviewed_patch_id:
-            # Issue #1187: ``git patch-id --stable`` strips leading
-            # whitespace from ``+``/``-`` content lines, so two diffs that
-            # differ only in indentation depth produce the identical
-            # patch-id. In an indentation-sensitive language (Python), an
-            # indentation-only change can alter control flow. A patch-id
-            # match alone must not carry forward a verdict: validate the
-            # tier-2 line-content signature (which preserves whitespace
-            # verbatim) when one was recorded. The tier-2 binary gate does
-            # NOT apply here — patch-id already proved binary content
-            # identity, and tier-2 is consulted only for its text-line view.
-            reviewed_changed_lines = decision.get("reviewed_changed_lines")
-            reviewed_changed_files = decision.get("reviewed_changed_files")
-            if reviewed_changed_lines is None or reviewed_changed_files is None:
-                # Decision predates tier-2 (no signature recorded) —
-                # patch-id is the only available signal; preserve #412's
-                # original carry-forward behavior for legacy decisions.
-                return CarryForwardCheck("patch-id", live_patch_id, live_signature)
-            lines_match = tuple(reviewed_changed_lines) == live_signature.changed_lines
-            files_match = frozenset(reviewed_changed_files) == live_signature.changed_files
-            if lines_match and files_match:
-                return CarryForwardCheck("patch-id", live_patch_id, live_signature)
-            # Patch-id matched but tier-2 signatures differ — a
-            # whitespace-only change that patch-id collapsed (issue #1187).
-            # Fail closed to stale rather than carrying forward an approved
-            # verdict across a semantically different, unreviewed head.
-            return CarryForwardCheck(None, live_patch_id, live_signature)
-
-        reviewed_changed_lines = decision.get("reviewed_changed_lines")
-        reviewed_changed_files = decision.get("reviewed_changed_files")
-        if reviewed_changed_lines is None or reviewed_changed_files is None:
-            # Decision predates tier-2 (no signature recorded) — cannot
-            # establish content identity; fail closed to stale.
-            return CarryForwardCheck(None, live_patch_id, live_signature)
-
-        if decision.get("reviewed_has_binary") or live_signature.has_binary:
-            # A binary payload emits no +/- content lines, so the signature
-            # cannot see it — never rely on its silence for content it
-            # never observed (issue #414 review follow-up).
-            return CarryForwardCheck(None, live_patch_id, live_signature)
-
-        lines_match = tuple(reviewed_changed_lines) == live_signature.changed_lines
-        files_match = frozenset(reviewed_changed_files) == live_signature.changed_files
-        if lines_match and files_match:
-            return CarryForwardCheck("line-content", live_patch_id, live_signature)
-
-        return CarryForwardCheck(None, live_patch_id, live_signature)
 
     @_guard_state_lock
     def loop(
@@ -14315,29 +14078,6 @@ class OrchestratorApp:
         """
         return build_branch_issue_validator(self.gh)
 
-    def _render_issue_comments(self, issue: dict[str, Any]) -> str:
-        """Render the ``$issue_comments`` slot for a worker prompt (issue #872).
-
-        The comments are already in hand: every ``_write_worker_prompt`` call
-        site sources its issue from ``gh.issue_view``, and ``ISSUE_VIEW_FIELDS``
-        has always requested ``comments``. This adds no API call -- the data was
-        being fetched and discarded.
-
-        Bodies are defanged here rather than in ``issue_comments`` itself so
-        that module stays free of the GitHub layer; the defang is what stops a
-        comment's "closes #123" from auto-closing an unrelated issue when a
-        worker copies the text into its PR body.
-        """
-        dispatch = self.config.dispatch
-        return render_issue_comments(
-            issue.get("comments"),
-            included_associations=dispatch.worker_prompt_comment_associations,
-            excluded_authors=dispatch.worker_prompt_excluded_comment_authors,
-            max_comments=dispatch.worker_prompt_max_comments,
-            max_chars=dispatch.worker_prompt_max_comment_chars,
-            sanitize=defang_closing_keywords,
-        )
-
     def _build_module_map_value(self, issue_number: int) -> str:
         """Derive the module-map section from the live tree (issue #1444).
 
@@ -14819,40 +14559,6 @@ class OrchestratorApp:
             },
         )
 
-    def _review_decision(self, pr_number: int) -> dict[str, Any]:
-        """Read the resolved review decision for ``pr_number`` as a Mapping.
-
-        Issue #1362 Stage 1: resolution order (the flat
-        ``review-decision.json`` file first, falling back to the
-        highest-numbered ``rounds/round-K/review-decision.json`` when the
-        flat file is missing or unparseable) is delegated to
-        ``review_decision``'s helpers -- the same ones
-        ``rework_prompts._round_history_entries`` now imports rather than
-        defining -- so the fallback logic lives in exactly one place
-        instead of being re-derived here, fixing all of this method's
-        call sites at once (previously this method had no round fallback
-        at all; only ``rework_prompts.py`` did).
-
-        Many callers need the FULL recorded payload (``required_changes``,
-        ``summary``, ``escalated``, ``authorized_override``, ...) --
-        fields ``review_decision.ReviewDecision`` deliberately does not
-        carry, since that dataclass is scoped to control-flow
-        approved/stale/missing questions only -- so this method keeps
-        returning a plain dict rather than the dataclass. A caller that
-        only needs "is this approved and fresh" should call
-        ``review_decision.review_decision()`` directly instead (see
-        ``already_approved`` in ``loop()``).
-
-        A corrupt flat file with no usable round fallback now resolves to
-        ``{"decision": "missing"}`` rather than the old ``"invalid"``
-        sentinel -- both are already treated as "not a terminal verdict"
-        by every caller that branches on decision value, so this collapses
-        two fail-safe outcomes into one without changing whether a caller
-        treats the PR as reviewed.
-        """
-        pr_dir = self.paths.prs / f"pr-{pr_number}"
-        return resolve_decision_payload(pr_dir)
-
     def _review_template_sha(self) -> str:
         """SHA-256 digest of the resolved review template + referenced section
         partials.
@@ -14865,111 +14571,6 @@ class OrchestratorApp:
         mismatch (issue #592).
         """
         return prompt_template_digest("review.md", search_dirs=self.prompt_dirs)
-
-    def _check_issue_citations(
-        self,
-        issue_number: int,
-        full_issue: dict[str, Any],
-        previous_entries: dict[int, dict[str, Any]],
-    ) -> dict[int, tuple[str, list[CitationVerdict]]]:
-        """Verify ``path:line`` citations in ``full_issue``'s body (issue #1000).
-
-        Returns ``{issue_number: (fingerprint, drifted_verdicts)}`` when the
-        drift fingerprint changed since the last pass (including a change to
-        empty when drift resolved), and ``{}`` otherwise -- the caller only
-        stamps/emit-vents on a change, so an unchanged-stale issue is not
-        re-commented every pass. When drift is newly detected a flag comment is
-        posted on the issue (best-effort; a failure is logged and swallowed so
-        it can never abort dispatch). The comment is visible to the dispatched
-        worker through ``$issue_comments`` (issue #872), which is the point: a
-        worker that sees "these line numbers have drifted, grep for the symbol"
-        is not silently misled onto unrelated code.
-
-        This is the "cheap check" backstop. It catches coordinate drift
-        (file missing / out of range / blank line); it does not catch in-range
-        content drift, which the filing convention (``CONTRIBUTING.md``) is the
-        durable fix for. See ``citation_check`` for the full rationale.
-        """
-        body = str(full_issue.get("body") or "")
-        if not body.strip():
-            return {}
-        try:
-            verdicts = verify_citations(body, self.repo_root)
-        except Exception:
-            logging.getLogger(__name__).warning(
-                "citation_check failed issue=%d", issue_number, exc_info=True
-            )
-            return {}
-        drifted = drifted_citation_verdicts(verdicts)
-        new_fp = citation_drift_fingerprint(verdicts)
-        prev_entry = previous_entries.get(issue_number, {})
-        prev_fp = prev_entry.get("citation_drift_fingerprint")
-        # ``None`` (never stamped) and "" (no drift) both mean "no current drift
-        # marker" for the comparison; treat them as equal so the first pass on a
-        # clean issue does not stamp an empty fingerprint as a "change".
-        if (prev_fp or "") == new_fp:
-            return {}
-        if new_fp:
-            self._post_citation_drift_comment(issue_number, drifted)
-        return {issue_number: (new_fp, drifted)}
-
-    def _post_citation_drift_comment(
-        self, issue_number: int, drifted: list[CitationVerdict]
-    ) -> None:
-        """Post a best-effort flag comment listing drifted citations (issue #1000).
-
-        Never raises: a comment-posting failure is logged and swallowed so it
-        cannot abort the dispatch pass. The comment is stamped with the current
-        ``HEAD`` sha (the commit the check ran against) per the issue's
-        recommendation 2, so a reader can tell a drifted citation from one that
-        was always wrong.
-        """
-        head_sha = self._read_head_sha_best_effort()
-        lines = [
-            f"{ORCHESTRATOR_COMMENT_MARKER}",
-            "",
-            "## Citation drift detected (issue #1000)",
-            "",
-            "One or more ``path:line`` citations in this issue no longer match the"
-            " working tree. A worker reading the bare line number would land on"
-            " unrelated code and may infer the defect was already fixed. **Grep for"
-            " the cited symbol or surrounding context instead of trusting the line"
-            " number**, and consider re-filing with a symbol citation (see"
-            ' ``CONTRIBUTING.md`` -- "Citing code in issues").',
-            "",
-        ]
-        if head_sha:
-            lines.append(f"Verified against `HEAD` = `{head_sha}`.")
-            lines.append("")
-        lines.append("| citation | status |")
-        lines.append("|---|---|")
-        for v in drifted:
-            lines.append(f"| `{v.citation.raw}` | {format_verdict_status_cell(v)} |")
-        body = "\n".join(lines)
-        issue_dir = self.paths.issues / f"issue-{issue_number}"
-        try:
-            issue_dir.mkdir(parents=True, exist_ok=True)
-            body_path = issue_dir / "citation-drift-comment.md"
-            body_path.write_text(body, encoding="utf-8")
-            self.gh.issue_comment(issue_number, body_path)
-        except Exception:
-            logging.getLogger(__name__).warning(
-                "citation drift comment post failed issue=%d", issue_number, exc_info=True
-            )
-
-    def _read_head_sha_best_effort(self) -> str | None:
-        """Return the current ``HEAD`` sha of ``repo_root``, or ``None``."""
-        try:
-            res = run_captured(
-                ["git", "rev-parse", "HEAD"],
-                cwd=self.repo_root,
-                timeout_seconds=15,
-            )
-            if not res.ok:
-                return None
-            return res.stdout.strip() or None
-        except Exception:
-            return None
 
     def _summarize_issue(self, issue: dict[str, Any]) -> dict[str, Any]:
         declared_blockers, open_blockers = self._get_open_blockers(issue)
