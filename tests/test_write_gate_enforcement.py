@@ -907,7 +907,27 @@ _RATCHET_BASELINE: dict[str, int] = {
     # after the move the live count is 116, so 121 = 116 + 5). Each destination
     # module's entry is set exactly to its own relocated live count (slack 0):
     # state_maintenance.py = 8, state_merge_train.py = 6.
-    "workflow.py": 121,
+    #
+    # Issue #1647 (Track 2 Phase B leaf L01 batch 4, the last L01 batch): verbatim
+    # extraction of the final nine OrchestratorApp members -- the four public
+    # operator commands (claim, merge_authorize, unescalate, ack_unauthorized_merge)
+    # into state_operator_commands.py and the five approval-head / unauthorized-
+    # merge-announcement members (_update_approval_head, _refresh_pr_decision_cache,
+    # _stamp_mention_rearm, _record_unauthorized_merge_skip,
+    # _announce_unauthorized_merges) into state_approval.py. Bodies moved
+    # byte-identically apart from the #1627 ``_wf.`` namespace rebind. 10 raw
+    # sites relocated out of workflow.py -- 6 into state_operator_commands.py and
+    # 4 into state_approval.py. As in #1632/#1645/#1646/#1317, this is a total-
+    # preserving redistribution: the baseline-dict sum stays 247 and no ratchet
+    # ceiling is loosened. workflow.py's entry drops by exactly that 10 (121 -> 111)
+    # while its own slack is held at 5 (measured raw count at this PR's base
+    # bb030300 is 116, so 121 = 116 + 5; after the move the live count is 106, so
+    # 111 = 106 + 5). Each destination module's entry is set exactly to its own
+    # relocated live count (slack 0): state_operator_commands.py = 6,
+    # state_approval.py = 4. (_stamp_mention_rearm and _refresh_pr_decision_cache
+    # carry zero gated-primitive raw sites -- both route their writes through
+    # self.write_gate -- so they contribute nothing to state_approval.py's count.)
+    "workflow.py": 111,
     "orchestration/state_rework_routing.py": 8,
     "orchestration/state_stale_checks.py": 9,
     "orchestration/state_record_review.py": 5,
@@ -917,6 +937,8 @@ _RATCHET_BASELINE: dict[str, int] = {
     "orchestration/state_unauthorized_merge.py": 1,
     "orchestration/state_maintenance.py": 8,
     "orchestration/state_merge_train.py": 6,
+    "orchestration/state_operator_commands.py": 6,
+    "orchestration/state_approval.py": 4,
     "dead_worker_reap.py": 11,
     # Issue #1423: +2 raw primitives in _reap_idle_foreign_writer (log_event
     # for the foreign_writer_reaped instrumentation event, and kill_orphan_pid
