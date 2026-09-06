@@ -725,8 +725,16 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
     # genuinely-new, by-design raw site off the per-module shrink-only
     # ratchet the same way the ratchet's own ~1160-1162 sentence intends for
     # sites that are correct as designed rather than an unconverted debt.
+    #
+    # Track 2 Phase B leaf L05 (#1636): `_loop_impl` moved verbatim out of
+    # workflow.py into `orchestration/instrumentation_ops.py`. The call_source,
+    # scope, and design rationale are unchanged; only the file it lives in
+    # moved, so this entry's `path` is repointed to the new module. Leaving it
+    # at "workflow.py" would make it stale (matches nothing) AND leave the
+    # relocated raw site unaccounted at its new path -- both failure directions
+    # of the two symmetric write-gate tests.
     _RawPrimitiveSite(
-        path="workflow.py",
+        path="orchestration/instrumentation_ops.py",
         scope="_loop_impl",
         primitive="log_event",
         call_source=(
@@ -999,7 +1007,28 @@ _RATCHET_BASELINE: dict[str, int] = {
     # raw count at this PR's base 5e3bebea is 106, so 111 = 106 + 5; after the move the
     # live count is 95, so 100 = 95 + 5). Each destination entry equals its own relocated
     # live count (slack 0). The baseline-dict sum stays 247 and no ratchet ceiling loosens.
-    "workflow.py": 100,
+    #
+    # Issue #1636 (Track 2 Phase B leaf L05, single PR): verbatim extraction of eight
+    # more OrchestratorApp members -- the instrumentation / loop-orchestration family
+    # (_backfill_missing_reason_classes, _build_module_map_value,
+    # _build_attachment_budget_value, _queue_sync_merge_covered,
+    # _reconcile_stranded_verdicts, ensure_labels, tripwire_status, _loop_impl) into
+    # one new charlie_work.orchestration submodule, instrumentation_ops.py. Bodies moved
+    # byte-identically apart from the #1627 ``_wf.`` namespace rebind. 12 raw log_event
+    # sites relocated out of workflow.py -- 11 ratchet-relevant (_build_module_map_value 1,
+    # _build_attachment_budget_value 1, _queue_sync_merge_covered 1,
+    # _reconcile_stranded_verdicts 2, ensure_labels 4, _loop_impl 2) plus the 1 by-design
+    # allow-listed _loop_impl preflight-warning site (repointed in
+    # _ALLOWED_RAW_PRIMITIVE_SITES above, so it never counted toward the ratchet at
+    # either location). As in the L01/L03 batches, this is a total-preserving
+    # redistribution: workflow.py's entry drops by exactly the 11 ratchet-relevant sites
+    # (100 -> 89) while its own slack is held at 5 (measured out-of-predicate raw count at
+    # this PR's base 5082a479 after the move is 84, so 89 = 84 + 5), and the new module's
+    # entry equals its own relocated live count exactly (slack 0):
+    # instrumentation_ops.py = 11. The baseline-dict sum stays 247 and no ratchet ceiling
+    # loosens.
+    "workflow.py": 89,
+    "orchestration/instrumentation_ops.py": 11,
     "orchestration/state_rework_routing.py": 8,
     "orchestration/state_stale_checks.py": 9,
     "orchestration/state_record_review.py": 5,
