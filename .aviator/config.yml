@@ -6,5 +6,6 @@ merge_rules:
     required_checks:
       - "Lint"
       - "Tests"
+      - "Collect-only gate"
   merge_strategy:
     name: "squash"
