@@ -890,10 +890,24 @@ _RATCHET_BASELINE: dict[str, int] = {
     # drops by exactly that 47 (182 -> 135) and each destination gains its
     # relocated count, so the baseline-dict sum is unchanged and no ratchet
     # ceiling is loosened. (workflow.py's measured raw count at this PR's base is
-    # 178, i.e. 4 below the recorded 182; that pre-existing slack is carried
+    # 177, i.e. 5 below the recorded 182; that pre-existing slack is carried
     # forward here rather than tightened, keeping this a pure move commit's
     # guard update.)
-    "workflow.py": 135,
+    #
+    # Issue #1646 (Track 2 Phase B leaf L01 batch 3): verbatim extraction of ten
+    # more OrchestratorApp members (loop-tick maintenance singletons and the
+    # merge-train / externally-merged-finalization members) into two new
+    # charlie_work.orchestration submodules. Bodies moved byte-identically apart
+    # from the #1627 ``_wf.`` namespace rebind. 14 raw sites relocated out of
+    # workflow.py -- 8 into state_maintenance.py and 6 into state_merge_train.py.
+    # As in #1632/#1645/#1317, this is a total-preserving redistribution: the
+    # baseline-dict sum stays 247 and no ratchet ceiling is loosened. workflow.py's
+    # entry drops by exactly that 14 (135 -> 121) while its own slack is held at 5
+    # (measured raw count at this PR's base 70ebbf9e is 130, i.e. 5 below 135;
+    # after the move the live count is 116, so 121 = 116 + 5). Each destination
+    # module's entry is set exactly to its own relocated live count (slack 0):
+    # state_maintenance.py = 8, state_merge_train.py = 6.
+    "workflow.py": 121,
     "orchestration/state_rework_routing.py": 8,
     "orchestration/state_stale_checks.py": 9,
     "orchestration/state_record_review.py": 5,
@@ -901,6 +915,8 @@ _RATCHET_BASELINE: dict[str, int] = {
     "orchestration/state_rework_review.py": 2,
     "orchestration/state_rescue.py": 2,
     "orchestration/state_unauthorized_merge.py": 1,
+    "orchestration/state_maintenance.py": 8,
+    "orchestration/state_merge_train.py": 6,
     "dead_worker_reap.py": 11,
     # Issue #1423: +2 raw primitives in _reap_idle_foreign_writer (log_event
     # for the foreign_writer_reaped instrumentation event, and kill_orphan_pid
