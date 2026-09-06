@@ -26,9 +26,11 @@ the template was then reverted. This proves the test is not a tautology.
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import re
 import string
+from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
@@ -698,30 +700,84 @@ _CITATION_RE = re.compile(r"workflow\.py::([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][
 _STALE_LINE_CITATION_RE = re.compile(r"workflow\.py:\d+(?:-\d+)?\b")
 
 
-def _workflow_py_source() -> tuple[list[str], ast.Module]:
-    """Read workflow.py's source lines and parsed AST."""
+def _resolve_cited_symbol_spans(
+    citation_keys: Iterable[str],
+) -> tuple[dict[str, tuple[int, int]], list[str]]:
+    """Resolve each ``workflow.py::<key>`` citation to its source span by
+    following the *live* attribute to whatever module now defines it.
+
+    Citations are written against the ``workflow.py`` namespace, but the
+    symbol a citation names may physically live in a delegate module:
+    issue #1283 Phase A moved the rework builders (``_write_rework_prompt``,
+    ``_render_rework_prompt``, ``_render_required_changes_section``) into
+    ``rework_prompts.py``, and Track 2 Phase B (issue #1582) moved
+    ``OrchestratorApp`` methods into ``charlie_work/orchestration/*.py`` --
+    ``workflow_delegation._install_delegates`` re-attaches them so the public
+    name stays reachable on the class. Rather than hardcode the set of files a
+    symbol might have landed in -- a list that would need editing for every
+    future move (rule #9) -- this resolves each cited name through the live
+    object:
+
+    * ``OrchestratorApp.<attr>`` -> ``getattr(OrchestratorApp, attr)``
+    * bare ``<name>`` -> ``getattr(workflow_module, name)``
+
+    ``inspect.unwrap`` peels any ``functools.wraps`` decorator layer, then
+    ``inspect.getsourcefile`` + ``obj.__qualname__`` name the defining file
+    and its in-file qualified name, which ``_resolve_symbols`` maps to a span.
+    Each defining file's source lines are appended to ``combined_lines`` once
+    (with a recorded offset) so a single ``(start, end)`` pair still slices
+    the right lines regardless of which file defines the symbol -- the same
+    concatenation strategy the previous fixed two-file version used, now
+    derived from the live symbols instead of a hardcoded file list. Following
+    the live object also resolves a name defined in more than one file to the
+    one the code actually installs, instead of dropping it as ambiguous.
+
+    A name that no longer resolves to any live attribute (or whose in-file
+    qualname is ambiguous, which ``_resolve_symbols`` drops) is simply left
+    out of the returned map; ``_collect_citation_failures`` then reports it as
+    unresolved (renamed/removed), exactly as a within-file miss is reported.
+    """
     import charlie_work.workflow as workflow_module
 
-    src_path = Path(workflow_module.__file__)
-    text = src_path.read_text(encoding="utf-8")
-    return text.splitlines(), ast.parse(text)
+    orchestrator_cls = workflow_module.OrchestratorApp
 
+    combined_lines: list[str] = []
+    # Defining file path -> (offset into combined_lines, in-file qualname -> span).
+    file_index: dict[str, tuple[int, dict[str, tuple[int, int]]]] = {}
+    symbol_spans: dict[str, tuple[int, int]] = {}
 
-def _rework_prompts_py_source() -> tuple[list[str], ast.Module]:
-    """Read rework_prompts.py's source lines and parsed AST.
+    def _index_file(path: str) -> tuple[int, dict[str, tuple[int, int]]]:
+        cached = file_index.get(path)
+        if cached is not None:
+            return cached
+        text = Path(path).read_text(encoding="utf-8")
+        offset = len(combined_lines)
+        combined_lines.extend(text.splitlines())
+        entry = (offset, _resolve_symbols(ast.parse(text)))
+        file_index[path] = entry
+        return entry
 
-    Issue #1283 Phase A moved three of this file's cited symbols
-    (``_write_rework_prompt``, ``_render_rework_prompt``,
-    ``_render_required_changes_section``) out of workflow.py into this
-    module. The citation strings in ``_CITATION_EXPECTATIONS`` still read
-    ``workflow.py::<Symbol>`` -- the facade re-export keeps the public name
-    stable -- so resolution must consider both files, not just workflow.py.
-    """
-    import charlie_work.rework_prompts as rework_prompts_module
+    for key in citation_keys:
+        head, sep, attr = key.partition(".")
+        if sep and head == orchestrator_cls.__name__:
+            target = getattr(orchestrator_cls, attr, None)
+        elif sep:
+            target = None  # a dotted path against an unknown owner
+        else:
+            target = getattr(workflow_module, key, None)
+        if target is None:
+            continue
+        target = inspect.unwrap(target)
+        src_file = inspect.getsourcefile(target)
+        if src_file is None:
+            continue
+        offset, spans = _index_file(src_file)
+        local = spans.get(getattr(target, "__qualname__", ""))
+        if local is None:
+            continue
+        symbol_spans[key] = (local[0] + offset, local[1] + offset)
 
-    src_path = Path(rework_prompts_module.__file__)
-    text = src_path.read_text(encoding="utf-8")
-    return text.splitlines(), ast.parse(text)
+    return symbol_spans, combined_lines
 
 
 def _resolve_symbols(tree: ast.Module) -> dict[str, tuple[int, int]]:
@@ -850,29 +906,17 @@ def test_workflow_py_citations_are_not_stale() -> None:
     is not the same as the citation being *right*: the marker check still
     catches a citation that resolves cleanly but points at the wrong code.
 
-    Issue #1283 Phase A: three cited symbols moved to
-    ``charlie_work/rework_prompts.py``. Rather than change
-    ``_collect_citation_failures``'s signature (a single flat
-    ``symbol_spans``/``wf_lines`` pair), workflow.py's and rework_prompts.py's
-    lines are concatenated and rework_prompts.py's spans are offset by
-    ``len(wf_lines)`` so a single ``(start, end)`` pair still slices the
-    right lines regardless of which file actually defines the symbol -- a
-    name resolved in both files is dropped as ambiguous, the same rule
-    ``_resolve_symbols`` already applies within one file.
+    Issue #1283 Phase A moved three cited symbols to
+    ``charlie_work/rework_prompts.py``; Track 2 Phase B (issue #1582) moved
+    several ``OrchestratorApp`` methods into ``charlie_work/orchestration/``.
+    Rather than change ``_collect_citation_failures``'s signature (a single
+    flat ``symbol_spans``/``wf_lines`` pair) or maintain a hardcoded list of
+    the files those symbols might have moved to, ``_resolve_cited_symbol_spans``
+    follows each cited name through its live attribute to whatever module now
+    defines it, concatenating those files' lines with per-file offsets so a
+    single ``(start, end)`` pair still slices the right lines.
     """
-    wf_lines, wf_tree = _workflow_py_source()
-    rp_lines, rp_tree = _rework_prompts_py_source()
-    wf_spans = _resolve_symbols(wf_tree)
-    rp_spans = _resolve_symbols(rp_tree)
-
-    offset = len(wf_lines)
-    combined_lines = wf_lines + rp_lines
-    symbol_spans: dict[str, tuple[int, int]] = dict(wf_spans)
-    for name, (start, end) in rp_spans.items():
-        if name in symbol_spans:
-            del symbol_spans[name]
-            continue
-        symbol_spans[name] = (start + offset, end + offset)
+    symbol_spans, combined_lines = _resolve_cited_symbol_spans(_CITATION_EXPECTATIONS)
 
     this_file = Path(__file__)
     this_src = this_file.read_text(encoding="utf-8").splitlines()
