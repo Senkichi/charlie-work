@@ -434,20 +434,50 @@ def test_subclass_override_intercepts() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_adapter_markers_deferred_to_l09() -> None:
+def test_adapter_markers_present_and_wrap_at_l09() -> None:
     """The ``as_property`` / ``as_staticmethod`` decorators, the
-    ``DELEGATE_ADAPTER_ATTR`` marker constant, and the ``_adapt`` wrapper are
-    scoped to the L09 leaf (design Section 3.3) -- the first leaf with a real
-    ``@property`` / ``@staticmethod`` consumer. L00 moves zero members, so
-    landing them here would mean new public, tested functions with zero
-    production callers (PR #1641 review finding). They must be absent from the
-    module until L09 reintroduces them alongside that consumer.
+    ``DELEGATE_ADAPTER_ATTR`` marker constant, and the ``_adapt`` wrapper land at
+    L09 (design Section 3.3) alongside their first real consumers
+    (``layout``, ``_is_dead_blocker``, ``_write_json`` in
+    ``orchestration/adapters.py``). This replaces the L00-era
+    ``test_adapter_markers_deferred_to_l09`` (which asserted their absence): the
+    deferral rationale (no production caller at L00) no longer holds now that the
+    property/staticmethod members have moved.
+
+    The markers must be present, must tag without otherwise altering the function
+    (the AST-equivalence gate still sees a plain ``FunctionDef``), and ``_adapt``
+    must wrap a marked function into the matching descriptor while leaving an
+    unmarked function untouched.
     """
-    for absent in ("as_property", "as_staticmethod", "_adapt", "DELEGATE_ADAPTER_ATTR"):
-        assert not hasattr(wd, absent), (
-            f"{absent!r} is present on workflow_delegation; the adapter surface "
-            f"was deferred to L09 (design Section 3.3) and must not land at L00"
+    for present in ("as_property", "as_staticmethod", "_adapt", "DELEGATE_ADAPTER_ATTR"):
+        assert hasattr(wd, present), (
+            f"{present!r} is absent from workflow_delegation; the adapter surface "
+            f"is reintroduced at L09 (design Section 3.3) with its first consumer"
         )
+
+    def _prop_fn(self) -> str:  # noqa: ARG001
+        return "P"
+
+    def _static_fn(x: int) -> int:
+        return x
+
+    def _plain_fn(self) -> str:  # noqa: ARG001
+        return "plain"
+
+    # Markers tag in place and return the same function object (no wrapping yet),
+    # so the moved body stays a plain ``def`` for the #1607 gate.
+    assert wd.as_property(_prop_fn) is _prop_fn
+    assert getattr(_prop_fn, wd.DELEGATE_ADAPTER_ATTR) == wd._ADAPTER_PROPERTY
+    assert wd.as_staticmethod(_static_fn) is _static_fn
+    assert getattr(_static_fn, wd.DELEGATE_ADAPTER_ATTR) == wd._ADAPTER_STATICMETHOD
+
+    # ``_adapt`` wraps each marked function into the matching descriptor and
+    # leaves an unmarked function unwrapped (installed as a plain method).
+    prop = wd._adapt(_prop_fn)
+    assert isinstance(prop, property) and prop.fget is _prop_fn
+    static = wd._adapt(_static_fn)
+    assert isinstance(static, staticmethod) and static.__func__ is _static_fn
+    assert wd._adapt(_plain_fn) is _plain_fn
 
 
 # --------------------------------------------------------------------------
@@ -561,9 +591,25 @@ def test_delegate_modules_match_pkgutil_and_all_defs_installed() -> None:
             assert name in vars(OrchestratorApp), (
                 f"{name} from {module.__name__} was not installed on OrchestratorApp"
             )
-            assert vars(OrchestratorApp)[name] is getattr(module, name), (
-                f"installed {name} is not the same function object as {module.__name__}.{name}"
-            )
+            installed = vars(OrchestratorApp)[name]
+            fn = getattr(module, name)
+            # L09 (#1640): a function tagged for adapter wrapping installs as the
+            # corresponding descriptor, not as the bare function -- so identity is
+            # checked against the descriptor's wrapped callable (``.fget`` /
+            # ``.__func__``). An untagged function still installs unwrapped.
+            marker = getattr(fn, wd.DELEGATE_ADAPTER_ATTR, None)
+            if marker == wd._ADAPTER_PROPERTY:
+                assert isinstance(installed, property) and installed.fget is fn, (
+                    f"installed property {name} does not wrap {module.__name__}.{name}"
+                )
+            elif marker == wd._ADAPTER_STATICMETHOD:
+                assert isinstance(installed, staticmethod) and installed.__func__ is fn, (
+                    f"installed staticmethod {name} does not wrap {module.__name__}.{name}"
+                )
+            else:
+                assert installed is fn, (
+                    f"installed {name} is not the same function object as {module.__name__}.{name}"
+                )
 
 
 def test_discover_positive_control_synthetic_package(tmp_path: Path) -> None:
