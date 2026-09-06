@@ -268,7 +268,7 @@ def test_exactly_one_workflow_runs_for_head_call_site_and_it_is_inside_the_detec
                 enclosing = _enclosing_function_name(node, parents)
                 call_sites.append((py_file.name, enclosing))
 
-    assert call_sites == [("workflow.py", "_detect_ci_run_never_created")], (
+    assert call_sites == [("reap_dispatch.py", "_detect_ci_run_never_created")], (
         f"expected exactly one workflow_runs_for_head call site, inside "
         f"_detect_ci_run_never_created; found {call_sites!r}"
     )
