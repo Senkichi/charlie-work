@@ -941,6 +941,22 @@ _RATCHET_BASELINE: dict[str, int] = {
     # As in #1632/#1645/#1646/#1647, the baseline-dict sum stays 247 and no
     # ratchet ceiling is loosened; this comment is the sole ratchet-side update,
     # recording the move's zero-raw-site status for the audit trail.
+    #
+    # Issue #1653 (Track 2 Phase B leaf L02 batch 2): verbatim extraction of
+    # seven more OrchestratorApp members -- the rework-packet / PR-comment I/O
+    # helpers (_read_advisories_from_pr_comment, _read_packet_head_oid,
+    # _read_packet_turn_cap_multiplier, _read_packet_template_sha,
+    # _packet_template_current, _read_packet_diff, _comment_pr) into
+    # helpers_packet.py. Bodies moved byte-identically apart from the #1627
+    # ``_wf.`` namespace rebind (_gh_api_list, ORCHESTRATOR_COMMENT_MARKER).
+    # Zero raw gated-primitive sites relocated -- every moved body is read-only
+    # packet/comment I/O (json reads, diff.patch reads, and _comment_pr's
+    # write_text + self.gh.pr_comment, none of which are gated primitives) --
+    # so workflow.py's live raw count is unchanged (107) and its baseline (111)
+    # holds with slack 4. The destination module needs no baseline entry (at
+    # implicit 0). As in #1632/#1645/#1646/#1647/#1652, the baseline-dict sum
+    # stays 247 and no ratchet ceiling is loosened; this comment is the sole
+    # ratchet-side update, recording the move's zero-raw-site status.
     "workflow.py": 111,
     "orchestration/state_rework_routing.py": 8,
     "orchestration/state_stale_checks.py": 9,
