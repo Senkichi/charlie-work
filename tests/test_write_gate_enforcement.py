@@ -957,6 +957,25 @@ _RATCHET_BASELINE: dict[str, int] = {
     # implicit 0). As in #1632/#1645/#1646/#1647/#1652, the baseline-dict sum
     # stays 247 and no ratchet ceiling is loosened; this comment is the sole
     # ratchet-side update, recording the move's zero-raw-site status.
+    #
+    # Issue #1654 (Track 2 Phase B leaf L02 batch 3): verbatim extraction of
+    # eight more OrchestratorApp members -- the merge preflight / outcome
+    # recording helpers (merge_check, _record_merge_or_error,
+    # _record_review_or_error, _record_event, _resolve) into
+    # helpers_merge_outcomes.py, and the rework request / conflict helpers
+    # (_request_cross_pr_revert_rework, _request_no_op_rework_repair,
+    # _rework_candidate_conflict_blocked) into helpers_rework.py. Bodies moved
+    # byte-identically apart from the #1627 ``_wf.`` namespace rebind
+    # (CommandResult, _authorized_override_matches). Zero raw gated-primitive
+    # sites relocated -- _record_event's own body calls
+    # self.write_gate.record_event (Convention A, gate-covered by construction,
+    # not a raw primitive) and the other seven bodies contain no gated
+    # primitive calls -- so workflow.py's live raw count is unchanged (107) and
+    # its baseline (111) holds with slack 4. Both destination modules need no
+    # baseline entry (at implicit 0). As in #1632/#1645/#1646/#1647/#1652/#1653,
+    # the baseline-dict sum stays 247 and no ratchet ceiling is loosened; this
+    # comment is the sole ratchet-side update, recording the move's
+    # zero-raw-site status.
     "workflow.py": 111,
     "orchestration/state_rework_routing.py": 8,
     "orchestration/state_stale_checks.py": 9,
