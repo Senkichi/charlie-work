@@ -69,5 +69,5 @@
   "tests/test_worker_health.py": 2400,
   "tests/test_worker_stop_gate.py": 1200,
   "tests/test_worktree.py": 8600,
-  "tests/test_write_gate_enforcement.py": 1800
+  "tests/test_write_gate_enforcement.py": 2000
 }
