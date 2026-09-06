@@ -1027,7 +1027,23 @@ _RATCHET_BASELINE: dict[str, int] = {
     # entry equals its own relocated live count exactly (slack 0):
     # instrumentation_ops.py = 11. The baseline-dict sum stays 247 and no ratchet ceiling
     # loosens.
-    "workflow.py": 89,
+    #
+    # Issue #1637 (Track 2 Phase B leaf L06, single PR): verbatim extraction of four
+    # more OrchestratorApp members -- the dead-worker-reap family (_loop_body into
+    # orchestration/reap_loop.py; _detect_ci_run_never_created,
+    # _apply_concurrency_governor, and dispatch into orchestration/reap_dispatch.py).
+    # Bodies moved verbatim apart from the #1627 ``_wf.`` namespace rebind. 6 raw
+    # log_event sites relocated out of workflow.py -- 5 from _loop_body, 1 from
+    # _apply_concurrency_governor; none allow-listed. As in L05, this is a
+    # total-preserving redistribution: workflow.py's entry drops by exactly those 6
+    # sites (89 -> 83) while its own slack is held at 5 (measured out-of-predicate raw
+    # count at this PR's base 4b7ccf7e after the move is 78, so 83 = 78 + 5), and each
+    # new module's entry equals its own relocated live count exactly (slack 0):
+    # reap_loop.py = 5, reap_dispatch.py = 1. The baseline-dict sum stays 247 and no
+    # ratchet ceiling loosens.
+    "workflow.py": 83,
+    "orchestration/reap_loop.py": 5,
+    "orchestration/reap_dispatch.py": 1,
     "orchestration/instrumentation_ops.py": 11,
     "orchestration/state_rework_routing.py": 8,
     "orchestration/state_stale_checks.py": 9,
