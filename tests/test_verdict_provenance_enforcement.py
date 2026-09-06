@@ -626,8 +626,19 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
     # (not exempted) because decision_payload carries the
     # "verdict_provenance" key literally. merge_authorize still contributes
     # exactly one exempted site.
+    # Issue #1647 (L01 batch 4): merge_authorize moved verbatim out of
+    # workflow.py into orchestration/state_operator_commands.py, so its one
+    # exempted record_decision(...) write site now reports that module. This is
+    # an address change of the known deliberate site, not a new or lost
+    # exemption (the len==1 + name=={"merge_authorize"} controls below remain
+    # the load-bearing evidence). The scanner discovers it via
+    # _SRC_ROOT.rglob("*.py"). record_decision is called as a bare name in the
+    # moved body (direct import from charlie_work.review_decision, not the
+    # #1627 _wf. namespace form) precisely so this by-bare-Name (receiver-
+    # sensitive) provenance scan keeps covering it -- an _wf.record_decision
+    # attribute form would evade the scan and drop the site from coverage.
     assert len(exempted_write_sites) == 1, exempted_write_sites
-    assert all(site.startswith("workflow.py:") for site in exempted_write_sites), (
+    assert all(site.startswith("state_operator_commands.py:") for site in exempted_write_sites), (
         exempted_write_sites
     )
     exempted_func_names = {site.rsplit(" (", 1)[1].rstrip(")") for site in exempted_write_sites}
