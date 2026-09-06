@@ -4079,35 +4079,6 @@ class OrchestratorApp:
     def _render(self, template_name: str, values: dict[str, Any]) -> str:
         return render_prompt(template_name, values, search_dirs=self.prompt_dirs)
 
-    def _record_event(
-        self,
-        state: dict[str, Any],
-        kind: str,
-        payload: dict[str, Any],
-        *,
-        level: str | None = None,
-    ) -> dict[str, Any]:
-        """Append an event to state.json and the unlimited events.db log.
-
-        This is the single instrumentation entry point for OrchestratorApp
-        methods. It forwards to ``self.write_gate.record_event`` (issue #1324)
-        so every one of its ~70 call sites is dry-run-gated by construction:
-        under ``dry_run=True`` the gate returns ``state`` unchanged with zero
-        writes to ``events.db`` and zero mutation of the in-memory event ring
-        (the WriteGate invariant -- "no event at all under dry-run"). Under
-        ``dry_run=False`` the gate is a pure passthrough to ``append_event``
-        with ``self.paths.state_file`` and the repo name auto-bound, dual-writing
-        each event to ``state.json``'s bounded ring (``EVENT_RING_SIZE``, default
-        2000) and the append-only ``events.db`` audit log. ``level`` is forwarded
-        to ``append_event`` so the emit site can declare it explicitly.
-        """
-        return self.write_gate.record_event(state, kind, payload, level=level)
-
-    def _resolve(self, value: str) -> Path:
-        # pathlib keeps an absolute right-hand side as-is, so this handles
-        # both repo-relative and absolute config paths.
-        return self.repo_root / value
-
     def _adapter_settings(self, *, adapter: str | None = None) -> AdapterSettings:
         claude = self.config.claude_code
         devin = self.config.devin
@@ -10643,125 +10614,6 @@ class OrchestratorApp:
     # the guard's contract is to return a *successful* skip (ok=True) when the
     # lock is held. On an authorization preflight that would be fail-open —
     # "cannot tell" rendered as "yes". Keep this method lock-free and pure.
-    def merge_check(self, pr_number: int) -> CommandResult:
-        """Answer "is this PR merge-authorized *right now*?" without merging it.
-
-        Issue #894. Merge authorization was enforced only on the paths that
-        merge through this codebase -- ``merge_ready`` (``ship-it``) and, for
-        the Aviator re-queue, ``reconcile._pr_review_approved_at_head``. A raw
-        ``gh pr merge`` bypassed both, and the #502 tripwire only reports the
-        bypass *after* the merge is irreversible. That is what happened to PR
-        #759, whose merge was justified from GitHub's review state while
-        ``review-decision.json`` recorded ``request_changes``.
-
-        This is the preflight those paths never exposed: same invariant, no
-        side effects, callable before the merge rather than after it. It is
-        the single command a ``PreToolUse`` hook can shell out to, so the
-        interception logic stays in the repo (versioned, CI-covered) instead
-        of in unversioned agent configuration.
-
-        **Fails closed.** Every unreadable, absent, malformed, or ambiguous
-        input yields ``ok=False``. An authorization preflight that answers
-        "yes" when it cannot tell is worse than no preflight, because it
-        launders uncertainty into permission. ``data["reason"]`` names which
-        condition fired so the caller can act on it; the distinction between
-        ``not_approved`` and ``head_moved`` is the difference between "get a
-        review" and "get a re-review".
-
-        Deliberately does *not* reuse ``merge_ready``'s inline gate: that one
-        may **mutate** state via approval carry-forward (``_update_approval_head``).
-        A preflight must be a pure question. The shared invariant is the pair
-        ``decision == "approved"`` and ``reviewed_head_sha == headRefOid``,
-        asserted identically here and in ``_pr_review_approved_at_head``.
-        """
-        pr = self.gh.pr_view(pr_number)
-        if not isinstance(pr, dict) or not pr:
-            return CommandResult(
-                False,
-                f"PR #{pr_number}: cannot read PR from GitHub — refusing to authorize",
-                {"pr": pr_number, "authorized": False, "reason": "pr_unreadable"},
-            )
-        if str(pr.get("state", "")).upper() == "MERGED":
-            return CommandResult(
-                False,
-                f"PR #{pr_number} is already merged — nothing to authorize",
-                {"pr": pr_number, "authorized": False, "reason": "already_merged"},
-            )
-
-        live_head_sha = pr.get("headRefOid")
-        decision = self._review_decision(pr_number)
-        decision_value = decision.get("decision")
-        reviewed_head_sha = decision.get("reviewed_head_sha")
-        base = {
-            "pr": pr_number,
-            "decision": decision_value,
-            "reviewed_head_sha": reviewed_head_sha,
-            "live_head_sha": live_head_sha,
-        }
-
-        if not live_head_sha:
-            return CommandResult(
-                False,
-                f"PR #{pr_number}: no live head sha — refusing to authorize",
-                {**base, "authorized": False, "reason": "no_live_head"},
-            )
-        # Issue #934: an explicit operator authorization recorded via
-        # ``merge_authorize`` is as authoritative as an approved review
-        # decision. Checked before the missing/invalid/not-approved/head-moved
-        # gates so a valid override authorizes regardless of the recorded
-        # review verdict — that is the whole point, since the override exists
-        # for PRs whose verdict is stale, absent, or pending. A malformed or
-        # SHA-mismatched override falls through to the existing fail-closed
-        # checks below, so this adds a way to record authorization without
-        # adding a way to skip the control.
-        if _authorized_override_matches(decision, live_head_sha):
-            override = decision["authorized_override"]
-            return CommandResult(
-                True,
-                f"PR #{pr_number}: authorized by operator override at head "
-                f"{live_head_sha} (by {override.get('by') or 'unknown'})",
-                {
-                    **base,
-                    "authorized": True,
-                    "reason": "authorized_override",
-                    "authorized_by": override.get("by"),
-                    "authorized_at": override.get("authorized_at"),
-                    "authorized_sha": override.get("authorized_sha"),
-                },
-            )
-        if decision_value == "missing":
-            # Issue #1362 Stage 1: resolve_decision_payload collapses both
-            # "no decision file at all" and "flat file corrupt, no round
-            # fallback" into this same "missing" sentinel (the old distinct
-            # "invalid" sentinel no longer exists) -- both are equally
-            # non-terminal for authorization purposes, so this one reason
-            # covers what used to be two.
-            return CommandResult(
-                False,
-                f"PR #{pr_number}: no readable review-decision.json — not authorized",
-                {**base, "authorized": False, "reason": "no_decision"},
-            )
-        if decision_value != "approved":
-            return CommandResult(
-                False,
-                f"PR #{pr_number}: recorded decision is {decision_value!r}, not 'approved'",
-                {**base, "authorized": False, "reason": "not_approved"},
-            )
-        if reviewed_head_sha != live_head_sha:
-            return CommandResult(
-                False,
-                (
-                    f"PR #{pr_number}: approved at {reviewed_head_sha} but head is now "
-                    f"{live_head_sha} — re-review required"
-                ),
-                {**base, "authorized": False, "reason": "head_moved"},
-            )
-        return CommandResult(
-            True,
-            f"PR #{pr_number}: approved at current head {live_head_sha}",
-            {**base, "authorized": True, "reason": "approved_at_head"},
-        )
-
     @_guard_state_lock
     def merge_ready(
         self,
@@ -13303,74 +13155,6 @@ class OrchestratorApp:
             },
         )
 
-    def _rework_candidate_conflict_blocked(self, pr_data: dict[str, Any], pr_number: int) -> bool:
-        """Issue #1349: a patch-id-advanced head on a CONFLICTING/DIRTY PR is
-        still a legitimate launch candidate — the head advance did not resolve
-        the conflict the rework was requested for. Routing such a PR to
-        review() just bounces off the janitor gate's conflict check back to
-        rework_requested, deadlocking the issue between dispatch_rework and
-        review() forever (the only exit being the #765 stall escalation to a
-        human, not a dispatch).
-
-        Returns True when the candidate must be kept as a launch candidate
-        (conflict-bypass applies). Shared by the dry-run and live paths so the
-        two cannot drift.
-
-        ``pr_list``'s ``mergeable`` can be UNKNOWN (GitHub computes it
-        asynchronously); ``mergeStateStatus == "DIRTY"`` is reliable from
-        ``pr_list``, but a CONFLICTING reading may only appear on a fresh
-        ``pr_view``. When ``pr_list``'s signal is indeterminate (not a definite
-        MERGEABLE and not a definite CONFLICTING), re-check with a fresh
-        ``pr_view`` before routing to review so a persistently-conflicting PR
-        is not misrouted back into the deadlock. A failed ``pr_view`` returns
-        ``{}`` (production) which ``_is_merge_conflict`` reads as
-        not-conflicting, falling through to the review lane — the same
-        fail-closed behavior review() itself uses (issue #1349).
-        """
-        if self._is_merge_conflict(pr_data):
-            return True
-        live_mergeable = str(pr_data.get("mergeable") or "").upper()
-        if live_mergeable not in ("MERGEABLE", "CONFLICTING"):
-            fresh_pr = self.gh.pr_view(pr_number)
-            if fresh_pr and self._is_merge_conflict(fresh_pr):
-                return True
-        return False
-
-    def _request_no_op_rework_repair(
-        self,
-        pr: dict[str, Any],
-        issue_number: int,
-        decision: dict[str, Any],
-        *,
-        extra_state: dict[str, Any] | None = None,
-    ) -> dict[str, Any] | None:
-        """Route a PR whose last rework cycle pushed no actual change to rework.
-
-        The janitor's no-op-rework check (``janitor._check_no_op_rework``)
-        only detects the condition (unchanged patch-id/head since the last
-        request_changes verdict); nothing previously consumed it
-        (pr-lifecycle.md Finding 1's "no-op-rework-never-escalated"
-        sub-case). This is that consumer, called from
-        ``_route_janitor_gate_failure_to_rework`` and shaped like
-        ``_request_merge_conflict_rework``.
-        """
-        summary = (
-            "The previous rework cycle produced no actual content change (the diff or head "
-            "matches the last request_changes verdict). Check the branch worktree for "
-            "unpushed commits and push the real fix, or explain in the PR body why no "
-            "further change was needed."
-        )
-        return self._route_to_rework(
-            pr,
-            issue_number,
-            decision,
-            summary,
-            # event-consumer: audit-only -- records a rework repair request already
-            # routed to a worker via _route_to_rework (the dispatch IS the action)
-            "no_op_rework_repair_requested",
-            extra_state=extra_state,
-        )
-
     def _detect_ci_run_never_created(
         self,
         pr: dict[str, Any],
@@ -13434,23 +13218,6 @@ class OrchestratorApp:
         if head_runs is not None and len(head_runs) == 0:
             return head_sha
         return None
-
-    def _request_cross_pr_revert_rework(
-        self,
-        pr: dict[str, Any],
-        issue_number: int,
-        decision: dict[str, Any],
-        reason: str,
-    ) -> dict[str, Any] | None:
-        """Route an approved PR whose branch silently reverts a base commit to rework."""
-        summary = (
-            f"{reason}. Remove the revert commit (or the merge+revert pair) from the PR "
-            "history, or add an explicit 'allow-revert: <reason>' line to the PR body if the "
-            "revert is intentional. Then push the corrected branch and re-request review."
-        )
-        return self._route_to_rework(
-            pr, issue_number, decision, summary, "cross_pr_revert_rework_requested"
-        )
 
     def _human_merge_hold_check(self, issue_number: int | None) -> tuple[bool, bool]:
         """Return ``(human_merge_hold, human_merge_check_unavailable)`` for the bound issue.
@@ -13651,37 +13418,6 @@ class OrchestratorApp:
             return CarryForwardCheck("line-content", live_patch_id, live_signature)
 
         return CarryForwardCheck(None, live_patch_id, live_signature)
-
-    def _record_review_or_error(
-        self,
-        review_result: CommandResult,
-        errors: list[dict[str, Any]],
-        reviews: list[dict[str, Any]],
-    ) -> bool:
-        """Append a review result to reviews or errors if checks are unavailable.
-
-        Returns True if the caller should continue to the next PR (the unavailable
-        case has already been recorded as an error).
-        """
-        if review_result.data.get("checks_unavailable"):
-            errors.append({"pr": review_result.data.get("pr"), "error": review_result.message})
-            return True
-        reviews.append(review_result.data)
-        return False
-
-    def _record_merge_or_error(
-        self,
-        merge_result: CommandResult,
-        errors: list[dict[str, Any]],
-        merges: list[dict[str, Any]],
-    ) -> None:
-        """Append a merge_ready result to merges or errors if a gh check failed."""
-        if merge_result.data.get("checks_unavailable") or merge_result.data.get(
-            "merge_hold_check_unavailable"
-        ):
-            errors.append({"pr": merge_result.data.get("pr"), "error": merge_result.message})
-        else:
-            merges.append(merge_result.data)
 
     @_guard_state_lock
     def loop(

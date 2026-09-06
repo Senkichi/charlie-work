@@ -1463,13 +1463,16 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
-        path="workflow.py",
+        path="orchestration/helpers_merge_outcomes.py",
         scope="_record_event",
         source="kind",
         reason=(
             "OrchestratorApp._record_event forwards its own `kind` parameter "
             "to append_event. Same pass-through as append_event/log_event; "
-            "every self._record_event(...) call site is scanned."
+            "every self._record_event(...) call site is scanned. "
+            "Moved out of workflow.py to charlie_work.orchestration."
+            "helpers_merge_outcomes by leaf L02 b3 (#1633); the allow-list "
+            "path follows the member (design 4.1), scope/source/reason unchanged."
         ),
     ),
     _UnresolvedKindSite(
