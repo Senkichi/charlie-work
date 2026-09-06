@@ -983,7 +983,23 @@ _RATCHET_BASELINE: dict[str, int] = {
     # _label_descriptions, _ensure_labels_core, bootstrap_labels). None calls
     # a gated primitive; both modules measured 0 out-of-predicate raw sites,
     # workflow.py holds at 111 (live 107) and the baseline-dict sum stays 247.
-    "workflow.py": 111,
+    #
+    # Issue #1660 (Track 2 Phase B leaf L03 batch 3, last): verbatim extraction of
+    # seven more OrchestratorApp members -- worker-dispatch/worktree-safety into
+    # misc_worker_dispatch.py, review-verdict reaping into misc_review_verdicts.py,
+    # the reconcile loop into misc_reconcile.py, and escalated-label repair into
+    # misc_escalation.py. Bodies moved byte-identically apart from the #1627 ``_wf.``
+    # namespace rebind. 11 raw sites relocated out of workflow.py -- 4 into
+    # misc_review_verdicts.py (_reap_review_verdicts: append_event x2, save_state x2),
+    # 4 into misc_reconcile.py (_reconcile_locked: append_event x1, save_state x3), and
+    # 3 into misc_escalation.py (_repair_escalated_labels: transition, append_event,
+    # save_state); misc_worker_dispatch.py carries zero raw sites. As in the L01/L02
+    # batches, this is a total-preserving redistribution: workflow.py's entry drops by
+    # exactly that 11 (111 -> 100) while its own slack is held (measured out-of-predicate
+    # raw count at this PR's base 5e3bebea is 106, so 111 = 106 + 5; after the move the
+    # live count is 95, so 100 = 95 + 5). Each destination entry equals its own relocated
+    # live count (slack 0). The baseline-dict sum stays 247 and no ratchet ceiling loosens.
+    "workflow.py": 100,
     "orchestration/state_rework_routing.py": 8,
     "orchestration/state_stale_checks.py": 9,
     "orchestration/state_record_review.py": 5,
@@ -995,6 +1011,9 @@ _RATCHET_BASELINE: dict[str, int] = {
     "orchestration/state_merge_train.py": 6,
     "orchestration/state_operator_commands.py": 6,
     "orchestration/state_approval.py": 4,
+    "orchestration/misc_review_verdicts.py": 4,
+    "orchestration/misc_reconcile.py": 4,
+    "orchestration/misc_escalation.py": 3,
     "dead_worker_reap.py": 11,
     # Issue #1423: +2 raw primitives in _reap_idle_foreign_writer (log_event
     # for the foreign_writer_reaped instrumentation event, and kill_orphan_pid

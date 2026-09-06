@@ -748,9 +748,14 @@ def test_review_decision_write_sites_collects_bare_name_form() -> None:
 # positive control below is the load-bearing evidence of that (the call count
 # and its "rescue_review" literal are unchanged; only (file, func)'s file
 # moved). The scanner already discovers this via _SRC_ROOT.rglob("*.py").
+# issue #1660 (L03 batch 3): _reap_review_verdicts moved verbatim out of
+# workflow.py into orchestration/misc_review_verdicts.py, so its one
+# record_review() call site (the "fresh_llm_review" literal) now reports that
+# module -- another address change of a known site, discovered via the same
+# rglob; the total_sites == 7 control below is unchanged.
 _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE: dict[tuple[str, str], Counter[str]] = {
     ("workflow.py", "review"): Counter({"ci_gate_auto_reject": 2, "test_adequacy_auto_reject": 1}),
-    ("workflow.py", "_reap_review_verdicts"): Counter({"fresh_llm_review": 1}),
+    ("misc_review_verdicts.py", "_reap_review_verdicts"): Counter({"fresh_llm_review": 1}),
     ("workflow.py", "_reconcile_stranded_verdicts"): Counter({"stranded_reconciliation": 1}),
     ("state_rescue.py", "_process_rescue_review"): Counter({"rescue_review": 1}),
     ("cli.py", "run_command"): Counter({"operator_manual": 1}),

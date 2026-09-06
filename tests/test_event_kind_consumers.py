@@ -62,6 +62,32 @@ TESTS_DIR = REPO_ROOT / "tests"
 HEARTBEAT = REPO_ROOT / "scripts" / "heartbeat_check.py"
 _THIS_FILE_NAME = Path(__file__).name
 
+# The god-object paydown (Track 2 Phase B) relocates OrchestratorApp method
+# bodies -- event emitters among them -- into the ``orchestration/`` delegate
+# subpackage. Those modules must be scanned too, or their emitted kinds (and
+# consumers) fall out of the extractor's view: a silent coverage loss, since a
+# kind emitted only from an unscanned file simply never enters ``emitted_kinds``
+# and no assertion can flag what it never saw. This is deliberately a targeted
+# glob of the top level plus ``orchestration/`` rather than a recursive
+# ``rglob`` because emit sites and markers are keyed by ``path.name`` alone, and
+# the package has real basename collisions across subpackages (``checks.py``,
+# ``labels.py``, ``__main__.py``) that ``rglob`` would silently misattribute.
+_SCANNED_SUBPACKAGES = ("orchestration",)
+
+
+def _src_py_files(src_root: Path) -> list[Path]:
+    """Top-level ``charlie_work`` modules plus the scanned delegate subpackages.
+
+    Sorted for determinism. ``__init__.py`` files carry no emit sites or event
+    markers, so the one basename collision this union can produce
+    (``__init__.py``) is inert.
+    """
+    files = list(src_root.glob("*.py"))
+    for sub in _SCANNED_SUBPACKAGES:
+        files.extend((src_root / sub).glob("*.py"))
+    return sorted(files)
+
+
 # ---------------------------------------------------------------------------
 # The three sanctioned emitters (per the issue) plus the shapes that share
 # their exact forwarding signature in practice: ``WriteGate`` mirrors all
@@ -760,7 +786,7 @@ def _analyze(src_root: Path, tests_root: Path | None, heartbeat_path: Path | Non
     emit_sites: list[EmitSite] = []
     file_markers: dict[str, FileMarkers] = {}
     file_sites: dict[str, list[EmitSite]] = {}
-    for path in sorted(src_root.glob("*.py")):
+    for path in _src_py_files(src_root):
         text = path.read_text(encoding="utf-8")
         try:
             tree = ast.parse(text, filename=str(path))
@@ -784,7 +810,7 @@ def _analyze(src_root: Path, tests_root: Path | None, heartbeat_path: Path | Non
 
     # Consumer collection.
     consumer_sites: list[ConsumerSite] = []
-    for path in sorted(src_root.glob("*.py")):
+    for path in _src_py_files(src_root):
         text = path.read_text(encoding="utf-8")
         try:
             tree = ast.parse(text, filename=str(path))
