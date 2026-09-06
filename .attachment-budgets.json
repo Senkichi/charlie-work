@@ -22,7 +22,7 @@
    "file": "src/charlie_work/workflow.py",
    "identity": "OrchestratorApp",
    "kind": "class",
-   "member_count": 86
+   "member_count": 79
   },
   {
    "boundary": 41.0,
