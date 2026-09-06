@@ -608,7 +608,11 @@ def test_valid_issue_statuses_covers_every_assigned_status_literal() -> None:
         r"|\bstatus\s*=\s*[\"']([a-z_]+)[\"']"  # bare local later stored under "status"
     )
     found: set[str] = set()
-    for py in Path(charlie_work.__file__).parent.glob("*.py"):
+    # rglob, not glob: since Track 2 Phase B the status-assigning code paths
+    # (e.g. _dispatch_impl's manifest_written/dispatch_failed bookkeeping) live
+    # in charlie_work/orchestration/ submodules, so a non-recursive top-level
+    # scan would go blind to them and the tripwire below would silently rot.
+    for py in Path(charlie_work.__file__).parent.rglob("*.py"):
         for match in pattern.finditer(py.read_text(encoding="utf-8")):
             found.add(match.group(1) or match.group(2))
 

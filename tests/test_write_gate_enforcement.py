@@ -1041,7 +1041,17 @@ _RATCHET_BASELINE: dict[str, int] = {
     # new module's entry equals its own relocated live count exactly (slack 0):
     # reap_loop.py = 5, reap_dispatch.py = 1. The baseline-dict sum stays 247 and no
     # ratchet ceiling loosens.
-    "workflow.py": 83,
+    # L08 (#1639): _dispatch_impl moved verbatim to orchestration/dispatch_state.py
+    # (bodies unchanged apart from the #1627 ``_wf.`` rebind; the scanner is
+    # receiver-agnostic, so ``_wf.save_state(...)`` counts identically to a bare
+    # call). 28 out-of-predicate raw sites (16 save_state + 7 append_event + 5
+    # transition) relocate with it; none allow-listed. Same total-preserving
+    # redistribution: workflow.py drops by exactly those 28 (83 -> 55) with its
+    # slack held at 5 (measured out-of-predicate raw count after the move is 50, so
+    # 55 = 50 + 5), and dispatch_state.py's entry equals its relocated live count
+    # exactly (28, slack 0). The baseline-dict sum stays 247 and no ceiling loosens.
+    "workflow.py": 55,
+    "orchestration/dispatch_state.py": 28,
     "orchestration/reap_loop.py": 5,
     "orchestration/reap_dispatch.py": 1,
     "orchestration/instrumentation_ops.py": 11,
