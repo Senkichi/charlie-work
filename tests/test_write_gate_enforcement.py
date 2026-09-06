@@ -927,6 +927,20 @@ _RATCHET_BASELINE: dict[str, int] = {
     # state_approval.py = 4. (_stamp_mention_rearm and _refresh_pr_decision_cache
     # carry zero gated-primitive raw sites -- both route their writes through
     # self.write_gate -- so they contribute nothing to state_approval.py's count.)
+    #
+    # Issue #1652 (Track 2 Phase B leaf L02 batch 1): verbatim extraction of
+    # nine more OrchestratorApp members (the seven base-currency / merge-readiness
+    # gating helpers into helpers_merge_gate.py, and the worker-summary /
+    # branch-naming helpers into helpers_worker.py). Bodies moved byte-identically
+    # apart from the #1627 ``_wf.`` namespace rebind. Zero raw gated-primitive
+    # sites relocated -- every moved body is read-only gating or summarization
+    # (the only call in _is_base_freshness_required is logging.getLogger, not a
+    # gated primitive; _summarize_worker writes nothing) -- so workflow.py's live
+    # raw count is unchanged (107) and its baseline (111) holds with slack 4.
+    # Neither destination module needs a baseline entry (both at implicit 0).
+    # As in #1632/#1645/#1646/#1647, the baseline-dict sum stays 247 and no
+    # ratchet ceiling is loosened; this comment is the sole ratchet-side update,
+    # recording the move's zero-raw-site status for the audit trail.
     "workflow.py": 111,
     "orchestration/state_rework_routing.py": 8,
     "orchestration/state_stale_checks.py": 9,
