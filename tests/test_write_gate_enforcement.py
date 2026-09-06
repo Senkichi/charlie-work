@@ -976,6 +976,13 @@ _RATCHET_BASELINE: dict[str, int] = {
     # the baseline-dict sum stays 247 and no ratchet ceiling is loosened; this
     # comment is the sole ratchet-side update, recording the move's
     # zero-raw-site status.
+    #
+    # Issue #1655 (Track 2 Phase B leaf L02 batch 4, last): the final eight
+    # OrchestratorApp members move to helpers_dispatch.py (the four dispatch
+    # sort/filter helpers) and helpers_labels.py (_label_color,
+    # _label_descriptions, _ensure_labels_core, bootstrap_labels). None calls
+    # a gated primitive; both modules measured 0 out-of-predicate raw sites,
+    # workflow.py holds at 111 (live 107) and the baseline-dict sum stays 247.
     "workflow.py": 111,
     "orchestration/state_rework_routing.py": 8,
     "orchestration/state_stale_checks.py": 9,
