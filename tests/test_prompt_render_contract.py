@@ -706,36 +706,17 @@ def _resolve_cited_symbol_spans(
     """Resolve each ``workflow.py::<key>`` citation to its source span by
     following the *live* attribute to whatever module now defines it.
 
-    Citations are written against the ``workflow.py`` namespace, but the
-    symbol a citation names may physically live in a delegate module:
-    issue #1283 Phase A moved the rework builders (``_write_rework_prompt``,
-    ``_render_rework_prompt``, ``_render_required_changes_section``) into
-    ``rework_prompts.py``, and Track 2 Phase B (issue #1582) moved
-    ``OrchestratorApp`` methods into ``charlie_work/orchestration/*.py`` --
-    ``workflow_delegation._install_delegates`` re-attaches them so the public
-    name stays reachable on the class. Rather than hardcode the set of files a
-    symbol might have landed in -- a list that would need editing for every
-    future move (rule #9) -- this resolves each cited name through the live
-    object:
-
-    * ``OrchestratorApp.<attr>`` -> ``getattr(OrchestratorApp, attr)``
-    * bare ``<name>`` -> ``getattr(workflow_module, name)``
-
-    ``inspect.unwrap`` peels any ``functools.wraps`` decorator layer, then
-    ``inspect.getsourcefile`` + ``obj.__qualname__`` name the defining file
-    and its in-file qualified name, which ``_resolve_symbols`` maps to a span.
-    Each defining file's source lines are appended to ``combined_lines`` once
-    (with a recorded offset) so a single ``(start, end)`` pair still slices
-    the right lines regardless of which file defines the symbol -- the same
-    concatenation strategy the previous fixed two-file version used, now
-    derived from the live symbols instead of a hardcoded file list. Following
-    the live object also resolves a name defined in more than one file to the
-    one the code actually installs, instead of dropping it as ambiguous.
-
-    A name that no longer resolves to any live attribute (or whose in-file
-    qualname is ambiguous, which ``_resolve_symbols`` drops) is simply left
-    out of the returned map; ``_collect_citation_failures`` then reports it as
-    unresolved (renamed/removed), exactly as a within-file miss is reported.
+    Citations name the ``workflow.py`` namespace, but the cited symbol may
+    physically live in a delegate module (Track 2 Phase B moves
+    ``OrchestratorApp`` methods into ``charlie_work/orchestration/*.py``, then
+    re-attaches them to the class). Rather than hardcode the files a symbol
+    might land in -- a list needing an edit for every future move (rule #9) --
+    this follows the live object: dotted ``OrchestratorApp.<attr>`` via
+    ``getattr`` on the class, bare ``<name>`` via ``getattr`` on the workflow
+    module. Each defining file's source is appended to ``combined_lines`` once
+    with a recorded offset, so the single ``(start, end)`` pair
+    ``_collect_citation_failures`` consumes slices the right lines regardless
+    of which file defines the symbol.
     """
     import charlie_work.workflow as workflow_module
 
