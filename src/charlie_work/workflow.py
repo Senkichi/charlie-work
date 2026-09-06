@@ -22,7 +22,7 @@ from .claude_code import (
     _events_path,
     launch_claude_worker,
     resolve_review_effort,
-    run_quota_probe,
+    run_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 )
 from .api_worker import launch_api_worker
 from .devin_shell import launch_devin_session
@@ -53,7 +53,7 @@ from .file_lock import try_acquire_byte_range_lock
 from .harnesses import REVIEWER_ADAPTER_KINDS, REVIEWER_HARNESSES
 from .fleet_registry import count_fleet_live_sessions, managed_repo_names, try_acquire_fleet_lock
 from . import layout, status_snapshot
-from .main_ci_reclaim import reclaim_superseded_main_ci_runs
+from .main_ci_reclaim import reclaim_superseded_main_ci_runs  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .subprocess_runner import run_captured
 from .rescue_review import (
@@ -73,7 +73,7 @@ from .github import (
     defang_closing_keywords,
     detect_prose_only_dependencies,
     get_github_issue_dependencies,
-    issue_numbers_mentioned_by_pr,
+    issue_numbers_mentioned_by_pr,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     label_names,
     parse_blockers,
     is_transient_repo_resolution_failure,
@@ -159,7 +159,7 @@ from .worktree import (
     WorktreeProbeFailedError,
     _worktree_refuse_to_reset_reason,
     _reap_idle_foreign_writer,
-    clean_worktrees,
+    clean_worktrees,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     inspect_worktree_state,
     read_worktree_marker,
     read_worker_outcome,
@@ -182,35 +182,35 @@ from .state import (
     PASSIVE_OPEN_STATUS,
     StateLockBusy,
     append_event,
-    arm_operator_queue_review,
-    arm_quota_probe,
-    arm_reconcile_pass,
-    clear_quota_throttles,
+    arm_operator_queue_review,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
+    arm_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
+    arm_reconcile_pass,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
+    clear_quota_throttles,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     clear_reviewer_quota,
-    defer_reviewer_probe_after,
+    defer_reviewer_probe_after,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     clear_escalation,
     clear_escalation_on_issue_prs,
-    disarm_quota_probe,
+    disarm_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     ESCALATION_REASON_CLASS_BY_EVENT_KIND,
     escalation_reason_class,
     is_claim_stale,
-    is_operator_queue_review_due,
-    is_quota_probe_actionable,
-    is_quota_probe_armed,
-    is_quota_probe_due,
-    is_reconcile_due,
+    is_operator_queue_review_due,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
+    is_quota_probe_actionable,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
+    is_quota_probe_armed,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
+    is_quota_probe_due,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
+    is_reconcile_due,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     is_reviewer_probe_ready,
     is_reviewer_quota_exhausted,
     is_throttled,
-    is_worktree_reclamation_due,
+    is_worktree_reclamation_due,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     load_state,
     load_state_locked,
     mark_reviewer_quota_alerted,
     operator_claimed_issues,
     release_operator_claimed,
     save_state,
-    schedule_worktree_reclamation,
+    schedule_worktree_reclamation,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     set_operator_claimed,
     stale_operator_claims,
     state_lock,
@@ -4772,194 +4772,6 @@ class OrchestratorApp:
                 "prose_only_deps_issues": prose_only_deps_issues,
             },
         )
-
-    def _finalize_externally_merged_issues(
-        self,
-        ready_issues: list[dict[str, Any]] | None = None,
-    ) -> tuple[set[int], list[dict[str, Any]], _MergedPRListOutcome]:
-        """Finalize closed ready-labeled issues whose linked PR merged externally,
-        and strip the ready/active labels from closed ready issues that have no
-        merged PR binding them (issue #429/#433).
-
-        Runs before dispatch capacity guards (fleet lock, GraphQL budget, provider
-        throttle) so a pass that defers new work still drains the backlog of
-        externally-merged issues (e.g. Aviator MergeQueue handoffs).  It first
-        binds candidates against the cheap most-recent-500 ``merged_pr_list()``;
-        only issues whose merged PR falls outside that window incur a per-issue
-        ``gh pr list --search`` lookup.
-
-        Per-issue lookups are capped at ``dispatch.finalize_limit`` and processed
-        oldest-first (by ``createdAt``, then issue number). A consecutive-failure
-        circuit breaker stops the pass after 3 failed lookups so a transient
-        Search API rate limit does not monopolize the shared token.
-        """
-        if ready_issues is None:
-            ready_issues = self.gh.issue_list(
-                labels=[self.config.labels.ready],
-                state="all",
-            )
-        closed_ready = [
-            issue
-            for issue in ready_issues
-            if str(issue.get("state") or "OPEN").upper() == "CLOSED"
-        ]
-        if not closed_ready:
-            return set(), ready_issues, _MergedPRListOutcome()
-
-        finalize_limit = self.config.dispatch.finalize_limit
-        if finalize_limit <= 0:
-            return set(), ready_issues, _MergedPRListOutcome()
-
-        # Try the cheap 500-window binding first; if the GraphQL-budget guard
-        # refuses the call, fall back to per-issue search for all candidates.
-        bound_issue_numbers: set[int] = set()
-        mention_only_issue_numbers: set[int] = set()
-        merged_pr_outcome = _MergedPRListOutcome()
-        try:
-            merged_prs = self.gh.merged_pr_list()
-        except GitHubError as exc:
-            merged_pr_outcome = _MergedPRListOutcome([], exc, called=True)
-            merged_prs = []
-        else:
-            merged_pr_outcome = _MergedPRListOutcome(merged_prs, called=True)
-        for pr in merged_prs:
-            if str(pr.get("state") or "").upper() != "MERGED":
-                continue
-            # Issue #1229 scoping decision: this call site is deliberately NOT
-            # threaded through branch_issue_validator. ``bound_issue_numbers``
-            # only gates which CLOSED ready issues have a merged PR binding
-            # them (so they are not stripped as closed-unmerged); no
-            # issue-label transition or state escalation keys off it. A stale
-            # branch-name binding can at worst add a wrong number to
-            # ``bound_issue_numbers``, causing a missed label-strip on an
-            # already-CLOSED (terminal) issue that the next pass recovers --
-            # not the "escalate the wrong issue" failure class the validator
-            # exists to prevent. (Contrast ``detect_mergequeue_wedged``, whose
-            # ``issue_number`` DOES drive ``_escalate_issue`` and is
-            # validator-threaded.)
-            bound = linked_issue_number(
-                pr,
-                is_cross_repository=pr.get("isCrossRepository"),
-                branch_prefix=self.config.dispatch.branch_prefix,
-            )
-            if bound is not None:
-                bound_issue_numbers.add(bound)
-            # isCrossRepository describes the PR's own head-branch provenance
-            # (fork vs. same-repo). It cannot fully guard a cross-repo mention
-            # collision, but it does guard the common case of a fork PR's text
-            # being trusted at all.
-            if pr.get("isCrossRepository") is False:
-                for mentioned in issue_numbers_mentioned_by_pr(pr):
-                    mention_only_issue_numbers.add(mentioned)
-
-        # Mention-only references are advisory; they are not a binding, but
-        # they also must not be stripped as "unmerged" — dispatch() will flag
-        # them for a human decision.
-        mention_only_issue_numbers -= bound_issue_numbers
-
-        # Only unbound closed issues are candidates for per-issue search or strip.
-        unbound_issues = [
-            issue for issue in closed_ready if int(issue["number"]) not in bound_issue_numbers
-        ]
-
-        def _finalization_order(issue: dict[str, Any]) -> tuple[str, int]:
-            return (str(issue.get("createdAt") or ""), int(issue["number"]))
-
-        # Slice BEFORE any per-issue lookup so a large backlog cannot exhaust
-        # the GitHub Search API bucket in a single pass.
-        candidates = sorted(unbound_issues, key=_finalization_order)[:finalize_limit]
-
-        issue_pr_map: dict[int, list[dict[str, Any]]] = {}
-        closed_unmerged_ready_issues: set[int] = set()
-        consecutive_failures = 0
-        for issue in candidates:
-            if consecutive_failures >= 3:
-                break
-            issue_number = int(issue["number"])
-            merged_prs = self.gh.merged_prs_for_issue(
-                issue_number,
-                self.config.dispatch.branch_prefix,
-            )
-            if not getattr(merged_prs, "ok", True):
-                consecutive_failures += 1
-                continue
-            consecutive_failures = 0
-            if merged_prs:
-                issue_pr_map[issue_number] = list(merged_prs)
-            elif issue_number not in mention_only_issue_numbers:
-                # Confirmed closed ready issue with no merged PR binding it.
-                closed_unmerged_ready_issues.add(issue_number)
-
-        # Persist state first, then apply labels outside the lock.
-        if issue_pr_map or closed_unmerged_ready_issues:
-            with state_lock(self.paths.state_file):
-                state = load_state(self.paths.state_file)
-                for issue_number, prs in issue_pr_map.items():
-                    issue_key = str(issue_number)
-                    issue_entry = state["issues"].get(issue_key, {})
-                    state["issues"][issue_key] = {
-                        **issue_entry,
-                        "number": issue_number,
-                        "status": "closed",
-                    }
-                    for pr in prs:
-                        pr_number = int(pr["number"])
-                        pr_key = str(pr_number)
-                        pr_entry = state["prs"].get(pr_key, {})
-                        _new_pr_state = {
-                            **pr_entry,
-                            "number": pr_number,
-                            "status": "merged",
-                            "merged": True,
-                            "issue_number": issue_number,
-                        }
-                        # Issue #747: stamp ``merged_at`` only on a genuine
-                        # non-merged -> merged transition so the original
-                        # observation time is preserved across re-finalization
-                        # passes and existing entries are never back-dated.
-                        if pr_entry.get("status") != "merged":
-                            _new_pr_state["merged_at"] = utc_now()
-                        state["prs"][pr_key] = _new_pr_state
-                if issue_pr_map:
-                    state = self._record_event(
-                        state,
-                        # event-consumer: audit-only -- records the PR-status "merged"
-                        # finalization already applied inline above; no separate consumer needed
-                        "finalize_externally_merged",
-                        {
-                            "issue_numbers": sorted(issue_pr_map.keys()),
-                            "pr_numbers": sorted(
-                                {int(pr["number"]) for prs in issue_pr_map.values() for pr in prs}
-                            ),
-                        },
-                    )
-                for issue_number in closed_unmerged_ready_issues:
-                    issue_key = str(issue_number)
-                    issue_entry = state["issues"].get(issue_key, {})
-                    state["issues"][issue_key] = {
-                        **issue_entry,
-                        "number": issue_number,
-                        "status": "closed",
-                    }
-                if closed_unmerged_ready_issues:
-                    state = self._record_event(
-                        state,
-                        "dispatch_closed_unmerged_ready_stripped",
-                        {"issue_numbers": sorted(closed_unmerged_ready_issues)},
-                    )
-                save_state(self.paths.state_file, state)
-
-        for issue_number in issue_pr_map:
-            transition(self.gh, self.config.labels, issue_number, "merged")
-            self.gh.close_issue(issue_number)
-
-        for issue_number in closed_unmerged_ready_issues:
-            transition(self.gh, self.config.labels, issue_number, "closed_unmerged")
-
-        finalized: set[int] = set(issue_pr_map.keys())
-        removed = finalized | closed_unmerged_ready_issues
-        remaining = [issue for issue in ready_issues if int(issue["number"]) not in removed]
-        return finalized, remaining, merged_pr_outcome
 
     def dispatch(
         self,
@@ -14105,95 +13917,6 @@ class OrchestratorApp:
             },
         )
 
-    def _merge_deferred_stale_base_result(
-        self,
-        pr_number: int,
-        issue_number: int | None,
-        decision: dict[str, Any],
-        base_ref: str | None,
-        head_sha: str | None,
-        reason: str = "base_stale",
-    ) -> CommandResult:
-        """Return a non-mergeable result for an approved PR whose base is stale.
-
-        Records a ``merge_deferred_stale_base`` event so operators can see that
-        the merge was deferred because the PR's merge-base is not the current
-        base branch tip.
-        """
-        with state_lock(self.paths.state_file):
-            state = load_state(self.paths.state_file)
-            existing = state["prs"].get(str(pr_number), {})
-            new_stale_base_deferrals = int(existing.get("consecutive_stale_base_deferrals", 0)) + 1
-            threshold = self.config.auto_merge.failed_attempt_alarm
-            stale_base_alarm = threshold > 0 and new_stale_base_deferrals == threshold
-            stale_base_warning: str | None = None
-            if stale_base_alarm:
-                stale_base_warning = _format_stale_base_alarm_message(
-                    pr_number, new_stale_base_deferrals, reason
-                )
-                state = append_event(
-                    state,
-                    "merge_deferred_stale_base_alarm",
-                    {
-                        "pr_number": pr_number,
-                        "issue_number": issue_number,
-                        "base_ref": base_ref,
-                        "head_sha": head_sha,
-                        "reason": reason,
-                        "attempts": new_stale_base_deferrals,
-                        "threshold": threshold,
-                        "message": stale_base_warning,
-                    },
-                    state_path=self.paths.state_file,
-                )
-            state = append_event(
-                state,
-                "merge_deferred_stale_base",
-                {
-                    "pr_number": pr_number,
-                    "issue_number": issue_number,
-                    "base_ref": base_ref,
-                    "head_sha": head_sha,
-                    "reason": reason,
-                },
-                state_path=self.paths.state_file,
-            )
-            state["prs"][str(pr_number)] = {
-                **existing,
-                "number": pr_number,
-                "issue_number": issue_number,
-                "consecutive_stale_base_deferrals": new_stale_base_deferrals,
-            }
-            save_state(self.paths.state_file, state)
-        return CommandResult(
-            True,
-            f"PR #{pr_number} base is stale; merge deferred until base is current",
-            {
-                "pr": pr_number,
-                "issue": issue_number,
-                "can_merge": False,
-                "auto_merge_enabled": self.config.auto_merge.enabled,
-                "merged": False,
-                "merge_output": None,
-                "branch_deleted": None,
-                "review_decision": decision,
-                "checks": asdict(summarize_checks([], self.config.auto_merge.required_checks)),
-                "checks_unavailable": False,
-                "label_error": None,
-                "update_open_prs_results": None,
-                "cancel_superseded_runs_results": None,
-                "containment_warnings": [],
-                "stale_base": True,
-                "consecutive_failed_merge_attempts": existing.get(
-                    "consecutive_failed_merge_attempts", 0
-                ),
-                "consecutive_stale_base_deferrals": new_stale_base_deferrals,
-                "merge_attempt_alarm": stale_base_alarm,
-                "merge_attempt_warning": stale_base_warning,
-                "merge_conflict": False,
-            },
-        )
-
     def _is_merge_conflict(self, pr: dict[str, Any]) -> bool:
         """Detect a genuine content conflict that gh pr update-branch cannot resolve.
 
@@ -14421,69 +14144,6 @@ class OrchestratorApp:
         if not isinstance(issue, dict) or "labels" not in issue:
             return False
         return bool(set(self.config.dispatch.human_merge_labels) & label_names(issue))
-
-    def _merge_train_candidates(
-        self,
-        prs: list[dict[str, Any]] | None = None,
-        exclude_pr_number: int | None = None,
-    ) -> list[tuple[str, int, dict[str, Any], dict[str, Any], str]]:
-        """Return approved-pending-ship candidates sorted by approval time.
-
-        Each tuple contains (sort_key, pr_number, pr, decision, head_ref).
-        """
-        if prs is None:
-            prs = self.gh.pr_list()
-
-        branch_prefix = self.config.dispatch.branch_prefix
-        human_merge_labels = self.config.dispatch.human_merge_labels
-        # Aviator MergeQueue handoff (task #10): a PR already parked in
-        # Aviator's queue (state status "mergequeue") must never occupy
-        # charlie's merge-train head — Aviator now owns serialization for it.
-        # Without this exclusion the parked PR keeps winning "earliest
-        # reviewed" on every poll until GitHub reports it merged, so under
-        # front_of_train no other approved PR is ever attempted while Aviator
-        # is still processing it. Reading state is only necessary when the
-        # mergequeue handoff feature is actually configured.
-        state_prs = (
-            load_state_locked(self.paths.state_file).get("prs", {})
-            if self.config.auto_merge.mergequeue_label
-            else {}
-        )
-        candidates: list[tuple[str, int, dict[str, Any], dict[str, Any], str]] = []
-        for pr in prs:
-            pr_number = int(pr.get("number", 0))
-            if pr_number == exclude_pr_number:
-                continue
-            if pr.get("isCrossRepository"):
-                continue
-            head = str(pr.get("headRefName") or "")
-            if not head.startswith(branch_prefix):
-                continue
-            if (state_prs.get(str(pr_number)) or {}).get("status") == "mergequeue":
-                continue
-            decision = self._review_decision(pr_number)
-            if decision.get("decision") != "approved":
-                continue
-            reviewed_head_sha = decision.get("reviewed_head_sha")
-            live_head_sha = pr.get("headRefOid")
-            if reviewed_head_sha is None or live_head_sha != reviewed_head_sha:
-                continue
-            # Issue #1598: a bound PR whose issue carries a configured
-            # human_merge_labels label is never a merge-train candidate —
-            # it is human-merged, not fleet-merged. The check reads live
-            # issue labels at decision time so an operator adding or
-            # removing the label mid-flight takes effect on the next pass.
-            # Skipped entirely when human_merge_labels is empty (default),
-            # preserving current behaviour with zero overhead.
-            if human_merge_labels and self._pr_bound_issue_has_human_merge_label(
-                pr, branch_prefix
-            ):
-                continue
-            reviewed_at = decision.get("reviewed_at") or pr.get("updatedAt") or ""
-            candidates.append((str(reviewed_at), pr_number, pr, decision, head))
-
-        candidates.sort(key=lambda item: (item[0], item[1]))
-        return candidates
 
     def _is_stale_ci_request_changes(self, pr_number: int, decision: dict[str, Any]) -> bool:
         """True when ``decision`` is a request_changes verdict whose only
@@ -15054,79 +14714,6 @@ class OrchestratorApp:
         else:
             merges.append(merge_result.data)
 
-    def _mark_foreign_issue_ref(self, pr_number: int, issue_number: int, reason: str) -> bool:
-        """Record a not-found for this (pr, issue) pair, parking durably once
-        confirmations reach the configured threshold.
-
-        A PR opened against the wrong fleet repo (e.g. its branch references
-        another repo's issue number) can never be processed here: every pass
-        would re-derive the same issue number and re-fail the same GitHub
-        lookup forever. Persist a ``foreign_issue_ref`` marker in the PR's
-        state entry so subsequent passes skip it with zero GitHub calls.
-
-        Issue #1132: a single not-found is no longer enough to park durably —
-        a transient GraphQL repo-resolution failure (network/infra dip) can
-        produce the same ``GitHubNotFoundError`` shape. The marker now carries
-        a ``confirmations`` counter; the PR is only *confirmed* (skipped on
-        subsequent passes) once the counter reaches
-        ``review.foreign_issue_ref_confirm_passes`` (default 2). A transient
-        window (minutes) clears before two 5-minute passes complete.
-
-        Legacy markers (pre-#1132, no ``confirmations`` field) are treated as
-        already-confirmed by the early-skip in ``_loop_body`` (``confirmed =
-        confirmations is None or ...``), so they never reach this method via
-        the loop. The ``same_issue and prev_conf is None`` branch below is a
-        defensive guard kept for direct/non-loop call sites: without it a
-        legacy marker would hit ``prev_conf + 1`` (``None + 1`` -> TypeError)
-        and could re-emit the one-shot digest. It does NOT silently migrate
-        the field on existing production markers — that handling lives in the
-        early-skip, which leaves the marker untouched (no ``confirmations``
-        key is written). See
-        ``test_legacy_marker_without_confirmations_skipped_silently``.
-
-        Returns True only when the confirmation threshold is first reached for
-        this (pr, issue) pair, so the caller emits the one-shot attention
-        digest exactly once.
-        """
-        confirm_passes = self.config.review.foreign_issue_ref_confirm_passes
-        with state_lock(self.paths.state_file):
-            state = load_state(self.paths.state_file)
-            pr_state = state["prs"].get(str(pr_number), {})
-            marker = pr_state.get("foreign_issue_ref") or {}
-            same_issue = marker.get("issue") == issue_number
-            prev_conf = marker.get("confirmations")
-            if same_issue and prev_conf is None:
-                # Defensive guard for a legacy marker (pre-#1132, no
-                # ``confirmations`` field) reaching this method via a
-                # non-loop call site. Unreachable via ``_loop_body``: the
-                # early-skip there treats ``confirmations is None`` as
-                # confirmed and skips before this method is called, leaving
-                # the marker untouched (no migration). Kept to avoid a
-                # ``None + 1`` TypeError on the ``elif same_issue`` branch
-                # and to suppress a spurious digest re-emit.
-                new_conf = confirm_passes
-                emit = False
-            elif same_issue:
-                new_conf = prev_conf + 1
-                emit = new_conf >= confirm_passes and prev_conf < confirm_passes
-            else:
-                # Fresh marker (new issue ref or first sighting).
-                new_conf = 1
-                emit = new_conf >= confirm_passes
-            detected_at = marker.get("detected_at") or utc_now()
-            state["prs"][str(pr_number)] = {
-                **pr_state,
-                "number": pr_number,
-                "foreign_issue_ref": {
-                    "issue": issue_number,
-                    "detected_at": detected_at,
-                    "reason": reason,
-                    "confirmations": new_conf,
-                },
-            }
-            save_state(self.paths.state_file, state)
-        return emit
-
     @_guard_state_lock
     def loop(
         self,
@@ -15345,520 +14932,6 @@ class OrchestratorApp:
                 status_snapshot.write_status_snapshot(self)
             return result
 
-    def _maybe_probe_quota_recovery(self, *, now: datetime | None = None) -> None:
-        """Flat-interval Haiku probe for early quota/rate-limit throttle recovery.
-
-        Runs every loop pass but is a near-no-op unless a throttle that a
-        green ambient-CLI probe could actually clear is currently active
-        (``is_quota_probe_actionable``) -- an operator switching to a
-        different subscription account can make a provider's quota recover
-        well before a blanket cooldown (e.g. the 24h
-        ``_DEFAULT_QUOTA_COOLDOWN_HOURS`` window) elapses, and there was
-        previously no way to detect that early. Deliberately a *flat*
-        ``quota_probe.interval_minutes`` schedule (not exponential backoff
-        like ``reviewer_quota.probe_after``): the user asked for a fixed
-        15-minute recheck, not a growing wait.
-
-        The gate is narrower than "any throttle indicator" -- a devin/api
-        adapter throttle or a provider_auth cooldown would survive
-        ``clear_quota_throttles`` untouched even on a green probe (see that
-        function), so arming/probing for one would just burn Haiku sessions
-        every interval for no possible benefit. Because of this, a green
-        probe reaching the success branch below is guaranteed to have
-        something to clear -- no post-hoc check needed there.
-
-        Two-phase lock pattern so the (possibly tens-of-seconds) subprocess
-        call in ``run_quota_probe`` never holds ``state_lock`` and blocks
-        every other state read/writer in the process:
-          1. Under the lock: decide whether to probe at all, and if not,
-             arm/disarm/return without calling out to the CLI.
-          2. Outside the lock: run the actual probe subprocess.
-          3. Under the lock again: re-read state (it may have changed while
-             unlocked) and apply the outcome.
-
-        ``now`` (issue #828) is the injectable clock for this whole method:
-        both internal ``datetime.now(UTC)`` samples below (the first-arm
-        branch and the red-probe reschedule branch) resolve from the same
-        seeded instant instead of each independently racing the wall clock.
-        Defaults to ``datetime.now(UTC)`` when omitted, so production
-        behavior is byte-identical; tests can freeze it and assert exact
-        equality on the scheduled ``next_probe_at`` instead of a
-        wall-clock-tolerance proximity check.
-        """
-        if not self.config.quota_probe.enabled:
-            return
-
-        resolved_now = now if now is not None else datetime.now(UTC)
-        state_file = self.paths.state_file
-        with state_lock(state_file):
-            state = load_state(state_file)
-            if not is_quota_probe_actionable(state):
-                if is_quota_probe_armed(state):
-                    state = disarm_quota_probe(state)
-                    save_state(state_file, state)
-                return
-            if not is_quota_probe_armed(state):
-                next_probe_at = (
-                    (resolved_now + timedelta(minutes=self.config.quota_probe.interval_minutes))
-                    .replace(microsecond=0)
-                    .isoformat()
-                    .replace("+00:00", "Z")
-                )
-                state = arm_quota_probe(state, next_probe_at)
-                save_state(state_file, state)
-                return
-            if not is_quota_probe_due(state):
-                return
-
-        probe_ok = run_quota_probe(repo_root=self.repo_root, config=self.config)
-
-        with state_lock(state_file):
-            state = load_state(state_file)
-            if not is_quota_probe_actionable(state):
-                # Cleared or became non-actionable while the probe ran unlocked.
-                state = disarm_quota_probe(state)
-                save_state(state_file, state)
-                return
-            if probe_ok:
-                state = clear_quota_throttles(state)
-                state = disarm_quota_probe(state)
-                state = self._record_event(state, "quota_probe_succeeded", {})
-            else:
-                next_probe_at = (
-                    (resolved_now + timedelta(minutes=self.config.quota_probe.interval_minutes))
-                    .replace(microsecond=0)
-                    .isoformat()
-                    .replace("+00:00", "Z")
-                )
-                state = arm_quota_probe(state, next_probe_at)
-                # Share the failure with dispatch_reviews's probe_mode gate:
-                # a red flat probe confirmed the window is still closed, so
-                # also bump reviewer_quota.probe_after (when the reviewer
-                # quota is exhausted) to stop dispatch_reviews from
-                # independently launching a real reviewer session into the
-                # same window on this or a nearby pass (issue #663).
-                state = defer_reviewer_probe_after(state, next_probe_at)
-                state = self._record_event(state, "quota_probe_failed", {})
-            save_state(state_file, state)
-
-    def _maybe_reclaim_worktrees(self, *, now: datetime | None = None) -> dict[str, Any] | None:
-        """Cadence-gated merged-PR worktree reclamation on the fleet pass.
-
-        Runs ``clean_worktrees`` -- the same junction-safe, merge-gated,
-        liveness-gated sweep behind ``charlie worktree-clean`` -- on a flat
-        ``worktree_reclamation.interval_minutes`` schedule. Before this call
-        site the sweep only ran when an operator remembered the standalone
-        subcommand, so worktrees for merged PRs accumulated indefinitely
-        (issue #636: 77 of 81 dead on the host this was measured on).
-
-        Two-phase lock pattern (same shape as ``_maybe_probe_quota_recovery``):
-        the schedule is advanced under the lock and the sweep itself runs
-        outside it, because ``clean_worktrees`` makes a live ``gh pr view`` call
-        per candidate worktree and must not hold ``state_lock`` while it does --
-        holding the lock across a per-candidate GitHub fan-out would block every
-        other state reader/writer in the process for the sweep's duration.
-
-        ``dry_run`` is threaded honestly: a ``--dry-run`` fleet pass runs the
-        sweep in preview mode, which removes nothing (the preview-vs-act class
-        tracked in #614-#619). Under live mode a ``worktrees_reclaimed`` event
-        is emitted so a maintenance action that left no trace is
-        indistinguishable from one that never ran (lesson from #595/#621);
-        under ``dry_run`` the event is suppressed per #1324 (WriteGate).
-        The event payload carries a bounded ``skipped_examples`` list (each
-        entry's own ``reason`` string) alongside the exact ``skipped_count``,
-        plus ``worktrees_registered``/``worktrees_out_of_scope`` -- so a
-        worktree stuck for days can be diagnosed from events.db alone,
-        without catching the sweep live (issue #1012).
-
-        The cadence schedule itself is advanced regardless of ``dry_run``.
-        This is deliberate, not an instance of the #614-#619 class:
-        ``clean_worktrees`` makes its live ``gh pr view`` call per candidate
-        unconditionally -- ``dry_run`` only gates the final ``git worktree
-        remove`` -- so the GitHub-quota cost this interval exists to bound is
-        identical in preview and live mode. Not advancing the schedule under
-        ``dry_run`` would let a repeated preview pass re-run the full
-        per-candidate fan-out every time, defeating the cadence gate.
-
-        Returns a small summary dict when the sweep ran (for the loop result's
-        ``data``), or ``None`` when reclamation is disabled or not due this
-        pass.
-
-        ``now`` (issue #828) is the injectable clock used to compute
-        ``next_run_at`` below, BEFORE the ``clean_worktrees`` call's live
-        ``gh pr view`` fan-out. Defaults to ``datetime.now(UTC)`` when
-        omitted, so production behavior is byte-identical; tests can freeze
-        it and assert exact equality on the scheduled ``next_run_at`` instead
-        of a wall-clock-tolerance proximity check that would otherwise race
-        the fan-out's own duration.
-        """
-        if not self.config.worktree_reclamation.enabled:
-            return None
-        resolved_now = now if now is not None else datetime.now(UTC)
-        state_file = self.paths.state_file
-        with state_lock(state_file):
-            state = load_state(state_file)
-            if not is_worktree_reclamation_due(state):
-                return None
-            # Advance the schedule BEFORE running the sweep so a concurrent
-            # pass (or a sweep that takes longer than one poll interval) cannot
-            # double-fire. The next run is interval_minutes away regardless of
-            # how long the sweep itself takes.
-            next_run_at = (
-                (
-                    resolved_now
-                    + timedelta(minutes=self.config.worktree_reclamation.interval_minutes)
-                )
-                .replace(microsecond=0)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-            state = schedule_worktree_reclamation(state, next_run_at)
-            save_state(state_file, state)
-
-        # Use the same resolved worktrees root dispatch and `charlie
-        # worktree-clean` use (self._layout.worktrees, from
-        # paths.resolved_layout) rather than re-deriving the
-        # claude_code.worktrees_dir/runtime.state_dir sentinel logic inline --
-        # that duplication across call sites is the exact shape of bug
-        # layout.py's module docstring documents as a past production
-        # incident (create and sweep sides silently disagreeing on the root).
-        state = load_state_locked(state_file)
-        result = clean_worktrees(
-            self.repo_root,
-            self._layout.worktrees,
-            state,
-            self.config,
-            self.gh,
-            dry_run=self.dry_run,
-        )
-        orphans = result.data.get("orphans", {})
-        skipped_full = result.data.get("skipped", [])
-        summary = {
-            "dry_run": self.dry_run,
-            "ok": result.ok,
-            "removed": len(result.data.get("removed", [])),
-            "planned": len(result.data.get("planned", [])),
-            "skipped_count": len(skipped_full),
-            "failed": len(result.data.get("failed", [])),
-            "orphans_removed": len(orphans.get("removed", [])),
-            "orphans_planned": len(orphans.get("planned", [])),
-            "orphans_failed": len(orphans.get("failed", [])),
-            "message": result.message,
-            # issue #1012: clean_worktrees computes a distinct `reason` per
-            # skipped worktree (at least nine distinct strings across the
-            # merged/closed-unmerged/liveness gates), but until this fix only
-            # `skipped_count` reached this durable payload -- "11 skipped" with
-            # no way to tell which reason, or whether a specific stuck
-            # worktree was even a candidate. Truncated to
-            # `_MAX_SKIPPED_WORKTREE_EXAMPLES` so a standing backlog can't
-            # re-emit the full list into events.db every interval;
-            # `skipped_count` above is still the exact, untruncated count.
-            "skipped_examples": skipped_full[:_MAX_SKIPPED_WORKTREE_EXAMPLES],
-            # Distinguishes "never a candidate" (outside worktrees_dir or off
-            # the dispatch branch prefix -- an operator-created worktree, for
-            # instance) from "considered and skipped": neither was
-            # observable from this event before.
-            "worktrees_registered": result.data.get("worktrees_registered", 0),
-            "worktrees_out_of_scope": result.data.get("worktrees_out_of_scope", 0),
-        }
-        with state_lock(state_file):
-            state = load_state(state_file)
-            state = self._record_event(state, "worktrees_reclaimed", summary)
-            save_state(state_file, state)
-        return summary
-
-    def _maybe_reconcile_drift(self, *, now: datetime | None = None) -> None:
-        """Periodic in-loop repair of GitHub label / state.json divergence.
-
-        merge-lane-recovery plan §6-B / D-8. ``OrchestratorApp.reconcile()``
-        (``detect_drift`` + ``apply_fixes``) was previously reachable only
-        via the operator-invoked ``charlie mop-up --fix`` CLI command
-        (``cli.py``'s ``mop-up`` handler) -- the fleet has never run its own
-        repair. This wires it into the loop on a fixed cadence so a
-        divergence like a failed escalation label write (the PRIMARY defect:
-        ``status`` flips to ``escalated`` but the paired ``human_needed``
-        label transition silently fails, leaving a stale ``needs-rework``
-        label on a dead issue forever) is corrected automatically instead of
-        only when an operator remembers to intervene.
-
-        This method is wiring only -- it does not reimplement drift
-        detection or repair. ``self._reconcile_locked(fix=True)`` owns that (and
-        already threads ``state_path`` so ``apply_fixes`` emits one
-        ``"reconcile"`` event per repaired drift item for free -- see
-        ``reconcile.py``). It also owns the safety invariant this
-        workstream exists to preserve: an open escalated issue's
-        ``status`` is never rewritten (D-2), and reconcile never rewrites
-        ``status`` to an active dispatch/rework value. Any status writes
-        it does make are to terminal or passive values (``closed``,
-        ``merged``, ``open_passive``) or to clear a stale/missing key;
-        a closed-while-escalated issue is finalized to ``closed`` like
-        any other, but no escalated issue is ever re-entered into the
-        machine. This method does not touch ``status``.
-
-        Calls with ``skip_dead_session_sweep=True``: this pass already ran
-        the loop's own stall/dead lanes (``_detect_and_handle_stalled_sessions``
-        / ``_classify_dead_sessions_and_update_throttle_state``) earlier in
-        ``_loop_body``, with grace-period semantics
-        (``max_inconclusive_probe_deferrals``) that reconcile.py's own
-        dead-session sweep predates and does not implement. Without this,
-        reconcile would re-scan the same sessions a few calls later and
-        unconditionally reap any not-alive one, silently defeating that
-        grace period every time this pass runs. See ``detect_drift``'s
-        docstring in ``reconcile.py`` for the full rationale. Launch-stalled
-        detection and live-session tracking (the other two things gated on
-        ``repo_root`` in ``detect_drift``) are unaffected -- they have no
-        counterpart in the loop's own lanes and keep running.
-
-        Calls ``_reconcile_locked`` directly, NOT ``reconcile()`` -- this is
-        the whole point of the D-8a split and reverting it silently disables
-        this entire method. ``reconcile()`` acquires ``supervisor.lock``
-        before doing anything else, and every production caller of ``loop()``
-        already holds that exact lock for the full duration of the call:
-        ``cli.py``'s ``bash-rats`` handler, ``fleet_dispatch.py``, and
-        ``supervise.py`` (which holds it across *every* pass of its
-        ``while True``). Byte-range locks taken via ``msvcrt.locking`` with
-        ``LK_NBLCK`` are per-handle and non-reentrant *even within a single
-        process* -- ``file_lock.py`` keeps no reentrancy bookkeeping -- so a
-        second acquisition from inside the same process fails exactly like a
-        foreign process's would. Going through ``reconcile()`` here therefore
-        always took the ``supervisor_lock_held`` early return and never ran.
-
-        Two-phase lock pattern, mirroring ``_maybe_probe_quota_recovery``:
-        ``_reconcile_locked`` acquires ``state_lock`` itself internally to
-        run drift detection/repair, and ``state_lock`` wraps a non-reentrant
-        advisory file lock (a plain per-path ``threading.Lock``, not an
-        ``RLock``) -- calling it while this method already held the same lock
-        would deadlock. So:
-          1. Under our own (short) lock: decide whether reconcile is due at
-             all. If not, return without calling out.
-          2. Outside any lock held by this method: call
-             ``self._reconcile_locked(fix=True)``. This may still defer (the
-             existing GraphQL rate-limit check) -- that path is preserved.
-             It can no longer report ``supervisor_lock_held``, because it
-             never attempts that acquisition; the lock is already held by
-             ``loop()``'s caller, which is the precondition this method
-             relies on rather than something it works around.
-          3. Under our own (short) lock again: persist the next-due
-             timestamp and emit exactly one summary event for this pass,
-             shaped by the outcome (completed / deferred / failed) so a
-             deferred or failed pass is distinguishable from a silent
-             no-op rather than failing silently (D-8, B-AC3).
-
-        The call is wrapped in exception containment, and that containment is
-        load-bearing rather than defensive habit: ``supervise.py``'s
-        ``except Exception`` sits *outside* its ``while True``, so a single
-        uncaught exception from here terminates the whole daemon rather than
-        one pass. ``_fetch_prs``/``_fetch_issues`` reach GitHub via
-        ``gh.run(..., json_output=True)`` with ``allow_failure=False``, which
-        *raises* ``GitHubError``/``GitHubNotFoundError`` once retries are
-        exhausted -- so without this, a GitHub outage is a live daemon-kill
-        path. A failed pass re-arms the timer like any other outcome, so a
-        persistent failure degrades to one logged error per interval instead
-        of a hot loop.
-
-        ``now`` (issue #828) is the injectable clock used to compute
-        ``next_reconcile_at`` below, BEFORE ``self._reconcile_locked(...)``
-        acquires ``state_lock`` and does its own (potentially slow) drift
-        detection/repair. Defaults to ``datetime.now(UTC)`` when omitted, so
-        production behavior is byte-identical; tests can freeze it and
-        assert exact equality on the scheduled ``next_reconcile_at`` instead
-        of a wall-clock-tolerance proximity check that would otherwise race
-        the reconcile call's own duration.
-        """
-        if not self.config.reconcile_pass.enabled:
-            return
-
-        resolved_now = now if now is not None else datetime.now(UTC)
-        state_file = self.paths.state_file
-        with state_lock(state_file):
-            state = load_state(state_file)
-            if not is_reconcile_due(state):
-                return
-
-        next_reconcile_at = (
-            (resolved_now + timedelta(minutes=self.config.reconcile_pass.interval_minutes))
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z")
-        )
-
-        # D-8a: _reconcile_locked, never reconcile(). See this method's
-        # docstring -- reconcile() would re-acquire the supervisor lock that
-        # loop()'s caller already holds and silently no-op every pass.
-        try:
-            result = self._reconcile_locked(
-                fix=True,
-                skip_dead_session_sweep=True,
-                dry_run=self.dry_run,
-            )
-        except Exception as exc:  # noqa: BLE001 - containment is deliberate; see docstring
-            with state_lock(state_file):
-                state = load_state(state_file)
-                state = arm_reconcile_pass(state, next_reconcile_at)
-                state = self._record_event(
-                    state,
-                    "reconcile_pass_failed",
-                    {"error": f"{type(exc).__name__}: {exc}"},
-                )
-                self.write_gate.save_state(state)
-            return
-
-        with state_lock(state_file):
-            state = load_state(state_file)
-            state = arm_reconcile_pass(state, next_reconcile_at)
-            data = result.data
-            if data.get("pass_skipped"):
-                state = self._record_event(
-                    state,
-                    "reconcile_pass_skipped",
-                    {"reason": data.get("reason")},
-                )
-            elif data.get("deferred"):
-                if not data.get("reconcile_pass_event_recorded"):
-                    state = self._record_event(
-                        state,
-                        "reconcile_pass_deferred",
-                        {
-                            "deferred_reason": data.get("deferred_reason"),
-                            "graphql_remaining": data.get("graphql_remaining"),
-                            "graphql_reset": data.get("graphql_reset"),
-                            "graphql_threshold": data.get("graphql_threshold"),
-                        },
-                    )
-            else:
-                drift_before = data.get("drift_before", 0)
-                drift_after = data.get("drift_after", 0)
-                state = self._record_event(
-                    state,
-                    "reconcile_pass_completed",
-                    {
-                        "ok": result.ok,
-                        "drift_detected": drift_before,
-                        "drift_fixed": drift_before - drift_after,
-                        "drift_remaining": drift_after,
-                    },
-                )
-            self.write_gate.save_state(state)
-
-    def _maybe_reclaim_superseded_main_ci(self) -> None:
-        """Cancel superseded, not-yet-started ``main`` CI runs every pass (#863, #815).
-
-        ``main_ci_reclaim.reclaim_superseded_main_ci_runs`` owns the actual
-        detection/cancellation logic and its safety invariant (never a
-        started run, never main's current tip, only strict ancestors of
-        tip) -- see that module's docstring. This method is wiring only.
-
-        Deliberately has NO cadence gate, unlike ``_maybe_reconcile_drift``
-        and ``_maybe_probe_quota_recovery`` above: running on every pass is
-        the mechanism that closes #815 (the reaper workflow gets only one
-        scheduling chance per main push and can permanently lose the race to
-        the stale run starting first). Since this lane needs no runner --
-        just a local ``git fetch`` plus a couple of cheap ``gh api`` calls --
-        running it unconditionally on every pass gives a superseded run
-        repeated chances to be reclaimed across passes, which a runner-bound
-        workflow retry could never provide regardless of how often it were
-        scheduled.
-
-        ``self.config.runners.default_branch`` is reused rather than adding
-        a second ``default_branch`` knob on ``MainCiReclaimConfig`` --
-        "what is this repo's default branch" is one fact, not one per
-        feature, and a second copy would only risk drifting out of sync with
-        the first.
-
-        Event policy (issue tracker: "signal without a consumer" is this
-        repo's #1 recurring defect class, so this is deliberate rather than
-        an oversight): unlike ``_maybe_reconcile_drift``, which emits one
-        summary event on every call because its cadence is bounded to once
-        per ``interval_minutes``, this method has no cadence gate and the
-        overwhelming majority of passes will find zero candidates -- writing
-        a ``main_ci_reclaim_completed`` event every single pass would add
-        events.db volume with zero diagnostic value and crowd the capped
-        200-entry ``state.json`` ring. So a durable event is written only
-        when there is something worth a durable record: an actual
-        cancellation (``main_ci_reclaim_cancelled``) or a pass-level failure
-        (``main_ci_reclaim_failed``). Both are consumed the same way
-        ``reconcile_pass_*`` events already are: ``query_events``/
-        ``event_counts_by_kind`` for structured aggregation, and
-        ``events_by_correlation_id`` to reconstruct a specific pass. The
-        zero-candidate case still gets an immediate, cheap consumer via
-        ``logger.debug`` below -- proof-of-life without a durable write.
-
-        Wrapped in exception containment for the same reason as every other
-        ``_maybe_*`` lane in this method: ``supervise.py``'s
-        ``except Exception`` sits outside its ``while True``, so one
-        uncaught exception here would kill the whole daemon rather than one
-        pass.
-        """
-        if not self.config.main_ci_reclaim.enabled:
-            return
-
-        import logging
-
-        logger = logging.getLogger(__name__)
-        state_file = self.paths.state_file
-        try:
-            result = reclaim_superseded_main_ci_runs(
-                self.gh,
-                self.repo_root,
-                default_branch=self.config.runners.default_branch,
-                workflow_filename=self.config.main_ci_reclaim.workflow_filename,
-            )
-        except Exception as exc:  # noqa: BLE001 - containment is deliberate; see docstring
-            with state_lock(state_file):
-                state = load_state(state_file)
-                state = self._record_event(
-                    state,
-                    "main_ci_reclaim_failed",
-                    {"error": f"{type(exc).__name__}: {exc}"},
-                )
-                self.write_gate.save_state(state)
-            logger.warning("main_ci_reclaim pass raised an exception", exc_info=True)
-            return
-
-        if not result.ok:
-            with state_lock(state_file):
-                state = load_state(state_file)
-                state = self._record_event(
-                    state, "main_ci_reclaim_failed", {"error": result.error}
-                )
-                self.write_gate.save_state(state)
-            logger.warning("main_ci_reclaim pass failed: %s", result.error)
-            return
-
-        if not result.cancelled:
-            logger.debug(
-                "main_ci_reclaim: no superseded main CI runs to reclaim this pass "
-                "(tip=%s, checked=%d)",
-                result.tip_sha,
-                result.candidates_checked,
-            )
-            return
-
-        with state_lock(state_file):
-            state = load_state(state_file)
-            state = self._record_event(
-                state,
-                "main_ci_reclaim_cancelled",
-                {
-                    "tip_sha": result.tip_sha,
-                    "cancelled_run_ids": [run.run_id for run in result.cancelled],
-                    "candidates_checked": result.candidates_checked,
-                    "skipped_not_ancestor": result.skipped_not_ancestor,
-                    "skipped_started_before_cancel": result.skipped_started_before_cancel,
-                    "cancel_errors": list(result.cancel_errors),
-                },
-            )
-            self.write_gate.save_state(state)
-        for run in result.cancelled:
-            logger.info(
-                "main_ci_reclaim: cancelled superseded main CI run %s "
-                "(sha %s, was %s, created %s)",
-                run.run_id,
-                run.head_sha,
-                run.status_before_cancel,
-                run.created_at,
-            )
-
     def _backfill_missing_reason_classes(self, state: dict[str, Any]) -> dict[str, Any]:
         """One-way migration that gives legacy escalations a ``reason_class`` (issue #797).
 
@@ -15930,78 +15003,6 @@ class OrchestratorApp:
                 },
             )
         return state
-
-    def _maybe_emit_operator_queue_depth(self) -> None:
-        """Emit the ``operator_queue_depth`` gauge event when depth exceeds threshold.
-
-        Issue #1314 item 3. The operator-queue depth gauge makes a silently
-        growing queue of mechanical escalations visible in ``events.db``
-        rather than only via GitHub label queries. The gauge is checked
-        every loop pass (or on the dedicated
-        ``operator_queue_review_interval_minutes`` cadence if configured),
-        and the ``operator_queue_depth`` warning event is emitted only when
-        the depth exceeds the configured ``operator_queue_depth_threshold``
-        -- the same "checked every pass, emitted only when the condition
-        holds" pattern ``dispatch_stale`` uses.
-
-        The consumer is ``heartbeat_check.py``'s ``check_warning_events``,
-        which buckets the kind (registered in
-        ``EXPECTED_OPERATIONAL_KINDS``) into a summarized count so a
-        chronically deep queue does not drown out genuinely rare warnings.
-        That bucketing wiring lands in the same PR as the signal, per the
-        signal-without-a-consumer rule.
-
-        Threshold 0 disables the alert entirely (no event emitted regardless
-        of depth), preserving the pre-feature silent-queue behavior for
-        fleets that have not yet opted in.
-
-        ``dry_run`` short-circuits the entire gauge before any lock or state
-        read: the gauge emits a warning event and persists the
-        ``next_operator_queue_review_at`` arm timestamp via a raw
-        ``save_state`` (outside WriteGate), so running it under
-        ``dry_run=True`` would both leak an ``operator_queue_depth`` row into
-        ``events.db`` and mutate ``state.json`` -- violating the C1.2
-        "byte-identical to a pass that never ran" dry-run invariant
-        (``test_loop_wrapper_telemetry_is_the_only_delta_under_dry_run_true``
-        pins that invariant; its fixture has zero escalated issues, so it
-        only exercises the depth<=threshold early return and would not catch
-        a deep-queue dry-run leak on its own). The guard is at the top rather
-        than after the threshold check so a dry-run pass pays neither the
-        lock acquisition nor the state load.
-        """
-        if self.dry_run:
-            return
-        threshold = self.config.deescalation.operator_queue_depth_threshold
-        if threshold <= 0:
-            return
-
-        state_file = self.paths.state_file
-        review_interval = self.config.deescalation.operator_queue_review_interval_minutes
-        with state_lock(state_file):
-            state = load_state(state_file)
-            if review_interval > 0 and not is_operator_queue_review_due(state):
-                return
-            depth_set = operator_queue_depth(state)
-            depth = len(depth_set)
-            if depth <= threshold:
-                return
-            next_review_at = (
-                (datetime.now(UTC) + timedelta(minutes=review_interval))
-                .replace(microsecond=0)
-                .isoformat()
-                .replace("+00:00", "Z")
-            )
-            state = arm_operator_queue_review(state, next_review_at)
-            state = self._record_event(
-                state,
-                "operator_queue_depth",
-                {
-                    "depth": depth,
-                    "threshold": threshold,
-                    "issue_numbers": sorted(depth_set),
-                },
-            )
-            save_state(state_file, state)
 
     def _loop_body(
         self, limit: int | None, *, merge: bool | None, now: datetime | None = None
@@ -16867,26 +15868,6 @@ class OrchestratorApp:
             )
             self.write_gate.save_state(state)
         return state
-
-    def _is_dispatchable(
-        self,
-        issue: dict[str, Any],
-        operator_claimed: set[int] | None = None,
-    ) -> bool:
-        # Closed issues are never dispatchable, regardless of labels.
-        if str(issue.get("state") or "OPEN").upper() != "OPEN":
-            return False
-        names = label_names(issue)
-        if self.config.labels.ready not in names:
-            return False
-        if names & self.config.labels.terminal:
-            return False
-        if names & self.config.labels.active:
-            return False
-        if operator_claimed is None:
-            state = load_state_locked(self.paths.state_file)
-            operator_claimed = operator_claimed_issues(state)
-        return int(issue["number"]) not in operator_claimed
 
     def _route_phantom_live_worker(
         self,
