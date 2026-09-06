@@ -87,6 +87,7 @@ def _src_py_files(src_root: Path) -> list[Path]:
         files.extend((src_root / sub).glob("*.py"))
     return sorted(files)
 
+
 # ---------------------------------------------------------------------------
 # The three sanctioned emitters (per the issue) plus the shapes that share
 # their exact forwarding signature in practice: ``WriteGate`` mirrors all
