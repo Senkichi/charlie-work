@@ -15,6 +15,7 @@ from charlie_work import rescue as rescue_helpers
 from charlie_work.github import GitHubError
 from charlie_work.janitor import DiffContentSignature
 from charlie_work.labels import TransitionOutcome
+from charlie_work.review_decision import record_decision
 import charlie_work.workflow as _wf
 
 
@@ -564,7 +565,10 @@ def record_review(
         # crash between the two writes still leaves a durable, readable
         # verdict via review_decision()'s round-fallback. head_sha=None:
         # decision_payload["reviewed_head_sha"] is already resolved above.
-        _wf.record_decision(pr_dir, decision_payload, None)
+        # Issue #1650: direct import + bare call (same convention as the
+        # other three record_decision sites), not the _wf. attribute form --
+        # all four sites share one binding style by convention.
+        record_decision(pr_dir, decision_payload, None)
         if decision == "request_changes" and not escalated:
             rework_path = str(self._write_rework_prompt(pr, issue_number, rework_summary))
             # Archived alongside the decision above, same round_dir: this
