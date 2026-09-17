@@ -28,12 +28,14 @@ from charlie_work.config import WORKER_OUTCOME_FILENAME, WRITER_MARKER_FILENAME
 _RESIDUE_NAMES = (WORKER_OUTCOME_FILENAME, WRITER_MARKER_FILENAME)
 
 # Worker PR-body scratch glob pattern. The worker prompt does not name a file,
-# but workers ad-hoc write ``PR_BODY_<issue>.md`` into the worktree root. This
-# is a glob, not a fixed filename, so it is declared here rather than sourced
-# from a config constant. A sample concrete name is used for ``check-ignore``
-# and ``ls-files`` exercises below.
-_PR_BODY_GLOB = "PR_BODY_*.md"
+# but workers ad-hoc write ``PR_BODY_<issue>.md`` — or the bare ``PR_BODY.md``
+# spelling the "gh unauthenticated" fallback flow produces — into the worktree
+# root. This is a glob, not a fixed filename, so it is declared here rather
+# than sourced from a config constant. Sample concrete names are used for
+# ``check-ignore`` and ``ls-files`` exercises below.
+_PR_BODY_GLOB = "PR_BODY*.md"
 _PR_BODY_SAMPLE = "PR_BODY_9999.md"
+_PR_BODY_BARE_SAMPLE = "PR_BODY.md"
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -125,6 +127,41 @@ def test_no_pr_body_scratch_files_are_tracked() -> None:
         name for name in tracked if name.startswith("PR_BODY_") and name.endswith(".md")
     )
     assert not tracked_pr_body, f"PR-body scratch files tracked as source: {tracked_pr_body}"
+
+
+def test_pr_body_bare_filename_is_gitignored() -> None:
+    """``git check-ignore`` must resolve the bare ``PR_BODY.md`` filename.
+
+    The "gh unauthenticated" fallback flow produces the bare spelling —
+    unsuffixed, so the #1204-era ``PR_BODY_*.md`` glob never covered it and a
+    salvage committed it to ``main`` (issue #1688). Widening the glob to
+    ``PR_BODY*.md`` closes the class; this pins git's actual resolution.
+    """
+    result = subprocess.run(
+        ["git", "check-ignore", _PR_BODY_BARE_SAMPLE],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    ignored = set(result.stdout.splitlines())
+    assert _PR_BODY_BARE_SAMPLE in ignored, (
+        f"git check-ignore did not match {_PR_BODY_BARE_SAMPLE!r} against {_PR_BODY_GLOB!r}"
+    )
+
+
+def test_no_bare_pr_body_file_is_tracked() -> None:
+    """The bare ``PR_BODY.md`` filename must not be tracked on this branch.
+
+    Positive control for the ``git rm --cached`` half of the #1688 fix: the
+    tracked copy a salvage committed is removed, and this fails the moment it
+    reappears. ``PR_BODY_<n>.md`` variants are covered by the sibling check
+    above; the bare name needs its own because it does not match the
+    ``PR_BODY_`` prefix that check keys on.
+    """
+    tracked = set(_git("ls-files").splitlines())
+    assert _PR_BODY_BARE_SAMPLE not in tracked, (
+        f"bare PR-body scratch file tracked as source: {_PR_BODY_BARE_SAMPLE}"
+    )
 
 
 # The ad-hoc PR-body spellings worktree.py's _LAUNCHER_OWNED_PR_BODY_RE already

@@ -43,9 +43,12 @@ test_marker*.txt
 # Worker PR-body scratch files. The worker prompt does not name a file, but
 # workers ad-hoc draft their PR body into a PR_BODY_<issue>.md file in the
 # worktree root before passing it to `gh pr create --body`. Salvage squash
-# #1197 committed PR_BODY_1010.md to main this way (issue #1204). The glob
-# closes the class: any issue number, present or future, is covered.
-PR_BODY_*.md
+# #1197 committed PR_BODY_1010.md to main this way (issue #1204). Workers
+# also draft the bare PR_BODY.md spelling (the name the "gh unauthenticated"
+# orchestrator-opens-the-PR fallback flow produces), which a salvage then
+# committed too (issue #1688). The glob closes the class: bare and
+# issue-suffixed names, present or future, are covered.
+PR_BODY*.md
 # The remaining variants mirror worktree.py's _LAUNCHER_OWNED_PR_BODY_RE
 # (issue #1391), which the dirty-check already recognizes but .gitignore did
 # not -- so a `_pr_body.md` (issue #1541 rework) or `.pr_body_<issue>.md`
