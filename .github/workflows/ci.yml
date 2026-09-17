@@ -87,18 +87,27 @@ jobs:
     # unchanged on hosted runners, where there is also no capacity shortage
     # for a group to "solve".
     #
-    # 75 min: carried over from the self-hosted era as a first-runs backstop,
-    # NOT a hosted-derived bound. The old number was contention-derived
-    # (shared box: a suite that ran 7:38 solo took 43.7 min under full
-    # overlap, and 45 min cap-killed 9 of 16 overnight runs -- #1434).
-    # Hosted VMs have no cross-job contention, but a standard 4-core
-    # windows-latest VM is much slower hardware than the old host and there
-    # is zero hosted timing data for this suite yet. Recalibrate from real
-    # runs once a few weeks of data exist (follow-up issue); do not tighten
-    # speculatively -- the #1434 failure mode was suites that PASSED being
-    # killed during cleanup by an optimistic cap, cycling
+    # Timeout history: 30 (original) -> 45 (#1254: contended runs hit 29:43
+    # and the cap produced false reds) -> 75 (#1434: a suite that ran 7:38
+    # solo took 43.7 min under full sibling overlap on the shared box, and
+    # 45 cap-killed 9 of 16 overnight runs). #1500 carried 75 onto hosted
+    # runners as a first-runs backstop; the contention it encodes does not
+    # exist on dedicated single-use VMs.
+    #
+    # 22 min: derived 2026-09-17 from hosted runs (#1504). Window = every
+    # CI run created after the #1500 merge commit (f9b96b3); 205 successful
+    # Tests jobs ran min 8.5 / median 11.9 / p95 14.0 / max 15.9 min
+    # (job started_at -> completed_at = whole job including checkout and
+    # uv sync, not just pytest). Non-success runs stayed under ~19 min
+    # except one superseded run still in-flight at 55 min when cancelled
+    # -- an outlier, not a completion time. 22 clears the observed max by
+    # ~38%, inside the #1254 method's ~25-50% band: headroom for suite
+    # growth, while a genuine hang now dies at 22 min instead of burning
+    # 75. If future data pushes typical runs toward the cap, re-derive
+    # from the Actions API rather than bumping by feel -- the #1434
+    # failure mode was PASSED suites cap-killed during cleanup, cycling
     # merge_failed_attempt_alarm.
-    timeout-minutes: 75
+    timeout-minutes: 22
     steps:
       - uses: actions/checkout@v5
       # setup-uv restored (2026-08-28). It was replaced by a PATH-append step
@@ -161,14 +170,16 @@ jobs:
         # box-sharing discipline -- CI shared 8 physical cores with a second
         # runner and the orchestrator's own dispatch tree (issue 646: ~36
         # uncapped workers took a 6.4-min suite to ~145 min). A hosted VM is
-        # dedicated, so auto is the right default. Note auto resolves to the
-        # VM's PHYSICAL core count, not vCPUs (xdist's psutil branch passes
-        # logical=False; `-n logical` is the spelling for the logical count);
-        # the resolved number on these images is unmeasured, because addopts'
-        # -q suppresses xdist's worker-count header -- add -v to a run to
-        # observe it. (pytest-xdist honors PYTEST_XDIST_AUTO_NUM_WORKERS when
-        # set; nothing in this workflow sets it. env_sanitize.py's =2 governs
-        # only the orchestrator's own dispatched sessions, not CI.)
+        # dedicated, so auto is the right default. auto resolves to the VM's
+        # PHYSICAL core count, not vCPUs (xdist's psutil branch passes
+        # logical=False; `-n logical` is the spelling for the logical count):
+        # on windows-latest that is 2 workers, because the image's 4 vCPUs
+        # are 2 hyperthreaded physical cores (measured 2026-09-17, run
+        # 35260087583 -- a -v run nets verbosity 0 against addopts' -q,
+        # un-suppressing xdist's "created: 2/2 workers" header that -q
+        # otherwise hides). (pytest-xdist honors PYTEST_XDIST_AUTO_NUM_WORKERS
+        # when set; nothing in this workflow sets it. env_sanitize.py's =2
+        # governs only the orchestrator's own dispatched sessions, not CI.)
         # --dist=load (xdist's default, spelled out for clarity) rather than
         # loadfile: tests/test_worktree.py alone is ~240 of the suite's
         # ~6,000 tests and the heaviest file by wall time (real git.exe
@@ -424,3 +435,114 @@ jobs:
         run: |
           set -e
           uv run charlie ast-equivalence-check --base ${{ github.event.pull_request.base.sha }}
+
+  collect-only-gate:
+    name: Collect-only gate
+    # PR-only: the gate compares base vs head collect-only output, which only
+    # makes sense for a PR (push-to-main has no base to compare against).
+    #
+    # UNLIKE the mojibake/private-slug/ast-equivalence gates (steps of the
+    # existing "Lint" job, riding the already-required "Lint" context), this
+    # gate is a SEPARATE JOB with its own required-check name. The issue
+    # (#1538) explicitly requires the new job's name to be added to
+    # required_checks in .aviator/config.yml, the deployed
+    # orchestrator.config.yaml, and Aviator's external required-checks config
+    # -- a coordinated three-place change. A step of an existing job would
+    # avoid the three-place change but would also make the gate advisory (it
+    # would ride "Lint"'s required-check context, not its own), which defeats
+    # the gate's purpose: it is ENFORCEMENT, not evidence (unlike the
+    # AST-equivalence gate, #1541, which is evidence-only and always exits 0).
+    #
+    # The gate compares leaf-name multisets (function name + class name(s) +
+    # parametrize id, module-path stripped) from `pytest --collect-only`
+    # output at base and head. A verbatim test relocation (same leaf name,
+    # different module path) passes; a rename, addition, deletion, or
+    # class-wrapping dodge does not. See src/charlie_work/collect_only_gate.py
+    # for the full rationale, including graft K (the leaf-name multiset fix)
+    # and graft E (diff-derived inputs, never hand-typed).
+    runs-on: windows-latest
+    timeout-minutes: 30
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+      - name: Collect tests at head
+        # Capture stdout (node IDs) to a file. `|| true` prevents the step
+        # from failing on collection errors -- the gate command will detect
+        # a failed collection from the output (no node IDs) and fail with a
+        # clear message instead of a bare CI step failure. stderr (warnings,
+        # errors) goes to the CI log for diagnostics.
+        #
+        # NOTE: ``--collect-only`` WITHOUT ``-q``. In pytest >= 8, ``-q``
+        # changes the output to a compact ``file: count`` format that does
+        # not include individual node IDs -- the gate cannot extract leaf
+        # names from that format. The issue (#1538) says ``--collect-only
+        # -q`` because it was written against an older pytest where ``-q``
+        # still produced one-node-ID-per-line; this repo's pytest (9.x in
+        # uv.lock) changed that. ``--collect-only`` (no ``-q``) produces the
+        # one-node-ID-per-line format the gate's parser expects.
+        #
+        # `shell: bash`: the `|| true` idiom is bash, not PowerShell. On
+        # windows-latest the default shell is pwsh, where `||` works (pwsh 7)
+        # but `true` is not a recognised command -- a collection failure
+        # would run `true`, fail to find it, and turn the step red instead of
+        # staying green for the gate to surface a clear finding. Bash is
+        # always available on GitHub-hosted Windows runners (Git Bash).
+        shell: bash
+        run: uv run pytest --collect-only > head_collect.txt || true
+      - name: Collect tests at base
+        # Create a git worktree at the base ref, sync deps, and run
+        # collect-only there. The worktree is cleaned up in the same step
+        # (a `finally`-style trap + `git worktree remove --force`).
+        #
+        # The collection runs in a SUBSHELL `( ... )`, not a bare `cd`:
+        # the EXIT trap fires with the shell's cwd wherever the script left
+        # it. A `cd ./base-tree` in the script body would leave the cwd
+        # inside the worktree, where the trap's relative `./base-tree`
+        # resolves to `base-tree/base-tree` and git exits 128
+        # ("fatal: './base-tree' is not a working tree" -- run 35256210708).
+        # With the subshell the parent shell's cwd never leaves the
+        # workspace root, so the relative path in the trap resolves
+        # correctly on both the success and failure paths.
+        #
+        # `uv sync` in the base worktree creates its own .venv from the
+        # shared uv cache -- fast (seconds) on a hosted runner with a warm
+        # cache. The alternative (sharing the head .venv via
+        # UV_PROJECT_ENVIRONMENT) would avoid the second sync but requires
+        # an env var that run_captured does not support; the second sync is
+        # the simpler, more robust choice.
+        #
+        # Same ``--collect-only`` (no ``-q``) note as the head step above.
+        shell: bash
+        run: |
+          set -e
+          git fetch --depth 1 origin ${{ github.event.pull_request.base.sha }}
+          git worktree add ./base-tree ${{ github.event.pull_request.base.sha }}
+          trap 'git worktree remove --force ./base-tree' EXIT
+          (
+            cd ./base-tree
+            uv sync --frozen --all-extras
+            uv run pytest --collect-only > ../base_collect.txt || true
+          )
+      - name: Run collect-only gate
+        # The gate command reads the two collect files and runs the pure
+        # comparison logic. It exits non-zero (fails the required check)
+        # when a leaf was removed, a removed leaf did not reappear in a
+        # sibling under tests/, or a leaf's multiplicity shrank (the issue's
+        # Scope table); `added` leaves and grown multiplicities are reported
+        # but pass.
+        #
+        # `shell: bash`: the multi-line `run: |` block uses bash `\` line
+        # continuations, which pwsh cannot parse -- a `\` at end of line is a
+        # literal backslash, not a continuation, so pwsh sees `--base-collect`
+        # on the next line as a bare unary `--` operator and throws
+        # ParserError (the #1624 CI failure, reproduced on this job's first
+        # run -- 35260669565). Bash is always available on GitHub-hosted
+        # Windows runners (Git Bash).
+        shell: bash
+        run: |
+          uv run charlie collect-only-check \
+            --base-collect base_collect.txt \
+            --head-collect head_collect.txt
