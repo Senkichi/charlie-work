@@ -289,3 +289,45 @@ def test_check_tree_live_fence_positive_control_when_kind_stats_absent(
         "for the unchanged P when the fence is not frozen"
     )
     assert p_findings[0].file == "src/pkg/p.py"
+
+
+def test_check_tree_flags_forged_kind_stats_with_bumped_generated_at(
+    tmp_path: Path,
+) -> None:
+    # Round-5 review: the generated_at forgery must surface through the REAL
+    # check_tree call path -- the live ``saturate_all`` recompute it performs
+    # for the ratchet-tamper guard is the unforgeable half of the generation-
+    # event test, and this is the wiring that becomes a blocking CI gate.
+    # A hand-edit that raises the frozen boundary AND bumps generated_at in
+    # the same edit must still be flagged: the forged stats do not equal a
+    # live recompute of this tree.
+    _build_freeze_repo(tmp_path)
+    _freeze_baseline(tmp_path)
+
+    # The committed baseline at the base ref -- what CI hands check_tree via
+    # ``check-tree --base-ref``.
+    previous_document = load(tmp_path / BASELINE_FILENAME)
+    assert previous_document["kind_stats"]["class"]["boundary"] == 17.0
+
+    # Hand-forge the on-disk baseline: raise the frozen class boundary and
+    # bump generated_at to impersonate a regen. No live recompute of this
+    # tree produces these statistics.
+    forged = load(tmp_path / BASELINE_FILENAME)
+    forged["kind_stats"]["class"]["boundary"] = 1000.0
+    forged["generated_at"] = "t-forged"
+    dump(forged, tmp_path / BASELINE_FILENAME)
+
+    # Without a previous document the forgery is invisible by design (the
+    # guard needs an independent reference point) -- the contrast proves the
+    # finding below is threaded through previous_baseline_document, not some
+    # incidental signal.
+    assert check_tree(tmp_path) == []
+
+    findings = check_tree(tmp_path, previous_baseline_document=previous_document)
+
+    assert len(findings) == 1
+    assert findings[0].severity == "error"
+    assert findings[0].file == BASELINE_FILENAME
+    assert findings[0].identity == "kind_stats:class"
+    assert "tamper" in findings[0].message
+    assert "17.0" in findings[0].message and "1000.0" in findings[0].message
