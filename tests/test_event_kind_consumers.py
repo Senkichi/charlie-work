@@ -62,29 +62,36 @@ TESTS_DIR = REPO_ROOT / "tests"
 HEARTBEAT = REPO_ROOT / "scripts" / "heartbeat_check.py"
 _THIS_FILE_NAME = Path(__file__).name
 
+
 # The god-object paydown (Track 2 Phase B) relocates OrchestratorApp method
 # bodies -- event emitters among them -- into the ``orchestration/`` delegate
-# subpackage. Those modules must be scanned too, or their emitted kinds (and
-# consumers) fall out of the extractor's view: a silent coverage loss, since a
-# kind emitted only from an unscanned file simply never enters ``emitted_kinds``
-# and no assertion can flag what it never saw. This is deliberately a targeted
-# glob of the top level plus ``orchestration/`` rather than a recursive
-# ``rglob`` because emit sites and markers are keyed by ``path.name`` alone, and
-# the package has real basename collisions across subpackages (``checks.py``,
-# ``labels.py``, ``__main__.py``) that ``rglob`` would silently misattribute.
-_SCANNED_SUBPACKAGES = ("orchestration",)
-
-
+# subpackage, and nothing stops the next ``src/charlie_work/`` subdirectory
+# from doing the same. The scanned set is therefore DERIVED from the package
+# tree -- the top level plus every directory beneath it that is a package
+# (contains ``__init__.py``), recursively -- never declared: a new subpackage's
+# emit sites enter ``emitted_kinds`` automatically, so an unscanned file cannot
+# sit silently outside every assertion below (the #1671 blind spot, generalized
+# by #1687). Everything downstream keys files by path relative to ``src_root``
+# (POSIX form), not by basename: ``checks.py``/``labels.py``/``__main__.py``
+# collide across subpackages, and a basename key would misattribute a marker or
+# an emit site to the wrong file with no error -- the reason the scan could not
+# widen until the key changed.
 def _src_py_files(src_root: Path) -> list[Path]:
-    """Top-level ``charlie_work`` modules plus the scanned delegate subpackages.
+    """Every ``*.py`` in the package tree under ``src_root``, sorted.
 
-    Sorted for determinism. ``__init__.py`` files carry no emit sites or event
-    markers, so the one basename collision this union can produce
-    (``__init__.py``) is inert.
+    ``src_root`` itself always contributes its top-level ``*.py`` (it IS the
+    ``charlie_work`` package); a descendant directory contributes only when it
+    is a package (``__init__.py`` present), which is also the only kind of
+    directory worth descending into.
     """
     files = list(src_root.glob("*.py"))
-    for sub in _SCANNED_SUBPACKAGES:
-        files.extend((src_root / sub).glob("*.py"))
+    pending = [src_root]
+    while pending:
+        current = pending.pop()
+        for child in current.iterdir():
+            if child.is_dir() and (child / "__init__.py").is_file():
+                files.extend(child.glob("*.py"))
+                pending.append(child)
     return sorted(files)
 
 
@@ -581,13 +588,13 @@ def _record_site(
 
 def _scan_emit_sites(root: Path) -> list[EmitSite]:
     sites: list[EmitSite] = []
-    for path in sorted(root.glob("*.py")):
+    for path in _src_py_files(root):
         text = path.read_text(encoding="utf-8")
         try:
             tree = ast.parse(text, filename=str(path))
         except SyntaxError:
             continue
-        file_sites, _, _ = _scan_emit_sites_in_tree(tree, path.name)
+        file_sites, _, _ = _scan_emit_sites_in_tree(tree, path.relative_to(root).as_posix())
         sites.extend(file_sites)
     return sites
 
@@ -787,15 +794,16 @@ def _analyze(src_root: Path, tests_root: Path | None, heartbeat_path: Path | Non
     file_markers: dict[str, FileMarkers] = {}
     file_sites: dict[str, list[EmitSite]] = {}
     for path in _src_py_files(src_root):
+        rel_path = path.relative_to(src_root).as_posix()
         text = path.read_text(encoding="utf-8")
         try:
             tree = ast.parse(text, filename=str(path))
         except SyntaxError:
             continue
-        sites, _, _ = _scan_emit_sites_in_tree(tree, path.name)
+        sites, _, _ = _scan_emit_sites_in_tree(tree, rel_path)
         emit_sites.extend(sites)
-        file_sites[path.name] = sites
-        file_markers[path.name] = _scan_markers(path)
+        file_sites[rel_path] = sites
+        file_markers[rel_path] = _scan_markers(path)
 
     emitted_kinds: set[str] = set()
     emit_scope_by_kind: dict[str, set[tuple[str, str]]] = {}
@@ -811,12 +819,13 @@ def _analyze(src_root: Path, tests_root: Path | None, heartbeat_path: Path | Non
     # Consumer collection.
     consumer_sites: list[ConsumerSite] = []
     for path in _src_py_files(src_root):
+        rel_path = path.relative_to(src_root).as_posix()
         text = path.read_text(encoding="utf-8")
         try:
             tree = ast.parse(text, filename=str(path))
         except SyntaxError:
             continue
-        consumer_sites.extend(_collect_src_consumer_sites(tree, path.name))
+        consumer_sites.extend(_collect_src_consumer_sites(tree, rel_path))
 
     heartbeat_literals: set[str] = set()
     if heartbeat_path is not None and heartbeat_path.is_file():
@@ -1165,3 +1174,65 @@ def test_genuine_downstream_consumer_in_a_different_scope_counts(tmp_path: Path)
     report = _analyze(module, tests_root=None, heartbeat_path=None)
     offending = {u.kind for u in report.unaccounted}
     assert "genuinely_consumed_kind" not in offending
+
+
+def test_subpackage_emit_site_is_seen_without_a_declared_list(tmp_path: Path) -> None:
+    """Coverage control (#1687): a package directory that exists only in the
+    tree -- named by no tuple, list, or set in this guard -- is scanned.
+
+    Fails against the pre-#1687 implementation: ``_SCANNED_SUBPACKAGES`` only
+    ever named ``orchestration``, so ``new_delegate_pkg/emitter.py`` would
+    never reach the extractor and ``subpkg_emitted_kind`` would not enter
+    ``emitted_kinds`` at all.
+    """
+    module = tmp_path / "src"
+    module.mkdir()
+    pkg = module / "new_delegate_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "emitter.py").write_text(
+        "from .instrumentation import log_event\n\n"
+        "def do_thing(path, payload):\n"
+        '    log_event(path, "subpkg_emitted_kind", payload)\n',
+        encoding="utf-8",
+    )
+    report = _analyze(module, tests_root=None, heartbeat_path=None)
+    assert "subpkg_emitted_kind" in report.emitted_kinds
+    offending = {u.kind: u for u in report.unaccounted}
+    assert "subpkg_emitted_kind" in offending
+    assert offending["subpkg_emitted_kind"].sites[0].path == "new_delegate_pkg/emitter.py"
+
+
+def test_same_basename_in_two_subpackages_attributes_by_relative_path(
+    tmp_path: Path,
+) -> None:
+    """Collision control (#1687): two files sharing a basename in different
+    subpackages attribute emit sites and markers to their own relative path.
+
+    Fails under basename keying: both files share the ``file_markers`` /
+    ``file_sites`` slot ``"emit.py"``, so the later scan clobbers the earlier
+    one's marker map -- ``pkg_a``'s own ``audit-only`` marker would be lost and
+    its kind would turn up unaccounted.
+    """
+    module = tmp_path / "src"
+    module.mkdir()
+    for pkg_name, kind in (("pkg_a", "kind_from_pkg_a"), ("pkg_b", "kind_from_pkg_b")):
+        pkg = module / pkg_name
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        marker = "  # event-consumer: audit-only test fixture" if pkg_name == "pkg_a" else ""
+        (pkg / "emit.py").write_text(
+            "from .instrumentation import log_event\n\n"
+            "def do_thing(path, payload):\n"
+            f'    log_event(path, "{kind}", payload){marker}\n',
+            encoding="utf-8",
+        )
+    report = _analyze(module, tests_root=None, heartbeat_path=None)
+    unaccounted = {u.kind: u for u in report.unaccounted}
+    assert "kind_from_pkg_a" not in unaccounted, (
+        "pkg_a's own audit-only marker was not honored -- file_markers keyed by "
+        "basename let pkg_b's marker map clobber pkg_a's"
+    )
+    assert "kind_from_pkg_b" in unaccounted
+    site = unaccounted["kind_from_pkg_b"].sites[0]
+    assert site.path == "pkg_b/emit.py"

@@ -38,7 +38,7 @@
   "tests/test_deescalation.py": 1800,
   "tests/test_devin_shell.py": 2800,
   "tests/test_doctor.py": 2600,
-  "tests/test_event_kind_consumers.py": 1200,
+  "tests/test_event_kind_consumers.py": 1400,
   "tests/test_feat_rescue_tier.py": 1000,
   "tests/test_fix_escalation_paths.py": 1400,
   "tests/test_fix_janitor_routing.py": 1600,

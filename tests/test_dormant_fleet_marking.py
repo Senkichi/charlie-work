@@ -88,68 +88,189 @@ MARKER = "rollback_path"
 KNOWN_LIVE = {"cli", "config", "workflow"}
 
 
-def _sibling_imports(path: Path) -> set[str]:
-    """Names of ``charlie_work`` sibling modules imported by one module.
+def _package_tree_files() -> list[Path]:
+    """Every ``*.py`` in the package tree, derived -- never declared (#1687).
+
+    The top level of ``src/charlie_work`` plus every directory beneath it that
+    is a package (contains ``__init__.py``), recursively. The pre-#1687 code
+    globbed the top level plus a declared ``orchestration/`` glob, so a new
+    subpackage could hold a module's only importer while sitting outside the
+    graph entirely -- the same fails-open blind spot this file exists to
+    remove. (``prompts/`` is a template directory, not a package, and
+    contributes nothing.)
+    """
+    files = sorted(SRC.glob("*.py"))
+    pending = [SRC]
+    while pending:
+        current = pending.pop()
+        for child in sorted(current.iterdir()):
+            if child.is_dir() and (child / "__init__.py").is_file():
+                files.extend(sorted(child.glob("*.py")))
+                pending.append(child)
+    return files
+
+
+def _node_name(path: Path) -> str:
+    """Collision-free node identity: path relative to SRC, POSIX, no suffix.
+
+    ``orchestration/dispatch_state.py`` is ``orchestration/dispatch_state``;
+    ``github_capabilities/__init__.py`` is ``github_capabilities/__init__``.
+    Basenames collide across subpackages (``checks.py``, ``labels.py``,
+    ``__main__.py``, ``__init__.py``), so a ``path.stem`` key would merge or
+    misattribute nodes silently -- the reason the scan could not widen until
+    the key changed (#1687).
+    """
+    return path.relative_to(SRC).with_suffix("").as_posix()
+
+
+def _resolve_node(parts: list[str], known: set[str]) -> str | None:
+    """Map dotted-path parts (relative to SRC) to a graph node, or ``None``.
+
+    ``["a", "b"]`` names ``a/b`` when ``a/b.py`` exists and ``a/b/__init__``
+    when ``a/b`` is a package directory; the longest existing prefix wins, so
+    ``from a.b import sym`` still lands on ``a/b`` when ``sym`` is a plain
+    symbol. Callers additionally probe ``base + [alias]`` for the
+    ``from pkg import submodule`` shape.
+    """
+    for n in range(len(parts), 0, -1):
+        prefix = "/".join(parts[:n])
+        if prefix in known:
+            return prefix
+        if prefix + "/__init__" in known:
+            return prefix + "/__init__"
+    return None
+
+
+def _sibling_imports(path: Path, known: set[str]) -> set[str]:
+    """Graph nodes imported by one module, resolved to node identities.
 
     AST rather than regex, and the whole tree rather than just the header: a
-    fleet module imported lazily inside a function body is still an edge in the
-    graph, and a name mentioned in a comment or a docstring is not.
+    fleet module imported lazily inside a function body is still an edge in
+    the graph, and a name mentioned in a comment or a docstring is not.
+
+    Relative imports resolve against the importing file's own package, so
+    ``from ._base import x`` inside ``github_capabilities/`` names
+    ``github_capabilities/_base`` while ``from ..checks import y`` there names
+    top-level ``checks``; absolute ``charlie_work.*`` imports resolve to the
+    same node identities. Importing ``a/b`` also marks ``a/__init__`` (and
+    every intermediate package init) as reached, because Python executes the
+    package's ``__init__`` on any submodule import.
+
+    Known limitation, stated rather than papered over: ``from charlie_work
+    import X`` -- the *bare-package* form, no dotted tail -- was invisible to
+    the pre-#1687 basename parser (it matched only ``charlie_work.`` prefixes)
+    and stays invisible here, deliberately, so this re-key does not change the
+    derived dormant set. It is why ``rescue`` currently reads dormant: its
+    only importers are ``orchestration/`` delegates using exactly that form.
     """
+    pkg_parts = path.parent.relative_to(SRC).parts
     found: set[str] = set()
+
+    def add(node: str | None) -> None:
+        if node is None:
+            return
+        found.add(node)
+        # Importing ``a/b`` executes ``a/__init__`` first -- every package
+        # ancestor of a resolved node is reached too.
+        ancestors = node.split("/")[:-1]
+        for i in range(1, len(ancestors) + 1):
+            init = "/".join(ancestors[:i]) + "/__init__"
+            if init in known:
+                found.add(init)
+
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
-            if node.level and node.module:
-                # from .runner_slots import x
-                found.add(node.module.split(".")[0])
-            elif node.level and node.module is None:
-                # from . import runner_slots
-                found.update(alias.name for alias in node.names)
-            elif node.module and node.module.startswith("charlie_work."):
-                found.add(node.module.split(".")[1])
+            level = node.level or 0
+            if level > len(pkg_parts) + 1:
+                # Climbs past the charlie_work package root -- not a sibling
+                # edge this graph can express.
+                continue
+            if level == 0:
+                if not (node.module and node.module.startswith("charlie_work.")):
+                    continue
+                base = node.module.split(".")[1:]
+            else:
+                base = list(pkg_parts[: len(pkg_parts) - (level - 1)])
+                if node.module:
+                    base.extend(node.module.split("."))
+            add(_resolve_node(base, known))
+            for alias in node.names:
+                add(_resolve_node([*base, alias.name], known))
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.startswith("charlie_work."):
-                    found.add(alias.name.split(".")[1])
+                    add(_resolve_node(alias.name.split(".")[1:], known))
     return found
 
 
 def _graph() -> dict[str, set[str]]:
-    graph = {p.stem: _sibling_imports(p) for p in sorted(SRC.glob("*.py"))}
-    # Track 2 Phase B (#1582): OrchestratorApp method bodies now live in
-    # `orchestration/*.py` delegate modules, re-attached onto the class at
-    # `charlie_work.workflow` import time by `workflow_delegation._install_delegates`
-    # (pkgutil discovery imports every submodule). A sibling module that a moved
-    # body is the sole top-level importer of would otherwise fall out of the
-    # reachability walk and be flagged false-dormant (issue #1671; L05/#1636 hit
-    # this on `module_map` when `_build_module_map_value` moved). The delegates ARE
-    # `workflow`'s methods in every sense that matters to reachability, so fold
-    # their sibling imports into the `workflow` node. This is the targeted
-    # `orchestration/` glob (top-level + orchestration/), NOT a recursive `rglob`:
-    # a plain rglob would pull in sibling subpackages and collide on shared
-    # basenames (`checks.py` / `labels.py` / `__main__.py`).
+    files = _package_tree_files()
+    known = {_node_name(p) for p in files}
+    edges = {_node_name(p): _sibling_imports(p, known) for p in files}
+
+    # Per-subpackage ownership, DERIVED from the tree (#1687) rather than
+    # declared: a subpackage imported by exactly ONE top-level module belongs
+    # to that module, so its files' edges fold into the owner's node instead of
+    # forming nodes of their own. That is `orchestration/`'s situation today:
+    # OrchestratorApp method bodies live in `orchestration/*.py` delegate
+    # modules, re-attached onto the class at `charlie_work.workflow` import
+    # time by `workflow_delegation._install_delegates`, and `workflow.py` is
+    # the subpackage's sole top-level importer (`from . import orchestration`).
+    # The delegates ARE `workflow`'s methods in every sense that matters to
+    # reachability -- a sibling module a moved body is the sole importer of
+    # (e.g. `module_map` after `_build_module_map_value` moved, L05/#1636)
+    # would otherwise fall false-dormant (issue #1671). A subpackage imported
+    # by zero or two-or-more top-level modules (`attachment_contracts`,
+    # `github_capabilities`) keeps its modules as nodes in their own right.
     #
     # Tradeoff (stated, not papered over): folding adds edges and can only
     # *shrink* the detectable dormant set, never grow it, so island-detection
-    # precision is reduced -- a module imported only by an orchestration delegate
-    # would now read as live instead of dormant. Accepted to kill the
-    # `module_map` false-dormant; bounded by
-    # `test_widened_graph_still_flags_a_genuine_island`, which proves a module no
-    # top-level *or* orchestration file imports is still flagged.
-    orchestration = SRC / "orchestration"
-    if orchestration.is_dir():
-        for path in sorted(orchestration.glob("*.py")):
-            if path.stem == "__init__":
-                continue
-            graph["workflow"] |= _sibling_imports(path)
+    # precision inside a folded package is reduced -- a module imported only
+    # by an orchestration delegate reads as live rather than dormant.
+    # Accepted to kill the `module_map` false-dormant; bounded by
+    # `test_widened_graph_still_flags_a_genuine_island`, which proves a module
+    # reachable from neither the top level nor a folded package is still
+    # flagged.
+    fold_owner: dict[str, str] = {}
+    for child in sorted(SRC.iterdir()):
+        if not (child.is_dir() and (child / "__init__.py").is_file()):
+            continue
+        prefix = child.name + "/"
+        importers = {
+            name
+            for name, targets in edges.items()
+            if "/" not in name
+            and name != "__init__"
+            and any(t == prefix + "__init__" or t.startswith(prefix) for t in targets)
+        }
+        if len(importers) == 1:
+            fold_owner[child.name] = next(iter(importers))
+
+    graph: dict[str, set[str]] = {}
+    for name, targets in edges.items():
+        owner = name
+        if "/" in name:
+            owner = fold_owner.get(name.split("/", 1)[0], name)
+        # Folded files never become nodes themselves; their edges merge into
+        # the owning top-level module's edge set.
+        graph.setdefault(owner, set()).update(targets)
     return graph
 
 
 def _live_modules() -> set[str]:
-    """Everything transitively reachable from the package's entry points."""
+    """Everything transitively reachable from the package's entry points.
+
+    Entry points are the declared top-level ``ENTRY_MODULES`` plus every
+    ``__main__.py`` in the tree -- ``python -m charlie_work.<pkg>`` is an
+    entry by construction, derived rather than listed (so
+    ``attachment_contracts/__main__``, invoked out-of-band by the
+    attachment-contracts CI workflow, is never mistaken for an island).
+    """
     graph = _graph()
     seen: set[str] = set()
-    stack = list(ENTRY_MODULES)
+    stack = [e for e in ENTRY_MODULES if e in graph]
+    stack.extend(n for n in graph if n.endswith("/__main__"))
     while stack:
         name = stack.pop()
         if name in seen or name not in graph:
@@ -164,17 +285,37 @@ def _dormant_modules() -> set[str]:
     return {name for name in graph if name not in _live_modules() and name != "__init__"}
 
 
+def _test_file_candidates(module: str) -> list[str]:
+    """Marker-requiring test files for ``module``, relative to ``tests/``.
+
+    Top-level ``foo`` keeps the historical ``test_foo.py`` form. A nested
+    module ``pkg/foo`` gets unambiguous forms only: ``pkg/test_foo.py``
+    (mirroring the package tree -- the ``tests/attachment_contracts/``
+    convention) or ``test_pkg_foo.py`` (flattened). The bare ``test_foo.py``
+    is deliberately NOT accepted for a nested module: it cannot be told
+    apart from a test for top-level ``foo``, the same basename ambiguity the
+    re-key exists to remove.
+    """
+    parts = module.split("/")
+    if len(parts) == 1:
+        return [f"test_{parts[0]}.py"]
+    parent = "/".join(parts[:-1])
+    return [f"{parent}/test_{parts[-1]}.py", f"test_{'_'.join(parts)}.py"]
+
+
 def _modules_with_marker() -> set[str]:
     """Test modules carrying a module-level ``pytestmark`` for our marker.
 
     Read from source rather than via pytest's own collection so this test says
     the same thing whether it runs alone or inside the full suite, and so a
-    failure names the file rather than a collected item id.
+    failure names the file rather than a collected item id. Keys are paths
+    relative to ``tests/`` (POSIX), not basenames, so a mark inside a mirrored
+    subpackage (``tests/<pkg>/test_<mod>.py``) is attributable.
     """
     marked: set[str] = set()
-    for path in sorted(TESTS.glob("test_*.py")):
+    for path in sorted(TESTS.rglob("test_*.py")):
         if f"pytest.mark.{MARKER}" in path.read_text(encoding="utf-8"):
-            marked.add(path.name)
+            marked.add(path.relative_to(TESTS).as_posix())
     return marked
 
 
@@ -214,15 +355,19 @@ def test_widened_graph_still_flags_a_genuine_island(tmp_path, monkeypatch) -> No
     src.mkdir()
     (src / "cli.py").write_text("from . import workflow\n", encoding="utf-8")
     (src / "__main__.py").write_text("", encoding="utf-8")
-    (src / "workflow.py").write_text("", encoding="utf-8")
+    # Sole top-level importer of the orchestration subpackage -> the package
+    # folds into this node by derivation, exactly like the real tree.
+    (src / "workflow.py").write_text("from . import orchestration\n", encoding="utf-8")
     (src / "module_map.py").write_text("", encoding="utf-8")
     # A genuine island: nothing in src/ imports it, top-level or orchestration.
     (src / "_synthetic_island.py").write_text("", encoding="utf-8")
     orch = src / "orchestration"
     orch.mkdir()
-    # A delegate whose sole sibling import is module_map -- the case the widening
-    # exists to keep live rather than false-dormant.
-    (orch / "delegate.py").write_text("from . import module_map\n", encoding="utf-8")
+    (orch / "__init__.py").write_text("", encoding="utf-8")
+    # A delegate whose sole sibling import is module_map -- the case the fold
+    # exists to keep live rather than false-dormant. (`from .. import X` is the
+    # subpackage-to-top-level form, resolving to the `module_map` node.)
+    (orch / "delegate.py").write_text("from .. import module_map\n", encoding="utf-8")
 
     monkeypatch.setattr(sys.modules[__name__], "SRC", src)
     dormant = _dormant_modules()
@@ -239,6 +384,44 @@ def test_widened_graph_still_flags_a_genuine_island(tmp_path, monkeypatch) -> No
     )
 
 
+def test_multi_importer_subpackage_keeps_modules_as_nodes(tmp_path, monkeypatch) -> None:
+    """Ownership derivation (#1687): a subpackage imported by MORE than one
+    top-level module does NOT fold -- its files stay graph nodes in their own
+    right, so an island inside it is still flagged and a ``__main__.py``
+    inside it is a derived ``python -m`` entry point, never dormant.
+    """
+    import sys
+
+    src = tmp_path / "charlie_work"
+    src.mkdir()
+    (src / "cli.py").write_text("from . import imp_a, imp_b\n", encoding="utf-8")
+    (src / "__main__.py").write_text("", encoding="utf-8")
+    (src / "imp_a.py").write_text("from . import pkg\n", encoding="utf-8")
+    (src / "imp_b.py").write_text("from . import pkg\n", encoding="utf-8")
+    pkg = src / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("from . import live_mod\n", encoding="utf-8")
+    (pkg / "live_mod.py").write_text("", encoding="utf-8")
+    # An island INSIDE an own-nodes subpackage: nothing imports it.
+    (pkg / "island_mod.py").write_text("", encoding="utf-8")
+    # `python -m charlie_work.pkg` entry point -- live by derivation, not list.
+    (pkg / "__main__.py").write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(sys.modules[__name__], "SRC", src)
+    dormant = _dormant_modules()
+
+    assert "pkg/island_mod" in dormant, (
+        "an island inside a non-folded subpackage must still be flagged -- "
+        "the package's modules are nodes in their own right"
+    )
+    assert "pkg/live_mod" not in dormant
+    assert "pkg/__init__" not in dormant
+    assert "pkg/__main__" not in dormant, (
+        "a subpackage __main__.py is a `python -m` entry point, derived from "
+        "the tree -- it must never read as dormant"
+    )
+
+
 def test_every_dormant_fleet_module_has_its_tests_marked_and_no_others_do() -> None:
     """The #876 invariant, in both directions.
 
@@ -248,7 +431,12 @@ def test_every_dormant_fleet_module_has_its_tests_marked_and_no_others_do() -> N
     modules and their tests go together.
     """
     dormant = _dormant_modules()
-    expected = {f"test_{name}.py" for name in dormant if (TESTS / f"test_{name}.py").is_file()}
+    expected = {
+        candidate
+        for name in dormant
+        for candidate in _test_file_candidates(name)
+        if (TESTS / candidate).is_file()
+    }
     actual = _modules_with_marker()
 
     assert actual == expected, (
