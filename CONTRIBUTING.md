@@ -16,6 +16,14 @@ uv run ruff check .           # lint
 uv run ruff format .          # format
 ```
 
+## The ci-fleet dependency
+
+`ci-fleet` is consumed as a versioned PyPI wheel, not an editable sibling
+checkout — bumping it is a lockfile workflow, not an edit-in-place one. See
+[docs/ci-fleet-version-bump.md](docs/ci-fleet-version-bump.md) for how to
+consume a new release, the daemon-checkout `uv sync` gotcha, and the safe
+temporary path override for cross-repo development.
+
 ## Commit format
 
 Use [Conventional Commits](https://www.conventionalcommits.org/):
