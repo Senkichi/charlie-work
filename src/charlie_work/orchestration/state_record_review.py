@@ -15,7 +15,10 @@ from charlie_work import rescue as rescue_helpers
 from charlie_work.github import GitHubError
 from charlie_work.janitor import DiffContentSignature
 from charlie_work.labels import TransitionOutcome
-from charlie_work.review_decision import record_decision
+from charlie_work.review_decision import (
+    record_decision,
+    reclassify_human_call_verdict,
+)
 import charlie_work.workflow as _wf
 
 
@@ -104,6 +107,26 @@ def record_review(
             # summary.
             effective_required_changes = [summary_text.strip()]
             findings_channel = "derived"
+
+    # Issue #1642: a ``request_changes`` verdict whose own findings ask for a
+    # human/operator decision is a misfiled ``blocked`` verdict -- review.md
+    # already says "use blocked when human input is needed" but nothing
+    # enforced the filing, so a human-call finding (observed on PR #1641)
+    # routed to automated rework and the rework worker asserted an operator
+    # decision that never occurred. Reclassify here, at the single choke
+    # point every verdict write passes through, so the verdict takes the
+    # exact ``blocked`` path: operator queue, no rework brief, no rework
+    # budget. Runs on ``effective_required_changes`` post-derivation, so a
+    # human call written into ``summary`` (the #792 "derived" channel) is
+    # caught identically. The pure decision lives in
+    # ``review_decision.reclassify_human_call_verdict``; this site owns the
+    # enforcement (event + routing).
+    decision, reclassified_human_call = reclassify_human_call_verdict(
+        decision,
+        effective_required_changes,
+        markers=self.config.review.human_decision_markers,
+        verdict_provenance=verdict_provenance,
+    )
 
     pr = self.gh.pr_view(pr_number)
     issue_number = (
@@ -734,6 +757,23 @@ def record_review(
         if recorded_external_findings is not None:
             event_payload["external_findings_count"] = len(recorded_external_findings)
         state = self._record_event(state, "record_review", event_payload)
+        if reclassified_human_call is not None:
+            # Issue #1642: separate event so the reclassification is
+            # independently queryable -- the operator-queue entry, review
+            # packets, and post-incident audits need the matched finding
+            # without re-deriving it from the verdict text.
+            matched_item, matched_marker = reclassified_human_call
+            state = self._record_event(
+                state,
+                "review_decision_reclassified_blocked",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "original_decision": "request_changes",
+                    "matched_item": matched_item,
+                    "matched_marker": matched_marker,
+                },
+            )
         if findings_channel == "vacuous":
             # Distinct from the general "record_review" event (issue
             # #792): this is the signal that a request_changes/blocked
@@ -923,6 +963,14 @@ def record_review(
         )
     else:
         message = f"review recorded ({source_note})"
+    if reclassified_human_call is not None:
+        # Issue #1642: caller-visible explanation so `charlie verdict` /
+        # orchestration logs show why a recorded request_changes landed as
+        # blocked in the operator queue.
+        message += (
+            " — request_changes reclassified as blocked: finding "
+            f"{reclassified_human_call[0]!r} asks for a human/operator decision"
+        )
     if label_error:
         message += f" (label update failed: {label_error.get('outcome', label_error)})"
     return _wf.CommandResult(
@@ -940,6 +988,9 @@ def record_review(
             "escalated": escalated,
             "rescue_dispatched": rescue_dispatched,
             "request_changes_count": request_changes_count,
+            "reclassified_from": (
+                "request_changes" if reclassified_human_call is not None else None
+            ),
             "label_error": label_error,
         },
     )
