@@ -62,6 +62,7 @@ This file covers:
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 from collections import Counter
 from pathlib import Path
@@ -529,13 +530,20 @@ def _review_decision_write_sites(
     Issue #1362 Stage 2: matches calls to ``record_decision`` -- the single
     writer of review-decision.json -- rather than the old direct
     ``self._write_json(decision_path, ...)`` call sites (all four of which
-    were converted to call ``record_decision`` instead). ``record_decision``
-    is imported and called as a bare name (``from .review_decision import
-    record_decision``), not a method, so this matches ``ast.Name`` rather
-    than ``ast.Attribute`` as the old ``_write_json`` scan did. No separate
+    were converted to call ``record_decision`` instead). No separate
     "does this resolve to a review-decision.json path" check is needed the
     way the old scan required one: ``record_decision`` writes nothing else,
     so the function name alone scopes every match correctly.
+
+    Issue #1650: receiver-agnostic, mirroring WriteGate R9's
+    ``_primitive_name`` in ``tests/test_write_gate_enforcement.py``. A call
+    is matched whether it is a bare ``Name`` (``record_decision(...)``) or
+    an ``Attribute`` whose ``.attr == "record_decision"``
+    (``_wf.record_decision(...)``). The #1627 ``_wf.`` namespace rebind that
+    moved bodies apply must NOT hide a write site from this scan -- the
+    prior receiver-sensitive (``ast.Name``-only) matcher silently dropped
+    ``_wf.record_decision(...)`` calls from coverage, and the guard still
+    passed (fewer sites to check), so the erosion was silent.
 
     Exempted sites are *collected*, not silently skipped, because the
     exemption in ``_PROVENANCE_WRITER_EXEMPT_FUNCTIONS`` matches by function
@@ -551,12 +559,13 @@ def _review_decision_write_sites(
     checked: list[tuple[str, ast.Call, ast.AST]] = []
     exempted: list[tuple[str, ast.Call, ast.AST]] = []
     for node in ast.walk(tree):
-        if not (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "record_decision"
-            and len(node.args) >= 2
-        ):
+        if not isinstance(node, ast.Call) or len(node.args) < 2:
+            continue
+        func = node.func
+        is_record_decision = (isinstance(func, ast.Name) and func.id == "record_decision") or (
+            isinstance(func, ast.Attribute) and func.attr == "record_decision"
+        )
+        if not is_record_decision:
             continue
         func_node = _enclosing_function(node, parents)
         if func_node is None:
@@ -625,17 +634,97 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
     # (not exempted) because decision_payload carries the
     # "verdict_provenance" key literally. merge_authorize still contributes
     # exactly one exempted site.
+    # Issue #1647 (L01 batch 4): merge_authorize moved verbatim out of
+    # workflow.py into orchestration/state_operator_commands.py, so its one
+    # exempted record_decision(...) write site now reports that module. This is
+    # an address change of the known deliberate site, not a new or lost
+    # exemption (the len==1 + name=={"merge_authorize"} controls below remain
+    # the load-bearing evidence). The scanner discovers it via
+    # _SRC_ROOT.rglob("*.py").
+    # Issue #1650: the scanner is now receiver-agnostic (mirroring WriteGate
+    # R9's _primitive_name), so a bare-Name ``record_decision(...)`` and an
+    # attribute ``_wf.record_decision(...)`` are both collected. The prior
+    # receiver-sensitive (ast.Name-only) matcher silently dropped the
+    # _wf. form from coverage -- the guard still passed (fewer sites to
+    # check), so the erosion was silent. All four sites now share one bare-
+    # Name binding style (direct import from charlie_work.review_decision)
+    # by convention, but the scanner no longer depends on that convention
+    # to keep coverage intact.
     assert len(exempted_write_sites) == 1, exempted_write_sites
-    assert all(site.startswith("workflow.py:") for site in exempted_write_sites), (
+    assert all(site.startswith("state_operator_commands.py:") for site in exempted_write_sites), (
         exempted_write_sites
     )
     exempted_func_names = {site.rsplit(" (", 1)[1].rstrip(")") for site in exempted_write_sites}
     assert exempted_func_names == {"merge_authorize"}, exempted_write_sites
 
+    # Issue #1650: aggregate count of ALL record_decision write sites
+    # (checked + exempted) across src/charlie_work/**/*.py. The prior guard
+    # had no aggregate count -- only presence assertions on named sites plus
+    # the exemption census -- so a silent drop (the _wf. form evading the
+    # receiver-sensitive matcher) could not be caught. Pinning the total
+    # means a future drop fails loudly instead of eroding coverage quietly.
+    # Today there are exactly 4 sites: 3 checked (review in workflow.py,
+    # _update_approval_head in state_approval.py, record_review in
+    # state_record_review.py) + 1 exempted (merge_authorize in
+    # state_operator_commands.py).
+    assert len(scanned_write_sites) + len(exempted_write_sites) == 4, {
+        "checked": scanned_write_sites,
+        "exempted": exempted_write_sites,
+    }
+
     assert offenders == [], (
         "record_review call site(s) or review-decision.json writer(s) bypass "
         f"the verdict_provenance contract (issue #1265): {offenders}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1650: the scanner must be receiver-agnostic. A synthetic positive
+# control proves an ``_wf.record_decision(...)`` attribute call is collected,
+# not just a bare ``record_decision(...)`` name call. Without this, the #1627
+# ``_wf.`` namespace rebind that moved bodies apply would silently drop the
+# site from provenance coverage -- exactly the erosion that landed at
+# state_record_review.py:567. Mirrors WriteGate R9's ``_primitive_name``.
+# ---------------------------------------------------------------------------
+
+
+def test_review_decision_write_sites_collects_wf_attribute_form() -> None:
+    """The scanner collects an ``_wf.record_decision(...)`` attribute call,
+    not just a bare ``record_decision(...)`` name call."""
+    source = (
+        "import charlie_work.workflow as _wf\n"
+        "def f(pr_dir):\n"
+        '    payload = {"verdict_provenance": "fresh_llm_review"}\n'
+        "    _wf.record_decision(pr_dir, payload, None)\n"
+    )
+    tree = ast.parse(source)
+    checked, exempted = _review_decision_write_sites(tree)
+    assert len(checked) == 1, (checked, exempted)
+    assert len(exempted) == 0
+    func_name, call, _func_node = checked[0]
+    assert func_name == "f"
+    assert isinstance(call.func, ast.Attribute)
+    assert call.func.attr == "record_decision"
+
+
+def test_review_decision_write_sites_collects_bare_name_form() -> None:
+    """The scanner still collects a bare ``record_decision(...)`` name call
+    (regression control: the receiver-agnostic extension must not drop the
+    original ``ast.Name`` path)."""
+    source = (
+        "from charlie_work.review_decision import record_decision\n"
+        "def f(pr_dir):\n"
+        '    payload = {"verdict_provenance": "fresh_llm_review"}\n'
+        "    record_decision(pr_dir, payload, None)\n"
+    )
+    tree = ast.parse(source)
+    checked, exempted = _review_decision_write_sites(tree)
+    assert len(checked) == 1, (checked, exempted)
+    assert len(exempted) == 0
+    func_name, call, _func_node = checked[0]
+    assert func_name == "f"
+    assert isinstance(call.func, ast.Name)
+    assert call.func.id == "record_decision"
 
 
 # ---------------------------------------------------------------------------
@@ -652,11 +741,30 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
 # a single string.
 # ---------------------------------------------------------------------------
 
+# issue #1645 (L01 batch 2): _process_rescue_review moved verbatim out of
+# workflow.py into orchestration/state_rescue.py, so the record_review() call
+# site it encloses now reports state_rescue.py as its module. This is an
+# address change of a known site, not a new or lost one -- the total_sites == 7
+# positive control below is the load-bearing evidence of that (the call count
+# and its "rescue_review" literal are unchanged; only (file, func)'s file
+# moved). The scanner already discovers this via _SRC_ROOT.rglob("*.py").
+# issue #1660 (L03 batch 3): _reap_review_verdicts moved verbatim out of
+# workflow.py into orchestration/misc_review_verdicts.py, so its one
+# record_review() call site (the "fresh_llm_review" literal) now reports that
+# module -- another address change of a known site, discovered via the same
+# rglob; the total_sites == 7 control below is unchanged.
+# issue #1636 (L05): _reconcile_stranded_verdicts moved verbatim out of
+# workflow.py into orchestration/instrumentation_ops.py, so its one
+# record_review() call site (the "stranded_reconciliation" literal) now reports
+# that module -- the same address change of a known site as #1645/#1660,
+# discovered via the same rglob; the total_sites == 7 control below is unchanged.
 _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE: dict[tuple[str, str], Counter[str]] = {
     ("workflow.py", "review"): Counter({"ci_gate_auto_reject": 2, "test_adequacy_auto_reject": 1}),
-    ("workflow.py", "_reap_review_verdicts"): Counter({"fresh_llm_review": 1}),
-    ("workflow.py", "_reconcile_stranded_verdicts"): Counter({"stranded_reconciliation": 1}),
-    ("workflow.py", "_process_rescue_review"): Counter({"rescue_review": 1}),
+    ("misc_review_verdicts.py", "_reap_review_verdicts"): Counter({"fresh_llm_review": 1}),
+    ("instrumentation_ops.py", "_reconcile_stranded_verdicts"): Counter(
+        {"stranded_reconciliation": 1}
+    ),
+    ("state_rescue.py", "_process_rescue_review"): Counter({"rescue_review": 1}),
     ("cli.py", "run_command"): Counter({"operator_manual": 1}),
 }
 
@@ -724,9 +832,14 @@ def _find_function_def(tree: ast.AST, name: str) -> ast.FunctionDef:
 
 
 def test_record_review_verdict_provenance_has_no_default_in_the_ast() -> None:
-    tree = ast.parse(
-        (_SRC_ROOT / "workflow.py").read_text(encoding="utf-8"), filename="workflow.py"
-    )
+    # issue #1645 (L01 batch 2): record_review moved out of workflow.py into a
+    # delegation submodule. Locate its defining module through the live
+    # OrchestratorApp attribute (design 4.1 guards-follow-members locator)
+    # rather than hard-coding workflow.py's path, so this AST check follows the
+    # member wherever future batches relocate it.
+    host_module = inspect.getmodule(OrchestratorApp.record_review)
+    host_path = Path(host_module.__file__)
+    tree = ast.parse(host_path.read_text(encoding="utf-8"), filename=host_path.name)
     func = _find_function_def(tree, "record_review")
 
     positional_names = [a.arg for a in func.args.posonlyargs + func.args.args]

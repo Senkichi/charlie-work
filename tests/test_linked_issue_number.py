@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from charlie_work.github import linked_issue_number
+from charlie_work.issue_linking import linked_issue_number
 
 
 def test_linked_issue_number_from_branch_body_or_title() -> None:

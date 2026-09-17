@@ -32,14 +32,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-# Mirrors `github._CLOSING_KEYWORDS_ALT` -- deliberately not imported from
-# there. That module's regex is scoped to bare `#N` (it exists to detect
-# GitHub's own auto-close scanning, which never accepts an owner/repo
-# qualifier from a same-repo PR body the way *this* module's canonical
-# rewrite needs to preserve one). Duplicating the keyword vocabulary as a
-# short, self-contained pattern keeps this module free of a github.py import
-# it does not otherwise need.
-_CLOSING_KEYWORDS_ALT = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
+from .issue_linking import _CLOSING_KEYWORDS_ALT
+
 # A whole closing-reference line: keyword, then an optional `owner/repo`
 # qualifier, then `#N`. Anchored to the whole line (MULTILINE + $) so a
 # keyword appearing mid-sentence in prose ("this closes #4 loose ends") is

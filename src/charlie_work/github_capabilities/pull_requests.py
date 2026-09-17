@@ -9,34 +9,33 @@ Cluster E of the design doc's capability segmentation (Section 3.1):
 ``merged_prs_for_issue`` is issue-keyed.
 
 Track 2, issue #1590; design doc Section 5, L06: seven of Cluster E's eight
-members move here (``pr_create``, ``pr_list``, ``merged_pr_list``,
+members moved here first (``pr_create``, ``pr_list``, ``merged_pr_list``,
 ``pr_view``, ``pr_diff``, ``pr_commits``, ``pr_ready``). ``merged_prs_for_issue``
-does NOT move in this leaf -- its verbatim body calls ``linked_issue_number(...)``
-as a bare global, a ~70-line, non-``GitHub``-method utility in ``github.py``
-with dozens of external call sites across ``janitor.py``, ``reconcile.py``,
-``dead_worker_reap.py``, ``cli.py``, ``backlog_reachability.py``,
-``worktree.py``, and ``workflow.py`` (17+ sites alone), plus its own
-dependency chain (one member of which, ``iter_unnegated_closing_keyword_matches``,
-has its own external consumer in ``closing_keyword_gate``). Relocating that
-whole surface would be a second, much larger Mikado leaf of its own, not a
-same-leaf bare-global relocation like ``GitHubRunResult``/``_is_mutating``/
-``_LIST_LIMIT`` below -- disclosed as a deviation from issue #1590's 8-member
-list in this leaf's PR body, with a follow-up leaf recommended rather than
-fixed inline here. ``merged_prs_for_issue`` therefore stays a lexical
-``GitHub`` method; ``PullRequestsLike`` still declares it (protocol
-conformance is satisfied by the unmoved lexical method on ``GitHub``, and by
-``CapabilityCollaborator.__getattr__`` forwarding to it on the
-``PullRequests`` collaborator side), and ``MergedPRSearchResult`` stays a
-``TYPE_CHECKING``-only import here -- used only in that protocol stub's
-return annotation, which ``inspect.signature`` never evaluates
-(``eval_str=False`` by default).
+deliberately did NOT move in that leaf -- its verbatim body called
+``linked_issue_number(...)`` as a bare global, a ~70-line, non-``GitHub``-method
+utility that at the time lived in ``github.py`` with dozens of external call
+sites and its own dependency chain, and relocating that whole surface would
+have been a second, much larger Mikado leaf of its own.
+
+Track 2, issue #1613; design doc Section 5, L06b: that follow-up leaf.
+``linked_issue_number`` and its closing-keyword chain moved to a neutral
+``issue_linking.py`` module (no ``charlie_work.github``/``gh`` coupling), and
+``merged_prs_for_issue`` moves here alongside the other seven members,
+importing ``linked_issue_number`` from ``issue_linking`` rather than from
+``charlie_work.github`` (which imports this package at module load time, so a
+runtime import from there would cycle). ``MergedPRSearchResult`` moves here
+too (previously a ``TYPE_CHECKING``-only import from ``charlie_work.github``,
+now the real, runtime definition) since ``merged_prs_for_issue``'s body
+constructs it directly. ``MERGED_PR_LIST_FIELDS`` (previously in
+``_base.py``, shared with ``Transport.validate_field_lists``) also moves
+here, alongside its sole remaining ``GitHub``-side consumer.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 # ``ci_fleet.github.GitHubError`` is imported directly here, not re-derived
 # through ``charlie_work.github`` or ``_base.py``: ``merged_pr_list`` (moved
@@ -49,6 +48,15 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 # itself, which imports ``github_capabilities`` before its own definitions are
 # ready). Mirrors ``repo_meta.py``'s L05 precedent for the same reasoning.
 from ci_fleet.github import GitHubError
+
+# ``linked_issue_number`` lives in ``issue_linking.py``, not ``charlie_work.github``
+# (Track 2, issue #1613; design doc Section 5, L06b). ``issue_linking.py`` has
+# no import of ``charlie_work.github`` or any ``gh``-coupled module, so this
+# import carries no circular-import risk -- unlike ``charlie_work.github``
+# itself, which imports this package (``github_capabilities``) before its own
+# definitions are ready, so an import from there at runtime would cycle.
+# ``merged_prs_for_issue`` below (moved this leaf) uses it as a bare global.
+from ..issue_linking import linked_issue_number
 
 # ``GitHubRunResult`` lives in ``_base.py``, not ``charlie_work.github`` (Track
 # 2, issue #1588; design doc Section 5, L04) -- see ``_base.py`` for the full
@@ -65,17 +73,6 @@ from ci_fleet.github import GitHubError
 # methods that have not moved yet, so they belong in the shared base, not
 # here).
 from ._base import CapabilityCollaborator, GitHubRunResult, _is_mutating, _LIST_LIMIT
-
-if TYPE_CHECKING:
-    # Runtime import would cycle (github.py imports this module to build the
-    # GitHubLike union); inspect.signature does not evaluate annotations
-    # (eval_str=False by default), so the bare string name is all the
-    # conformance test's signature comparison needs. Stays TYPE_CHECKING-only
-    # even after L06 (unlike GitHubRunResult above) because the real
-    # ``MergedPRSearchResult(...)`` construction happens inside
-    # ``merged_prs_for_issue``, which this leaf deliberately does not move
-    # (see the module docstring).
-    from charlie_work.github import MergedPRSearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +92,60 @@ logger = logging.getLogger(__name__)
 # re-export pattern already used for ``PR_CHECKS_FIELDS``/``LABEL_LIST_FIELDS``.
 PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,mergeable,state"
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
+
+# Moved from ``github_capabilities/_base.py`` alongside ``merged_prs_for_issue``
+# (Track 2, issue #1613; design doc Section 5, L06b). ``MERGED_PR_LIST_FIELDS``
+# is referenced as a bare global by ``merged_prs_for_issue`` below AND by
+# ``Transport.validate_field_lists`` (moved from ``github.py`` in L09) --
+# ``transport.py`` imports it from here rather than from ``_base.py`` now, the
+# same re-export pattern already used for ``PR_LIST_FIELDS``/``PR_VIEW_FIELDS``
+# above. Re-exported through ``github_capabilities/__init__.py`` and
+# re-imported into ``github.py`` (no longer used directly there now that
+# ``merged_prs_for_issue`` has moved, but ``tests/test_github.py``/
+# ``tests/test_charlie_work.py`` still read it via
+# ``charlie_work.github.MERGED_PR_LIST_FIELDS``).
+#
+# The field contract for every merged-PR listing. Two producers must satisfy
+# it identically: merged_prs_for_issue() queries these fields directly, and
+# merged_pr_list() goes through the REST endpoint and must reproduce this exact
+# key set via _normalize_rest_pr() (enforced by
+# test_normalize_rest_pr_satisfies_merged_pr_list_field_contract).
+#
+# Consumers: workflow._merged_pr_referenced_issue_numbers() (via
+# linked_issue_number()/issue_numbers_mentioned_by_pr()) reads the identity and
+# branch fields; post-merge audit paths additionally need `headRefOid` to tell
+# *which commit* was merged, not merely that a merge happened.
+#
+# Deliberately narrower than PR_LIST_FIELDS: merged PRs don't need current
+# CI/review/label state, and `statusCheckRollup` in particular forces gh's
+# GraphQL query to walk each PR's check-run connection -- expensive across up
+# to 500 merged PRs and the cause of intermittent gateway 502s on this query
+# (issue #361). `headRefOid` carries no such cost: it is a scalar on the PR
+# object, and on the REST path it is already present in the payload as
+# head.sha, so adding it costs neither an extra request nor a graph walk.
+MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,headRefOid"
+
+
+# Moved from ``github.py`` verbatim alongside ``merged_prs_for_issue`` (Track
+# 2, issue #1613; design doc Section 5, L06b). Kept as a plain re-export
+# through ``github_capabilities/__init__.py`` and back into ``github.py``
+# because ``tests/_fakes_github.py``, ``tests/_reconcile_fixtures.py``,
+# ``tests/_salvage_fixtures.py``, and ``tests/test_charlie_work.py`` all
+# construct it via ``charlie_work.github.MergedPRSearchResult``/
+# ``._MergedPRSearchResult`` (the latter an alias kept on ``github.py`` for
+# the same tests).
+class MergedPRSearchResult(list):
+    """List-like result from ``merged_prs_for_issue`` with an ``ok`` flag.
+
+    Behaves like a normal list so existing list-consuming callers keep working,
+    but exposes ``ok`` so callers can distinguish a successful empty search from
+    a failed ``gh pr list --search`` call (rate limit, search error, etc.).
+    """
+
+    def __init__(self, items: list[Any], ok: bool = True) -> None:
+        super().__init__(items)
+        self.ok = ok
+
 
 # Matches the PR-number segment of a pull-request URL, e.g.
 # https://github.com/OWNER/REPO/pull/123
@@ -166,10 +217,12 @@ class PullRequestsLike(Protocol):
 class PullRequests(CapabilityCollaborator):
     """Pull-request read/create capability collaborator.
 
-    Moved from ``GitHub`` verbatim (Track 2, issue #1590; design doc Section
-    5, L06) -- seven of Cluster E's eight members; see the module docstring
-    for why ``merged_prs_for_issue`` stays on ``GitHub``. Bodies still say
-    ``self.run(...)``/``self._list_cache``/``self._normalize_rest_pr(...)``/
+    Moved from ``GitHub`` verbatim in two leaves: seven of Cluster E's eight
+    members in Track 2, issue #1590 (design doc Section 5, L06), and the
+    eighth (``merged_prs_for_issue``) in the L06b follow-up (Track 2, issue
+    #1613; design doc Section 5, L06b) once its ``linked_issue_number``
+    dependency had its own neutral home (``issue_linking.py``). Bodies still
+    say ``self.run(...)``/``self._list_cache``/``self._normalize_rest_pr(...)``/
     ``self.dry_run``, which resolve through ``CapabilityCollaborator.__getattr__``
     to the owner (design doc Section 3.3).
 
@@ -181,15 +234,18 @@ class PullRequests(CapabilityCollaborator):
     use ``GitHubRunResult`` (relocated to ``_base.py`` in L04 and imported
     from there, not re-derived from ``github.py``, to avoid a circular
     import); ``pr_list``/``merged_pr_list`` use ``_LIST_LIMIT`` and
-    ``pr_ready`` uses ``_is_mutating`` (both relocated to ``_base.py`` in this
-    leaf because they are also used by ``GitHub`` methods that have not moved
-    yet -- see ``_base.py``'s own comments on each); and ``merged_pr_list``
+    ``pr_ready`` uses ``_is_mutating`` (both relocated to ``_base.py`` in L06
+    because they are also used by ``GitHub`` methods that have not moved
+    yet -- see ``_base.py``'s own comments on each); ``merged_pr_list``
     raises ``GitHubError`` (imported directly from ``ci_fleet.github``, the
     same external, identity-sensitive source ``github.py`` itself re-exports
-    from -- see this module's import block). Design doc Section 3.3 covers
-    only ``self.<attr>`` forwarding, not bare-global runtime symbols in moved
-    bodies; this is the same disclosed design-gap resolution that recurs
-    identically in L04/L05/L06/L08/L09.
+    from -- see this module's import block); and ``merged_prs_for_issue``
+    uses ``MERGED_PR_LIST_FIELDS`` and ``linked_issue_number`` (the latter
+    imported from ``issue_linking.py``, not ``charlie_work.github``, to avoid
+    a circular import -- see this module's import block). Design doc Section
+    3.3 covers only ``self.<attr>`` forwarding, not bare-global runtime
+    symbols in moved bodies; this is the same disclosed design-gap resolution
+    that recurs identically in L04/L05/L06/L06b/L08/L09.
     """
 
     def pr_create(
@@ -401,3 +457,68 @@ class PullRequests(CapabilityCollaborator):
         result = self.run(args, allow_failure=True)
         assert isinstance(result, GitHubRunResult)
         return result
+
+    # Moved from ``GitHub`` verbatim (Track 2, issue #1613; design doc
+    # Section 5, L06b). Its only sibling call is ``self.run(...)``; ``run`` is
+    # never itself a routed/collaborator-side member, so no subclass-override
+    # bypass hazard applies (see the module docstring and this leaf's PR body
+    # for the full analysis).
+    def merged_prs_for_issue(
+        self,
+        issue_number: int,
+        branch_prefix: str,
+    ) -> MergedPRSearchResult:
+        """Return merged PRs that hijack-safely bind to ``issue_number``.
+
+        Uses ``gh pr list --state merged --search`` so PRs merged long ago
+        (outside the most-recent 500 window used by ``merged_pr_list``) are
+        still discoverable.  The search is scoped to the issue number, so a
+        single merged PR outside the global window can be finalized without
+        fetching every merged PR.
+
+        Returns a list-like object because multiple merged PRs can reference the
+        same issue; callers treat any returned PR as evidence the issue is done.
+        The returned object's ``ok`` flag is False when the search call itself
+        failed (e.g. rate limit), allowing callers to implement circuit breakers.
+        """
+        query = f'"#{issue_number}"'
+        result = self.run(
+            [
+                "pr",
+                "list",
+                "--state",
+                "merged",
+                "--search",
+                query,
+                "--limit",
+                "20",
+                "--json",
+                MERGED_PR_LIST_FIELDS,
+            ],
+            json_output=True,
+            allow_failure=True,
+        )
+        if isinstance(result, GitHubRunResult):
+            if not result.ok:
+                logger.warning(
+                    "Failed to search merged PRs for issue #%d: %s",
+                    issue_number,
+                    result.error,
+                )
+                return MergedPRSearchResult([], ok=False)
+            items = result.value if isinstance(result.value, list) else []
+        else:
+            items = result if isinstance(result, list) else []
+
+        matched: list[dict[str, Any]] = []
+        for pr in items:
+            if str(pr.get("state") or "").upper() != "MERGED":
+                continue
+            bound = linked_issue_number(
+                pr,
+                is_cross_repository=pr.get("isCrossRepository"),
+                branch_prefix=branch_prefix,
+            )
+            if bound == issue_number:
+                matched.append(pr)
+        return MergedPRSearchResult(matched, ok=True)

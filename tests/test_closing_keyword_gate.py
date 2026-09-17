@@ -34,9 +34,8 @@ from charlie_work.github import (
     CLOSING_KEYWORD_PR_FIELDS,
     GitHub,
     GitHubRunResult,
-    iter_unnegated_closing_keyword_matches,
 )
-from charlie_work.github import linked_issue_number
+from charlie_work.issue_linking import iter_unnegated_closing_keyword_matches, linked_issue_number
 
 # --- find_unexpected_closing_references: core scanning behavior ---
 

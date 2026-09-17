@@ -24,7 +24,7 @@ from typing import Any
 
 from _worktree_fixtures import _git
 from charlie_work import github as github_module
-from charlie_work.github import linked_issue_number
+from charlie_work.issue_linking import linked_issue_number
 from charlie_work.reconcile import _LIST_LIMIT as reconcile_list_limit
 from charlie_work.worktree import create_worktree
 

@@ -112,8 +112,8 @@ from .github import (
     PR_CLOSING_ISSUES_FIELDS,
     build_branch_issue_validator,
     label_names,
-    linked_issue_number,
 )
+from .issue_linking import linked_issue_number
 from .instrumentation import log_event
 from .labels import TransitionOutcome
 from .paths import resolved_layout

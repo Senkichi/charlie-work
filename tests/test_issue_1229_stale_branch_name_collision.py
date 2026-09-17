@@ -485,7 +485,7 @@ def test_dispatch_claim_stale_branch_does_not_bind_unrelated_pr_to_closed_issue(
     from unittest.mock import patch
 
     import charlie_work.workflow as workflow_mod
-    from charlie_work.github import linked_issue_number as _real_linked
+    from charlie_work.issue_linking import linked_issue_number as _real_linked
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -611,7 +611,7 @@ def test_review_queue_stale_branch_does_not_bind_unrelated_pr_to_closed_issue(
     from unittest.mock import patch
 
     import charlie_work.workflow as workflow_mod
-    from charlie_work.github import linked_issue_number as _real_linked
+    from charlie_work.issue_linking import linked_issue_number as _real_linked
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

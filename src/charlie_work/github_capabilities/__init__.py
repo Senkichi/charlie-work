@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from ._base import (
     GitHubRunResult,
-    MERGED_PR_LIST_FIELDS,
     RUN_LIST_FIELDS,
     _is_mutating,
     _LIST_LIMIT,
@@ -34,6 +33,8 @@ from .issues import (
 from .labels import LABEL_LIST_FIELDS, Labels, LabelsLike
 from .merge_branch import _ADMIN_FLAG, _STRATEGY_FLAGS, MergeBranch, MergeBranchLike
 from .pull_requests import (
+    MERGED_PR_LIST_FIELDS,
+    MergedPRSearchResult,
     PR_LIST_FIELDS,
     PR_VIEW_FIELDS,
     PullRequests,
@@ -59,6 +60,7 @@ __all__ = [
     "MERGED_PR_LIST_FIELDS",
     "MergeBranch",
     "MergeBranchLike",
+    "MergedPRSearchResult",
     "PR_CHECKS_FIELDS",
     "PR_LIST_FIELDS",
     "PR_VIEW_FIELDS",

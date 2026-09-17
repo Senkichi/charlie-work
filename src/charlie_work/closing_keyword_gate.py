@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from .github import iter_unnegated_closing_keyword_matches
+from .issue_linking import iter_unnegated_closing_keyword_matches
 
 
 @dataclass(frozen=True)
