@@ -425,7 +425,7 @@ jobs:
           set -e
           uv run charlie ast-equivalence-check --base ${{ github.event.pull_request.base.sha }}
 
-  Collect-only gate:
+  collect-only-gate:
     name: Collect-only gate
     # PR-only: the gate compares base vs head collect-only output, which only
     # makes sense for a PR (push-to-main has no base to compare against).
