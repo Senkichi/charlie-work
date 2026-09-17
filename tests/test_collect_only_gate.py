@@ -36,6 +36,8 @@ import ast
 from collections import Counter
 from pathlib import Path
 
+import yaml
+
 from charlie_work.collect_only_gate import (
     CollectOnlyFinding,
     CollectOnlyResult,
@@ -727,3 +729,55 @@ def test_cli_collect_only_check_writes_output_file(monkeypatch, tmp_path: Path) 
     assert result.ok is True
     report = (tmp_path / "gate_report.txt").read_text(encoding="utf-8")
     assert "PASSED" in report
+
+
+# ---------------------------------------------------------------------------
+# CI workflow shell compatibility (PR #1595 rework -- the #1624 bug class)
+# ---------------------------------------------------------------------------
+
+_CI_YML = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+
+
+def test_collect_only_gate_job_steps_use_bash_shell() -> None:
+    """The collect-only-gate job's bash-syntax steps must declare ``shell: bash``.
+
+    The ``Collect tests at head`` step uses the bash ``|| true`` idiom
+    (``true`` is not a pwsh command), the ``Collect tests at base`` step is a
+    bash script (``set -e``, ``trap``, a subshell), and the
+    ``Run collect-only gate`` step uses bash ``\\`` line continuations in a
+    multi-line ``run: |`` block.  The job runs on ``windows-latest``, whose
+    default shell is pwsh -- pwsh cannot parse ``\\`` at end of line (it
+    treats it as a literal backslash, then sees ``--base-collect`` on the next
+    line as a bare unary ``--`` operator and throws ``ParserError`` -- the
+    #1624 failure, reproduced on this job's first run, 35260669565).  All
+    three steps must therefore explicitly set ``shell: bash`` (Git Bash is
+    always available on GitHub-hosted Windows runners).
+
+    This is the mutation-checkable regression guard for the #1595 rework:
+    reverting any of the three ``shell: bash`` lines makes the test fail.
+    """
+    assert _CI_YML.exists(), f"ci.yml not found at {_CI_YML}"
+    workflow = yaml.safe_load(_CI_YML.read_text(encoding="utf-8"))
+
+    job = workflow["jobs"]["collect-only-gate"]
+    by_name = {s["name"]: s for s in job["steps"] if "name" in s}
+
+    head_step = by_name["Collect tests at head"]
+    assert head_step.get("shell") == "bash", (
+        "ci.yml 'Collect tests at head' step must set shell: bash -- the "
+        "|| true idiom is bash, not pwsh (true is not a pwsh command)"
+    )
+
+    base_step = by_name["Collect tests at base"]
+    assert base_step.get("shell") == "bash", (
+        "ci.yml 'Collect tests at base' step must set shell: bash -- the "
+        "run block is a bash script (set -e, trap, subshell) that pwsh "
+        "cannot parse"
+    )
+
+    gate_step = by_name["Run collect-only gate"]
+    assert gate_step.get("shell") == "bash", (
+        "ci.yml 'Run collect-only gate' step must set shell: bash -- the "
+        "multi-line run block uses bash \\ line continuations that pwsh "
+        "cannot parse (ParserError: Missing expression after unary '--')"
+    )

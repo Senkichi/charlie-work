@@ -472,6 +472,14 @@ jobs:
         # still produced one-node-ID-per-line; this repo's pytest (9.x in
         # uv.lock) changed that. ``--collect-only`` (no ``-q``) produces the
         # one-node-ID-per-line format the gate's parser expects.
+        #
+        # `shell: bash`: the `|| true` idiom is bash, not PowerShell. On
+        # windows-latest the default shell is pwsh, where `||` works (pwsh 7)
+        # but `true` is not a recognised command -- a collection failure
+        # would run `true`, fail to find it, and turn the step red instead of
+        # staying green for the gate to surface a clear finding. Bash is
+        # always available on GitHub-hosted Windows runners (Git Bash).
+        shell: bash
         run: uv run pytest --collect-only > head_collect.txt || true
       - name: Collect tests at base
         # Create a git worktree at the base ref, sync deps, and run
@@ -510,8 +518,19 @@ jobs:
       - name: Run collect-only gate
         # The gate command reads the two collect files and runs the pure
         # comparison logic. It exits non-zero (fails the required check)
-        # when the leaf-name multisets differ or a removed leaf did not
-        # reappear in a sibling under tests/.
+        # when a leaf was removed, a removed leaf did not reappear in a
+        # sibling under tests/, or a leaf's multiplicity shrank (the issue's
+        # Scope table); `added` leaves and grown multiplicities are reported
+        # but pass.
+        #
+        # `shell: bash`: the multi-line `run: |` block uses bash `\` line
+        # continuations, which pwsh cannot parse -- a `\` at end of line is a
+        # literal backslash, not a continuation, so pwsh sees `--base-collect`
+        # on the next line as a bare unary `--` operator and throws
+        # ParserError (the #1624 CI failure, reproduced on this job's first
+        # run -- 35260669565). Bash is always available on GitHub-hosted
+        # Windows runners (Git Bash).
+        shell: bash
         run: |
           uv run charlie collect-only-check \
             --base-collect base_collect.txt \
