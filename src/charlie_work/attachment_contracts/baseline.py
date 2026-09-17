@@ -220,18 +220,28 @@ def dumps(document: dict[str, object]) -> str:
 
 
 def with_kind_stats(
-    document: dict[str, object], verdicts: tuple[SaturationVerdict, ...]
+    document: dict[str, object],
+    verdicts: tuple[SaturationVerdict, ...],
+    *,
+    generated_at: str,
 ) -> dict[str, object]:
     """Return a copy of ``document`` with ``kind_stats`` recomputed from ``verdicts``.
 
     The ``--refreeze`` path (issue #1614): ratchet the entries against a
     LIVE fence (the caller passes live ``saturate_all`` verdicts to
     ``compare``), then overwrite the frozen per-kind stats with the
-    recomputed values via this helper. The input document is not mutated.
+    recomputed values via this helper. ``generated_at`` is re-stamped for
+    the same reason ``generate()`` stamps it: recomputing the frozen fence
+    IS a generation event, and ``check_ratchet_tamper`` tells a sanctioned
+    recompute apart from a hand-edit precisely by the changed timestamp --
+    a refreeze that kept the old ``generated_at`` would read as a
+    ratchet-to-ratchet boundary raise and be flagged as tamper. The input
+    document is not mutated.
     """
     kind_stats = _kind_stats_from_verdicts(verdicts)
     return {
         **document,
+        "generated_at": generated_at,
         KIND_STATS_KEY: {
             kind: _kind_stats_to_dict(stats) for kind, stats in sorted(kind_stats.items())
         },
@@ -533,6 +543,18 @@ def compare(
     return findings, ratcheted
 
 
+def _kind_stats_delta(prev: KindStats, current: KindStats) -> str:
+    """One-line summary of how a frozen kind's stats changed, for tamper messages."""
+    if current.boundary != prev.boundary:
+        direction = "rose" if current.boundary > prev.boundary else "lowered"
+        return f"boundary {direction} {prev.boundary} -> {current.boundary}"
+    return (
+        "boundary unchanged but stats modified "
+        f"(q3 {prev.q3} -> {current.q3}, iqr {prev.iqr} -> {current.iqr}, "
+        f"population {prev.population} -> {current.population})"
+    )
+
+
 def check_ratchet_tamper(
     previous_document: dict[str, object] | None,
     current_document: dict[str, object],
@@ -560,14 +582,22 @@ def check_ratchet_tamper(
     under every legitimate write path a ratchet preserves ``kind_stats``
     verbatim (``compare`` spreads ``baseline_document`` without rewriting
     ``KIND_STATS_KEY``), and an explicit re-baseline / ``--refreeze`` is the
-    only path that recomputes it. So for any kind present in both documents,
-    a rise in the frozen ``boundary`` between two consecutive committed
-    baselines -- where the later one is NOT a freshly generated document --
-    is tamper: a hand-edit that loosened the fence to keep a growing class
-    below it. (A genuine re-baseline writes a new ``generated_at`` and is
-    reviewed as a whole; this diff guard only fires on the ratchet-to-ratchet
-    transition, exactly the raise-to-match laundering vector it already
-    covers for ``member_count``.)
+    only path that recomputes it. Both sanctioned recompute paths stamp a
+    fresh ``generated_at`` (``generate()`` always does; ``with_kind_stats()``
+    re-stamps it on the ``--refreeze`` path), so ``generated_at`` is the
+    discriminator between a fresh generation event -- reviewed as a
+    whole-document diff -- and a ratchet-to-ratchet transition, exactly the
+    laundering vector this guard already covers for ``member_count``. On the
+    ratchet-to-ratchet transition ANY difference in ``kind_stats`` is tamper:
+    a raised or lowered boundary, a tweaked q3/iqr/population (``iqr: 0`` or
+    ``population < FLOOR`` disables a kind's fence outright inside
+    ``saturate_with_fence``), a removed kind (a kind with no frozen fence
+    gets no verdicts at all -- the whole kind is silently exempted), or an
+    added kind. Removing the ``kind_stats`` key outright is flagged
+    unconditionally: every baseline writer emits the key (``compare``
+    preserves it; ``generate()`` / ``with_kind_stats()`` always emit it), so
+    its absence can only be a hand-deletion silently reverting to the
+    pre-#1614 live-recomputation fallback.
 
     `previous_document` is None when there is nothing to diff against yet
     (e.g. the very first committed baseline) -- no findings are possible.
@@ -595,33 +625,95 @@ def check_ratchet_tamper(
                 redirect=None,
             )
         )
-    # Issue #1614: a ratchet may lower entries and may not raise the frozen
-    # per-kind boundary. A rise between two committed baselines can only be a
-    # hand-edit (compare/generate are the only sanctioned writers of
-    # kind_stats, and neither raises an existing kind's boundary on the
-    # ratchet path). Malformed kind_stats already raised at loads() time, so
-    # kind_stats_of here cannot raise on a document that passed loads().
+    # Issue #1614: a ratchet preserves ``kind_stats`` verbatim, so on a
+    # ratchet-to-ratchet transition ANY difference in the frozen fence is a
+    # hand-edit. A fresh ``generated_at`` marks the sanctioned exceptions --
+    # a full ``baseline`` regen or a ``--refreeze`` -- which recompute the
+    # fence and are reviewed as whole-document diffs. Malformed kind_stats
+    # already raised at loads() time, so kind_stats_of here cannot raise on
+    # a document that passed loads().
     previous_stats = kind_stats_of(previous_document)
     current_stats = kind_stats_of(current_document)
-    for kind, prev in previous_stats.items():
-        current = current_stats.get(kind)
-        if current is None or current.boundary <= prev.boundary:
-            continue
+    regenerated = current_document.get("generated_at") is not None and current_document.get(
+        "generated_at"
+    ) != previous_document.get("generated_at")
+
+    if KIND_STATS_KEY in previous_document and KIND_STATS_KEY not in current_document:
+        # No sanctioned writer ever drops the key, so its absence can only be
+        # a hand-deletion -- silently reverting check_tree / --ratchet to the
+        # pre-#1614 live-recomputation fallback this issue exists to close.
+        # Flag it even when ``generated_at`` changed: a real regen /
+        # --refreeze still writes the key.
         findings.append(
             Finding(
                 severity="error",
                 file=BASELINE_FILENAME,
-                identity=f"kind_stats:{kind}",
+                identity=KIND_STATS_KEY,
                 message=(
-                    f"tamper: frozen {kind} fence boundary rose "
-                    f"{prev.boundary} -> {current.boundary} since the previous "
-                    "committed baseline. A ratchet may not raise the frozen "
-                    "boundary; recompute it only via an explicit re-baseline or "
-                    "`baseline --refreeze`."
+                    f"tamper: baseline {KIND_STATS_KEY!r} was removed since the "
+                    "previous committed baseline. Removing the frozen per-kind "
+                    "fence silently reverts saturation to live recomputation; "
+                    "restore it via `baseline --refreeze` or a full `baseline` "
+                    "run."
                 ),
                 redirect=None,
             )
         )
+    elif not regenerated:
+        for kind, prev in previous_stats.items():
+            current = current_stats.get(kind)
+            if current is None:
+                findings.append(
+                    Finding(
+                        severity="error",
+                        file=BASELINE_FILENAME,
+                        identity=f"kind_stats:{kind}",
+                        message=(
+                            f"tamper: frozen {kind} fence was removed since the "
+                            "previous committed baseline. A kind with no frozen "
+                            "fence gets no verdicts at all, silently exempting "
+                            "the whole kind; restore it via `baseline --refreeze` "
+                            "or a full `baseline` run."
+                        ),
+                        redirect=None,
+                    )
+                )
+            elif current != prev:
+                findings.append(
+                    Finding(
+                        severity="error",
+                        file=BASELINE_FILENAME,
+                        identity=f"kind_stats:{kind}",
+                        message=(
+                            f"tamper: frozen {kind} fence was modified since the "
+                            "previous committed baseline "
+                            f"({_kind_stats_delta(prev, current)}) with no "
+                            "re-baseline / --refreeze (generated_at unchanged). "
+                            "A ratchet preserves kind_stats verbatim; recompute "
+                            "it only via `baseline --refreeze` or a full "
+                            "`baseline` run."
+                        ),
+                        redirect=None,
+                    )
+                )
+        for kind in current_stats:
+            if kind in previous_stats:
+                continue
+            findings.append(
+                Finding(
+                    severity="error",
+                    file=BASELINE_FILENAME,
+                    identity=f"kind_stats:{kind}",
+                    message=(
+                        f"tamper: frozen {kind} fence appeared since the "
+                        "previous committed baseline with no re-baseline / "
+                        "--refreeze (generated_at unchanged). kind_stats may "
+                        "only change through a generation event; add it via "
+                        "`baseline --refreeze` or a full `baseline` run."
+                    ),
+                    redirect=None,
+                )
+            )
     return findings
 
 

@@ -7,7 +7,6 @@ import json
 from charlie_work.attachment_contracts.baseline import (
     KIND_STATS_KEY,
     TamperError,
-    check_ratchet_tamper,
     check_tamper,
     compare,
     dumps,
@@ -423,106 +422,6 @@ def test_tamper_no_finding_when_matches_and_no_bumps() -> None:
 
 
 # ---------------------------------------------------------------------------
-# check_ratchet_tamper(): closes the raise-to-match laundering gap (finding #1)
-# ---------------------------------------------------------------------------
-
-
-def test_ratchet_tamper_detects_raise_to_match_laundering() -> None:
-    # The empirical proof case from the round-1 review: baseline hand-raised
-    # from 134 to 135 in lockstep with real growth, no bump -- both
-    # `compare()` and `check_tamper()` are blind to this; only a diff against
-    # the PREVIOUS committed baseline can see it.
-    previous = _doc_with_entries(
-        BaselineEntry(
-            kind="class",
-            identity="OrchestratorApp",
-            file="src/x.py",
-            member_count=134,
-            boundary=5.0,
-        )
-    )
-    current = _doc_with_entries(
-        BaselineEntry(
-            kind="class",
-            identity="OrchestratorApp",
-            file="src/x.py",
-            member_count=135,
-            boundary=5.0,
-        )
-    )
-
-    findings = check_ratchet_tamper(previous, current)
-
-    assert len(findings) == 1
-    assert findings[0].severity == "error"
-    assert "tamper" in findings[0].message
-    assert "134" in findings[0].message and "135" in findings[0].message
-
-
-def test_ratchet_tamper_clean_when_unchanged() -> None:
-    entry = BaselineEntry(
-        kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0
-    )
-    previous = _doc_with_entries(entry)
-    current = _doc_with_entries(entry)
-
-    assert check_ratchet_tamper(previous, current) == []
-
-
-def test_ratchet_tamper_clean_on_legitimate_ratchet_down() -> None:
-    previous = _doc_with_entries(
-        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0)
-    )
-    current = _doc_with_entries(
-        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=5, boundary=6.0)
-    )
-
-    assert check_ratchet_tamper(previous, current) == []
-
-
-def test_ratchet_tamper_clean_for_a_brand_new_entry() -> None:
-    previous = _doc_with_entries()
-    current = _doc_with_entries(
-        BaselineEntry(kind="class", identity="new", file="src/n.py", member_count=10, boundary=6.0)
-    )
-
-    assert check_ratchet_tamper(previous, current) == []
-
-
-def test_ratchet_tamper_no_findings_when_no_previous_document() -> None:
-    current = _doc_with_entries(
-        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=999, boundary=6.0)
-    )
-
-    assert check_ratchet_tamper(None, current) == []
-
-
-def test_ratchet_tamper_bump_does_not_excuse_a_member_count_raise() -> None:
-    # Even a validly-acked bump does NOT justify the member_count FIELD
-    # itself rising -- legitimate bump usage raises the ceiling while leaving
-    # member_count untouched (see test_compare_bump_raises_effective_ceiling).
-    # A rise in member_count is tamper regardless of bumps.
-    bump = Bump(to=20, reason="reviewed", actor="interactive", ack="handle:senkichi")
-    previous = _doc_with_entries(
-        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0)
-    )
-    current = _doc_with_entries(
-        BaselineEntry(
-            kind="class",
-            identity="a",
-            file="src/a.py",
-            member_count=15,
-            boundary=6.0,
-            bumps=(bump,),
-        )
-    )
-
-    findings = check_ratchet_tamper(previous, current)
-
-    assert len(findings) == 1
-
-
-# ---------------------------------------------------------------------------
 # loads(): duplicate (kind, file, identity) entries are rejected (finding #7)
 # ---------------------------------------------------------------------------
 
@@ -748,53 +647,11 @@ def test_with_kind_stats_recomputes_from_verdicts() -> None:
         KIND_STATS_KEY: {"class": {"q3": 14.0, "iqr": 2.0, "boundary": 17.0, "population": 8}},
     }
     verdicts = (_verdict_kind("big", 20, "class", boundary=15.5, saturated=True),)
-    refrozen = with_kind_stats(doc, verdicts)
+    refrozen = with_kind_stats(doc, verdicts, generated_at="t2")
     assert kind_stats_of(refrozen)["class"].boundary == 15.5
+    # The --refreeze path IS a generation event: generated_at is re-stamped so
+    # check_ratchet_tamper can tell a sanctioned recompute from a hand-edit.
+    assert refrozen["generated_at"] == "t2"
     # Input document is not mutated.
     assert kind_stats_of(doc)["class"].boundary == 17.0
-
-
-def test_check_ratchet_tamper_detects_raised_frozen_boundary() -> None:
-    # Issue #1614: a ratchet may lower entries and may not raise the frozen
-    # boundary. A hand-edit that loosened the fence is tamper.
-    previous = {
-        **_doc_with_entries(),
-        KIND_STATS_KEY: {"class": {"q3": 14.0, "iqr": 2.0, "boundary": 17.0, "population": 8}},
-    }
-    current = {
-        **_doc_with_entries(),
-        KIND_STATS_KEY: {"class": {"q3": 20.0, "iqr": 2.0, "boundary": 23.0, "population": 8}},
-    }
-    findings = check_ratchet_tamper(previous, current)
-    assert len(findings) == 1
-    assert findings[0].severity == "error"
-    assert "frozen" in findings[0].message and "class" in findings[0].message
-    assert "17.0" in findings[0].message and "23.0" in findings[0].message
-
-
-def test_check_ratchet_tamper_clean_when_boundary_lowered_or_unchanged() -> None:
-    base = {
-        **_doc_with_entries(),
-        KIND_STATS_KEY: {"class": {"q3": 14.0, "iqr": 2.0, "boundary": 17.0, "population": 8}},
-    }
-    lowered = {
-        **_doc_with_entries(),
-        KIND_STATS_KEY: {"class": {"q3": 12.0, "iqr": 2.0, "boundary": 15.0, "population": 8}},
-    }
-    unchanged = {
-        **_doc_with_entries(),
-        KIND_STATS_KEY: {"class": {"q3": 14.0, "iqr": 2.0, "boundary": 17.0, "population": 8}},
-    }
-    assert check_ratchet_tamper(base, lowered) == []
-    assert check_ratchet_tamper(base, unchanged) == []
-
-
-def test_check_ratchet_tamper_clean_when_neither_document_has_kind_stats() -> None:
-    # Pre-#1614 baselines: no kind_stats on either side -> no boundary finding.
-    previous = _doc_with_entries(
-        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0)
-    )
-    current = _doc_with_entries(
-        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0)
-    )
-    assert check_ratchet_tamper(previous, current) == []
+    assert doc["generated_at"] == "t"

@@ -116,7 +116,11 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
         kinds = sorted({p.kind for p in scan.points})
         verdicts = saturate_all(scan.points, kinds)
         _findings, ratcheted = compare(verdicts, document)
-        ratcheted = with_kind_stats(ratcheted, verdicts)
+        ratcheted = with_kind_stats(
+            ratcheted,
+            verdicts,
+            generated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        )
         dump(ratcheted, baseline_path)
         print(f"refrozen baseline written: {baseline_path} ({len(ratcheted['entries'])} entries)")
         return 0
