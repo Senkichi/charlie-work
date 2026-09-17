@@ -212,6 +212,18 @@ class LabelConfig:
     # via ``_compute_remove``) and of ``all`` (so ``bootstrap_labels``
     # creates it on GitHub).
     operator_queue: str = "agent:operator-queue"
+    # Issue #1686: the operator-applied escape hatch for the collect-only
+    # gate's fail-closed verdict. Applied to a PR -- never an issue -- by a
+    # human operator to waive that head's failing findings (legitimate test
+    # deletions/renames) after review; the gate reads the PR's LIVE labels
+    # at run time, and the review packet surfaces exactly what was waived on
+    # the reviewed head. Member of ``all`` so ``bootstrap_labels`` creates
+    # it on the repo, and deliberately NOT of ``workflow_labels``,
+    # ``terminal``, or ``active``: the label state machine only ever manages
+    # issue lifecycle labels, and this one is applied/removed by humans only
+    # (including persisting across ``synchronize`` -- a label applied for
+    # head A legitimately remains on head B).
+    collect_gate_exempt: str = "collect-gate-exempt"
 
     @property
     def terminal(self) -> set[str]:
@@ -242,6 +254,7 @@ class LabelConfig:
             self.prose_only_deps,
             self.merge_hold,
             self.operator_queue,
+            self.collect_gate_exempt,
         ]
 
     @property

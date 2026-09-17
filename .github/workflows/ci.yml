@@ -460,9 +460,21 @@ jobs:
     # class-wrapping dodge does not. See src/charlie_work/collect_only_gate.py
     # for the full rationale, including graft K (the leaf-name multiset fix)
     # and graft E (diff-derived inputs, never hand-typed).
+    #
+    # Issue #1686: the gate step queries the PR's LIVE labels for the
+    # operator exemption (`collect-gate-exempt` by default), so this job
+    # needs pull-requests: read for the `gh pr view` GraphQL query -- same
+    # scope the closing-keyword gate's Lint step needed (see that step's
+    # comment for the "Resource not accessible by integration" history).
+    # contents: read stays listed because ANY explicit job-level
+    # permissions: key makes every unlisted scope `none`, and
+    # actions/checkout@v5 still needs it.
     runs-on: windows-latest
     timeout-minutes: 30
     if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
@@ -541,8 +553,23 @@ jobs:
         # ParserError (the #1624 CI failure, reproduced on this job's first
         # run -- 35260669565). Bash is always available on GitHub-hosted
         # Windows runners (Git Bash).
+        #
+        # Issue #1686: `--pr` hands the gate the PR number so it can query
+        # the PR's LIVE labels via `gh pr view` (never the
+        # github.event.pull_request.labels snapshot -- a label applied to
+        # waive findings must take effect on RERUN without a new push, and
+        # a label removed must stop waiving immediately). The job still
+        # runs to completion either way -- no step-level `if:` skips on
+        # label presence. With the label present the gate prints every
+        # waived finding and exits 0; without it, nothing about the
+        # #1538 verdict changes. A failed label query fails closed.
+        # GH_TOKEN feeds the `gh` CLI inside the gate command -- same
+        # env-wiring as the closing-keyword gate step in the Lint job.
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           uv run charlie collect-only-check \
             --base-collect base_collect.txt \
-            --head-collect head_collect.txt
+            --head-collect head_collect.txt \
+            --pr ${{ github.event.pull_request.number }}

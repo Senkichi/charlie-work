@@ -31,13 +31,13 @@ Covers:
 
 from __future__ import annotations
 
-import argparse
 import ast
 from collections import Counter
 from pathlib import Path
 
 import yaml
 
+from _collect_gate_helpers import _apply_cli_mocks, _CI_YML, _make_cli_args
 from charlie_work.collect_only_gate import (
     CollectOnlyFinding,
     CollectOnlyResult,
@@ -623,45 +623,6 @@ def test_render_gate_report_fail() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_cli_args(
-    tmp_path: Path,
-    *,
-    base_collect: str = "base_collect.txt",
-    head_collect: str = "head_collect.txt",
-    output: str | None = None,
-) -> argparse.Namespace:
-    """Build the argparse namespace for ``collect-only-check``."""
-    return argparse.Namespace(
-        command="collect-only-check",
-        base_collect=base_collect,
-        head_collect=head_collect,
-        output=output,
-        repo=None,
-        config=None,
-        fleet_dir=None,
-        dry_run=True,
-    )
-
-
-def _apply_cli_mocks(monkeypatch, tmp_path: Path) -> None:
-    """Mock ``cli.bootstrap_command`` to return a context rooted at *tmp_path*."""
-    from charlie_work import cli as cli_module
-
-    def mock_bootstrap(args):
-        from charlie_work.config import OrchestratorConfig
-        from charlie_work.github import GitHub
-        from charlie_work.paths import RuntimePaths
-
-        return cli_module.CommandContext(
-            repo_root=tmp_path,
-            config=OrchestratorConfig(),
-            paths=RuntimePaths.__new__(RuntimePaths),
-            gh=GitHub(repo_root=tmp_path, runtime=None, dry_run=True),
-        )
-
-    monkeypatch.setattr(cli_module, "bootstrap_command", mock_bootstrap)
-
-
 def test_cli_collect_only_check_passes_verbatim_relocation(monkeypatch, tmp_path: Path) -> None:
     """The CLI command passes a verbatim relocation (same leaf names, different modules)."""
     _apply_cli_mocks(monkeypatch, tmp_path)
@@ -734,8 +695,6 @@ def test_cli_collect_only_check_writes_output_file(monkeypatch, tmp_path: Path) 
 # ---------------------------------------------------------------------------
 # CI workflow shell compatibility (PR #1595 rework -- the #1624 bug class)
 # ---------------------------------------------------------------------------
-
-_CI_YML = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
 
 
 def test_collect_only_gate_job_steps_use_bash_shell() -> None:

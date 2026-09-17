@@ -21,6 +21,7 @@ You are the senior orchestrator performing a critical, adversarial review. Do no
 $diff_size_section$janitor_section$prior_review_section
 ## CI status
 $ci_status_section
+$collect_gate_exemption_section
 ## Review procedure
 
 1. Read the original issue and acceptance intent.
