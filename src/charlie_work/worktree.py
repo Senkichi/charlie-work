@@ -20,7 +20,7 @@ import re
 import shutil
 import stat
 import tomllib
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -29,7 +29,6 @@ from typing import Any, Protocol, runtime_checkable
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
 from .config import (
-    LAUNCHER_OWNED_DIRS,
     OrchestratorConfig,
     WORKER_OUTCOME_FILENAME,
     WRITER_MARKER_FILENAME,
@@ -52,6 +51,13 @@ from .rescue_capture_exclusions import (  # noqa: F401  (deliberate re-export)
     _is_glob_pathspec,
 )
 from .base_branch import resolve_base_branch_name  # noqa: F401  (deliberate re-export)
+from .non_worker_product import (  # noqa: F401  (deliberate re-export)
+    _LAUNCHER_OWNED_PR_BODY_RE,
+    _declared_scaffolding_matcher,
+    _launcher_owned_file_matcher,
+    _launcher_owned_matcher,
+    _non_worker_product_matcher,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,16 +65,6 @@ _DEFAULT_TIMEOUT_SECONDS = 60
 # Shorter timeout for network-touching git commands (ls-remote, fetch) so a
 # stalled remote call cannot consume the entire local dispatch budget.
 _REMOTE_TIMEOUT_SECONDS = 20
-
-# PR body scratch files: workers ad-hoc draft PR bodies into root-level .md
-# files with varying naming conventions (``PR_BODY.md``, ``PR_BODY_<issue>.md``,
-# ``.worker-pr-body.md``, ``_pr_body.md``, ``.pr_body_<issue>.md``). All are
-# launcher/protocol residue, not worker output (issue #1391). The regex
-# matches any root-level filename in this family so a new ad-hoc variant does
-# not re-trip the unsafe check.
-_LAUNCHER_OWNED_PR_BODY_RE = re.compile(
-    r"^(?:PR_BODY.*|\.worker-pr-body|_pr_body|\.pr_body.*)\.md$", re.IGNORECASE
-)
 
 
 def _run_remote_captured(command: list[str], cwd: Path) -> RunResult:
@@ -1779,127 +1775,6 @@ def _parse_status_v2_paths(stdout: str) -> list[str]:
             # record type: skip rather than guess at a layout we don't know.
             i += 1
     return paths
-
-
-def _launcher_owned_file_matcher() -> Callable[[str], bool]:
-    """Build a predicate matching ONLY the root-level launcher-owned PR-body
-    scratch files — the file half of :func:`_launcher_owned_matcher`.
-
-    Split out for issue #1688: the pre-merge repair path may discard the
-    launcher-owned *files* (a stale local ``PR_BODY.md`` edit is
-    launcher-regenerable residue, and letting it stand wedges the merge
-    forever — the #1477 loop), but must never extend the same license to the
-    launcher-owned *directories*, which can be junctions or other reparse
-    points on Windows. ``git clean``/``git checkout`` eligibility therefore
-    uses this narrower predicate while the dirty check uses the full one.
-    """
-
-    def _is_launcher_owned_file(raw_path: str) -> bool:
-        path = PurePosixPath(str(raw_path).replace("\\", "/"))
-        # PR body scratch file match: root-level file (no path separator)
-        # whose name matches the PR body family pattern.
-        return len(path.parts) == 1 and _LAUNCHER_OWNED_PR_BODY_RE.match(path.name) is not None
-
-    return _is_launcher_owned_file
-
-
-def _launcher_owned_matcher() -> Callable[[str], bool]:
-    """Build a predicate matching worktree-relative paths owned by the
-    worker launch shim (not worker output).
-
-    The shim materializes ``.devin/`` (the Devin CLI config directory) and
-    ``.git_worktree_dir/`` into each worktree on every dispatch; workers
-    also ad-hoc draft PR bodies into root-level ``.md`` scratch files.
-    None of this is worker product — it is launcher/protocol residue that
-    the shim re-materializes on the next dispatch — so it is excluded from
-    the dirty check alongside declared scaffolding (issue #1391).
-
-    Semantically distinct from :func:`_declared_scaffolding_matcher`:
-    declared scaffolding is what the *orchestrator* itself writes
-    (``injected_paths`` + ``materialize_dirs``); launcher-owned paths are
-    what the *shim* writes. Both are "not worker product", but they have
-    different sources and different re-materialization guarantees, so they
-    are kept as separate predicates.
-    """
-    excluded_dirs = [PurePosixPath(d) for d in LAUNCHER_OWNED_DIRS]
-    is_launcher_owned_file = _launcher_owned_file_matcher()
-
-    def _is_launcher_owned(raw_path: str) -> bool:
-        path = PurePosixPath(str(raw_path).replace("\\", "/"))
-        # Directory match: path is at or under a launcher-owned directory.
-        if any(path == d or d in path.parents for d in excluded_dirs):
-            return True
-        return is_launcher_owned_file(raw_path)
-
-    return _is_launcher_owned
-
-
-def _declared_scaffolding_matcher(
-    injected_paths: tuple[str, ...] = (),
-    materialize_dirs: tuple[str, ...] = (),
-) -> Callable[[str], bool]:
-    """Build a predicate matching worktree-relative paths the orchestrator
-    itself declares it writes (``injected_paths`` + ``materialize_dirs``).
-
-    Extracted so the dirty-check and the pre-merge collision cleanup share one
-    definition of "orchestrator scaffolding, not worker product". Two copies of
-    this rule that drift apart would let the cleanup delete something the dirty
-    check considers worker-authored — the one outcome that must never happen.
-    """
-    # Normalize the configured side too, so a Windows-style backslash override
-    # still matches git's forward-slash path reporting.
-    excluded = [
-        PurePosixPath(str(p).replace("\\", "/")) for p in (*injected_paths, *materialize_dirs)
-    ]
-
-    def _is_declared(raw_path: str) -> bool:
-        # Git may emit backslashes on Windows; normalize for comparison.
-        path = PurePosixPath(str(raw_path).replace("\\", "/"))
-        return any(
-            path == excluded_path or excluded_path in path.parents for excluded_path in excluded
-        )
-
-    return _is_declared
-
-
-def _non_worker_product_matcher(
-    injected_paths: tuple[str, ...] = (),
-    materialize_dirs: tuple[str, ...] = (),
-    *,
-    include_launcher_dirs: bool,
-) -> Callable[[str], bool]:
-    """Build the single combined "not worker product" predicate shared by the
-    dirty check and the pre-merge repair path (issue #1688).
-
-    ``_worker_authored_dirty`` already ignored both orchestrator-declared
-    scaffolding and launcher-owned residue, but the pre-merge repair path
-    recognized only the declared half — so a locally-modified tracked
-    ``PR_BODY.md`` colliding with the base's own moving copy could never be
-    repaired and wedged the rework branch into an infinite pre-merge failure
-    loop (the #1477 reproduction). Sharing one combined predicate keeps the
-    two call sites from drifting apart again, the same rationale
-    :func:`_declared_scaffolding_matcher` gives for existing as one function.
-
-    ``include_launcher_dirs`` splits the launcher-owned family in two, and
-    the split is load-bearing in opposite directions:
-
-    - The *ignore* path (dirty check) passes ``True``: launcher-owned
-      directories are not worker product, so residue under them is not dirt.
-    - The *destructive* path (pre-merge clear/restore) passes ``False``: only
-      the root-level PR-body FILE family is repair-eligible. A launcher-owned
-      directory may be a junction or other reparse point on Windows, and a
-      ``git clean -f -d`` that follows one escapes the worktree — the same
-      hazard the ``.venv`` guard exists for.
-    """
-    is_declared = _declared_scaffolding_matcher(injected_paths, materialize_dirs)
-    is_launcher_owned = (
-        _launcher_owned_matcher() if include_launcher_dirs else _launcher_owned_file_matcher()
-    )
-
-    def _is_non_worker_product(raw_path: str) -> bool:
-        return is_declared(raw_path) or is_launcher_owned(raw_path)
-
-    return _is_non_worker_product
 
 
 def _worktree_git_runner(worktree_path: Path) -> git_pull_blockers.GitRunner:
