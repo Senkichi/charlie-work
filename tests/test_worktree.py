@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from _sessions_db_fixtures import make_sessions_db
-from _worktree_fixtures import _clone_repo, _git
+from _worktree_fixtures import _clone_repo, _git, _init_repo
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -94,71 +94,6 @@ def _force_capture_failure(monkeypatch: pytest.MonkeyPatch) -> None:
             ref_name=None, commit_sha=None, error="forced capture failure for refusal test"
         ),
     )
-
-
-def _init_repo(repo_root: Path, bare: bool = False) -> None:
-    repo_root.mkdir(parents=True, exist_ok=True)
-    run = lambda args: subprocess.run(  # noqa: E731
-        args, cwd=repo_root, check=True, capture_output=True, text=True
-    )
-    if bare:
-        # Create a temporary non-bare repo, initialize it, then convert to bare
-        temp_repo = repo_root.parent / f"{repo_root.name}-temp"
-        temp_repo.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["git", "init", "--initial-branch=main"],
-            cwd=temp_repo,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.email", "test@example.test"],
-            cwd=temp_repo,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "Test User"],
-            cwd=temp_repo,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        (temp_repo / "README.md").write_text("hello\n", encoding="utf-8")
-        subprocess.run(
-            ["git", "add", "README.md"],
-            cwd=temp_repo,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run(
-            ["git", "commit", "-m", "initial commit"],
-            cwd=temp_repo,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        # Convert to bare by cloning with --bare
-        subprocess.run(
-            ["git", "clone", "--bare", str(temp_repo), str(repo_root)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        # Clean up temp repo (ignore errors on Windows due to file locks)
-        import shutil
-
-        shutil.rmtree(temp_repo, ignore_errors=True)
-    else:
-        run(["git", "init", "--initial-branch=main"])
-        run(["git", "config", "user.email", "test@example.test"])
-        run(["git", "config", "user.name", "Test User"])
-        (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-        run(["git", "add", "README.md"])
-        run(["git", "commit", "-m", "initial commit"])
 
 
 def test_create_and_remove_round_trip(tmp_path: Path) -> None:
