@@ -23,6 +23,7 @@ import json
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -34,7 +35,7 @@ from charlie_work.config import (
     build_config_from_data,
 )
 from charlie_work.state import load_state, save_state, state_lock
-from charlie_work.throttle_signatures import match_quota_tail
+from charlie_work.throttle_signatures import match_quota_tail, match_throttle_tail
 from charlie_work.workflow import (
     _classify_dead_sessions_and_update_throttle_state,
     _detect_and_handle_stalled_reviews,
@@ -47,6 +48,7 @@ from charlie_work.write_gate import WriteGate
 
 from _fakes_github import FakeGitHub
 from _helpers import _init_git_repo
+from _review_fixtures import _dispatch_reviews_app, _write_review_packet
 
 # The exact message observed live 2026-09-17 on PR #1595 (issue #1684).
 _WEEKLY_QUOTA_LOG = (
@@ -298,6 +300,85 @@ def test_claude_update_worker_record_internal_kind_falls_back(tmp_path: Path) ->
     )
     assert kind == "launch_failed"
     assert throttled_until is None
+
+
+# ---------------------------------------------------------------------------
+# dispatch_reviews launch-time quota_hit — the match_quota_tail OR-clause
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_reviews_quota_hit_on_structured_trailer_only(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A launch failure whose error carries ONLY the structured
+    ``cognition.ai/errorKind: resource_exhausted`` trailer — and no prose
+    matching either marker list — must still set ``quota_hit``.
+
+    Regression coverage for the ``or match_quota_tail(...)`` OR-clause
+    ``dispatch_reviews`` gained under issue #1684: the pre-existing
+    quota_hit tests reach ``quota_hit`` through the ``match_throttle_tail``
+    prose branch (``"usage limit exceeded"`` matches
+    ``throttle_error_markers``), so they cannot catch a regression that
+    deletes the structured-trailer clause. This error string is built to
+    miss every ``throttle_error_markers`` and every ``quota_error_markers``
+    substring — only the ``match_quota_tail`` branch can fire. If that
+    clause regresses, the launch failure is recorded as an ordinary
+    per-PR failure instead of a global quota hit.
+    """
+    error_text = "Error: reviewer exited before first turn: " + _RESOURCE_EXHAUSTED_TRAILER
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    # Guard the premise: this error string must exercise ONLY the
+    # structured-trailer path. Asserted here so a future marker-list
+    # addition cannot silently turn this back into a prose-branch test.
+    assert match_throttle_tail(error_text, app.config.runtime.throttle_error_markers)[0] is False
+    assert not any(
+        marker.lower() in error_text.lower() for marker in app.config.runtime.quota_error_markers
+    )
+    # The trailer alone classifies even with an empty prose fallback list.
+    assert match_quota_tail(error_text, ()) is True
+
+    def fake_launch(*args: Any, **kwargs: Any) -> claude_code.ClaudeWorkerRecord:
+        return claude_code.ClaudeWorkerRecord(
+            issue_number=kwargs.get("issue_number") or args[0],
+            branch=kwargs.get("branch") or args[1],
+            worktree_path="/fake/worktree",
+            prompt_path="/fake/prompt.md",
+            command=("claude", "-p", "--permission-mode", "plan"),
+            pid=None,
+            started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            log_path="/fake/log.log",
+            error=error_text,
+            process_start_time=1.0,
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+    state = load_state(app.paths.state_file)
+
+    assert result.data["launched_count"] == 0
+    assert result.data.get("quota_hit") is True
+    assert state["reviewer_quota"]["throttled_until"] is not None
+    # Claim rolled back — a global provider condition is not charged to the
+    # PR as a failed dispatch.
+    assert state["prs"]["100"].get("review_dispatch_status") is None
 
 
 # ---------------------------------------------------------------------------
