@@ -9,10 +9,18 @@ Covers:
 * :func:`collect_leaf_names` -- aggregating leaf names into multisets per
   module and overall.
 * :func:`compare_collect_only` -- the two clauses (graft K):
-  - Clause 1: leaf-name multiset equality (verbatim relocation passes, rename
-    / addition / deletion / count-mismatch fail).
+  - Clause 1: leaf-name multiset comparison (verbatim relocation produces no
+    finding; rename / addition / deletion / count-mismatch produce one
+    finding per differing leaf).
   - Clause 2: sibling reappearance (leaf removed from a module under tests/
     must reappear in a sibling under tests/).
+* The Scope table (issue #1538, amendment 2026-09-17): one test per row --
+  ``removed``, ``missing_sibling``, and ``count_mismatch`` with head < base
+  fail; ``added`` and ``count_mismatch`` with head > base are reported but
+  pass. Includes the pure-addition PR case and the scoping mutation control
+  (a head that drops one leaf and adds a differently named one must fail --
+  it goes red if the verdict is ever computed from net totals or ``removed``
+  is made non-fatal).
 * Mutation control: reverting the multiset comparison to full-node-ID equality
   makes the gate reject a verbatim relocation (proves the fix actually fixes
   graft K's defect).
@@ -193,13 +201,20 @@ def test_renamed_leaf_fails() -> None:
     assert "added" in kinds
 
 
-def test_added_leaf_fails() -> None:
-    """A net-new leaf (addition without removal) fails the multiset check."""
+def test_added_leaf_is_reported() -> None:
+    """A net-new leaf (addition without removal) is an ``added`` finding.
+
+    The finding is still emitted -- the Scope table reports it -- but it does
+    not fail the gate (see the Scope-table section below).
+    """
     base = "tests/test_foo.py::test_a\n"
     head = "tests/test_foo.py::test_a\ntests/test_foo.py::test_new\n"
     result = compare_collect_only(base, head)
-    assert result.ok is False
-    assert any(f.kind == "added" and f.leaf_name == "test_new" for f in result.findings)
+    added = [f for f in result.findings if f.kind == "added"]
+    assert len(added) == 1
+    assert added[0].leaf_name == "test_new"
+    assert added[0].base_count == 0
+    assert added[0].head_count == 1
 
 
 def test_removed_leaf_fails() -> None:
@@ -211,8 +226,12 @@ def test_removed_leaf_fails() -> None:
     assert any(f.kind == "removed" and f.leaf_name == "test_b" for f in result.findings)
 
 
-def test_count_mismatch_fails() -> None:
-    """A parametrize case dropped or added (count mismatch) fails."""
+def test_dropped_parametrize_case_fails() -> None:
+    """A dropped parametrize case is a ``removed`` finding and fails.
+
+    The parametrize id is part of the leaf name, so ``test_c[2]`` vanishing
+    is a removal, not a count_mismatch on ``test_c``.
+    """
     base = "tests/test_foo.py::test_c[1]\ntests/test_foo.py::test_c[2]\n"
     head = "tests/test_foo.py::test_c[1]\n"
     result = compare_collect_only(base, head)
@@ -301,6 +320,181 @@ def test_multiple_leaves_one_missing_sibling() -> None:
     missing = [f for f in result.findings if f.kind == "missing_sibling"]
     assert len(missing) == 1
     assert missing[0].leaf_name == "test_c"
+
+
+# ---------------------------------------------------------------------------
+# Scope table (issue #1538, amendment 2026-09-17) -- one test per row.
+#
+# The verdict is evaluated PER FINDING, never from net totals:
+#   - FAIL: ``removed``; ``missing_sibling``; ``count_mismatch`` head < base.
+#   - PASS (still reported): ``added``; ``count_mismatch`` head > base.
+# ---------------------------------------------------------------------------
+
+
+def test_scope_removed_row_fails() -> None:
+    """Scope row ``removed``: a leaf present at base and absent at head fails."""
+    base = "tests/test_foo.py::test_a\ntests/test_foo.py::test_b\n"
+    head = "tests/test_foo.py::test_a\n"
+    result = compare_collect_only(base, head)
+    assert result.ok is False
+    removed = [f for f in result.findings if f.kind == "removed"]
+    assert len(removed) == 1
+    assert removed[0].leaf_name == "test_b"
+    assert removed[0].fails_gate is True
+    assert result.failures == tuple(f for f in result.findings if f.fails_gate)
+
+
+def test_scope_missing_sibling_row_fails() -> None:
+    """Scope row ``missing_sibling``: a leaf that leaves its module and
+    reappears nowhere under tests/ fails."""
+    base = "tests/test_foo.py::test_a\n"
+    head = "src/test_foo.py::test_a\n"
+    result = compare_collect_only(base, head)
+    assert result.ok is False
+    missing = [f for f in result.findings if f.kind == "missing_sibling"]
+    assert len(missing) == 1
+    assert missing[0].fails_gate is True
+
+
+def test_scope_count_mismatch_shrunk_row_fails() -> None:
+    """Scope row ``count_mismatch`` head < base: a dropped multiplicity fails.
+
+    ``test_init`` exists in two modules at base and only one at head -- the
+    leaf is present on both sides, so this is a count_mismatch (not a
+    removal), and the shrunk direction makes it fail.
+    """
+    base = "tests/test_foo.py::test_init\ntests/test_bar.py::test_init\n"
+    head = "tests/test_foo.py::test_init\n"
+    result = compare_collect_only(base, head)
+    assert result.ok is False
+    mismatches = [f for f in result.findings if f.kind == "count_mismatch"]
+    assert len(mismatches) == 1
+    assert mismatches[0].leaf_name == "test_init"
+    # Direction is carried as data, not inferred from text.
+    assert mismatches[0].base_count == 2
+    assert mismatches[0].head_count == 1
+    assert mismatches[0].fails_gate is True
+
+
+def test_scope_added_row_passes() -> None:
+    """Scope row ``added``: a leaf present at head but not at base is
+    reported but does not fail."""
+    base = "tests/test_foo.py::test_a\n"
+    head = "tests/test_foo.py::test_a\ntests/test_foo.py::test_new\n"
+    result = compare_collect_only(base, head)
+    assert result.ok is True
+    assert result.failures == ()
+    added = [f for f in result.findings if f.kind == "added"]
+    assert len(added) == 1
+    assert added[0].leaf_name == "test_new"
+    assert added[0].fails_gate is False
+
+
+def test_scope_count_mismatch_grown_row_passes() -> None:
+    """Scope row ``count_mismatch`` head > base: a grown multiplicity is
+    reported but does not fail.
+
+    The issue's example: a new module reuses a common leaf name such as
+    ``test_init``, so its multiplicity grows from 1 to 2.
+    """
+    base = "tests/test_foo.py::test_init\n"
+    head = "tests/test_foo.py::test_init\ntests/test_bar.py::test_init\n"
+    result = compare_collect_only(base, head)
+    assert result.ok is True
+    assert result.failures == ()
+    mismatches = [f for f in result.findings if f.kind == "count_mismatch"]
+    assert len(mismatches) == 1
+    assert mismatches[0].leaf_name == "test_init"
+    assert mismatches[0].base_count == 1
+    assert mismatches[0].head_count == 2
+    assert mismatches[0].fails_gate is False
+
+
+def test_pure_addition_pr_passes() -> None:
+    """A PR that only adds tests -- the normal feature/bugfix shape -- passes.
+
+    This is what keeps the gate satisfiable alongside the test-adequacy
+    gate (ordinary PRs are REQUIRED to add tests). This PR itself adds
+    ``tests/test_collect_only_gate.py``, so it is the first real
+    pure-addition case: the gate's own job must conclude success on it.
+    """
+    base = "tests/test_foo.py::test_a\ntests/test_foo.py::test_b\n"
+    head = (
+        "tests/test_foo.py::test_a\n"
+        "tests/test_foo.py::test_b\n"
+        "tests/test_new_module.py::test_x\n"
+        "tests/test_new_module.py::test_y[param]\n"
+        "tests/test_new_module.py::TestNew::test_z\n"
+    )
+    result = compare_collect_only(base, head)
+    assert result.ok is True
+    assert result.failures == ()
+    # The additions are still reported, just not enforced.
+    kinds = {f.kind for f in result.findings}
+    assert kinds == {"added"}
+    assert len(result.findings) == 3
+
+
+def test_relocation_plus_new_test_passes() -> None:
+    """Net-new tests alongside a relocation are allowed.
+
+    The moved leaf's multiset entry is unchanged and it reappears in a
+    sibling under tests/; the net-new leaf is an ``added`` finding. The two
+    are evaluated independently per leaf -- the addition does not mask a
+    removal, and the removal check does not block the addition.
+    """
+    base = "tests/test_foo.py::test_a\ntests/test_foo.py::test_b\n"
+    head = "tests/test_foo.py::test_a\ntests/test_bar.py::test_b\ntests/test_bar.py::test_new\n"
+    result = compare_collect_only(base, head)
+    assert result.ok is True
+    added = [f for f in result.findings if f.kind == "added"]
+    assert [f.leaf_name for f in added] == ["test_new"]
+
+
+def test_scoping_mutation_control_drop_one_add_one_fails() -> None:
+    """Scoping mutation control: a head that drops one leaf and adds a
+    differently named one must FAIL.
+
+    Mutated TOWARD the forbidden outcome (issue #1538, amendment
+    2026-09-17): base and head have the SAME total leaf count (2 == 2), so
+    any verdict computed from net totals passes this case -- which is
+    exactly the dodge the gate exists for. This test goes red if the
+    verdict is ever computed from net totals, or if ``removed`` is made
+    non-fatal.
+    """
+    base = "tests/test_foo.py::test_a\ntests/test_foo.py::test_b\n"
+    head = "tests/test_foo.py::test_a\ntests/test_foo.py::test_x\n"
+    result = compare_collect_only(base, head)
+
+    # Totals are equal -- a net-totals verdict would (wrongly) pass.
+    assert sum(result.base_leaf_counts.values()) == sum(result.head_leaf_counts.values())
+
+    assert result.ok is False
+    kinds = {f.kind for f in result.findings}
+    assert "removed" in kinds  # test_b dropped -- the failing half
+    assert "added" in kinds  # test_x added -- reported, does not rescue the gate
+    assert any(f.kind == "removed" and f.leaf_name == "test_b" for f in result.failures)
+
+
+def test_fails_gate_unknown_kind_fails_closed() -> None:
+    """An unrecognised finding kind fails closed (Scope table default).
+
+    Only ``added`` and ``count_mismatch`` with head > base are scoped as
+    passing; anything the table does not name as passing is enforced.
+    """
+    finding = CollectOnlyFinding(kind="surprise_new_kind", leaf_name="test_a")
+    assert finding.fails_gate is True
+
+
+def test_fails_gate_count_mismatch_missing_counts_fails_closed() -> None:
+    """A ``count_mismatch`` without direction data fails closed.
+
+    The direction must come from ``base_count``/``head_count`` fields; if
+    they are absent the finding cannot be classified as the passing row, so
+    it fails rather than silently passing.
+    """
+    finding = CollectOnlyFinding(kind="count_mismatch", leaf_name="test_a")
+    assert finding.fails_gate is True
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +689,24 @@ def test_cli_collect_only_check_fails_on_missing_leaf(monkeypatch, tmp_path: Pat
     assert len(result.data["findings"]) > 0
     kinds = {f["kind"] for f in result.data["findings"]}
     assert "removed" in kinds
+
+
+def test_cli_collect_only_check_passes_pure_addition(monkeypatch, tmp_path: Path) -> None:
+    """The CLI command passes a pure-addition head (Scope table: ``added`` is
+    reported, not enforced)."""
+    _apply_cli_mocks(monkeypatch, tmp_path)
+    (tmp_path / "base_collect.txt").write_text("tests/test_foo.py::test_a\n", encoding="utf-8")
+    (tmp_path / "head_collect.txt").write_text(
+        "tests/test_foo.py::test_a\ntests/test_new_module.py::test_b\n", encoding="utf-8"
+    )
+    result = run_collect_only_check_command(_make_cli_args(tmp_path))
+    assert result.ok is True
+    assert result.data["failing_count"] == 0
+    assert len(result.data["findings"]) == 1
+    finding = result.data["findings"][0]
+    assert finding["kind"] == "added"
+    assert finding["leaf_name"] == "test_b"
+    assert finding["fails"] is False
 
 
 def test_cli_collect_only_check_fails_on_missing_collect_file(monkeypatch, tmp_path: Path) -> None:

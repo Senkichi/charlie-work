@@ -16,9 +16,12 @@ with string fixtures; the command is tested with temp files) and avoids
 duplicating the worktree/venv-management logic that belongs in the CI workflow.
 
 Unlike the AST-equivalence gate (#1541, evidence only -- always ``ok=True``),
-this gate is **enforcement**: it returns ``ok=False`` when the leaf-name
-multisets differ or a removed leaf did not reappear in a sibling.  The CI job
-is a required check, so a failed gate blocks the merge.
+this gate is **enforcement**: it returns ``ok=False`` when any finding fails
+the issue's Scope table (``removed``, ``missing_sibling``, or
+``count_mismatch`` with head < base); ``added`` and ``count_mismatch`` with
+head > base are reported but pass, so a pure-addition PR -- the normal
+feature/bugfix shape the test-adequacy gate requires -- does not fail.  The
+CI job is a required check, so a failed gate blocks the merge.
 
 ``cli`` is imported lazily *inside* the functions that need it, for the same
 circular-import / ``-m`` guard reasons documented in
@@ -44,12 +47,14 @@ def register_collect_only_check_subparser(
         "collect-only-check",
         help=(
             "CI gate (issue #1538): compare leaf-name multisets from "
-            "pytest --collect-only -q output at base and head. A verbatim "
+            "pytest --collect-only output at base and head. A verbatim "
             "test relocation (same leaf name, different module path) passes; "
-            "a rename, addition, deletion, or class-wrapping dodge does not. "
-            "Additionally asserts every leaf removed from a source module "
-            "under tests/ reappears in a sibling under tests/. This gate is "
-            "enforcement (a required check), not evidence."
+            "net-new tests (added leaves) and grown multiplicities are "
+            "reported but pass; a rename, deletion, shrunken multiplicity, "
+            "or class-wrapping dodge fails. Additionally asserts every leaf "
+            "removed from a source module under tests/ reappears in a "
+            "sibling under tests/. This gate is enforcement (a required "
+            "check), not evidence."
         ),
     )
     parser.add_argument(
@@ -95,7 +100,7 @@ def _read_collect_file(path: Path) -> str:
     if not path.exists():
         raise ConfigError(
             f"collect-only-check: collect file not found: {path}. "
-            f"Ensure the CI workflow ran 'pytest --collect-only -q' and "
+            f"Ensure the CI workflow ran 'pytest --collect-only' and "
             f"wrote the output to this path."
         )
     try:
@@ -111,10 +116,13 @@ def run_collect_only_check_command(
 ) -> CommandResult:
     """CI gate (issue #1538): compare leaf-name multisets from base and head.
 
-    Reads the two pre-collected ``pytest --collect-only -q`` output files
+    Reads the two pre-collected ``pytest --collect-only`` output files
     (``--base-collect`` and ``--head-collect``), runs the pure comparison
-    logic (:func:`compare_collect_only`), and returns ``ok=False`` when the
-    multisets differ or a removed leaf did not reappear in a sibling.
+    logic (:func:`compare_collect_only`), and returns ``ok=False`` when any
+    finding fails the issue's Scope table: ``removed``, ``missing_sibling``,
+    or ``count_mismatch`` with head < base.  ``added`` and
+    ``count_mismatch`` with head > base are reported but do not fail, so a
+    pure-addition PR passes.
 
     Unlike the AST-equivalence gate (#1541, always ``ok=True``), this gate is
     **enforcement**: a failed gate blocks the merge (the CI job is a required
@@ -169,41 +177,55 @@ def run_collect_only_check_command(
 
     base_total = sum(result.base_leaf_counts.values())
     head_total = sum(result.head_leaf_counts.values())
+    failures = result.failures
     data: dict[str, Any] = {
         "base_collect": str(base_collect_path),
         "head_collect": str(head_collect_path),
         "base_leaf_count": base_total,
         "head_leaf_count": head_total,
+        "failing_count": len(failures),
         "findings": [
             {
                 "kind": f.kind,
                 "leaf_name": f.leaf_name,
                 "source_module": f.source_module,
                 "detail": f.detail,
+                "base_count": f.base_count,
+                "head_count": f.head_count,
+                "fails": f.fails_gate,
             }
             for f in result.findings
         ],
     }
 
     if result.ok:
+        reported = len(result.findings)
+        suffix = (
+            "multisets match"
+            if reported == 0
+            else f"{reported} reported finding(s), none enforced"
+        )
         return CommandResult(
             True,
             f"collect-only-check: PASSED ({base_total} leaf names at base, "
-            f"{head_total} at head; multisets match)",
+            f"{head_total} at head; {suffix})",
             data,
         )
 
     finding_lines = [
         f"  {f.kind}: {f.leaf_name}" + (f" (from {f.source_module})" if f.source_module else "")
-        for f in result.findings
+        for f in failures
     ]
     message = (
-        f"collect-only-check: FAILED ({len(result.findings)} finding(s))\n"
+        f"collect-only-check: FAILED ({len(failures)} failing finding(s), "
+        f"{len(result.findings) - len(failures)} reported)\n"
         + "\n".join(finding_lines)
         + f"\nBase: {base_total} leaf names, Head: {head_total} leaf names.\n"
-        f"Multiset mismatch or missing sibling reappearance detected. "
-        f"A verbatim test relocation (same leaf name, different module path) "
-        f"should pass; a rename, addition, deletion, or class-wrapping dodge "
-        f"should fail. See the gate report for details."
+        f"Scoped verdict (issue #1538): removed leaves, missing sibling "
+        f"reappearances, and shrunken multiplicities fail; net-new leaves "
+        f"and grown multiplicities are reported but pass. A verbatim test "
+        f"relocation (same leaf name, different module path) should pass; a "
+        f"rename, deletion, or class-wrapping dodge should fail. See the "
+        f"gate report for details."
     )
     return CommandResult(False, message, data)

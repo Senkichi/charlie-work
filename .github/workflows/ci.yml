@@ -476,7 +476,17 @@ jobs:
       - name: Collect tests at base
         # Create a git worktree at the base ref, sync deps, and run
         # collect-only there. The worktree is cleaned up in the same step
-        # (a `finally`-style `||` + `git worktree remove --force`).
+        # (a `finally`-style trap + `git worktree remove --force`).
+        #
+        # The collection runs in a SUBSHELL `( ... )`, not a bare `cd`:
+        # the EXIT trap fires with the shell's cwd wherever the script left
+        # it. A `cd ./base-tree` in the script body would leave the cwd
+        # inside the worktree, where the trap's relative `./base-tree`
+        # resolves to `base-tree/base-tree` and git exits 128
+        # ("fatal: './base-tree' is not a working tree" -- run 35256210708).
+        # With the subshell the parent shell's cwd never leaves the
+        # workspace root, so the relative path in the trap resolves
+        # correctly on both the success and failure paths.
         #
         # `uv sync` in the base worktree creates its own .venv from the
         # shared uv cache -- fast (seconds) on a hosted runner with a warm
@@ -492,9 +502,11 @@ jobs:
           git fetch --depth 1 origin ${{ github.event.pull_request.base.sha }}
           git worktree add ./base-tree ${{ github.event.pull_request.base.sha }}
           trap 'git worktree remove --force ./base-tree' EXIT
-          cd ./base-tree
-          uv sync --frozen --all-extras
-          uv run pytest --collect-only > ../base_collect.txt || true
+          (
+            cd ./base-tree
+            uv sync --frozen --all-extras
+            uv run pytest --collect-only > ../base_collect.txt || true
+          )
       - name: Run collect-only gate
         # The gate command reads the two collect files and runs the pure
         # comparison logic. It exits non-zero (fails the required check)

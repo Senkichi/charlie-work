@@ -59,17 +59,47 @@ class CollectOnlyFinding:
     * ``"added"`` -- a leaf name present at head but not at base (net-new test).
     * ``"removed"`` -- a leaf name present at base but not at head (deleted test).
     * ``"count_mismatch"`` -- a leaf name present at both base and head but with
-      different multiplicities (e.g. a parametrize case was dropped or added).
+      different multiplicities (e.g. a new module reuses a common leaf name
+      such as ``test_init``).
     * ``"missing_sibling"`` -- a leaf name removed from a source module under
       ``tests/`` that did not reappear in any sibling module under ``tests/``
       at head (graft K's second clause: defeats class-wrapping and in-place
       deletion).
+
+    ``base_count`` / ``head_count`` carry the leaf's multiplicity on each side
+    for the clause-1 kinds (``added`` / ``removed`` / ``count_mismatch``), so a
+    ``count_mismatch``'s direction is derived from data, never inferred from
+    text.  They are ``None`` for ``missing_sibling``, whose relevant counts
+    (removed-from-module and sibling reappearances) live in ``detail``.
     """
 
     kind: str
     leaf_name: str
     source_module: str | None = None
     detail: str = ""
+    base_count: int | None = None
+    head_count: int | None = None
+
+    @property
+    def fails_gate(self) -> bool:
+        """Whether this finding fails the gate (Scope table, issue #1538).
+
+        The verdict is evaluated per finding, never from net totals
+        (amendment 2026-09-17): ``removed``, ``missing_sibling``, and
+        ``count_mismatch`` where head < base fail; ``added`` and
+        ``count_mismatch`` where head > base are reported but pass.  A
+        ``count_mismatch`` missing its counts fails closed (direction
+        unknown), as does any unrecognised kind.
+        """
+        if self.kind == "added":
+            return False
+        if self.kind == "count_mismatch":
+            return (
+                self.base_count is None
+                or self.head_count is None
+                or self.head_count < self.base_count
+            )
+        return True  # "removed", "missing_sibling", and any unknown kind
 
 
 @dataclass(frozen=True)
@@ -80,8 +110,8 @@ class CollectOnlyResult:
     of leaf names at base and head.  ``base_module_leaves`` /
     ``head_module_leaves`` map each module path to its leaf-name multiset, used
     by the sibling-reappearance check.  ``findings`` is the tuple of
-    :class:`CollectOnlyFinding` discrepancies; an empty tuple means the gate
-    passed.
+    :class:`CollectOnlyFinding` discrepancies -- both enforced failures and
+    reported-only rows (the Scope table distinguishes them per finding kind).
     """
 
     base_leaf_counts: Counter[str]
@@ -91,9 +121,20 @@ class CollectOnlyResult:
     findings: tuple[CollectOnlyFinding, ...] = ()
 
     @property
+    def failures(self) -> tuple[CollectOnlyFinding, ...]:
+        """The findings that fail the gate (Scope table, per finding kind)."""
+        return tuple(f for f in self.findings if f.fails_gate)
+
+    @property
     def ok(self) -> bool:
-        """``True`` when the gate passed (no findings)."""
-        return len(self.findings) == 0
+        """``True`` when the gate passed (no enforced findings).
+
+        Reported-only findings (``added``, ``count_mismatch`` with head >
+        base) do not fail the gate -- the verdict is the disjunction of
+        per-finding verdicts, never a net-totals comparison (a head that
+        drops one leaf and adds another must still fail).
+        """
+        return len(self.failures) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -202,10 +243,13 @@ def compare_collect_only(base_output: str, head_output: str) -> CollectOnlyResul
     Two clauses (graft K):
 
     1. **Multiset equality**: the multiset of all leaf names (function name +
-       class name(s) + parametrize id, module-path stripped) must be identical
-       at base and head.  A verbatim relocation (same leaf name, different
-       module path) passes this clause; a rename, addition, or deletion does
-       not.
+       class name(s) + parametrize id, module-path stripped) is compared at
+       base and head.  A verbatim relocation (same leaf name, different
+       module path) produces no finding; every leaf whose multiplicity
+       differs produces exactly one finding -- ``added`` (absent at base),
+       ``removed`` (absent at head), or ``count_mismatch`` (present at both
+       with different counts, direction carried in ``base_count`` /
+       ``head_count``).
 
     2. **Sibling reappearance**: every leaf name removed from a source module
        under ``tests/`` must reappear in a sibling module under ``tests/`` at
@@ -213,10 +257,17 @@ def compare_collect_only(base_output: str, head_output: str) -> CollectOnlyResul
        in the same module, which changes the leaf name) and in-place deletion
        (a leaf that just vanishes from a module without reappearing anywhere).
 
-    The gate **fails** (returns a result with ``ok=False``) if either clause
-    is violated.  Unlike the AST-equivalence gate (#1541, evidence only), this
-    gate is **enforcement** -- the CLI command exits non-zero on failure, and
-    the job is a required check.
+    The verdict follows the issue's Scope table (amendment 2026-09-17),
+    evaluated per finding via :attr:`CollectOnlyFinding.fails_gate`, never
+    from net totals: ``removed``, ``missing_sibling``, and ``count_mismatch``
+    where head < base fail; ``added`` and ``count_mismatch`` where head >
+    base are reported but pass.  This is what keeps the gate satisfiable
+    alongside the test-adequacy gate (ordinary PRs are REQUIRED to add
+    tests): a pure-addition PR reports ``added`` findings and passes, while a
+    head that drops one leaf and adds a differently named one still fails on
+    the ``removed`` finding.  Unlike the AST-equivalence gate (#1541,
+    evidence only), this gate is **enforcement** -- the CLI command exits
+    non-zero on failure, and the job is a required check.
 
     Gate inputs are diff-derived, never hand-typed (graft E, rule #9): the two
     collected sets come from parsing ``pytest --collect-only -q`` output.  No
@@ -228,43 +279,35 @@ def compare_collect_only(base_output: str, head_output: str) -> CollectOnlyResul
     findings: list[CollectOnlyFinding] = []
 
     # --- Clause 1: multiset equality (leaf names, module-path stripped) ---
-    added = head_leaf_counts - base_leaf_counts
-    removed = base_leaf_counts - head_leaf_counts
-    for leaf in sorted(added):
+    # One finding per leaf whose multiplicity differs, classified so the kind
+    # matches the issue's Scope table exactly: absent at base -> ``added``;
+    # absent at head -> ``removed``; present at both with different counts ->
+    # ``count_mismatch``.  Both counts ride on the finding as data so a
+    # count_mismatch's direction (head < base fails, head > base is reported
+    # only) is derived from fields, never inferred from text.
+    for leaf in sorted(set(base_leaf_counts) | set(head_leaf_counts)):
+        bc = base_leaf_counts.get(leaf, 0)
+        hc = head_leaf_counts.get(leaf, 0)
+        if bc == hc:
+            continue
+        if bc == 0:
+            kind = "added"
+            detail = f"leaf name present at head but not at base (base count=0, head count={hc})"
+        elif hc == 0:
+            kind = "removed"
+            detail = f"leaf name present at base but not at head (base count={bc}, head count=0)"
+        else:
+            kind = "count_mismatch"
+            detail = f"base count={bc}, head count={hc}"
         findings.append(
             CollectOnlyFinding(
-                kind="added",
+                kind=kind,
                 leaf_name=leaf,
-                detail=(
-                    f"leaf name present at head but not at base "
-                    f"(head count={head_leaf_counts[leaf]}, base count=0)"
-                ),
+                base_count=bc,
+                head_count=hc,
+                detail=detail,
             )
         )
-    for leaf in sorted(removed):
-        findings.append(
-            CollectOnlyFinding(
-                kind="removed",
-                leaf_name=leaf,
-                detail=(
-                    f"leaf name present at base but not at head "
-                    f"(base count={base_leaf_counts[leaf]}, head count=0)"
-                ),
-            )
-        )
-    # Count mismatches: leaf present at both but with different multiplicity.
-    common_keys = set(base_leaf_counts) & set(head_leaf_counts)
-    for leaf in sorted(common_keys):
-        bc = base_leaf_counts[leaf]
-        hc = head_leaf_counts[leaf]
-        if bc != hc:
-            findings.append(
-                CollectOnlyFinding(
-                    kind="count_mismatch",
-                    leaf_name=leaf,
-                    detail=f"base count={bc}, head count={hc}",
-                )
-            )
 
     # --- Clause 2: sibling reappearance (graft K's second clause) ---
     # For each module under tests/ at base, for each leaf removed from that
@@ -316,47 +359,72 @@ def compare_collect_only(base_output: str, head_output: str) -> CollectOnlyResul
 # ---------------------------------------------------------------------------
 
 
+def _render_finding_line(finding: CollectOnlyFinding) -> str:
+    """Render one finding as a markdown bullet."""
+    if finding.kind == "missing_sibling":
+        return (
+            f"- **{finding.kind}**: `{finding.leaf_name}` removed from "
+            f"`{finding.source_module}` -- {finding.detail}"
+        )
+    return f"- **{finding.kind}**: `{finding.leaf_name}` -- {finding.detail}"
+
+
 def render_gate_report(result: CollectOnlyResult) -> str:
     """Render the gate's findings as a human-readable report.
 
     Unlike the AST-equivalence gate's review packet (evidence, not enforcement),
     this report is the gate's **failure output** -- it is printed to stdout and
     the CI step summary when the gate fails, and the command exits non-zero.
-    When the gate passes, a brief one-line summary is produced instead.
+    When the gate passes, a brief summary is produced instead -- including any
+    reported-only findings (``added``, ``count_mismatch`` with head > base),
+    which are listed as passing rows, not failures.
     """
     base_total = sum(result.base_leaf_counts.values())
     head_total = sum(result.head_leaf_counts.values())
 
     if result.ok:
-        return (
+        if not result.findings:
+            return (
+                f"collect-only gate: PASSED ({base_total} leaf names at base, "
+                f"{head_total} at head; multisets match, all removed leaves "
+                f"reappeared in siblings under tests/)"
+            )
+        lines = [
             f"collect-only gate: PASSED ({base_total} leaf names at base, "
-            f"{head_total} at head; multisets match, all removed leaves "
-            f"reappeared in siblings under tests/)"
-        )
+            f"{head_total} at head; no enforced findings)",
+            "",
+            f"{len(result.findings)} reported finding(s) (pass, not enforced):",
+        ]
+        lines.extend(_render_finding_line(f) for f in result.findings)
+        return "\n".join(lines)
 
-    lines: list[str] = [
+    failures = result.failures
+    reported = [f for f in result.findings if not f.fails_gate]
+
+    lines = [
         "## Collect-only gate (issue #1538)",
         "",
         f"Base: {base_total} leaf names",
         f"Head: {head_total} leaf names",
         "",
-        f"**{len(result.findings)} finding(s):**",
+        f"**{len(failures)} failing finding(s):**",
         "",
     ]
+    lines.extend(_render_finding_line(f) for f in failures)
 
-    for finding in result.findings:
-        if finding.kind == "missing_sibling":
-            lines.append(
-                f"- **{finding.kind}**: `{finding.leaf_name}` removed from "
-                f"`{finding.source_module}` -- {finding.detail}"
-            )
-        else:
-            lines.append(f"- **{finding.kind}**: `{finding.leaf_name}` -- {finding.detail}")
+    if reported:
+        lines.append("")
+        lines.append(f"{len(reported)} reported finding(s) (pass, not enforced):")
+        lines.append("")
+        lines.extend(_render_finding_line(f) for f in reported)
 
     lines.append("")
     lines.append(
-        "_This gate is enforcement (a required check). A verbatim test "
-        "relocation (same leaf name, different module path) passes; a "
-        "rename, addition, deletion, or class-wrapping dodge does not._"
+        "_This gate is enforcement (a required check), scoped per finding "
+        "(issue #1538): `removed`, `missing_sibling`, and `count_mismatch` "
+        "with head < base fail; `added` and `count_mismatch` with head > "
+        "base are reported but pass. A verbatim test relocation (same leaf "
+        "name, different module path) passes; a rename, deletion, dropped "
+        "multiplicity, or class-wrapping dodge fails._"
     )
     return "\n".join(lines)
