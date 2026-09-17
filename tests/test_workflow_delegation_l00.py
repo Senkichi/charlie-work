@@ -56,6 +56,18 @@ _BUDGETS_JSON = _REPO_ROOT / ".attachment-budgets.json"
 # documented constant, never a member-name list (CLAUDE.md rule 9).
 _PRE_CAMPAIGN_MEMBER_SURFACE = 133
 
+# Members legitimately ADDED to the OrchestratorApp surface after the campaign
+# baseline was pinned. The conservation invariant covers bodies MOVED out of
+# workflow.py; a net-new member is not a move, so it is declared here by name
+# and subtracted before the pre-campaign total is checked. Naming each addition
+# (rather than a bare count) keeps the audit trail: a member that disappears or
+# is silently swapped still fails the subset assertion below.
+#
+# - ``review_verdict_guard`` (issue #1695): the why-charlie-hate CLI guard
+#   that refuses to regenerate a review packet when the recorded verdict is
+#   still valid.
+_POST_CAMPAIGN_SURFACE_ADDITIONS = frozenset({"review_verdict_guard"})
+
 
 def _committed_orchestratorapp_member_count() -> int:
     """The APC-budgeted ``member_count`` for ``workflow.py::OrchestratorApp``,
@@ -525,9 +537,13 @@ def test_orchestratorapp_member_surface_conserved_lexical_plus_installed() -> No
       1. the lexical FunctionDef/AsyncFunctionDef count still in workflow.py
          equals the committed .attachment-budgets.json member_count for
          workflow.py::OrchestratorApp (the APC ceiling tracks the source);
-      2. lexical defs + installed delegates == the pre-campaign surface (133) --
-         every def that left the class body is re-attached by the installer, so
-         nothing is lost or double-counted;
+      2. lexical defs + (installed delegates minus the declared post-campaign
+         additions) == the pre-campaign surface (133) -- every def that left
+         the class body is re-attached by the installer, so nothing is lost
+         or double-counted, and net-new members added after the baseline was
+         pinned (issue #1695's ``review_verdict_guard``) are declared in
+         ``_POST_CAMPAIGN_SURFACE_ADDITIONS`` rather than silently growing
+         the conserved total;
       3. no installed delegate name is also a lexical def -- a name in both
          places is exactly the shadow the installer raises on, cross-checked
          here as two disjoint sets.
@@ -546,7 +562,15 @@ def test_orchestratorapp_member_surface_conserved_lexical_plus_installed() -> No
     assert lexical_defs == _committed_orchestratorapp_member_count()
 
     installed = _installed_delegate_names()
-    assert lexical_defs + len(installed) == _PRE_CAMPAIGN_MEMBER_SURFACE
+    # Post-campaign additions (e.g. issue #1695's review_verdict_guard) are
+    # net-new members, not moved bodies -- every declared addition must be
+    # installed, then the moved-only remainder conserves the baseline.
+    assert _POST_CAMPAIGN_SURFACE_ADDITIONS <= installed, (
+        f"declared post-campaign addition(s) missing from installed delegates: "
+        f"{sorted(_POST_CAMPAIGN_SURFACE_ADDITIONS - installed)}"
+    )
+    moved_delegates = installed - _POST_CAMPAIGN_SURFACE_ADDITIONS
+    assert lexical_defs + len(moved_delegates) == _PRE_CAMPAIGN_MEMBER_SURFACE
 
     shadowed = installed & lexical_names
     assert not shadowed, (

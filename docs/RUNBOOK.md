@@ -111,7 +111,8 @@ either:
   routes straight to `ship-it` eligibility, or
 - Manually swap `agent:human-needed` back to `agent:reviewing` (or
   `agent:needs-rework`) on GitHub and re-run `charlie why-charlie-hate --pr <n>` to
-  regenerate a fresh packet before deciding again.
+  regenerate a fresh packet before deciding again (add `--force-rereview` if
+  the command refuses to discard a still-valid recorded verdict).
 
 There is no automatic un-escalation — a human decision, once escalated,
 requires a human (or an explicit re-`verdict`) to move the issue

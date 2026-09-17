@@ -207,8 +207,40 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    review = subparsers.add_parser("why-charlie-hate")
+    review = subparsers.add_parser(
+        "why-charlie-hate",
+        help=(
+            "(Re)generate a PR's review packet. Despite the name this is a "
+            "mutating command, not a read-only diagnostic: it rewrites "
+            "prs/pr-N/review-decision.json (voiding a stale-head verdict "
+            "back to a pending stub), resets the PR's review state entry to "
+            "'reviewing', and fires the review_started label transition. A "
+            "recorded verdict that is still valid -- pinned to the live "
+            "head, or carrying forward to it -- is refused unless "
+            "--force-rereview is given (issue #1695)."
+        ),
+        description=(
+            "(Re)generate the review packet for a PR and reset its review "
+            "state. Despite the name this is a mutating command, not a "
+            "read-only diagnostic: it rewrites "
+            "prs/pr-N/review-decision.json (voiding a stale-head verdict "
+            "back to a pending stub), resets the PR's review state entry to "
+            "'reviewing', and fires the review_started label transition. A "
+            "recorded verdict that is still valid -- pinned to the live "
+            "head, or carrying forward to it -- is refused unless "
+            "--force-rereview is given (issue #1695)."
+        ),
+    )
     review.add_argument("--pr", type=int, required=True)
+    review.add_argument(
+        "--force-rereview",
+        action="store_true",
+        help=(
+            "Discard a still-valid recorded verdict and regenerate the "
+            "packet anyway; the voided verdict is preserved in the rounds "
+            "archive before the pending stub overwrites it."
+        ),
+    )
 
     record = subparsers.add_parser("verdict")
     record.add_argument("--pr", type=int, required=True)
@@ -2450,6 +2482,18 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     if args.command == "operator-queue":
         return app.operator_queue()
     if args.command == "why-charlie-hate":
+        # Issue #1695: a bare CLI invocation must not silently discard a
+        # still-valid recorded verdict -- review() voids a stale-head
+        # verdict to pending, flips status to "reviewing", and fires
+        # review_started. The guard lives at the CLI boundary only: the
+        # loop's internal review() callers are never consulted, and
+        # --force-rereview is the explicit opt-out. ``getattr`` because
+        # run_command is also invoked with hand-built Namespaces that
+        # never went through argparse (mirroring the no_cache read above).
+        if not getattr(args, "force_rereview", False):
+            refusal = app.review_verdict_guard(args.pr)
+            if refusal is not None:
+                return refusal
         return app.review(args.pr)
     if args.command == "verdict":
         try:
