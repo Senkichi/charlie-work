@@ -14,9 +14,11 @@ method.
 it is never invoked implicitly — callers gate it behind an explicit
 ``--fix`` flag. It reuses ``labels.transition`` for the one drift
 kind that maps onto a standard lifecycle edge (a PR merged outside the
-orchestrator behaves exactly like a normal merge once discovered) and issues
-direct ``remove_issue_label`` calls only for label combinations that
-``labels.transition`` has no edge for (contradictory terminal+active labels).
+orchestrator behaves exactly like a normal merge once discovered — label
+edge, merged-issue field set, and issue close, the same trio every other
+merged-PR door performs) and issues direct ``remove_issue_label`` calls
+only for label combinations that ``labels.transition`` has no edge for
+(contradictory terminal+active labels).
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ from .github import (
 from .issue_linking import linked_issue_number
 from .instrumentation import log_event, query_events
 from .labels import TransitionOutcome, _edges, transition
+from .merge_finalize import _merged_issue_fields
 from .paths import resolved_layout, runtime_paths
 from .pr_create_retry import create_pr_with_retry
 from .process_utils import kill_process_tree
@@ -1269,10 +1272,15 @@ def detect_drift(
             issue_still_active = bool(issue is not None and label_names(issue) & labels_cfg.active)
             if state_status != "merged" or issue_still_active:
                 fix_actions = [f"mark state prs[{pr_number}].status = 'merged'"]
-                if issue_number is not None and issue_still_active:
+                if issue_number is not None:
                     fix_actions.append(
-                        f"transition issue #{issue_number} labels via 'merged' event"
+                        f"finalize state issues[{issue_number}] via merged-issue field set"
                     )
+                    if issue_still_active:
+                        fix_actions.append(
+                            f"transition issue #{issue_number} labels via 'merged' event"
+                        )
+                    fix_actions.append(f"close issue #{issue_number} on GitHub")
                 drift.append(
                     DriftItem(
                         kind="merged_outside_orchestrator",
@@ -2637,6 +2645,17 @@ def apply_fixes(
                     add_labels=item.add_labels,
                 )
             if item.issue_number is not None:
+                # Issue #1493: the linked issue's state record must advance
+                # to the same terminal disposition as the PR -- the shared
+                # merged-issue field set every other merged-PR door applies.
+                # Without it the record stayed at whatever status it held
+                # when the external merge landed ("approved" in the #1493
+                # corpus), parked in the dead zone the repair sweeps
+                # deliberately exclude because merge finalization owns it.
+                issue_key = str(item.issue_number)
+                new_issues[issue_key] = _merged_issue_fields(
+                    new_issues.get(issue_key, {}), item.issue_number
+                )
                 result = transition(gh, config.labels, item.issue_number, "merged")
                 # Record transition outcome in the event
                 fix_actions = list(item.fix_actions)
@@ -2656,6 +2675,16 @@ def apply_fixes(
                         remove_labels=item.remove_labels,
                         add_labels=item.add_labels,
                     )
+                # Issue #1493: close the linked issue explicitly, the same
+                # way every other merged-PR door pairs the "merged" edge with
+                # an issue close (workflow.py's merge path, state_merge_train's
+                # finalization sweep, dispatch_state's close-out). Idempotent
+                # if GitHub's closing-keyword automation already closed it.
+                # Without it, an issue bound only via the branch convention
+                # lingers as agent:done+OPEN on GitHub while state.json says
+                # "closed" -- and issue_status_normalized then reads that
+                # mismatch as fresh drift the very next pass.
+                gh.close_issue(item.issue_number)
 
         elif item.kind == "closed_unmerged_pr_active_labels":
             # Issue #504: defer if the reviewer process is still running.

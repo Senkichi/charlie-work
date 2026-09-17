@@ -288,11 +288,10 @@ def _finalize_externally_merged_issues(
             for issue_number, prs in issue_pr_map.items():
                 issue_key = str(issue_number)
                 issue_entry = state["issues"].get(issue_key, {})
-                state["issues"][issue_key] = {
-                    **issue_entry,
-                    "number": issue_number,
-                    "status": "closed",
-                }
+                # Issue #1493: the shared merged-issue field set, identical to
+                # what workflow.py's internal merge flow applies -- the two
+                # doors derive from one helper so they cannot diverge again.
+                state["issues"][issue_key] = _wf._merged_issue_fields(issue_entry, issue_number)
                 for pr in prs:
                     pr_number = int(pr["number"])
                     pr_key = str(pr_number)
