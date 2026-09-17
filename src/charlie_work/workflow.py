@@ -322,6 +322,7 @@ from .rework_prompts import (  # noqa: F401  (deliberate re-export)
 # `.escalation` / `.verdict_parsing` / `.rework_prompts` blocks above.
 from .ci_findings import (  # noqa: F401  (deliberate re-export)
     _ci_status_section,
+    _collect_gate_exemption_section,
     _non_required_check_findings,
     _backlog_is_non_empty,
     _latest_non_empty_dispatch,
@@ -3276,6 +3277,32 @@ def _gh_api_list(gh: GitHubLike, path: str) -> list[dict[str, Any]]:
     return []
 
 
+def _actions_job_log_text(gh: GitHubLike, job_id: int) -> str | None:
+    """Fetch an Actions job's plaintext log via ``gh api`` (issue #1686).
+
+    ``repos/{owner}/{repo}/actions/jobs/{id}/logs`` is the read-only channel
+    the collect-gate exemption evidence rides: the gate prints a
+    ``COLLECT-GATE-EXEMPTION`` marker to stdout, the Actions job log
+    preserves it, and the review packet parses it back out. ``{owner}`` and
+    ``{repo}`` are literal ``gh api`` placeholders substituted from the
+    checkout remote -- the same pattern ``fleet_registry.py`` already uses.
+    The endpoint redirects to a signed download URL, which ``gh api``
+    follows automatically.
+
+    Returns ``None`` on any failure (endpoint needs ``actions: read``, which
+    the orchestrator token already holds for ``actions_job``) -- the caller
+    renders "evidence unavailable" rather than treating a missing log as a
+    waiver.
+    """
+    result = gh.run(
+        ["api", f"repos/{{owner}}/{{repo}}/actions/jobs/{job_id}/logs"],
+        allow_failure=True,
+    )
+    if isinstance(result, GitHubRunResult):
+        return result.value if result.ok and isinstance(result.value, str) else None
+    return result if isinstance(result, str) else None
+
+
 def _commit_timestamp(gh: GitHubLike, sha: str | None) -> str | None:
     """Return the committer-date ISO 8601 timestamp of commit ``sha``, or None.
 
@@ -5596,6 +5623,17 @@ class OrchestratorApp:
         ci_status_section = _ci_status_section(
             checks, self.config.auto_merge.required_checks, pr_dir / "checks.json"
         )
+        # Issue #1686: collect-gate exemption evidence for the reviewed head.
+        # ``checks`` is the PR's head-pinned check list (``gh pr checks``
+        # describes ``pr["headRefOid"]``); the builder locates the gate job
+        # through it and reads the job log's exemption marker via the
+        # injected fetcher (same seam as _required_changes_from_checks).
+        collect_gate_exemption_section = _collect_gate_exemption_section(
+            checks,
+            pr,
+            self.config.labels.collect_gate_exempt,
+            lambda job_id: _actions_job_log_text(self.gh, job_id),
+        )
         # Issue #1445: over-cap file-addition finding. Advisory-only, never
         # blocking -- the rubric line in review.md flags an over-cap addition
         # as a REPORTABLE FINDING and this probe surfaces the concrete files.
@@ -5730,6 +5768,7 @@ class OrchestratorApp:
                 "static_probe_section": static_probe_section,
                 "diff_size_section": diff_size_section,
                 "ci_status_section": ci_status_section,
+                "collect_gate_exemption_section": collect_gate_exemption_section,
                 "over_cap_section": over_cap_section,
                 "attachment_budget_section": attachment_budget_section,
                 "prior_review_section": prior_review_section,

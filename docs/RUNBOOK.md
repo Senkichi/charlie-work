@@ -207,6 +207,50 @@ PR with no tests and no exemption claim never reaches the LLM, while a PR with
 tests present gets the facts block and rubric but the LLM still decides
 approval.
 
+## Collect-only gate operator exemption
+
+The `Collect-only gate` required check (issue #1538) fails a PR that deletes,
+renames, or shrinks the multiplicity of collected tests. Some of those
+changes are legitimate — deleting a feature's tests with the feature, fixing
+a misnamed test, renumbering parametrization ids. Issue #1686 adds an
+operator-only escape hatch: the `collect-gate-exempt` PR label (configurable
+via `labels.collect_gate_exempt`).
+
+**Operator flow — two steps:**
+
+1. Apply the label to the PR: `gh pr edit <PR> --add-label collect-gate-exempt`
+   (create it once per repo with `gh label create collect-gate-exempt` —
+   `charlie`'s label bootstrap also creates it since it is in
+   `LabelConfig.all`).
+2. Rerun the failed `Collect-only gate` job (Actions → re-run failed jobs).
+   No new push is needed: the gate reads the PR's **live** labels at run
+   time, never the `github.event.pull_request.labels` snapshot.
+
+**What the label does and does not do:**
+
+- With the label present, the gate still runs the complete comparison and
+  prints every waived finding (kind + leaf name) before exiting 0 — the
+  label waives the verdict, never the evidence. With no findings to waive,
+  the gate says so explicitly so a stale label is visible.
+- With the label absent — or if the live labels query itself fails — the
+  gate fails closed: identical #1538 verdict, and the output says why the
+  exemption was not granted.
+- Workers cannot self-grant: only a GitHub API label applied by an
+  operator counts. A PR body line, commit trailer, tree file, or PR title
+  containing the label name does nothing (workers run without a GitHub
+  token and cannot apply labels).
+- The label is **head-agnostic on purpose**: it stays applied across
+  `synchronize` pushes (nothing strips it), and each new head's gate run
+  re-evaluates it against that head's findings. Remove it with
+  `gh pr edit <PR> --remove-label collect-gate-exempt` when the work that
+  needed it is done — the gate reports "nothing to waive" when it no
+  longer does anything.
+- The review packet renders a "Collect-gate exemption" section for the
+  reviewed head: whether the label is applied, exactly which findings were
+  waived (read back from the gate job's log, head-verified), or a warning
+  that the label is present but no waiver evidence could be confirmed —
+  missing evidence is never presented as a waiver.
+
 ## Worktree cleanup gone wrong (junction hazard)
 
 **The hazard**: worker worktrees created by `worktree.create_worktree()`

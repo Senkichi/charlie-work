@@ -31,11 +31,21 @@ circular-import / ``-m`` guard reasons documented in
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 from typing import Any
 
-from .collect_only_gate import CollectOnlyResult, compare_collect_only, render_gate_report
+from .collect_only_gate import (
+    EXEMPTION_LOG_MARKER,
+    CollectGateExemption,
+    CollectOnlyResult,
+    compare_collect_only,
+    exemption_log_marker,
+    render_gate_report,
+    resolve_collect_gate_exemption,
+)
+from .github import label_names
 from .workflow import CommandResult
 
 
@@ -85,6 +95,20 @@ def register_collect_only_check_subparser(
             "Write the gate report to this file (in addition to stdout). "
             "When set, also writes to $GITHUB_STEP_SUMMARY if that env var "
             "is set (CI step-summary rendering)."
+        ),
+    )
+    parser.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        help=(
+            "PR number for the operator exemption (issue #1686). When set, "
+            "the command queries the PR's LIVE labels via the GitHub API "
+            "and, if the configured collect_gate_exempt label is present, "
+            "waives this head's failing findings (exit 0 with every waived "
+            "finding still printed). A failed or empty labels query fails "
+            "closed -- never read as an exemption. When unset, no exemption "
+            "is evaluated."
         ),
     )
 
@@ -158,7 +182,45 @@ def run_collect_only_check_command(
         )
 
     result: CollectOnlyResult = compare_collect_only(base_output, head_output)
-    report = render_gate_report(result)
+
+    # Issue #1686: resolve the operator exemption against the PR's LIVE
+    # labels. The query goes through ``GitHub.pr_view`` with a deliberately
+    # narrow field set (``labels,headRefOid`` -- same narrowing discipline
+    # as the closing-keyword gate's CLOSING_KEYWORD_PR_FIELDS, which exists
+    # because the default Actions GITHUB_TOKEN cannot read every nested
+    # GraphQL field PR_VIEW_FIELDS pulls). A falsy response means the query
+    # failed and resolves to NOT exempt (fail closed); the exemption can
+    # only ever be granted on the query's positive answer -- nothing under
+    # the PR author's control (PR body, title, commit messages, tree files,
+    # or the github.event labels snapshot) participates in this decision.
+    exemption: CollectGateExemption | None = None
+    head_sha: str | None = None
+    pr_number = getattr(args, "pr", None)
+    if pr_number is not None:
+        # ``headRefOid`` rides the same query: the log marker stamps it so
+        # the review packet can prove the evidence describes ITS reviewed
+        # head, not an earlier head the label survived (issue #1686).
+        pr: dict[str, Any] = {}
+        query_error: str | None = None
+        try:
+            pr = ctx.gh.pr_view(pr_number, fields="labels,headRefOid")
+        except Exception as exc:  # GitHubError -- fail closed, never grant
+            query_error = f"{type(exc).__name__}: {exc}"
+        pr_labels = label_names(pr) if isinstance(pr, dict) and pr else None
+        raw_head = pr.get("headRefOid") if isinstance(pr, dict) else None
+        head_sha = str(raw_head) if raw_head else None
+        if pr_labels is None and query_error is None:
+            query_error = "could not fetch PR labels"
+        exemption = resolve_collect_gate_exemption(
+            exemption_label=ctx.config.labels.collect_gate_exempt,
+            pr_number=pr_number,
+            pr_labels=pr_labels,
+            query_error=query_error,
+        )
+    waived = result.failures if (exemption is not None and exemption.active) else ()
+    gate_ok = result.ok or bool(waived)
+
+    report = render_gate_report(result, exemption=exemption)
 
     # Write to --output file and/or $GITHUB_STEP_SUMMARY (CI rendering).
     output_path = getattr(args, "output", None)
@@ -197,20 +259,54 @@ def run_collect_only_check_command(
             for f in result.findings
         ],
     }
+    # The machine-readable line the review packet reads back out of this
+    # job's log (issue #1686): emitted whenever an exemption was evaluated
+    # (--pr given), whether or not it was granted, so the packet can tell
+    # "waived N findings on this head" apart from "label present but the
+    # run never applied it" and "label present but there was nothing to
+    # waive". The same payload rides data["exemption"] for the printed-JSON
+    # consumer.
+    exemption_line = ""
+    if exemption is not None:
+        marker = exemption_log_marker(exemption, waived, head_sha=head_sha)
+        data["exemption"] = json.loads(marker[len(EXEMPTION_LOG_MARKER) :])
+        exemption_line = "\n" + marker
+    else:
+        data["exemption"] = None
 
-    if result.ok:
+    if gate_ok:
         reported = len(result.findings)
         suffix = (
             "multisets match"
             if reported == 0
             else f"{reported} reported finding(s), none enforced"
         )
-        return CommandResult(
-            True,
+        message = (
             f"collect-only-check: PASSED ({base_total} leaf names at base, "
-            f"{head_total} at head; {suffix})",
-            data,
+            f"{head_total} at head; {suffix})"
         )
+        if waived:
+            assert exemption is not None  # non-empty waived implies active
+            waived_lines = [
+                f"  {f.kind}: {f.leaf_name}"
+                + (f" (from {f.source_module})" if f.source_module else "")
+                for f in waived
+            ]
+            message = (
+                f"collect-only-check: PASSED ({base_total} leaf names at base, "
+                f"{head_total} at head; {len(waived)} failing finding(s) WAIVED "
+                f"by operator exemption label '{exemption.label}')\n"
+                + "\n".join(waived_lines)
+                + f"\nexemption: {exemption.detail}."
+            )
+        elif exemption is not None:
+            message += f"\nexemption: {exemption.detail}." + (
+                " Nothing to waive -- no enforced findings on this run "
+                "(a stale label can be removed)."
+                if exemption.active
+                else ""
+            )
+        return CommandResult(True, message + exemption_line, data)
 
     finding_lines = [
         f"  {f.kind}: {f.leaf_name}" + (f" (from {f.source_module})" if f.source_module else "")
@@ -221,11 +317,15 @@ def run_collect_only_check_command(
         f"{len(result.findings) - len(failures)} reported)\n"
         + "\n".join(finding_lines)
         + f"\nBase: {base_total} leaf names, Head: {head_total} leaf names.\n"
-        f"Scoped verdict (issue #1538): removed leaves, missing sibling "
-        f"reappearances, and shrunken multiplicities fail; net-new leaves "
-        f"and grown multiplicities are reported but pass. A verbatim test "
-        f"relocation (same leaf name, different module path) should pass; a "
-        f"rename, deletion, or class-wrapping dodge should fail. See the "
-        f"gate report for details."
     )
-    return CommandResult(False, message, data)
+    if exemption is not None:
+        message += f"exemption: {exemption.detail}.\n"
+    message += (
+        "Scoped verdict (issue #1538): removed leaves, missing sibling "
+        "reappearances, and shrunken multiplicities fail; net-new leaves "
+        "and grown multiplicities are reported but pass. A verbatim test "
+        "relocation (same leaf name, different module path) should pass; a "
+        "rename, deletion, or class-wrapping dodge should fail. See the "
+        "gate report for details."
+    )
+    return CommandResult(False, message + exemption_line, data)

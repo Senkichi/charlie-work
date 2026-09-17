@@ -38,7 +38,9 @@ from .checks import (
     _is_failing_run,
     summarize_checks,
 )
+from .collect_only_gate import COLLECT_ONLY_GATE_CHECK_NAME, parse_exemption_log_marker
 from .config import DispatchConfig
+from .github import _job_id_from_link, label_names
 from .instrumentation import query_events
 
 
@@ -449,3 +451,173 @@ def _required_changes_from_checks(
                 f"inspect the failing run at {link}"
             )
     return required_changes
+
+
+def _collect_gate_exemption_section(
+    checks: list[dict[str, Any]] | None,
+    pr: dict[str, Any],
+    exemption_label: str,
+    fetch_job_log: Callable[[int], str | None],
+) -> str:
+    """Render the collect-gate exemption evidence for the reviewed head (#1686).
+
+    The collect-only gate command emits a ``COLLECT-GATE-EXEMPTION v1 {...}``
+    line into its Actions job log whenever ``--pr`` was passed, whether or not
+    the exemption was granted. This section reads that marker back out of the
+    gate job's log -- located through the PR's head-pinned check list
+    (``gh pr checks`` rows describe ``pr["headRefOid"]``) -- and renders what
+    the operator-applied label did on THIS head.
+
+    ``fetch_job_log`` is injected (rather than this function calling
+    ``GitHub`` directly) so the section logic stays pure and unit-testable --
+    the same seam ``_required_changes_from_checks`` uses for
+    ``fetch_annotations``. The caller passes a wrapper over
+    ``gh.run(["api", "repos/{owner}/{repo}/actions/jobs/{id}/logs"])`` that
+    returns the log text or ``None``.
+
+    Trust model, mirroring the gate itself:
+
+    * The label is only ever *read*: the packet states whether it is applied
+      and what it waived. No label mutation happens here (and none happens
+      anywhere -- the issue forbids stripping it on ``synchronize``).
+    * Evidence must be head-pinned twice before it counts: the check row
+      comes from the head-scoped check list AND the marker's ``head_sha``
+      must equal ``pr["headRefOid"]``. A label applied for head A
+      legitimately survives on head B, so evidence describing another head
+      is rendered as stale, never as a waiver.
+    * Missing evidence is never rendered as a waiver. When the label is
+      applied but the job log is unreachable or carries no marker, the
+      section says so explicitly and tells the reviewer not to treat the
+      label as proof of a waiver.
+
+    Renders ``""`` (no section) when nothing exemption-related happened:
+    label absent and no active waiver evidence.
+    """
+    label_present = exemption_label in label_names(pr)
+    head_sha = str(pr.get("headRefOid") or "")
+
+    gate_check = next(
+        (
+            check
+            for check in (checks or [])
+            if str(check.get("name") or "") == COLLECT_ONLY_GATE_CHECK_NAME
+        ),
+        None,
+    )
+
+    payload: dict[str, Any] | None = None
+    # "verified": marker parsed AND head_sha matches the reviewed head.
+    # "stale": marker parsed but its head binding is missing or mismatched.
+    # "none": log fetched, no marker (gate ran without --pr, or pre-#1686).
+    # "unavailable": no log to read (job id unparseable or fetch failed).
+    evidence = "none"
+    if gate_check is not None:
+        job_id = gate_check.get("databaseId")
+        if not isinstance(job_id, int) or isinstance(job_id, bool):
+            job_id = _job_id_from_link(gate_check.get("link"))
+        if job_id is None:
+            evidence = "unavailable"
+        else:
+            log_text = fetch_job_log(job_id)
+            if log_text is None:
+                evidence = "unavailable"
+            else:
+                payload = parse_exemption_log_marker(log_text)
+                if payload is not None:
+                    recorded = payload.get("head_sha")
+                    evidence = (
+                        "verified"
+                        if recorded and head_sha and str(recorded) == head_sha
+                        else "stale"
+                    )
+
+    waived = payload.get("waived") if payload else None
+    if not isinstance(waived, list):
+        waived = []
+
+    def _finding_line(finding: Any) -> str:
+        if not isinstance(finding, dict):
+            return f"- {finding}"
+        line = f"- `{finding.get('kind')}`: `{finding.get('leaf_name')}`"
+        source = finding.get("source_module")
+        if source:
+            line += f" (from `{source}`)"
+        return line
+
+    heading = "**Collect-gate exemption (issue #1686):** "
+
+    if evidence == "verified" and payload is not None and payload.get("active"):
+        if waived:
+            label_state = (
+                f"label `{exemption_label}` is applied to this PR"
+                if label_present
+                else f"label `{exemption_label}` is no longer applied (it was removed after this gate run)"
+            )
+            lines = [
+                heading
+                + f"{label_state}. The collect-only gate **waived "
+                + f"{len(waived)} enforced finding(s)** on the reviewed head "
+                + f"`{head_sha}`:"
+            ]
+            lines.extend(_finding_line(f) for f in waived)
+            lines.append(
+                "The gate ran the full comparison -- these findings were "
+                "reported and then waived by the operator-applied label, not "
+                "suppressed. An exemption does not make a deletion correct: "
+                "weigh each waived finding against the diff yourself."
+            )
+            return "\n".join(lines) + "\n"
+        label_state = (
+            f"label `{exemption_label}` is applied to this PR"
+            if label_present
+            else f"label `{exemption_label}` is no longer applied (it was removed after this gate run)"
+        )
+        stale_note = "The label is stale and can be removed." if label_present else ""
+        return (
+            heading
+            + f"{label_state}, and the gate reported no enforced findings on "
+            + f"the reviewed head -- **nothing was waived**.{(' ' + stale_note) if stale_note else ''}\n"
+        )
+
+    if evidence == "verified" and payload is not None and not payload.get("active"):
+        if label_present:
+            return (
+                heading
+                + f"label `{exemption_label}` is applied to this PR NOW, but "
+                + "the gate run on the reviewed head resolved it as absent "
+                + f"({payload.get('detail')}) -- **no findings were waived**. "
+                + "If the waiver was intended, an operator must rerun the "
+                + "gate job so it re-reads the live labels.\n"
+            )
+        return ""  # label absent, run resolved absent: nothing happened
+
+    if evidence == "stale":
+        recorded = payload.get("head_sha") if payload else None
+        label_state = (
+            f"label `{exemption_label}` is applied to this PR, and " if label_present else ""
+        )
+        return (
+            heading
+            + label_state
+            + "exemption evidence exists in the gate job's log but could not "
+            + f"be verified against the reviewed head `{head_sha}` "
+            + f"(recorded for `{recorded or 'an unknown head'}`) -- treating "
+            + "it as stale evidence, NOT as a waiver for this head.\n"
+        )
+
+    if label_present:
+        reason = (
+            "the gate job's log could not be fetched"
+            if evidence == "unavailable"
+            else "the gate job's log carries no exemption record (the run may "
+            "predate --pr support, or the job could not be located)"
+        )
+        return (
+            heading
+            + f"label `{exemption_label}` is applied to this PR, but no "
+            + f"exemption evidence was found for the reviewed head -- {reason}. "
+            + "Do NOT treat the label as proof of a waiver: verify the gate "
+            + "job's output directly.\n"
+        )
+
+    return ""

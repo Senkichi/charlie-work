@@ -88,6 +88,10 @@ class FakeGitHub:
         self.pr_external_issue_comments: dict[int, list[dict[str, Any]]] = {}
         self.pr_external_reviews: dict[int, list[dict[str, Any]]] = {}
         self.pr_external_review_comments: dict[int, list[dict[str, Any]]] = {}
+        # Actions job-log responses keyed by job id (issue #1686): the review
+        # packet's collect-gate exemption section reads the gate job's log
+        # via `gh api repos/{o}/{r}/actions/jobs/{id}/logs`.
+        self.job_logs: dict[int, str] = {}
         self.closed_issues: list[int] = []
         self.commits: dict[str, dict[str, Any]] = {}
         # Default base head and per-(base,head) compare overrides for testing
@@ -451,6 +455,30 @@ class FakeGitHub:
         m = re.search(r"/pulls/(\d+)/comments", joined)
         if m and "/reviews/" not in joined:
             return self.pr_external_review_comments.get(int(m.group(1)), [])
+        # Handle Actions job-log downloads (issue #1686): the review packet's
+        # collect-gate exemption section reads the gate job's log through
+        # `gh api repos/{o}/{r}/actions/jobs/{id}/logs`.
+        m = re.search(r"/actions/jobs/(\d+)/logs", joined)
+        if m:
+            job_id = int(m.group(1))
+            if job_id in self.job_logs:
+                text = self.job_logs[job_id]
+                return github_module.GitHubRunResult(
+                    ok=True,
+                    returncode=0,
+                    stdout=text,
+                    stderr="",
+                    value=text,
+                    error=None,
+                )
+            return github_module.GitHubRunResult(
+                ok=False,
+                returncode=1,
+                stdout="",
+                stderr="",
+                value=None,
+                error=f"job {job_id} log not found",
+            )
         # Handle paginated PR list REST API calls from reconcile.py.
         if args[0] == "api" and "pulls?state=all" in args[1]:
             url = args[1]
