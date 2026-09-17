@@ -172,3 +172,115 @@ def test_lower_dry_run_does_not_write(refresh_mod, monkeypatch, tmp_path, capsys
     assert rc == 0
     assert baseline_path.read_text(encoding="utf-8") == original
     assert "[dry-run]" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# _check: fixed-point gate (issue #1675)
+# ---------------------------------------------------------------------------
+
+
+def test_check_passes_at_fixed_point(refresh_mod, monkeypatch, tmp_path, capsys) -> None:
+    """A baseline already equal to the lower-only refresh's output exits 0
+    and writes nothing. Same-bucket shrink and hold are both fixed-point
+    states (the quantized mark already equals what a refresh would write)."""
+    baseline_path = tmp_path / "file_size_ratchet_baseline.json"
+    original = _write_json(baseline_path, {"src/a.py": 1600, "src/b.py": 1000})
+    monkeypatch.setattr(
+        refresh_mod,
+        "_scan_over_cap",
+        lambda repo_root: {"src/a.py": 1401, "src/b.py": 1000},
+    )
+
+    rc = refresh_mod._check(tmp_path, baseline_path)
+
+    assert rc == 0
+    assert "fixed point" in capsys.readouterr().out
+    assert baseline_path.read_text(encoding="utf-8") == original
+
+
+def test_check_fails_on_pending_lowerings_and_drops(
+    refresh_mod, monkeypatch, tmp_path, capsys
+) -> None:
+    """The gate's reason to exist: a stale-high mark (a shrink that did not
+    carry its same-PR lowering) or a dead entry (file deleted or back under
+    the cap) exits non-zero and lists exactly the changes a refresh run would
+    apply. The baseline file is left byte-identical -- --check never writes."""
+    baseline_path = tmp_path / "file_size_ratchet_baseline.json"
+    original = _write_json(
+        baseline_path,
+        {"src/shrunk.py": 2000, "src/deleted.py": 1000, "src/holds.py": 1000},
+    )
+    monkeypatch.setattr(
+        refresh_mod,
+        "_scan_over_cap",
+        lambda repo_root: {"src/shrunk.py": 1500, "src/holds.py": 1000},
+    )
+
+    rc = refresh_mod._check(tmp_path, baseline_path)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "not a fixed point" in out
+    assert "~ src/shrunk.py: 2000 -> 1600 (lowered; live=1500)" in out
+    assert "- src/deleted.py: dropped (no longer over cap)" in out
+    assert "src/holds.py" not in out
+    assert baseline_path.read_text(encoding="utf-8") == original
+
+
+def test_check_growth_only_is_not_a_fixed_point_violation(
+    refresh_mod, monkeypatch, tmp_path, capsys
+) -> None:
+    """Growth past a mark leaves the lower-only map's output unchanged (the
+    map never raises), so a pure-growth state is still a fixed point and
+    exits 0 -- reporting that violation is the ratchet keystone's job
+    (test_over_cap_files_do_not_exceed_high_water_mark), not this gate's. The
+    '!' notice is still printed for visibility."""
+    baseline_path = tmp_path / "file_size_ratchet_baseline.json"
+    original = _write_json(baseline_path, {"src/grown.py": 1000})
+    monkeypatch.setattr(
+        refresh_mod,
+        "_scan_over_cap",
+        lambda repo_root: {"src/grown.py": 1100},
+    )
+
+    rc = refresh_mod._check(tmp_path, baseline_path)
+
+    assert rc == 0
+    assert "! src/grown.py" in capsys.readouterr().out
+    assert baseline_path.read_text(encoding="utf-8") == original
+
+
+def test_check_fails_when_baseline_missing(refresh_mod, tmp_path, capsys) -> None:
+    rc = refresh_mod._check(tmp_path, tmp_path / "file_size_ratchet_baseline.json")
+
+    assert rc == 1
+    assert "--init" in capsys.readouterr().err
+
+
+def test_main_routes_check_flag_to_check_not_lower(refresh_mod, monkeypatch, tmp_path) -> None:
+    """CLI wiring: --check dispatches to _check (the read-only gate), never
+    to the writing _lower path."""
+    called: dict[str, object] = {}
+
+    def fake_check(repo_root, baseline_path):
+        called["check"] = baseline_path
+        return 0
+
+    monkeypatch.setattr(refresh_mod, "_check", fake_check)
+    monkeypatch.setattr(
+        refresh_mod, "_lower", lambda *a, **k: pytest.fail("--check must not reach _lower")
+    )
+    monkeypatch.setattr(refresh_mod, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr("sys.argv", ["refresh_file_size_ratchet.py", "--check"])
+
+    assert refresh_mod.main() == 0
+    assert called["check"] == tmp_path / "file_size_ratchet_baseline.json"
+
+
+def test_main_rejects_check_with_dry_run(refresh_mod, monkeypatch) -> None:
+    """--check already writes nothing; --dry-run on it is a no-op flag the CLI
+    rejects rather than silently ignoring."""
+    monkeypatch.setattr("sys.argv", ["refresh_file_size_ratchet.py", "--check", "--dry-run"])
+
+    with pytest.raises(SystemExit):
+        refresh_mod.main()
