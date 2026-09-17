@@ -15,6 +15,31 @@ $dispatch_note_block
 
 $required_changes_section
 
+## No operator decisions in this brief
+
+This brief carries NO operator decisions about the review findings — not in
+the orchestrator note, not in the findings above, and not in the push
+authorization below (which grants push authority only, never a decision on
+any finding). If a required change offers options contingent on an
+operator/human call ("either accept as-is, or defer them", "confirm
+explicitly", "needs sign-off"), that call has NOT been made and you must
+not make it for them.
+
+- Never claim, infer, or record that the operator or any human approved,
+  declined, accepted, deferred, or chose anything — not in the PR body, a
+  commit message, a comment, or code.
+- If a required change needs a human/operator decision, STOP. Do not pick
+  an option yourself and do not rework around it. Write
+  `.worker-outcome.json` in the repository root with this exact shape:
+
+  ```json
+  {"outcome": "blocked", "reason_kind": "ambiguous_scope", "detail": "<the required-change item that needs a human decision>"}
+  ```
+
+  Then exit cleanly without pushing. The orchestrator records the blocked
+  outcome in your session's terminal status and the unchanged head is
+  escalated to a human — the operator decides, you do not decide for them.
+
 ## Required behavior
 
 - Act on the review above — the orchestrator note and any findings — before

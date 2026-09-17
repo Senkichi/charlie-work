@@ -31,6 +31,7 @@ a verdict pinned to an old head.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -392,3 +393,95 @@ def review_decision(
         stale=stale,
         missing=False,
     )
+
+
+# Issue #1642: provenances whose ``required_changes`` are authored prose (a
+# reviewer writing a verdict, or an operator typing ``charlie verdict``) --
+# the only population :func:`reclassify_human_call_verdict` applies to. The
+# two ``*_auto_reject`` gates are deliberately absent: they build
+# ``required_changes`` mechanically from CI check annotations and rubric
+# templates, and a check annotation like pycodestyle's "missing whitespace
+# around operator" would trip the markers and park a mechanical CI-red
+# verdict in the operator queue instead of auto-reworking. A new
+# reviewer-authored provenance added later belongs in this set. Literal
+# strings rather than ``workflow.VERDICT_PROVENANCE_VALUES`` members: this
+# module cannot import workflow (workflow imports this module).
+AUTHORED_VERDICT_PROVENANCES: frozenset[str] = frozenset(
+    {
+        "fresh_llm_review",
+        "stranded_reconciliation",
+        "rescue_review",
+        "operator_manual",
+    }
+)
+
+
+def human_decision_marker_match(
+    required_changes: Iterable[Any],
+    markers: Iterable[str],
+) -> tuple[str, str] | None:
+    """Return ``(item, marker)`` when a required-changes item asks for a human decision.
+
+    Issue #1642: ``prompts/review.md`` tells the reviewer "use
+    ``request_changes`` when rework is required, and ``blocked`` when human
+    input is needed" -- but nothing enforced that filing, so a reviewer can
+    (and on PR #1641 did) write a human-input request under
+    ``request_changes`` and have it routed to automated rework, where the
+    rework worker spoke for the operator. This predicate is the detection
+    half of the fix; ``record_review`` (orchestration/state_record_review.py)
+    is the enforcement half, reclassifying a matching verdict to ``blocked``.
+
+    Matching is a plain case-insensitive substring test: ``item`` wins when
+    any configured marker appears anywhere in it. The marker list lives in
+    ``ReviewConfig.human_decision_markers``, not here -- the operator tunes
+    precision/recall in config, and the failure direction is deliberately
+    toward a human: a false positive costs an operator glance plus
+    ``charlie unescalate``, while a false negative repeats the incident
+    (unsupervised rework asserting operator consent that never happened).
+
+    Returns the *first* match as ``(item_text, marker)`` -- enough to make
+    the emitted ``review_decision_reclassified_blocked`` event actionable
+    without logging the entire findings list. ``item`` is coerced with
+    ``str()`` for the same reason ``record_review``'s event payload joins
+    with ``str(item)``: the external-findings replacement path can put
+    non-str values in this list and the guard must not crash on them.
+    ``None`` means no item asked for a human decision.
+    """
+    normalized_markers = [marker.strip().lower() for marker in markers if marker.strip()]
+    for item in required_changes:
+        text = str(item).lower()
+        for marker in normalized_markers:
+            if marker in text:
+                return str(item), marker
+    return None
+
+
+def reclassify_human_call_verdict(
+    decision: str,
+    required_changes: Iterable[Any],
+    *,
+    markers: Iterable[str],
+    verdict_provenance: str,
+) -> tuple[str, tuple[str, str] | None]:
+    """Reclassify a ``request_changes`` verdict to ``blocked`` when its findings call for a human decision (issue #1642).
+
+    Returns ``(decision, match)``: the possibly-reclassified decision string
+    plus the ``(item, marker)`` match :func:`human_decision_marker_match`
+    found, or ``(decision, None)`` unchanged. The reclassification applies
+    only to authored verdicts (``AUTHORED_VERDICT_PROVENANCES``) -- mechanical
+    auto-reject provenances are exempt because their ``required_changes``
+    carry check-annotation text, not reviewer judgment, and a substring like
+    "operator" inside an annotation would otherwise route a mechanical CI-red
+    verdict to the operator queue.
+
+    ``record_review`` (orchestration/state_record_review.py) is the caller:
+    it keeps the verdict-recording choke point as the enforcement site while
+    this pure function owns the decision, so the policy is testable without
+    orchestrator fixtures.
+    """
+    match = None
+    if decision == "request_changes" and verdict_provenance in AUTHORED_VERDICT_PROVENANCES:
+        match = human_decision_marker_match(required_changes, markers)
+    if match is not None:
+        return "blocked", match
+    return decision, None
