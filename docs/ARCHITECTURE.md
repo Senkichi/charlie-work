@@ -48,10 +48,13 @@ should not need to be read to reason about it.
 |---|---|
 | `__init__.py` | Package version and `CLI_NAME` (`charlie`) constant. |
 | `cli.py` | `argparse` surface: parses `charlie <command>` invocations, builds `OrchestratorApp`, and prints `CommandResult` as text or `--json`. No business logic. |
-| `config.py` | Frozen dataclasses (`LabelConfig`, `DispatchConfig`, `ReviewConfig`, `AutoMergeConfig`, `RuntimeConfig`, `DevinConfig`, `ClaudeCodeConfig`, `WorkerRoleConfig`, `ReviewerRoleConfig`, `WatchdogConfig`, `TestAdequacyConfig`, `FleetConfig`, `NotifyConfig`) plus `load_config`/`find_config_path`. Absent `orchestrator.config.yaml` → pure dataclass defaults. |
+| `config.py` | Frozen dataclasses (`LabelConfig`, `DispatchConfig`, `ReviewConfig`, `AutoMergeConfig`, `RuntimeConfig`, `DevinConfig`, `ClaudeCodeConfig`, `WorkerRoleConfig`, `ReviewerRoleConfig`, `WatchdogConfig`, `TestAdequacyConfig`, `FleetConfig`, `NotifyConfig`, `LocalIssuesConfig`) plus `load_config`/`find_config_path`. Absent `orchestrator.config.yaml` → pure dataclass defaults. |
 | `workflow.py` | `OrchestratorApp` — the orchestration engine: `status`, `bootstrap_labels`, `intake`, `dispatch`, `review`, `record_review`, `merge_ready`, `spec_review`, `loop`. Owns every multi-step business rule (merge-update-not-replace, rework cap, merge/label/branch-delete ordering). |
 | `github.py` | `GitHub` — every `gh` CLI invocation, JSON parsing, and the `dry_run` mutating-call guard. Also `label_names()` and `linked_issue_number()` helpers used across the codebase to read label/issue-link state from raw `gh` JSON. |
-| `labels.py` | **Single point of enforcement** for label transitions — `transition(gh, labels, issue_number, event)`. Every add/remove pair is a named edge (`queued`, `dispatched`, `review_started`, `rework_requested`, `escalated`, `blocked`, `merged`); workflow code names the event, never touches individual labels. |
+| `local_issues.py` | `LocalFileGitHub` — a `GitHubLike` over a directory of markdown issue files, for a repo with no GitHub remote (`local_issues.enabled`). Issues/labels are real, backed by `local_issue_files.py`; everything PR/CI/merge-shaped is a null object (reads answer `[]`/`{}`/`None`, writes fail as values or raise `GitHubError`). `github_client_for()` is the single point of choice between this and the real `GitHub` client. |
+| `local_issue_files.py` | Pure file layer under `local_issues.py`: parses/scans/rewrites `<issues_dir>/NNN_*.md` issue files (YAML frontmatter + body). Mutations are confined to the frontmatter block and preserve the file's own newline convention; writes are atomic (temp file + `replace`), same as `state.py`. |
+| `local_work_park.py` | Salvage for a backend with no pull requests: `park_unpublishable_work` moves a dead session's committed branch to `review_ready` instead of push + PR. Called from `dead_worker_reap._attempt_salvage`; returns `None` for a PR-capable backend. |
+| `labels.py` | **Single point of enforcement** for label transitions — `transition(gh, labels, issue_number, event)`. Every add/remove pair is a named edge (`queued`, `dispatched`, `review_started`, `rework_requested`, `escalated`, `blocked`, `merged`, `local_work_ready`, …); workflow code names the event, never touches individual labels. |
 | `adapters.py` | `dispatch_sessions()` — the Devin `manual` (write-manifest-only) and `command` (subprocess-launch) adapters, plus the session manifest/results JSON writers. Refuses `{issue_title}` interpolation in string-form (shell) commands — command injection risk, since issue titles are attacker-influenceable on any repo taking public issues. |
 | `subprocess_runner.py` | `run_captured()` — the one subprocess entry point for adapters. Centralizes UTF-8 + `errors="replace"` decoding and bytes-safe `TimeoutExpired` handling so Windows console encoding never crashes a caller. |
 | `checks.py` | `summarize_checks()` / `CheckSummary` — classifies `gh pr checks` output against `auto_merge.required_checks` into passed/pending/failed/missing; `.ready` is true only when none are pending, failed, or missing. |
@@ -141,8 +144,20 @@ Notes tying the diagram to `_edges()` exactly:
   (`queued`, `in_progress`, `pr_open`, `reviewing`, `needs_rework` — sorted
   for deterministic `gh` call ordering). Fired by `merge_ready()` only after
   an actual merge succeeded.
+- **`local_work_ready`** (local-file issue source only — like several other
+  `_edges()` entries, e.g. `operator_queued`, `human_merge_required`,
+  `redispatch_*`, `unescalated_*`, it is not shown in the diagram above,
+  which covers only the primary GitHub-PR flow): adds `labels.review_ready`,
+  removes it from every other workflow label. Fired by
+  `local_work_park.park_unpublishable_work` when a local worker's
+  session ends with commits on its branch and there is no remote to push to
+  — the branch itself is the deliverable, and `review_ready` is a **success**
+  state (deliberately not `labels.human_needed`) that holds the issue out of
+  dispatch until a human reviews, merges, and closes it by hand. See
+  [README.md#local-file-issue-source](../README.md#local-file-issue-source).
 
-`LabelConfig.terminal` = `{blocked, done, human_needed}`;
+`LabelConfig.terminal` = `{blocked, done, human_needed, prose_only_deps,
+operator_queue, review_ready}`;
 `LabelConfig.active` = `{queued, in_progress, pr_open, reviewing,
 needs_rework}`. `OrchestratorApp._is_dispatchable()` requires the `ready`
 label, no terminal label, and no active label — an issue already mid-flight
