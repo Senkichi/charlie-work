@@ -50,6 +50,7 @@ class FakeGitHub:
         self.run_calls: list[list[str]] = []
         self.labels_added: list[tuple[int, str]] = []
         self.labels_removed: list[tuple[int, str]] = []
+        self.closed_issues: list[int] = []
         self._fail_add_labels = fail_add_labels or set()
         self._fail_remove_labels = fail_remove_labels or set()
         self.repo_root = repo_root
@@ -102,6 +103,16 @@ class FakeGitHub:
     def remove_issue_label(self, number: int, label: str) -> bool:
         self.labels_removed.append((number, label))
         return (number, label) not in self._fail_remove_labels
+
+    def close_issue(self, number: int) -> bool:
+        """Record the closure and flip the served issue's state, the same
+        way the real API's next ``issue list`` would report it -- so a
+        re-detect in the same reconcile pass sees the issue as CLOSED."""
+        self.closed_issues.append(number)
+        for issue in self._issues:
+            if issue["number"] == number:
+                issue["state"] = "CLOSED"
+        return True
 
     def add_pr_label(self, number: int, label: str) -> bool:
         self.pr_labels_added.append((number, label))
