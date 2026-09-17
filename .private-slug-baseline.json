@@ -6,6 +6,7 @@
   ],
   "files": {
     ".gitignore": 1,
+    "docs/ci-fleet-version-bump.md": 8,
     "scripts/heartbeat-suppressions.yaml": 1,
     "src/charlie_work/ci_fleet_anchor.py": 3,
     "src/charlie_work/cli.py": 2,
@@ -45,5 +46,5 @@
     "tests/test_worker_declared_blocked.py": 2,
     "tests/test_worktree.py": 11
   },
-  "total": 167
+  "total": 175
 }
