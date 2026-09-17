@@ -478,3 +478,46 @@ def test_workflow_py_baseline_mark_is_tight_after_shrink() -> None:
         f"mark in the same PR (review on PR #1643; design doc Section 3.2 "
         f"'Effect on workflow.py's own size')."
     )
+
+
+def test_baseline_is_a_fixed_point_of_the_lower_only_refresh() -> None:
+    """Issue #1675: the checked-in baseline must already be a fixed point of
+    the refresh script's lower-only map -- every pending lowering and every
+    dead entry already applied. A PR that shrinks an over-cap file or deletes
+    one must lower/drop its mark in the SAME diff; before this gate, nothing
+    forced a refresh-script run after a shrink, and marks for deleted files
+    (and stale-high headroom like github.py's ~1950 lines) accumulated
+    indefinitely.
+
+    This generalizes ``test_workflow_py_baseline_mark_is_tight_after_shrink``
+    (which pins workflow.py's mark only, to keep a general assertion from
+    false-tripping on the then-deliberately-tolerated stale-high marks of
+    other files) to every baseline entry: stale-high marks are no longer a
+    passing state. It is complementary, not redundant -- the workflow.py pin
+    also catches mark < live growth for that file, which the lower-only map
+    deliberately leaves alone (growth is the keystone's failure domain).
+
+    Enforcement runs the sanctioned writer's ``--check`` mode end to end
+    against the real tree: it recomputes the lower-only refresh in memory
+    and exits non-zero -- printing the exact pending changes -- when the
+    baseline is not already a fixed point. Pure assertion: ``--check`` never
+    writes."""
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "scripts" / "refresh_file_size_ratchet.py"),
+            "--check",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, (
+        "file_size_ratchet_baseline.json is not a fixed point of the lower-only "
+        "refresh (issue #1675): an over-cap file shrank or was deleted without "
+        "its mark being lowered/dropped in the same PR. Run "
+        "`python scripts/refresh_file_size_ratchet.py` and commit the updated "
+        "baseline in this PR. Pending changes:\n"
+        f"{proc.stdout}{proc.stderr}"
+    )
