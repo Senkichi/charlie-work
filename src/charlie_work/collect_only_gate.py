@@ -41,8 +41,11 @@ file reads and the exit-code decision, following the same split as
 
 from __future__ import annotations
 
+import json
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +138,172 @@ class CollectOnlyResult:
         drops one leaf and adds another must still fail).
         """
         return len(self.failures) == 0
+
+
+# ---------------------------------------------------------------------------
+# Operator exemption (issue #1686)
+# ---------------------------------------------------------------------------
+#
+# The gate's verdict is fail-closed by design: a deleted test, a rename, or a
+# shrunken multiplicity fails the required check on every applicable PR.
+# Some of those failures are legitimate -- the PR deleted a feature and its
+# tests, renamed a misnamed test, changed parametrization ids, or
+# consolidated duplicates -- so the gate needs a controlled escape hatch.
+#
+# The escape hatch is an OPERATOR-APPLIED PR LABEL (the configured
+# ``labels.collect_gate_exempt`` name), resolved against the PR's live
+# labels at gate run time -- never the ``github.event.pull_request.labels``
+# snapshot, a PR-body line, a commit trailer, or any file in the tree, all
+# of which are worker-authored content and would let a PR self-grant the
+# exemption. Workers have no GitHub token, so only an operator can apply
+# the label; the two-step operator flow is "apply the label, re-run the
+# failed job".
+#
+# An active exemption waives only the gate's enforced verdict: findings are
+# computed identically, every waived finding is still printed (kind + leaf),
+# and the exit status flips to success. Nothing about how findings are
+# computed or reported changes -- the label never suppresses output.
+
+
+@dataclass(frozen=True)
+class CollectGateExemption:
+    """The resolved operator-exemption verdict for one gate run (issue #1686).
+
+    ``label`` is the configured exemption label name (from
+    ``LabelConfig.collect_gate_exempt``, never re-declared). ``active`` is
+    True only when the live labels query confirmed the label is present on
+    the PR -- a failed, empty, or malformed query resolves to ``active=False``
+    (fail closed). ``detail`` is the human-readable reason for the
+    resolution, printed in the gate output so the outcome is never silent.
+    """
+
+    label: str
+    active: bool
+    detail: str
+
+
+def resolve_collect_gate_exemption(
+    *,
+    exemption_label: str,
+    pr_number: int | None,
+    pr_labels: set[str] | None,
+    query_error: str | None = None,
+) -> CollectGateExemption | None:
+    """Resolve the operator-exemption verdict for a gate run.
+
+    Returns ``None`` when no resolution was attempted at all (``pr_number``
+    is ``None`` -- the caller supplied no ``--pr``): the gate then behaves
+    exactly as it did before #1686, with no exemption mention in the output.
+
+    When a PR number was supplied the verdict is always resolved, but the
+    resolution can only *grant* on positive evidence: ``pr_labels`` is the
+    set of label names on the PR as returned by a live API query, and
+    ``None`` means the query itself failed -- which resolves to
+    ``active=False`` (fail closed) with the reason carried in ``detail``.
+    Never raises.
+    """
+    if pr_number is None:
+        return None
+    if pr_labels is None:
+        return CollectGateExemption(
+            label=exemption_label,
+            active=False,
+            detail=(
+                f"labels query failed for PR #{pr_number}"
+                + (f": {query_error}" if query_error else "")
+                + " -- exemption not granted (fail closed)"
+            ),
+        )
+    if exemption_label in pr_labels:
+        return CollectGateExemption(
+            label=exemption_label,
+            active=True,
+            detail=f"label `{exemption_label}` present on PR #{pr_number}",
+        )
+    return CollectGateExemption(
+        label=exemption_label,
+        active=False,
+        detail=f"label `{exemption_label}` not present on PR #{pr_number}",
+    )
+
+
+# Single-line machine-readable record the gate command appends to its stdout
+# message whenever an exemption was evaluated. The Actions job log preserves
+# it verbatim (prefixed with the runner timestamp), and the review packet
+# reads it back through ``repos/{owner}/{repo}/actions/jobs/{id}/logs`` --
+# the only read-only, head-pinned channel that carries what the gate waived
+# on a given head (Actions check runs expose no ``output`` fields, and the
+# check-run annotations surface is capped and file-diagnostic shaped).
+EXEMPTION_LOG_MARKER = "COLLECT-GATE-EXEMPTION v1 "
+
+# The check-run name the ``collect-only-gate`` job reports under (the job's
+# ``name:`` in .github/workflows/ci.yml). The review packet locates the
+# gate's Actions job through this name on the PR's head-pinned check list,
+# then reads the job's log for EXEMPTION_LOG_MARKER. It is a wire contract
+# shared between ci.yml and the packet builder --
+# ``test_collect_only_gate.py`` asserts both ends of it stay equal.
+COLLECT_ONLY_GATE_CHECK_NAME = "Collect-only gate"
+
+
+def exemption_log_marker(
+    exemption: CollectGateExemption,
+    waived: Sequence[CollectOnlyFinding],
+    head_sha: str | None = None,
+) -> str:
+    """Render the single-line log marker for one evaluated exemption.
+
+    ``waived`` is the set of findings the exemption waived (the gate's
+    enforced findings when ``exemption.active`` -- ``()`` otherwise). The
+    payload stays compact (kind + leaf + source module per finding) so the
+    line survives intact in the job log.
+
+    ``head_sha`` binds the record to the head the gate ran against. The
+    review packet verifies it against the PR's live ``headRefOid`` before
+    trusting the record -- a label applied for head A legitimately remains
+    applied on head B (the issue forbids stripping it on ``synchronize``),
+    so evidence must provably describe THIS head or be ignored.
+    """
+    payload = {
+        "v": 1,
+        "label": exemption.label,
+        "active": exemption.active,
+        "detail": exemption.detail,
+        "head_sha": head_sha,
+        "waived": [
+            {
+                "kind": f.kind,
+                "leaf_name": f.leaf_name,
+                "source_module": f.source_module,
+            }
+            for f in waived
+        ],
+    }
+    return EXEMPTION_LOG_MARKER + json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def parse_exemption_log_marker(log_text: str) -> dict[str, Any] | None:
+    """Extract the exemption payload from Actions job-log text.
+
+    Scans for the LAST line carrying :data:`EXEMPTION_LOG_MARKER` (a job log
+    can legitimately contain earlier output before the marker) and returns
+    its parsed JSON payload when it is a ``v: 1`` object. Returns ``None``
+    on no marker or any malformed payload -- callers treat ``None`` as
+    "waived findings unavailable", never as an exemption verdict.
+    """
+    payload: Any = None
+    for line in log_text.splitlines():
+        idx = line.find(EXEMPTION_LOG_MARKER)
+        if idx == -1:
+            continue
+        try:
+            candidate = json.loads(line[idx + len(EXEMPTION_LOG_MARKER) :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            payload = candidate
+    if not isinstance(payload, dict) or payload.get("v") != 1:
+        return None
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +538,10 @@ def _render_finding_line(finding: CollectOnlyFinding) -> str:
     return f"- **{finding.kind}**: `{finding.leaf_name}` -- {finding.detail}"
 
 
-def render_gate_report(result: CollectOnlyResult) -> str:
+def render_gate_report(
+    result: CollectOnlyResult,
+    exemption: CollectGateExemption | None = None,
+) -> str:
     """Render the gate's findings as a human-readable report.
 
     Unlike the AST-equivalence gate's review packet (evidence, not enforcement),
@@ -378,24 +550,67 @@ def render_gate_report(result: CollectOnlyResult) -> str:
     When the gate passes, a brief summary is produced instead -- including any
     reported-only findings (``added``, ``count_mismatch`` with head > base),
     which are listed as passing rows, not failures.
+
+    ``exemption`` (issue #1686) is the resolved operator-exemption verdict,
+    or ``None`` when none was evaluated -- in which case the report is
+    byte-identical to the pre-#1686 output. When evaluated, the report
+    states the resolution explicitly: an ACTIVE exemption marks the failing
+    findings as waived (they are still listed, kind + leaf -- the label
+    suppresses the verdict, never the output); an inactive one states why
+    the exemption was not applied; an active one with nothing to waive says
+    so, making a stale label visible.
     """
     base_total = sum(result.base_leaf_counts.values())
     head_total = sum(result.head_leaf_counts.values())
 
-    if result.ok:
+    def _exemption_note() -> str:
+        assert exemption is not None
+        return f"Operator exemption `{exemption.label}`: {exemption.detail}."
+
+    if result.ok or (exemption is not None and exemption.active):
+        waived = exemption is not None and exemption.active and bool(result.failures)
         if not result.findings:
-            return (
+            line = (
                 f"collect-only gate: PASSED ({base_total} leaf names at base, "
                 f"{head_total} at head; multisets match, all removed leaves "
                 f"reappeared in siblings under tests/)"
             )
-        lines = [
-            f"collect-only gate: PASSED ({base_total} leaf names at base, "
-            f"{head_total} at head; no enforced findings)",
-            "",
-            f"{len(result.findings)} reported finding(s) (pass, not enforced):",
-        ]
-        lines.extend(_render_finding_line(f) for f in result.findings)
+            if exemption is not None:
+                line += (
+                    f"\nexemption: {_exemption_note()} "
+                    "Nothing to waive -- no enforced findings on this run "
+                    "(a label left on a clean PR is stale and can be removed)."
+                )
+            return line
+        reported = [f for f in result.findings if not f.fails_gate]
+        if waived:
+            assert exemption is not None
+            lines = [
+                f"collect-only gate: PASSED ({base_total} leaf names at base, "
+                f"{head_total} at head; {len(result.failures)} enforced "
+                f"finding(s) WAIVED by operator exemption label "
+                f"`{exemption.label}`)",
+                "",
+            ]
+            lines.extend(_render_finding_line(f) + "  *(waived)*" for f in result.failures)
+        else:
+            lines = [
+                f"collect-only gate: PASSED ({base_total} leaf names at base, "
+                f"{head_total} at head; no enforced findings)",
+            ]
+        if exemption is not None:
+            lines.append("")
+            note = f"exemption: {_exemption_note()}"
+            if exemption.active and not result.failures:
+                note += (
+                    " Nothing to waive -- no enforced findings on this run "
+                    "(a label left on a clean PR is stale and can be removed)."
+                )
+            lines.append(note)
+        if reported:
+            lines.append("")
+            lines.append(f"{len(reported)} reported finding(s) (pass, not enforced):")
+            lines.extend(_render_finding_line(f) for f in reported)
         return "\n".join(lines)
 
     failures = result.failures
@@ -417,6 +632,10 @@ def render_gate_report(result: CollectOnlyResult) -> str:
         lines.append(f"{len(reported)} reported finding(s) (pass, not enforced):")
         lines.append("")
         lines.extend(_render_finding_line(f) for f in reported)
+
+    if exemption is not None:
+        lines.append("")
+        lines.append(f"exemption: {_exemption_note()}")
 
     lines.append("")
     lines.append(

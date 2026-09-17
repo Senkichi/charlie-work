@@ -1639,6 +1639,61 @@ def test_label_config_operator_queue_is_overridable(tmp_path: Path) -> None:
     assert config.labels.operator_queue == "agent:needs-operator"
 
 
+# ---------------------------------------------------------------------------
+# LabelConfig — collect_gate_exempt (issue #1686: operator exemption for the
+# collect-only gate)
+# ---------------------------------------------------------------------------
+
+
+def test_label_config_collect_gate_exempt_default() -> None:
+    from charlie_work.config import LabelConfig
+
+    assert LabelConfig().collect_gate_exempt == "collect-gate-exempt"
+
+
+def test_label_config_collect_gate_exempt_in_all_for_bootstrap() -> None:
+    """The label must exist on the repo for operators to apply it, so it is a
+    member of ``all`` (what ``bootstrap_labels`` creates)."""
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.collect_gate_exempt in labels.all
+
+
+def test_label_config_collect_gate_exempt_not_in_workflow_labels() -> None:
+    """The exemption label is operator-managed only: the label state machine
+    must never add it or strip it via ``_compute_remove`` -- an operator's
+    exemption on a PR must persist until a human removes it (issue #1686: do
+    not strip it on synchronize)."""
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.collect_gate_exempt not in labels.workflow_labels
+
+
+def test_label_config_collect_gate_exempt_not_in_terminal_or_active() -> None:
+    """It is not an issue-lifecycle state at all -- it lives on PRs."""
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.collect_gate_exempt not in labels.terminal
+    assert labels.collect_gate_exempt not in labels.active
+
+
+def test_label_config_collect_gate_exempt_is_overridable(tmp_path: Path) -> None:
+    """The label string is configurable via the labels: section like every
+    other label -- issue #1686 requires the name be declared exactly once."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """labels:
+  collect_gate_exempt: agent:collect-gate-exempt
+""",
+    )
+    config = load_config(config_file)
+    assert config.labels.collect_gate_exempt == "agent:collect-gate-exempt"
+
+
 # --- Issue #600: runner_allocation is host-wide only; cross-validate floors ---
 
 

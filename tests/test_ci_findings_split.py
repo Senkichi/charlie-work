@@ -110,6 +110,7 @@ _MOVED_NAMES = (
     "check_dispatch_staleness",
     "_annotation_to_required_change",
     "_required_changes_from_checks",
+    "_collect_gate_exemption_section",
 )
 
 
@@ -320,7 +321,7 @@ def test_all_ci_findings_names_are_reexported_by_identity() -> None:
     function would compare unequal-but-structurally-similar in ways that are
     easy to miss.
 
-    The ``len(names) == 8`` assertion below is a membership/drift guard
+    The ``len(names) == 9`` assertion below is a membership/drift guard
     only -- unlike the analogous assertion in
     ``test_rework_prompts_split.py`` (which additionally proves
     ``_module_level_defined_names`` still walks the ``Assign`` branch, since
@@ -335,7 +336,7 @@ def test_all_ci_findings_names_are_reexported_by_identity() -> None:
 
     names = _module_level_defined_names(_CI_FINDINGS_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 8, f"expected 8 moved units, found {len(names)}: {sorted(names)}"
+    assert len(names) == 9, f"expected 9 moved units, found {len(names)}: {sorted(names)}"
     assert set(names) == set(_MOVED_NAMES), (
         f"AST-derived names {sorted(names)} do not match the expected moved set "
         f"{sorted(_MOVED_NAMES)}"
