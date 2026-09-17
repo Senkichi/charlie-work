@@ -184,7 +184,7 @@ jobs:
         # into a single <testsuites> document, so one file holds the full
         # recorded set. The file is a CI artifact only (not uploaded) -- the
         # gate fails the step in-process; a human reads the gate's stdout.
-        run: uv run pytest --tb=short -n auto --dist=load --junit-xml=pytest-junit.xml
+        run: uv run pytest --tb=short -n auto --dist=load --junit-xml=pytest-junit.xml -v
       - name: Recorded-vs-collected check (issue #1621)
         # Fail the job when the junit <testcase> count differs from the
         # collected count -- the load-truncation failure mode where pytest
