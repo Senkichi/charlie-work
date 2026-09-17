@@ -17747,6 +17747,14 @@ def test_reconcile_exit_ok_when_drift_fixed(tmp_path: Path) -> None:
             if label not in names:
                 self._issue["labels"].append({"name": label})
 
+        def close_issue(self, number: int) -> bool:
+            # Mirror the label overrides above: a real close is visible to
+            # the next issues snapshot, so flip the state this fake serves.
+            ok = super().close_issue(number)
+            if number == self._issue["number"]:
+                self._issue["state"] = "CLOSED"
+            return ok
+
     app = OrchestratorApp(
         tmp_path, runtime_paths(tmp_path, config.runtime.state_dir), config, DriftGitHub()
     )

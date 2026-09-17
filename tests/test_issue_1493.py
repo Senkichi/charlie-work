@@ -14,9 +14,10 @@ These tests live in their own module (rather than ``test_charlie_work.py``)
 to stay under the file-size ratchet marks (issue #1442), mirroring how the
 #1482 mirror-image fix extracted ``test_issue_1482.py`` /
 ``test_fix_unescalate.py``. The shared field-set helper lives in
-``charlie_work.merge_finalize`` and is consumed by every door that records a
-merged PR -- internal merge, external-merge finalization, and the dispatch
-merged-PR-references close-out.
+``charlie_work.merge_finalize`` and is consumed by every lifecycle door that
+records a merged PR -- internal merge, external-merge finalization, the
+dispatch merged-PR-references close-out, and reconcile's
+``merged_outside_orchestrator`` drift-fix.
 """
 
 from __future__ import annotations
@@ -27,7 +28,8 @@ from typing import Any
 
 from charlie_work.merge_finalize import _merged_issue_fields
 from charlie_work.paths import runtime_paths
-from charlie_work.state import load_state, save_state, state_lock
+from charlie_work.reconcile import DriftItem, apply_fixes
+from charlie_work.state import empty_state, load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
 
 from _fakes_github import FakeGitHub
@@ -226,6 +228,63 @@ def test_dispatch_merged_pr_references_door_shares_field_set(tmp_path: Path) -> 
     assert actual == expected
     assert actual["status"] == "closed"
     assert "labels" not in actual
+
+
+def test_reconcile_merged_outside_orchestrator_door_shares_field_set() -> None:
+    """reconcile's ``merged_outside_orchestrator`` drift-fix is the fifth
+    door that records a merged PR -- an external merge discovered on a
+    reconcile pass rather than through the fleet's own merge flow. It must
+    apply the identical issue field set: a linked issue parked at
+    ``"approved"`` converges to ``"closed"`` alongside
+    ``prs[n].status = "merged"``. Without it, this door reproduced the exact
+    #1493 dead zone (PR merged, issue approved, repair sweeps deliberately
+    excluded) triggered by an externally-merged PR instead of ``merge_ready``."""
+    config = _required_checks_config()
+    gh = FakeGitHub()
+    state = empty_state()
+    seeded = {
+        "number": 123,
+        "status": "approved",
+        "merge_alert": "merge_failed",
+        "labels": ["agent:pr-open", "automated-ready"],
+    }
+    state["issues"]["123"] = dict(seeded)
+    state["prs"]["456"] = {
+        "number": 456,
+        "issue_number": 123,
+        "status": "reviewing",
+    }
+    drift = [
+        DriftItem(
+            kind="merged_outside_orchestrator",
+            issue_number=123,
+            pr_number=456,
+            detail="PR #456 is MERGED on GitHub but state status is 'reviewing'",
+            fix_actions=(
+                "mark state prs[456].status = 'merged'",
+                "finalize state issues[123] via merged-issue field set",
+            ),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert new_state["prs"]["456"]["status"] == "merged"
+    expected = _merged_issue_fields(seeded, 123)
+    actual = new_state["issues"]["123"]
+    assert actual == expected
+    assert actual["status"] == "closed"
+    assert actual["merge_alert"] == "OK"
+    assert "labels" not in actual
+    # apply_fixes returns a new state dict; the input record is untouched.
+    assert state["issues"]["123"]["status"] == "approved"
+    # The GitHub-side edge still runs alongside the state finalization --
+    # labels via the "merged" transition, then the same explicit issue
+    # close every other merged-PR door performs (without it the issue
+    # lingers agent:done+OPEN and issue_status_normalized re-flags the
+    # "closed" status as fresh drift on the next pass).
+    assert (123, config.labels.done) in gh.labels_added
+    assert 123 in gh.closed_issues
 
 
 def test_merged_issue_fields_preserves_unrelated_fields() -> None:
