@@ -27,6 +27,10 @@ Covers four layers:
    blocked channel.
 4. **Config tests** -- ``review.human_decision_markers`` parses from YAML
    and both shipped example configs carry the default set.
+5. **Drift guard** -- ``AUTHORED_VERDICT_PROVENANCES`` (literal strings in
+   ``review_decision.py``, which cannot import ``workflow``) and the exempt
+   set must partition ``workflow.VERDICT_PROVENANCE_VALUES``, so a new
+   provenance cannot silently bypass the reclassification guard.
 """
 
 from __future__ import annotations
@@ -46,12 +50,13 @@ from charlie_work.config import (
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.review_decision import (
+    AUTHORED_VERDICT_PROVENANCES,
     human_decision_marker_match,
     reclassify_human_call_verdict,
 )
 from charlie_work.rework_prompts import _render_rework_prompt
 from charlie_work.state import load_state
-from charlie_work.workflow import OrchestratorApp
+from charlie_work.workflow import VERDICT_PROVENANCE_VALUES, OrchestratorApp
 
 from _fakes_github import FakeGitHub
 
@@ -429,3 +434,49 @@ def test_example_configs_load_with_default_markers() -> None:
         cfg = load_config(_EXAMPLES_DIR / name)
         assert "operator" in cfg.review.human_decision_markers
         assert "not automated rework" in cfg.review.human_decision_markers
+
+
+# ---------------------------------------------------------------------------
+# Layer 5: AUTHORED_VERDICT_PROVENANCES drift guard
+# ---------------------------------------------------------------------------
+
+# Provenances exempt from the human-call reclassification guard: the two
+# ``*_auto_reject`` gates build ``required_changes`` mechanically from CI
+# check annotations and rubric templates (an annotation like pycodestyle's
+# "missing whitespace around operator" would trip the markers), and
+# ``carried_forward`` is stamped by ``_update_approval_head`` without ever
+# passing through ``record_review``'s guard. Every provenance NOT in this
+# set must be authored -- so adding a new member to
+# ``VERDICT_PROVENANCE_VALUES`` fails the partition test below until it is
+# deliberately placed on one side or the other. That trip-wire is the
+# point: a new human-authored provenance silently absent from
+# ``AUTHORED_VERDICT_PROVENANCES`` would bypass the reclassification guard
+# and reopen the PR #1641 incident.
+_NON_AUTHORED_VERDICT_PROVENANCES: frozenset[str] = frozenset(
+    {
+        "carried_forward",
+        "ci_gate_auto_reject",
+        "test_adequacy_auto_reject",
+    }
+)
+
+
+def test_authored_verdict_provenances_partition_verdict_provenance_values() -> None:
+    """``review_decision`` cannot import ``workflow`` (circular), so
+    ``AUTHORED_VERDICT_PROVENANCES`` is a literal-string copy of the
+    authored subset of ``workflow.VERDICT_PROVENANCE_VALUES`` -- with no
+    compiler keeping them in sync, this test is the drift guard.
+
+    The two sets must partition the enum: every provenance is either
+    authored (the reclassification guard applies to it) or explicitly
+    exempt. A subset check alone would only catch a stale/typo'd authored
+    entry; the partition additionally fails when a new provenance is added
+    to ``VERDICT_PROVENANCE_VALUES`` without being classified on either
+    side -- which is the drift direction that would silently bypass the
+    guard and reintroduce the incident this file exists to prevent."""
+    assert AUTHORED_VERDICT_PROVENANCES <= VERDICT_PROVENANCE_VALUES
+    assert not AUTHORED_VERDICT_PROVENANCES & _NON_AUTHORED_VERDICT_PROVENANCES
+    assert (
+        AUTHORED_VERDICT_PROVENANCES | _NON_AUTHORED_VERDICT_PROVENANCES
+        == VERDICT_PROVENANCE_VALUES
+    )
