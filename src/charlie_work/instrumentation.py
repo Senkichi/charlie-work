@@ -607,6 +607,14 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # ``review_verdict_reconcile_failed``, emitted from the same call
         # site at warning level.
         "review_verdict_reconciled": "info",
+        # Issue #1642: a reviewer filed human-decision prose under
+        # ``request_changes`` and ``record_review`` reclassified it to
+        # ``blocked`` -- the verdict took the operator-queue path instead of
+        # automated rework. Warning, not info: the reclassification is the
+        # system doing its job, but it only fires on a misfiling that should
+        # be visible to an operator auditing why a verdict never reached the
+        # rework lane (same anomaly shape as ``required_changes_vacuous``).
+        "review_decision_reclassified_blocked": "warning",
         "rework_already_pushed": "info",
         "rework_brief_regenerated": "info",
         "runner_allocation": "info",
