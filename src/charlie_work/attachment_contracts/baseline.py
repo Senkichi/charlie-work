@@ -17,11 +17,17 @@ from charlie_work.attachment_contracts.model import (
     BaselineEntry,
     Bump,
     Finding,
+    Kind,
+    KindStats,
     SaturationVerdict,
 )
 
 SCHEMA_VERSION = 1
 BASELINE_FILENAME = ".attachment-budgets.json"
+# Top-level key under which frozen per-kind Tukey fences are persisted
+# (issue #1614). Optional: baselines written before #1614 lack it and load
+# fine (callers fall back to live recomputation), so SCHEMA_VERSION stays 1.
+KIND_STATS_KEY = "kind_stats"
 
 
 class TamperError(ValueError):
@@ -84,6 +90,78 @@ def _entry_sort_key(entry: BaselineEntry) -> tuple[str, str, str]:
     return (entry.kind, entry.file, entry.identity)
 
 
+def _kind_stats_to_dict(stats: KindStats) -> dict[str, object]:
+    return {
+        "q3": stats.q3,
+        "iqr": stats.iqr,
+        "boundary": stats.boundary,
+        "population": stats.population,
+    }
+
+
+def _kind_stats_from_dict(kind: str, raw: dict[str, object]) -> KindStats:
+    try:
+        return KindStats(
+            kind=kind,  # type: ignore[arg-type]
+            q3=float(raw["q3"]),  # type: ignore[arg-type]
+            iqr=float(raw["iqr"]),  # type: ignore[arg-type]
+            boundary=float(raw["boundary"]),  # type: ignore[arg-type]
+            population=int(raw["population"]),  # type: ignore[arg-type]
+        )
+    except (KeyError, ValueError, TypeError) as exc:
+        # Same rationale as _entry_from_dict / _bump_from_dict (finding #12):
+        # a missing or non-numeric kind_stats field must surface as a
+        # structured TamperError, never as a bare KeyError/ValueError that
+        # escapes check_tree's `except TamperError` and crashes the CI step.
+        raise TamperError(f"malformed kind_stats entry for {kind!r}: {exc}") from exc
+
+
+def kind_stats_of(document: dict[str, object]) -> dict[Kind, KindStats]:
+    """Return the frozen per-kind fence stats persisted in ``document``.
+
+    Empty dict when the document predates issue #1614 (no ``kind_stats`` key)
+    -- callers treat absence as "no frozen fence, fall back to live
+    recomputation". Raises ``TamperError`` if the key is present but
+    malformed (non-object value, missing/ non-numeric fields).
+    """
+    raw = document.get(KIND_STATS_KEY)
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise TamperError(f"baseline {KIND_STATS_KEY!r} must be an object, got {type(raw)!r}")
+    result: dict[Kind, KindStats] = {}
+    for kind, stats_raw in raw.items():
+        if not isinstance(stats_raw, dict):
+            raise TamperError(f"kind_stats[{kind!r}] must be an object, got {type(stats_raw)!r}")
+        result[kind] = _kind_stats_from_dict(kind, stats_raw)  # type: ignore[index]
+    return result
+
+
+def _kind_stats_from_verdicts(
+    verdicts: tuple[SaturationVerdict, ...],
+) -> dict[Kind, KindStats]:
+    """Derive frozen per-kind stats from a live ``saturate_all`` result.
+
+    Every verdict of a kind carries that kind's q3/iqr/boundary/population
+    (they are identical across a kind's verdicts by construction), so the
+    first verdict seen per kind is authoritative. Kinds with no eligible
+    points produce no verdicts and therefore no entry -- nothing of that
+    kind can saturate anyway.
+    """
+    stats: dict[Kind, KindStats] = {}
+    for v in verdicts:
+        if v.point.kind in stats:
+            continue
+        stats[v.point.kind] = KindStats(
+            kind=v.point.kind,
+            q3=v.q3,
+            iqr=v.iqr,
+            boundary=v.boundary,
+            population=v.population,
+        )
+    return stats
+
+
 def generate(
     verdicts: tuple[SaturationVerdict, ...],
     *,
@@ -94,6 +172,9 @@ def generate(
     """Build the baseline document (as a plain dict, ready for dump()) from verdicts.
 
     Only saturated points are entered; freshly generated entries carry no bumps.
+    The per-kind Tukey fence statistics (issue #1614) are persisted under
+    ``kind_stats`` so later ``check_tree`` / ``--ratchet`` runs saturate
+    against the frozen fence instead of recomputing it live.
     """
     entries = [
         BaselineEntry(
@@ -107,12 +188,16 @@ def generate(
         if v.saturated
     ]
     entries.sort(key=_entry_sort_key)
+    kind_stats = _kind_stats_from_verdicts(verdicts)
     return {
         "version": SCHEMA_VERSION,
         "generated_by": generated_by,
         "generated_at": generated_at,
         "floor": floor,
         "entries": [_entry_to_dict(e) for e in entries],
+        KIND_STATS_KEY: {
+            kind: _kind_stats_to_dict(stats) for kind, stats in sorted(kind_stats.items())
+        },
     }
 
 
@@ -123,8 +208,45 @@ def dumps(document: dict[str, object]) -> str:
         entries_raw,  # type: ignore[arg-type]
         key=lambda e: (e["kind"], e["file"], e["identity"]),
     )
-    normalized = {**document, "entries": ordered_entries}
+    normalized: dict[str, object] = {**document, "entries": ordered_entries}
+    # Normalize kind_stats key order for byte-stable output across runs when
+    # present. Only touch the key if the document already carries it -- a
+    # pre-#1614 baseline has no kind_stats and must not gain a ``null`` entry
+    # on a round-trip dump.
+    kind_stats_raw = document.get(KIND_STATS_KEY)
+    if isinstance(kind_stats_raw, dict):
+        normalized[KIND_STATS_KEY] = {k: kind_stats_raw[k] for k in sorted(kind_stats_raw)}
     return json.dumps(normalized, indent=1, sort_keys=True) + "\n"
+
+
+def with_kind_stats(
+    document: dict[str, object],
+    verdicts: tuple[SaturationVerdict, ...],
+    *,
+    generated_at: str,
+) -> dict[str, object]:
+    """Return a copy of ``document`` with ``kind_stats`` recomputed from ``verdicts``.
+
+    The ``--refreeze`` path (issue #1614): ratchet the entries against a
+    LIVE fence (the caller passes live ``saturate_all`` verdicts to
+    ``compare``), then overwrite the frozen per-kind stats with the
+    recomputed values via this helper. ``generated_at`` is re-stamped for
+    the same reason ``generate()`` stamps it: recomputing the frozen fence
+    IS a generation event, and ``check_ratchet_tamper`` requires BOTH the
+    re-stamp AND statistics equal to a live recompute of the checked tree
+    before it treats a ``kind_stats`` change as sanctioned -- a refreeze
+    that kept the old ``generated_at`` would read as a ratchet-to-ratchet
+    boundary raise and be flagged as tamper even though its stats are
+    honest. The input document is not mutated.
+    """
+    kind_stats = _kind_stats_from_verdicts(verdicts)
+    return {
+        **document,
+        "generated_at": generated_at,
+        KIND_STATS_KEY: {
+            kind: _kind_stats_to_dict(stats) for kind, stats in sorted(kind_stats.items())
+        },
+    }
 
 
 def dump(document: dict[str, object], path: Path) -> None:
@@ -157,6 +279,10 @@ def loads(text: str) -> dict[str, object]:
                 f"duplicate baseline entry for kind={key[0]!r} file={key[1]!r} identity={key[2]!r}"
             )
         seen_keys.add(key)
+    # Validate frozen per-kind stats if present (issue #1614). Absent is
+    # valid -- baselines written before #1614 have no kind_stats and callers
+    # fall back to live recomputation. Present-but-malformed is tamper.
+    kind_stats_of(document)
     return document  # type: ignore[return-value]
 
 
@@ -408,12 +534,33 @@ def compare(
         "version": SCHEMA_VERSION,
         "entries": [_entry_to_dict(e) for e in sorted_entries],
     }
+    # Issue #1614: a ratchet must NOT recompute or raise the frozen per-kind
+    # fence. ``kind_stats`` is preserved verbatim from ``baseline_document``
+    # by the spread above (compare never writes KIND_STATS_KEY itself -- only
+    # generate() and with_kind_stats() do, on the explicit re-baseline /
+    # --refreeze paths). The boundary-raise tamper guard lives in
+    # check_ratchet_tamper, which diffs the frozen fence against the previous
+    # committed baseline.
     return findings, ratcheted
+
+
+def _kind_stats_delta(prev: KindStats, current: KindStats) -> str:
+    """One-line summary of how a frozen kind's stats changed, for tamper messages."""
+    if current.boundary != prev.boundary:
+        direction = "rose" if current.boundary > prev.boundary else "lowered"
+        return f"boundary {direction} {prev.boundary} -> {current.boundary}"
+    return (
+        "boundary unchanged but stats modified "
+        f"(q3 {prev.q3} -> {current.q3}, iqr {prev.iqr} -> {current.iqr}, "
+        f"population {prev.population} -> {current.population})"
+    )
 
 
 def check_ratchet_tamper(
     previous_document: dict[str, object] | None,
     current_document: dict[str, object],
+    *,
+    live_verdicts: tuple[SaturationVerdict, ...] | None,
 ) -> list[Finding]:
     """Diff-based tamper guard: closes the raise-to-match laundering gap.
 
@@ -433,6 +580,40 @@ def check_ratchet_tamper(
     `member_count` itself (see `compare()`'s ratchet branches). So for any
     identity present in both documents, ANY rise in `member_count` did not
     come from this package's own tooling -- it is tamper, full stop.
+
+    Issue #1614 extends the same logic to the frozen per-kind Tukey fence:
+    under every legitimate write path a ratchet preserves ``kind_stats``
+    verbatim (``compare`` spreads ``baseline_document`` without rewriting
+    ``KIND_STATS_KEY``), and an explicit re-baseline / ``--refreeze`` is the
+    only path that recomputes it. A generation event is recognized by TWO
+    conditions that must BOTH hold: a fresh ``generated_at`` (``generate()``
+    and ``with_kind_stats()`` always re-stamp) AND ``kind_stats`` equal to
+    a live recompute of the tree under check. Neither half suffices alone:
+    ``generated_at`` is a self-declared field in the same document an
+    attacker is hand-editing, so a bare timestamp difference cannot be the
+    discriminator -- a one-line forgery that bumps it alongside a raised
+    boundary would read as a sanctioned regen and skip every per-kind check
+    (round-4 review). The live-recompute half is the part that cannot be
+    forged: the only way to write statistics equal to the honest recompute
+    is to produce exactly what ``generate()`` / ``with_kind_stats()`` would
+    emit, i.e. the sanctioned output itself. On a transition that is not a
+    verified generation event ANY difference in ``kind_stats`` is tamper:
+    a raised or lowered boundary, a tweaked q3/iqr/population (``iqr: 0`` or
+    ``population < FLOOR`` disables a kind's fence outright inside
+    ``saturate_with_fence``), a removed kind (a kind with no frozen fence
+    gets no verdicts at all -- the whole kind is silently exempted), or an
+    added kind. Removing the ``kind_stats`` key outright is flagged
+    unconditionally: every baseline writer emits the key (``compare``
+    preserves it; ``generate()`` / ``with_kind_stats()`` always emit it), so
+    its absence can only be a hand-deletion silently reverting to the
+    pre-#1614 live-recomputation fallback.
+
+    ``live_verdicts`` is the checked tree's LIVE ``saturate_all`` output --
+    the same verdict stream ``generate()`` / ``--refreeze`` consume, NOT
+    the frozen-fence verdicts ``compare()`` uses for entry ratcheting.
+    ``None`` means the caller had no scan context and fails the guard
+    closed: no ``kind_stats`` change is excused. ``check_tree`` passes the
+    live verdicts whenever it passes ``previous_baseline_document``.
 
     `previous_document` is None when there is nothing to diff against yet
     (e.g. the very first committed baseline) -- no findings are possible.
@@ -460,6 +641,104 @@ def check_ratchet_tamper(
                 redirect=None,
             )
         )
+    # Issue #1614: a ratchet preserves ``kind_stats`` verbatim, so on a
+    # ratchet-to-ratchet transition ANY difference in the frozen fence is a
+    # hand-edit. The sanctioned exception is a VERIFIED generation event: a
+    # fresh ``generated_at`` AND statistics equal to a live recompute of the
+    # tree under check. The stamp alone is forgeable by the same hand-edit
+    # it is meant to distinguish (round-4 review) -- the live-recompute
+    # equality is the binding a forgery cannot satisfy without writing the
+    # honest values. Malformed kind_stats already raised at loads() time,
+    # so kind_stats_of here cannot raise on a document that passed loads().
+    previous_stats = kind_stats_of(previous_document)
+    current_stats = kind_stats_of(current_document)
+    regenerated = (
+        current_document.get("generated_at") is not None
+        and current_document.get("generated_at") != previous_document.get("generated_at")
+        and live_verdicts is not None
+        and current_stats == _kind_stats_from_verdicts(live_verdicts)
+    )
+
+    if KIND_STATS_KEY in previous_document and KIND_STATS_KEY not in current_document:
+        # No sanctioned writer ever drops the key, so its absence can only be
+        # a hand-deletion -- silently reverting check_tree / --ratchet to the
+        # pre-#1614 live-recomputation fallback this issue exists to close.
+        # Flag it even when ``generated_at`` changed: a real regen /
+        # --refreeze still writes the key.
+        findings.append(
+            Finding(
+                severity="error",
+                file=BASELINE_FILENAME,
+                identity=KIND_STATS_KEY,
+                message=(
+                    f"tamper: baseline {KIND_STATS_KEY!r} was removed since the "
+                    "previous committed baseline. Removing the frozen per-kind "
+                    "fence silently reverts saturation to live recomputation; "
+                    "restore it via `baseline --refreeze` or a full `baseline` "
+                    "run."
+                ),
+                redirect=None,
+            )
+        )
+    elif not regenerated:
+        for kind, prev in previous_stats.items():
+            current = current_stats.get(kind)
+            if current is None:
+                findings.append(
+                    Finding(
+                        severity="error",
+                        file=BASELINE_FILENAME,
+                        identity=f"kind_stats:{kind}",
+                        message=(
+                            f"tamper: frozen {kind} fence was removed since the "
+                            "previous committed baseline. A kind with no frozen "
+                            "fence gets no verdicts at all, silently exempting "
+                            "the whole kind; restore it via `baseline --refreeze` "
+                            "or a full `baseline` run."
+                        ),
+                        redirect=None,
+                    )
+                )
+            elif current != prev:
+                findings.append(
+                    Finding(
+                        severity="error",
+                        file=BASELINE_FILENAME,
+                        identity=f"kind_stats:{kind}",
+                        message=(
+                            f"tamper: frozen {kind} fence was modified since the "
+                            "previous committed baseline "
+                            f"({_kind_stats_delta(prev, current)}) with no "
+                            "verifiable re-baseline. A ratchet preserves "
+                            "kind_stats verbatim; it may only change through a "
+                            "generation event (`baseline --refreeze` or a full "
+                            "`baseline` run) that re-stamps generated_at AND "
+                            "writes the exact statistics a live recompute of "
+                            "the current tree produces."
+                        ),
+                        redirect=None,
+                    )
+                )
+        for kind in current_stats:
+            if kind in previous_stats:
+                continue
+            findings.append(
+                Finding(
+                    severity="error",
+                    file=BASELINE_FILENAME,
+                    identity=f"kind_stats:{kind}",
+                    message=(
+                        f"tamper: frozen {kind} fence appeared since the "
+                        "previous committed baseline with no verifiable "
+                        "re-baseline. kind_stats may only change through a "
+                        "generation event (`baseline --refreeze` or a full "
+                        "`baseline` run) that re-stamps generated_at AND "
+                        "writes the exact statistics a live recompute of "
+                        "the current tree produces."
+                    ),
+                    redirect=None,
+                )
+            )
     return findings
 
 

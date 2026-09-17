@@ -152,6 +152,67 @@ def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> _wf.
     return _wf.CarryForwardCheck(None, live_patch_id, live_signature)
 
 
+def review_verdict_guard(self, pr_number: int) -> _wf.CommandResult | None:
+    """CLI-boundary guard for ``charlie why-charlie-hate`` (issue #1695).
+
+    ``review()`` unconditionally regenerates the review packet: when the
+    recorded verdict is pinned to a superseded head it is voided back to a
+    ``pending`` stub -- destroying the carry-forward baseline
+    (``reviewed_patch_id`` and the tier-2 signature) -- the PR's state
+    entry flips to ``reviewing``, and the ``review_started`` label
+    transition fires. Run from the operator CLI that is destructive when
+    the recorded verdict is still valid: a content-unchanged PR falls back
+    to a full fresh review, burning a reviewer session and delaying a
+    merge the queue would otherwise carry forward.
+
+    Returns a refusal ``CommandResult`` (``ok=False``) when the recorded
+    verdict is still valid -- ``reviewed_head_sha`` equals the live head,
+    or ``_check_carry_forward`` says the verdict carries forward to it --
+    and ``None`` when there is nothing worth preserving (no verdict, a
+    ``pending`` placeholder, or a genuinely stale verdict the
+    carry-forward check rejects). The loop's internal ``review()``
+    callers never consult this guard; it exists only at the CLI boundary,
+    where a bare ``why-charlie-hate --pr N`` must not silently discard a
+    verdict. The operator opts out explicitly with ``--force-rereview``.
+    """
+    pr = self.gh.pr_view(pr_number)
+    if not pr:
+        # review() itself reports the not-found case; nothing to preserve.
+        return None
+    decision = self._review_decision(pr_number)
+    decision_value = decision.get("decision")
+    if decision_value not in ("approved", "request_changes", "blocked"):
+        # pending/missing -- no recorded verdict to discard.
+        return None
+    live_head_sha = pr.get("headRefOid")
+    reviewed_head_sha = decision.get("reviewed_head_sha")
+    if live_head_sha is not None and reviewed_head_sha == live_head_sha:
+        reason = (
+            f"the recorded {decision_value} verdict is still valid at the "
+            f"live head ({live_head_sha})"
+        )
+    else:
+        check = self._check_carry_forward(pr_number, decision)
+        if not check.carry_forward:
+            return None
+        reason = (
+            f"the recorded {decision_value} verdict at {reviewed_head_sha} "
+            f"carries forward to the live head ({live_head_sha}) via "
+            f"{check.tier} carry-forward"
+        )
+    refusal = f"refusing to regenerate the review packet for PR #{pr_number}: {reason}"
+    return _wf.CommandResult(
+        False,
+        # Issue #1695 acceptance: the refusal reason must survive `head -1`
+        # AND `tail -1` of the rendered output, so it is restated on the
+        # last line. ``data`` stays empty -- print_result appends a JSON
+        # block for a non-empty payload, whose closing brace would become
+        # the last output line and hide the reason.
+        f"{refusal}\n{refusal} -- pass --force-rereview to discard it",
+        {},
+    )
+
+
 def _enrich_checks_infra_blocked(
     self, checks: list[dict[str, Any]] | None, required: tuple[str, ...]
 ) -> list[dict[str, Any]]:
