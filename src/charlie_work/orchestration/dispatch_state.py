@@ -748,11 +748,9 @@ def _dispatch_impl(
         for issue_number in closed_merged_pr_issues:
             _issue_key = str(issue_number)
             _issue_entry = state["issues"].get(_issue_key, {})
-            state["issues"][_issue_key] = {
-                **_issue_entry,
-                "number": issue_number,
-                "status": "closed",
-            }
+            # Issue #1493: same merged-issue field set the merge doors apply,
+            # derived from the shared helper so this third door cannot drift.
+            state["issues"][_issue_key] = _wf._merged_issue_fields(_issue_entry, issue_number)
         if closed_merged_pr_issues:
             state = _wf.append_event(
                 state,
