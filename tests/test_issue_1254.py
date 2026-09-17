@@ -27,7 +27,11 @@ parsing the workflow YAML statically:
 1. The Tests job has NO job-level ``concurrency`` block (any group key, any
    ``cancel-in-progress`` value -- the pending-cancel semantics apply to all
    of them).
-2. ``timeout-minutes`` stays >= 75.
+2. ``timeout-minutes`` stays at the hosted-derived bound: >= 22 and <= 30
+   (#1504 recalibrated the 75-min self-hosted backstop from hosted runtime
+   data -- 22 clears the observed max by ~38%; the ceiling keeps a
+   "just-in-case" bump back toward the contention-era numbers from
+   silently re-loosening the hang bound).
 """
 
 from __future__ import annotations
@@ -91,26 +95,41 @@ def test_workflow_level_concurrency_is_per_ref() -> None:
     )
 
 
-def test_tests_timeout_minutes_raised_from_30() -> None:
-    """The Tests job ``timeout-minutes`` must be at least 75.
+def test_tests_timeout_minutes_at_hosted_derived_bound() -> None:
+    """The Tests job ``timeout-minutes`` must stay at the hosted bound (22).
 
-    30 min was the value that produced the #1254 false reds: under contention
-    the suite stretched to 29:43 and the 30m job timeout killed it at the
-    finish line. 45 min (#1254 raise) cleared the then-observed contended
-    runtime (30m) by ~1.5x but was itself overtaken: the ``suite`` runner-label
-    semaphore (#1404) bounds cw Tests to 2 concurrent, yet the host also
-    carries job-cannon's two ``suite`` legs plus dispatch-tree pytest
-    sessions, so per-repo semaphores cannot see each other and a suite that
-    runs 7:38 solo at -n 2 took 43.7 min with three siblings. 45m left only
-    ~12% headroom and overnight 2026-08-23/24, 9 of 16 completed Tests runs
-    were cap-killed at 45m (#1434). 75 min clears the worst measured
-    contended runtime (43.7m) by ~70% while still catching genuine hangs.
+    History: 30 produced the #1254 false reds (under contention the suite
+    stretched to 29:43 and the 30m cap killed it at the finish line); 45
+    (#1254 raise) was itself overtaken by sustained cross-repo contention
+    and cap-killed 9 of 16 overnight runs (#1434); 75 cleared the worst
+    measured contended runtime (43.7m) by ~70%. #1500 carried 75 onto
+    hosted runners as a first-runs backstop -- but dedicated single-use
+    VMs have no cross-job contention, so the contention-derived bound was
+    far looser than a genuine hang needs.
+
+    #1504 recalibrated from hosted data: 205 successful Tests jobs created
+    after the #1500 merge commit ran min 8.5 / median 11.9 / p95 14.0 /
+    max 15.9 min, and 22 clears the observed max by ~38% (the #1254
+    method's ~25-50% band). The floor blocks speculative tightening back
+    toward the observed max without a re-derivation (the #1434 failure
+    mode was PASSED suites cap-killed during cleanup); the ceiling blocks
+    drifting back toward the contention-era numbers (45/75), which only
+    ever made sense on the shared box -- on a dedicated VM a bigger cap
+    just lets a hang burn longer.
     """
     tests_job = _tests_job()
     timeout = tests_job.get("timeout-minutes")
     assert timeout is not None, "ci.yml Tests job has no timeout-minutes"
-    assert timeout >= 75, (
-        f"ci.yml Tests job timeout-minutes is {timeout}, expected >= 75 -- "
-        "45 produced false reds under sustained cross-repo contention "
-        "(issue #1434; 30 produced false reds under contention, issue #1254)"
+    assert timeout >= 22, (
+        f"ci.yml Tests job timeout-minutes is {timeout}, expected >= 22 -- "
+        "22 is the hosted-era bound derived in #1504 (205 successful hosted "
+        "runs, observed max 15.9 min, ~38% margin); tightening below it "
+        "without re-deriving risks the #1434/#1254 cap-killed-PASSED-suite "
+        "failure mode"
+    )
+    assert timeout <= 30, (
+        f"ci.yml Tests job timeout-minutes is {timeout}, expected <= 30 -- "
+        "the contention-era numbers (45/75) were bounds on a shared "
+        "self-hosted box; on a dedicated hosted VM they only let a genuine "
+        "hang burn longer before being killed (issue #1504)"
     )
