@@ -5826,6 +5826,37 @@ class OrchestratorApp:
                 live_reviewed_head_sha is None or live_reviewed_head_sha != pr.get("headRefOid")
             )
             if not decision_path.exists() or voided_stale_verdict:
+                if voided_stale_verdict:
+                    # Issue #1695: preserve the verdict being voided in the
+                    # rounds archive before the pending stub overwrites the
+                    # flat file. record_review archives every verdict it
+                    # records, but _update_approval_head's carry-forward
+                    # re-pin deliberately writes flat-only
+                    # (archive_round=False) -- a carried-forward verdict
+                    # exists ONLY here, so overwriting it would destroy the
+                    # sole copy. Routing the resolved payload through the
+                    # single writer archives it under _next_round_number's
+                    # dedup: a verbatim re-archive of the highest round is a
+                    # retry onto that round, while a carried-forward payload
+                    # (reviewed_head_sha is a compare key) mints the next
+                    # round. ``head_sha=None`` leaves the payload's own
+                    # reviewed_head_sha untouched -- re-stamping it to the
+                    # live head here would fabricate a verdict pin that was
+                    # never recorded. ``verdict_provenance`` is re-stated
+                    # explicitly (the write-site provenance scan, issue
+                    # #1265): a verdict that predates the contract archives
+                    # with an explicit None rather than omitting the key --
+                    # the same sentinel convention as the pending stub
+                    # below.
+                    record_decision(
+                        pr_dir,
+                        {
+                            **live_decision,
+                            "verdict_provenance": live_decision.get("verdict_provenance"),
+                        },
+                        None,
+                        archive_round=True,
+                    )
                 # Issue #1362 Stage 2: routed through the single writer so the
                 # placeholder is head-stamped like every other verdict --
                 # ``reviewed_head_sha`` lets a "pending" that is actually
