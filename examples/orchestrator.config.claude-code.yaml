@@ -34,6 +34,18 @@ review:
   # conflict / no-op rework before escalating to agent:human-needed.
   # max_conflict_rework_attempts: 2
   # max_no_op_rework_attempts: 2
+  # Issue #1642: a request_changes verdict whose required_changes ask for a
+  # human/operator decision is reclassified to blocked (agent:human-needed)
+  # instead of routing to automated rework. These are the case-insensitive
+  # substring markers; tune to taste.
+  # human_decision_markers:
+  #   - human
+  #   - operator
+  #   - sign-off
+  #   - signoff
+  #   - sign off
+  #   - not automated rework
+  #   - confirm explicitly
   require_tests_or_rationale: true
   require_issue_link: true
 
@@ -90,6 +102,7 @@ auto_merge:
   required_checks:
     - Test
     - "Lint, Types & Pre-commit"
+    - "Collect-only gate"
   # Extra flags appended to the `gh pr merge` invocation. Takes precedence
   # over the legacy `admin` field. Use this for protected-base merges
   # (e.g., ["--admin"] when your gh auth has admin on the repo) or
