@@ -118,6 +118,7 @@ from .unescalate_reset_fields import (
     UNESCALATE_ISSUE_RESET_FIELDS,
     UNESCALATE_PR_RESET_FIELDS,
 )
+from .merge_finalize import _merged_issue_fields  # noqa: F401  (deliberate re-export; used by moved merge-finalization delegates via _wf.)
 from .state import (
     PASSIVE_OPEN_STATUS,
     StateLockBusy,
@@ -7219,12 +7220,17 @@ class OrchestratorApp:
             existing_pr_state = state["prs"].get(str(pr_number), {})
             if existing_pr_state.get("status") == "merged":
                 # Clear any stale merge alert so a reopened issue can re-alert.
+                # Issue #1493: apply the same merged-issue field set here too,
+                # so a record the post-merge_pr block left half-finalized (or
+                # that predates it) converges on re-entry instead of staying
+                # stale at "approved" forever.
                 _issue_number = existing_pr_state.get("issue_number")
                 if _issue_number is not None:
                     _issue_key = str(_issue_number)
                     _issue_entry = state["issues"].get(_issue_key, {})
-                    if _issue_entry.get("merge_alert") != "OK":
-                        state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
+                    _finalized = _merged_issue_fields(_issue_entry, _issue_number)
+                    if _finalized != _issue_entry:
+                        state["issues"][_issue_key] = _finalized
                         save_state(self.paths.state_file, state)
                 return CommandResult(
                     True,
@@ -8025,7 +8031,15 @@ class OrchestratorApp:
                     if issue_number is not None:
                         _issue_key = str(issue_number)
                         _issue_entry = state["issues"].get(_issue_key, {})
-                        state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
+                        # Issue #1493: the issue record must advance to the same
+                        # terminal disposition as the PR -- not just merge_alert.
+                        # Leaving status at "approved" parked the record in the
+                        # dead zone reconcile deliberately never repairs (merge
+                        # finalization owns it), so session liveness checks
+                        # re-evaluated the issue as mid-flight on every pass.
+                        state["issues"][_issue_key] = _merged_issue_fields(
+                            _issue_entry, issue_number
+                        )
                     save_state(self.paths.state_file, state)
                 # Label + branch cleanup are best-effort; the merged fact is already
                 # durable. A branch-deletion failure (head branch checked out in a
