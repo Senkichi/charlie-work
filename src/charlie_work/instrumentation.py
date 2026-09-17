@@ -559,6 +559,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # ``salvage_pushed_stranded_commits`` rather than to
         # ``salvage_push_failed`` (which is a genuine failure to publish).
         "salvage_skipped_already_landed": "info",
+        # Local-file issue source: the dead session left commits on its
+        # branch and the backend cannot host PRs, so salvage parked the
+        # issue as review-ready instead of pushing. Info: this is the
+        # success path for a repo with no remote, the local counterpart of
+        # ``session_salvaged`` without that kind's "a worker died" reading.
+        "local_work_ready": "info",
         # Issue #1241: the pre-open reachability re-check found the salvage
         # branch's tip already reachable from origin/main (the work merged via
         # a merge commit whose tree differed from the salvage head's tree --

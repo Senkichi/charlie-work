@@ -18,6 +18,22 @@ NO_MERGE_CONTRACT_MARKERS: tuple[str, ...] = (
     "Your deliverable ENDS at pushing the branch and opening the PR",
 )
 
+# The local-file issue source (no remote, no PRs) ships its own statement of
+# the same contract, ``worker_sections/local_no_merge_contract.md``: the PR
+# wording above would order a worker to push to a remote that does not exist.
+# The invariant the guard protects is "the worker is told where its deliverable
+# ends and that merging / relabeling is not its job" -- either variant, fully
+# present, carries it. A prompt with neither still fails.
+LOCAL_NO_MERGE_CONTRACT_MARKERS: tuple[str, ...] = (
+    "## No-merge contract",
+    "Your deliverable ENDS at committing to your branch",
+)
+
+NO_MERGE_CONTRACT_VARIANTS: tuple[tuple[str, ...], ...] = (
+    NO_MERGE_CONTRACT_MARKERS,
+    LOCAL_NO_MERGE_CONTRACT_MARKERS,
+)
+
 
 class MissingNoMergeContractError(RuntimeError):
     """A rendered worker/rework prompt is missing the no-merge contract.
@@ -50,9 +66,11 @@ def assert_no_merge_contract(prompt: str, *, context: str = "worker prompt") -> 
     reference is caught regardless of how the override was structured.
     """
 
+    if any(all(m in prompt for m in variant) for variant in NO_MERGE_CONTRACT_VARIANTS):
+        return
+    # Report against the PR variant: it is the one every override predates.
     missing = tuple(m for m in NO_MERGE_CONTRACT_MARKERS if m not in prompt)
-    if missing:
-        raise MissingNoMergeContractError(context, missing)
+    raise MissingNoMergeContractError(context, missing)
 
 
 # Markers that must appear in every rendered *worker* (not rework) prompt's
