@@ -87,18 +87,27 @@ jobs:
     # unchanged on hosted runners, where there is also no capacity shortage
     # for a group to "solve".
     #
-    # 75 min: carried over from the self-hosted era as a first-runs backstop,
-    # NOT a hosted-derived bound. The old number was contention-derived
-    # (shared box: a suite that ran 7:38 solo took 43.7 min under full
-    # overlap, and 45 min cap-killed 9 of 16 overnight runs -- #1434).
-    # Hosted VMs have no cross-job contention, but a standard 4-core
-    # windows-latest VM is much slower hardware than the old host and there
-    # is zero hosted timing data for this suite yet. Recalibrate from real
-    # runs once a few weeks of data exist (follow-up issue); do not tighten
-    # speculatively -- the #1434 failure mode was suites that PASSED being
-    # killed during cleanup by an optimistic cap, cycling
+    # Timeout history: 30 (original) -> 45 (#1254: contended runs hit 29:43
+    # and the cap produced false reds) -> 75 (#1434: a suite that ran 7:38
+    # solo took 43.7 min under full sibling overlap on the shared box, and
+    # 45 cap-killed 9 of 16 overnight runs). #1500 carried 75 onto hosted
+    # runners as a first-runs backstop; the contention it encodes does not
+    # exist on dedicated single-use VMs.
+    #
+    # 22 min: derived 2026-09-17 from hosted runs (#1504). Window = every
+    # CI run created after the #1500 merge commit (f9b96b3); 205 successful
+    # Tests jobs ran min 8.5 / median 11.9 / p95 14.0 / max 15.9 min
+    # (job started_at -> completed_at = whole job including checkout and
+    # uv sync, not just pytest). Non-success runs stayed under ~19 min
+    # except one superseded run still in-flight at 55 min when cancelled
+    # -- an outlier, not a completion time. 22 clears the observed max by
+    # ~38%, inside the #1254 method's ~25-50% band: headroom for suite
+    # growth, while a genuine hang now dies at 22 min instead of burning
+    # 75. If future data pushes typical runs toward the cap, re-derive
+    # from the Actions API rather than bumping by feel -- the #1434
+    # failure mode was PASSED suites cap-killed during cleanup, cycling
     # merge_failed_attempt_alarm.
-    timeout-minutes: 75
+    timeout-minutes: 22
     steps:
       - uses: actions/checkout@v5
       # setup-uv restored (2026-08-28). It was replaced by a PATH-append step
@@ -161,14 +170,16 @@ jobs:
         # box-sharing discipline -- CI shared 8 physical cores with a second
         # runner and the orchestrator's own dispatch tree (issue 646: ~36
         # uncapped workers took a 6.4-min suite to ~145 min). A hosted VM is
-        # dedicated, so auto is the right default. Note auto resolves to the
-        # VM's PHYSICAL core count, not vCPUs (xdist's psutil branch passes
-        # logical=False; `-n logical` is the spelling for the logical count);
-        # the resolved number on these images is unmeasured, because addopts'
-        # -q suppresses xdist's worker-count header -- add -v to a run to
-        # observe it. (pytest-xdist honors PYTEST_XDIST_AUTO_NUM_WORKERS when
-        # set; nothing in this workflow sets it. env_sanitize.py's =2 governs
-        # only the orchestrator's own dispatched sessions, not CI.)
+        # dedicated, so auto is the right default. auto resolves to the VM's
+        # PHYSICAL core count, not vCPUs (xdist's psutil branch passes
+        # logical=False; `-n logical` is the spelling for the logical count):
+        # on windows-latest that is 2 workers, because the image's 4 vCPUs
+        # are 2 hyperthreaded physical cores (measured 2026-09-17, run
+        # 35260087583 -- a -v run nets verbosity 0 against addopts' -q,
+        # un-suppressing xdist's "created: 2/2 workers" header that -q
+        # otherwise hides). (pytest-xdist honors PYTEST_XDIST_AUTO_NUM_WORKERS
+        # when set; nothing in this workflow sets it. env_sanitize.py's =2
+        # governs only the orchestrator's own dispatched sessions, not CI.)
         # --dist=load (xdist's default, spelled out for clarity) rather than
         # loadfile: tests/test_worktree.py alone is ~240 of the suite's
         # ~6,000 tests and the heaviest file by wall time (real git.exe
@@ -184,7 +195,7 @@ jobs:
         # into a single <testsuites> document, so one file holds the full
         # recorded set. The file is a CI artifact only (not uploaded) -- the
         # gate fails the step in-process; a human reads the gate's stdout.
-        run: uv run pytest --tb=short -n auto --dist=load --junit-xml=pytest-junit.xml -v
+        run: uv run pytest --tb=short -n auto --dist=load --junit-xml=pytest-junit.xml
       - name: Recorded-vs-collected check (issue #1621)
         # Fail the job when the junit <testcase> count differs from the
         # collected count -- the load-truncation failure mode where pytest
