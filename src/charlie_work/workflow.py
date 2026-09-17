@@ -94,14 +94,6 @@ from .prompts import (
     resolve_template,
     unsupplied_placeholders,
 )
-from .reconcile import (  # noqa: F401  (deliberate re-export; reconcile symbols reached via charlie_work.reconcile by orchestration/misc_reconcile.py; keeps reconcile.py live in the import-reachability graph, see tests/test_dormant_fleet_marking.py)
-    DriftItem,
-    apply_fixes as apply_drift_fixes,
-    detect_aviator_stale_blocked,
-    detect_drift,
-    detect_mergequeue_not_approved,
-    detect_mergequeue_wedged,
-)
 from .review_decision import (
     record_decision,
     review_decision,
