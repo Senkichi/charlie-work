@@ -45,6 +45,14 @@ Usage::
     # Dry run: print what would change without writing.
     python scripts/refresh_file_size_ratchet.py --dry-run
 
+    # Fixed-point gate (issue #1675): recompute the lower-only refresh in
+    # memory and exit non-zero -- listing the pending changes -- when the
+    # checked-in baseline is not already a fixed point. Writes nothing. A PR
+    # that shrinks an over-cap file or deletes one must lower/drop its mark
+    # in the same diff; tests/test_file_size_ratchet.py enforces this mode
+    # against the real tree so the tightening cannot be left unclaimed.
+    python scripts/refresh_file_size_ratchet.py --check
+
 The covered file set is derived from a live scan of tracked ``*.py`` files
 (``git ls-files``) plus the baseline's own keys -- never a hardcoded list
 (issue #1375: derive-what-is-covered fails closed). The size cap is the repo's
@@ -193,22 +201,21 @@ def _init(repo_root: Path, baseline_path: Path, dry_run: bool) -> int:
     return 0
 
 
-def _lower(repo_root: Path, baseline_path: Path, dry_run: bool) -> int:
-    """Lower-only maintenance: lower each mark to the current line count
-    quantized up to a multiple of ``MARK_QUANTUM`` -- and only when that
-    quantized value is strictly BELOW the recorded mark (never raise). Drop
-    entries for files that fell under the cap or were deleted. Never adds new
-    entries -- a new over-cap file requires an explicit reviewed baseline
-    edit."""
-    baseline = _load_baseline(baseline_path)
-    if not baseline:
-        print(
-            f"ERROR: no baseline at {baseline_path}. Run with --init first to "
-            "create it from the live tree.",
-            file=sys.stderr,
-        )
-        return 1
-    over = _scan_over_cap(repo_root)
+def _lower_plan(
+    baseline: dict[str, int], over: dict[str, int]
+) -> tuple[dict[str, int], list[str]]:
+    """Pure lower-only refresh plan, shared by ``_lower`` (which applies it)
+    and ``_check`` (which verifies the checked-in baseline already equals it).
+
+    Returns ``(updated_baseline, change_lines)``: each mark lowered to the
+    live count quantized up to a multiple of ``MARK_QUANTUM`` -- only when
+    that quantized value is strictly BELOW the recorded mark (never raise) --
+    and each entry whose file fell under the cap or was deleted dropped.
+    Never adds new entries; a new over-cap file requires an explicit reviewed
+    baseline edit. ``change_lines`` is the human-readable plan in the
+    script's ``-``/``~``/``!`` notation; ``!`` lines report growth the map
+    leaves alone and do not alter ``updated_baseline``.
+    """
     updated = dict(baseline)
     changes: list[str] = []
     for path, mark in baseline.items():
@@ -231,6 +238,25 @@ def _lower(repo_root: Path, baseline_path: Path, dry_run: bool) -> int:
                 f"  ! {path}: {mark} -> live={current} (GROWTH -- not raised; CI will "
                 f"fail; a reviewed raise must use {target})"
             )
+    return updated, changes
+
+
+def _lower(repo_root: Path, baseline_path: Path, dry_run: bool) -> int:
+    """Lower-only maintenance: lower each mark to the current line count
+    quantized up to a multiple of ``MARK_QUANTUM`` -- and only when that
+    quantized value is strictly BELOW the recorded mark (never raise). Drop
+    entries for files that fell under the cap or were deleted. Never adds new
+    entries -- a new over-cap file requires an explicit reviewed baseline
+    edit."""
+    baseline = _load_baseline(baseline_path)
+    if not baseline:
+        print(
+            f"ERROR: no baseline at {baseline_path}. Run with --init first to "
+            "create it from the live tree.",
+            file=sys.stderr,
+        )
+        return 1
+    updated, changes = _lower_plan(baseline, _scan_over_cap(repo_root))
     if not changes:
         print(f"no changes; baseline at {baseline_path} is current")
         return 0
@@ -246,9 +272,58 @@ def _lower(repo_root: Path, baseline_path: Path, dry_run: bool) -> int:
     return 0
 
 
+def _check(repo_root: Path, baseline_path: Path) -> int:
+    """Fixed-point gate (issue #1675): recompute the lower-only refresh in
+    memory and exit non-zero -- listing the pending changes -- when the
+    checked-in baseline is not already a fixed point. Writes nothing.
+
+    "Fixed point" is judged on the baseline CONTENT the refresh would
+    produce: pending lowerings (``~``) and dead-entry drops (``-``) fail the
+    check. Growth past a mark (``!``) does not change the refresh's output --
+    the lower-only map leaves that mark alone by design -- so a pure-growth
+    state still exits 0 here; that violation is the ratchet keystone's
+    (``test_over_cap_files_do_not_exceed_high_water_mark`` in
+    tests/test_file_size_ratchet.py) to report, not this gate's.
+    """
+    baseline = _load_baseline(baseline_path)
+    if not baseline:
+        print(
+            f"ERROR: no baseline at {baseline_path}. Run with --init first to "
+            "create it from the live tree.",
+            file=sys.stderr,
+        )
+        return 1
+    updated, changes = _lower_plan(baseline, _scan_over_cap(repo_root))
+    if updated == baseline:
+        print(f"no pending lowerings; baseline at {baseline_path} is a fixed point")
+        for c in changes:
+            # Only '!' growth notices can be present here -- informational;
+            # the ratchet keystone owns that failure, not this gate.
+            print(c)
+        return 0
+    print(
+        f"baseline at {baseline_path} is not a fixed point of the lower-only "
+        "refresh; run `python scripts/refresh_file_size_ratchet.py` and commit "
+        "the updated file_size_ratchet_baseline.json in the same PR to apply:"
+    )
+    for c in changes:
+        print(c)
+    return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--init", action="store_true", help="one-time baseline generation")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--init", action="store_true", help="one-time baseline generation")
+    mode.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "fixed-point gate: exit non-zero (listing pending changes) when the "
+            "checked-in baseline is not already a fixed point of the lower-only "
+            "refresh; writes nothing (issue #1675)"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="print changes without writing")
     args = parser.parse_args()
 
@@ -256,6 +331,10 @@ def main() -> int:
     baseline_path = repo_root / _BASELINE_NAME
     if args.init:
         return _init(repo_root, baseline_path, args.dry_run)
+    if args.check:
+        if args.dry_run:
+            parser.error("--check never writes; --dry-run is redundant")
+        return _check(repo_root, baseline_path)
     return _lower(repo_root, baseline_path, args.dry_run)
 
 
