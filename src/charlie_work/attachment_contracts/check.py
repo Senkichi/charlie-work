@@ -69,7 +69,12 @@ def check_tree(
     enables the diff-based ratchet-tamper guard (raise-to-match laundering,
     finding #1) -- it is optional and CI-only (it needs a prior commit's
     baseline as an independent reference point) because the per-edit hook
-    path has no git context and should stay cheap.
+    path has no git context and should stay cheap. When it is given, a
+    second LIVE ``saturate_all`` pass feeds the guard's generation-event
+    verification: a ``kind_stats`` change is only sanctioned when it equals
+    a live recompute of this tree (round-4 review -- the document's own
+    ``generated_at`` stamp is forgeable and cannot be the sole
+    discriminator).
 
     Issue #1614: when the committed baseline carries frozen per-kind Tukey
     statistics (``kind_stats``), live points are saturated against the FROZEN
@@ -111,9 +116,23 @@ def check_tree(
             kind_stats = baseline_mod.kind_stats_of(document)
             if kind_stats:
                 verdicts = saturate_all_with_fences(scan.points, kind_stats)
+                # Round-4 review: the ratchet-tamper guard verifies a claimed
+                # baseline regeneration against a LIVE recompute of this tree
+                # (generated_at is a self-declared field a hand-edit can
+                # forge). Compute it only when the guard can actually run --
+                # check_file's per-edit hook path has no previous document
+                # and stays cheap.
+                live_verdicts = (
+                    saturate_all(scan.points, sorted({p.kind for p in scan.points}))
+                    if previous_baseline_document is not None
+                    else None
+                )
             else:
                 kinds = sorted({p.kind for p in scan.points})
                 verdicts = saturate_all(scan.points, kinds)
+                # The verdicts ARE the live recompute; reuse them for the
+                # ratchet-tamper guard's regen verification.
+                live_verdicts = verdicts
             compare_findings, _ratcheted = baseline_mod.compare(verdicts, document)
             findings.extend(
                 _enrich_with_redirect(f, scan) if f.severity == "block" else f
@@ -121,7 +140,9 @@ def check_tree(
             )
             findings.extend(baseline_mod.check_tamper(verdicts, document))
             findings.extend(
-                baseline_mod.check_ratchet_tamper(previous_baseline_document, document)
+                baseline_mod.check_ratchet_tamper(
+                    previous_baseline_document, document, live_verdicts=live_verdicts
+                )
             )
 
     findings.sort(key=lambda f: (_SEVERITY_RANK.get(f.severity, 99), f.file, f.identity))

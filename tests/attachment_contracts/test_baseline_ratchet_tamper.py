@@ -6,10 +6,12 @@ Two guards over consecutive committed baselines:
   member_count field may only ever hold or lower on the ratchet path, so any
   rise is a hand-edit.
 - Frozen per-kind Tukey fence (issue #1614): a ratchet preserves ``kind_stats``
-  verbatim; only a generation event (full ``baseline`` regen / ``--refreeze``,
-  which stamp a fresh ``generated_at``) may recompute it. Any same-generation
-  difference -- modified stats, a removed or added kind -- is tamper, and the
-  key disappearing outright is tamper unconditionally.
+  verbatim; only a generation event (full ``baseline`` regen / ``--refreeze``)
+  may recompute it. A generation event is recognized by BOTH a re-stamped
+  ``generated_at`` AND statistics equal to a live recompute of the tree under
+  check -- the timestamp alone is a self-declared field a hand-edit can forge.
+  Any difference outside that -- modified stats, a removed or added kind -- is
+  tamper, and the key disappearing outright is tamper unconditionally.
 """
 
 from __future__ import annotations
@@ -100,7 +102,7 @@ def test_ratchet_tamper_detects_raise_to_match_laundering() -> None:
         )
     )
 
-    findings = check_ratchet_tamper(previous, current)
+    findings = check_ratchet_tamper(previous, current, live_verdicts=None)
 
     assert len(findings) == 1
     assert findings[0].severity == "error"
@@ -115,7 +117,7 @@ def test_ratchet_tamper_clean_when_unchanged() -> None:
     previous = _doc_with_entries(entry)
     current = _doc_with_entries(entry)
 
-    assert check_ratchet_tamper(previous, current) == []
+    assert check_ratchet_tamper(previous, current, live_verdicts=None) == []
 
 
 def test_ratchet_tamper_clean_on_legitimate_ratchet_down() -> None:
@@ -126,7 +128,7 @@ def test_ratchet_tamper_clean_on_legitimate_ratchet_down() -> None:
         BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=5, boundary=6.0)
     )
 
-    assert check_ratchet_tamper(previous, current) == []
+    assert check_ratchet_tamper(previous, current, live_verdicts=None) == []
 
 
 def test_ratchet_tamper_clean_for_a_brand_new_entry() -> None:
@@ -135,7 +137,7 @@ def test_ratchet_tamper_clean_for_a_brand_new_entry() -> None:
         BaselineEntry(kind="class", identity="new", file="src/n.py", member_count=10, boundary=6.0)
     )
 
-    assert check_ratchet_tamper(previous, current) == []
+    assert check_ratchet_tamper(previous, current, live_verdicts=None) == []
 
 
 def test_ratchet_tamper_no_findings_when_no_previous_document() -> None:
@@ -143,7 +145,7 @@ def test_ratchet_tamper_no_findings_when_no_previous_document() -> None:
         BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=999, boundary=6.0)
     )
 
-    assert check_ratchet_tamper(None, current) == []
+    assert check_ratchet_tamper(None, current, live_verdicts=None) == []
 
 
 def test_ratchet_tamper_bump_does_not_excuse_a_member_count_raise() -> None:
@@ -166,7 +168,7 @@ def test_ratchet_tamper_bump_does_not_excuse_a_member_count_raise() -> None:
         )
     )
 
-    findings = check_ratchet_tamper(previous, current)
+    findings = check_ratchet_tamper(previous, current, live_verdicts=None)
 
     assert len(findings) == 1
 
@@ -187,7 +189,7 @@ def test_check_ratchet_tamper_detects_raised_frozen_boundary() -> None:
         **_doc_with_entries(),
         KIND_STATS_KEY: {"class": {"q3": 20.0, "iqr": 2.0, "boundary": 23.0, "population": 8}},
     }
-    findings = check_ratchet_tamper(previous, current)
+    findings = check_ratchet_tamper(previous, current, live_verdicts=None)
     assert len(findings) == 1
     assert findings[0].severity == "error"
     assert "frozen" in findings[0].message and "class" in findings[0].message
@@ -203,15 +205,15 @@ def test_check_ratchet_tamper_clean_when_frozen_boundary_unchanged() -> None:
         **_doc_with_entries(),
         KIND_STATS_KEY: {"class": {"q3": 14.0, "iqr": 2.0, "boundary": 17.0, "population": 8}},
     }
-    assert check_ratchet_tamper(base, unchanged) == []
+    assert check_ratchet_tamper(base, unchanged, live_verdicts=None) == []
 
 
 def test_check_ratchet_tamper_flags_lowered_frozen_boundary() -> None:
     # A ratchet preserves kind_stats VERBATIM -- there is no "ratchet down"
     # for the frozen fence the way there is for member_count, so a lowered
-    # boundary on a same-generation transition is just as unsanctioned as a
-    # raised one: only a generation event (regen / --refreeze, which re-stamp
-    # generated_at) may move it.
+    # boundary on a ratchet-to-ratchet transition is just as unsanctioned as
+    # a raised one: only a verified generation event (regen / --refreeze)
+    # may move it.
     base = {
         **_doc_with_entries(),
         KIND_STATS_KEY: {"class": {"q3": 14.0, "iqr": 2.0, "boundary": 17.0, "population": 8}},
@@ -220,7 +222,7 @@ def test_check_ratchet_tamper_flags_lowered_frozen_boundary() -> None:
         **_doc_with_entries(),
         KIND_STATS_KEY: {"class": {"q3": 12.0, "iqr": 2.0, "boundary": 15.0, "population": 8}},
     }
-    findings = check_ratchet_tamper(base, lowered)
+    findings = check_ratchet_tamper(base, lowered, live_verdicts=None)
     assert len(findings) == 1
     assert findings[0].severity == "error"
     assert "lowered" in findings[0].message
@@ -239,7 +241,7 @@ def test_check_ratchet_tamper_flags_same_boundary_stats_tweak() -> None:
         **_doc_with_entries(),
         KIND_STATS_KEY: {"class": {"q3": 14.0, "iqr": 0.0, "boundary": 17.0, "population": 8}},
     }
-    findings = check_ratchet_tamper(base, tweaked)
+    findings = check_ratchet_tamper(base, tweaked, live_verdicts=None)
     assert len(findings) == 1
     assert findings[0].severity == "error"
     assert "modified" in findings[0].message
@@ -253,12 +255,13 @@ def test_check_ratchet_tamper_clean_when_neither_document_has_kind_stats() -> No
     current = _doc_with_entries(
         BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0)
     )
-    assert check_ratchet_tamper(previous, current) == []
+    assert check_ratchet_tamper(previous, current, live_verdicts=None) == []
 
 
 # ---------------------------------------------------------------------------
 # Generation-event discriminator + key-removal
-# (round-3 review: --refreeze false-positive / kind_stats-strip false-negative)
+# (round-3 review: --refreeze false-positive / kind_stats-strip false-negative;
+#  round-4 review: generated_at forgery bypass -> live-recompute binding)
 # ---------------------------------------------------------------------------
 
 
@@ -267,6 +270,8 @@ def test_check_ratchet_tamper_clean_on_refreeze_raised_boundary() -> None:
     # recomputes the frozen fence and MAY legitimately raise a kind's
     # boundary. It must not be flagged as tamper. Exercises the real CLI
     # sequence: compare() against live verdicts, then with_kind_stats().
+    # The guard now verifies the regen claim against the same live verdicts
+    # the refreeze consumed -- a fresh generated_at alone is not enough.
     previous = generate(
         (_verdict_kind("big", 20, "class", boundary=17.0, saturated=True),),
         generated_by="x",
@@ -278,25 +283,28 @@ def test_check_ratchet_tamper_clean_on_refreeze_raised_boundary() -> None:
     refrozen = with_kind_stats(ratcheted, live_verdicts, generated_at="t2")
 
     assert kind_stats_of(refrozen)["class"].boundary == 23.0
-    assert check_ratchet_tamper(previous, refrozen) == []
+    assert check_ratchet_tamper(previous, refrozen, live_verdicts=live_verdicts) == []
 
 
 def test_check_ratchet_tamper_clean_on_full_regen() -> None:
     # A fresh full `baseline` run writes a new generated_at and may recompute
     # the fence upward; it is reviewed as a whole-document diff, not flagged.
+    # Same live-recompute binding: the regenerated document's kind_stats equal
+    # what the live verdicts produce.
     previous = generate(
         (_verdict_kind("big", 20, "class", boundary=17.0, saturated=True),),
         generated_by="x",
         generated_at="t1",
         floor=4,
     )
+    live_verdicts = (_verdict_kind("big", 20, "class", boundary=23.0, saturated=True),)
     regenerated = generate(
-        (_verdict_kind("big", 20, "class", boundary=23.0, saturated=True),),
+        live_verdicts,
         generated_by="x",
         generated_at="t2",
         floor=4,
     )
-    assert check_ratchet_tamper(previous, regenerated) == []
+    assert check_ratchet_tamper(previous, regenerated, live_verdicts=live_verdicts) == []
 
 
 def test_check_ratchet_tamper_flags_stripped_kind_stats_key() -> None:
@@ -313,7 +321,7 @@ def test_check_ratchet_tamper_flags_stripped_kind_stats_key() -> None:
     stripped = {k: v for k, v in previous.items() if k != KIND_STATS_KEY}
     assert KIND_STATS_KEY in previous and KIND_STATS_KEY not in stripped
 
-    findings = check_ratchet_tamper(previous, stripped)
+    findings = check_ratchet_tamper(previous, stripped, live_verdicts=None)
     assert len(findings) == 1
     assert findings[0].severity == "error"
     assert findings[0].identity == KIND_STATS_KEY
@@ -323,7 +331,8 @@ def test_check_ratchet_tamper_flags_stripped_kind_stats_key() -> None:
 def test_check_ratchet_tamper_flags_stripped_key_even_with_fresh_generated_at() -> None:
     # A hand-deletion that also bumps generated_at to impersonate a regen
     # still cannot explain a missing key: generate()/with_kind_stats() always
-    # emit it. Key removal is therefore flagged unconditionally.
+    # emit it. Key removal is therefore flagged unconditionally -- even with
+    # live verdicts available for the regen claim to be checked against.
     previous = generate(
         (_verdict_kind("big", 20, "class", boundary=17.0, saturated=True),),
         generated_by="x",
@@ -334,7 +343,11 @@ def test_check_ratchet_tamper_flags_stripped_key_even_with_fresh_generated_at() 
         **{k: v for k, v in previous.items() if k != KIND_STATS_KEY},
         "generated_at": "t2",
     }
-    findings = check_ratchet_tamper(previous, stripped)
+    findings = check_ratchet_tamper(
+        previous,
+        stripped,
+        live_verdicts=(_verdict_kind("big", 20, "class", boundary=23.0, saturated=True),),
+    )
     assert len(findings) == 1
     assert findings[0].identity == KIND_STATS_KEY
 
@@ -356,7 +369,7 @@ def test_check_ratchet_tamper_flags_removed_kind() -> None:
         **previous,
         KIND_STATS_KEY: {"class": {"q3": 14.0, "iqr": 2.0, "boundary": 17.0, "population": 4}},
     }
-    findings = check_ratchet_tamper(previous, shrunk)
+    findings = check_ratchet_tamper(previous, shrunk, live_verdicts=None)
     assert len(findings) == 1
     assert findings[0].severity == "error"
     assert findings[0].identity == "kind_stats:test_module"
@@ -378,8 +391,85 @@ def test_check_ratchet_tamper_flags_added_kind() -> None:
             "test_module": {"q3": 30.0, "iqr": 5.0, "boundary": 1000.0, "population": 8},
         },
     }
-    findings = check_ratchet_tamper(previous, added)
+    findings = check_ratchet_tamper(previous, added, live_verdicts=None)
     assert len(findings) == 1
     assert findings[0].severity == "error"
     assert findings[0].identity == "kind_stats:test_module"
     assert "appeared" in findings[0].message
+
+
+# ---------------------------------------------------------------------------
+# generated_at forgery bypass (round-4 review)
+# ---------------------------------------------------------------------------
+
+
+def test_check_ratchet_tamper_flags_raised_boundary_even_with_fresh_generated_at() -> None:
+    # Regression (round-4 finding): generated_at is a self-declared field in
+    # the same document an attacker is hand-editing, so bumping it alongside a
+    # raised boundary used to read as a sanctioned regen and skip every
+    # kind_stats check -- the exact laundering vector this guard exists to
+    # close. The regen claim is now verified against a live recompute of the
+    # tree: the forged stats do not match it, so the edit is still tamper.
+    honest_verdicts = (_verdict_kind("big", 20, "class", boundary=17.0, saturated=True),)
+    previous = generate(
+        honest_verdicts,
+        generated_by="x",
+        generated_at="t1",
+        floor=4,
+    )
+    forged = {
+        **previous,
+        "generated_at": "t2",
+        KIND_STATS_KEY: {"class": {"q3": 14.0, "iqr": 2.0, "boundary": 1000.0, "population": 4}},
+    }
+    findings = check_ratchet_tamper(previous, forged, live_verdicts=honest_verdicts)
+    assert len(findings) == 1
+    assert findings[0].severity == "error"
+    assert findings[0].identity == "kind_stats:class"
+    assert "tamper" in findings[0].message
+    assert "17.0" in findings[0].message and "1000.0" in findings[0].message
+
+
+def test_check_ratchet_tamper_flags_stats_change_when_live_verdicts_unavailable() -> None:
+    # Fail closed: with no live recompute to verify a claimed regen against,
+    # a fresh generated_at alone cannot excuse a kind_stats change.
+    previous = generate(
+        (_verdict_kind("big", 20, "class", boundary=17.0, saturated=True),),
+        generated_by="x",
+        generated_at="t1",
+        floor=4,
+    )
+    forged = {
+        **previous,
+        "generated_at": "t2",
+        KIND_STATS_KEY: {"class": {"q3": 14.0, "iqr": 2.0, "boundary": 1000.0, "population": 4}},
+    }
+    findings = check_ratchet_tamper(previous, forged, live_verdicts=None)
+    assert len(findings) == 1
+    assert findings[0].severity == "error"
+    assert findings[0].identity == "kind_stats:class"
+
+
+def test_check_ratchet_tamper_flags_live_matching_stats_without_restamp() -> None:
+    # Both halves of the generation-event test are required: even statistics
+    # that DO match a live recompute are flagged when generated_at was not
+    # re-stamped -- every sanctioned writer (generate / with_kind_stats)
+    # re-stamps, so an unchanged stamp on changed stats is not tool output.
+    previous = generate(
+        (_verdict_kind("big", 20, "class", boundary=17.0, saturated=True),),
+        generated_by="x",
+        generated_at="t1",
+        floor=4,
+    )
+    live_verdicts = (_verdict_kind("big", 20, "class", boundary=23.0, saturated=True),)
+    rewritten = {
+        **previous,
+        KIND_STATS_KEY: {"class": {"q3": 20.0, "iqr": 2.0, "boundary": 23.0, "population": 4}},
+    }
+    assert kind_stats_of(rewritten) == kind_stats_of(
+        generate(live_verdicts, generated_by="x", generated_at="t2", floor=4)
+    )
+    findings = check_ratchet_tamper(previous, rewritten, live_verdicts=live_verdicts)
+    assert len(findings) == 1
+    assert findings[0].severity == "error"
+    assert findings[0].identity == "kind_stats:class"
