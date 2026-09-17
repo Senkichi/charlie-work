@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import os
 import re
 import shutil
@@ -51,6 +52,8 @@ from .rescue_capture_exclusions import (  # noqa: F401  (deliberate re-export)
     _is_glob_pathspec,
 )
 from .base_branch import resolve_base_branch_name  # noqa: F401  (deliberate re-export)
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 60
 # Shorter timeout for network-touching git commands (ls-remote, fetch) so a
@@ -336,7 +339,7 @@ class ReworkBranchConflictError(RuntimeError):
             super().__init__(
                 f"rework branch {branch!r} could not begin a merge with base "
                 f"{base_ref!r} (no MERGE_HEAD — this is a pre-merge failure, "
-                f"NOT a content conflict); blocking paths outside declared "
+                f"NOT a content conflict); blocking paths outside repairable "
                 f"scaffolding: {blocked}; git said: {detail}"
             )
             return
@@ -1422,7 +1425,9 @@ def _merge_update_rework_branch(
 
     ``injected_paths`` and ``materialize_dirs`` name the orchestrator's own
     scaffolding. They are used only to clear a self-inflicted pre-merge
-    collision (see below); nothing outside them is ever removed.
+    collision (see below); nothing outside them — plus the launcher-owned
+    root-level PR-body file family, which is likewise launcher-regenerable
+    residue — is ever removed.
 
     Raises:
         ReworkBranchConflictError: in two distinct situations, distinguished by
@@ -1437,12 +1442,15 @@ def _merge_update_rework_branch(
             ``stage="pre_merge"`` — the merge never began (no ``MERGE_HEAD``),
             and the reason could not be remediated. This is NOT a content
             conflict; the branch may merge perfectly cleanly. Two causes are
-            remediated, both being the orchestrator's own scaffolding colliding
+            remediated, both being self-inflicted residue colliding
             with the incoming tree in a reused worktree, and both repaired
             before a single retry: an *untracked* copy of a base-tracked file
             (removed), and a *locally modified tracked* file the merge would
             overwrite (restored from ``HEAD``). Anything else — or any blocker
-            outside the declared scaffolding — is left untouched and escalated.
+            outside the repairable residue (declared scaffolding plus the
+            launcher-owned PR-body file family — never launcher-owned
+            directories, which can be reparse points) — is left untouched and
+            escalated.
         RuntimeError: if the base ref cannot be fetched or the merge command
             itself cannot be run.
     """
@@ -1502,18 +1510,22 @@ def _merge_update_rework_branch(
         untracked_blocking = _untracked_paths_shadowing_ref(worktree_path, merge_base_ref)
         modified_blocking = _modified_paths_overwritten_by_ref(worktree_path, merge_base_ref)
         blocking = untracked_blocking + modified_blocking
-        undeclared = tuple(
-            path
-            for path in blocking
-            if not _declared_scaffolding_matcher(injected_paths, materialize_dirs)(path)
+        # Repair eligibility is the same "not worker product" definition the
+        # dirty check uses — declared scaffolding plus the launcher-owned
+        # PR-body file family — minus the launcher-owned directories, which
+        # stay ineligible because a directory can be a reparse point a
+        # destructive sweep would follow out of the worktree (issue #1688).
+        is_repairable = _non_worker_product_matcher(
+            injected_paths, materialize_dirs, include_launcher_dirs=False
         )
-        # The declared/undeclared verdict is taken over the *union*: a single
-        # undeclared blocker in either class means nothing is repaired at all,
-        # because a partial repair that still fails the merge would destroy
-        # files for no benefit.
+        unrepairable = tuple(path for path in blocking if not is_repairable(path))
+        # The repairable/unrepairable verdict is taken over the *union*: a
+        # single unrepairable blocker in either class means nothing is
+        # repaired at all, because a partial repair that still fails the
+        # merge would destroy files for no benefit.
         if (
             blocking
-            and not undeclared
+            and not unrepairable
             and _repair_declared_scaffolding_blockers(
                 worktree_path,
                 untracked_blocking,
@@ -1522,6 +1534,17 @@ def _merge_update_rework_branch(
                 materialize_dirs,
             )
         ):
+            # Name every discarded path: a repair that did not name what it
+            # dropped would make a destroyed local edit invisible after the
+            # fact (issue #1688).
+            logger.info(
+                "rework pre-merge repair on %s discarded %d scaffolding/"
+                "launcher-owned collision(s) before retrying merge of %s: %s",
+                branch,
+                len(blocking),
+                merge_base_ref,
+                ", ".join(blocking),
+            )
             retry_result = run_captured(
                 ["git", "merge", "--no-edit", merge_base_ref],
                 cwd=worktree_path,
@@ -1544,13 +1567,13 @@ def _merge_update_rework_branch(
                 )
         else:
             # Either nothing identifiable is blocking, or something outside the
-            # declared scaffolding is. Escalating is correct — but say what it
+            # repairable residue is. Escalating is correct — but say what it
             # actually was instead of calling it a content conflict.
             raise ReworkBranchConflictError(
                 worktree_path=worktree_path,
                 branch=branch,
                 base_ref=merge_base_ref,
-                conflicted_paths=undeclared,
+                conflicted_paths=unrepairable,
                 stderr=merge_result.stderr or merge_result.error,
                 stage="pre_merge",
             )
@@ -1758,6 +1781,28 @@ def _parse_status_v2_paths(stdout: str) -> list[str]:
     return paths
 
 
+def _launcher_owned_file_matcher() -> Callable[[str], bool]:
+    """Build a predicate matching ONLY the root-level launcher-owned PR-body
+    scratch files — the file half of :func:`_launcher_owned_matcher`.
+
+    Split out for issue #1688: the pre-merge repair path may discard the
+    launcher-owned *files* (a stale local ``PR_BODY.md`` edit is
+    launcher-regenerable residue, and letting it stand wedges the merge
+    forever — the #1477 loop), but must never extend the same license to the
+    launcher-owned *directories*, which can be junctions or other reparse
+    points on Windows. ``git clean``/``git checkout`` eligibility therefore
+    uses this narrower predicate while the dirty check uses the full one.
+    """
+
+    def _is_launcher_owned_file(raw_path: str) -> bool:
+        path = PurePosixPath(str(raw_path).replace("\\", "/"))
+        # PR body scratch file match: root-level file (no path separator)
+        # whose name matches the PR body family pattern.
+        return len(path.parts) == 1 and _LAUNCHER_OWNED_PR_BODY_RE.match(path.name) is not None
+
+    return _is_launcher_owned_file
+
+
 def _launcher_owned_matcher() -> Callable[[str], bool]:
     """Build a predicate matching worktree-relative paths owned by the
     worker launch shim (not worker output).
@@ -1777,17 +1822,14 @@ def _launcher_owned_matcher() -> Callable[[str], bool]:
     are kept as separate predicates.
     """
     excluded_dirs = [PurePosixPath(d) for d in LAUNCHER_OWNED_DIRS]
+    is_launcher_owned_file = _launcher_owned_file_matcher()
 
     def _is_launcher_owned(raw_path: str) -> bool:
         path = PurePosixPath(str(raw_path).replace("\\", "/"))
         # Directory match: path is at or under a launcher-owned directory.
         if any(path == d or d in path.parents for d in excluded_dirs):
             return True
-        # PR body scratch file match: root-level file (no path separator)
-        # whose name matches the PR body family pattern.
-        if len(path.parts) == 1 and _LAUNCHER_OWNED_PR_BODY_RE.match(path.name):
-            return True
-        return False
+        return is_launcher_owned_file(raw_path)
 
     return _is_launcher_owned
 
@@ -1818,6 +1860,46 @@ def _declared_scaffolding_matcher(
         )
 
     return _is_declared
+
+
+def _non_worker_product_matcher(
+    injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
+    *,
+    include_launcher_dirs: bool,
+) -> Callable[[str], bool]:
+    """Build the single combined "not worker product" predicate shared by the
+    dirty check and the pre-merge repair path (issue #1688).
+
+    ``_worker_authored_dirty`` already ignored both orchestrator-declared
+    scaffolding and launcher-owned residue, but the pre-merge repair path
+    recognized only the declared half — so a locally-modified tracked
+    ``PR_BODY.md`` colliding with the base's own moving copy could never be
+    repaired and wedged the rework branch into an infinite pre-merge failure
+    loop (the #1477 reproduction). Sharing one combined predicate keeps the
+    two call sites from drifting apart again, the same rationale
+    :func:`_declared_scaffolding_matcher` gives for existing as one function.
+
+    ``include_launcher_dirs`` splits the launcher-owned family in two, and
+    the split is load-bearing in opposite directions:
+
+    - The *ignore* path (dirty check) passes ``True``: launcher-owned
+      directories are not worker product, so residue under them is not dirt.
+    - The *destructive* path (pre-merge clear/restore) passes ``False``: only
+      the root-level PR-body FILE family is repair-eligible. A launcher-owned
+      directory may be a junction or other reparse point on Windows, and a
+      ``git clean -f -d`` that follows one escapes the worktree — the same
+      hazard the ``.venv`` guard exists for.
+    """
+    is_declared = _declared_scaffolding_matcher(injected_paths, materialize_dirs)
+    is_launcher_owned = (
+        _launcher_owned_matcher() if include_launcher_dirs else _launcher_owned_file_matcher()
+    )
+
+    def _is_non_worker_product(raw_path: str) -> bool:
+        return is_declared(raw_path) or is_launcher_owned(raw_path)
+
+    return _is_non_worker_product
 
 
 def _worktree_git_runner(worktree_path: Path) -> git_pull_blockers.GitRunner:
@@ -1867,25 +1949,30 @@ def _clear_declared_scaffolding_collisions(
     injected_paths: tuple[str, ...],
     materialize_dirs: tuple[str, ...],
 ) -> bool:
-    """Remove orchestrator scaffolding that is blocking a pre-merge.
+    """Remove orchestrator/launcher residue that is blocking a pre-merge.
 
-    Returns True only if every blocking path was declared scaffolding AND the
-    removal succeeded. If anything outside the declared set is blocking, this
+    Returns True only if every blocking path was repair-eligible residue —
+    declared scaffolding or a root-level launcher-owned PR-body file — AND
+    the removal succeeded. If anything outside that set is blocking, this
     refuses outright and removes nothing — a partial cleanup that still fails
     the merge would destroy files for no benefit.
 
     Safe by three independent properties:
 
-    1. Only paths matching ``_declared_scaffolding_matcher`` are eligible —
-       the same predicate ``_worker_authored_dirty`` uses to decide a path is
-       not worker product. Everything removed here is re-materialized
-       unconditionally later in ``create_worktree``.
+    1. Only paths matching ``_non_worker_product_matcher`` (with launcher
+       directories excluded) are eligible — the destructive half of the same
+       "not worker product" definition ``_worker_authored_dirty`` uses.
+       Declared scaffolding is re-materialized unconditionally later in
+       ``create_worktree``, and a launcher-owned PR-body file is residue the
+       launcher rewrites on the next dispatch.
     2. Removal goes through ``git clean``, which structurally cannot remove a
        tracked file or a modified tracked file. A filesystem ``rmtree`` could.
     3. Each path is containment-checked against the worktree on its *resolved*
        form, and anything at or under ``.venv`` is refused regardless — that
        link is a junction into the SHARED virtualenv on this host, so
-       following it would corrupt every worktree at once.
+       following it would corrupt every worktree at once. Launcher-owned
+       directories are excluded from eligibility for the same reparse-point
+       reason (issue #1688).
     """
     if not _eligible_for_scaffolding_repair(
         worktree_path, blocking_paths, injected_paths, materialize_dirs
@@ -1908,14 +1995,20 @@ def _eligible_for_scaffolding_repair(
     """The safety gate every scaffolding repair must pass before touching disk.
 
     Shared by the untracked-removal and modified-restore paths for the same
-    reason ``_declared_scaffolding_matcher`` is shared with the dirty check: two
+    reason ``_non_worker_product_matcher`` is shared with the dirty check: two
     copies of a rule that decides what may be destroyed are two chances for them
     to drift into disagreeing, and only one of those outcomes is recoverable.
+
+    The destructive side of that shared predicate deliberately excludes the
+    launcher-owned DIRECTORIES — only declared scaffolding and the root-level
+    PR-body file family are eligible here (issue #1688).
     """
     if not blocking_paths:
         return False
-    is_declared = _declared_scaffolding_matcher(injected_paths, materialize_dirs)
-    if not all(is_declared(path) for path in blocking_paths):
+    is_repairable = _non_worker_product_matcher(
+        injected_paths, materialize_dirs, include_launcher_dirs=False
+    )
+    if not all(is_repairable(path) for path in blocking_paths):
         return False
     for path in blocking_paths:
         if PurePosixPath(path).parts[:1] == (".venv",):
@@ -1931,13 +2024,15 @@ def _restore_declared_scaffolding_modifications(
     injected_paths: tuple[str, ...],
     materialize_dirs: tuple[str, ...],
 ) -> bool:
-    """Discard local modifications to orchestrator scaffolding blocking a merge.
+    """Discard local modifications to orchestrator/launcher residue blocking a merge.
 
     The tracked-file counterpart of ``_clear_declared_scaffolding_collisions``,
     gated by the identical eligibility check. Discarding these edits loses
-    nothing: every path here is one the orchestrator itself wrote and
-    re-materializes unconditionally later in ``create_worktree``, which is the
-    same premise that lets ``_worker_authored_dirty`` ignore them when deciding
+    nothing durable: every path here is either declared scaffolding the
+    orchestrator itself re-materializes unconditionally later in
+    ``create_worktree``, or a launcher-owned PR-body scratch file the launcher
+    rewrites on the next dispatch — which is the same premise that lets
+    ``_worker_authored_dirty`` ignore them when deciding
     whether a worktree holds real work.
 
     ``git checkout HEAD --`` rather than ``git checkout --``: the latter
@@ -1971,8 +2066,10 @@ def _repair_declared_scaffolding_blockers(
 
     A False return does not promise nothing was written: if the removal succeeds
     and the restore then fails, the removed files stay removed. That is
-    deliberate and harmless — every path eligible here is re-materialized
-    unconditionally later in ``create_worktree`` — whereas rolling a partial
+    deliberate and harmless — every path eligible here is regenerable residue
+    (declared scaffolding re-materializes unconditionally later in
+    ``create_worktree``; a launcher-owned PR-body file is rewritten by the
+    launcher on the next dispatch) — whereas rolling a partial
     repair back would mean re-creating files from content this function never
     had.
     """
@@ -2039,10 +2136,11 @@ def _worker_authored_dirty(
             f"worktree status probe failed; treating as dirty: {detail}"
         )
 
-    is_declared = _declared_scaffolding_matcher(injected_paths, materialize_dirs)
-    is_launcher_owned = _launcher_owned_matcher()
+    is_non_worker_product = _non_worker_product_matcher(
+        injected_paths, materialize_dirs, include_launcher_dirs=True
+    )
     for raw_path in _parse_status_v2_paths(status_result.stdout):
-        if is_declared(raw_path) or is_launcher_owned(raw_path):
+        if is_non_worker_product(raw_path):
             continue
         return True
     return False
