@@ -3247,9 +3247,10 @@ def test_detect_drift_completed_worktree_skips_log_tail_throttle_classification(
 
     This guards the three ``session_completed=True`` call sites in
     ``reconcile.detect_drift`` (one per adapter kind). The log file is seeded
-    with ``"usage limit"`` -- a ``_QUOTA_EXHAUSTED_PATTERN`` substring that, if
-    log-tail classification ran, would return ``quota_exhausted`` plus a 24h
-    ``throttled_until`` and emit a ``provider_throttle_detected`` drift item.
+    with ``"usage limit"`` -- a ``match_quota_tail`` / ``quota_error_markers``
+    substring that, if log-tail classification ran, would return
+    ``quota_exhausted`` plus a 24h ``throttled_until`` and emit a
+    ``provider_throttle_detected`` drift item.
     The worktree inspection is ground truth the session completed, so
     ``session_completed=True`` must skip log-tail matching entirely.
 

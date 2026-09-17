@@ -1060,6 +1060,23 @@ class RuntimeConfig:
     # against reviewer text. Extend via config when a new session-limit
     # phrasing is observed.
     session_limit_markers: tuple[str, ...] = ("hit your session limit",)
+    # Prose fallback markers for provider quota exhaustion (issue #1684).
+    # The PRIMARY quota signal is the structured JSON trailer —
+    # "cognition.ai/errorKind": "resource_exhausted" — matched structurally
+    # in ``throttle_signatures.match_quota_tail``, so provider wording
+    # changes cannot defeat it. These markers are the fallback for tails
+    # with no trailer (older provider messages, other CLIs). They are
+    # deliberately period-agnostic: the live Devin message says "weekly
+    # usage quota has been exhausted", and the historical pattern that
+    # keyed on the literal word "daily" went silent the week the provider
+    # changed the sentence (2026-09-17, PR #1595 — three reviewer launches
+    # burned the review-attempt cap). Extend via config when a new quota
+    # phrasing is observed, never by re-pinning the period word.
+    quota_error_markers: tuple[str, ...] = (
+        "usage quota has been exhausted",
+        "quota exceeded",
+        "usage limit",
+    )
     # Bounded retry for transient GitHub API failures (TLS blips, connection
     # resets, gateway 5xx, secondary rate limits, etc.) in GitHub.run().
     # These knobs apply fleet-wide; keep them in RuntimeConfig so GitHub stays
@@ -2730,6 +2747,20 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                     f"strings, got element of type {type(item).__name__}"
                 )
         runtime_data["session_limit_markers"] = tuple(session_limit_markers)
+    quota_error_markers = runtime_data.get("quota_error_markers")
+    if quota_error_markers is not None:
+        if not isinstance(quota_error_markers, list):
+            raise ConfigError(
+                "config section 'runtime' key 'quota_error_markers' must be a list of "
+                f"strings, got {type(quota_error_markers).__name__}"
+            )
+        for item in quota_error_markers:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    "config section 'runtime' key 'quota_error_markers' must be a list of "
+                    f"strings, got element of type {type(item).__name__}"
+                )
+        runtime_data["quota_error_markers"] = tuple(quota_error_markers)
     gh_max_retries = runtime_data.get("gh_max_retries")
     if gh_max_retries is not None and not isinstance(gh_max_retries, int):
         raise ConfigError(

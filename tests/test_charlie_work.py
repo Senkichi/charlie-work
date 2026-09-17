@@ -26101,12 +26101,15 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
     rework_prompt = pr_dir / "rework-prompt.md"
     rework_prompt.write_text("Fix the issues", encoding="utf-8")
 
-    # Create a sessions directory with a launch-failure sidecar (rate-limit signature).
+    # Create a sessions directory with a launch-failure sidecar carrying an
+    # ordinary (non-throttle) failure signature — under issue #1684 a
+    # provider-throttle-classified death is exempt from cap bookkeeping, so
+    # this fixture must be an ordinary failure to exercise it.
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
     log_path.write_text(
-        "Reached overall message rate limit. Your limit will reset in 0 minutes.\n",
+        "Error: worker exited before its first turn.\n",
         encoding="utf-8",
     )
 
@@ -26120,7 +26123,7 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
         pid=None,  # launch-failure sidecar
         started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
-        error="devin launch failed: rate limit",
+        error="devin launch failed: worker exited",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
@@ -26344,14 +26347,16 @@ def test_classify_dead_rework_session_escalates_at_death_cap(
         encoding="utf-8",
     )
 
-    # Launch-failure sidecar with a non-deterministic failure signature (rate
-    # limit) -- isolates the cap check from finding 2b's deterministic-kind
-    # guard (covered by the worktree_unsafe test below).
+    # Launch-failure sidecar with a non-deterministic, non-throttle failure
+    # signature -- isolates the cap check from finding 2b's deterministic-kind
+    # guard (covered by the worktree_unsafe test below). A provider-throttle
+    # signature would be exempt from cap bookkeeping under issue #1684, so the
+    # fixture is an ordinary failure.
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
     log_path.write_text(
-        "Reached overall message rate limit. Your limit will reset in 0 minutes.\n",
+        "Error: worker exited before its first turn.\n",
         encoding="utf-8",
     )
     sidecar_path = sessions_dir / "issue-123.json"
@@ -26364,7 +26369,7 @@ def test_classify_dead_rework_session_escalates_at_death_cap(
         pid=None,  # launch-failure sidecar
         started_at=now.isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
-        error="devin launch failed: rate limit",
+        error="devin launch failed: worker exited",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
@@ -26462,7 +26467,7 @@ def test_classify_dead_rework_session_no_op_cap_with_prior_no_ops(
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
     log_path.write_text(
-        "Reached overall message rate limit. Your limit will reset in 0 minutes.\n",
+        "Error: worker exited before its first turn.\n",
         encoding="utf-8",
     )
     sidecar_path = sessions_dir / "issue-123.json"
@@ -26475,7 +26480,7 @@ def test_classify_dead_rework_session_no_op_cap_with_prior_no_ops(
         pid=None,
         started_at=now.isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
-        error="devin launch failed: rate limit",
+        error="devin launch failed: worker exited",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
@@ -26559,7 +26564,7 @@ def test_classify_dead_rework_session_deaths_below_cap_not_escalated(
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
     log_path.write_text(
-        "Reached overall message rate limit. Your limit will reset in 0 minutes.\n",
+        "Error: worker exited before its first turn.\n",
         encoding="utf-8",
     )
     sidecar_path = sessions_dir / "issue-123.json"
@@ -26572,7 +26577,7 @@ def test_classify_dead_rework_session_deaths_below_cap_not_escalated(
         pid=None,
         started_at=now.isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
-        error="devin launch failed: rate limit",
+        error="devin launch failed: worker exited",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 

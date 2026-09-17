@@ -130,6 +130,7 @@ from .state import (
     set_throttled_until,
     state_lock,
 )
+from .throttle_signatures import PROVIDER_THROTTLE_FAILURE_KINDS
 from .worker import WorkerHealth, WorkerView
 from .worktree import (
     WORKTREE_UNSAFE_KINDS,
@@ -1302,12 +1303,22 @@ def _reap_restore_rework_requested(
         # itself; see the docstring above.
         has_rework_prompt = rework_prompt_path.exists()
 
+        # Issue #1684: a provider-throttle-classified death (the kinds that
+        # arm ``throttled_until`` — quota_exhausted, rate_limited,
+        # provider_auth) is a global provider condition, not a worker-quality
+        # signal, so it must not consume either cap below. The fleet-wide
+        # cooldown is already armed by the classifier; the rework is
+        # restored below and re-dispatches once the window opens.
+        provider_throttled = failure_kind in PROVIDER_THROTTLE_FAILURE_KINDS
+
         # Issue #315 finding 2: same window-filtered redispatch_at bookkeeping
         # the sibling lanes use (~line 950-961, ~4186-4194), so the cap below
         # is actually consulted instead of silently never growing.
         redispatch_at = _windowed_redispatch_at(
             entry, window_minutes=config.watchdog.redispatch_window_minutes
-        ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
+        )
+        if not provider_throttled:
+            redispatch_at = redispatch_at + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
         # Issue #807: a deterministic judgment failure (e.g. genuine local
@@ -1328,7 +1339,7 @@ def _reap_restore_rework_requested(
         worker_death_at = _windowed_worker_death_at(
             entry, window_minutes=config.watchdog.redispatch_window_minutes
         )
-        if not immediate_escalation:
+        if not immediate_escalation and not provider_throttled:
             worker_death_at = worker_death_at + [
                 datetime.now(UTC).isoformat().replace("+00:00", "Z")
             ]
@@ -1580,7 +1591,12 @@ def _route_dead_worker_to_pre_review_rework(
 
         redispatch_at = _windowed_redispatch_at(
             entry, window_minutes=config.watchdog.redispatch_window_minutes
-        ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
+        )
+        # Issue #1684: a provider-throttle-classified death (the kinds that
+        # arm ``throttled_until``) is a global provider condition, not a
+        # worker-quality signal — it must not consume the redispatch cap.
+        if failure_kind not in PROVIDER_THROTTLE_FAILURE_KINDS:
+            redispatch_at = redispatch_at + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
         # Issue #807: a deterministic judgment failure escalates immediately
@@ -2240,7 +2256,14 @@ def _classify_dead_sessions_and_update_throttle_state(
                     now = datetime.now(UTC)
                     redispatch_at = _windowed_redispatch_at(
                         entry, window_minutes=config.watchdog.redispatch_window_minutes
-                    ) + [now.isoformat().replace("+00:00", "Z")]
+                    )
+                    # Issue #1684: a provider-throttle-classified death (the
+                    # kinds that arm ``throttled_until``) is a global provider
+                    # condition, not a worker-quality signal — it must not
+                    # consume the redispatch cap. The issue still relabels to
+                    # ready below and re-dispatches once the window opens.
+                    if failure_kind not in PROVIDER_THROTTLE_FAILURE_KINDS:
+                        redispatch_at = redispatch_at + [now.isoformat().replace("+00:00", "Z")]
                     # issue #261: a worker_blocked verdict (extracted from the
                     # Devin CLI's session store — see post_mortem.classify_and_record)
                     # means the worker was killed by a push-gate hook, not a
