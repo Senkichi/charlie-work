@@ -454,7 +454,7 @@ jobs:
     # AST-equivalence gate, #1541, which is evidence-only and always exits 0).
     #
     # The gate compares leaf-name multisets (function name + class name(s) +
-    # parametrize id, module-path stripped) from `pytest --collect-only -q`
+    # parametrize id, module-path stripped) from `pytest --collect-only`
     # output at base and head. A verbatim test relocation (same leaf name,
     # different module path) passes; a rename, addition, deletion, or
     # class-wrapping dodge does not. See src/charlie_work/collect_only_gate.py
