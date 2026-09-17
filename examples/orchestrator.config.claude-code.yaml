@@ -90,6 +90,7 @@ auto_merge:
   required_checks:
     - Test
     - "Lint, Types & Pre-commit"
+    - "Collect-only gate"
   # Extra flags appended to the `gh pr merge` invocation. Takes precedence
   # over the legacy `admin` field. Use this for protected-base merges
   # (e.g., ["--admin"] when your gh auth has admin on the repo) or
