@@ -48,6 +48,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).parents[1]
 _BACKLOG_REACHABILITY_PATH = _REPO_ROOT / "src" / "charlie_work" / "backlog_reachability.py"
 _WORKFLOW_PATH = _REPO_ROOT / "src" / "charlie_work" / "workflow.py"
+_ORCHESTRATION_DIR = _REPO_ROOT / "src" / "charlie_work" / "orchestration"
 
 _MOVED_NAMES = (
     "_get_open_blockers_for_issue",
@@ -495,19 +496,32 @@ def test_backlog_reachability_write_event_surface_is_exactly_empty() -> None:
 
 def test_write_event_call_scanner_has_a_positive_control() -> None:
     """Required positive control for the empty-result assertion above: runs
-    the identical scanner over workflow.py, which is known to still contain
-    ``append_event``/``log_event`` and ``_write_text_atomic`` call sites.
-    """
-    workflow_source = _WORKFLOW_PATH.read_text(encoding="utf-8")
-    hits = _write_event_call_sites(workflow_source, filename=str(_WORKFLOW_PATH))
+    the identical scanner over the orchestrator corpus (workflow.py plus its
+    ``orchestration/`` delegate submodules), which is known to still contain
+    ``append_event``/``log_event``, ``_write_json`` and ``_write_text_atomic``
+    call sites.
 
-    found_names = {h["name"] for h in hits}
-    assert found_names, "the scanner found zero call sites in workflow.py -- the scanner is broken"
+    issue #1645 (L01 batch 2): ``_write_text_atomic`` call sites moved with
+    ``record_review`` out of workflow.py into
+    ``orchestration/state_record_review.py``. The corpus is the module object
+    surface (workflow.py + every ``orchestration/*.py`` delegate module,
+    discovered by glob rather than a hard-coded module name), so the control
+    keeps covering all four names as members relocate across batches without
+    dropping any name from ``expected_broad_coverage`` (that drop would be the
+    weakening this guard exists to prevent).
+    """
+    found_names = {
+        hit["name"]
+        for path in [_WORKFLOW_PATH, *sorted(_ORCHESTRATION_DIR.glob("*.py"))]
+        for hit in _write_event_call_sites(path.read_text(encoding="utf-8"), filename=str(path))
+    }
+    assert found_names, "the scanner found zero call sites in the corpus -- the scanner is broken"
     expected_broad_coverage = {"_write_json", "_write_text_atomic", "append_event", "log_event"}
     missing = expected_broad_coverage - found_names
     assert missing == set(), (
-        f"scanner found zero call sites for {sorted(missing)} in workflow.py, which is known to "
-        "contain calls to all of them -- the scanner's Call-node matching is broken"
+        f"scanner found zero call sites for {sorted(missing)} across the orchestrator corpus, "
+        "which is known to contain calls to all of them -- the scanner's Call-node matching "
+        "is broken"
     )
 
 

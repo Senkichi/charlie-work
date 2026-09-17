@@ -42,7 +42,10 @@ self-hosted-runner ``sessions.db`` for the test PID).
 from __future__ import annotations
 
 import ast
+import importlib
 import importlib.util
+import inspect
+import pkgutil
 from pathlib import Path
 
 import pytest
@@ -648,8 +651,37 @@ def _dict_literal_keys(node: ast.expr) -> set[str]:
     return {k.value for k in node.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
 
 
+def _escalation_scan_sources() -> list[str]:
+    """Source of every module that can host an escalation emit site: workflow.py
+    plus every ``charlie_work.orchestration`` submodule.
+
+    Track 2 Phase B leaves move escalator methods out of workflow.py into
+    orchestration submodules (e.g. ``_check_janitor_rework_stall``, which emits
+    ``janitor_rework_escalated``, relocated by leaf L01 b1). Deriving the file
+    list from the live package with ``pkgutil`` -- instead of the single
+    hard-coded ``charlie_work.workflow`` path -- keeps this scanner following
+    the members wherever they land, with no member-name list. Paths come from
+    each module's own ``__file__``.
+    """
+    import charlie_work.orchestration as _orchestration
+
+    sources: list[str] = []
+    spec = importlib.util.find_spec("charlie_work.workflow")
+    assert spec is not None and spec.origin is not None
+    sources.append(Path(spec.origin).read_text(encoding="utf-8"))
+    for info in sorted(pkgutil.iter_modules(_orchestration.__path__), key=lambda i: i.name):
+        if info.ispkg:
+            continue
+        module = importlib.import_module(f"charlie_work.orchestration.{info.name}")
+        origin = getattr(module, "__file__", None)
+        assert origin is not None, f"{module.__name__} has no __file__ to scan"
+        sources.append(Path(origin).read_text(encoding="utf-8"))
+    return sources
+
+
 def _escalation_event_kinds_from_workflow() -> set[str]:
-    """Discover escalation-transition event kinds by inspecting workflow.py.
+    """Discover escalation-transition event kinds by inspecting the orchestrator
+    source -- workflow.py plus every ``charlie_work.orchestration`` submodule.
 
     An escalation event is an ``append_event`` / ``_record_event`` call --
     bare, or WriteGate-routed as ``self.write_gate.append_event(...)`` /
@@ -658,18 +690,24 @@ def _escalation_event_kinds_from_workflow() -> set[str]:
     call in a function that also assigns a ``reason_class`` and whose
     payload carries an ``escalated`` key.
 
+    The scan spans every module a Phase B leaf may have moved an escalator into.
+    All trees share one ``calls_by_name`` call graph, so the escalators closure
+    (grown from ``_escalate_issue`` / ``escalation_reason_class``) resolves
+    across module boundaries exactly as it did when every method was lexically
+    in workflow.py -- a method moved into an orchestration submodule that calls
+    ``_wf._escalate_issue`` is still recognised as an escalator.
+
     The test is deliberately conservative: only kinds that unambiguously mark
     an ``escalated``/``blocked`` status transition with a ``reason_class`` are
     discovered. Any new escalation kind that does not match these patterns must
     be explicitly added to the mapping/unclassified sets, so it fails CI
     instead of silently degrading to fail-closed-forever.
     """
-    spec = importlib.util.find_spec("charlie_work.workflow")
-    assert spec is not None and spec.origin is not None
-    source = Path(spec.origin).read_text(encoding="utf-8")
-    tree = ast.parse(source)
+    trees = [ast.parse(source) for source in _escalation_scan_sources()]
 
-    # Build parent map so we can find the enclosing function for any node.
+    # Build one parent map across all trees (node objects are unique per tree,
+    # so a single identity-keyed dict is unambiguous) so we can find the
+    # enclosing function for any node.
     parents: dict[ast.AST, ast.AST] = {}
 
     class _ParentVisitor(ast.NodeVisitor):
@@ -678,7 +716,8 @@ def _escalation_event_kinds_from_workflow() -> set[str]:
                 parents[child] = node
                 self.visit(child)
 
-    _ParentVisitor().visit(tree)
+    for tree in trees:
+        _ParentVisitor().visit(tree)
 
     def _enclosing_function(node: ast.AST) -> ast.AST | None:
         while node is not None and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -698,12 +737,13 @@ def _escalation_event_kinds_from_workflow() -> set[str]:
 
     calls_by_func: dict[ast.AST, set[str]] = {}
     calls_by_name: dict[str, set[str]] = {}
-    for func in ast.walk(tree):
-        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        called = _called_names(func)
-        calls_by_func[func] = called
-        calls_by_name.setdefault(func.name, set()).update(called)
+    for tree in trees:
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            called = _called_names(func)
+            calls_by_func[func] = called
+            calls_by_name.setdefault(func.name, set()).update(called)
 
     # Derive the set of escalation-performing callables from the source itself
     # instead of hard-coding names. Start from the two primitives that own the
@@ -728,45 +768,47 @@ def _escalation_event_kinds_from_workflow() -> set[str]:
 
     # First pass: collect local dict-literal assignments per function.
     func_dicts: dict[ast.AST, dict[str, set[str]]] = {}
-    for func in ast.walk(tree):
-        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        func_dicts[func] = {}
-        for assign in ast.walk(func):
-            if isinstance(assign, ast.Assign):
-                for target in assign.targets:
-                    if isinstance(target, ast.Name) and isinstance(assign.value, ast.Dict):
-                        func_dicts[func][target.id] = _dict_literal_keys(assign.value)
-            elif isinstance(assign, ast.AnnAssign) and isinstance(assign.target, ast.Name):
-                if isinstance(assign.value, ast.Dict):
-                    func_dicts[func][assign.target.id] = _dict_literal_keys(assign.value)
+    for tree in trees:
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            func_dicts[func] = {}
+            for assign in ast.walk(func):
+                if isinstance(assign, ast.Assign):
+                    for target in assign.targets:
+                        if isinstance(target, ast.Name) and isinstance(assign.value, ast.Dict):
+                            func_dicts[func][target.id] = _dict_literal_keys(assign.value)
+                elif isinstance(assign, ast.AnnAssign) and isinstance(assign.target, ast.Name):
+                    if isinstance(assign.value, ast.Dict):
+                        func_dicts[func][assign.target.id] = _dict_literal_keys(assign.value)
 
     kinds: set[str] = set()
-    for call in ast.walk(tree):
-        if not isinstance(call, ast.Call) or not _is_event_call(call.func):
-            continue
-        kind_node = _call_arg(call, 1, "kind")
-        if not isinstance(kind_node, ast.Constant) or not isinstance(kind_node.value, str):
-            continue
-        kind = kind_node.value
-        if kind.endswith("_escalated"):
-            kinds.add(kind)
-            continue
+    for tree in trees:
+        for call in ast.walk(tree):
+            if not isinstance(call, ast.Call) or not _is_event_call(call.func):
+                continue
+            kind_node = _call_arg(call, 1, "kind")
+            if not isinstance(kind_node, ast.Constant) or not isinstance(kind_node.value, str):
+                continue
+            kind = kind_node.value
+            if kind.endswith("_escalated"):
+                kinds.add(kind)
+                continue
 
-        func = _enclosing_function(call)
-        if func is None or not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        if not _performs_escalation(func):
-            continue
+            func = _enclosing_function(call)
+            if func is None or not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not _performs_escalation(func):
+                continue
 
-        payload_node = _call_arg(call, 2, "payload")
-        if payload_node is None:
-            continue
-        payload_keys = _dict_literal_keys(payload_node)
-        if not payload_keys and isinstance(payload_node, ast.Name):
-            payload_keys = func_dicts.get(func, {}).get(payload_node.id, set())
-        if "escalated" in payload_keys:
-            kinds.add(kind)
+            payload_node = _call_arg(call, 2, "payload")
+            if payload_node is None:
+                continue
+            payload_keys = _dict_literal_keys(payload_node)
+            if not payload_keys and isinstance(payload_node, ast.Name):
+                payload_keys = func_dicts.get(func, {}).get(payload_node.id, set())
+            if "escalated" in payload_keys:
+                kinds.add(kind)
 
     return kinds
 
@@ -876,17 +918,26 @@ def test_pass_event_records_why_each_candidate_was_skipped(
 # ---------------------------------------------------------------------------
 
 
-def _workflow_ast() -> ast.Module:
-    spec = importlib.util.find_spec("charlie_work.workflow")
-    assert spec is not None and spec.origin is not None
-    return ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
-
-
 def _deescalate_issue_func() -> ast.FunctionDef:
-    for node in ast.walk(_workflow_ast()):
-        if isinstance(node, ast.FunctionDef) and node.name == "_deescalate_mechanical_issue":
+    # Locate ``_deescalate_mechanical_issue`` through its installed delegate on
+    # ``OrchestratorApp`` and parse whatever module now hosts it, so this
+    # structural guard follows the member wherever a leaf moves it (Track 2
+    # Phase B leaf L01 batch 2, #1645, relocated it into
+    # ``charlie_work.orchestration.state_mechanical``) instead of hard-coding
+    # ``workflow.py``. Mirrors the member-following scan pattern batch 1
+    # introduced in test_stale_checks_detection_regression.py's
+    # ``_guard_member_modules``.
+    member = OrchestratorApp._deescalate_mechanical_issue
+    module = inspect.getmodule(member)
+    assert module is not None and getattr(module, "__file__", None) is not None
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_deescalate_mechanical_issue"
+        ):
             return node
-    raise AssertionError("_deescalate_mechanical_issue not found in workflow.py")
+    raise AssertionError(f"_deescalate_mechanical_issue not found in {module.__name__}")
 
 
 def test_deescalate_mechanical_issue_never_returns_none() -> None:
@@ -928,8 +979,14 @@ def test_skip_reason_vocabulary_is_derived_from_the_branches() -> None:
         node.args[0].value
         for node in ast.walk(func)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "_deescalation_skip"
+        # Match both the bare ``_deescalation_skip(...)`` call (as written when
+        # this member lived in workflow.py) and the ``_wf._deescalation_skip(...)``
+        # attribute form produced by leaf L01's #1627 namespace rebind once the
+        # member moved into a charlie_work.orchestration submodule (#1645).
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == "_deescalation_skip")
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == "_deescalation_skip")
+        )
         and node.args
         and isinstance(node.args[0], ast.Constant)
     ]

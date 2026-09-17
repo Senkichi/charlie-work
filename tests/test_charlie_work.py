@@ -41199,6 +41199,16 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     # keeps failing if a genuinely NEW, unknown writer appears in any of the
     # three files, rather than going blind to two known call sites because
     # they changed address.
+    #
+    # issue #1645 (L01 batch 2): the OrchestratorApp delegation extraction moved
+    # call site 1 above (dispatch_rework normal paths) out of workflow.py into
+    # orchestration/state_dispatch_rework.py verbatim (_dispatch_rework_impl) --
+    # the two writers still exist, only their module changed (confirmed real
+    # split: workflow.py=0, dispatch_selection.py=0, dead_worker_reap.py=2,
+    # state_dispatch_rework.py=2, total unchanged at 4). state_dispatch_rework.py
+    # is added to the scan for the same reason dead_worker_reap.py was: keep
+    # failing on a genuinely NEW writer rather than going blind to two known
+    # call sites because they changed address.
     import ast
 
     workflow_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
@@ -41207,6 +41217,13 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     )
     dead_worker_reap_path = (
         Path(__file__).parents[1] / "src" / "charlie_work" / "dead_worker_reap.py"
+    )
+    state_dispatch_rework_path = (
+        Path(__file__).parents[1]
+        / "src"
+        / "charlie_work"
+        / "orchestration"
+        / "state_dispatch_rework.py"
     )
 
     def _count_redispatch_at_assignments(path: Path) -> int:
@@ -41231,10 +41248,12 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
         _count_redispatch_at_assignments(workflow_path)
         + _count_redispatch_at_assignments(dispatch_selection_path)
         + _count_redispatch_at_assignments(dead_worker_reap_path)
+        + _count_redispatch_at_assignments(state_dispatch_rework_path)
     )
     assert redispatch_assignments == 4, (
         'Expected 4 real entry["redispatch_at"] assignment statements across '
-        "workflow.py, dispatch_selection.py, and dead_worker_reap.py, found "
+        "workflow.py, dispatch_selection.py, dead_worker_reap.py, and "
+        "orchestration/state_dispatch_rework.py, found "
         f"{redispatch_assignments}"
     )
 

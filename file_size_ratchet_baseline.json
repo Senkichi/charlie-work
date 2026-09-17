@@ -13,6 +13,9 @@
   "src/charlie_work/github.py": 3200,
   "src/charlie_work/instrumentation.py": 1400,
   "src/charlie_work/janitor.py": 2000,
+  "src/charlie_work/orchestration/dispatch_state.py": 2000,
+  "src/charlie_work/orchestration/state_dispatch_rework.py": 1800,
+  "src/charlie_work/orchestration/state_record_review.py": 1000,
   "src/charlie_work/post_mortem.py": 1600,
   "src/charlie_work/reconcile.py": 3400,
   "src/charlie_work/rework_prompts.py": 1000,
@@ -22,7 +25,7 @@
   "src/charlie_work/supervise.py": 1800,
   "src/charlie_work/verdict_parsing.py": 1000,
   "src/charlie_work/worker.py": 1600,
-  "src/charlie_work/workflow.py": 24200,
+  "src/charlie_work/workflow.py": 8800,
   "src/charlie_work/worktree.py": 5600,
   "tests/test_api_budget.py": 1200,
   "tests/test_api_worker.py": 1200,
@@ -67,5 +70,5 @@
   "tests/test_worker_health.py": 2400,
   "tests/test_worker_stop_gate.py": 1200,
   "tests/test_worktree.py": 8600,
-  "tests/test_write_gate_enforcement.py": 1800
+  "tests/test_write_gate_enforcement.py": 2000
 }

@@ -1463,23 +1463,30 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
-        path="workflow.py",
+        path="orchestration/helpers_merge_outcomes.py",
         scope="_record_event",
         source="kind",
         reason=(
             "OrchestratorApp._record_event forwards its own `kind` parameter "
             "to append_event. Same pass-through as append_event/log_event; "
-            "every self._record_event(...) call site is scanned."
+            "every self._record_event(...) call site is scanned. "
+            "Moved out of workflow.py to charlie_work.orchestration."
+            "helpers_merge_outcomes by leaf L02 b3 (#1633); the allow-list "
+            "path follows the member (design 4.1), scope/source/reason unchanged."
         ),
     ),
     _UnresolvedKindSite(
-        path="workflow.py",
+        path="orchestration/state_rework_routing.py",
         scope="_route_to_rework",
         source="event_kind",
         reason=(
             "_route_to_rework forwards its own `event_kind` parameter to "
             "self._record_event. Every self._route_to_rework(...) call site "
-            "is scanned (it is in _WRAPPER_FUNCS, 5th positional argument)."
+            "is scanned (it is in _WRAPPER_FUNCS, 5th positional argument). "
+            "Moved out of workflow.py to charlie_work.orchestration."
+            "state_rework_routing by leaf L01 b1 (#1632); the allow-list key "
+            "follows the member to its new module -- scope/source/reason "
+            "unchanged."
         ),
     ),
     _UnresolvedKindSite(

@@ -70,6 +70,7 @@ import pytest
 _REPO_ROOT = Path(__file__).parents[1]
 _REWORK_PROMPTS_PATH = _REPO_ROOT / "src" / "charlie_work" / "rework_prompts.py"
 _WORKFLOW_PATH = _REPO_ROOT / "src" / "charlie_work" / "workflow.py"
+_ORCHESTRATION_DIR = _REPO_ROOT / "src" / "charlie_work" / "orchestration"
 
 
 # ---------------------------------------------------------------------------
@@ -797,26 +798,30 @@ def test_write_event_call_scanner_has_a_positive_control() -> None:
     discipline: a result used as evidence needs a control proving the query
     itself isn't broken).
 
-    The identical scanner, run over workflow.py, must find call sites for
-    every one of COMMON's target names -- proving the scanner is capable of
-    matching real write/event surface broadly, not merely capable of finding
-    exactly the two sites this test expects in rework_prompts.py.
-    """
-    workflow_source = _WORKFLOW_PATH.read_text(encoding="utf-8")
-    hits = _write_event_call_sites(workflow_source, filename=str(_WORKFLOW_PATH))
+    The identical scanner, run over the orchestrator corpus (workflow.py + its
+    ``orchestration/*.py`` delegate modules, globbed rather than hard-coded),
+    must find call sites for every one of COMMON's target names -- proving the
+    scanner is capable of matching real write/event surface broadly, not merely
+    capable of finding exactly the two sites this test expects in
+    rework_prompts.py.
 
-    found_names = {h["name"] for h in hits}
-    assert found_names, "the scanner found zero call sites in workflow.py -- the scanner is broken"
-    # workflow.py is expected to contain call sites for every one of these
-    # names somewhere (OrchestratorApp._write_json, append_event/log_event
-    # helpers, and _write_text_atomic call sites inside record_review's own
-    # archive-copy logic) -- a scanner that only found a subset would be
-    # silently blind to some of the forms it's supposed to catch.
+    issue #1645 (L01 b2): ``record_review`` -- with its ``_write_text_atomic``
+    archive-copy call sites -- moved to ``orchestration/state_record_review``,
+    so the corpus spans the delegate modules; dropping a name from
+    ``expected_broad_coverage`` instead would be the weakening this prevents.
+    """
+    found_names = {
+        hit["name"]
+        for path in [_WORKFLOW_PATH, *sorted(_ORCHESTRATION_DIR.glob("*.py"))]
+        for hit in _write_event_call_sites(path.read_text(encoding="utf-8"), filename=str(path))
+    }
+    assert found_names, "the scanner found zero call sites in the corpus -- the scanner is broken"
     expected_broad_coverage = {"_write_json", "_write_text_atomic", "append_event", "log_event"}
     missing = expected_broad_coverage - found_names
     assert missing == set(), (
-        f"scanner found zero call sites for {sorted(missing)} in workflow.py, which is known to "
-        "contain calls to all of them -- the scanner's Call-node matching is broken"
+        f"scanner found zero call sites for {sorted(missing)} across the orchestrator corpus, "
+        "which is known to contain calls to all of them -- the scanner's Call-node matching "
+        "is broken"
     )
 
 

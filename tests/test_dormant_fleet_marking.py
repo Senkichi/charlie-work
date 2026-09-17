@@ -115,7 +115,34 @@ def _sibling_imports(path: Path) -> set[str]:
 
 
 def _graph() -> dict[str, set[str]]:
-    return {p.stem: _sibling_imports(p) for p in sorted(SRC.glob("*.py"))}
+    graph = {p.stem: _sibling_imports(p) for p in sorted(SRC.glob("*.py"))}
+    # Track 2 Phase B (#1582): OrchestratorApp method bodies now live in
+    # `orchestration/*.py` delegate modules, re-attached onto the class at
+    # `charlie_work.workflow` import time by `workflow_delegation._install_delegates`
+    # (pkgutil discovery imports every submodule). A sibling module that a moved
+    # body is the sole top-level importer of would otherwise fall out of the
+    # reachability walk and be flagged false-dormant (issue #1671; L05/#1636 hit
+    # this on `module_map` when `_build_module_map_value` moved). The delegates ARE
+    # `workflow`'s methods in every sense that matters to reachability, so fold
+    # their sibling imports into the `workflow` node. This is the targeted
+    # `orchestration/` glob (top-level + orchestration/), NOT a recursive `rglob`:
+    # a plain rglob would pull in sibling subpackages and collide on shared
+    # basenames (`checks.py` / `labels.py` / `__main__.py`).
+    #
+    # Tradeoff (stated, not papered over): folding adds edges and can only
+    # *shrink* the detectable dormant set, never grow it, so island-detection
+    # precision is reduced -- a module imported only by an orchestration delegate
+    # would now read as live instead of dormant. Accepted to kill the
+    # `module_map` false-dormant; bounded by
+    # `test_widened_graph_still_flags_a_genuine_island`, which proves a module no
+    # top-level *or* orchestration file imports is still flagged.
+    orchestration = SRC / "orchestration"
+    if orchestration.is_dir():
+        for path in sorted(orchestration.glob("*.py")):
+            if path.stem == "__init__":
+                continue
+            graph["workflow"] |= _sibling_imports(path)
+    return graph
 
 
 def _live_modules() -> set[str]:
@@ -161,6 +188,55 @@ def test_the_reachability_walk_actually_reaches_things() -> None:
     assert len(live) > 10, f"reachability walk returned {len(live)} modules -- graph is broken"
     missing = KNOWN_LIVE - live
     assert not missing, f"known-live modules were not reached: {sorted(missing)}"
+
+
+def test_widened_graph_still_flags_a_genuine_island(tmp_path, monkeypatch) -> None:
+    """Negative control for the ``_graph()`` widening (#1671, #1636).
+
+    The widening folds ``orchestration/*.py`` delegate imports into the
+    ``workflow`` node so a sibling module a moved body is the sole importer of
+    (e.g. ``module_map`` after ``_build_module_map_value`` relocated) does not
+    fall false-dormant. That fix can only ever *shrink* the detectable dormant
+    set -- it adds edges, never removes them -- so the guard's island-detection
+    precision is reduced, not strengthened: a module imported only by an
+    orchestration delegate would now read as live instead of dormant. This test
+    bounds that reduction by proving a module no top-level *or* orchestration
+    file imports is still flagged dormant, i.e. a genuine new island is still
+    caught.
+
+    A synthetic tree (monkeypatched ``SRC``) is used rather than dropping a file
+    into the real ``src/`` tree so the test is hermetic and cannot perturb the
+    other two tests in this file (which read the real tree).
+    """
+    import sys
+
+    src = tmp_path / "charlie_work"
+    src.mkdir()
+    (src / "cli.py").write_text("from . import workflow\n", encoding="utf-8")
+    (src / "__main__.py").write_text("", encoding="utf-8")
+    (src / "workflow.py").write_text("", encoding="utf-8")
+    (src / "module_map.py").write_text("", encoding="utf-8")
+    # A genuine island: nothing in src/ imports it, top-level or orchestration.
+    (src / "_synthetic_island.py").write_text("", encoding="utf-8")
+    orch = src / "orchestration"
+    orch.mkdir()
+    # A delegate whose sole sibling import is module_map -- the case the widening
+    # exists to keep live rather than false-dormant.
+    (orch / "delegate.py").write_text("from . import module_map\n", encoding="utf-8")
+
+    monkeypatch.setattr(sys.modules[__name__], "SRC", src)
+    dormant = _dormant_modules()
+
+    # The false-dormant fix holds: module_map is reached via the delegate.
+    assert "module_map" not in dormant, (
+        "module_map fell dormant -- the _graph() widening is not folding "
+        "orchestration delegate imports into the workflow node"
+    )
+    # The sensitivity retained: a genuine island is still flagged.
+    assert "_synthetic_island" in dormant, (
+        "synthetic island was not flagged dormant -- the widening erased the "
+        "guard's ability to detect a module no src/ importer reaches"
+    )
 
 
 def test_every_dormant_fleet_module_has_its_tests_marked_and_no_others_do() -> None:
