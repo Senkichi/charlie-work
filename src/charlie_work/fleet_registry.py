@@ -21,7 +21,7 @@ from .state import save_state, state_lock
 from .worker import iter_workers
 
 if TYPE_CHECKING:
-    from .config import RuntimeConfig
+    from .config import OrchestratorConfig, RuntimeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -461,6 +461,44 @@ def count_fleet_runners(
                 f"Skipping fleet runner-count for {name_with_owner}: repo_root {repo_root} is not a git worktree"
             )
             skipped_repos.append(name_with_owner)
+            continue
+
+        # Issue #1702: a repo whose config enables the local-file issue
+        # source has no GitHub remote, so it has no self-hosted runners to
+        # count. Contribute (0, 0) without a client call, a warning, or a
+        # skipped_repos entry — skipped_repos exists for repos that *could
+        # not* be counted, and a permanent entry for a healthy repo trains
+        # the operator to ignore the list. The discriminator is the repo's
+        # config (``local_issues.enabled``), not the ``local/`` name prefix
+        # LocalFileGitHub synthesizes — matching on the string form would be
+        # a second, drifting source of truth. Resolve the config the way the
+        # fleet loop does for that repo: load_layered_config with the
+        # fleet's global layer, because a bare load_config on the repo path
+        # can return defaults that read as "disabled" when the knob lives in
+        # the fleet layer.
+        explicit_cfg = entry.get("config_path")
+        repo_config: OrchestratorConfig | None
+        try:
+            repo_config = load_layered_config(
+                repo_root,
+                Path(explicit_cfg) if explicit_cfg else None,
+                fleet_dir_override=fleet_dir_override,
+            )
+        except Exception as exc:  # noqa: BLE001 - deliberate fallback
+            # An unreadable config cannot prove the repo is local, so fall
+            # through to the GitHub path below: its own failure handling
+            # lands the repo in skipped_repos, which is the honest outcome
+            # for a repo we could not classify. Skipping here on the same
+            # evidence would add a new skip reason for GitHub repos whose
+            # runner query does not depend on config at all.
+            logger.debug(
+                "fleet runner-count for %s: layered config unreadable (%s); "
+                "treating as a GitHub repo",
+                name_with_owner,
+                exc,
+            )
+            repo_config = None
+        if repo_config is not None and repo_config.local_issues.enabled:
             continue
 
         # Create a GitHub client for this repo

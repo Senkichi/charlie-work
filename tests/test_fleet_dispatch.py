@@ -1859,6 +1859,118 @@ def test_count_fleet_runners_skips_repo_on_unreadable_response(
     assert skipped == ["owner/repo1"]
 
 
+@patch("charlie_work.fleet_registry._load_registry")
+@patch("charlie_work.fleet_registry.GitHub")
+def test_count_fleet_runners_skips_local_issues_repo_quietly(
+    mock_gh_class: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #1702: a registered repo whose config enables the local-file
+    issue source has no GitHub remote, so it has no self-hosted runners to
+    count. It must contribute (0, 0) without constructing a GitHub client,
+    without a warning, and without a skipped_repos entry — a permanent skip
+    entry for a healthy repo trains the operator to ignore the list.
+
+    Positive control: a genuinely missing checkout still warns and lands in
+    skipped_repos.
+    """
+    gh_repo = tmp_path / "repo1"
+    gh_repo.mkdir()
+    (gh_repo / ".git").mkdir()
+
+    local_repo = tmp_path / "localrepo"
+    local_repo.mkdir()
+    (local_repo / ".git").mkdir()
+    (local_repo / "orchestrator.config.yaml").write_text(
+        "local_issues:\n  enabled: true\n", encoding="utf-8"
+    )
+
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(gh_repo),
+                "config_path": str(gh_repo / "orchestrator.config.yaml"),
+            },
+            "local/localrepo": {
+                "repo_root": str(local_repo),
+                "config_path": str(local_repo / "orchestrator.config.yaml"),
+            },
+            "owner/missing": {
+                "repo_root": str(tmp_path / "missing"),
+                "config_path": str(tmp_path / "missing" / "orchestrator.config.yaml"),
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    # Two clients, one per construction: the GitHub repo's query succeeds;
+    # the local repo's fails the way ``gh api`` does on a repo with no
+    # GitHub remote — the failure that produced the recurring warning and
+    # skipped_repos entry this issue removes.
+    gh_client = MagicMock()
+    gh_client.run.return_value = {"runners": [{"busy": False}, {"busy": True}]}
+    local_client = MagicMock()
+    local_client.run.side_effect = GitHubError("no GitHub remote")
+    mock_gh_class.side_effect = [gh_client, local_client]
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_registry"):
+        total, busy, skipped = count_fleet_runners(str(tmp_path / "fleet"))
+
+    assert total == 2
+    assert busy == 1
+    # The local repo contributes (0, 0) with no skipped_repos entry; the
+    # missing checkout still lands there.
+    assert skipped == ["owner/missing"]
+    # The GitHub client was constructed only for the real GitHub repo —
+    # never for the local-file repo.
+    mock_gh_class.assert_called_once_with(repo_root=gh_repo, runtime=None)
+    local_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and "local/localrepo" in record.getMessage()
+    ]
+    assert local_warnings == []
+
+
+@patch("charlie_work.fleet_registry._load_registry")
+@patch("charlie_work.fleet_registry.GitHub")
+def test_count_fleet_runners_local_issues_enabled_via_fleet_layer(
+    mock_gh_class: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #1702: the discriminator is the repo's *layered* config, not a
+    bare per-repo load. When ``local_issues.enabled`` lives only in the
+    fleet-wide global layer (<fleet_dir>/config.yaml) and the repo has no
+    per-repo config at all, the repo must still be recognised as local — a
+    bare load_config on the repo path would read it as "disabled".
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    (fleet_dir / "config.yaml").write_text("local_issues:\n  enabled: true\n", encoding="utf-8")
+
+    local_repo = tmp_path / "localrepo"
+    local_repo.mkdir()
+    (local_repo / ".git").mkdir()
+
+    registry = {
+        "repos": {
+            "local/localrepo": {
+                "repo_root": str(local_repo),
+                "config_path": str(local_repo / "orchestrator.config.yaml"),
+            }
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    total, busy, skipped = count_fleet_runners(str(fleet_dir))
+
+    assert (total, busy, skipped) == (0, 0, [])
+    mock_gh_class.assert_not_called()
+
+
 def _drained_fleet_result() -> CommandResult:
     return CommandResult(
         True,
