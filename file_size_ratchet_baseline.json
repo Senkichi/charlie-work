@@ -25,7 +25,7 @@
   "src/charlie_work/verdict_parsing.py": 1000,
   "src/charlie_work/worker.py": 1600,
   "src/charlie_work/workflow.py": 8800,
-  "src/charlie_work/worktree.py": 5600,
+  "src/charlie_work/worktree.py": 5800,
   "tests/test_api_budget.py": 1200,
   "tests/test_api_worker.py": 1200,
   "tests/test_backlog_reachability.py": 1000,
@@ -50,6 +50,7 @@
   "tests/test_heartbeat_check.py": 4200,
   "tests/test_instrumentation.py": 2200,
   "tests/test_issue_1229_stale_branch_name_collision.py": 1000,
+  "tests/test_issue_1684_quota_classifier.py": 1000,
   "tests/test_janitor.py": 4000,
   "tests/test_merge_preflight_hook.py": 1200,
   "tests/test_post_mortem.py": 2000,
@@ -67,6 +68,6 @@
   "tests/test_worker.py": 2800,
   "tests/test_worker_health.py": 2400,
   "tests/test_worker_stop_gate.py": 1200,
-  "tests/test_worktree.py": 8600,
+  "tests/test_worktree.py": 8800,
   "tests/test_write_gate_enforcement.py": 2000
 }
