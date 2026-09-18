@@ -119,8 +119,13 @@ _MOVED_NAMES = (
 # to stalled_review_reap.py) without the band needing re-derivation for
 # routine per-function growth, while still catching a gross structural
 # change (a member silently dropped or duplicated).
-_CAP_BAND_MIN = 2517
-_CAP_BAND_MAX = 2817
+# Re-derived under issue #1684: the provider-throttle cap-exemption gates
+# (``PROVIDER_THROTTLE_FAILURE_KINDS`` checks in the rework-restore,
+# pre-review-rework, and no-open-PR lanes) grew the module to 2830 lines —
+# the band is re-centered on the new measured total with the same +/-150
+# headroom, per the assertion's own re-derivation instruction.
+_CAP_BAND_MIN = 2680
+_CAP_BAND_MAX = 2980
 
 
 # ---------------------------------------------------------------------------
@@ -410,8 +415,9 @@ def test_module_defines_exactly_the_27_moved_symbols() -> None:
 
 def test_module_total_line_count_is_within_the_recorded_cap_band() -> None:
     """BAND gate: the new module's total (docstring + imports + body) must
-    fall within [2517, 2817] -- derived live from this PR's own measured
-    total (2667 lines) with +/-150 lines of headroom on either side. This is
+    fall within [2680, 2980] -- re-derived under issue #1684 from this PR's
+    measured total (2830 lines, grown by the provider-throttle cap-exemption
+    gates) with +/-150 lines of headroom on either side. This is
     NOT the repo's normal 800-line cap (explicitly waived for this
     extraction under the same #1283 operator exemption
     ``stalled_review_reap.py`` used).

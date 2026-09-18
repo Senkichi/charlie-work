@@ -163,7 +163,11 @@ from .instrumentation import (
 from .preflight import (
     run_preflight,  # noqa: F401  (deliberate re-export; Tier D patch target + used by moved L05 _loop_impl delegate via _wf.)
 )
-from .throttle_signatures import match_throttle_tail, parse_reset_clock_time
+from .throttle_signatures import (
+    match_quota_tail,
+    match_throttle_tail,
+    parse_reset_clock_time,
+)
 from .process_utils import (
     find_worker_terminal_status,
     is_pid_alive,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
@@ -7044,12 +7048,19 @@ class OrchestratorApp:
                     # A quota failure is a global condition, not a per-PR
                     # failure. Stop the pass immediately so the next probe can
                     # retry once the usage window resets.
-                    if (
-                        record.error
-                        and match_throttle_tail(
+                    if record.error and (
+                        match_throttle_tail(
                             record.error,
                             self.config.runtime.throttle_error_markers,
                         )[0]
+                        # Issue #1684: quota exhaustion is a throttle
+                        # outcome too — the structured
+                        # "cognition.ai/errorKind": "resource_exhausted"
+                        # trailer wins over provider prose drift.
+                        or match_quota_tail(
+                            record.error,
+                            self.config.runtime.quota_error_markers,
+                        )
                     ):
                         quota_hit = True
                         quota_hit_error = record.error

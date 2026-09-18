@@ -60,7 +60,11 @@ from .state import (
     utc_now,
     without_review_dispatch_claim,
 )
-from .throttle_signatures import match_throttle_tail, parse_reset_clock_time
+from .throttle_signatures import (
+    match_quota_tail,
+    match_throttle_tail,
+    parse_reset_clock_time,
+)
 from .worker import _alive_review_worker_issue_numbers, iter_workers
 from .worktree import remove_review_checkout
 from .write_gate import WriteGate, require_write_gate
@@ -478,7 +482,14 @@ def _detect_and_handle_stalled_reviews(
             classification = _ThrottleClassification.UNDETERMINED
         else:
             tail = log_text[-2048:] if len(log_text) > 2048 else log_text
-            matched = match_throttle_tail(tail, config.runtime.throttle_error_markers)[0]
+            # Issue #1684: quota exhaustion is a throttle outcome too. The
+            # structured "cognition.ai/errorKind": "resource_exhausted"
+            # trailer is matched before any prose so provider wording drift
+            # ("daily" -> "weekly") cannot demote a quota death to an
+            # ordinary failure that burns review_dispatch_attempt_count.
+            matched = match_throttle_tail(tail, config.runtime.throttle_error_markers)[0] or (
+                match_quota_tail(tail, config.runtime.quota_error_markers)
+            )
             classification = (
                 _ThrottleClassification.THROTTLED
                 if matched
