@@ -15,6 +15,7 @@ Three layers of defense, each guarding a different failure mode:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile as _tempfile
@@ -124,27 +125,131 @@ def test_touch_repo_writes_for_repo_root_outside_temp_dir(tmp_path: Path) -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_autouse_fixture_isolates_fleet_registry(tmp_path: Path) -> None:
-    """Issue #1372 acceptance criterion #1: a test that invokes cli.main via
-    _FakeGitHub without any explicit fleet-dir isolation leaves the real
-    %LOCALAPPDATA%\\charlie-work\\fleet.json byte-identical.
+def test_autouse_fixture_isolates_fleet_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1372 acceptance criterion #1: the autouse fixture's isolation
+    must hold through the real consumer, not just in ``os.environ``.
 
-    The autouse ``_isolate_fleet_registry`` fixture in conftest.py sets
-    ``CHARLIE_WORK_FLEET_DIR`` to ``tmp_path / "fleet"`` for every test. This
-    test verifies that env var is set and that the real registry path resolves
-    to the tmp_path, not the platform default.
+    ``fleet_dir()`` is the single resolver for the fleet registry location:
+    it returns ``CHARLIE_WORK_FLEET_DIR`` when set and the platform default
+    (``%LOCALAPPDATA%\\charlie-work`` / ``~/.local/state/charlie-work``) when
+    unset. Every registry read/write — ``layout.fleet_registry_path``,
+    ``touch_repo``, the fleet lock, the global config layer — goes through
+    it, so asserting on the path *it* returns is the assertion that matters.
+    An env var that is set but never read still satisfies an
+    ``os.environ.get`` re-read, which is all the previous version of this
+    test checked.
     """
+    from charlie_work.fleet_paths import fleet_dir
+    from charlie_work.safe_path import contains
+
     # The autouse fixture should have set CHARLIE_WORK_FLEET_DIR.
     fleet_dir_env = os.environ.get("CHARLIE_WORK_FLEET_DIR")
     assert fleet_dir_env is not None, (
         "CHARLIE_WORK_FLEET_DIR must be set by the autouse _isolate_fleet_registry "
         "fixture — without it, tests write to the operator's live registry."
     )
-    # The env var must point inside tmp_path (the fixture uses tmp_path / "fleet").
-    assert str(tmp_path) in fleet_dir_env, (
-        f"CHARLIE_WORK_FLEET_DIR={fleet_dir_env!r} must resolve under tmp_path="
-        f"{tmp_path!r} for test isolation."
+
+    # The real consumer honors the knob and lands under this test's tmp_path.
+    resolved = fleet_dir()
+    assert resolved == Path(fleet_dir_env)
+    assert contains(tmp_path, resolved), (
+        f"fleet_dir() resolved to {resolved}, which escapes tmp_path={tmp_path} "
+        "— the autouse fixture is not isolating the fleet registry."
     )
+
+    # Test-of-the-test: with the env var deleted — the state the suite would
+    # be in if _isolate_fleet_registry were removed or weakened — the same
+    # consumer must resolve to the platform default instead. If this branch
+    # ever resolved under tmp_path too, the assertions above would be
+    # vacuous: they could pass with isolation broken.
+    with monkeypatch.context() as m:
+        m.delenv("CHARLIE_WORK_FLEET_DIR", raising=False)
+        platform_default = fleet_dir()
+    assert platform_default != resolved
+    assert not contains(tmp_path, platform_default), (
+        f"fleet_dir() with CHARLIE_WORK_FLEET_DIR unset resolved to "
+        f"{platform_default} under tmp_path — the platform-default fallback "
+        "is broken, so this test cannot detect a missing fixture."
+    )
+
+
+def test_cli_main_leaves_real_fleet_registry_byte_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1372 acceptance criterion #1, end to end: invoking ``cli.main``
+    via _FakeGitHub without any explicit ``--fleet-dir`` leaves the real
+    ``%LOCALAPPDATA%\\charlie-work\\fleet.json`` byte-identical.
+
+    ``build_app`` calls ``touch_repo(args.fleet_dir)``; with ``--fleet-dir``
+    absent that is ``touch_repo(None, ...)``, which resolves the registry
+    through ``fleet_dir()`` → ``CHARLIE_WORK_FLEET_DIR``. The autouse
+    fixture's env var must steer that write under ``tmp_path``. Proven by
+    hash-comparing the real registry before and after a full ``cli.main``
+    run — the check issue #1372's AC1 asked for verbatim — not by re-reading
+    the env var the fixture set.
+    """
+    from _cli_fixtures import _FakeGitHub as _CliFakeGitHub
+    from _cli_fixtures import _make_repo
+    from charlie_work import cli, layout
+    from charlie_work.safe_path import contains
+
+    monkeypatch.setattr(cli, "GitHub", _CliFakeGitHub)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    repo = _make_repo(repo_root)
+    summary = repo / "summary.md"
+    summary.write_text("lgtm", encoding="utf-8")
+
+    # The real platform-default registry path, resolved with the fixture's
+    # env var removed through the same consumer the write goes through —
+    # exactly where touch_repo would land without isolation. This doubles as
+    # the test-of-the-test for the write path: the delenv resolution must
+    # still produce a concrete path outside tmp_path for the byte-compare
+    # below to mean anything.
+    with monkeypatch.context() as m:
+        m.delenv("CHARLIE_WORK_FLEET_DIR", raising=False)
+        real_fleet_json = layout.fleet_registry_path()
+    assert not contains(tmp_path, real_fleet_json)
+    real_hash_before = (
+        hashlib.sha256(real_fleet_json.read_bytes()).hexdigest()
+        if real_fleet_json.exists()
+        else None
+    )
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "verdict",
+            "--pr",
+            "1",
+            "--decision",
+            "approved",
+            "--summary-file",
+            str(summary),
+        ]
+    )
+    assert rc == 0
+
+    # The registration write landed in the isolated registry — resolved
+    # through the same fleet_dir() consumer path — under tmp_path.
+    isolated_fleet_json = layout.fleet_registry_path()
+    assert contains(tmp_path, isolated_fleet_json)
+    assert isolated_fleet_json.exists()
+    data = json.loads(isolated_fleet_json.read_text(encoding="utf-8"))
+    assert data["repos"]["owner/repo"]["repo_root"] == str(repo)
+
+    # The operator's real registry is byte-identical (or still absent).
+    if real_hash_before is None:
+        assert not real_fleet_json.exists()
+    else:
+        real_hash_after = hashlib.sha256(real_fleet_json.read_bytes()).hexdigest()
+        assert real_hash_after == real_hash_before, (
+            f"real fleet registry {real_fleet_json} changed during cli.main "
+            "(sha256 mismatch) — fleet-dir isolation is not holding."
+        )
 
 
 # ---------------------------------------------------------------------------
