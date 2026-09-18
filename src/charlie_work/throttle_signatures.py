@@ -31,6 +31,13 @@ into a still-closed window when it resets in 8h. ``parse_reset_clock_time``
 is the single parser for the clock-time form, returning the next UTC
 occurrence of the named reset time so callers can back off until the
 provider's own stated reset instead of a fixed guess.
+
+Issue #1684: quota-exhaustion classification also lives here
+(``match_quota_tail``), keyed primarily on the structured
+``cognition.ai/errorKind`` trailer with ``RuntimeConfig.quota_error_markers``
+as the prose fallback — one definition shared by both adapters instead of
+the two hand-maintained regex copies that drifted on "daily" vs "weekly"
+provider wording.
 """
 
 from __future__ import annotations
@@ -55,6 +62,35 @@ _RESETS_CLOCK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Structured provider quota discriminator (issue #1684): the Devin CLI's
+# quota errors carry a JSON trailer with a stable, structured
+# ``cognition.ai/errorKind`` field — observed verbatim 2026-09-17:
+#   {"cognition.ai/errorKind": "resource_exhausted",
+#    "cognition.ai/retryable": true}
+# — which is far more reliable than the English sentence around it (the
+# prose said "daily", then "weekly" — a drift that silently defeated the
+# previous prose-only pattern and burned the review-attempt cap on PR
+# #1595). Anchored to the exact ``resource_exhausted`` value so sibling
+# kinds ("internal", "permission_denied", ...) never classify as quota.
+_RESOURCE_EXHAUSTED_PATTERN = re.compile(
+    r'"cognition\.ai/errorKind"\s*:\s*"resource_exhausted"',
+    re.IGNORECASE,
+)
+
+# The ``failure_kind`` values that represent a provider-side throttle
+# condition — the kinds for which ``_classify_session_failure`` arms
+# ``throttled_until``. Cap accounting uses this set so a zero-turn death
+# caused by a global provider condition (quota wall, rate limit, dead
+# API key) is never charged against the issue's redispatch/rework caps
+# (issue #1684): those caps exist to bound retries of *worker* failures,
+# and the fleet-wide cooldown is already armed by the classifier.
+# ``provider_suspended`` is deliberately absent — it is terminal (no
+# cooldown) and escalates deterministically on first occurrence via
+# ``DETERMINISTIC_ESCALATION_FAILURE_KINDS``.
+PROVIDER_THROTTLE_FAILURE_KINDS: frozenset[str] = frozenset(
+    {"quota_exhausted", "rate_limited", "provider_auth"}
+)
+
 
 def match_throttle_tail(tail: str, markers: Sequence[str]) -> tuple[bool, int | None]:
     """Match ``tail`` against ``markers`` (case-insensitive substrings).
@@ -72,6 +108,28 @@ def match_throttle_tail(tail: str, markers: Sequence[str]) -> tuple[bool, int | 
     reset_match = _RESETS_IN_PATTERN.search(tail)
     reset_minutes = int(reset_match.group(1)) if reset_match else None
     return True, reset_minutes
+
+
+def match_quota_tail(tail: str, markers: Sequence[str]) -> bool:
+    """Match ``tail`` against the provider quota-exhaustion signature.
+
+    The structured signal is checked FIRST (issue #1684): a tail carrying
+    ``"cognition.ai/errorKind": "resource_exhausted"`` is quota-exhausted
+    regardless of the prose around it — the Devin CLI has already drifted
+    the sentence once ("daily" → "weekly") and will drift it again. The
+    ``markers`` list (``RuntimeConfig.quota_error_markers``) is the prose
+    fallback for tails with no structured trailer (older provider
+    messages, other CLIs) and is deliberately period-agnostic — the
+    default ``"usage quota has been exhausted"`` matches daily, weekly,
+    monthly, or any future period word. Operators extend it via config
+    without a code change, mirroring ``throttle_error_markers``.
+
+    Returns True when either signal matches.
+    """
+    if _RESOURCE_EXHAUSTED_PATTERN.search(tail):
+        return True
+    tail_lower = tail.lower()
+    return any(marker.lower() in tail_lower for marker in markers)
 
 
 def parse_reset_clock_time(tail: str, now: datetime) -> datetime | None:
@@ -124,4 +182,9 @@ def parse_reset_clock_time(tail: str, now: datetime) -> datetime | None:
     return candidate.astimezone(UTC)
 
 
-__all__ = ["match_throttle_tail", "parse_reset_clock_time"]
+__all__ = [
+    "PROVIDER_THROTTLE_FAILURE_KINDS",
+    "match_quota_tail",
+    "match_throttle_tail",
+    "parse_reset_clock_time",
+]

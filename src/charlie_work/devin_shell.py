@@ -38,7 +38,7 @@ from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, run_captured
-from .throttle_signatures import match_throttle_tail
+from .throttle_signatures import match_quota_tail, match_throttle_tail
 from .worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
@@ -65,11 +65,12 @@ logger = logging.getLogger(__name__)
 # throttle_signatures.match_throttle_tail — used here and by
 # get_rate_limit_defer_until below (PR #262 review findings F1/F5).
 _DEFAULT_THROTTLE_ERROR_MARKERS = OrchestratorConfig().runtime.throttle_error_markers
-# Pattern for quota-exhaustion errors (e.g., "daily usage quota has been exhausted")
-_QUOTA_EXHAUSTED_PATTERN = re.compile(
-    r"daily usage quota has been exhausted|quota exceeded|usage limit",
-    re.IGNORECASE,
-)
+# Quota-exhaustion prose fallback markers — defaults sourced from
+# RuntimeConfig so there is a single default list; the structured
+# "cognition.ai/errorKind": "resource_exhausted" trailer and the
+# period-agnostic prose match live in throttle_signatures.match_quota_tail
+# (issue #1684), shared with the claude_code sibling adapter.
+_DEFAULT_QUOTA_ERROR_MARKERS = OrchestratorConfig().runtime.quota_error_markers
 
 # Default cooldown durations when we can't parse a specific reset time
 _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
@@ -257,6 +258,7 @@ def _classify_session_failure(
     log_path: Path,
     throttle_error_markers: Sequence[str] | None = None,
     *,
+    quota_error_markers: Sequence[str] | None = None,
     resume_margin_seconds: int = 0,
     now: datetime | None = None,
 ) -> tuple[str | None, str | None]:
@@ -267,6 +269,12 @@ def _classify_session_failure(
     - throttled_until_iso: ISO timestamp when the cooldown ends, or None if not applicable
 
     This is called after a session exits to detect provider throttling and set a cool-down window.
+
+    ``quota_error_markers`` is the prose-fallback list for quota exhaustion
+    (``RuntimeConfig.quota_error_markers``); the structured
+    ``cognition.ai/errorKind`` trailer is always checked first, regardless
+    of the marker list (issue #1684). Defaults to the config module's
+    default list when not provided.
 
     ``resume_margin_seconds`` is an extra safety margin past the provider's
     reported reset (or fixed quota cooldown) time. Provider reset estimates are
@@ -293,8 +301,16 @@ def _classify_session_failure(
     # Check the last 2KB of the log (where error messages appear)
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
 
-    # Check for quota exhaustion first (more severe)
-    if _QUOTA_EXHAUSTED_PATTERN.search(tail):
+    # Check for quota exhaustion first (more severe). Single point of
+    # enforcement (throttle_signatures.match_quota_tail) shared with the
+    # claude_code sibling adapter — the structured "cognition.ai/errorKind":
+    # "resource_exhausted" trailer is matched before the config-driven prose
+    # markers so provider wording drift ("daily" -> "weekly", issue #1684)
+    # cannot defeat the classification.
+    quota_markers = (
+        quota_error_markers if quota_error_markers is not None else _DEFAULT_QUOTA_ERROR_MARKERS
+    )
+    if match_quota_tail(tail, quota_markers):
         # Quota exhaustion uses a fixed 24-hour cooldown regardless of reset time
         cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
         throttled_until = resolved_now + cooldown
@@ -901,8 +917,8 @@ def update_session_record_with_failure_classification(
     throttle-marker text).
 
     ``config`` is optional for backward compatibility; when provided, its
-    ``runtime.throttle_error_markers`` and ``runtime.throttle_resume_margin_s``
-    are used instead of the defaults.
+    ``runtime.throttle_error_markers``, ``runtime.quota_error_markers``, and
+    ``runtime.throttle_resume_margin_s`` are used instead of the defaults.
 
     ``now`` is forwarded to ``_classify_session_failure`` (issue #822's
     injectable clock); defaults to ``datetime.now(UTC)`` there when omitted.
@@ -934,13 +950,16 @@ def update_session_record_with_failure_classification(
     if log_path_str:
         if config is not None:
             throttle_markers = config.runtime.throttle_error_markers
+            quota_markers = config.runtime.quota_error_markers
             resume_margin_seconds = config.runtime.throttle_resume_margin_s
         else:
             throttle_markers = None
+            quota_markers = None
             resume_margin_seconds = 0
         classified_kind, throttled_until = _classify_session_failure(
             Path(log_path_str),
             throttle_markers,
+            quota_error_markers=quota_markers,
             resume_margin_seconds=resume_margin_seconds,
             now=now,
         )

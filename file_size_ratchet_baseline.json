@@ -50,6 +50,7 @@
   "tests/test_heartbeat_check.py": 4200,
   "tests/test_instrumentation.py": 2200,
   "tests/test_issue_1229_stale_branch_name_collision.py": 1000,
+  "tests/test_issue_1684_quota_classifier.py": 1000,
   "tests/test_janitor.py": 4000,
   "tests/test_merge_preflight_hook.py": 1200,
   "tests/test_post_mortem.py": 2000,
