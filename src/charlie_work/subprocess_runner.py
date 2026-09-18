@@ -188,9 +188,18 @@ def run_captured(
     timeout_seconds: int,
     shell: bool = False,
     stdin: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> RunResult:
     """Run ``command`` and capture output. Never raises for runtime failures —
-    timeouts, missing binaries, and non-zero exits all come back as a result."""
+    timeouts, missing binaries, and non-zero exits all come back as a result.
+
+    ``extra_env``, when given, is layered on top of (never in place of) the
+    current process environment -- a full replacement would drop ``PATH`` and
+    break the child's ability to even find ``git``. Omitted (the default),
+    the child inherits the parent environment unchanged, matching prior
+    behavior for every existing call site.
+    """
+    env = {**os.environ, **extra_env} if extra_env else None
     try:
         completed = subprocess.run(
             command,
@@ -203,6 +212,7 @@ def run_captured(
             shell=shell,
             check=False,
             input=stdin,
+            env=env,
             **hidden_console_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
