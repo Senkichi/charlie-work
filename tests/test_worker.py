@@ -1175,8 +1175,9 @@ def test_workflow_classify_dead_sessions_completed_skips_log_tail_throttle(
     ``workflow._classify_dead_sessions_and_update_throttle_state`` (one per
     adapter kind, including the claude-code branch that caused the live #651
     incident). The log file is seeded with ``"usage limit"`` -- a
-    ``_QUOTA_EXHAUSTED_PATTERN`` substring that, if log-tail classification
-    ran, would return ``quota_exhausted`` plus a 24h ``throttled_until`` and
+    ``match_quota_tail`` / ``quota_error_markers`` substring that, if log-tail
+    classification ran, would return ``quota_exhausted`` plus a 24h
+    ``throttled_until`` and
     write it into state.json. The worktree inspection is ground truth the
     session completed, so ``session_completed=True`` must skip log-tail
     matching entirely and leave ``failure_kind="unpublished_work"``.
