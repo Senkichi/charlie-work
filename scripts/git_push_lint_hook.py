@@ -11,12 +11,13 @@ salvage lane handles, whose pushes bypass the worker entirely). This hook
 closes that gap by running the same scoped-ruff check at push time.
 
 **Reuses** ``worker_stop_gate``'s changed-set derivation
-(``_all_changed_files``) and scoped-ruff machinery (``_run_ruff``) rather
-than a second implementation -- loaded via ``importlib`` from the sibling
-script, never duplicated. Does NOT run targeted tests: the Stop gate
-already does that at session end, and running tests before every push
-would be too slow and too aggressive for a PreToolUse gate that fires on
-every Bash command.
+(``_all_changed_files``), ruff-scope predicate (``_ruff_lint_paths`` --
+untracked ``??`` files excluded per #1306, the parity fix for #1704), and
+scoped-ruff machinery (``_run_ruff``) rather than a second implementation
+-- loaded via ``importlib`` from the sibling script, never duplicated.
+Does NOT run targeted tests: the Stop gate already does that at session
+end, and running tests before every push would be too slow and too
+aggressive for a PreToolUse gate that fires on every Bash command.
 
 Registered as a PreToolUse hook on ``Bash`` in ``.claude/settings.json``.
 Only fires on actual ``git push`` invocations (token-based detection --
@@ -326,18 +327,19 @@ def _check_push_lint(command: str, cwd: Path) -> str | None:
 
     Returns a deny reason string, or ``None`` to allow the push. Reuses
     ``worker_stop_gate``'s ``_all_changed_files`` (changed-set derivation
-    with the same fail-open branch-base fallback) and ``_run_ruff``
-    (scoped ``ruff check`` + ``ruff format --check`` on exactly the
-    changed ``.py`` files).
+    with the same fail-open branch-base fallback), ``_ruff_lint_paths``
+    (the shared ruff-scope predicate -- tracked-modified + committed-
+    since-base only, with untracked ``??`` files excluded per #1306 so
+    pre-existing debris the session never touched cannot deny the push,
+    #1704), and ``_run_ruff`` (scoped ``ruff check`` + ``ruff format
+    --check`` on exactly the changed ``.py`` files).
     """
     stop_gate = _load_stop_gate()
     repo_root = stop_gate._repo_root(cwd)
     changed = stop_gate._all_changed_files(repo_root)
     if not changed:
         return None  # nothing to lint -- allow
-    py_files = tuple(
-        sorted(cf.path for cf in changed if not cf.deleted and cf.path.endswith(".py"))
-    )
+    py_files = stop_gate._ruff_lint_paths(changed)
     if not py_files:
         return None  # no .py files in the changed set -- allow
     result = stop_gate._run_ruff(repo_root, py_files)
