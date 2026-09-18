@@ -73,8 +73,9 @@ def _request_no_op_rework_repair(
         issue_number,
         decision,
         summary,
-        # event-consumer: audit-only -- records a rework repair request already
-        # routed to a worker via _route_to_rework (the dispatch IS the action)
+        # records a rework repair request already routed to a worker via
+        # _route_to_rework (the dispatch IS the action); consumed by
+        # experiment_report's no_op_kickback_rate metric (issue #1701)
         "no_op_rework_repair_requested",
         extra_state=extra_state,
     )
