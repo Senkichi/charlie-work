@@ -116,6 +116,7 @@ from .github import (
 from .issue_linking import linked_issue_number
 from .instrumentation import log_event
 from .labels import TransitionOutcome
+from .local_work_park import park_unpublishable_work
 from .paths import resolved_layout
 from .pr_create_retry import create_pr_with_retry
 from .process_utils import (
@@ -2737,6 +2738,14 @@ def _attempt_salvage(
             )
             write_gate.save_state(state)
         return True, None
+
+    # No-PR backend (local-file issues): the branch is the deliverable -- see
+    # ``local_work_park``. After the already-landed skip, before any push.
+    parked = park_unpublishable_work(
+        gh, config, repo_root, branch, issue_number, active_labels, failure_kind, write_gate
+    )
+    if parked is not None:
+        return parked
 
     push_ok, push_error = push_branch(
         repo_root, branch, worktree_path=worktree_path, dry_run=write_gate.dry_run

@@ -941,6 +941,29 @@ def _resolve_default_branch_ref(repo_root: Path) -> str:
     )
 
 
+def _main_worktree_head(worktree_path: Path) -> str | None:
+    """Commit the *main* worktree's HEAD points at, asked from any worktree.
+
+    ``git worktree list --porcelain`` always lists the main worktree first,
+    whichever worktree it is run from, as ``worktree <path>`` / ``HEAD <sha>``.
+    Returns ``None`` when git fails or the entry carries no HEAD (a bare or
+    unborn main worktree) -- an error value, per the ``run_captured`` contract.
+    """
+    result = run_captured(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not result.ok:
+        return None
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            return None  # end of the first (main) entry without a HEAD line
+        if line.startswith("HEAD "):
+            return line[len("HEAD ") :].strip() or None
+    return None
+
+
 def _has_origin_remote(repo_root: Path) -> bool:
     """Check if the repo has an 'origin' remote configured.
 
@@ -4157,8 +4180,33 @@ def inspect_worktree_state(
     else:
         resolved_base_ref = base_ref
 
+    comparison_ref = resolved_base_ref
+    if resolved_base_ref == "HEAD":
+        # Pure-local repo (no origin). ``"HEAD"`` is relative to whoever asks:
+        # at worktree *creation* the resolver runs in the main checkout, so it
+        # names the dispatch base; here it runs inside the worker's worktree,
+        # so it names the worker's own tip and ``merge-base HEAD HEAD`` makes
+        # ``ahead_count`` 0 by construction -- every finished local worker
+        # would read as NO_COMMITS. Re-anchor to the main worktree's HEAD, the
+        # commit ``"HEAD"`` meant when this worktree was cut. The main checkout
+        # moving forward since is harmless: merge-base still finds the fork
+        # point. Unresolvable is UNKNOWN, never a confident NO_COMMITS.
+        #
+        # Only the comparison anchor changes. ``resolved_base_ref`` still
+        # reports ``"HEAD"``: consumers hand it to ``resolve_base_branch_name``
+        # with ``cwd=repo_root``, where ``"HEAD"`` correctly means "the main
+        # checkout's current branch" and a bare SHA would fall through to the
+        # hardcoded ``main`` last resort.
+        main_head = _main_worktree_head(worktree_path)
+        if main_head is None:
+            return WorktreeInspection(
+                WorktreeState.UNKNOWN,
+                error="no origin remote and the main worktree's HEAD could not be read",
+            )
+        comparison_ref = main_head
+
     merge_base_result = run_captured(
-        ["git", "merge-base", resolved_base_ref, "HEAD"],
+        ["git", "merge-base", comparison_ref, "HEAD"],
         cwd=worktree_path,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )

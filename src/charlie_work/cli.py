@@ -51,9 +51,11 @@ from .github import (
     CLOSING_KEYWORD_PR_FIELDS,
     GitHub,
     GitHubError,
+    GitHubLike,
     defang_closing_keywords,
 )
 from .issue_linking import linked_issue_number
+from .local_issues import github_client_for
 from . import layout
 from .dirty_tree import check_working_tree_clean
 from .logging_setup import configure_logging
@@ -765,7 +767,7 @@ class CommandContext:
     repo_root: Path
     config: OrchestratorConfig
     paths: RuntimePaths
-    gh: GitHub
+    gh: GitHubLike
 
 
 def bootstrap_command(
@@ -803,7 +805,7 @@ def bootstrap_command(
     _assert_config_repo_matches(args.config, repo_root)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
-    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
+    gh = github_client_for(repo_root, config, github=GitHub, dry_run=args.dry_run)
     return CommandContext(repo_root=repo_root, config=config, paths=paths, gh=gh)
 
 
@@ -1493,7 +1495,7 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
 
             config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
-            gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=True)
+            gh = github_client_for(repo_root, config, github=GitHub, dry_run=True)
             app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
             result = app.status(use_cache=not getattr(args, "no_cache", False))
             per_repo[repo_key] = result.data
@@ -1539,7 +1541,7 @@ def run_fleet_review_queue(args: argparse.Namespace) -> CommandResult:
 
             config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
-            gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=True)
+            gh = github_client_for(repo_root, config, github=GitHub, dry_run=True)
             app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
             result = app.review_queue()
             per_repo[repo_key] = result.data
@@ -1575,7 +1577,7 @@ def run_fleet_operator_queue(args: argparse.Namespace) -> CommandResult:
 
             config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
-            gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=True)
+            gh = github_client_for(repo_root, config, github=GitHub, dry_run=True)
             app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
             result = app.operator_queue()
             per_repo[repo_key] = result.data

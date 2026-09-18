@@ -71,6 +71,7 @@ hours from the ring alone, you are reading roughly the most recent 9% of history
 | `agent:blocked` | `verdict --decision blocked` — a product/security decision is needed. | `verdict` → event `blocked`. |
 | `agent:done` | PR merged via `ship-it`. Every `active` label is removed in the same transition. | `ship-it` → event `merged`. |
 | `agent:human-needed` | `blocked` or the rework cap exhausted. Terminal — no further automation happens until a human clears it. | `verdict` → event `escalated`/`blocked`. |
+| `agent:review-ready` | Local-file issue source only (`local_issues.enabled`): a worker's session ended with commits and there was no remote to push to, so the branch is the deliverable. Terminal, but **not** an escalation — nothing went wrong. | `dead_worker_reap._park_local_work_for_review` → event `local_work_ready`. |
 
 Legal transitions are exactly `labels.py`'s `_edges()` table — see the
 mermaid diagram in
@@ -117,6 +118,27 @@ either:
 There is no automatic un-escalation — a human decision, once escalated,
 requires a human (or an explicit re-`verdict`) to move the issue
 forward again.
+
+## Handling `agent:review-ready` (local-file issue source)
+
+Only reachable when `local_issues.enabled: true` (see
+[README.md#local-file-issue-source](../README.md#local-file-issue-source)).
+An issue lands here when a worker's session ended with commits on its branch
+and there was no remote to push to — the branch itself is the deliverable,
+not a PR. This is a **success** state, not an escalation:
+`agent:review-ready` is terminal (it holds the issue out of dispatch, same as
+`agent:human-needed`) but deliberately a distinct label, so it never inflates
+escalation counts.
+
+The issue file itself carries a comment naming the branch to review (appended
+below `<!-- charlie-work:comments -->` by `LocalFileGitHub.issue_comment`).
+
+**Recovery**: review the named branch by hand (`git log`, `git diff` against
+your default branch), merge it however you normally would, and close the
+issue yourself — nothing in this repo pushes, opens a PR, or merges on your
+behalf for a local-file issue. `charlie unescalate` is a no-op here (it only
+acts when an issue's recorded status is `escalated`, which a review-ready
+issue never has) — clear `agent:review-ready` by hand once you're done.
 
 ## Corrupt-state quarantine recovery
 
