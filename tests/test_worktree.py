@@ -6180,6 +6180,120 @@ def test_clean_worktrees_skips_when_merged_head_object_is_absent(tmp_path: Path)
     assert info.path.exists()
 
 
+def test_clean_worktrees_fetches_missing_merged_pr_head_and_reclaims(tmp_path: Path) -> None:
+    """Regression test for the bug this fix closes.
+
+    A squash-merged PR whose remote branch was deleted post-merge leaves
+    ``headRefOid`` unreachable from anything ``repo_root`` has ever fetched
+    -- nothing local ever pointed at it, so it was never fetched in the
+    first place (a live sweep hit this for 37 of 63 candidates and could
+    never reclaim any of them). GitHub still serves the commit via
+    ``refs/pull/<N>/head`` even after the branch is gone, so
+    ``clean_worktrees`` must fetch that ref on demand and re-check before
+    falling into the "not present in the local object store" skip.
+    """
+    remote, repo_root = _init_repo_with_remote(tmp_path)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _git(repo_root, "push", "origin", "main")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    branch_name = "agent/issue-9-fetch-pr-head"
+    info = create_worktree(repo_root, branch_name, base_ref="origin/main")
+    (info.path / "feature.txt").write_text("real work\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "real work for issue 9")
+    push_ok, push_error = push_branch(repo_root, branch_name, worktree_path=info.path)
+    assert push_ok, push_error
+
+    # A separate clone advances the branch further (mirrors a merge-queue
+    # rebase landing a new commit past the worker's last local commit) and
+    # pushes the result ONLY to refs/pull/<pr>/head -- never as a branch --
+    # mirroring how GitHub exposes a merged PR's head once its branch is
+    # deleted post-merge (this repo's AutoMergeConfig default: squash +
+    # delete_branch=True).
+    third_clone = tmp_path / "third"
+    _clone_repo(remote, third_clone)
+    _git(third_clone, "fetch", "origin", branch_name)
+    _git(third_clone, "checkout", "-b", branch_name, f"origin/{branch_name}")
+    (third_clone / "queued.txt").write_text("advanced by the merge queue\n", encoding="utf-8")
+    _git(third_clone, "add", "queued.txt")
+    _git(third_clone, "commit", "-m", "merge queue advanced the branch")
+    merged_head_sha = _git(third_clone, "rev-parse", "HEAD").stdout.strip()
+    _git(third_clone, "push", "origin", "HEAD:refs/pull/109/head")
+    _git(third_clone, "push", "origin", "--delete", branch_name)
+
+    # Sanity-check the regression shape: repo_root has never fetched this
+    # object (it never fetched refs/pull/*, and the branch that once could
+    # have carried it was deleted before repo_root ever saw the advance).
+    cat_file = subprocess.run(
+        ["git", "cat-file", "-e", f"{merged_head_sha}^{{commit}}"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert cat_file.returncode != 0
+
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=9, pr_number=109)
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(head_sha=merged_head_sha),
+    )
+
+    assert result.data["skipped"] == [], result.data["skipped"]
+    assert [entry["issue_number"] for entry in result.data["removed"]] == [9]
+    assert not info.path.exists()
+
+
+def test_clean_worktrees_skips_when_pr_head_fetch_fails(tmp_path: Path) -> None:
+    """The fetch-on-demand fallback must itself fail closed, without raising.
+
+    Distinct from ``test_clean_worktrees_skips_when_merged_head_object_is_absent``
+    (which has no origin remote at all, so the fetch attempt is skipped
+    entirely): here an origin remote exists, but nothing was ever pushed to
+    ``refs/pull/<pr>/head``, so the fetch this fix adds actually runs and
+    fails ("couldn't find remote ref"). That failure must degrade to the
+    same fail-closed skip and reason as before -- never an exception that
+    aborts the whole sweep.
+    """
+    remote, repo_root = _init_repo_with_remote(tmp_path)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _git(repo_root, "push", "origin", "main")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    info = create_worktree(repo_root, "agent/issue-11-fetch-fails", base_ref="origin/main")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=11, pr_number=111)
+    # A well-formed SHA that names no object anywhere -- not locally, and
+    # never pushed to refs/pull/111/head on the remote either.
+    absent_sha = "0" * 39 + "2"
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(head_sha=absent_sha),
+    )
+
+    assert result.data["removed"] == []
+    assert len(result.data["skipped"]) == 1
+    assert "not present in the local object store" in result.data["skipped"][0]["reason"]
+    assert info.path.exists()
+
+
 def test_clean_worktrees_removes_squash_merged_worktree_with_deleted_remote_branch(
     tmp_path: Path,
 ) -> None:
