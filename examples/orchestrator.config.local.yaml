@@ -1,0 +1,124 @@
+# charlie-work config — local-file issue source, Claude-Code-workers profile.
+# Copy to your repo root as `orchestrator.config.yaml` and adjust.
+#
+# For a repo with NO GitHub remote: issues are markdown files under
+# local_issues.issues_dir instead of GitHub issues (local_issues.py /
+# local_issue_files.py). Everything PR/CI/merge-shaped (review_dispatch,
+# auto_merge, required_checks, …) is a null object here — reads answer
+# empty, writes fail as values — so those sections below are declared for
+# parity with the other shipped profiles but have nothing to act on. See
+# README.md#local-file-issue-source for the full mechanism and limitations.
+
+local_issues:
+  enabled: true
+  # Relative to the repo root. One file per issue: NNN_*.md, YAML
+  # frontmatter (title/state/labels/…) + body. Non-recursive scan.
+  issues_dir: docs/issues
+
+labels:
+  ready: automated-ready
+
+dispatch:
+  # Each unit of default_limit is one LOCAL worker (its own worktree + claude -p
+  # + test run) on THIS host — unlike the Devin adapters, which run in the
+  # cloud. Total host load ≈ default_limit × the suite's xdist worker count, so
+  # keep that product near your physical core count and bound the consumer
+  # suite's `-n` (don't let it inherit `-n auto`). See RUNBOOK.md
+  # "Local host saturation ceiling (claude-code adapter)".
+  default_limit: 3
+  # Per-pass cap for merge-finalization of merged-PR-referenced closed issues
+  # (stale ready-label cleanup). Irrelevant here (no PRs) but harmless — 0
+  # disables finalization outright if you'd rather make that explicit.
+  finalize_limit: 25
+  branch_prefix: agent/issue
+  # No worker_template set here deliberately: local_issues.enabled above
+  # re-defaults dispatch.worker_template to worker_local.md automatically
+  # (config.load_config) — commit-only, no push, no PR. Set this explicitly
+  # only to override that default with your own repo-local template.
+  # worker_template: worker_claude_code.md
+  # Dispatch order: "oldest" (default) or "newest" (previous behavior)
+  # order: oldest
+
+review:
+  # Escalates to agent:human-needed past this many request_changes cycles.
+  # Irrelevant for local issues (there is no PR to review), kept for parity.
+  max_rework_cycles: 2
+  require_tests_or_rationale: true
+  require_issue_link: true
+
+review_dispatch:
+  # No PRs exist for a local-file issue source, so there is nothing for an
+  # automated reviewer to dispatch against. Leave this off.
+  enabled: false
+  reviews_dir: .var/charlie-work/dispatches/reviews
+  max_local_review_processes: 0
+
+auto_merge:
+  # LocalFileGitHub.merge_pr always fails (GitHubError) — there is no PR to
+  # merge. Leaving this on is harmless (ship-it has nothing to act on); flip
+  # it off if the "enabled but never fires" state bothers you operationally.
+  enabled: true
+  strategy: squash
+  delete_branch: true
+  require_approved_review: true
+  # MUST match the check-run names GitHub reports for your CI. Irrelevant
+  # here (no CI integration for local repos) — kept for parity with the
+  # other shipped profiles.
+  required_checks:
+    - Test
+    - "Lint, Types & Pre-commit"
+    - "Collect-only gate"
+
+runtime:
+  state_dir: .var/charlie-work
+  # Repo-local templates override package templates by filename. Point this at
+  # a tracked dir holding your specialized worker prompt (repo invariants,
+  # canonical commands) — see the empericus setup for the pattern.
+  # prompts_dir: orchestrator-prompts
+
+worker:
+  # claude-code launches each worker headless in an isolated git worktree.
+  # Fall back to harness: manual to paste prompts from the session manifest
+  # by hand if the claude CLI is unavailable.
+  harness: claude-code
+
+reviewer:
+  # No automated reviewer is dispatched in this profile (review_dispatch is
+  # off above, and there are no PRs to review regardless); harness is
+  # declared for config-shape parity with the other shipped profiles.
+  harness: claude-code
+
+devin:
+  # Each worker cold-builds its own per-worktree `.venv` by default (issue
+  # #274); set claude_code.venv_source to a path only if you want to opt back
+  # into the shared-venv junction. Verify with `charlie doctor
+  # --adapter-probe` before the first wave.
+  session_manifest: .var/charlie-work/dispatches/session-manifest.json
+  session_results: .var/charlie-work/dispatches/session-results.json
+  sessions_dir: .var/charlie-work/dispatches/sessions
+
+claude_code:
+  # Worktrees live under .var/charlie-work/worktrees unless overridden.
+  # worktrees_dir: .var/charlie-work/worktrees
+  # Disabled by default (issue #274): a claude-code worker has a full agentic
+  # shell and can run uv sync, which would rewrite the shared venv's editable
+  # install metadata. Set to a path to re-enable the legacy shared-venv
+  # junction; set to null to keep it disabled.
+  venv_source: null
+  # Extra env merged over the orchestrator's env in every worker process. Each
+  # claude-code worker runs LOCALLY on this host, so a default_limit-wide wave
+  # stacks K test runs here. PYTEST_XDIST_AUTO_NUM_WORKERS caps `pytest -n auto`
+  # at the launch boundary so the fleet doesn't oversubscribe cores into swap.
+  # "2" is a starting point for a ~6-8 core box; raise/lower so default_limit
+  # x value ~= your physical cores. See RUNBOOK.md "Local host saturation
+  # ceiling (claude-code adapter)".
+  worker_env:
+    PYTEST_XDIST_AUTO_NUM_WORKERS: "2"
+
+supervisor:
+  # Foreground poll/sleep loop used by `charlie bash-rats` (per-repo) and
+  # `charlie fleet supervise` (fleet-wide). All four fields below apply to both.
+  poll_interval_seconds: 20
+  full_pass_interval_seconds: 300
+  active_cooldown_seconds: 30
+  max_runtime_minutes: 0

@@ -194,9 +194,11 @@ escalates to `agent:human-needed`), `auto_merge.required_checks` (verify with
 `test_adequacy.*` (opt-in test-adequacy gate), `watchdog.*` (supervisor tripwires: stall/wall-clock/
 loop/cost-token budgets, WARN-first by default), `fleet.*`
 (`global_max_concurrent_sessions` — cross-repo worker-count budget),
-`notify.*` (opt-in needs-attention sink: webhook | desktop | shell | file), and
-`runner_allocation.*` (host-wide elastic CI-runner slots — see below), and
-`runner_capacity_escalation.*` (sustained-window starvation escalation — see below).
+`notify.*` (opt-in needs-attention sink: webhook | desktop | shell | file),
+`runner_allocation.*` (host-wide elastic CI-runner slots — see below),
+`runner_capacity_escalation.*` (sustained-window starvation escalation — see below),
+and `local_issues.*` (issue source for a repo with no GitHub remote — see
+[Local-file issue source](#local-file-issue-source) below).
 
 ### Self-hosted runner allocation
 
@@ -279,14 +281,60 @@ before launch; junction-safe teardown on failure), with sidecar tracking;
 venv junctioned in — teardown is junction-safe). Probe the configured adapter
 with `charlie doctor --adapter-probe`.
 
+### Local-file issue source
+
+For a repo with no GitHub remote, `local_issues.enabled: true` swaps the
+`gh`-backed client for `LocalFileGitHub` — `local_issues.github_client_for`
+is the single point of choice, so every `OrchestratorApp` construction path
+picks up the same backend. Issues become markdown files under
+`local_issues.issues_dir` (default `docs/issues`), one file per issue named
+`NNN_*.md`, with YAML frontmatter (`title`, `state`, `labels`, …) and the
+rest of the file as the issue body (`local_issue_files.py`). Comments —
+including the orchestrator's own — are appended below a
+`<!-- charlie-work:comments -->` marker so they never leak into the body a
+worker prompt renders. Label names still come from `LabelConfig`; this
+section only says where the issues live.
+
+Enabling it also re-defaults `dispatch.worker_template` to `worker_local.md`
+(commit-only: no `git push`, no PR) unless you set an explicit template
+yourself. See `examples/orchestrator.config.local.yaml`.
+
+A worker's deliverable is commits on its branch. When a local worker's
+session ends with commits and there is no remote to push to or PR to open,
+the orchestrator transitions the issue to the terminal `agent:review-ready`
+label and appends a comment naming the branch to the issue file
+(`local_work_park.park_unpublishable_work`, event `local_work_ready`).
+A human then reviews the branch, merges it, and closes the issue by hand —
+nothing here does that step for you.
+
+Out of scope: no PR, review, or merge lanes for local issues, no reconcile
+changes, and no CI integration. Everything PR/CI/merge-shaped on
+`LocalFileGitHub` is a null object — reads answer `[]`/`{}`/`None` (the same
+"nothing here" shapes the real client returns for an empty repo), and writes
+fail as values or raise `GitHubError`.
+
+**Limitations**:
+
+- Label, state, and comment writes edit files in the consumer repo's own
+  working tree (the main checkout), so they show up as uncommitted changes
+  there.
+- In fleet mode, the runner-count pass (`fleet_registry.count_fleet_runners`)
+  builds a real `GitHub` client per registered repo regardless of issue
+  source, and will log a warning and skip a `local/<dir>` repo.
+- PR-shaped commands (`why-charlie-hate`, `verdict`, `ship-it`, …) have
+  nothing to act on.
+
 ## Prompt templates
 
 Package defaults live in `src/charlie_work/prompts/`. A repo-local
 directory (`runtime.prompts_dir`) overrides them **by filename** — drop in
 your own `worker.md` carrying your repo's invariants and canonical commands,
 and everything else keeps the defaults. `worker.md` targets Devin sessions;
-`worker_claude_code.md` targets Claude Code workers
-(`dispatch.worker_template` selects). Blocks shared by both worker templates
+`worker_claude_code.md` targets Claude Code workers; `worker_local.md`
+targets the [local-file issue source](#local-file-issue-source) (commit-only:
+no push, no PR) — `dispatch.worker_template` selects, and re-defaults to
+`worker_local.md` automatically when `local_issues.enabled` is set and no
+explicit template is given. Blocks shared across worker templates
 live as partials under `prompts/worker_sections/` and render as
 `$section_<stem>` — repo-local `worker_sections/` dirs override by filename
 too, so a shared change lands in one place instead of drifting across forks.

@@ -31,6 +31,7 @@ from . import layout
 from .github import GitHub, GitHubError
 from .global_config import describe_config_file, load_layered_config
 from .instrumentation import log_event
+from .local_issues import github_client_for
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, runtime_paths
 from .venv_anchor import verify_interpreter_anchored_editables
@@ -2019,7 +2020,7 @@ def fleet_loop(
                 continue
 
             try:
-                gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
+                gh = github_client_for(repo_root, config, github=GitHub, dry_run=dry_run)
                 app = OrchestratorApp(
                     repo_root,
                     paths,
