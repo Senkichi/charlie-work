@@ -25,6 +25,14 @@
    "member_count": 9
   },
   {
+   "boundary": 6.0,
+   "bumps": [],
+   "file": "src/charlie_work/workflow.py",
+   "identity": "OrchestratorApp",
+   "kind": "class",
+   "member_count": 7
+  },
+  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_api_budget.py",
