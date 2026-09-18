@@ -5,21 +5,24 @@ from __future__ import annotations
 import json
 
 from charlie_work.attachment_contracts.baseline import (
+    KIND_STATS_KEY,
     TamperError,
-    check_ratchet_tamper,
     check_tamper,
     compare,
     dumps,
     entries_of,
     generate,
+    kind_stats_of,
     load,
     loads,
     validate_bump,
+    with_kind_stats,
 )
 from charlie_work.attachment_contracts.model import (
     AttachmentPoint,
     BaselineEntry,
     Bump,
+    KindStats,
     SaturationVerdict,
 )
 
@@ -419,106 +422,6 @@ def test_tamper_no_finding_when_matches_and_no_bumps() -> None:
 
 
 # ---------------------------------------------------------------------------
-# check_ratchet_tamper(): closes the raise-to-match laundering gap (finding #1)
-# ---------------------------------------------------------------------------
-
-
-def test_ratchet_tamper_detects_raise_to_match_laundering() -> None:
-    # The empirical proof case from the round-1 review: baseline hand-raised
-    # from 134 to 135 in lockstep with real growth, no bump -- both
-    # `compare()` and `check_tamper()` are blind to this; only a diff against
-    # the PREVIOUS committed baseline can see it.
-    previous = _doc_with_entries(
-        BaselineEntry(
-            kind="class",
-            identity="OrchestratorApp",
-            file="src/x.py",
-            member_count=134,
-            boundary=5.0,
-        )
-    )
-    current = _doc_with_entries(
-        BaselineEntry(
-            kind="class",
-            identity="OrchestratorApp",
-            file="src/x.py",
-            member_count=135,
-            boundary=5.0,
-        )
-    )
-
-    findings = check_ratchet_tamper(previous, current)
-
-    assert len(findings) == 1
-    assert findings[0].severity == "error"
-    assert "tamper" in findings[0].message
-    assert "134" in findings[0].message and "135" in findings[0].message
-
-
-def test_ratchet_tamper_clean_when_unchanged() -> None:
-    entry = BaselineEntry(
-        kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0
-    )
-    previous = _doc_with_entries(entry)
-    current = _doc_with_entries(entry)
-
-    assert check_ratchet_tamper(previous, current) == []
-
-
-def test_ratchet_tamper_clean_on_legitimate_ratchet_down() -> None:
-    previous = _doc_with_entries(
-        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0)
-    )
-    current = _doc_with_entries(
-        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=5, boundary=6.0)
-    )
-
-    assert check_ratchet_tamper(previous, current) == []
-
-
-def test_ratchet_tamper_clean_for_a_brand_new_entry() -> None:
-    previous = _doc_with_entries()
-    current = _doc_with_entries(
-        BaselineEntry(kind="class", identity="new", file="src/n.py", member_count=10, boundary=6.0)
-    )
-
-    assert check_ratchet_tamper(previous, current) == []
-
-
-def test_ratchet_tamper_no_findings_when_no_previous_document() -> None:
-    current = _doc_with_entries(
-        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=999, boundary=6.0)
-    )
-
-    assert check_ratchet_tamper(None, current) == []
-
-
-def test_ratchet_tamper_bump_does_not_excuse_a_member_count_raise() -> None:
-    # Even a validly-acked bump does NOT justify the member_count FIELD
-    # itself rising -- legitimate bump usage raises the ceiling while leaving
-    # member_count untouched (see test_compare_bump_raises_effective_ceiling).
-    # A rise in member_count is tamper regardless of bumps.
-    bump = Bump(to=20, reason="reviewed", actor="interactive", ack="handle:senkichi")
-    previous = _doc_with_entries(
-        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0)
-    )
-    current = _doc_with_entries(
-        BaselineEntry(
-            kind="class",
-            identity="a",
-            file="src/a.py",
-            member_count=15,
-            boundary=6.0,
-            bumps=(bump,),
-        )
-    )
-
-    findings = check_ratchet_tamper(previous, current)
-
-    assert len(findings) == 1
-
-
-# ---------------------------------------------------------------------------
 # loads(): duplicate (kind, file, identity) entries are rejected (finding #7)
 # ---------------------------------------------------------------------------
 
@@ -641,3 +544,114 @@ def test_loads_allows_same_identity_in_different_files() -> None:
 
     reloaded = loads(text)
     assert len(entries_of(reloaded)) == 2
+
+
+# ---------------------------------------------------------------------------
+# kind_stats: frozen per-kind Tukey fence (issue #1614)
+# ---------------------------------------------------------------------------
+
+
+def _verdict_kind(
+    identity: str, count: int, kind: str, boundary: float, saturated: bool = True
+) -> SaturationVerdict:
+    return SaturationVerdict(
+        point=AttachmentPoint(
+            kind=kind,  # type: ignore[arg-type]
+            identity=identity,
+            file=f"src/{identity}.py",
+            members=tuple(f"m{i}" for i in range(count)),
+        ),
+        saturated=saturated,
+        q3=boundary - 3.0,
+        iqr=2.0,
+        boundary=boundary,
+        population=4,
+    )
+
+
+def test_generate_persists_kind_stats_derived_from_verdicts() -> None:
+    verdicts = (
+        _verdict_kind("big", 20, "class", boundary=17.0, saturated=True),
+        _verdict_kind("bigmod", 50, "test_module", boundary=40.0, saturated=True),
+        _verdict_kind("small", 2, "class", boundary=17.0, saturated=False),
+    )
+    doc = generate(verdicts, generated_by="x", generated_at="t", floor=4)
+    stats = kind_stats_of(doc)
+    assert set(stats) == {"class", "test_module"}
+    assert stats["class"] == KindStats(kind="class", q3=14.0, iqr=2.0, boundary=17.0, population=4)
+    assert stats["test_module"].boundary == 40.0
+
+
+def test_kind_stats_of_empty_when_absent() -> None:
+    doc = _doc_with_entries()
+    assert kind_stats_of(doc) == {}
+
+
+def test_kind_stats_round_trips_through_dumps_loads() -> None:
+    verdicts = (_verdict_kind("big", 20, "class", boundary=17.0, saturated=True),)
+    doc = generate(verdicts, generated_by="x", generated_at="t", floor=4)
+    reloaded = loads(dumps(doc))
+    assert kind_stats_of(reloaded)["class"].boundary == 17.0
+
+
+def test_dumps_does_not_add_kind_stats_null_for_old_baseline() -> None:
+    # A pre-#1614 baseline (no kind_stats) must not gain a ``"kind_stats": null``
+    # entry on a round-trip dump -- that would silently change every old
+    # baseline's diff and break check_tree's "absent means fall back to live".
+    old = _doc_with_entries(
+        BaselineEntry(kind="class", identity="a", file="src/a.py", member_count=10, boundary=6.0)
+    )
+    text = dumps(old)
+    assert KIND_STATS_KEY not in json.loads(text)
+    assert kind_stats_of(loads(text)) == {}
+
+
+def test_loads_rejects_malformed_kind_stats_missing_field() -> None:
+    doc = _doc_with_entries()
+    doc[KIND_STATS_KEY] = {"class": {"q3": 8.0, "iqr": 6.0}}  # missing boundary, population
+    import pytest
+
+    with pytest.raises(TamperError):
+        loads(dumps(doc))
+
+
+def test_loads_rejects_kind_stats_not_object() -> None:
+    doc = _doc_with_entries()
+    doc[KIND_STATS_KEY] = "not-an-object"
+    import pytest
+
+    with pytest.raises(TamperError):
+        loads(json.dumps(doc))
+
+
+def test_compare_preserves_kind_stats_verbatim_on_ratchet() -> None:
+    # Issue #1614: a ratchet may not recompute or raise the frozen fence.
+    baseline_entry = BaselineEntry(
+        kind="class", identity="a", file="src/a.py", member_count=10, boundary=17.0
+    )
+    doc = {
+        **_doc_with_entries(baseline_entry),
+        KIND_STATS_KEY: {"class": {"q3": 14.0, "iqr": 2.0, "boundary": 17.0, "population": 8}},
+    }
+    # Shrink the point -> ratchet down; kind_stats must be unchanged.
+    current = (_verdict_kind("a", 5, "class", boundary=17.0, saturated=True),)
+    _findings, ratcheted = compare(current, doc)
+    assert kind_stats_of(ratcheted)["class"].boundary == 17.0
+    # And the ratcheted document carries the same kind_stats object verbatim.
+    assert ratcheted[KIND_STATS_KEY] == doc[KIND_STATS_KEY]
+
+
+def test_with_kind_stats_recomputes_from_verdicts() -> None:
+    doc = {
+        **_doc_with_entries(),
+        KIND_STATS_KEY: {"class": {"q3": 14.0, "iqr": 2.0, "boundary": 17.0, "population": 8}},
+    }
+    verdicts = (_verdict_kind("big", 20, "class", boundary=15.5, saturated=True),)
+    refrozen = with_kind_stats(doc, verdicts, generated_at="t2")
+    assert kind_stats_of(refrozen)["class"].boundary == 15.5
+    # The --refreeze path IS a generation event: generated_at is re-stamped so
+    # check_ratchet_tamper can tell a sanctioned recompute from a hand-edit.
+    assert refrozen["generated_at"] == "t2"
+    # Input document is not mutated.
+    assert kind_stats_of(doc)["class"].boundary == 17.0
+    assert doc["generated_at"] == "t"

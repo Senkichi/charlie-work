@@ -502,6 +502,16 @@ def test_ci_findings_header_ratio_still_matches_the_bands_own_justification() ->
     mechanically reproducible from ci_findings.py alone -- see the module
     docstring above) -- this only proves the *precedent* the band cites
     hasn't silently changed shape underneath it since Preflight ran.
+
+    Re-measured at issue #1686: ``_collect_gate_exemption_section`` was
+    added to ``ci_findings.py`` as its ninth unit (a deliberate placement --
+    the review-packet collect-gate-exemption section is a pure builder with
+    injected I/O, same family as ``_required_changes_from_checks``), growing
+    the header to 46 lines (two new import lines) and the total to 623.
+    The band derivation this guard protects is unaffected: the [50, 80]-line
+    header estimate it recorded for the NEW module was a range deliberately
+    anchored above the precedent figure, and 46 still sits inside the
+    judgment call that produced it.
     """
     ci_findings_source = _CI_FINDINGS_PATH.read_text(encoding="utf-8")
     ci_findings_lines = ci_findings_source.splitlines()
@@ -516,14 +526,14 @@ def test_ci_findings_header_ratio_still_matches_the_bands_own_justification() ->
     # the exact arithmetic (which involved manual line-classification at
     # Preflight time, e.g. deciding a bare `)` closing a multi-line import
     # counts toward "import block" but not toward "docstring").
-    assert header_length == 44, (
-        f"ci_findings.py's header length is now {header_length} lines, expected 44 -- "
+    assert header_length == 46, (
+        f"ci_findings.py's header length is now {header_length} lines, expected 46 -- "
         "the cap-exemption band this file asserts was derived from that figure; if "
         "ci_findings.py has genuinely changed shape, the band needs re-deriving, not "
         "this guard silently loosened"
     )
-    assert len(ci_findings_lines) == 451, (
-        f"ci_findings.py is now {len(ci_findings_lines)} lines total, expected 451 -- "
+    assert len(ci_findings_lines) == 623, (
+        f"ci_findings.py is now {len(ci_findings_lines)} lines total, expected 623 -- "
         "same drift-guard rationale as the header-length assertion above"
     )
 

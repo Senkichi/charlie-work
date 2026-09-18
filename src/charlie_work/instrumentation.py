@@ -559,6 +559,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # ``salvage_pushed_stranded_commits`` rather than to
         # ``salvage_push_failed`` (which is a genuine failure to publish).
         "salvage_skipped_already_landed": "info",
+        # Local-file issue source: the dead session left commits on its
+        # branch and the backend cannot host PRs, so salvage parked the
+        # issue as review-ready instead of pushing. Info: this is the
+        # success path for a repo with no remote, the local counterpart of
+        # ``session_salvaged`` without that kind's "a worker died" reading.
+        "local_work_ready": "info",
         # Issue #1241: the pre-open reachability re-check found the salvage
         # branch's tip already reachable from origin/main (the work merged via
         # a merge commit whose tree differed from the salvage head's tree --
@@ -607,6 +613,14 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # ``review_verdict_reconcile_failed``, emitted from the same call
         # site at warning level.
         "review_verdict_reconciled": "info",
+        # Issue #1642: a reviewer filed human-decision prose under
+        # ``request_changes`` and ``record_review`` reclassified it to
+        # ``blocked`` -- the verdict took the operator-queue path instead of
+        # automated rework. Warning, not info: the reclassification is the
+        # system doing its job, but it only fires on a misfiling that should
+        # be visible to an operator auditing why a verdict never reached the
+        # rework lane (same anomaly shape as ``required_changes_vacuous``).
+        "review_decision_reclassified_blocked": "warning",
         "rework_already_pushed": "info",
         "rework_brief_regenerated": "info",
         "runner_allocation": "info",

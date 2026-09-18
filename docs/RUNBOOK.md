@@ -71,6 +71,7 @@ hours from the ring alone, you are reading roughly the most recent 9% of history
 | `agent:blocked` | `verdict --decision blocked` — a product/security decision is needed. | `verdict` → event `blocked`. |
 | `agent:done` | PR merged via `ship-it`. Every `active` label is removed in the same transition. | `ship-it` → event `merged`. |
 | `agent:human-needed` | `blocked` or the rework cap exhausted. Terminal — no further automation happens until a human clears it. | `verdict` → event `escalated`/`blocked`. |
+| `agent:review-ready` | Local-file issue source only (`local_issues.enabled`): a worker's session ended with commits and there was no remote to push to, so the branch is the deliverable. Terminal, but **not** an escalation — nothing went wrong. | `dead_worker_reap._park_local_work_for_review` → event `local_work_ready`. |
 
 Legal transitions are exactly `labels.py`'s `_edges()` table — see the
 mermaid diagram in
@@ -111,11 +112,33 @@ either:
   routes straight to `ship-it` eligibility, or
 - Manually swap `agent:human-needed` back to `agent:reviewing` (or
   `agent:needs-rework`) on GitHub and re-run `charlie why-charlie-hate --pr <n>` to
-  regenerate a fresh packet before deciding again.
+  regenerate a fresh packet before deciding again (add `--force-rereview` if
+  the command refuses to discard a still-valid recorded verdict).
 
 There is no automatic un-escalation — a human decision, once escalated,
 requires a human (or an explicit re-`verdict`) to move the issue
 forward again.
+
+## Handling `agent:review-ready` (local-file issue source)
+
+Only reachable when `local_issues.enabled: true` (see
+[README.md#local-file-issue-source](../README.md#local-file-issue-source)).
+An issue lands here when a worker's session ended with commits on its branch
+and there was no remote to push to — the branch itself is the deliverable,
+not a PR. This is a **success** state, not an escalation:
+`agent:review-ready` is terminal (it holds the issue out of dispatch, same as
+`agent:human-needed`) but deliberately a distinct label, so it never inflates
+escalation counts.
+
+The issue file itself carries a comment naming the branch to review (appended
+below `<!-- charlie-work:comments -->` by `LocalFileGitHub.issue_comment`).
+
+**Recovery**: review the named branch by hand (`git log`, `git diff` against
+your default branch), merge it however you normally would, and close the
+issue yourself — nothing in this repo pushes, opens a PR, or merges on your
+behalf for a local-file issue. `charlie unescalate` is a no-op here (it only
+acts when an issue's recorded status is `escalated`, which a review-ready
+issue never has) — clear `agent:review-ready` by hand once you're done.
 
 ## Corrupt-state quarantine recovery
 
@@ -206,6 +229,50 @@ LLM reviewer (Tier 2) but hard-blocking for pure-skip failures (Tier 1)** — a
 PR with no tests and no exemption claim never reaches the LLM, while a PR with
 tests present gets the facts block and rubric but the LLM still decides
 approval.
+
+## Collect-only gate operator exemption
+
+The `Collect-only gate` required check (issue #1538) fails a PR that deletes,
+renames, or shrinks the multiplicity of collected tests. Some of those
+changes are legitimate — deleting a feature's tests with the feature, fixing
+a misnamed test, renumbering parametrization ids. Issue #1686 adds an
+operator-only escape hatch: the `collect-gate-exempt` PR label (configurable
+via `labels.collect_gate_exempt`).
+
+**Operator flow — two steps:**
+
+1. Apply the label to the PR: `gh pr edit <PR> --add-label collect-gate-exempt`
+   (create it once per repo with `gh label create collect-gate-exempt` —
+   `charlie`'s label bootstrap also creates it since it is in
+   `LabelConfig.all`).
+2. Rerun the failed `Collect-only gate` job (Actions → re-run failed jobs).
+   No new push is needed: the gate reads the PR's **live** labels at run
+   time, never the `github.event.pull_request.labels` snapshot.
+
+**What the label does and does not do:**
+
+- With the label present, the gate still runs the complete comparison and
+  prints every waived finding (kind + leaf name) before exiting 0 — the
+  label waives the verdict, never the evidence. With no findings to waive,
+  the gate says so explicitly so a stale label is visible.
+- With the label absent — or if the live labels query itself fails — the
+  gate fails closed: identical #1538 verdict, and the output says why the
+  exemption was not granted.
+- Workers cannot self-grant: only a GitHub API label applied by an
+  operator counts. A PR body line, commit trailer, tree file, or PR title
+  containing the label name does nothing (workers run without a GitHub
+  token and cannot apply labels).
+- The label is **head-agnostic on purpose**: it stays applied across
+  `synchronize` pushes (nothing strips it), and each new head's gate run
+  re-evaluates it against that head's findings. Remove it with
+  `gh pr edit <PR> --remove-label collect-gate-exempt` when the work that
+  needed it is done — the gate reports "nothing to waive" when it no
+  longer does anything.
+- The review packet renders a "Collect-gate exemption" section for the
+  reviewed head: whether the label is applied, exactly which findings were
+  waived (read back from the gate job's log, head-verified), or a warning
+  that the label is present but no waiver evidence could be confirmed —
+  missing evidence is never presented as a waiver.
 
 ## Worktree cleanup gone wrong (junction hazard)
 

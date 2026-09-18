@@ -94,14 +94,6 @@ from .prompts import (
     resolve_template,
     unsupplied_placeholders,
 )
-from .reconcile import (  # noqa: F401  (deliberate re-export; reconcile symbols reached via charlie_work.reconcile by orchestration/misc_reconcile.py; keeps reconcile.py live in the import-reachability graph, see tests/test_dormant_fleet_marking.py)
-    DriftItem,
-    apply_fixes as apply_drift_fixes,
-    detect_aviator_stale_blocked,
-    detect_drift,
-    detect_mergequeue_not_approved,
-    detect_mergequeue_wedged,
-)
 from .review_decision import (
     record_decision,
     review_decision,
@@ -126,6 +118,7 @@ from .unescalate_reset_fields import (
     UNESCALATE_ISSUE_RESET_FIELDS,
     UNESCALATE_PR_RESET_FIELDS,
 )
+from .merge_finalize import _merged_issue_fields  # noqa: F401  (deliberate re-export; used by moved merge-finalization delegates via _wf.)
 from .state import (
     PASSIVE_OPEN_STATUS,
     StateLockBusy,
@@ -329,6 +322,7 @@ from .rework_prompts import (  # noqa: F401  (deliberate re-export)
 # `.escalation` / `.verdict_parsing` / `.rework_prompts` blocks above.
 from .ci_findings import (  # noqa: F401  (deliberate re-export)
     _ci_status_section,
+    _collect_gate_exemption_section,
     _non_required_check_findings,
     _backlog_is_non_empty,
     _latest_non_empty_dispatch,
@@ -3283,6 +3277,32 @@ def _gh_api_list(gh: GitHubLike, path: str) -> list[dict[str, Any]]:
     return []
 
 
+def _actions_job_log_text(gh: GitHubLike, job_id: int) -> str | None:
+    """Fetch an Actions job's plaintext log via ``gh api`` (issue #1686).
+
+    ``repos/{owner}/{repo}/actions/jobs/{id}/logs`` is the read-only channel
+    the collect-gate exemption evidence rides: the gate prints a
+    ``COLLECT-GATE-EXEMPTION`` marker to stdout, the Actions job log
+    preserves it, and the review packet parses it back out. ``{owner}`` and
+    ``{repo}`` are literal ``gh api`` placeholders substituted from the
+    checkout remote -- the same pattern ``fleet_registry.py`` already uses.
+    The endpoint redirects to a signed download URL, which ``gh api``
+    follows automatically.
+
+    Returns ``None`` on any failure (endpoint needs ``actions: read``, which
+    the orchestrator token already holds for ``actions_job``) -- the caller
+    renders "evidence unavailable" rather than treating a missing log as a
+    waiver.
+    """
+    result = gh.run(
+        ["api", f"repos/{{owner}}/{{repo}}/actions/jobs/{job_id}/logs"],
+        allow_failure=True,
+    )
+    if isinstance(result, GitHubRunResult):
+        return result.value if result.ok and isinstance(result.value, str) else None
+    return result if isinstance(result, str) else None
+
+
 def _commit_timestamp(gh: GitHubLike, sha: str | None) -> str | None:
     """Return the committer-date ISO 8601 timestamp of commit ``sha``, or None.
 
@@ -5603,6 +5623,17 @@ class OrchestratorApp:
         ci_status_section = _ci_status_section(
             checks, self.config.auto_merge.required_checks, pr_dir / "checks.json"
         )
+        # Issue #1686: collect-gate exemption evidence for the reviewed head.
+        # ``checks`` is the PR's head-pinned check list (``gh pr checks``
+        # describes ``pr["headRefOid"]``); the builder locates the gate job
+        # through it and reads the job log's exemption marker via the
+        # injected fetcher (same seam as _required_changes_from_checks).
+        collect_gate_exemption_section = _collect_gate_exemption_section(
+            checks,
+            pr,
+            self.config.labels.collect_gate_exempt,
+            lambda job_id: _actions_job_log_text(self.gh, job_id),
+        )
         # Issue #1445: over-cap file-addition finding. Advisory-only, never
         # blocking -- the rubric line in review.md flags an over-cap addition
         # as a REPORTABLE FINDING and this probe surfaces the concrete files.
@@ -5737,6 +5768,7 @@ class OrchestratorApp:
                 "static_probe_section": static_probe_section,
                 "diff_size_section": diff_size_section,
                 "ci_status_section": ci_status_section,
+                "collect_gate_exemption_section": collect_gate_exemption_section,
                 "over_cap_section": over_cap_section,
                 "attachment_budget_section": attachment_budget_section,
                 "prior_review_section": prior_review_section,
@@ -5829,6 +5861,37 @@ class OrchestratorApp:
                 live_reviewed_head_sha is None or live_reviewed_head_sha != pr.get("headRefOid")
             )
             if not decision_path.exists() or voided_stale_verdict:
+                if voided_stale_verdict:
+                    # Issue #1695: preserve the verdict being voided in the
+                    # rounds archive before the pending stub overwrites the
+                    # flat file. record_review archives every verdict it
+                    # records, but _update_approval_head's carry-forward
+                    # re-pin deliberately writes flat-only
+                    # (archive_round=False) -- a carried-forward verdict
+                    # exists ONLY here, so overwriting it would destroy the
+                    # sole copy. Routing the resolved payload through the
+                    # single writer archives it under _next_round_number's
+                    # dedup: a verbatim re-archive of the highest round is a
+                    # retry onto that round, while a carried-forward payload
+                    # (reviewed_head_sha is a compare key) mints the next
+                    # round. ``head_sha=None`` leaves the payload's own
+                    # reviewed_head_sha untouched -- re-stamping it to the
+                    # live head here would fabricate a verdict pin that was
+                    # never recorded. ``verdict_provenance`` is re-stated
+                    # explicitly (the write-site provenance scan, issue
+                    # #1265): a verdict that predates the contract archives
+                    # with an explicit None rather than omitting the key --
+                    # the same sentinel convention as the pending stub
+                    # below.
+                    record_decision(
+                        pr_dir,
+                        {
+                            **live_decision,
+                            "verdict_provenance": live_decision.get("verdict_provenance"),
+                        },
+                        None,
+                        archive_round=True,
+                    )
                 # Issue #1362 Stage 2: routed through the single writer so the
                 # placeholder is head-stamped like every other verdict --
                 # ``reviewed_head_sha`` lets a "pending" that is actually
@@ -7196,12 +7259,17 @@ class OrchestratorApp:
             existing_pr_state = state["prs"].get(str(pr_number), {})
             if existing_pr_state.get("status") == "merged":
                 # Clear any stale merge alert so a reopened issue can re-alert.
+                # Issue #1493: apply the same merged-issue field set here too,
+                # so a record the post-merge_pr block left half-finalized (or
+                # that predates it) converges on re-entry instead of staying
+                # stale at "approved" forever.
                 _issue_number = existing_pr_state.get("issue_number")
                 if _issue_number is not None:
                     _issue_key = str(_issue_number)
                     _issue_entry = state["issues"].get(_issue_key, {})
-                    if _issue_entry.get("merge_alert") != "OK":
-                        state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
+                    _finalized = _merged_issue_fields(_issue_entry, _issue_number)
+                    if _finalized != _issue_entry:
+                        state["issues"][_issue_key] = _finalized
                         save_state(self.paths.state_file, state)
                 return CommandResult(
                     True,
@@ -8002,7 +8070,15 @@ class OrchestratorApp:
                     if issue_number is not None:
                         _issue_key = str(issue_number)
                         _issue_entry = state["issues"].get(_issue_key, {})
-                        state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
+                        # Issue #1493: the issue record must advance to the same
+                        # terminal disposition as the PR -- not just merge_alert.
+                        # Leaving status at "approved" parked the record in the
+                        # dead zone reconcile deliberately never repairs (merge
+                        # finalization owns it), so session liveness checks
+                        # re-evaluated the issue as mid-flight on every pass.
+                        state["issues"][_issue_key] = _merged_issue_fields(
+                            _issue_entry, issue_number
+                        )
                     save_state(self.paths.state_file, state)
                 # Label + branch cleanup are best-effort; the merged fact is already
                 # durable. A branch-deletion failure (head branch checked out in a

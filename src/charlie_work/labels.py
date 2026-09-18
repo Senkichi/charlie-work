@@ -118,6 +118,17 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
             (labels.operator_queue,),
             _compute_remove((labels.operator_queue,)),
         ),
+        # Local-file issue source: the worker committed to its branch and
+        # there is no remote to push to, so the branch is the deliverable.
+        # A success state, deliberately NOT one of the escalation edges --
+        # see ``LabelConfig.review_ready``. ``ready`` is kept (unlike
+        # "merged") because the issue is not done until a human merges the
+        # branch and closes it; ``review_ready`` being terminal is what holds
+        # it out of dispatch meanwhile.
+        "local_work_ready": (
+            (labels.review_ready,),
+            _compute_remove((labels.review_ready,)),
+        ),
         # Operator re-arm (`charlie unescalate`) for an issue whose PR is
         # still open: drop human-needed (and any other stale workflow state)
         # and return to the passive pr-open state pending a fresh review.

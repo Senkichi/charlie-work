@@ -4,7 +4,7 @@ import copy
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Any
 
@@ -212,6 +212,27 @@ class LabelConfig:
     # via ``_compute_remove``) and of ``all`` (so ``bootstrap_labels``
     # creates it on GitHub).
     operator_queue: str = "agent:operator-queue"
+    # Issue #1686: the operator-applied escape hatch for the collect-only
+    # gate's fail-closed verdict. Applied to a PR -- never an issue -- by a
+    # human operator to waive that head's failing findings (legitimate test
+    # deletions/renames) after review; the gate reads the PR's LIVE labels
+    # at run time, and the review packet surfaces exactly what was waived on
+    # the reviewed head. Member of ``all`` so ``bootstrap_labels`` creates
+    # it on the repo, and deliberately NOT of ``workflow_labels``,
+    # ``terminal``, or ``active``: the label state machine only ever manages
+    # issue lifecycle labels, and this one is applied/removed by humans only
+    # (including persisting across ``synchronize`` -- a label applied for
+    # head A legitimately remains on head B).
+    collect_gate_exempt: str = "collect-gate-exempt"
+    # Local-file issue source (``local_issues.py``): the worker's commits are
+    # on its branch and there is no remote to publish them to, so the branch
+    # itself is the deliverable and a human reviews/merges it. Terminal (holds
+    # the issue out of dispatch via ``_is_dispatchable``) but NOT an
+    # escalation: nothing went wrong, so it must not share ``human_needed`` /
+    # ``operator_queue`` and inflate every escalation count. Set by the
+    # "local_work_ready" edge, so -- like ``operator_queue`` above -- it is a
+    # ``workflow_labels`` member (a re-arm strips it) and in ``all``.
+    review_ready: str = "agent:review-ready"
 
     @property
     def terminal(self) -> set[str]:
@@ -221,6 +242,7 @@ class LabelConfig:
             self.human_needed,
             self.prose_only_deps,
             self.operator_queue,
+            self.review_ready,
         }
 
     @property
@@ -242,6 +264,8 @@ class LabelConfig:
             self.prose_only_deps,
             self.merge_hold,
             self.operator_queue,
+            self.collect_gate_exempt,
+            self.review_ready,
         ]
 
     @property
@@ -265,6 +289,7 @@ class LabelConfig:
             self.done,
             self.human_needed,
             self.operator_queue,
+            self.review_ready,
         }
 
 
@@ -505,6 +530,39 @@ class ReviewConfig:
     # self-heals in hours instead of sitting forever. 0 disables self-heal
     # (operator-only remedy via ``charlie unescalate --pr``).
     foreign_issue_ref_reprobe_hours: int = 24
+    # Issue #1642: case-insensitive substring markers that flag a
+    # ``request_changes`` finding as asking for a human/operator decision.
+    # ``record_review`` runs ``review_decision.human_decision_marker_match``
+    # over the verdict's ``required_changes`` (post-#792 derivation, so a
+    # human call written into ``summary`` instead of the structured list is
+    # caught identically) and reclassifies a match to ``blocked`` -- the
+    # escalation sink ``prompts/review.md`` already defines for "human input
+    # is needed". The default set is derived from that prompt's own wording
+    # plus the PR #1641 incident text. Keeping the list here, not in code,
+    # lets the operator tune precision/recall without touching the matching
+    # logic; a false positive costs an operator glance plus ``charlie
+    # unescalate``, while a false negative repeats the incident (automated
+    # rework asserting an operator decision that never happened).
+    human_decision_markers: tuple[str, ...] = (
+        "human",
+        "operator",
+        "sign-off",
+        "signoff",
+        "sign off",
+        "not automated rework",
+        "confirm explicitly",
+    )
+
+    def __post_init__(self) -> None:
+        # Mirror DispatchConfig.__post_init__: ``load_config`` validates and
+        # converts the YAML list to a tuple before ``_build_section``, but a
+        # direct ``ReviewConfig(...)`` in a test or a caller bypasses that --
+        # normalize here so a bare string is wrapped rather than iterated
+        # character-by-character and a list cannot smuggle mutability into a
+        # frozen instance.
+        value = self.human_decision_markers
+        normalized = (str(value),) if isinstance(value, str) else tuple(str(v) for v in value)
+        object.__setattr__(self, "human_decision_markers", normalized)
 
 
 @dataclass(frozen=True)
@@ -1779,6 +1837,32 @@ class NotifyConfig:
     file_path: str = ""
 
 
+# Package worker template for the local-file issue source: commit-only, no
+# push, no PR. Becomes ``dispatch.worker_template``'s default when
+# ``local_issues.enabled`` (see ``load_config``).
+LOCAL_WORKER_TEMPLATE = "worker_local.md"
+
+
+@dataclass(frozen=True)
+class LocalIssuesConfig:
+    """Issue source for a repo with no GitHub remote (``local_issues.py``).
+
+    When ``enabled``, issues are markdown files with YAML frontmatter under
+    ``issues_dir`` and ``local_issues.github_client_for`` hands the
+    orchestrator a file-backed ``GitHubLike`` instead of the ``gh`` client.
+    Label names still come from ``LabelConfig`` -- this section only says
+    *where* the issues live, not what the workflow states are called.
+
+    ``issues_dir`` is relative to the repo root. It is validated here as a
+    relative, non-escaping path; the resolved-path containment check (the one
+    a junction cannot fool) runs where the path is first used, in
+    ``LocalFileGitHub.__post_init__``.
+    """
+
+    enabled: bool = False
+    issues_dir: str = "docs/issues"
+
+
 @dataclass(frozen=True)
 class RunnersConfig:
     """GitHub Actions runner management.
@@ -1982,6 +2066,7 @@ class OrchestratorConfig:
     coverage_probe: CoverageProbeConfig = field(default_factory=CoverageProbeConfig)
     fleet: FleetConfig = field(default_factory=FleetConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
+    local_issues: LocalIssuesConfig = field(default_factory=LocalIssuesConfig)
     runners: RunnersConfig = field(default_factory=RunnersConfig)
     main_ci_reclaim: MainCiReclaimConfig = field(default_factory=MainCiReclaimConfig)
     runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
@@ -2295,6 +2380,22 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'review' key 'foreign_issue_ref_reprobe_hours' must not be negative"
             )
+    # Issue #1642: validate human_decision_markers as a list of strings,
+    # same convention as dispatch.* list-of-strings keys above.
+    _hdm = review_data.get("human_decision_markers")
+    if _hdm is not None:
+        if not isinstance(_hdm, list):
+            raise ConfigError(
+                "config section 'review' key 'human_decision_markers' must be a list of "
+                f"strings, got {type(_hdm).__name__}"
+            )
+        for item in _hdm:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    "config section 'review' key 'human_decision_markers' must be a list of "
+                    f"strings, got element of type {type(item).__name__}"
+                )
+        review_data["human_decision_markers"] = tuple(str(item) for item in _hdm)
     review = _build_section(ReviewConfig, "review", review_data)
     review_dispatch_data = _section(data, "review_dispatch")
     for rd_bool_key in ("enabled",):
@@ -3431,6 +3532,41 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     if isinstance(shell_command, list):
         notify_data["shell_command"] = tuple(str(item) for item in shell_command)
     notify = _build_section(NotifyConfig, "notify", notify_data)
+
+    local_issues_data = _section(data, "local_issues")
+    local_issues_enabled = local_issues_data.get("enabled")
+    if local_issues_enabled is not None and not isinstance(local_issues_enabled, bool):
+        raise ConfigError(
+            "config section 'local_issues' key 'enabled' must be a bool, "
+            f"got {type(local_issues_enabled).__name__}"
+        )
+    issues_dir = local_issues_data.get("issues_dir")
+    if issues_dir is not None:
+        if not isinstance(issues_dir, str) or not issues_dir.strip():
+            raise ConfigError(
+                "config section 'local_issues' key 'issues_dir' must be a non-empty string"
+            )
+        issues_dir_path = PurePosixPath(issues_dir.replace("\\", "/"))
+        if issues_dir_path.is_absolute() or PureWindowsPath(issues_dir).is_absolute():
+            raise ConfigError(
+                "config section 'local_issues' key 'issues_dir' must be relative to the "
+                f"repo root, got {issues_dir!r}"
+            )
+        if ".." in issues_dir_path.parts:
+            raise ConfigError(
+                "config section 'local_issues' key 'issues_dir' must not contain '..', "
+                f"got {issues_dir!r}"
+            )
+    local_issues = _build_section(LocalIssuesConfig, "local_issues", local_issues_data)
+    # A repo with no remote cannot satisfy the default worker prompt, which
+    # mandates push + PR and calls anything less a task failure. Re-default
+    # the template HERE, once, so ``dispatch.worker_template`` stays the single
+    # source of truth every consumer already reads (the prompt writer, the
+    # #713 startup drift check, ``doctor``, the template digest) -- none of
+    # them needs to know a local backend exists. An explicit operator value
+    # wins: only the *default* moves.
+    if local_issues.enabled and "worker_template" not in dispatch_data:
+        dispatch = replace(dispatch, worker_template=LOCAL_WORKER_TEMPLATE)
     runners_data = _section(data, "runners")
     # Validate runners config fields
     for bool_key in ("enabled", "cancel_superseded_main_runs"):
@@ -3670,6 +3806,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         coverage_probe=coverage_probe,
         fleet=fleet,
         notify=notify,
+        local_issues=local_issues,
         runners=runners,
         main_ci_reclaim=main_ci_reclaim,
         runner_scaling=runner_scaling,

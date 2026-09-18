@@ -191,6 +191,39 @@ def test_worker_claude_code_md_renders_via_real_writer(tmp_path: Path) -> None:
     _assert_no_default_state_dir_literal(rendered, template_name="worker_claude_code.md")
 
 
+def test_worker_local_md_renders_via_real_writer(tmp_path: Path) -> None:
+    """worker_local.md is rendered by the *same* real writer,
+    ``_write_worker_prompt`` (``workflow.py::OrchestratorApp._write_worker_prompt``),
+    via ``config.dispatch.worker_template`` set to the local-file issue
+    source's worker template name.
+
+    ``load_config`` re-defaults ``dispatch.worker_template`` to this name
+    when ``local_issues.enabled`` and no explicit value is configured
+    (``config.py``'s ``LOCAL_WORKER_TEMPLATE`` re-default block); this test
+    sets it directly, the same way ``test_worker_claude_code_md_renders_via_real_writer``
+    sets ``worker_claude_code.md`` directly, to exercise this template's own
+    placeholder correctness through the real writer without needing a full
+    ``load_config`` round trip.
+
+    Rendered under a non-default ``runtime.state_dir`` (issue #737) so the
+    companion literal-absence assertion is non-vacuous -- see
+    ``test_worker_md_renders_via_real_writer`` for the rationale."""
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(worker_template="worker_local.md"),
+        runtime=RuntimeConfig(state_dir="custom-state"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, gh=None)
+
+    prompt_path = app._write_worker_prompt(_fake_issue())
+
+    rendered = prompt_path.read_text(encoding="utf-8")
+    assert not _unresolved_placeholders_in_output(rendered), (
+        "rendered prompt still contains an unresolved $placeholder"
+    )
+    _assert_no_default_state_dir_literal(rendered, template_name="worker_local.md")
+
+
 def test_rework_md_renders_via_real_writer_with_no_prior_decision(tmp_path: Path) -> None:
     """rework.md's real caller is the module-level ``_write_rework_prompt``
     (``workflow.py::_write_rework_prompt``), which delegates to
@@ -445,6 +478,7 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "static_probe_section",
     "diff_size_section",
     "ci_status_section",
+    "collect_gate_exemption_section",
     "over_cap_section",
     "attachment_budget_section",
     "prior_review_section",
@@ -521,6 +555,7 @@ def test_review_md_renders_with_production_paths_and_no_state_dir_literal(
         "static_probe_section": "",
         "diff_size_section": "",
         "ci_status_section": "",
+        "collect_gate_exemption_section": "",
         "over_cap_section": "",
         "attachment_budget_section": "",
         "prior_review_section": "",
@@ -577,6 +612,7 @@ def test_review_md_repo_local_override_render_with_no_state_dir_literal(
         "static_probe_section": "",
         "diff_size_section": "",
         "ci_status_section": "",
+        "collect_gate_exemption_section": "",
         "over_cap_section": "",
         "attachment_budget_section": "",
         "prior_review_section": "",
@@ -616,6 +652,7 @@ def test_review_md_repo_local_override_render_with_no_state_dir_literal(
 _COVERED_TEMPLATES = {
     "worker.md",
     "worker_claude_code.md",
+    "worker_local.md",
     "rework.md",
     *_PINNED_KEY_SETS,
 }

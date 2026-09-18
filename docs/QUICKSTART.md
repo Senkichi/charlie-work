@@ -83,6 +83,7 @@ for the full dataclass list and defaults):
 | `watchdog.*` | Supervisor tripwires (stall, wall-clock, loop/no-progress, cost/token budget) and restart-intensity cap. WARN-first by default — see [RUNBOOK.md](RUNBOOK.md#supervisor-worker-health--escalation). |
 | `fleet.global_max_concurrent_sessions` | Cross-repo worker-count budget for `charlie fleet …` (default `0` = unlimited). |
 | `notify.*` | Opt-in needs-attention sink (webhook \| desktop \| shell \| file); `enabled: false` by default. See `examples/notify.config.yaml`. |
+| `local_issues.*` | Issue source for a repo with **no GitHub remote**: issues become markdown files under `local_issues.issues_dir` (default `docs/issues`) instead of GitHub issues. See [README.md#local-file-issue-source](../README.md#local-file-issue-source) and `examples/orchestrator.config.local.yaml`. |
 
 ## 3. Preflight with `doctor`
 
@@ -194,8 +195,8 @@ the configured adapter's CLI is reachable with `charlie doctor --adapter-probe`.
 ## 7. Prompt templates
 
 Package defaults live in `src/charlie_work/prompts/`
-(`orchestrator.md`, `worker.md`, `worker_claude_code.md`, `review.md`,
-`rework.md`). A
+(`orchestrator.md`, `worker.md`, `worker_claude_code.md`, `worker_local.md`,
+`review.md`, `rework.md`). A
 repo-local `runtime.prompts_dir` overrides these **by filename** — point it
 at a tracked directory in your consumer repo and drop in your own
 `worker.md` carrying repo-specific invariants and canonical commands; every

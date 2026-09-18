@@ -51,9 +51,11 @@ from .github import (
     CLOSING_KEYWORD_PR_FIELDS,
     GitHub,
     GitHubError,
+    GitHubLike,
     defang_closing_keywords,
 )
 from .issue_linking import linked_issue_number
+from .local_issues import github_client_for
 from . import layout
 from .dirty_tree import check_working_tree_clean
 from .logging_setup import configure_logging
@@ -207,8 +209,40 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    review = subparsers.add_parser("why-charlie-hate")
+    review = subparsers.add_parser(
+        "why-charlie-hate",
+        help=(
+            "(Re)generate a PR's review packet. Despite the name this is a "
+            "mutating command, not a read-only diagnostic: it rewrites "
+            "prs/pr-N/review-decision.json (voiding a stale-head verdict "
+            "back to a pending stub), resets the PR's review state entry to "
+            "'reviewing', and fires the review_started label transition. A "
+            "recorded verdict that is still valid -- pinned to the live "
+            "head, or carrying forward to it -- is refused unless "
+            "--force-rereview is given (issue #1695)."
+        ),
+        description=(
+            "(Re)generate the review packet for a PR and reset its review "
+            "state. Despite the name this is a mutating command, not a "
+            "read-only diagnostic: it rewrites "
+            "prs/pr-N/review-decision.json (voiding a stale-head verdict "
+            "back to a pending stub), resets the PR's review state entry to "
+            "'reviewing', and fires the review_started label transition. A "
+            "recorded verdict that is still valid -- pinned to the live "
+            "head, or carrying forward to it -- is refused unless "
+            "--force-rereview is given (issue #1695)."
+        ),
+    )
     review.add_argument("--pr", type=int, required=True)
+    review.add_argument(
+        "--force-rereview",
+        action="store_true",
+        help=(
+            "Discard a still-valid recorded verdict and regenerate the "
+            "packet anyway; the voided verdict is preserved in the rounds "
+            "archive before the pending stub overwrites it."
+        ),
+    )
 
     record = subparsers.add_parser("verdict")
     record.add_argument("--pr", type=int, required=True)
@@ -733,7 +767,7 @@ class CommandContext:
     repo_root: Path
     config: OrchestratorConfig
     paths: RuntimePaths
-    gh: GitHub
+    gh: GitHubLike
 
 
 def bootstrap_command(
@@ -771,7 +805,7 @@ def bootstrap_command(
     _assert_config_repo_matches(args.config, repo_root)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
-    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
+    gh = github_client_for(repo_root, config, github=GitHub, dry_run=args.dry_run)
     return CommandContext(repo_root=repo_root, config=config, paths=paths, gh=gh)
 
 
@@ -1461,7 +1495,7 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
 
             config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
-            gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=True)
+            gh = github_client_for(repo_root, config, github=GitHub, dry_run=True)
             app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
             result = app.status(use_cache=not getattr(args, "no_cache", False))
             per_repo[repo_key] = result.data
@@ -1507,7 +1541,7 @@ def run_fleet_review_queue(args: argparse.Namespace) -> CommandResult:
 
             config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
-            gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=True)
+            gh = github_client_for(repo_root, config, github=GitHub, dry_run=True)
             app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
             result = app.review_queue()
             per_repo[repo_key] = result.data
@@ -1543,7 +1577,7 @@ def run_fleet_operator_queue(args: argparse.Namespace) -> CommandResult:
 
             config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
-            gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=True)
+            gh = github_client_for(repo_root, config, github=GitHub, dry_run=True)
             app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
             result = app.operator_queue()
             per_repo[repo_key] = result.data
@@ -2450,6 +2484,18 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     if args.command == "operator-queue":
         return app.operator_queue()
     if args.command == "why-charlie-hate":
+        # Issue #1695: a bare CLI invocation must not silently discard a
+        # still-valid recorded verdict -- review() voids a stale-head
+        # verdict to pending, flips status to "reviewing", and fires
+        # review_started. The guard lives at the CLI boundary only: the
+        # loop's internal review() callers are never consulted, and
+        # --force-rereview is the explicit opt-out. ``getattr`` because
+        # run_command is also invoked with hand-built Namespaces that
+        # never went through argparse (mirroring the no_cache read above).
+        if not getattr(args, "force_rereview", False):
+            refusal = app.review_verdict_guard(args.pr)
+            if refusal is not None:
+                return refusal
         return app.review(args.pr)
     if args.command == "verdict":
         try:
