@@ -474,12 +474,33 @@ def _targeted_tests(repo_root: Path, changed: tuple[ChangedFile, ...]) -> tuple[
 # ---------------------------------------------------------------------------
 
 
+def _ruff_lint_paths(changed: tuple[ChangedFile, ...]) -> tuple[str, ...]:
+    """The sorted ``.py`` paths in ``changed`` that ruff should lint.
+
+    Single owner of the ruff-scope predicate: non-deleted, ``.py``, and NOT
+    untracked (``??``) -- #1306: ``git status`` cannot distinguish a file
+    this session just wrote from pre-existing untracked debris that
+    predates the session, so untracked debris with real lint/format issues
+    must never spuriously block a session that never touched it.
+    ``git_push_lint_hook._check_push_lint`` calls this same function so the
+    push-time gate and this Stop gate cannot silently diverge on ruff scope
+    again (#1704).
+    """
+    return tuple(
+        sorted(
+            cf.path
+            for cf in changed
+            if not cf.deleted and cf.path.endswith(".py") and not cf.untracked
+        )
+    )
+
+
 def _run_ruff(repo_root: Path, py_files: tuple[str, ...]) -> GateResult:
     """Run ``ruff check``/``ruff format --check`` scoped to exactly
     ``py_files`` -- never the whole tree (review-round fix, #1259: a
     pre-existing lint/format issue in a file this session never touched
-    must not spuriously block the stop). The caller (``_evaluate``)
-    further narrows this to tracked-modified + committed-since-base only,
+    must not spuriously block the stop). ``_ruff_lint_paths`` further
+    narrows this to tracked-modified + committed-since-base only,
     excluding untracked ``??`` files (#1306: ``git status`` cannot
     distinguish session-written debris from pre-existing debris). A caller
     with no ``.py`` files in its changed set should not call this at all;
@@ -533,19 +554,10 @@ def _evaluate(repo_root: Path) -> GateResult:
     if not changed:
         return GateResult(block=False)  # fast path: nothing changed, nothing to check
     # Ruff scope is narrowed to tracked-modified + committed-since-base only
-    # (#1306): untracked (``??``) files are excluded because ``git status``
-    # cannot distinguish a file this session just wrote from pre-existing
-    # untracked debris that predates the session -- and the latter must never
-    # spuriously block a session that never touched it. Untracked files are
-    # still in ``changed`` for the W4 emit-site rule and test targeting below,
+    # by ``_ruff_lint_paths`` (#1306). Untracked files are still in
+    # ``changed`` for the W4 emit-site rule and test targeting below,
     # where a brand-new file legitimately needs coverage.
-    py_files = tuple(
-        sorted(
-            cf.path
-            for cf in changed
-            if not cf.deleted and cf.path.endswith(".py") and not cf.untracked
-        )
-    )
+    py_files = _ruff_lint_paths(changed)
     ruff_result = _run_ruff(repo_root, py_files)
     if ruff_result.block:
         return ruff_result
