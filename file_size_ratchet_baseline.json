@@ -28,7 +28,7 @@
   "src/charlie_work/worktree.py": 5800,
   "tests/test_api_worker.py": 1200,
   "tests/test_backlog_reachability.py": 1000,
-  "tests/test_charlie_work.py": 39000,
+  "tests/test_charlie_work.py": 33800,
   "tests/test_checks.py": 1000,
   "tests/test_closing_reference.py": 1000,
   "tests/test_config.py": 2000,
