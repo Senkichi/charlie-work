@@ -29336,7 +29336,7 @@ def test_classify_dead_sessions_launch_failed_api_session_settles_budget_ledger(
 # ``elif w.adapter_kind == "api"`` branches threaded through workflow.py /
 # reconcile.py). The pure helpers (_classify_session_failure,
 # _api_session_over_budget) are tested in test_claude_code_adapter.py /
-# test_worker_health.py; these tests exercise the production call sites so a
+# test_worker_health_api_budget.py; these tests exercise the production call sites so a
 # wiring regression that drops the api branch or the budget-kill block is
 # caught.
 # ---------------------------------------------------------------------------
