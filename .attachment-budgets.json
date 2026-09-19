@@ -65,21 +65,6 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1522",
-     "actor": "worker",
-     "reason": "growth from PRs #1522 #1449; operator decision 2026-09-02, issue 1458",
-     "to": 141
-    }
-   ],
-   "file": "tests/test_claude_code_adapter.py",
-   "identity": "tests/test_claude_code_adapter.py::module",
-   "kind": "test_module",
-   "member_count": 130
-  },
-  {
-   "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_cli.py",
    "identity": "tests/test_cli.py::module",
@@ -151,34 +136,11 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1464",
-     "actor": "worker",
-     "reason": "incident regression tests added by PRs #1429 #1433 #1437 #1440 #1421 #1464; operator decision 2026-09-02, issue 1458",
-     "to": 171
-    }
-   ],
-   "file": "tests/test_heartbeat_check.py",
-   "identity": "tests/test_heartbeat_check.py::module",
-   "kind": "test_module",
-   "member_count": 152
-  },
-  {
-   "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_instrumentation.py",
    "identity": "tests/test_instrumentation.py::module",
    "kind": "test_module",
    "member_count": 58
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_janitor.py",
-   "identity": "tests/test_janitor.py::module",
-   "kind": "test_module",
-   "member_count": 157
   },
   {
    "boundary": 41.0,
