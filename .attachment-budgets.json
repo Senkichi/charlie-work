@@ -74,14 +74,6 @@
   {
    "boundary": 41.0,
    "bumps": [],
-   "file": "tests/test_cli.py",
-   "identity": "tests/test_cli.py::module",
-   "kind": "test_module",
-   "member_count": 103
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
    "file": "tests/test_collect_only_gate.py",
    "identity": "tests/test_collect_only_gate.py::module",
    "kind": "test_module",
@@ -197,21 +189,6 @@
    "identity": "tests/test_prompt_skills.py::module",
    "kind": "test_module",
    "member_count": 35
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1480",
-     "actor": "worker",
-     "reason": "growth from PRs #1480 #1395 #1431; operator decision 2026-09-02, issue 1458",
-     "to": 153
-    }
-   ],
-   "file": "tests/test_reconcile.py",
-   "identity": "tests/test_reconcile.py::module",
-   "kind": "test_module",
-   "member_count": 135
   },
   {
    "boundary": 41.0,
