@@ -128,21 +128,6 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1464",
-     "actor": "worker",
-     "reason": "incident regression tests added by PRs #1429 #1433 #1437 #1440 #1421 #1464; operator decision 2026-09-02, issue 1458",
-     "to": 171
-    }
-   ],
-   "file": "tests/test_heartbeat_check.py",
-   "identity": "tests/test_heartbeat_check.py::module",
-   "kind": "test_module",
-   "member_count": 152
-  },
-  {
-   "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_instrumentation.py",
    "identity": "tests/test_instrumentation.py::module",
