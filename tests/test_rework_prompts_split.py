@@ -513,12 +513,18 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     Anchors verified by direct grep against this tree (not merely copied
     from the recon):
 
-    - ``_render_required_changes_section``: real top-of-file import at
-      ``tests/test_charlie_work.py:123`` (``sorted(root.rglob("*.py"))``
-      visits ``tests/`` before ``scripts/``, and within ``tests/`` this file
-      sorts ahead of the production consumer's own test file, so the found
-      import wins over ``scripts/ac1b_findings_actionability.py:72`` even
-      though both are real).
+    - ``_render_required_changes_section``: real function-local import at
+      ``tests/test_charlie_work_record_review_findings.py:434`` (inside
+      ``test_record_review_derived_with_external_findings_preserves_both``). The
+      issue-#1553 wave-7 split moved this name's last matching form out of
+      ``tests/test_charlie_work.py`` -- the tests that carried its
+      top-of-file import now live in ``tests/test_charlie_work_render.py``
+      (line 11), which loses the ``found.setdefault`` race to the
+      earlier-sorting ``record_review_findings`` file (``record`` precedes
+      ``render``). ``sorted(root.rglob("*.py"))`` still visits ``tests/``
+      before ``scripts/``, so the found import wins over
+      ``scripts/ac1b_findings_actionability.py:72`` even though both are
+      real.
     - ``_is_verdict_newer_than_brief``: real import at
       ``tests/test_backfill_stale_rework_briefs.py:23``.
     - ``_read_review_decision``: NOT imported by name in
@@ -563,7 +569,10 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     )
 
     assert "_render_required_changes_section" in referenced
-    assert referenced["_render_required_changes_section"] == "tests/test_charlie_work.py"
+    assert (
+        referenced["_render_required_changes_section"]
+        == "tests/test_charlie_work_record_review_findings.py"
+    )
 
     assert "_is_verdict_newer_than_brief" in referenced
     assert (
