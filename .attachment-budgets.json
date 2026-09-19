@@ -202,21 +202,6 @@
    "boundary": 41.0,
    "bumps": [
     {
-     "ack": "#1409",
-     "actor": "worker",
-     "reason": "growth from PR #1409 + identifier scrub; operator decision 2026-09-02, issue 1458",
-     "to": 53
-    }
-   ],
-   "file": "tests/test_worker_stop_gate.py",
-   "identity": "tests/test_worker_stop_gate.py::module",
-   "kind": "test_module",
-   "member_count": 49
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
      "ack": "#1522",
      "actor": "worker",
      "reason": "growth from PRs #1522 #1486 #1395; operator decision 2026-09-02, issue 1458",
