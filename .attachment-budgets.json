@@ -41,12 +41,12 @@
    "member_count": 33
   },
   {
-   "boundary": 32.0,
+   "boundary": 31.0,
    "bumps": [],
    "file": "tests/test_charlie_work.py",
    "identity": "tests/test_charlie_work.py::module",
    "kind": "test_module",
-   "member_count": 612
+   "member_count": 519
   },
   {
    "boundary": 41.0,
@@ -112,12 +112,28 @@
    "member_count": 42
   },
   {
+   "boundary": 31.0,
+   "bumps": [],
+   "file": "tests/test_human_merge_labels_1598.py",
+   "identity": "tests/test_human_merge_labels_1598.py::module",
+   "kind": "test_module",
+   "member_count": 32
+  },
+  {
    "boundary": 32.0,
    "bumps": [],
    "file": "tests/test_instrumentation.py",
    "identity": "tests/test_instrumentation.py::module",
    "kind": "test_module",
    "member_count": 34
+  },
+  {
+   "boundary": 31.0,
+   "bumps": [],
+   "file": "tests/test_issue_1314_operator_queue_followups.py",
+   "identity": "tests/test_issue_1314_operator_queue_followups.py::module",
+   "kind": "test_module",
+   "member_count": 32
   },
   {
    "boundary": 34.5,
