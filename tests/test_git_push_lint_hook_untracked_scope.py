@@ -2,9 +2,12 @@
 untracked (``??``) ``.py`` debris -- the same narrowing
 ``worker_stop_gate._evaluate`` applies for #1306.
 
-Split out of ``tests/test_git_push_lint_hook.py`` because that module is a
+Split out of ``tests/test_git_push_lint_hook.py`` because that module was a
 saturated ``test_module`` attachment point (member ceiling 42) and also
-carries a file-size-ratchet mark -- new members bind here instead.
+carried a file-size-ratchet mark. The #1577 Track-1 split later moved the
+``_is_git_push`` and ``_resolve_cwd`` seams into their own sibling modules
+(``test_git_push_lint_hook_is_git_push.py`` and
+``test_git_push_lint_hook_resolve_cwd.py``).
 
 Every test drives ``main()`` against a REAL ``git init``-ed ``tmp_path``
 repo and the REAL ``worker_stop_gate`` module (loaded through
