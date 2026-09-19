@@ -721,9 +721,10 @@ _CITATION_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         '"review.md"',
         "pr_dir = self.paths.prs",
     ),
-    "OrchestratorApp._render": (
-        "render_prompt(template_name, values, search_dirs=self.prompt_dirs)",
-    ),
+    # The marker is the argument tail, not the whole call: ``ruff format`` wraps
+    # ``_wf.render_prompt(...)`` across lines once it carries ``variants=``, and a
+    # marker spanning that wrap would break on formatting alone.
+    "OrchestratorApp._render": ("search_dirs=self.prompt_dirs, variants=variants",),
 }
 
 # Matches `workflow.py::<Symbol>` / `workflow.py::<Class>.<method>` -- a dotted

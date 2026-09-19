@@ -30,6 +30,10 @@ from .junit_recorded_gate_command import (
     register_junit_recorded_check_subparser,
     run_junit_recorded_check_command,
 )
+from .experiment_report_command import (
+    register_experiment_report_subparser,
+    run_experiment_report_command,
+)
 from .config import ConfigError, OrchestratorConfig, find_config_path
 from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import (
@@ -530,6 +534,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_ast_equivalence_check_subparser(subparsers)
     register_collect_only_check_subparser(subparsers)
     register_junit_recorded_check_subparser(subparsers)
+    register_experiment_report_subparser(subparsers)
 
     migrate_parser = subparsers.add_parser(
         "migrate-state-dir",
@@ -2709,6 +2714,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_collect_only_check_command(args)
         elif args.command == "junit-recorded-check":
             result = run_junit_recorded_check_command(args)
+        elif args.command == "experiment-report":
+            result = run_experiment_report_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)

@@ -36,6 +36,11 @@ dispatch:
   # (config.load_config) — commit-only, no push, no PR. Set this explicitly
   # only to override that default with your own repo-local template.
   # worker_template: worker_claude_code.md
+  # Runner prefix for templates that render a test command (worker.md,
+  # worker_claude_code.md, rework.md); the prompt adds the impacted test files
+  # and "-q --tb=short". No effect under the default worker_local.md, which tells
+  # the worker to use the repo's own documented test command.
+  # test_command: uv run --directory server pytest
   # Dispatch order: "oldest" (default) or "newest" (previous behavior)
   # order: oldest
 

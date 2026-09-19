@@ -38,7 +38,7 @@
    "file": "tests/test_charlie_work.py",
    "identity": "tests/test_charlie_work.py::module",
    "kind": "test_module",
-   "member_count": 995
+   "member_count": 851
   },
   {
    "boundary": 41.0,
@@ -116,21 +116,6 @@
    "identity": "tests/test_fix_reconcile.py::module",
    "kind": "test_module",
    "member_count": 47
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1531",
-     "actor": "worker",
-     "reason": "growth from PR #1531; operator decision 2026-09-02, issue 1458",
-     "to": 168
-    }
-   ],
-   "file": "tests/test_fleet_dispatch.py",
-   "identity": "tests/test_fleet_dispatch.py::module",
-   "kind": "test_module",
-   "member_count": 166
   },
   {
    "boundary": 41.0,

@@ -15,8 +15,14 @@ dispatch:
   # queues or merges the PR — it transitions the issue to agent:operator-queue
   # and posts a PR comment asking a human to merge. Default empty (off).
   # human_merge_labels: [needs-design]
-  # Devin worker sessions use the skills-based loop.
+  # Devin worker sessions use the skills-based loop only when your repo ships
+  # every skill it names (.devin/skills/ or .claude/skills/; see QUICKSTART.md
+  # "Prompt templates"); otherwise the same template renders a plain git/gh loop.
   worker_template: worker.md
+  # Runner prefix the worker/rework prompts tell workers to run (the prompt adds
+  # the impacted test files and "-q --tb=short"). Empty (default) derives it from
+  # the repo-root pyproject.toml, else points workers at the repo's CLAUDE.md.
+  # test_command: uv run --directory server pytest
   # Dispatch order: "oldest" (default) or "newest" (previous behavior)
   # order: oldest
 

@@ -58,6 +58,12 @@ Scale of the difference, measured on this fleet: 22,467 events in `events.db`
 against a 2000-entry ring. If you reason about anything older than the last few
 hours from the ring alone, you are reading roughly the most recent 9% of history.
 
+For the reviewer-effort A/B experiment specifically, `charlie
+experiment-report --experiment review_effort` is the read-only per-PR
+read-out over `events.db` — see
+[review-effort-experiment.md](review-effort-experiment.md) for the metric
+definitions and the experiment's stopping rule.
+
 ## Label meanings and legal transitions
 
 | Label | Meaning | Set by |

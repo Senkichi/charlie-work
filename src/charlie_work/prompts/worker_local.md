@@ -54,6 +54,7 @@ $section_config_parity
    module/function/symbol your production diff touched — not just the tests
    you wrote. Use the repository's own documented test command.
    $section_execution_contract
+   $section_repo_commands_precedence
 6. Add or update regression tests unless not applicable.
 7. $section_ruff_preflight
 8. Commit your changes. Commit message subject: Conventional-Commits format
