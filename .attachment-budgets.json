@@ -74,14 +74,6 @@
   {
    "boundary": 41.0,
    "bumps": [],
-   "file": "tests/test_cli.py",
-   "identity": "tests/test_cli.py::module",
-   "kind": "test_module",
-   "member_count": 103
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
    "file": "tests/test_collect_only_gate.py",
    "identity": "tests/test_collect_only_gate.py::module",
    "kind": "test_module",
@@ -134,14 +126,6 @@
    "identity": "tests/test_githublike_protocol.py::module",
    "kind": "test_module",
    "member_count": 42
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_instrumentation.py",
-   "identity": "tests/test_instrumentation.py::module",
-   "kind": "test_module",
-   "member_count": 58
   },
   {
    "boundary": 34.5,
@@ -200,21 +184,6 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1480",
-     "actor": "worker",
-     "reason": "growth from PRs #1480 #1395 #1431; operator decision 2026-09-02, issue 1458",
-     "to": 153
-    }
-   ],
-   "file": "tests/test_reconcile.py",
-   "identity": "tests/test_reconcile.py::module",
-   "kind": "test_module",
-   "member_count": 135
-  },
-  {
-   "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_safe_ref.py",
    "identity": "tests/test_safe_ref.py::module",
@@ -251,21 +220,6 @@
    "identity": "tests/test_worker.py::module",
    "kind": "test_module",
    "member_count": 48
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1426",
-     "actor": "worker",
-     "reason": "pre-freeze artifact: PR #1426, not shadow-week accretion; operator decision 2026-09-02, issue 1458",
-     "to": 59
-    }
-   ],
-   "file": "tests/test_worker_health.py",
-   "identity": "tests/test_worker_health.py::module",
-   "kind": "test_module",
-   "member_count": 55
   },
   {
    "boundary": 41.0,
