@@ -29,7 +29,6 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
-import json
 import pkgutil
 import subprocess
 import sys
@@ -46,7 +45,6 @@ from charlie_work.workflow import OrchestratorApp
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _WORKFLOW_PY = _REPO_ROOT / "src" / "charlie_work" / "workflow.py"
-_BUDGETS_JSON = _REPO_ROOT / ".attachment-budgets.json"
 
 # The OrchestratorApp member surface before Track 2 Phase B began moving bodies
 # out of workflow.py. Every leaf relocates lexical ``def``s into
@@ -69,27 +67,22 @@ _PRE_CAMPAIGN_MEMBER_SURFACE = 133
 _POST_CAMPAIGN_SURFACE_ADDITIONS = frozenset({"review_verdict_guard"})
 
 
-def _committed_orchestratorapp_member_count() -> int:
-    """The APC-budgeted ``member_count`` for ``workflow.py::OrchestratorApp``,
-    read from the committed ``.attachment-budgets.json``.
+def _apc_orchestratorapp_member_count() -> int:
+    """The APC ``member_count`` for ``workflow.py::OrchestratorApp``, computed
+    by the contracts scanner over the live source.
 
-    The budget ceiling is keyed by that file path and derived from the class's
-    lexical source, so it is the ground truth for "how many defs still live in
-    workflow.py" -- the one guard here that is legitimately file-keyed.
+    ``scan_source`` is the same counter the ``.attachment-budgets.json``
+    pipeline uses, so it is the identical oracle the committed budget entry
+    used to provide -- without depending on the entry's presence. Track-2
+    extraction dropped the class below the frozen class fence, so
+    ``baseline --ratchet`` legitimately omits its entry now; what must stay
+    true (and what this checks) is that the scanner's member count agrees
+    with a plain ast walk of the class body.
     """
-    data = json.loads(_BUDGETS_JSON.read_text(encoding="utf-8"))
-    entries = data["entries"] if isinstance(data, dict) else data
-    matches = [
-        e
-        for e in entries
-        if e.get("file") == "src/charlie_work/workflow.py"
-        and e.get("identity") == "OrchestratorApp"
-        and e.get("kind") == "class"
-    ]
-    assert len(matches) == 1, (
-        f"expected exactly one OrchestratorApp class budget entry, got {len(matches)}"
+    points = scan_source(_WORKFLOW_PY.read_text(encoding="utf-8"), "src/charlie_work/workflow.py")
+    return next(
+        p.member_count for p in points if p.kind == "class" and p.identity == "OrchestratorApp"
     )
-    return int(matches[0]["member_count"])
 
 
 def _installed_delegate_names() -> frozenset[str]:
@@ -535,8 +528,10 @@ def test_orchestratorapp_member_surface_conserved_lexical_plus_installed() -> No
 
     Three derived invariants, none keyed to a member-name list:
       1. the lexical FunctionDef/AsyncFunctionDef count still in workflow.py
-         equals the committed .attachment-budgets.json member_count for
-         workflow.py::OrchestratorApp (the APC ceiling tracks the source);
+         equals the attachment-contracts scanner's member_count for
+         workflow.py::OrchestratorApp (the APC counter tracks the source --
+         the committed budget entry it used to be read from is legitimately
+         absent now that the class sits below the frozen class fence);
       2. lexical defs + (installed delegates minus the declared post-campaign
          additions) == the pre-campaign surface (133) -- every def that left
          the class body is re-attached by the installer, so nothing is lost
@@ -559,7 +554,7 @@ def test_orchestratorapp_member_surface_conserved_lexical_plus_installed() -> No
     }
     lexical_defs = len(lexical_names)
 
-    assert lexical_defs == _committed_orchestratorapp_member_count()
+    assert lexical_defs == _apc_orchestratorapp_member_count()
 
     installed = _installed_delegate_names()
     # Post-campaign additions (e.g. issue #1695's review_verdict_guard) are

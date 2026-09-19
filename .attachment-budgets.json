@@ -9,20 +9,20 @@
    "member_count": 12
   },
   {
+   "boundary": 8.5,
+   "bumps": [],
+   "file": "src/charlie_work/local_issues.py",
+   "identity": "LocalFileGitHub",
+   "kind": "class",
+   "member_count": 48
+  },
+  {
    "boundary": 6.0,
    "bumps": [],
    "file": "src/charlie_work/wedge_watchdog.py",
    "identity": "WedgeWatchdog",
    "kind": "class",
    "member_count": 9
-  },
-  {
-   "boundary": 6.0,
-   "bumps": [],
-   "file": "src/charlie_work/workflow.py",
-   "identity": "OrchestratorApp",
-   "kind": "class",
-   "member_count": 7
   },
   {
    "boundary": 41.0,
@@ -34,18 +34,11 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1522",
-     "actor": "worker",
-     "reason": "role-config migration growth, PRs #1512 #1522 + phase-2 tracks; operator decision 2026-09-02, issue 1458",
-     "to": 1077
-    }
-   ],
+   "bumps": [],
    "file": "tests/test_charlie_work.py",
    "identity": "tests/test_charlie_work.py::module",
    "kind": "test_module",
-   "member_count": 1059
+   "member_count": 995
   },
   {
    "boundary": 41.0,
@@ -84,6 +77,14 @@
    "identity": "tests/test_cli.py::module",
    "kind": "test_module",
    "member_count": 103
+  },
+  {
+   "boundary": 41.0,
+   "bumps": [],
+   "file": "tests/test_collect_only_gate.py",
+   "identity": "tests/test_collect_only_gate.py::module",
+   "kind": "test_module",
+   "member_count": 43
   },
   {
    "boundary": 41.0,
