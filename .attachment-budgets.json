@@ -57,21 +57,6 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1522",
-     "actor": "worker",
-     "reason": "growth from PRs #1522 #1449; operator decision 2026-09-02, issue 1458",
-     "to": 141
-    }
-   ],
-   "file": "tests/test_claude_code_adapter.py",
-   "identity": "tests/test_claude_code_adapter.py::module",
-   "kind": "test_module",
-   "member_count": 130
-  },
-  {
-   "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_cli.py",
    "identity": "tests/test_cli.py::module",
