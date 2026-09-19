@@ -313,8 +313,9 @@ def _finalize_externally_merged_issues(
             if issue_pr_map:
                 state = self._record_event(
                     state,
-                    # event-consumer: audit-only -- records the PR-status "merged"
-                    # finalization already applied inline above; no separate consumer needed
+                    # records the PR-status "merged" finalization applied
+                    # inline above; consumed by experiment_report's merge
+                    # attribution (issue #1701)
                     "finalize_externally_merged",
                     {
                         "issue_numbers": sorted(issue_pr_map.keys()),
