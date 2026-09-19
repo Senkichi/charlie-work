@@ -25,6 +25,14 @@
    "member_count": 9
   },
   {
+   "boundary": 37.0,
+   "bumps": [],
+   "file": "tests/attachment_contracts/test_baseline.py",
+   "identity": "tests/attachment_contracts/test_baseline.py::module",
+   "kind": "test_module",
+   "member_count": 41
+  },
+  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_api_budget.py",
@@ -58,14 +66,6 @@
   {
    "boundary": 41.0,
    "bumps": [],
-   "file": "tests/test_cli.py",
-   "identity": "tests/test_cli.py::module",
-   "kind": "test_module",
-   "member_count": 103
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
    "file": "tests/test_collect_only_gate.py",
    "identity": "tests/test_collect_only_gate.py::module",
    "kind": "test_module",
@@ -78,21 +78,6 @@
    "identity": "tests/test_config.py::module",
    "kind": "test_module",
    "member_count": 114
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1509",
-     "actor": "worker",
-     "reason": "role-config migration growth + PR #1509; operator decision 2026-09-02, issue 1458",
-     "to": 89
-    }
-   ],
-   "file": "tests/test_doctor.py",
-   "identity": "tests/test_doctor.py::module",
-   "kind": "test_module",
-   "member_count": 82
   },
   {
    "boundary": 41.0,
@@ -158,6 +143,14 @@
    "member_count": 59
   },
   {
+   "boundary": 37.0,
+   "bumps": [],
+   "file": "tests/test_private_slug_gate.py",
+   "identity": "tests/test_private_slug_gate.py::module",
+   "kind": "test_module",
+   "member_count": 39
+  },
+  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_process_utils.py",
@@ -175,21 +168,6 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1480",
-     "actor": "worker",
-     "reason": "growth from PRs #1480 #1395 #1431; operator decision 2026-09-02, issue 1458",
-     "to": 153
-    }
-   ],
-   "file": "tests/test_reconcile.py",
-   "identity": "tests/test_reconcile.py::module",
-   "kind": "test_module",
-   "member_count": 135
-  },
-  {
-   "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_safe_ref.py",
    "identity": "tests/test_safe_ref.py::module",
@@ -203,21 +181,6 @@
    "identity": "tests/test_state_dir_migration.py::module",
    "kind": "test_module",
    "member_count": 60
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1486",
-     "actor": "worker",
-     "reason": "growth from PR #1486; operator decision 2026-09-02, issue 1458",
-     "to": 100
-    }
-   ],
-   "file": "tests/test_supervise.py",
-   "identity": "tests/test_supervise.py::module",
-   "kind": "test_module",
-   "member_count": 99
   },
   {
    "boundary": 41.0,
