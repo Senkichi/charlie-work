@@ -24,6 +24,8 @@ from .config import OrchestratorConfig
 from .rescue_review import LEGACY_VACUOUS_SUMMARY
 from .github import defang_closing_keywords
 from .markdown_fence import fenced_block
+from .prompt_skills import active_prompt_variants
+from .prompt_test_command import prompt_test_command_values
 from .prompts import (
     assert_containment,
     assert_execution_contract,
@@ -823,6 +825,7 @@ def _render_rework_prompt(
         required_changes_section = (
             f"{caveat}\n\n{required_changes_section}" if required_changes_section else caveat
         )
+    search_dirs = _rework_prompt_search_dirs(config, repo_root=repo_root)
     return render_prompt(
         config.dispatch.rework_template,
         {
@@ -842,8 +845,12 @@ def _render_rework_prompt(
             "dispatch_note_block": fenced_block(defang_closing_keywords(dispatch_note), "md"),
             "required_changes_section": required_changes_section,
             "branch_name": pr.get("headRefName", ""),
+            # Same derivation as the worker prompt (``prompt_test_command``); the
+            # fresh and rework lanes must not disagree about how to run tests.
+            **prompt_test_command_values(config.dispatch.test_command, repo_root),
         },
-        search_dirs=_rework_prompt_search_dirs(config, repo_root=repo_root),
+        search_dirs=search_dirs,
+        variants=active_prompt_variants(config.worker.harness, repo_root, search_dirs),
     )
 
 

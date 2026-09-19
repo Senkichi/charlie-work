@@ -47,16 +47,33 @@ class HarnessCapabilities:
     produce a ``WorkerView``-tracked session (synchronous, no sidecar --
     ``"manual"``, ``"command"``) carry their own harness name here as a
     harmless placeholder; nothing filters on it for those.
+
+    ``skill_dirs``: repo-root-relative directories this harness loads project
+    skills (``<dir>/<name>/SKILL.md``) from, so a worker prompt may name a
+    slash-command only when the consumer actually ships it there. Empty for
+    harnesses with no skill loader. Observed, not assumed: a devin-shell worker's
+    ``<available_skills>`` block sources project skills from the worktree's
+    ``.devin/skills`` and ``.claude/skills``, and a skill the consumer does not
+    ship comes back as ``Skill "<name>" not found`` -- the harness alone does not
+    provide it.
     """
 
     worker: bool
     review: bool
     adapter_kind: str
+    skill_dirs: tuple[str, ...] = ()
 
 
 HARNESS_REGISTRY: dict[str, HarnessCapabilities] = {
-    "claude-code": HarnessCapabilities(worker=True, review=True, adapter_kind="claude-code"),
-    "devin-shell": HarnessCapabilities(worker=True, review=True, adapter_kind="devin"),
+    "claude-code": HarnessCapabilities(
+        worker=True, review=True, adapter_kind="claude-code", skill_dirs=(".claude/skills",)
+    ),
+    "devin-shell": HarnessCapabilities(
+        worker=True,
+        review=True,
+        adapter_kind="devin",
+        skill_dirs=(".devin/skills", ".claude/skills"),
+    ),
     "api": HarnessCapabilities(worker=True, review=True, adapter_kind="api"),
     "command": HarnessCapabilities(worker=True, review=False, adapter_kind="command"),
     "manual": HarnessCapabilities(worker=True, review=False, adapter_kind="manual"),

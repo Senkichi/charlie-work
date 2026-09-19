@@ -23,6 +23,10 @@ dispatch:
   # human_merge_labels: [needs-design]
   # Claude Code workers use the direct-shell loop (no Devin session skills).
   worker_template: worker_claude_code.md
+  # Runner prefix the worker/rework prompts tell workers to run (the prompt adds
+  # the impacted test files and "-q --tb=short"). Empty (default) derives it from
+  # the repo-root pyproject.toml, else points workers at the repo's CLAUDE.md.
+  # test_command: uv run --directory server pytest
   # Dispatch order: "oldest" (default) or "newest" (previous behavior)
   # order: oldest
 
