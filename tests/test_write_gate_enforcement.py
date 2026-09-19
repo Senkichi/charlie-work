@@ -174,7 +174,7 @@ comment and manual close, not closed by this commit).
 Every site (and every allow-list entry) is keyed by ``(module path,
 enclosing scope, primitive name, unparsed call source, occurrence index)``
 -- never a bare line number, which rots as the surrounding file edits. The
-first four fields mirror ``tests/test_instrumentation.py``'s own
+first four fields mirror ``tests/_instrumentation_kind_scanner.py``'s own
 ``_UnresolvedKindSite.key`` idiom exactly. The fifth, ``occurrence``, is
 required because calling the same primitive with byte-identical arguments
 multiple times in one function is the dominant real shape (e.g.
@@ -202,7 +202,7 @@ _SRC_ROOT = Path(__file__).parents[1] / "src" / "charlie_work"
 # The gated-mutator-layer's fixed primitive vocabulary. Includes BOTH
 # `_record_event` (the pre-migration `OrchestratorApp` private forwarding
 # method) and `record_event` (WriteGate's replacement method name) --
-# mirroring `tests/test_instrumentation.py`'s own
+# mirroring `tests/_instrumentation_kind_scanner.py`'s own
 # `_EMIT_FUNCS = {"log_event", "append_event", "_record_event", "record_event"}`,
 # which already treats these two names as the same underlying "record an
 # event" shape for its own (different) purpose. Matching is receiver-
@@ -249,7 +249,7 @@ def _is_exempt_module(rel_path: str) -> bool:
 
 def _primitive_name(node: ast.Call) -> str | None:
     """Receiver-agnostic name match, mirroring `_emit_func_name` in
-    tests/test_instrumentation.py: a bare `Name` or an `Attribute.attr`."""
+    tests/_instrumentation_kind_scanner.py: a bare `Name` or an `Attribute.attr`."""
     func = node.func
     if isinstance(func, ast.Name) and func.id in _GATED_PRIMITIVE_NAMES:
         return func.id
@@ -456,7 +456,7 @@ class _RawPrimitiveSite:
     Structural anchor -- (path, scope, primitive, unparsed call source,
     occurrence) -- never a bare line number. `lineno` is retained for
     human-readable reporting only and deliberately excluded from `key`,
-    mirroring `test_instrumentation.py`'s `_UnresolvedKindSite`.
+    mirroring `tests/_instrumentation_kind_scanner.py`'s `_UnresolvedKindSite`.
 
     `occurrence` (0-indexed, in source/traversal order) is REQUIRED for real
     exact-siteness: the same primitive is routinely invoked with
@@ -532,7 +532,7 @@ def _scan_module_for_raw_primitive_calls(
     # use WriteGate. A collision between two functions sharing a name within
     # the SAME module (e.g. two methods of different classes) is a known,
     # documented residual limit of the unqualified-scope-name design this
-    # scanner inherits from test_instrumentation.py's own idiom -- not
+    # scanner inherits from tests/_instrumentation_kind_scanner.py's own idiom -- not
     # something R9 asked PR4 to solve.
     scope_uses_write_gate: dict[str, bool] = {}
     # Issue #1374: per-scope param-alias map (param name -> primitive name).
@@ -1120,7 +1120,7 @@ def _format_inventory(sites: list[_RawPrimitiveSite]) -> str:
 
 # ---------------------------------------------------------------------------
 # Self-tests: prove the scanner DETECTS, not merely runs. Mirrors
-# test_instrumentation.py's own regression-control idiom: a seeded-violation
+# tests/test_instrumentation_kind_scanner.py's own regression-control idiom: a seeded-violation
 # positive control paired with a gate-routed negative control, so a scanner
 # that flagged *everything* (or *nothing*) would be caught by one half or
 # the other.
