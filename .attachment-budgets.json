@@ -9,14 +9,6 @@
    "member_count": 12
   },
   {
-   "boundary": 8.5,
-   "bumps": [],
-   "file": "src/charlie_work/local_issues.py",
-   "identity": "LocalFileGitHub",
-   "kind": "class",
-   "member_count": 48
-  },
-  {
    "boundary": 6.0,
    "bumps": [],
    "file": "src/charlie_work/wedge_watchdog.py",
@@ -92,14 +84,6 @@
    "identity": "tests/test_cli.py::module",
    "kind": "test_module",
    "member_count": 103
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_collect_only_gate.py",
-   "identity": "tests/test_collect_only_gate.py::module",
-   "kind": "test_module",
-   "member_count": 43
   },
   {
    "boundary": 41.0,
