@@ -75,7 +75,8 @@ def _request_no_op_rework_repair(
         summary,
         # records a rework repair request already routed to a worker via
         # _route_to_rework (the dispatch IS the action); consumed by
-        # experiment_report's no_op_kickback_rate metric (issue #1701)
+        # experiment_report's no_op_kickback_rate activity metric (issue
+        # #1701) -- an empty rework cycle, not a review-correctness signal
         "no_op_rework_repair_requested",
         extra_state=extra_state,
     )

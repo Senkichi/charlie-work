@@ -18,7 +18,10 @@ from _cli_fixtures import _FakeGitHub, _make_repo
 from charlie_work import cli, instrumentation
 from charlie_work.experiment_report import (
     CONFIDENCE_Z,
+    EQUIVALENCE_MARGIN,
+    _outcome_coverage,
     build_report,
+    evaluate_stopping_rule,
     metrics_key_for_experiment,
     parse_window_bound,
     render_text,
@@ -128,13 +131,21 @@ def test_arm_values_derived_from_claim_assignments_and_rounds() -> None:
 
 def test_no_literal_arm_name_in_implementation() -> None:
     """The report derives arm names from the data; the literal experiment
-    arm names must never appear in the implementation source."""
+    arm names must never appear in the implementation source. The module
+    set is derived (every ``experiment_report*`` module in the package),
+    so a new split-out module is covered without this test being edited."""
     import inspect
+    import pkgutil
 
-    import charlie_work.experiment_report as er
-    import charlie_work.experiment_report_command as erc
+    import charlie_work
 
-    for module in (er, erc):
+    modules = [
+        __import__(f"charlie_work.{m.name}", fromlist=["x"])
+        for m in pkgutil.iter_modules(charlie_work.__path__)
+        if m.name.startswith("experiment_report")
+    ]
+    assert any(m.__name__.endswith("experiment_report") for m in modules)
+    for module in modules:
         source = inspect.getsource(module)
         for forbidden in ("treatment", "control"):
             assert forbidden not in source, (
@@ -259,7 +270,8 @@ def test_below_minimum_prs_reports_not_met() -> None:
 
 
 def test_stopping_rule_met_on_outcome_difference() -> None:
-    """Arm a: 4/6 approvals bounced to rework. Arm b: 0/6. The outcome
+    """Arm a: 4/6 approvals bounced to rework by a silent base-commit
+    revert (the review-correctness signal). Arm b: 0/6. The outcome
     difference interval excludes 0 -> met, difference_detected, naming the
     lower-defect arm."""
     events = []
@@ -271,7 +283,7 @@ def test_stopping_rule_met_on_outcome_difference() -> None:
         events.append(
             _evt(
                 "2026-08-05T00:00:00Z",
-                "check_failure_rework_requested",
+                "cross_pr_revert_rework_requested",
                 {"pr_number": 200 + i, "issue_number": 1},
             )
         )
@@ -285,21 +297,154 @@ def test_stopping_rule_met_on_outcome_difference() -> None:
     assert outcome["per_arm"]["b"]["k"] == 0
 
 
-def test_equivalence_bound_ends_inconclusive_experiment() -> None:
-    """Every arm at >= 2x min with all outcome intervals spanning 0 ->
-    met, no_detectable_difference."""
+def test_zero_outcome_events_cannot_end_experiment() -> None:
+    """Regression: 200 approved PRs per arm and ZERO outcome events used
+    to return met/no_detectable_difference off a degenerate [0, 0] Wald
+    interval. Zero observed events cannot distinguish equivalent arms from
+    a dead outcome channel, so the rule must stay not_met (underpowered)
+    and the difference interval must be non-degenerate."""
     events = []
-    for i in range(12):
+    for i in range(200):
         events.append(_round(400 + i, "approved", "a", ts="2026-08-01T00:00:00Z"))
-        events.append(_round(500 + i, "approved", "b", ts="2026-08-01T00:00:00Z"))
-    report = build_report(events, KEY, min_prs_per_arm=6)
+        events.append(_round(700 + i, "approved", "b", ts="2026-08-01T00:00:00Z"))
+    report = build_report(events, KEY, min_prs_per_arm=100)
+    rule = report["stopping_rule"]
+    assert rule["met"] is False and rule["verdict"] == "not_met"
+    assert "underpowered" in rule["detail"]
+    diff = report["metrics"]["post_approval_defect_rate"]["differences"]
+    assert len(diff) == 1
+    lo, hi = diff[0]["ci95"]
+    assert lo < 0.0 < hi  # a real interval, never the old [+0.0000, +0.0000]
+
+
+def test_equivalence_bound_ends_experiment_with_evidence() -> None:
+    """Positive equivalence case: every arm at >= 2x min, each arm with
+    >= 1 observed outcome event, and every difference interval inside the
+    stated equivalence margin -> met, no_detectable_difference."""
+    events = []
+    for i in range(200):
+        events.append(_round(600 + i, "approved", "a", ts="2026-08-01T00:00:00Z"))
+        events.append(_round(800 + i, "approved", "b", ts="2026-08-01T00:00:00Z"))
+    for i in range(5):
+        events.append(
+            _evt(
+                "2026-08-05T00:00:00Z",
+                "cross_pr_revert_rework_requested",
+                {"pr_number": 600 + i, "issue_number": 1},
+            )
+        )
+        events.append(
+            _evt(
+                "2026-08-05T00:00:00Z",
+                "cross_pr_revert_rework_requested",
+                {"pr_number": 800 + i, "issue_number": 2},
+            )
+        )
+    report = build_report(events, KEY, min_prs_per_arm=100)
     rule = report["stopping_rule"]
     assert rule["met"] is True and rule["verdict"] == "no_detectable_difference"
+    assert rule["equivalence_margin"] == EQUIVALENCE_MARGIN
+    diff = report["metrics"]["post_approval_defect_rate"]["differences"][0]
+    assert diff["ci95"][0] >= -EQUIVALENCE_MARGIN
+    assert diff["ci95"][1] <= EQUIVALENCE_MARGIN
+
+
+def test_intervals_wider_than_margin_keep_running_at_equivalence_bound() -> None:
+    """Every arm >= 2x min with outcome events, but the difference
+    interval is wider than the stated equivalence margin without excluding
+    0 -- neither difference_detected nor equivalence: not_met."""
+    events = []
+    for i in range(200):
+        events.append(_round(1000 + i, "approved", "a", ts="2026-08-01T00:00:00Z"))
+        events.append(_round(1200 + i, "approved", "b", ts="2026-08-01T00:00:00Z"))
+    for i in range(8):
+        events.append(
+            _evt(
+                "2026-08-05T00:00:00Z",
+                "cross_pr_revert_rework_requested",
+                {"pr_number": 1000 + i, "issue_number": 1},
+            )
+        )
+    for i in range(2):
+        events.append(
+            _evt(
+                "2026-08-05T00:00:00Z",
+                "cross_pr_revert_rework_requested",
+                {"pr_number": 1200 + i, "issue_number": 2},
+            )
+        )
+    report = build_report(events, KEY, min_prs_per_arm=100)
+    rule = report["stopping_rule"]
+    assert rule["met"] is False and rule["verdict"] == "not_met"
+    diff = report["metrics"]["post_approval_defect_rate"]["differences"][0]
+    assert diff["ci95"][0] < 0 < diff["ci95"][1]  # not a detected difference
+    assert diff["ci95"][1] > EQUIVALENCE_MARGIN  # and too wide for equivalence
 
 
 # ---------------------------------------------------------------------------
 # Activity vs outcome labelling, JSON shape, intervals
 # ---------------------------------------------------------------------------
+
+
+def test_pipeline_signals_are_not_outcome_metrics() -> None:
+    """check_failure_rework_requested keeps the approval standing (its
+    rework brief says 'do not re-litigate the review'), so it is pipeline
+    state, not a review-correctness outcome: it must not count toward
+    post_approval_defect_rate nor end the experiment. no_op_kickback_rate
+    measures an empty rework CYCLE, not a wrong kickback -- activity too."""
+    events = []
+    for i in range(6):
+        events.append(_round(1400 + i, "approved", "a", ts="2026-08-01T00:00:00Z"))
+        events.append(_round(1500 + i, "approved", "b", ts="2026-08-01T00:00:00Z"))
+    # every approved PR in arm a later bounces on failing checks
+    for i in range(6):
+        events.append(
+            _evt(
+                "2026-08-05T00:00:00Z",
+                "check_failure_rework_requested",
+                {"pr_number": 1400 + i, "issue_number": 1},
+            )
+        )
+    report = build_report(events, KEY, min_prs_per_arm=6)
+    metrics = report["metrics"]
+    # the check failures are reported -- as activity, not outcome
+    ci = metrics["post_approval_ci_failure_rate"]
+    assert ci["measure"] == "activity"
+    assert ci["per_arm"]["a"]["k"] == 6 and ci["per_arm"]["a"]["n"] == 6
+    # and they contribute nothing to the review-correctness outcome
+    defect = metrics["post_approval_defect_rate"]
+    assert defect["measure"] == "outcome"
+    assert defect["per_arm"]["a"]["k"] == 0 and defect["per_arm"]["b"]["k"] == 0
+    # so check failures alone can never end the experiment
+    assert report["stopping_rule"]["met"] is False
+    # the no-op kickback rate is likewise activity, and its description
+    # does not claim the kickback was wrong
+    noop = metrics["no_op_kickback_rate"]
+    assert noop["measure"] == "activity"
+    assert "no content change" in noop["description"]
+
+
+def test_no_outcome_metric_reports_statement_and_not_met() -> None:
+    """Where no outcome metric is derivable the report must say so
+    explicitly and the stopping rule must stay not_met -- it cannot be
+    ended on activity metrics alone."""
+    coverage = _outcome_coverage({"m": {"measure": "activity"}})
+    assert coverage["derivable"] == []
+    assert coverage["statement"] is not None
+    assert "no outcome metric is derivable" in coverage["statement"]
+    rule = evaluate_stopping_rule(["a", "b"], {"a": 10, "b": 10}, None, 1, CONFIDENCE_Z)
+    assert rule["met"] is False and rule["verdict"] == "not_met"
+    assert rule["outcome_metric"] is None
+    assert "no outcome metric" in rule["detail"]
+    # the renderer prints the explicit statement on an empty derivable set
+    report = build_report(
+        [_round(1600, "approved", "a", ts="2026-08-01T00:00:00")],
+        KEY,
+        min_prs_per_arm=1,
+    )
+    report["outcome_coverage"]["derivable"] = []
+    report["outcome_coverage"]["statement"] = coverage["statement"]
+    assert "no outcome metric is derivable" in render_text(report)
 
 
 def test_every_metric_labelled_and_at_least_one_outcome() -> None:
@@ -364,14 +509,42 @@ def test_json_output_is_serializable_and_complete() -> None:
 
 
 def test_help_describes_read_only() -> None:
-    text = cli.build_parser().format_help()
-    assert "experiment-report" in text
-    # the subcommand help line describes the read-only contract
-    assert "Read-only" in text or "read-only" in text
+    """The experiment-report subparser's OWN help and description must
+    state the read-only contract -- a top-level ``--help`` assertion is
+    satisfied by unrelated commands' help text and cannot fail on the
+    regression it claims to guard."""
+    import argparse
+
+    parser = cli.build_parser()
+    subs = next(
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+    )
+    sub = subs.choices["experiment-report"]
+    assert "read-only" in (sub.description or "").lower()
+    pseudo = next(a for a in subs._choices_actions if a.dest == "experiment-report")
+    assert "read-only" in (pseudo.help or "").lower()
 
 
 def _state_path(repo: Path) -> Path:
     return repo / ".var" / "charlie-work" / "state.json"
+
+
+def _repo_with_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    """A fake repo with one recorded event (and thus a live events.db)."""
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+    state_path = _state_path(repo)
+    instrumentation.log_event(
+        state_path,
+        "record_review",
+        {
+            "pr_number": 1,
+            "issue_number": 1,
+            "decision": "approved",
+            "session_metrics": {KEY: "deep", "cost_usd": 1.25},
+        },
+    )
+    return repo, state_path
 
 
 def test_missing_events_db_fails_without_creating_files(
@@ -391,25 +564,27 @@ def test_missing_events_db_fails_without_creating_files(
     assert not (state_path.parent / "events.db").exists()
 
 
+def _state_dir_snapshot(state_path: Path) -> dict[str, bytes]:
+    """Every file in the state dir mapped to its bytes -- catches a WAL
+    sidecar, a .migrated rename, or any stray file, not just the two
+    byte-compared files."""
+    return {p.name: p.read_bytes() for p in sorted(state_path.parent.iterdir()) if p.is_file()}
+
+
 def test_report_performs_no_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """events.db and state.json are byte-identical before and after a run."""
-    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
-    repo = _make_repo(tmp_path)
-    state_path = _state_path(repo)
-    instrumentation.log_event(
-        state_path,
-        "record_review",
-        {
-            "pr_number": 1,
-            "issue_number": 1,
-            "decision": "approved",
-            "session_metrics": {KEY: "deep", "cost_usd": 1.25},
-        },
-    )
-    db_bytes = (state_path.parent / "events.db").read_bytes()
-    state_bytes = state_path.read_bytes()
+    """events.db, state.json, and every sibling file are byte-identical
+    before and after a run on the COLD-OPEN path. Two subtleties make the
+    comparison honest: (1) close_db BEFORE snapshotting so _get_db really
+    re-opens the database inside the command -- a warm-cache run could
+    mask a write on reopen; (2) close_db AFTER the run so any write that
+    landed in the events.db-wal sidecar (WAL mode: a row write does not
+    touch the main db file until a checkpoint) is folded back in before
+    the byte comparison."""
+    repo, state_path = _repo_with_db(tmp_path, monkeypatch)
+    instrumentation.close_db(state_path)
+    before = _state_dir_snapshot(state_path)
 
     rc = cli.main(["--repo", str(repo), "experiment-report", "--experiment", "review_effort"])
 
@@ -417,8 +592,120 @@ def test_report_performs_no_writes(
     out = capsys.readouterr().out
     assert 'arm "deep"' in out or '"deep"' in out
     assert "stopping rule" in out
+    instrumentation.close_db(state_path)
+    assert _state_dir_snapshot(state_path) == before
+
+
+def test_unmigrated_events_jsonl_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unmigrated events.jsonl beside events.db must be refused (rc=1):
+    reading through query_events would auto-migrate it -- a write. Both
+    files must come out byte-identical."""
+    repo, state_path = _repo_with_db(tmp_path, monkeypatch)
+    instrumentation.close_db(state_path)
+    jsonl = state_path.parent / "events.jsonl"
+    jsonl.write_text(
+        '{"ts": "2026-08-01T00:00:00Z", "kind": "record_review", "payload": {}}\n',
+        encoding="utf-8",
+    )
+    db_bytes = (state_path.parent / "events.db").read_bytes()
+    jsonl_bytes = jsonl.read_bytes()
+
+    rc = cli.main(["--repo", str(repo), "experiment-report", "--experiment", "review_effort"])
+
+    assert rc == 1
+    assert "refusing" in capsys.readouterr().out
     assert (state_path.parent / "events.db").read_bytes() == db_bytes
-    assert state_path.read_bytes() == state_bytes
+    assert jsonl.read_bytes() == jsonl_bytes
+
+
+def test_exclude_window_flag_reaches_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--exclude-window START END plumbs through argparse into the report:
+    an exclusion covering now drops every event (NO DATA), one covering
+    only ancient history changes nothing."""
+    repo, state_path = _repo_with_db(tmp_path, monkeypatch)
+    instrumentation.close_db(state_path)
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "experiment-report",
+            "--experiment",
+            "review_effort",
+            "--exclude-window",
+            "2000-01-01T00:00:00Z",
+            "2100-01-01T00:00:00Z",
+        ]
+    )
+    assert rc == 0
+    assert "NO DATA" in capsys.readouterr().out
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "experiment-report",
+            "--experiment",
+            "review_effort",
+            "--exclude-window",
+            "2000-01-01T00:00:00Z",
+            "2000-01-02T00:00:00Z",
+        ]
+    )
+    assert rc == 0
+    assert 'arm "deep"' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "needle"),
+    [
+        (["--since", "not-a-timestamp"], "not an ISO-8601 timestamp"),
+        (["--until", "garbage"], "not an ISO-8601 timestamp"),
+        (
+            ["--since", "2026-08-10T00:00:00Z", "--until", "2026-08-01T00:00:00Z"],
+            "is after --until",
+        ),
+        (
+            [
+                "--exclude-window",
+                "2026-08-10T00:00:00Z",
+                "2026-08-01T00:00:00Z",
+            ],
+            "is after end",
+        ),
+        (["--min-prs-per-arm", "0"], "must be a positive integer"),
+        (["--min-prs-per-arm", "-3"], "must be a positive integer"),
+    ],
+)
+def test_cli_window_and_min_prs_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    extra_args: list[str],
+    needle: str,
+) -> None:
+    """Every user-facing argument error is a CommandResult(False) -- rc=1
+    with a named reason, never a traceback."""
+    repo, state_path = _repo_with_db(tmp_path, monkeypatch)
+    instrumentation.close_db(state_path)
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "experiment-report",
+            "--experiment",
+            "review_effort",
+            *extra_args,
+        ]
+    )
+
+    assert rc == 1
+    assert needle in capsys.readouterr().out
 
 
 def test_json_flag_emits_structured_report(
@@ -480,5 +767,13 @@ def test_stopping_rule_is_documented() -> None:
         "post_approval_defect_rate",
         "assigned PRs",
         "experiment-report",
+        # the stopping rule's evidence guards must be written down too:
+        # the stated equivalence margin and the observed-event floor
+        "equivalence margin",
+        "MIN_EQUIVALENCE_EVENTS_PER_ARM",
+        # outcome claims must match what is measured, and the missing
+        # post-merge attribution recording must be linked (issue #1717)
+        "no content change",
+        "#1717",
     ):
         assert needle in text, f"docs missing required content: {needle!r}"

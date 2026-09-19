@@ -9,6 +9,22 @@ PR -- not the review round -- is the unit of analysis), and reports
 activity and outcome metrics per arm with intervals, plus the experiment's
 stopping rule.
 
+The module is split under the repo's 800-line cap:
+
+* :mod:`charlie_work.experiment_report_intervals` -- Wilson per-arm
+  intervals and the Newcombe hybrid-score difference interval.
+* :mod:`charlie_work.experiment_report_scan` -- the event vocabulary and
+  the payload scanners that turn raw events into ``(pr, arm)``
+  observations and per-PR flags.
+* :mod:`charlie_work.experiment_report_stopping` -- the stopping rule and
+  its constants (the equivalence margin and observed-event floor live
+  there).
+* :mod:`charlie_work.experiment_report_render` -- the text rendering.
+
+This module keeps the report assembly (:func:`build_report`), the window
+semantics, and the public names the command layer and tests import --
+re-exported deliberately per the repo's facade pattern.
+
 Design invariants:
 
 * **PR-level unit.**  A PR can have many ``record_review`` rounds.  Rates
@@ -23,10 +39,17 @@ Design invariants:
   the same code serves the current experiment and any future one that
   records an ``*_arm`` key (e.g. the planned ``brief_arm``, issue #1276).
 * **Outcomes vs. activity.**  Every metric is labelled ``"activity"`` or
-  ``"outcome"``.  Activity metrics (first-round decision, rounds, cost,
-  escalation, merge share, dispatch-to-merge latency) describe *what the
-  arms did*; outcome metrics describe *whether the review was right* --
-  the only signals allowed to drive the stopping rule.
+  ``"outcome"``.  Outcome metrics measure *whether the review was right*
+  and are the only signals allowed to drive the stopping rule.  Only one
+  outcome signal is derivable today -- an approved branch found to
+  silently revert a base commit.  ``check_failure_rework_requested`` is
+  deliberately **not** an outcome: its own rework brief says the approval
+  stands ("do not re-litigate the review"), so it is pipeline state, not
+  evidence the review was wrong.  ``no_op_rework_repair_requested``
+  measures an empty rework *cycle*, not a wrong kickback.  Where no
+  outcome metric is derivable, the report says so explicitly and the
+  stopping rule stays ``not_met`` -- activity metrics never imply a
+  conclusion they cannot support.
 * **Read-only.**  The command layer gates on ``events.db`` existence before
   calling :func:`charlie_work.instrumentation.query_events`, because
   ``_get_db`` performs WAL setup / schema migration / legacy-jsonl import
@@ -36,80 +59,74 @@ Design invariants:
 
 from __future__ import annotations
 
-import math
 import statistics
 from datetime import UTC, datetime
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
-# Stopping-rule defaults.  These match docs/review-effort-experiment.md;
-# --min-prs-per-arm overrides the minimum for ad-hoc analysis, not the rule.
-DEFAULT_MIN_PRS_PER_ARM = 100
-# Equivalence bound: every arm at twice the minimum with a still-overlapping
-# outcome-difference interval ends the experiment as "no detectable
-# difference" rather than running forever.
-EQUIVALENCE_MULTIPLE = 2
-CONFIDENCE_Z = 1.96
-
-# The record_review decision vocabulary (verdict_parsing.py).
-_DECISIONS = ("approved", "request_changes", "blocked")
-
-# Event kinds naming a PR's merge completion (the report takes the earliest
-# timestamp across them).  `reconcile` is included but only counts when its
-# payload kind is `merged_outside_orchestrator`.
-_MERGE_EVENT_KINDS = frozenset(
-    {
-        "merge_succeeded",
-        "finalize_externally_merged",
-        "reconcile",
-    }
+from .experiment_report_intervals import (
+    CONFIDENCE_Z,  # noqa: F401  (deliberate re-export)
+    rate_difference_interval,
+    wilson_interval,  # noqa: F401  (deliberate re-export)
+)
+from .experiment_report_render import render_text  # noqa: F401  (deliberate re-export)
+from .experiment_report_scan import (
+    DECISIONS,
+    DISPATCH_EVENT_KINDS,
+    ESCALATED_SUFFIX,
+    MERGE_EVENT_KINDS,
+    NO_OUTCOME_STATEMENT,
+    NOT_DERIVABLE,
+    _dispatch_prs,
+    _iter_arm_observations,
+    _merge_prs,
+    _pr_of,
+)
+from .experiment_report_stopping import (
+    DEFAULT_MIN_PRS_PER_ARM,  # noqa: F401  (deliberate re-export)
+    EQUIVALENCE_MARGIN,  # noqa: F401  (deliberate re-export)
+    EQUIVALENCE_MULTIPLE,  # noqa: F401  (deliberate re-export)
+    MIN_EQUIVALENCE_EVENTS_PER_ARM,  # noqa: F401  (deliberate re-export)
+    evaluate_stopping_rule,  # noqa: F401  (deliberate re-export)
 )
 
-# Event kinds that timestamp a PR's entry into the pipeline, used as the
-# dispatch end of dispatch-to-merge latency: issue dispatch (payload
-# `issue_numbers`), review-launch (`launched`), and claim (`pr_numbers` /
-# assignment dicts).  The earliest across all of them is the dispatch time.
-_DISPATCH_EVENT_KINDS = frozenset(
-    {
-        "dispatch",
-        "review_dispatch",
-        "review_dispatch_claim",
-    }
-)
+# Post-approval signal classification -- see the taxonomy docstring in
+# experiment_report_scan.py for what each kind measures.  These sets live
+# in THIS module (the consumption site) rather than the vocabulary module
+# on purpose: tests/test_event_kind_consumers.py counts a kind as consumed
+# only when its literal sits in a read position resolvable within the same
+# file, and an imported-name comparison is invisible to that audit.
 
-# Post-approval defect signals: events that fire only after a PR has an
-# approved verdict, meaning the approval did not hold up.
-#   check_failure_rework_requested  -- required checks genuinely failed on
-#                                      the approved head (merge_ready path)
-#   cross_pr_revert_rework_requested -- the approved branch was found to
-#                                      silently revert a base commit
-_POST_APPROVAL_DEFECT_KINDS = frozenset(
+# Post-approval signals that measure review correctness -- the only kind
+# allowed into the outcome aggregate and the stopping rule.
+REVIEW_DEFECT_KINDS = frozenset(
     {
-        "check_failure_rework_requested",
         "cross_pr_revert_rework_requested",
     }
 )
 
-_ESCALATED_SUFFIX = "_escalated"
-
-# Outcome candidates the recorded event stream cannot produce today.  The
-# report states this explicitly rather than implying a conclusion from
-# activity metrics (issue #1701's contract).
-_NOT_DERIVABLE: tuple[dict[str, str], ...] = (
+# Post-approval signals that measure pipeline state, not review
+# correctness.  Reported as activity; never input to the stopping rule.
+PIPELINE_REWORK_KINDS = frozenset(
     {
-        "candidate": "post-merge main-branch CI failure attributed to the merged PR",
-        "reason": (
-            "no recorded event links a main-branch check failure after a merge "
-            "back to the PR that merged"
-        ),
-    },
-    {
-        "candidate": "follow-up fix or revert naming the merged PR",
-        "reason": (
-            "no recorded event attributes a later fix or revert commit/PR to a "
-            "previously merged PR"
-        ),
-    },
+        "check_failure_rework_requested",
+    }
 )
+
+POST_APPROVAL_SIGNAL_KINDS = REVIEW_DEFECT_KINDS | PIPELINE_REWORK_KINDS
+
+# A rework cycle that produced no content change relative to the last
+# request_changes verdict (janitor._check_no_op_rework consumer) -- a
+# rework-cycle measure, not a wrong-kickback measure.
+NO_OP_REWORK_KINDS = frozenset(
+    {
+        "no_op_rework_repair_requested",
+    }
+)
+
+# The outcome aggregate that feeds the stopping rule.  Kept as a named
+# constant so the rule's input is declared once; the metric itself counts
+# every kind in REVIEW_DEFECT_KINDS.
+STOPPING_RULE_OUTCOME_METRIC = "post_approval_defect_rate"
 
 
 def metrics_key_for_experiment(experiment: str) -> str:
@@ -175,156 +192,6 @@ def _in_window(
         if start <= ts <= end:
             return False
     return True
-
-
-# ---------------------------------------------------------------------------
-# Interval math
-# ---------------------------------------------------------------------------
-
-
-def wilson_interval(k: int, n: int, z: float = CONFIDENCE_Z) -> tuple[float, float] | None:
-    """Wilson score interval for a binomial rate; None when n == 0."""
-    if n <= 0:
-        return None
-    p = k / n
-    z2 = z * z
-    denom = 1.0 + z2 / n
-    centre = (p + z2 / (2 * n)) / denom
-    half = z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n)) / denom
-    return (max(0.0, centre - half), min(1.0, centre + half))
-
-
-def rate_difference_interval(
-    k1: int, n1: int, k2: int, n2: int, z: float = CONFIDENCE_Z
-) -> tuple[float, float] | None:
-    """Wald interval for the difference of two binomial rates (a - b).
-
-    The issue asks for "the difference between arms for each rate with an
-    interval"; a difference interval (unlike two CIs compared visually)
-    directly answers "is the gap distinguishable from zero".  Clamped to
-    [-1, 1]; None when either denominator is 0.
-    """
-    if n1 <= 0 or n2 <= 0:
-        return None
-    p1, p2 = k1 / n1, k2 / n2
-    diff = p1 - p2
-    half = z * math.sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
-    return (max(-1.0, diff - half), min(1.0, diff + half))
-
-
-# ---------------------------------------------------------------------------
-# Event scanning
-# ---------------------------------------------------------------------------
-
-
-def _pr_of(payload: Mapping[str, Any], event: Mapping[str, Any]) -> int | None:
-    """The PR an event refers to: payload pr_number, then the indexed column."""
-    for source in (payload, event):
-        raw = source.get("pr_number") or source.get("pr")
-        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-            return int(raw)
-    return None
-
-
-def _iter_arm_observations(
-    event: Mapping[str, Any], metrics_key: str
-) -> Iterable[tuple[int, str]]:
-    """Yield ``(pr_number, arm_value)`` pairs carrying the experiment key.
-
-    Three recorded shapes carry an arm value today, and the scan covers all
-    of them generically so future recorders do not need a code change here:
-
-    * ``payload["session_metrics"][key]`` -- per-round values inside
-      ``record_review`` (folded from PR state at verdict reap time).
-    * ``payload[key]`` -- a top-level arm field on any event.
-    * ``payload[*]`` lists of dicts containing the key -- claim-batch
-      shapes like ``review_effort_assignments: [{pr_number, <key>, ...}]``.
-    """
-    payload = event.get("payload")
-    if not isinstance(payload, dict):
-        return
-    session_metrics = payload.get("session_metrics")
-    if isinstance(session_metrics, dict) and metrics_key in session_metrics:
-        pr = _pr_of(payload, event)
-        value = session_metrics[metrics_key]
-        if pr is not None and isinstance(value, str) and value:
-            yield (pr, value)
-    if metrics_key in payload:
-        pr = _pr_of(payload, event)
-        value = payload[metrics_key]
-        if pr is not None and isinstance(value, str) and value:
-            yield (pr, value)
-    for value in payload.values():
-        if not isinstance(value, list):
-            continue
-        for item in value:
-            if not isinstance(item, dict) or metrics_key not in item:
-                continue
-            arm = item[metrics_key]
-            pr = item.get("pr_number") or item.get("pr")
-            if (
-                isinstance(pr, (int, float))
-                and not isinstance(pr, bool)
-                and isinstance(arm, str)
-                and arm
-            ):
-                yield (int(pr), arm)
-
-
-def _merge_prs(event: Mapping[str, Any]) -> set[int]:
-    """PRs this event marks as merged (empty for non-merge events)."""
-    if event["kind"] not in _MERGE_EVENT_KINDS:
-        return set()
-    payload = event.get("payload") or {}
-    if not isinstance(payload, dict):
-        return set()
-    if event["kind"] == "reconcile" and payload.get("kind") != "merged_outside_orchestrator":
-        return set()
-    prs: set[int] = set()
-    single = _pr_of(payload, event)
-    if single is not None:
-        prs.add(single)
-    for raw in payload.get("pr_numbers") or ():
-        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-            prs.add(int(raw))
-    return prs
-
-
-def _dispatch_prs(event: Mapping[str, Any], issue_to_prs: Mapping[int, set[int]]) -> set[int]:
-    """PRs this event marks as dispatched/launched.
-
-    ``dispatch`` names issues (resolved through the PR->issue map built
-    from record_review payloads); ``review_dispatch`` and
-    ``review_dispatch_claim`` name PRs directly.
-    """
-    payload = event.get("payload") or {}
-    if not isinstance(payload, dict):
-        return set()
-    prs: set[int] = set()
-    if event["kind"] == "dispatch":
-        for raw in payload.get("issue_numbers") or ():
-            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-                prs |= issue_to_prs.get(int(raw), set())
-        return prs
-    if event["kind"] == "review_dispatch":
-        for key in ("launched", "failed"):
-            for raw in payload.get(key) or ():
-                if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-                    prs.add(int(raw))
-        return prs
-    # review_dispatch_claim
-    for raw in payload.get("pr_numbers") or ():
-        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-            prs.add(int(raw))
-    for value in payload.values():
-        if not isinstance(value, list):
-            continue
-        for item in value:
-            if isinstance(item, dict):
-                pr = item.get("pr_number") or item.get("pr")
-                if isinstance(pr, (int, float)) and not isinstance(pr, bool):
-                    prs.add(int(pr))
-    return prs
 
 
 # ---------------------------------------------------------------------------
@@ -428,88 +295,22 @@ def _median_metric(
     return _metric(name, "activity", "median", description, per_arm)
 
 
-def _evaluate_stopping_rule(
-    arms: list[str],
-    prs_assigned: dict[str, int],
-    outcome_metric: dict[str, Any],
-    min_prs_per_arm: int,
-    z: float,
-) -> dict[str, Any]:
-    """The experiment's stopping rule, evaluated against this window's data.
+def _outcome_coverage(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Assemble the report's outcome-coverage section.
 
-    The rule (docs/review-effort-experiment.md):
-    * every arm needs >= ``min_prs_per_arm`` assigned PRs before anything is
-      decided;
-    * once that holds, a ``post_approval_defect_rate`` difference interval
-      that excludes 0 ends the experiment in favour of the lower-defect arm;
-    * every arm at >= 2x the minimum with all outcome intervals still
-      spanning 0 ends it as "no detectable difference";
-    * anything else -- including a one-arm or zero-arm report -- is
-      ``"not met"``.
+    ``derivable`` is derived from the metrics themselves (every metric
+    labelled ``outcome``), never enumerated -- a future outcome signal is
+    covered the moment it is recorded.  When the list is empty the section
+    carries the explicit ``statement`` the issue requires, and the
+    stopping rule reports ``not_met`` rather than implying a conclusion
+    from activity metrics.
     """
-    equivalence_min = EQUIVALENCE_MULTIPLE * min_prs_per_arm
-    rule: dict[str, Any] = {
-        "min_prs_per_arm": min_prs_per_arm,
-        "equivalence_min_prs_per_arm": equivalence_min,
-        "outcome_metric": outcome_metric["name"],
-        "confidence_z": z,
-        "post_experiment_config": "reviewer.effort_experiment_fraction: 0.0",
-        "met": False,
-        "verdict": "not_met",
-        "detail": "",
+    derivable = [name for name, m in metrics.items() if m["measure"] == "outcome"]
+    return {
+        "derivable": derivable,
+        "not_derivable": list(NOT_DERIVABLE),
+        "statement": None if derivable else NO_OUTCOME_STATEMENT,
     }
-    if len(arms) < 2:
-        rule["detail"] = f"fewer than two arms observed ({len(arms)}); nothing to compare"
-        return rule
-    short = {a: n for a, n in prs_assigned.items() if n < min_prs_per_arm}
-    if short:
-        detail = ", ".join(f'arm "{a}" has {n} assigned PRs' for a, n in sorted(short.items()))
-        rule["detail"] = f"minimum {min_prs_per_arm} assigned PRs per arm not reached: {detail}"
-        return rule
-    decided = [
-        d
-        for d in outcome_metric["differences"]
-        if d["ci95"] and (d["ci95"][0] > 0 or d["ci95"][1] < 0)
-    ]
-    if decided:
-        best = decided[0]
-        a, b = best["pair"]
-        # diff = rate_a - rate_b; a strictly positive interval means a is worse.
-        better = b if best["diff"] > 0 else a
-        worse = a if best["diff"] > 0 else b
-        rule.update(
-            met=True,
-            verdict="difference_detected",
-            detail=(
-                f'post_approval_defect_rate differs: arm "{better}" is lower '
-                f"(pair {a} vs {b}, diff {best['diff']:+.4f}, "
-                f"95% CI [{best['ci95'][0]:+.4f}, {best['ci95'][1]:+.4f}]). "
-                f'Adopt arm "{better}" (lower post-approval defect rate over '
-                f'arm "{worse}") and set reviewer.effort_experiment_fraction: 0.0.'
-            ),
-        )
-        return rule
-    all_pairs_intervalled = bool(outcome_metric["differences"]) and all(
-        d["ci95"] for d in outcome_metric["differences"]
-    )
-    if all(n >= equivalence_min for n in prs_assigned.values()) and all_pairs_intervalled:
-        rule.update(
-            met=True,
-            verdict="no_detectable_difference",
-            detail=(
-                f"every arm has >= {equivalence_min} assigned PRs and every "
-                "post_approval_defect_rate difference interval still spans 0. "
-                "End the experiment (effort_experiment_fraction: 0.0); pick "
-                "the arm with the lower review_cost_per_pr_usd_mean."
-            ),
-        )
-        return rule
-    rule["detail"] = (
-        "minimum per-arm N reached, but the outcome-metric difference "
-        "intervals still span 0 and the equivalence bound "
-        f"({equivalence_min} PRs/arm) is not reached -- keep running."
-    )
-    return rule
 
 
 def build_report(
@@ -559,22 +360,22 @@ def build_report(
                     and not isinstance(issue_raw, bool)
                 ):
                     issue_of[pr] = int(issue_raw)
-        elif e["kind"] in _MERGE_EVENT_KINDS:
+        elif e["kind"] in MERGE_EVENT_KINDS:
             for pr in _merge_prs(e):
                 merged_prs.add(pr)
                 if ts is not None and (pr not in merge_ts or ts < merge_ts[pr]):
                     merge_ts[pr] = ts
-        elif e["kind"] in _DISPATCH_EVENT_KINDS:
+        elif e["kind"] in DISPATCH_EVENT_KINDS:
             dispatch_events.append(e)
-        if e["kind"].endswith(_ESCALATED_SUFFIX):
+        if e["kind"].endswith(ESCALATED_SUFFIX):
             pr = _pr_of(payload, e)
             if pr is not None:
                 escalated_prs.add(pr)
-        if e["kind"] in _POST_APPROVAL_DEFECT_KINDS:
+        if e["kind"] in POST_APPROVAL_SIGNAL_KINDS:
             pr = _pr_of(payload, e)
             if pr is not None:
                 defect_events.setdefault(pr, set()).add(e["kind"])
-        if e["kind"] == "no_op_rework_repair_requested":
+        if e["kind"] in NO_OP_REWORK_KINDS:
             pr = _pr_of(payload, e)
             if pr is not None:
                 noop_kickback_prs.add(pr)
@@ -606,7 +407,7 @@ def build_report(
     # ---- per-arm raw tallies ----
     prs_assigned = {a: len(prs_by_arm[a]) for a in arms}
     prs_with_rounds = {a: sum(1 for p in prs_by_arm[a] if rounds.get(p)) for a in arms}
-    first_decision_k: dict[str, dict[str, int]] = {a: {d: 0 for d in _DECISIONS} for a in arms}
+    first_decision_k: dict[str, dict[str, int]] = {a: {d: 0 for d in DECISIONS} for a in arms}
     first_decision_other: dict[str, int] = {a: 0 for a in arms}
     rounds_per_pr: dict[str, list[float]] = {a: [] for a in arms}
     cost_per_pr: dict[str, list[float]] = {a: [] for a in arms}
@@ -616,9 +417,8 @@ def build_report(
     merged_k: dict[str, int] = {a: 0 for a in arms}
     d2m_seconds: dict[str, list[float]] = {a: [] for a in arms}
     approved_n: dict[str, int] = {a: 0 for a in arms}
-    defect_k: dict[str, dict[str, int]] = {
-        a: {kind: 0 for kind in sorted(_POST_APPROVAL_DEFECT_KINDS)} for a in arms
-    }
+    review_defect_k: dict[str, int] = {a: 0 for a in arms}
+    pipeline_rework_k: dict[str, int] = {a: 0 for a in arms}
     kickback_n: dict[str, int] = {a: 0 for a in arms}
     noop_k: dict[str, int] = {a: 0 for a in arms}
 
@@ -635,7 +435,7 @@ def build_report(
         rounds_per_pr[arm].append(float(len(pr_rounds)))
         decisions = [p.get("decision") for _, p in pr_rounds]
         first = decisions[0]
-        if first in _DECISIONS:
+        if first in DECISIONS:
             first_decision_k[arm][first] += 1
         else:
             first_decision_other[arm] += 1
@@ -651,7 +451,10 @@ def build_report(
         if "approved" in decisions:
             approved_n[arm] += 1
             for kind in defect_events.get(pr, ()):
-                defect_k[arm][kind] += 1
+                if kind in REVIEW_DEFECT_KINDS:
+                    review_defect_k[arm] += 1
+                elif kind in PIPELINE_REWORK_KINDS:
+                    pipeline_rework_k[arm] += 1
         if "request_changes" in decisions:
             kickback_n[arm] += 1
             if pr in noop_kickback_prs:
@@ -673,7 +476,7 @@ def build_report(
         "assigned PRs with at least one recorded review round",
         {a: {"n": prs_with_rounds[a], "value": prs_with_rounds[a]} for a in arms},
     )
-    for decision in _DECISIONS:
+    for decision in DECISIONS:
         metrics[f"first_round_{decision}_rate"] = _rate_metric(
             f"first_round_{decision}_rate",
             "activity",
@@ -728,25 +531,17 @@ def build_report(
         arms,
         d2m_seconds,
     )
-    defect_k_total = {a: sum(defect_k[a].values()) for a in arms}
     metrics["post_approval_defect_rate"] = _rate_metric(
         "post_approval_defect_rate",
         "outcome",
         "share of approved PRs later routed to rework by a post-approval "
-        "defect signal (check failure on the approved head, or a silent "
-        "base-commit revert in the branch)",
+        "review-correctness defect signal (cross_pr_revert_rework_requested: "
+        "the approved branch silently reverted a base commit) -- an approval "
+        "that did not hold up. check_failure_rework_requested is excluded "
+        "by construction: its rework brief keeps the approval standing, so "
+        "it measures pipeline state, not whether the review was right",
         arms,
-        defect_k_total,
-        approved_n,
-        z,
-    )
-    metrics["post_approval_ci_failure_rate"] = _rate_metric(
-        "post_approval_ci_failure_rate",
-        "outcome",
-        "share of approved PRs later routed to rework for genuinely failing "
-        "required checks (check_failure_rework_requested)",
-        arms,
-        {a: defect_k[a]["check_failure_rework_requested"] for a in arms},
+        review_defect_k,
         approved_n,
         z,
     )
@@ -754,18 +549,33 @@ def build_report(
         "post_approval_revert_bounce_rate",
         "outcome",
         "share of approved PRs later routed to rework for a silent "
-        "base-commit revert in the branch (cross_pr_revert_rework_requested)",
+        "base-commit revert in the branch (cross_pr_revert_rework_requested) "
+        "-- currently the whole of post_approval_defect_rate",
         arms,
-        {a: defect_k[a]["cross_pr_revert_rework_requested"] for a in arms},
+        review_defect_k,
+        approved_n,
+        z,
+    )
+    metrics["post_approval_ci_failure_rate"] = _rate_metric(
+        "post_approval_ci_failure_rate",
+        "activity",
+        "share of approved PRs later routed to rework for genuinely failing "
+        "required checks (check_failure_rework_requested) -- pipeline state, "
+        "not a review-correctness outcome: the rework brief keeps the "
+        "approval standing, so this never feeds the stopping rule",
+        arms,
+        pipeline_rework_k,
         approved_n,
         z,
     )
     metrics["no_op_kickback_rate"] = _rate_metric(
         "no_op_kickback_rate",
-        "outcome",
-        "share of request_changes PRs whose next rework produced no change "
-        "relative to the verdict (no_op_rework_repair_requested) -- a "
-        "kickback that found nothing real to fix",
+        "activity",
+        "share of request_changes PRs whose next rework cycle produced no "
+        "content change relative to the verdict "
+        "(no_op_rework_repair_requested) -- an empty or stalled rework cycle "
+        "(unpushed commits, a dead session, or nothing left to change), not "
+        "evidence the kickback itself was wrong",
         arms,
         noop_k,
         kickback_n,
@@ -785,16 +595,11 @@ def build_report(
     ]
     unassigned_with_rounds = sum(1 for pr in rounds if pr not in arm_obs and pr not in conflicted)
 
-    derivable = [
-        "post_approval_defect_rate",
-        "post_approval_ci_failure_rate",
-        "post_approval_revert_bounce_rate",
-        "no_op_kickback_rate",
-    ]
-    stopping = _evaluate_stopping_rule(
+    coverage = _outcome_coverage(metrics)
+    stopping = evaluate_stopping_rule(
         arms,
         prs_assigned,
-        metrics["post_approval_defect_rate"],
+        metrics[STOPPING_RULE_OUTCOME_METRIC] if coverage["derivable"] else None,
         min_prs_per_arm,
         z,
     )
@@ -812,7 +617,7 @@ def build_report(
             a: {
                 "prs_assigned": prs_assigned[a],
                 "prs_with_rounds": prs_with_rounds[a],
-                "first_round_decisions": {d: first_decision_k[a][d] for d in _DECISIONS},
+                "first_round_decisions": {d: first_decision_k[a][d] for d in DECISIONS},
                 "first_round_other_decisions": first_decision_other[a],
             }
             for a in arms
@@ -820,127 +625,6 @@ def build_report(
         "metrics": metrics,
         "data_integrity_warnings": warnings,
         "prs_with_rounds_without_arm_value": unassigned_with_rounds,
-        "outcome_coverage": {
-            "derivable": derivable,
-            "not_derivable": list(_NOT_DERIVABLE),
-        },
+        "outcome_coverage": coverage,
         "stopping_rule": stopping,
     }
-
-
-# ---------------------------------------------------------------------------
-# Text rendering
-# ---------------------------------------------------------------------------
-
-
-def _fmt_rate(entry: Mapping[str, Any]) -> str:
-    if entry["n"] == 0 or entry["rate"] is None:
-        return f"0/{entry['n']} = n/a (no PRs in denominator)"
-    ci = entry["ci95"]
-    ci_s = f"  95% CI [{ci[0]:.3f}, {ci[1]:.3f}]" if ci else ""
-    return f"{entry['k']}/{entry['n']} = {entry['rate']:.3f}{ci_s}"
-
-
-def _fmt_value(entry: Mapping[str, Any]) -> str:
-    if entry["value"] is None:
-        return f"n/a (n={entry['n']})"
-    return f"{entry['value']:.3f} (n={entry['n']})"
-
-
-def render_text(report: Mapping[str, Any]) -> str:
-    """Render the report dict as the command's human-readable output."""
-    lines: list[str] = []
-    w = report["window"]
-    window_bits = []
-    if w["since"]:
-        window_bits.append(f"since={w['since']}")
-    if w["until"]:
-        window_bits.append(f"until={w['until']}")
-    for s, e in w["exclude_windows"]:
-        window_bits.append(f"exclude=[{s} .. {e}]")
-    lines.append(
-        f'experiment report: session-metrics key "{report["metrics_key"]}" '
-        "(read-only; no state was modified)"
-    )
-    lines.append(
-        f"window: {', '.join(window_bits) if window_bits else 'unfiltered'}; "
-        f"events scanned: {report['events_scanned']}"
-    )
-    if report.get("events_db"):
-        lines.append(f"source: {report['events_db']}")
-    lines.append(
-        "unit of analysis: the PR (arm assignment is stable per PR across "
-        "rounds; rates count each PR once)"
-    )
-    if not report["arms"]:
-        lines.append(
-            f'NO DATA: no PR carries a "{report["metrics_key"]}" value in the scanned window.'
-        )
-    for arm in report["arms"]:
-        pa = report["per_arm"][arm]
-        lines.append(
-            f'arm "{arm}": {pa["prs_assigned"]} assigned, '
-            f"{pa['prs_with_rounds']} with recorded rounds"
-        )
-    lines.append("")
-    lines.append("metrics:")
-    for name, m in report["metrics"].items():
-        lines.append(f"  {name} [{m['measure']}]")
-        lines.append(f"    {m['description']}")
-        for arm in report["arms"]:
-            entry = m["per_arm"].get(arm)
-            if entry is None:
-                continue
-            if m["kind"] == "rate":
-                rendered = _fmt_rate(entry)
-            elif m["kind"] == "count":
-                rendered = str(entry["n"])
-            else:
-                rendered = _fmt_value(entry)
-            extra = ""
-            if name == "review_cost_per_pr_usd_mean" and "rounds_total" in entry:
-                extra = (
-                    f"  (cost data on {entry['rounds_with_cost']}/{entry['rounds_total']} rounds)"
-                )
-            lines.append(f"    {arm}: {rendered}{extra}")
-        for d in m["differences"]:
-            a, b = d["pair"]
-            lines.append(
-                f"    diff {a} - {b} = {d['diff']:+.4f}  "
-                f"95% CI [{d['ci95'][0]:+.4f}, {d['ci95'][1]:+.4f}]"
-            )
-    lines.append("")
-    lines.append("outcome coverage:")
-    lines.append(
-        "  derivable and reported above: " + ", ".join(report["outcome_coverage"]["derivable"])
-    )
-    for item in report["outcome_coverage"]["not_derivable"]:
-        lines.append(
-            f"  NOT derivable from recorded events: {item['candidate']} ({item['reason']})"
-        )
-    warnings = report["data_integrity_warnings"]
-    if warnings or report["prs_with_rounds_without_arm_value"]:
-        lines.append("")
-        lines.append("data integrity:")
-        for wrn in warnings:
-            lines.append(f"  PR #{wrn['pr']}: {wrn['detail']}")
-        n = report["prs_with_rounds_without_arm_value"]
-        if n:
-            lines.append(
-                f"  {n} PR(s) with recorded rounds carried no "
-                f'"{report["metrics_key"]}" value (outside the experiment)'
-            )
-    lines.append("")
-    rule = report["stopping_rule"]
-    status = "MET" if rule["met"] else "NOT MET"
-    lines.append(f"stopping rule: {status} ({rule['verdict']})")
-    lines.append(
-        f"  min PRs/arm: {rule['min_prs_per_arm']} "
-        f"(equivalence bound: {rule['equivalence_min_prs_per_arm']}/arm); "
-        f"outcome metric: {rule['outcome_metric']}"
-    )
-    lines.append(f"  {rule['detail']}")
-    lines.append(
-        f"  when met: set {rule['post_experiment_config']} (docs/review-effort-experiment.md)"
-    )
-    return "\n".join(lines)

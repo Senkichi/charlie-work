@@ -73,10 +73,11 @@ Window flags (all inclusive, ISO-8601; naive values read as UTC):
 
 Every metric carries a `measure` label:
 
-* **activity** — what the arms *did*: first-round decision distribution,
-  rounds per PR, review cost per PR, escalation share, merge share,
-  dispatch-to-merge latency. Activity differences are descriptive only;
-  they cannot decide the experiment.
+* **activity** — what the arms *did* or what happened to their PRs:
+  first-round decision distribution, rounds per PR, review cost per PR,
+  escalation share, merge share, dispatch-to-merge latency, and the
+  post-approval *pipeline* signals below. Activity differences are
+  descriptive only; they cannot decide the experiment.
 * **outcome** — whether the review was *right*. These are the only metrics
   allowed to drive the stopping rule.
 
@@ -90,14 +91,17 @@ Every metric carries a `measure` label:
 | `escalation_rate` | activity | share of assigned PRs named by any `*_escalated` event |
 | `merge_rate` | activity | share of assigned PRs reaching a merge event |
 | `dispatch_to_merge_seconds_median` | activity | median dispatch→merge latency over merged PRs |
-| `post_approval_defect_rate` | **outcome** | share of approved PRs later routed to rework by a post-approval defect signal (`check_failure_rework_requested`: required checks genuinely failed on the approved head; `cross_pr_revert_rework_requested`: the approved branch silently reverted a base commit) — an approval that did not hold up |
-| `post_approval_ci_failure_rate` | outcome | the check-failure component alone |
-| `post_approval_revert_bounce_rate` | outcome | the silent-revert component alone |
-| `no_op_kickback_rate` | outcome | share of `request_changes` PRs whose next rework produced no change (`no_op_rework_repair_requested`) — a kickback that found nothing real to fix |
+| `post_approval_defect_rate` | **outcome** | share of approved PRs later routed to rework by a post-approval **review-correctness** defect signal — an approval that did not hold up. Today the only derivable such signal is `cross_pr_revert_rework_requested` (the approved branch silently reverted a base commit). `check_failure_rework_requested` is excluded by construction: its rework brief keeps the approval standing ("do not re-litigate the review"), so it cannot measure review correctness |
+| `post_approval_revert_bounce_rate` | outcome | the silent-revert component alone — currently the whole of `post_approval_defect_rate` |
+| `post_approval_ci_failure_rate` | activity | share of approved PRs later routed to rework for genuinely failing required checks (`check_failure_rework_requested`). Pipeline state, **not** a review-correctness outcome — the emitter's own brief says the approval stands — so it never feeds the stopping rule |
+| `no_op_kickback_rate` | activity | share of `request_changes` PRs whose next rework cycle produced **no content change** relative to the verdict (`no_op_rework_repair_requested`). That is what the emitter measures — an empty or stalled rework cycle (unpushed commits, a dead session, or nothing left to change) — **not** that the kickback was wrong |
 
-Each rate is reported with a 95% Wilson interval per arm and a pairwise
-difference interval per arm pair; `n` is always shown so a wide interval
-on a thin sample is visible, not hidden.
+Each rate is reported with a 95% Wilson interval per arm and a Newcombe
+hybrid-score difference interval per arm pair; `n` is always shown so a
+wide interval on a thin sample is visible, not hidden. The difference
+interval cannot collapse to `[0, 0]` at zero observed events (unlike the
+Wald approximation), so a no-evidence window reads as "unbounded", never
+as a degenerate point estimate of equivalence.
 
 ### Outcome coverage caveat
 
@@ -110,23 +114,41 @@ conclusion from activity metrics:
 * a follow-up fix or revert naming the merged PR — no event attributes a
   later fix/revert to a previously merged PR.
 
+Issue **#1717** tracks adding the missing recording (a post-merge
+attribution event such as a main-CI failure or a follow-up fix/revert
+naming the merged PR). The issue's contract applies transitively: if the
+remaining outcome set ever empties, the report emits the explicit "no
+outcome metric is derivable" statement and the stopping rule stays
+`not_met` — it cannot be met on activity metrics alone.
+
 ## Stopping rule
 
 Evaluated by `experiment-report` against the scanned window; defaults are
 `DEFAULT_MIN_PRS_PER_ARM = 100`, equivalence bound `= 2 × minimum`,
-`CONFIDENCE_Z = 1.96` (`src/charlie_work/experiment_report.py`).
+equivalence margin `EQUIVALENCE_MARGIN = 0.05`, minimum observed outcome
+events per arm `MIN_EQUIVALENCE_EVENTS_PER_ARM = 1`, `CONFIDENCE_Z = 1.96`
+(`src/charlie_work/experiment_report_stopping.py`).
 
 1. **Minimum N.** Every arm needs **≥ 100 assigned PRs** before anything
    is decided. Below that the rule reports `not met` — including a report
-   with fewer than two arms.
+   with fewer than two arms, and any report where no outcome metric is
+   derivable.
 2. **Difference detected.** Once the minimum holds, if the
    `post_approval_defect_rate` difference interval between any arm pair
    excludes 0, the experiment ends in favour of the lower-defect arm.
-3. **No detectable difference.** Every arm at **≥ 200 assigned PRs** with
-   all `post_approval_defect_rate` difference intervals still spanning 0
-   ends the experiment as inconclusive-by-equivalence.
-4. **Otherwise keep running** — the minimum is met but the outcome
-   intervals still span 0 and the equivalence bound is not reached.
+3. **No detectable difference.** Every arm at **≥ 200 assigned PRs** ends
+   the experiment as inconclusive-by-equivalence **only when both** hold:
+   * every pairwise `post_approval_defect_rate` difference interval lies
+     entirely inside the stated equivalence margin **±0.05** — a positive
+     claim that any remaining gap is too small to matter, not merely
+     "the interval spans 0"; and
+   * every arm observed **≥ 1 outcome event** — with zero outcome events
+     the intervals cannot distinguish "the arms are equivalent" from "the
+     outcome channel never fires in this pipeline". Below that floor the
+     rule reports `not_met` (underpowered), never equivalence.
+4. **Otherwise keep running** — the minimum is met but the difference
+   intervals are not decisive, or the equivalence bound/margin/event
+   floor is not reached.
 
 ### What the configuration becomes afterward
 
