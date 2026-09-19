@@ -246,21 +246,6 @@
    "boundary": 41.0,
    "bumps": [
     {
-     "ack": "#1486",
-     "actor": "worker",
-     "reason": "growth from PR #1486; operator decision 2026-09-02, issue 1458",
-     "to": 100
-    }
-   ],
-   "file": "tests/test_supervise.py",
-   "identity": "tests/test_supervise.py::module",
-   "kind": "test_module",
-   "member_count": 99
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
      "ack": "#1449",
      "actor": "worker",
      "reason": "growth from PRs #1449 #1412; operator decision 2026-09-02, issue 1458",
