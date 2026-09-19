@@ -85,7 +85,7 @@ logger = logging.getLogger(__name__)
 # ``github_capabilities/__init__.py`` and re-imported into ``github.py``
 # (nothing there uses them directly anymore now that ``validate_field_lists``
 # moved to ``transport.py`` in L09, but ``doctor.py``/``test_github.py``/
-# ``test_janitor.py`` still read them via
+# ``test_janitor_verdict.py`` still read them via
 # ``charlie_work.github.PR_LIST_FIELDS``/``PR_VIEW_FIELDS``) and directly into
 # ``transport.py`` (Track 2, issue #1593; design doc Section 5, L09), which
 # imports them from here rather than re-deriving a second copy -- the same

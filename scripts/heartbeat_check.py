@@ -608,9 +608,10 @@ def save_state(state: dict[str, Any]) -> None:
 #   - charlie_work.layout.worktrees_dir(state_root) -> state_root / "worktrees"
 #   - charlie_work.worktree._slugify(branch)
 #   - charlie_work.worktree.worktree_path_for_branch(root, branch, worktrees_dir)
-# If those ever diverge, tests/test_heartbeat_check.py's worktree-mtime tests
-# will catch it (they build the worktree dir the same way the orchestrator
-# does, via the same slugify, so a slug mismatch surfaces as a missing dir).
+# If those ever diverge, tests/test_heartbeat_check_in_progress_stale.py's
+# worktree-mtime tests will catch it (they build the worktree dir the same
+# way the orchestrator does, via the same slugify, so a slug mismatch
+# surfaces as a missing dir).
 
 
 def _slugify_branch(branch: str) -> str:
@@ -619,9 +620,9 @@ def _slugify_branch(branch: str) -> str:
     The production function lives in ``charlie_work.worktree``; this script
     cannot import it (stdlib-only invariant, scripts/README.md). The two must
     agree so the worktree path derived here matches the one the orchestrator
-    created. ``tests/test_heartbeat_check.py`` exercises the same derivation
-    against real branch names, so a drift surfaces as a missing-dir test
-    failure rather than a silent false ANOMALY.
+    created. ``tests/test_heartbeat_check_in_progress_stale.py`` exercises
+    the same derivation against real branch names, so a drift surfaces as a
+    missing-dir test failure rather than a silent false ANOMALY.
     """
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", branch).strip("-")
     slug = re.sub(r"-+", "-", slug)
