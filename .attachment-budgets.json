@@ -233,21 +233,6 @@
    "boundary": 41.0,
    "bumps": [
     {
-     "ack": "#1426",
-     "actor": "worker",
-     "reason": "pre-freeze artifact: PR #1426, not shadow-week accretion; operator decision 2026-09-02, issue 1458",
-     "to": 59
-    }
-   ],
-   "file": "tests/test_worker_health.py",
-   "identity": "tests/test_worker_health.py::module",
-   "kind": "test_module",
-   "member_count": 55
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
      "ack": "#1409",
      "actor": "worker",
      "reason": "growth from PR #1409 + identifier scrub; operator decision 2026-09-02, issue 1458",
