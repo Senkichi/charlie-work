@@ -41,6 +41,14 @@
    "member_count": 55
   },
   {
+   "boundary": 32.0,
+   "bumps": [],
+   "file": "tests/test_backlog_reachability.py",
+   "identity": "tests/test_backlog_reachability.py::module",
+   "kind": "test_module",
+   "member_count": 33
+  },
+  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_charlie_work.py",
@@ -70,6 +78,14 @@
    "identity": "tests/test_citation_check.py::module",
    "kind": "test_module",
    "member_count": 37
+  },
+  {
+   "boundary": 32.0,
+   "bumps": [],
+   "file": "tests/test_closing_reference.py",
+   "identity": "tests/test_closing_reference.py::module",
+   "kind": "test_module",
+   "member_count": 33
   },
   {
    "boundary": 41.0,
@@ -126,6 +142,14 @@
    "identity": "tests/test_githublike_protocol.py::module",
    "kind": "test_module",
    "member_count": 42
+  },
+  {
+   "boundary": 32.0,
+   "bumps": [],
+   "file": "tests/test_instrumentation.py",
+   "identity": "tests/test_instrumentation.py::module",
+   "kind": "test_module",
+   "member_count": 34
   },
   {
    "boundary": 34.5,
@@ -213,21 +237,6 @@
    "identity": "tests/test_wedge_watchdog.py::module",
    "kind": "test_module",
    "member_count": 36
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1449",
-     "actor": "worker",
-     "reason": "growth from PRs #1449 #1412; operator decision 2026-09-02, issue 1458",
-     "to": 52
-    }
-   ],
-   "file": "tests/test_worker.py",
-   "identity": "tests/test_worker.py::module",
-   "kind": "test_module",
-   "member_count": 48
   },
   {
    "boundary": 41.0,
