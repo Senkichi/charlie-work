@@ -136,21 +136,6 @@
    "member_count": 37
   },
   {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1420",
-     "actor": "worker",
-     "reason": "pre-freeze artifact: PR #1420 merged 08-24, baseline frozen 08-25 stale, not shadow-week accretion; operator decision 2026-09-02, issue 1458",
-     "to": 84
-    }
-   ],
-   "file": "tests/test_merge_preflight_hook.py",
-   "identity": "tests/test_merge_preflight_hook.py::module",
-   "kind": "test_module",
-   "member_count": 54
-  },
-  {
    "boundary": 37.0,
    "bumps": [],
    "file": "tests/test_private_slug_gate.py",
