@@ -89,10 +89,9 @@ Every metric carries a `measure` label:
 | `rounds_per_pr_mean` | activity | mean recorded rounds per reviewed PR |
 | `review_cost_per_pr_usd_mean` | activity | mean total `session_metrics.cost_usd` per reviewed PR |
 | `escalation_rate` | activity | share of assigned PRs named by any `*_escalated` event |
-| `merge_rate` | activity | share of assigned PRs reaching a merge event |
-| `dispatch_to_merge_seconds_median` | activity | median dispatch→merge latency over merged PRs |
+| `merge_rate` | activity | share of assigned PRs recorded merged — `state.json` `prs[n].status == "merged"` unioned with merge events. The merge-event vocabulary alone is **not** the merge rate: most merges land via the Aviator merge queue, which emits no `merge_succeeded`, so events alone counted under half of state-merged PRs on the live fleet. The report prints a `merge coverage` line — merge events observed for X of Y state-merged PRs — so the size of the event blind spot is always visible |
+| `dispatch_to_merge_seconds_median` | activity | median dispatch→merge latency over merged assigned PRs with a dispatch timestamp; the merge timestamp is the earliest of the state's `merged_at` and any merge event |
 | `post_approval_defect_rate` | **outcome** | share of approved PRs later routed to rework by a post-approval **review-correctness** defect signal — an approval that did not hold up. Today the only derivable such signal is `cross_pr_revert_rework_requested` (the approved branch silently reverted a base commit). `check_failure_rework_requested` is excluded by construction: its rework brief keeps the approval standing ("do not re-litigate the review"), so it cannot measure review correctness |
-| `post_approval_revert_bounce_rate` | outcome | the silent-revert component alone — currently the whole of `post_approval_defect_rate` |
 | `post_approval_ci_failure_rate` | activity | share of approved PRs later routed to rework for genuinely failing required checks (`check_failure_rework_requested`). Pipeline state, **not** a review-correctness outcome — the emitter's own brief says the approval stands — so it never feeds the stopping rule |
 | `no_op_kickback_rate` | activity | share of `request_changes` PRs whose next rework cycle produced **no content change** relative to the verdict (`no_op_rework_repair_requested`). That is what the emitter measures — an empty or stalled rework cycle (unpushed commits, a dead session, or nothing left to change) — **not** that the kickback was wrong |
 
@@ -121,6 +120,17 @@ remaining outcome set ever empties, the report emits the explicit "no
 outcome metric is derivable" statement and the stopping rule stays
 `not_met` — it cannot be met on activity metrics alone.
 
+**"Derivable" means the emitter exists — not that events were observed.**
+The report prints the observed outcome-event count per arm next to the
+derivable list for exactly this reason: on the live fleet the sole outcome
+signal (`cross_pr_revert_rework_requested`) had **zero** recorded events,
+which is indistinguishable from a dead outcome channel. With no outcome
+events observed the stopping rule stays `not_met` regardless of PR counts
+— it reports "cannot conclude" (a channel-liveness problem to
+investigate), never "keep running" toward a bound at which the interval
+math still cannot decide. Until #1717 lands, the experiment's only exit is
+the operational-end path in *Inconclusive results* below.
+
 ## Stopping rule
 
 Evaluated by `experiment-report` against the scanned window; defaults are
@@ -132,11 +142,18 @@ events per arm `MIN_EQUIVALENCE_EVENTS_PER_ARM = 1`, `CONFIDENCE_Z = 1.96`
 1. **Minimum N.** Every arm needs **≥ 100 assigned PRs** before anything
    is decided. Below that the rule reports `not met` — including a report
    with fewer than two arms, and any report where no outcome metric is
-   derivable.
+   derivable. Once the minimum holds, the rule's detail reports the
+   observed outcome-event count per arm.
 2. **Difference detected.** Once the minimum holds, if the
    `post_approval_defect_rate` difference interval between any arm pair
    excludes 0, the experiment ends in favour of the lower-defect arm.
-3. **No detectable difference.** Every arm at **≥ 200 assigned PRs** ends
+3. **Zero observed outcome events — cannot conclude.** Once the minimum
+   holds, any arm with **0 observed outcome events** leaves the rule
+   `not_met` with an explicit "cannot conclude" detail: zero events cannot
+   distinguish equivalent arms from a dead outcome channel, so this is a
+   channel-liveness problem to investigate, not progress toward the
+   equivalence bound.
+4. **No detectable difference.** Every arm at **≥ 200 assigned PRs** ends
    the experiment as inconclusive-by-equivalence **only when both** hold:
    * every pairwise `post_approval_defect_rate` difference interval lies
      entirely inside the stated equivalence margin **±0.05** — a positive
@@ -146,9 +163,9 @@ events per arm `MIN_EQUIVALENCE_EVENTS_PER_ARM = 1`, `CONFIDENCE_Z = 1.96`
      the intervals cannot distinguish "the arms are equivalent" from "the
      outcome channel never fires in this pipeline". Below that floor the
      rule reports `not_met` (underpowered), never equivalence.
-4. **Otherwise keep running** — the minimum is met but the difference
-   intervals are not decisive, or the equivalence bound/margin/event
-   floor is not reached.
+5. **Otherwise keep running** — the minimum is met, every arm has observed
+   outcome events, but the difference intervals are not decisive and the
+   equivalence bound/margin is not reached.
 
 ### What the configuration becomes afterward
 

@@ -54,8 +54,16 @@ def evaluate_stopping_rule(
     The rule (docs/review-effort-experiment.md):
     * every arm needs >= ``min_prs_per_arm`` assigned PRs before anything is
       decided;
-    * once that holds, an outcome-difference interval that excludes 0 ends
-      the experiment in favour of the lower-defect arm;
+    * once that holds, the observed outcome-event count per arm is reported
+      on the rule (``outcome_events_per_arm``) -- the channel's liveness is
+      visible immediately, not only at the equivalence bound;
+    * an outcome-difference interval that excludes 0 ends the experiment in
+      favour of the lower-defect arm;
+    * any arm at zero observed outcome events makes the rule ``not_met``
+      with an explicit "cannot conclude" detail -- zero events cannot
+      distinguish equivalent arms from a dead outcome channel, so this is
+      reported as a channel-liveness problem, not as "keep running" toward
+      a bound the rule cannot conclude at;
     * every arm at >= ``EQUIVALENCE_MULTIPLE`` x the minimum ends it as
       "no detectable difference" only when every pairwise difference
       interval sits entirely inside +/- ``EQUIVALENCE_MARGIN`` AND every
@@ -96,6 +104,21 @@ def evaluate_stopping_rule(
         detail = ", ".join(f'arm "{a}" has {n} assigned PRs' for a, n in sorted(short.items()))
         rule["detail"] = f"minimum {min_prs_per_arm} assigned PRs per arm not reached: {detail}"
         return rule
+    # From here the minimum PR count holds: surface the outcome channel's
+    # liveness immediately (counts of observed outcome events per arm), not
+    # only once the equivalence bound is reached.  observed_events_per_arm
+    # carries raw event counts when build_report supplies them; the metric's
+    # per-arm k (PRs flagged) is the fallback for hand-built metrics.
+    per_arm_entries = outcome_metric.get("per_arm") or {}
+    observed = outcome_metric.get("observed_events_per_arm") or {}
+    events_per_arm: dict[str, int] = {}
+    for a in arms:
+        k = observed.get(a)
+        if not isinstance(k, int) or isinstance(k, bool):
+            k = (per_arm_entries.get(a) or {}).get("k")
+        events_per_arm[a] = k if isinstance(k, int) and not isinstance(k, bool) else 0
+    rule["outcome_events_per_arm"] = events_per_arm
+    counts = ", ".join(f"{a}={events_per_arm[a]}" for a in arms)
     decided = [
         d
         for d in outcome_metric["differences"]
@@ -119,32 +142,26 @@ def evaluate_stopping_rule(
             ),
         )
         return rule
+    starved = sorted(a for a, k in events_per_arm.items() if k < MIN_EQUIVALENCE_EVENTS_PER_ARM)
+    if starved:
+        named = ", ".join(f'"{a}"' for a in starved)
+        rule["detail"] = (
+            f"zero outcome events were observed for arm(s) {named} "
+            f"(observed outcome events per arm: {counts}); the rule is "
+            "underpowered and cannot conclude until every arm observes at "
+            f"least {MIN_EQUIVALENCE_EVENTS_PER_ARM} outcome event(s) -- "
+            "an arm with zero observed outcome events cannot be told apart "
+            "from a dead outcome channel, so this is a channel-liveness "
+            "problem to investigate, not progress toward the equivalence "
+            "bound."
+        )
+        return rule
     if not all(n >= equivalence_min for n in prs_assigned.values()):
         rule["detail"] = (
             "minimum per-arm N reached, but the outcome-metric difference "
             "intervals are not yet decisive and the equivalence bound "
-            f"({equivalence_min} PRs/arm) is not reached -- keep running."
-        )
-        return rule
-    # Equivalence bound reached: equivalence needs both a positive margin
-    # claim and a minimum of observed outcome evidence.
-    events_per_arm = {a: (outcome_metric["per_arm"].get(a) or {}).get("k") for a in arms}
-    starved = {
-        a: k
-        for a, k in events_per_arm.items()
-        if not isinstance(k, int) or k < MIN_EQUIVALENCE_EVENTS_PER_ARM
-    }
-    if starved:
-        detail = ", ".join(
-            f'arm "{a}" observed {k if isinstance(k, int) else 0} outcome events'
-            for a, k in sorted(starved.items())
-        )
-        rule["detail"] = (
-            f"equivalence bound ({equivalence_min} PRs/arm) reached but the "
-            f"rule is underpowered: {detail} -- every arm must observe at "
-            f"least {MIN_EQUIVALENCE_EVENTS_PER_ARM} outcome event(s) before "
-            "the intervals can distinguish equivalent arms from a dead "
-            "outcome channel -- keep running."
+            f"({equivalence_min} PRs/arm) is not reached (observed outcome "
+            f"events per arm: {counts}) -- keep running."
         )
         return rule
     all_pairs_intervalled = bool(outcome_metric["differences"]) and all(

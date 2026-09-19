@@ -3,8 +3,11 @@
 Covers the issue's acceptance criteria: PR-level unit of analysis (never
 round-level inflation), arm values derived from the session-metrics key
 with conflict detection, the date-window flags, activity/outcome metric
-labelling, the documented stopping rule, read-only behaviour (byte-identical
-``events.db``/``state.json``), and the docs that carry the stopping rule.
+labelling, the documented stopping rule, state.json merge coverage, the
+outcome channel's observed-event liveness, and the docs that carry the
+stopping rule.  The CLI-driving tests live in
+``test_experiment_report_cli.py`` (split under the 800-line cap, issue
+#1442); shared fixtures in ``_experiment_report_fixtures.py``.
 """
 
 from __future__ import annotations
@@ -14,8 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from _cli_fixtures import _FakeGitHub, _make_repo
-from charlie_work import cli, instrumentation
+from _experiment_report_fixtures import KEY, _evt, _round
 from charlie_work.experiment_report import (
     CONFIDENCE_Z,
     EQUIVALENCE_MARGIN,
@@ -27,37 +29,6 @@ from charlie_work.experiment_report import (
     render_text,
     wilson_interval,
 )
-
-KEY = "review_effort_arm"
-
-
-def _evt(ts: str, kind: str, payload: dict) -> dict:
-    return {
-        "ts": ts,
-        "kind": kind,
-        "payload": payload,
-        "pr_number": payload.get("pr_number"),
-        "issue_number": payload.get("issue_number"),
-        "repo": None,
-        "correlation_id": None,
-        "level": "info",
-    }
-
-
-def _round(pr: int, decision: str, arm: str, *, ts: str, cost=None, issue: int = 1) -> dict:
-    sm: dict = {KEY: arm}
-    if cost is not None:
-        sm["cost_usd"] = cost
-    return _evt(
-        ts,
-        "record_review",
-        {
-            "pr_number": pr,
-            "issue_number": issue,
-            "decision": decision,
-            "session_metrics": sm,
-        },
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +165,69 @@ def test_cost_rounds_escalation_merge_and_latency() -> None:
     assert d2m["n"] == 1 and d2m["value"] == pytest.approx(259200.0)
 
 
+def test_state_merged_pr_without_merge_event_counts() -> None:
+    """Regression (PR #1714 round-2 review): a PR that state.json marks
+    merged but that has no merge event must still count in merge_rate and
+    dispatch_to_merge.  On the live fleet most merges land via Aviator and
+    emit no event, so the event vocabulary alone reported ~43% against
+    state.json's ~96%."""
+    events = [
+        _evt("2026-08-01T00:00:00Z", "dispatch", {"issue_numbers": [1]}),
+        _round(50, "approved", "x", ts="2026-08-02T00:00:00Z", issue=1),
+        _round(51, "approved", "x", ts="2026-08-02T00:00:00Z", issue=2),
+    ]
+    state_prs = {
+        50: {"status": "merged", "merged_at": "2026-08-04T00:00:00Z"},
+        51: {"status": "open"},
+    }
+    report = build_report(events, KEY, state_prs=state_prs, min_prs_per_arm=1)
+    m = report["metrics"]["merge_rate"]["per_arm"]["x"]
+    assert m["k"] == 1 and m["n"] == 2
+    d2m = report["metrics"]["dispatch_to_merge_seconds_median"]["per_arm"]["x"]
+    # dispatch 08-01T00:00 -> state merged_at 08-04T00:00 = 72h
+    assert d2m["n"] == 1 and d2m["value"] == pytest.approx(259200.0)
+    cov = report["merge_coverage"]
+    assert cov["state_prs"] == "available"
+    c = cov["per_arm"]["x"]
+    assert c["merged_total"] == 1
+    assert c["state_merged"] == 1
+    assert c["state_merged_event_observed"] == 0
+    text = render_text(report)
+    assert "merge events observed for 0 of 1 state-merged PRs" in text
+    # without the state snapshot the same events show the old undercount,
+    # and the coverage line says so explicitly instead of implying a rate
+    event_only = build_report(events, KEY, min_prs_per_arm=1)
+    assert event_only["metrics"]["merge_rate"]["per_arm"]["x"]["k"] == 0
+    assert event_only["merge_coverage"]["state_prs"] == "unavailable"
+    assert "merge events only" in render_text(event_only)
+
+
+def test_event_merged_pr_counts_when_state_agrees_or_not() -> None:
+    """An event-observed merge counts even when state.json disagrees (or
+    the PR is absent): the merged set is a union, and merge_coverage
+    splits state-confirmed from event-only merges."""
+    events = [
+        _round(52, "approved", "x", ts="2026-08-02T00:00:00Z"),
+        _round(53, "approved", "x", ts="2026-08-02T00:00:00Z"),
+        _evt(
+            "2026-08-04T00:00:00Z",
+            "merge_succeeded",
+            {"pr_number": 52, "issue_number": 1},
+        ),
+    ]
+    state_prs = {
+        52: {"status": "merged", "merged_at": "2026-08-04T00:00:00Z"},
+        53: {"status": "merged", "merged_at": "2026-08-05T00:00:00Z"},
+    }
+    report = build_report(events, KEY, state_prs=state_prs, min_prs_per_arm=1)
+    c = report["merge_coverage"]["per_arm"]["x"]
+    # 52 merged by both sources; 53 merged by state only (no event)
+    assert c["merged_total"] == 2
+    assert c["state_merged"] == 2
+    assert c["state_merged_event_observed"] == 1
+    assert report["metrics"]["merge_rate"]["per_arm"]["x"]["k"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Window filtering
 # ---------------------------------------------------------------------------
@@ -317,6 +351,89 @@ def test_zero_outcome_events_cannot_end_experiment() -> None:
     assert lo < 0.0 < hi  # a real interval, never the old [+0.0000, +0.0000]
 
 
+def test_zero_outcome_events_below_bound_reports_cannot_conclude() -> None:
+    """Regression (PR #1714 round-2 review): at min-N-reached but below the
+    equivalence bound, an arm with zero observed outcome events must NOT
+    get the 'not yet decisive -- keep running' message: zero events cannot
+    distinguish equivalent arms from a dead outcome channel, so the rule
+    says it cannot conclude until events are observed."""
+    events = [
+        *[_round(2000 + i, "approved", "a", ts="2026-08-01T00:00:00Z") for i in range(6)],
+        *[_round(2100 + i, "approved", "b", ts="2026-08-01T00:00:00Z") for i in range(6)],
+        # one observed outcome event in arm a -- proves the channel fires,
+        # but arm b still has zero
+        _evt(
+            "2026-08-05T00:00:00Z",
+            "cross_pr_revert_rework_requested",
+            {"pr_number": 2000, "issue_number": 1},
+        ),
+    ]
+    report = build_report(events, KEY, min_prs_per_arm=6)
+    rule = report["stopping_rule"]
+    assert rule["met"] is False and rule["verdict"] == "not_met"
+    assert "zero outcome events" in rule["detail"]
+    assert "cannot conclude" in rule["detail"]
+    assert '"b"' in rule["detail"]  # names the starved arm
+    assert "keep running" not in rule["detail"]
+    assert rule["outcome_events_per_arm"] == {"a": 1, "b": 0}
+
+
+def test_outcome_coverage_reports_observed_event_counts() -> None:
+    """outcome_coverage must distinguish 'emitter exists' (derivable) from
+    'events observed in window' -- raw REVIEW_DEFECT_KINDS event counts
+    per arm, plus a total that includes events on unassigned PRs."""
+    events = [
+        _round(2200, "approved", "a", ts="2026-08-01T00:00:00Z"),
+        _round(2300, "approved", "b", ts="2026-08-01T00:00:00Z"),
+        _evt(
+            "2026-08-05T00:00:00Z",
+            "cross_pr_revert_rework_requested",
+            {"pr_number": 2200, "issue_number": 1},
+        ),
+        _evt(
+            "2026-08-06T00:00:00Z",
+            "cross_pr_revert_rework_requested",
+            {"pr_number": 2200, "issue_number": 1},
+        ),
+        # an outcome event on a PR outside the experiment: still counts in
+        # the total (channel liveness), not in either arm
+        _evt(
+            "2026-08-07T00:00:00Z",
+            "cross_pr_revert_rework_requested",
+            {"pr_number": 9999, "issue_number": 1},
+        ),
+    ]
+    report = build_report(events, KEY, min_prs_per_arm=1)
+    cov = report["outcome_coverage"]
+    assert cov["observed_outcome_events_per_arm"] == {"a": 2, "b": 0}
+    assert cov["observed_outcome_events_total"] == 3
+    assert cov["derivable"] == ["post_approval_defect_rate"]
+    # the outcome metric carries the same counts for the stopping rule
+    assert report["metrics"]["post_approval_defect_rate"]["observed_events_per_arm"] == {
+        "a": 2,
+        "b": 0,
+    }
+    text = render_text(report)
+    assert "a=2" in text and "b=0" in text
+    # events were observed somewhere -> no dead-channel warning
+    assert "may be dead" not in text
+
+
+def test_render_warns_when_emitter_exists_but_zero_events() -> None:
+    """The derivable list alone used to imply a live outcome channel; with
+    zero observed events the render must warn that the emitter exists but
+    produced nothing -- emitter-exists is not events-observed."""
+    events = [
+        _round(2400, "approved", "a", ts="2026-08-01T00:00:00Z"),
+        _round(2500, "approved", "b", ts="2026-08-01T00:00:00Z"),
+    ]
+    report = build_report(events, KEY, min_prs_per_arm=1)
+    text = render_text(report)
+    # the coverage-section warning (distinct from the rule's own detail)
+    assert "zero outcome events were observed in this window" in text
+    assert "may be dead" in text
+
+
 def test_equivalence_bound_ends_experiment_with_evidence() -> None:
     """Positive equivalence case: every arm at >= 2x min, each arm with
     >= 1 observed outcome event, and every difference interval inside the
@@ -436,15 +553,22 @@ def test_no_outcome_metric_reports_statement_and_not_met() -> None:
     assert rule["met"] is False and rule["verdict"] == "not_met"
     assert rule["outcome_metric"] is None
     assert "no outcome metric" in rule["detail"]
-    # the renderer prints the explicit statement on an empty derivable set
-    report = build_report(
-        [_round(1600, "approved", "a", ts="2026-08-01T00:00:00")],
-        KEY,
-        min_prs_per_arm=1,
-    )
-    report["outcome_coverage"]["derivable"] = []
-    report["outcome_coverage"]["statement"] = coverage["statement"]
-    assert "no outcome metric is derivable" in render_text(report)
+    # the renderer prints the implementation's own statement on an empty
+    # derivable set -- a minimal report exercises that path without the
+    # test mutating a report to inject the text it then asserts on
+    minimal = {
+        "metrics_key": KEY,
+        "window": {"since": None, "until": None, "exclude_windows": []},
+        "events_scanned": 0,
+        "arms": [],
+        "per_arm": {},
+        "metrics": {},
+        "data_integrity_warnings": [],
+        "prs_with_rounds_without_arm_value": 0,
+        "outcome_coverage": coverage,
+        "stopping_rule": rule,
+    }
+    assert "no outcome metric is derivable" in render_text(minimal)
 
 
 def test_every_metric_labelled_and_at_least_one_outcome() -> None:
@@ -501,248 +625,6 @@ def test_json_output_is_serializable_and_complete() -> None:
     parsed = json.loads(blob)
     assert parsed["metrics_key"] == KEY
     assert parsed["metrics"]["prs_assigned"]["per_arm"]["a"]["n"] == 1
-
-
-# ---------------------------------------------------------------------------
-# Command layer: read-only, --help, missing db, json flag
-# ---------------------------------------------------------------------------
-
-
-def test_help_describes_read_only() -> None:
-    """The experiment-report subparser's OWN help and description must
-    state the read-only contract -- a top-level ``--help`` assertion is
-    satisfied by unrelated commands' help text and cannot fail on the
-    regression it claims to guard."""
-    import argparse
-
-    parser = cli.build_parser()
-    subs = next(
-        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
-    )
-    sub = subs.choices["experiment-report"]
-    assert "read-only" in (sub.description or "").lower()
-    pseudo = next(a for a in subs._choices_actions if a.dest == "experiment-report")
-    assert "read-only" in (pseudo.help or "").lower()
-
-
-def _state_path(repo: Path) -> Path:
-    return repo / ".var" / "charlie-work" / "state.json"
-
-
-def _repo_with_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
-    """A fake repo with one recorded event (and thus a live events.db)."""
-    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
-    repo = _make_repo(tmp_path)
-    state_path = _state_path(repo)
-    instrumentation.log_event(
-        state_path,
-        "record_review",
-        {
-            "pr_number": 1,
-            "issue_number": 1,
-            "decision": "approved",
-            "session_metrics": {KEY: "deep", "cost_usd": 1.25},
-        },
-    )
-    return repo, state_path
-
-
-def test_missing_events_db_fails_without_creating_files(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Read-only means: a missing events.db must not be created by the
-    report (instrumentation._get_db would create+schema it on open)."""
-    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
-    repo = _make_repo(tmp_path)
-    state_path = _state_path(repo)
-    before = state_path.read_bytes()
-
-    rc = cli.main(["--repo", str(repo), "experiment-report", "--experiment", "review_effort"])
-
-    assert rc == 1
-    assert state_path.read_bytes() == before
-    assert not (state_path.parent / "events.db").exists()
-
-
-def _state_dir_snapshot(state_path: Path) -> dict[str, bytes]:
-    """Every file in the state dir mapped to its bytes -- catches a WAL
-    sidecar, a .migrated rename, or any stray file, not just the two
-    byte-compared files."""
-    return {p.name: p.read_bytes() for p in sorted(state_path.parent.iterdir()) if p.is_file()}
-
-
-def test_report_performs_no_writes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """events.db, state.json, and every sibling file are byte-identical
-    before and after a run on the COLD-OPEN path. Two subtleties make the
-    comparison honest: (1) close_db BEFORE snapshotting so _get_db really
-    re-opens the database inside the command -- a warm-cache run could
-    mask a write on reopen; (2) close_db AFTER the run so any write that
-    landed in the events.db-wal sidecar (WAL mode: a row write does not
-    touch the main db file until a checkpoint) is folded back in before
-    the byte comparison."""
-    repo, state_path = _repo_with_db(tmp_path, monkeypatch)
-    instrumentation.close_db(state_path)
-    before = _state_dir_snapshot(state_path)
-
-    rc = cli.main(["--repo", str(repo), "experiment-report", "--experiment", "review_effort"])
-
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert 'arm "deep"' in out or '"deep"' in out
-    assert "stopping rule" in out
-    instrumentation.close_db(state_path)
-    assert _state_dir_snapshot(state_path) == before
-
-
-def test_unmigrated_events_jsonl_is_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """An unmigrated events.jsonl beside events.db must be refused (rc=1):
-    reading through query_events would auto-migrate it -- a write. Both
-    files must come out byte-identical."""
-    repo, state_path = _repo_with_db(tmp_path, monkeypatch)
-    instrumentation.close_db(state_path)
-    jsonl = state_path.parent / "events.jsonl"
-    jsonl.write_text(
-        '{"ts": "2026-08-01T00:00:00Z", "kind": "record_review", "payload": {}}\n',
-        encoding="utf-8",
-    )
-    db_bytes = (state_path.parent / "events.db").read_bytes()
-    jsonl_bytes = jsonl.read_bytes()
-
-    rc = cli.main(["--repo", str(repo), "experiment-report", "--experiment", "review_effort"])
-
-    assert rc == 1
-    assert "refusing" in capsys.readouterr().out
-    assert (state_path.parent / "events.db").read_bytes() == db_bytes
-    assert jsonl.read_bytes() == jsonl_bytes
-
-
-def test_exclude_window_flag_reaches_the_report(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """--exclude-window START END plumbs through argparse into the report:
-    an exclusion covering now drops every event (NO DATA), one covering
-    only ancient history changes nothing."""
-    repo, state_path = _repo_with_db(tmp_path, monkeypatch)
-    instrumentation.close_db(state_path)
-
-    rc = cli.main(
-        [
-            "--repo",
-            str(repo),
-            "experiment-report",
-            "--experiment",
-            "review_effort",
-            "--exclude-window",
-            "2000-01-01T00:00:00Z",
-            "2100-01-01T00:00:00Z",
-        ]
-    )
-    assert rc == 0
-    assert "NO DATA" in capsys.readouterr().out
-
-    rc = cli.main(
-        [
-            "--repo",
-            str(repo),
-            "experiment-report",
-            "--experiment",
-            "review_effort",
-            "--exclude-window",
-            "2000-01-01T00:00:00Z",
-            "2000-01-02T00:00:00Z",
-        ]
-    )
-    assert rc == 0
-    assert 'arm "deep"' in capsys.readouterr().out
-
-
-@pytest.mark.parametrize(
-    ("extra_args", "needle"),
-    [
-        (["--since", "not-a-timestamp"], "not an ISO-8601 timestamp"),
-        (["--until", "garbage"], "not an ISO-8601 timestamp"),
-        (
-            ["--since", "2026-08-10T00:00:00Z", "--until", "2026-08-01T00:00:00Z"],
-            "is after --until",
-        ),
-        (
-            [
-                "--exclude-window",
-                "2026-08-10T00:00:00Z",
-                "2026-08-01T00:00:00Z",
-            ],
-            "is after end",
-        ),
-        (["--min-prs-per-arm", "0"], "must be a positive integer"),
-        (["--min-prs-per-arm", "-3"], "must be a positive integer"),
-    ],
-)
-def test_cli_window_and_min_prs_errors(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    extra_args: list[str],
-    needle: str,
-) -> None:
-    """Every user-facing argument error is a CommandResult(False) -- rc=1
-    with a named reason, never a traceback."""
-    repo, state_path = _repo_with_db(tmp_path, monkeypatch)
-    instrumentation.close_db(state_path)
-
-    rc = cli.main(
-        [
-            "--repo",
-            str(repo),
-            "experiment-report",
-            "--experiment",
-            "review_effort",
-            *extra_args,
-        ]
-    )
-
-    assert rc == 1
-    assert needle in capsys.readouterr().out
-
-
-def test_json_flag_emits_structured_report(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
-    repo = _make_repo(tmp_path)
-    state_path = _state_path(repo)
-    instrumentation.log_event(
-        state_path,
-        "record_review",
-        {
-            "pr_number": 1,
-            "issue_number": 1,
-            "decision": "request_changes",
-            "session_metrics": {KEY: "deep"},
-        },
-    )
-
-    rc = cli.main(
-        [
-            "--repo",
-            str(repo),
-            "experiment-report",
-            "--experiment",
-            "review_effort",
-            "--json",
-        ]
-    )
-
-    assert rc == 0
-    parsed = json.loads(capsys.readouterr().out)
-    assert parsed["ok"] is True
-    data = parsed["data"]
-    assert data["metrics_key"] == KEY
-    assert data["arms"] == ["deep"]
-    assert data["metrics"]["first_round_request_changes_rate"]["per_arm"]["deep"]["rate"] == 1.0
 
 
 def test_experiment_key_derivation() -> None:

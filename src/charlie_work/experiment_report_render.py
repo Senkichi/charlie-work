@@ -90,11 +90,41 @@ def render_text(report: Mapping[str, Any]) -> str:
                 f"    diff {a} - {b} = {d['diff']:+.4f}  "
                 f"95% CI [{d['ci95'][0]:+.4f}, {d['ci95'][1]:+.4f}]"
             )
+    merge_cov = report.get("merge_coverage")
+    if merge_cov is not None:
+        if merge_cov.get("state_prs") == "unavailable":
+            lines.append(
+                "merge coverage: state.json PR entries unavailable -- "
+                "merge_rate and dispatch_to_merge cover merge events only "
+                "and undercount externally-landed merges"
+            )
+        else:
+            parts = []
+            for arm in report["arms"]:
+                c = merge_cov["per_arm"].get(arm) or {}
+                parts.append(
+                    f"{arm}: merge events observed for "
+                    f"{c.get('state_merged_event_observed', 0)} of "
+                    f"{c.get('state_merged', 0)} state-merged PRs "
+                    f"(merged total incl. event-observed: "
+                    f"{c.get('merged_total', 0)})"
+                )
+            lines.append("merge coverage (state.json union merge events): " + "; ".join(parts))
     lines.append("")
     lines.append("outcome coverage:")
     derivable = report["outcome_coverage"]["derivable"]
     if derivable:
-        lines.append("  derivable and reported above: " + ", ".join(derivable))
+        lines.append("  outcome-signal emitter(s) exist; reported above: " + ", ".join(derivable))
+        obs = report["outcome_coverage"].get("observed_outcome_events_per_arm") or {}
+        obs_txt = ", ".join(f"{a}={n}" for a, n in sorted(obs.items())) or "none"
+        lines.append(f"  outcome events observed in window (per arm): {obs_txt}")
+        if not any(obs.values()):
+            lines.append(
+                "  WARNING: an emitter exists but zero outcome events were "
+                "observed in this window -- the outcome channel may be dead "
+                "and the stopping rule cannot conclude until events are "
+                "observed"
+            )
     else:
         lines.append(f"  {report['outcome_coverage'].get('statement') or NO_OUTCOME_STATEMENT}")
     for item in report["outcome_coverage"]["not_derivable"]:

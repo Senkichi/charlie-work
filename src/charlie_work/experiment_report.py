@@ -49,12 +49,23 @@ Design invariants:
   measures an empty rework *cycle*, not a wrong kickback.  Where no
   outcome metric is derivable, the report says so explicitly and the
   stopping rule stays ``not_met`` -- activity metrics never imply a
-  conclusion they cannot support.
+  conclusion they cannot support.  "Derivable" means the emitter exists;
+  the report additionally distinguishes *events observed in the window*
+  from a merely-derivable metric, because an outcome channel that never
+  fires cannot conclude the experiment either way.
+* **Merged status comes from state.json, not only from events.**  Most
+  merges land through the Aviator merge queue, which emits no
+  ``merge_succeeded`` event, so the merge-event vocabulary alone
+  undercounts merges badly.  The command layer passes a read-only
+  snapshot of ``state.json``'s ``prs`` map (``status == "merged"`` is the
+  fleet's ground truth) and the report unions it with event-observed
+  merges; ``merge_coverage`` states how many state-merged PRs were never
+  seen in a merge event.
 * **Read-only.**  The command layer gates on ``events.db`` existence before
   calling :func:`charlie_work.instrumentation.query_events`, because
   ``_get_db`` performs WAL setup / schema migration / legacy-jsonl import
   on first open.  This module itself never opens the database; it consumes
-  the event list the caller fetched.
+  the event list and the ``state_prs`` snapshot the caller fetched.
 """
 
 from __future__ import annotations
@@ -295,7 +306,11 @@ def _median_metric(
     return _metric(name, "activity", "median", description, per_arm)
 
 
-def _outcome_coverage(metrics: Mapping[str, Any]) -> dict[str, Any]:
+def _outcome_coverage(
+    metrics: Mapping[str, Any],
+    observed_events_per_arm: Mapping[str, int] | None = None,
+    observed_events_total: int | None = None,
+) -> dict[str, Any]:
     """Assemble the report's outcome-coverage section.
 
     ``derivable`` is derived from the metrics themselves (every metric
@@ -304,11 +319,21 @@ def _outcome_coverage(metrics: Mapping[str, Any]) -> dict[str, Any]:
     carries the explicit ``statement`` the issue requires, and the
     stopping rule reports ``not_met`` rather than implying a conclusion
     from activity metrics.
+
+    ``derivable`` means *the emitter exists* -- it says nothing about
+    whether the outcome channel produced any events in the window.
+    ``observed_outcome_events_per_arm`` (raw ``REVIEW_DEFECT_KINDS`` event
+    counts over assigned PRs) makes that liveness visible: an arm with
+    zero observed outcome events cannot be distinguished from a dead
+    outcome channel, and the stopping rule cannot conclude while that
+    holds.
     """
     derivable = [name for name, m in metrics.items() if m["measure"] == "outcome"]
     return {
         "derivable": derivable,
         "not_derivable": list(NOT_DERIVABLE),
+        "observed_outcome_events_per_arm": dict(observed_events_per_arm or {}),
+        "observed_outcome_events_total": observed_events_total,
         "statement": None if derivable else NO_OUTCOME_STATEMENT,
     }
 
@@ -317,6 +342,7 @@ def build_report(
     events: list[dict[str, Any]],
     metrics_key: str,
     *,
+    state_prs: Mapping[int, Mapping[str, Any]] | None = None,
     since: datetime | None = None,
     until: datetime | None = None,
     exclude_windows: Sequence[tuple[datetime, datetime]] = (),
@@ -329,16 +355,28 @@ def build_report(
     ``query_events`` returns).  Window filtering happens here so
     ``--since``/``--until``/``--exclude-window`` share one inclusive
     semantics implemented once.
+
+    *state_prs* is a read-only snapshot of ``state.json``'s ``prs`` map
+    (PR number -> entry), supplied by the command layer.  Entries with
+    ``status == "merged"`` are the fleet's merge ground truth: most merges
+    land through the Aviator merge queue, which emits no merge event, so
+    the event vocabulary alone undercounts ``merge_rate`` badly (on the
+    live fleet, events covered fewer than half of state-merged PRs).  A
+    PR's merge counts when *either* source says merged; ``merged_at`` is
+    window-filtered the same way event timestamps are (absent/unparseable
+    is fail-open, matching ``_in_window``).  ``None`` degrades to
+    event-only coverage, which ``merge_coverage`` states explicitly.
     """
     kept = [e for e in events if _in_window(_parse_ts(e.get("ts")), since, until, exclude_windows)]
 
     arm_obs: dict[int, set[str]] = {}
     rounds: dict[int, list[tuple[datetime | None, dict[str, Any]]]] = {}
     issue_of: dict[int, int] = {}
-    merged_prs: set[int] = set()
+    event_merged_prs: set[int] = set()
     merge_ts: dict[int, datetime] = {}
     escalated_prs: set[int] = set()
     defect_events: dict[int, set[str]] = {}
+    outcome_event_count: dict[int, int] = {}
     noop_kickback_prs: set[int] = set()
     dispatch_events: list[dict[str, Any]] = []
 
@@ -362,7 +400,7 @@ def build_report(
                     issue_of[pr] = int(issue_raw)
         elif e["kind"] in MERGE_EVENT_KINDS:
             for pr in _merge_prs(e):
-                merged_prs.add(pr)
+                event_merged_prs.add(pr)
                 if ts is not None and (pr not in merge_ts or ts < merge_ts[pr]):
                     merge_ts[pr] = ts
         elif e["kind"] in DISPATCH_EVENT_KINDS:
@@ -375,6 +413,8 @@ def build_report(
             pr = _pr_of(payload, e)
             if pr is not None:
                 defect_events.setdefault(pr, set()).add(e["kind"])
+                if e["kind"] in REVIEW_DEFECT_KINDS:
+                    outcome_event_count[pr] = outcome_event_count.get(pr, 0) + 1
         if e["kind"] in NO_OP_REWORK_KINDS:
             pr = _pr_of(payload, e)
             if pr is not None:
@@ -392,6 +432,25 @@ def build_report(
         for pr in _dispatch_prs(e, issue_to_prs):
             if pr not in dispatch_ts or ts < dispatch_ts[pr]:
                 dispatch_ts[pr] = ts
+
+    # Merge set: state.json is the ground truth -- externally-landed merges
+    # (Aviator) emit no merge event, so events alone undercount.  A state
+    # entry's merged_at is window-filtered like an event timestamp; an
+    # absent/unparseable merged_at is fail-open (matching _in_window on
+    # events).  merge_ts takes the earliest timestamp across both sources.
+    state_merged_prs: set[int] = set()
+    merged_prs: set[int] = set(event_merged_prs)
+    if state_prs is not None:
+        for pr, entry in state_prs.items():
+            if not isinstance(entry, Mapping) or entry.get("status") != "merged":
+                continue
+            merged_at = _parse_ts(entry.get("merged_at"))
+            if not _in_window(merged_at, since, until, exclude_windows):
+                continue
+            state_merged_prs.add(pr)
+            merged_prs.add(pr)
+            if merged_at is not None and (pr not in merge_ts or merged_at < merge_ts[pr]):
+                merge_ts[pr] = merged_at
 
     # Arm assignment: a PR belongs to an arm iff every observed arm value
     # for it agrees.  A conflict is a data-integrity finding, not a vote.
@@ -450,11 +509,13 @@ def build_report(
         cost_per_pr[arm].append(total_cost)
         if "approved" in decisions:
             approved_n[arm] += 1
-            for kind in defect_events.get(pr, ()):
-                if kind in REVIEW_DEFECT_KINDS:
-                    review_defect_k[arm] += 1
-                elif kind in PIPELINE_REWORK_KINDS:
-                    pipeline_rework_k[arm] += 1
+            # Per-PR, not per-kind: a PR flagged by N defect kinds counts
+            # once, so k <= n holds as the kind vocabulary grows.
+            kinds = defect_events.get(pr, set())
+            if kinds & REVIEW_DEFECT_KINDS:
+                review_defect_k[arm] += 1
+            if kinds & PIPELINE_REWORK_KINDS:
+                pipeline_rework_k[arm] += 1
         if "request_changes" in decisions:
             kickback_n[arm] += 1
             if pr in noop_kickback_prs:
@@ -518,7 +579,10 @@ def build_report(
     metrics["merge_rate"] = _rate_metric(
         "merge_rate",
         "activity",
-        "share of assigned PRs that reached a merge event",
+        "share of assigned PRs recorded merged -- state.json "
+        "prs[n].status == 'merged' unioned with observed merge events; "
+        "the event vocabulary alone misses externally-landed merges "
+        "(Aviator emits no merge_succeeded), see merge_coverage",
         arms,
         merged_k,
         prs_assigned,
@@ -526,8 +590,9 @@ def build_report(
     )
     metrics["dispatch_to_merge_seconds_median"] = _median_metric(
         "dispatch_to_merge_seconds_median",
-        "median seconds from earliest dispatch/launch event to earliest merge "
-        "event, over merged assigned PRs with a dispatch timestamp",
+        "median seconds from earliest dispatch/launch event to earliest "
+        "merge timestamp (state.json merged_at or merge event, whichever "
+        "is earlier), over merged assigned PRs with a dispatch timestamp",
         arms,
         d2m_seconds,
     )
@@ -540,17 +605,6 @@ def build_report(
         "that did not hold up. check_failure_rework_requested is excluded "
         "by construction: its rework brief keeps the approval standing, so "
         "it measures pipeline state, not whether the review was right",
-        arms,
-        review_defect_k,
-        approved_n,
-        z,
-    )
-    metrics["post_approval_revert_bounce_rate"] = _rate_metric(
-        "post_approval_revert_bounce_rate",
-        "outcome",
-        "share of approved PRs later routed to rework for a silent "
-        "base-commit revert in the branch (cross_pr_revert_rework_requested) "
-        "-- currently the whole of post_approval_defect_rate",
         arms,
         review_defect_k,
         approved_n,
@@ -582,6 +636,34 @@ def build_report(
         z,
     )
 
+    # Observed outcome-event counts per arm -- the outcome channel's
+    # liveness signal.  Counts raw REVIEW_DEFECT_KINDS events on assigned
+    # PRs (not just approved ones): any observation proves the channel
+    # fires, and an arm at zero cannot be told apart from a dead channel.
+    outcome_events_by_arm = {a: 0 for a in arms}
+    for pr, count in outcome_event_count.items():
+        arm = assigned.get(pr)
+        if arm is not None:
+            outcome_events_by_arm[arm] += count
+    metrics["post_approval_defect_rate"]["observed_events_per_arm"] = dict(outcome_events_by_arm)
+
+    merge_coverage = {
+        "state_prs": "available" if state_prs is not None else "unavailable",
+        "per_arm": {
+            a: {
+                "merged_total": sum(1 for p in prs_by_arm[a] if p in merged_prs),
+                "state_merged": sum(1 for p in prs_by_arm[a] if p in state_merged_prs),
+                "state_merged_event_observed": sum(
+                    1 for p in prs_by_arm[a] if p in state_merged_prs and p in event_merged_prs
+                ),
+                "event_merged_only": sum(
+                    1 for p in prs_by_arm[a] if p in event_merged_prs and p not in state_merged_prs
+                ),
+            }
+            for a in arms
+        },
+    }
+
     warnings: list[dict[str, Any]] = [
         {
             "pr": pr,
@@ -595,7 +677,11 @@ def build_report(
     ]
     unassigned_with_rounds = sum(1 for pr in rounds if pr not in arm_obs and pr not in conflicted)
 
-    coverage = _outcome_coverage(metrics)
+    coverage = _outcome_coverage(
+        metrics,
+        outcome_events_by_arm,
+        sum(outcome_event_count.values()),
+    )
     stopping = evaluate_stopping_rule(
         arms,
         prs_assigned,
@@ -625,6 +711,7 @@ def build_report(
         "metrics": metrics,
         "data_integrity_warnings": warnings,
         "prs_with_rounds_without_arm_value": unassigned_with_rounds,
+        "merge_coverage": merge_coverage,
         "outcome_coverage": coverage,
         "stopping_rule": stopping,
     }

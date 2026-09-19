@@ -30,6 +30,8 @@ circular-import / ``-m`` guard reasons documented in
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 from typing import Any
 
 from .experiment_report import (
@@ -137,6 +139,29 @@ def _parse_windows(args: argparse.Namespace) -> tuple[Any, Any, list[tuple[Any, 
     return since, until, exclude
 
 
+def _state_prs_snapshot(state_path: Path) -> dict[int, dict[str, Any]] | None:
+    """Pure read of ``state.json``'s ``prs`` map for merge-status ground truth.
+
+    ``state.load_state`` is deliberately NOT used: its corruption path
+    quarantines the file (a rename -- a write), and this command's contract
+    is that it performs no writes.  A missing or unreadable file degrades
+    to ``None``, which build_report reports as event-only merge coverage
+    rather than failing the read-out.
+    """
+    try:
+        raw = json.loads(state_path.read_bytes().decode("utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    prs = raw.get("prs") if isinstance(raw, dict) else None
+    if not isinstance(prs, dict):
+        return None
+    return {
+        int(key): entry
+        for key, entry in prs.items()
+        if isinstance(key, str) and key.isdigit() and isinstance(entry, dict)
+    }
+
+
 def run_experiment_report_command(args: argparse.Namespace) -> CommandResult:
     """Read-only per-PR experiment read-out from ``events.db``.
 
@@ -193,6 +218,7 @@ def run_experiment_report_command(args: argparse.Namespace) -> CommandResult:
     report = build_report(
         events,
         metrics_key,
+        state_prs=_state_prs_snapshot(state_path),
         since=since,
         until=until,
         exclude_windows=exclude,
