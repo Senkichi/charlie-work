@@ -74,6 +74,7 @@ for the full dataclass list and defaults):
 |---|---|
 | `labels.*` | The `agent:*` / `automated-ready` label strings that make up the state machine (see [ARCHITECTURE.md](ARCHITECTURE.md#label-state-machine)). |
 | `dispatch.default_limit` / `branch_prefix` / `worker_template` | Wave size, branch-name prefix, which prompt template renders per-issue worker prompts (`worker.md` for Devin, `worker_claude_code.md` for Claude Code). |
+| `dispatch.test_command` | Optional string, default `""`. The **runner prefix** the worker and rework prompts tell workers to run, e.g. `uv run --directory server pytest` for a repo whose `pyproject.toml` is not at the repo root; the prompt appends the impacted test files and `-q --tb=short`. Empty derives the runner from the repo-root `pyproject.toml` (the core dependencies, an extra, or a PEP 735 dependency group that declares `pytest`); if nothing is derivable no command is invented and the prompt points the worker at the repo's own `CLAUDE.md` / `CONTRIBUTING.md`. |
 | `review.max_rework_cycles` | `request_changes` cycles allowed before escalating to `agent:human-needed` instead of dispatching another rework round. |
 | `auto_merge.required_checks` | CI check-run names that must be green before `ship-it` will merge. **Must match your `.github/workflows/*.yml` job `name:` fields exactly** — `doctor` verifies this. |
 | `auto_merge.merge_flags` | Extra flags appended to `gh pr merge` (e.g., `["--admin"]` for protected-base merges, `["--auto"]` for merge-queue flows). Takes precedence over the legacy `admin` field. Flags must start with `--` and cannot be strategy flags (`--merge`/`--rebase`/`--squash`) or `--delete-branch` (branch deletion is handled separately). |
@@ -179,7 +180,7 @@ runtimes:
 
 | Profile | `dispatch.worker_template` | `worker.harness` | Notes |
 |---|---|---|---|
-| `examples/orchestrator.config.devin.yaml` | `worker.md` | `devin-shell` | Skills-based worker loop (`/create-branch`, `/commit`, `/test`, `/preflight`, `/push`, `/create-pr`, `/complete`); no automated reviewer dispatch (`review_dispatch.enabled: false`). |
+| `examples/orchestrator.config.devin.yaml` | `worker.md` | `devin-shell` | Skills-based worker loop (slash-command skills such as `/create-branch`, `/commit`, `/preflight`) **only when your repo ships every skill the loop names** (see [Prompt templates](#7-prompt-templates)); otherwise the same template renders a plain git/gh loop. No automated reviewer dispatch (`review_dispatch.enabled: false`). |
 | `examples/orchestrator.config.claude-code.yaml` | `worker_claude_code.md` | `claude-code` | Direct-shell worker loop (no Devin skills, plain git/test commands in the prompt); no automated reviewer dispatch (Claude-only review). |
 
 Both shipped profiles use a non-blocking adapter that actually launches a
@@ -203,3 +204,34 @@ at a tracked directory in your consumer repo and drop in your own
 other template keeps the package default (`prompts.resolve_template`
 searches the override dir first, falls back to the package `prompts/`
 directory per-file).
+
+The worker and rework prompts take two things from the consumer repo instead
+of hardcoding them:
+
+- **Test command.** Resolved in order: `dispatch.test_command` (the runner
+  prefix, see the table above), else derived from the repo-root
+  `pyproject.toml`, else no command at all — the prompt then tells the worker
+  to use the one documented in the repo's `CLAUDE.md` / `CONTRIBUTING.md`. The
+  prompts also state that commands documented in the repo's own `CLAUDE.md` /
+  `CONTRIBUTING.md` take precedence over the generic ones (`prompt_test_command.py`).
+- **Slash-command skills.** `/create-branch`, `/commit`, `/preflight` and the
+  rest come from the *consumer* repo (`<dir>/<name>/SKILL.md`), not from the
+  harness. `worker.md` and `rework.md` render the skills-based loop only when
+  the worker harness loads project skills (`devin-shell`: `.devin/skills/` and
+  `.claude/skills/`; `claude-code`: `.claude/skills/`; `manual`, `command` and
+  `api` load none) **and** the repo ships *every* skill named in
+  `prompts/worker_sections/skills/available_skills.md`. Otherwise they render a
+  plain git/gh loop, by design — a repo shipping only some of the skills gets
+  the plain loop. The required set is read from that file's bullet list, so
+  there is no second list to keep in sync (`prompt_skills.py`).
+  `worker_claude_code.md` and `worker_local.md` always use the direct-shell loop.
+
+**Section variants.** A partial under `prompts/worker_sections/` can be
+overlaid per variant: `worker_sections/<variant>/<stem>.md` replaces
+`worker_sections/<stem>.md` while that variant is active. The variants are
+just the subdirectories that exist (today one, `skills/`), and a stem that
+exists *only* inside a variant directory renders as empty text while that
+variant is inactive. Precedence, most specific first: `<prompts_dir>/worker_sections/<variant>/`,
+`<prompts_dir>/worker_sections/`, package `worker_sections/<variant>/`, package
+`worker_sections/`. So a repo-local partial always beats the package's,
+including the package's variant overlay.

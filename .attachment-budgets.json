@@ -119,21 +119,6 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1531",
-     "actor": "worker",
-     "reason": "growth from PR #1531; operator decision 2026-09-02, issue 1458",
-     "to": 168
-    }
-   ],
-   "file": "tests/test_fleet_dispatch.py",
-   "identity": "tests/test_fleet_dispatch.py::module",
-   "kind": "test_module",
-   "member_count": 166
-  },
-  {
-   "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_git_push_lint_hook.py",
    "identity": "tests/test_git_push_lint_hook.py::module",

@@ -99,6 +99,7 @@ from charlie_work.github import issue_numbers_mentioned_by_pr, label_names
 from charlie_work.instrumentation import query_events
 from charlie_work.markdown_fence import fenced_block
 from charlie_work.paths import resolved_layout, runtime_paths
+from charlie_work.prompt_test_command import prompt_test_command_values
 from charlie_work.prompts import render_prompt
 from charlie_work.review_decision import ReviewDecision
 from charlie_work.state import (
@@ -610,6 +611,7 @@ def test_worker_prompt_renders_issue_values() -> None:
             "issue_comments": "",
             "module_map": "",
             "attachment_budget": "",
+            **prompt_test_command_values("", None),
         },
     )
 
@@ -631,6 +633,7 @@ def test_claude_code_worker_prompt_renders_issue_values() -> None:
             "issue_comments": "",
             "module_map": "",
             "attachment_budget": "",
+            **prompt_test_command_values("", None),
         },
     )
 
@@ -670,6 +673,7 @@ def test_missing_repo_local_template_falls_back_to_package(tmp_path: Path) -> No
             "dispatch_note_block": fenced_block("s", "md"),
             "required_changes_section": "",
             "branch_name": "agent/issue-1-t",
+            **prompt_test_command_values("", None),
         },
         search_dirs=(override_dir,),
     )
