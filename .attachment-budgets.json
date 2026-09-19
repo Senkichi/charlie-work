@@ -25,6 +25,14 @@
    "member_count": 9
   },
   {
+   "boundary": 37.0,
+   "bumps": [],
+   "file": "tests/attachment_contracts/test_baseline.py",
+   "identity": "tests/attachment_contracts/test_baseline.py::module",
+   "kind": "test_module",
+   "member_count": 41
+  },
+  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_api_budget.py",
@@ -70,21 +78,6 @@
    "identity": "tests/test_config.py::module",
    "kind": "test_module",
    "member_count": 114
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1509",
-     "actor": "worker",
-     "reason": "role-config migration growth + PR #1509; operator decision 2026-09-02, issue 1458",
-     "to": 89
-    }
-   ],
-   "file": "tests/test_doctor.py",
-   "identity": "tests/test_doctor.py::module",
-   "kind": "test_module",
-   "member_count": 82
   },
   {
    "boundary": 41.0,
@@ -148,6 +141,14 @@
    "identity": "tests/test_post_mortem.py::module",
    "kind": "test_module",
    "member_count": 59
+  },
+  {
+   "boundary": 37.0,
+   "bumps": [],
+   "file": "tests/test_private_slug_gate.py",
+   "identity": "tests/test_private_slug_gate.py::module",
+   "kind": "test_module",
+   "member_count": 39
   },
   {
    "boundary": 41.0,
