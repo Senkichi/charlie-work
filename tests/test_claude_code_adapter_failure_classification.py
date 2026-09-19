@@ -258,7 +258,7 @@ def test_classify_session_failure_tool_rejected_is_not_throttle(tmp_path: Path) 
     Devin CLI's own surfacing of a PreToolUse hook block, not a provider
     throttle condition — it must NOT classify as rate_limited (no retry
     semantics, no throttled_until). See test_devin_shell.py's mirror test
-    and test_post_mortem.py for the worker_blocked log-tail fallback that
+    and test_post_mortem_log_tail_fallback.py for the worker_blocked log-tail fallback that
     now owns this signature instead."""
     from charlie_work.claude_code import _classify_session_failure
 
