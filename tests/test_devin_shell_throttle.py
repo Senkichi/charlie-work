@@ -417,7 +417,7 @@ def test_classify_session_failure_tool_rejected_is_not_throttle(tmp_path: Path) 
     this string as a throttle signature; a correction comment on issue #260
     established it is a hard failure that must instead route through
     post_mortem.classify_and_record's worker_blocked log-tail fallback (see
-    test_post_mortem.py), which composes with escalation, not cooldown."""
+    test_post_mortem_log_tail_fallback.py), which composes with escalation, not cooldown."""
     from charlie_work.devin_shell import _classify_session_failure
 
     log_path = tmp_path / "session.log"
