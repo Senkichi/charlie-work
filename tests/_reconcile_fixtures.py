@@ -3,11 +3,12 @@
 Hoisted out of ``test_reconcile.py`` (issue #1284): its own minimal
 reconcile-pass ``FakeGitHub`` double, PR/issue payload builders, and a
 bare-remote-plus-clone / completed-worktree pair of git fixture builders,
-all imported by other test modules. ``test_reconcile.py`` is one of the
-three monoliths issue #1284 marks out of scope for a full split -- only
-these five exported symbols move; the rest of the file (including its own
-~14+ internal uses of ``FakeGitHub`` below) is untouched, via a
-back-reference import.
+all imported by other test modules.
+
+Issue #1559 (Track-1 split of ``test_reconcile.py``) added the shared
+check-run / review-decision / empty-stdout helpers the new sibling modules
+need -- symbols consumed by more than one sibling live here because test
+modules may not import from each other.
 
 This ``FakeGitHub`` is unrelated to ``tests/_fakes_github.py``'s
 ``FakeGitHub`` (the orchestrator-suite-wide fake hoisted out of
@@ -18,14 +19,21 @@ the same bare name in one module, or made to subclass one another.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
 
 from _worktree_fixtures import _git
 from charlie_work import github as github_module
+from charlie_work.config import OrchestratorConfig
 from charlie_work.issue_linking import linked_issue_number
-from charlie_work.reconcile import _LIST_LIMIT as reconcile_list_limit
+from charlie_work.paths import runtime_paths
+from charlie_work.reconcile import (
+    AVIATOR_BLOCKED_MESSAGE,
+    AVIATOR_CHECK_NAME,
+    _LIST_LIMIT as reconcile_list_limit,
+)
 from charlie_work.worktree import create_worktree
 
 
@@ -244,3 +252,71 @@ def _setup_completed_worktree(
     if dirty:
         (info.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
     return info.path, branch
+
+
+# ---------------------------------------------------------------------------
+# detect_aviator_stale_blocked (job-cannon #1387/#1400/#1398/#1392, 2026-07-27)
+# ---------------------------------------------------------------------------
+
+_AVIATOR_FAILURE_OUTPUT = {
+    "title": "Aviator checks - blocked",
+    "summary": (
+        "This PR is not ready to merge (currently in state blocked): "
+        f"{AVIATOR_BLOCKED_MESSAGE}.\n\n### Pending Status Checks\n\n* ✅ 5 tests passing!"
+    ),
+}
+
+
+def _aviator_check_run(
+    conclusion: str | None, output: dict[str, Any] | None = None, *, run_id: int = 1
+) -> dict[str, Any]:
+    return {
+        "id": run_id,
+        "name": AVIATOR_CHECK_NAME,
+        "status": "completed" if conclusion else "in_progress",
+        "conclusion": conclusion,
+        "output": output or {},
+    }
+
+
+def _passing_check_run(name: str, *, run_id: int) -> dict[str, Any]:
+    return {
+        "id": run_id,
+        "name": name,
+        "status": "completed",
+        "conclusion": "success",
+        "output": {},
+    }
+
+
+def _write_review_decision(
+    tmp_path: Path, config: OrchestratorConfig, pr_number: int, decision: dict[str, Any]
+) -> None:
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    pr_dir = paths.prs / f"pr-{pr_number}"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+
+
+class _EmptyStdoutGitHub:
+    """``gh`` exits 0 but writes nothing to stdout.
+
+    ``GitHub.run`` turns that into ``None`` (``if not output: return None`` on
+    the success path) -- the exact value both reconcile fetchers used to
+    coerce into ``[]``.
+    """
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        json_output: bool = False,
+        allow_failure: bool = False,
+    ) -> Any:
+        return None
+
+    def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int]:
+        return True, 10000, 0
+
+    def invalidate_list_cache(self) -> None:
+        return None

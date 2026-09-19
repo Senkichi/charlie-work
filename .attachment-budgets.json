@@ -25,6 +25,14 @@
    "member_count": 9
   },
   {
+   "boundary": 39.5,
+   "bumps": [],
+   "file": "tests/attachment_contracts/test_baseline.py",
+   "identity": "tests/attachment_contracts/test_baseline.py::module",
+   "kind": "test_module",
+   "member_count": 41
+  },
+  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_api_budget.py",
@@ -210,21 +218,6 @@
    "identity": "tests/test_prompt_sections.py::module",
    "kind": "test_module",
    "member_count": 58
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1480",
-     "actor": "worker",
-     "reason": "growth from PRs #1480 #1395 #1431; operator decision 2026-09-02, issue 1458",
-     "to": 153
-    }
-   ],
-   "file": "tests/test_reconcile.py",
-   "identity": "tests/test_reconcile.py::module",
-   "kind": "test_module",
-   "member_count": 135
   },
   {
    "boundary": 41.0,
