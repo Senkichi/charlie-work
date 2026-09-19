@@ -41,6 +41,14 @@
    "member_count": 33
   },
   {
+   "boundary": 32.0,
+   "bumps": [],
+   "file": "tests/test_backlog_reachability.py",
+   "identity": "tests/test_backlog_reachability.py::module",
+   "kind": "test_module",
+   "member_count": 33
+  },
+  {
    "boundary": 37.0,
    "bumps": [],
    "file": "tests/test_charlie_work.py",
@@ -173,14 +181,6 @@
    "identity": "tests/test_private_slug_gate.py::module",
    "kind": "test_module",
    "member_count": 39
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_process_utils.py",
-   "identity": "tests/test_process_utils.py::module",
-   "kind": "test_module",
-   "member_count": 47
   },
   {
    "boundary": 41.0,
