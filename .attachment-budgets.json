@@ -95,14 +95,6 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_devin_shell.py",
-   "identity": "tests/test_devin_shell.py::module",
-   "kind": "test_module",
-   "member_count": 75
-  },
-  {
-   "boundary": 41.0,
    "bumps": [
     {
      "ack": "#1509",
