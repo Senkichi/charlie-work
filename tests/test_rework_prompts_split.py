@@ -531,18 +531,27 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     - ``_write_text_atomic``: real import at
       ``tests/test_review_event_payload.py:46``.
     - ``_write_rework_prompt``: the scan's winning match is
-      ``tests/test_charlie_work.py``, but -- unlike the five anchors above --
-      this one is NOT a real import in that file. It is a parenthesized
-      prose mention in a docstring, ``(workflow._write_rework_prompt)`` at
-      line 26358, that is not backtick-quoted and so is not excluded by the
-      backtick-mention control below (which only excludes RST-style
+      ``tests/test_charlie_work_classify_dead_rework.py``, but -- unlike the
+      five anchors above -- this one is NOT a real import in that file. It
+      is a parenthesized prose mention in a docstring,
+      ``(workflow._write_rework_prompt)`` at line 189 (inside
+      ``test_classify_dead_rework_session_stale_prompt_does_not_reopen_approved_head``,
+      whose body -- docstring included -- the issue-#1551 wave-5 split moved
+      verbatim out of ``tests/test_charlie_work.py``, where the mention sat
+      at line 26358), that is not backtick-quoted and so is not excluded by
+      the backtick-mention control below (which only excludes RST-style
       backtick cross-references, the one false-positive class this family's
-      own precedent already hit once). ``test_charlie_work.py`` sorts ahead
-      of this name's REAL import sites (``tests/test_markdown_fence.py``,
-      ``tests/test_prompt_render_contract.py:41``,
-      ``tests/test_prompt_template_drift_check.py:38``), so
-      ``found.setdefault`` locks in the docstring mention first. This is the
-      mirror image of the verdict_parsing precedent's own control for
+      own precedent already hit once). ``tests/test_charlie_work.py`` still
+      sorts first (``.`` precedes ``_``), but the split stripped it of every
+      matching form -- its surviving ``_write_rework_prompt`` mentions are
+      bare prose and ``app.``-prefixed attribute access, neither of which
+      the scan's patterns recognize -- so ``found.setdefault`` falls through
+      to the earliest-sorted ``test_charlie_work_*`` file, which still locks
+      in ahead of this name's REAL import sites
+      (``tests/test_markdown_fence.py:40``,
+      ``tests/test_prompt_render_contract.py:43``,
+      ``tests/test_prompt_template_drift_check.py:38``). This is the mirror
+      image of the verdict_parsing precedent's own control for
       ``_escalate_issue``/``_extract_verdict_from_text`` (where the ordering
       quirk ran the other way) -- re-derived here rather than assumed, since
       the winner differs per name and per file tree.
@@ -575,7 +584,7 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     assert referenced["_write_text_atomic"] == "tests/test_review_event_payload.py"
 
     assert "_write_rework_prompt" in referenced
-    assert referenced["_write_rework_prompt"] == "tests/test_charlie_work.py"
+    assert referenced["_write_rework_prompt"] == "tests/test_charlie_work_classify_dead_rework.py"
 
 
 @pytest.mark.parametrize(
