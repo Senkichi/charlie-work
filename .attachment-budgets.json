@@ -175,14 +175,6 @@
    "member_count": 39
   },
   {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_prompt_sections.py",
-   "identity": "tests/test_prompt_sections.py::module",
-   "kind": "test_module",
-   "member_count": 58
-  },
-  {
    "boundary": 34.5,
    "bumps": [],
    "file": "tests/test_prompt_skills.py",
