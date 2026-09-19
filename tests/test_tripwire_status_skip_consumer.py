@@ -22,7 +22,7 @@ Reuses the tripwire fixtures from ``test_charlie_work.py`` (``FakeGitHub``,
 Skip events carry a real-wall-clock ``ts`` with no way to backdate it through the
 public API (``instrumentation.log_event`` always stamps ``_now_iso()``), so
 testing the ``armed_at`` window bound requires writing rows into ``events.db``
-directly. ``test_instrumentation.py`` (e.g.
+directly. ``test_instrumentation_jsonl_migration.py`` (e.g.
 ``test_dedupe_existing_duplicates_on_first_access``) already does this for the
 same reason -- ``_write_skip_event`` below follows that precedent, mirroring
 ``instrumentation._SCHEMA_SQL`` exactly so the app's later ``CREATE TABLE IF NOT
