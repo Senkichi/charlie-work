@@ -54,7 +54,6 @@
   "tests/test_rework_prompts_split.py": 1000,
   "tests/test_stale_checks_retrigger.py": 1000,
   "tests/test_state_dir_migration.py": 1600,
-  "tests/test_supervise.py": 3200,
   "tests/test_verdict_parsing_split.py": 1000,
   "tests/test_verdict_provenance_enforcement.py": 1000,
   "tests/test_wedge_watchdog.py": 1600,
