@@ -89,21 +89,6 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1509",
-     "actor": "worker",
-     "reason": "role-config migration growth + PR #1509; operator decision 2026-09-02, issue 1458",
-     "to": 89
-    }
-   ],
-   "file": "tests/test_doctor.py",
-   "identity": "tests/test_doctor.py::module",
-   "kind": "test_module",
-   "member_count": 82
-  },
-  {
-   "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_fix_reconcile.py",
    "identity": "tests/test_fix_reconcile.py::module",
