@@ -529,7 +529,7 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     from Preflight's notes):
 
     - ``_non_required_check_findings``: real single-name import at
-      ``tests/test_checks.py:17``.
+      ``tests/test_checks_classification.py:21``.
     - ``check_dispatch_staleness``: real single-name import at
       ``tests/test_dispatch_staleness.py:21``.
     - ``_annotation_to_required_change`` and ``_required_changes_from_checks``:
@@ -556,7 +556,7 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     )
 
     assert "_non_required_check_findings" in referenced
-    assert referenced["_non_required_check_findings"] == "tests/test_checks.py"
+    assert referenced["_non_required_check_findings"] == "tests/test_checks_classification.py"
 
     assert "check_dispatch_staleness" in referenced
     assert referenced["check_dispatch_staleness"] == "tests/test_dispatch_staleness.py"
@@ -621,11 +621,11 @@ def test_reference_scan_recognizes_every_documented_form(tmp_path: Path, source:
     ``workflow._non_required_check_findings``/
     ``charlie_work.workflow._non_required_check_findings`` text inside THIS
     file's own source, and this file is itself part of the real tree the
-    completeness test above walks. ``tests/test_checks.py`` --
-    ``_non_required_check_findings``'s real anchor -- sorts alphabetically
-    before ``tests/test_ci_findings_split.py``, so ``found.setdefault``
-    locks in the real anchor before this file is ever scanned regardless of
-    what these probe strings contain. ``check_dispatch_staleness``'s real
+    completeness test above walks. ``tests/test_checks_classification.py``
+    -- ``_non_required_check_findings``'s real anchor since the #1565 split
+    -- sorts alphabetically before ``tests/test_ci_findings_split.py``, so
+    ``found.setdefault`` locks in the real anchor before this file is ever
+    scanned regardless of what these probe strings contain. ``check_dispatch_staleness``'s real
     anchor (``tests/test_dispatch_staleness.py``) sorts AFTER this filename,
     so using it here would let these very probe strings hijack that anchor
     in the completeness test above -- confirmed the hard way while writing
