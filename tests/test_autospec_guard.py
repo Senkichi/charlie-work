@@ -284,15 +284,16 @@ def test_enforced_files_non_empty_and_real() -> None:
 
 
 def test_converted_region_uses_autospec_fixture() -> None:
-    """The fleet-status tests in test_charlie_work.py request ``autospec``.
+    """The fleet-status tests request ``autospec``.
 
     The guard no longer uses the fixture request as an opt-in gate, but the
     fleet-status tests remain the converted region that will let
     test_charlie_work.py enter ``ENFORCED_FILES`` once the rest of the file is
-    converted.
+    converted. They now live in ``test_charlie_work_fleet_status.py`` after
+    the wave-2 split (#1548).
     """
-    source = (TESTS_DIR / "test_charlie_work.py").read_text(encoding="utf-8")
-    tree = ast.parse(source, filename="tests/test_charlie_work.py")
+    source = (TESTS_DIR / "test_charlie_work_fleet_status.py").read_text(encoding="utf-8")
+    tree = ast.parse(source, filename="tests/test_charlie_work_fleet_status.py")
     parents = _build_parent_map(tree)
     test_nodes = _collect_test_nodes(tree, parents)
     fleet_status_tests = [n for n in test_nodes if n.name.startswith("test_fleet_status_")]
