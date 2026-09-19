@@ -25,6 +25,14 @@
    "member_count": 9
   },
   {
+   "boundary": 37.0,
+   "bumps": [],
+   "file": "tests/attachment_contracts/test_baseline.py",
+   "identity": "tests/attachment_contracts/test_baseline.py::module",
+   "kind": "test_module",
+   "member_count": 41
+  },
+  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_api_budget.py",
@@ -128,21 +136,6 @@
   },
   {
    "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1464",
-     "actor": "worker",
-     "reason": "incident regression tests added by PRs #1429 #1433 #1437 #1440 #1421 #1464; operator decision 2026-09-02, issue 1458",
-     "to": 171
-    }
-   ],
-   "file": "tests/test_heartbeat_check.py",
-   "identity": "tests/test_heartbeat_check.py::module",
-   "kind": "test_module",
-   "member_count": 152
-  },
-  {
-   "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_instrumentation.py",
    "identity": "tests/test_instrumentation.py::module",
@@ -152,18 +145,18 @@
   {
    "boundary": 41.0,
    "bumps": [],
-   "file": "tests/test_janitor.py",
-   "identity": "tests/test_janitor.py::module",
-   "kind": "test_module",
-   "member_count": 157
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
    "file": "tests/test_post_mortem.py",
    "identity": "tests/test_post_mortem.py::module",
    "kind": "test_module",
    "member_count": 59
+  },
+  {
+   "boundary": 37.0,
+   "bumps": [],
+   "file": "tests/test_private_slug_gate.py",
+   "identity": "tests/test_private_slug_gate.py::module",
+   "kind": "test_module",
+   "member_count": 39
   },
   {
    "boundary": 41.0,
