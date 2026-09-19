@@ -18,12 +18,20 @@ Note: ``test_reconcile.py`` defines its own, byte-identical top-level
 so it stays where it is per the same out-of-scope-monolith carve-out;
 ``tests/_reconcile_fixtures.py`` imports this module's ``_git`` rather than
 keeping a third copy.
+
+``_init_bare_remote_and_clone`` and ``_setup_completed_worktree`` joined under
+the #1548 Track-1 wave-2 split: a moved ``test_charlie_work.py`` test needs
+them, and they are this module's domain -- a bare-remote-plus-clone builder
+and a worktree-with-a-commit builder. ``test_charlie_work.py`` keeps its own
+byte-identical ``_git`` for the same reason as ``test_reconcile.py``.
 """
 
 from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+
+from charlie_work.worktree import create_worktree
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -105,3 +113,36 @@ def _init_repo(repo_root: Path, bare: bool = False) -> None:
         (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
         run(["git", "add", "README.md"])
         run(["git", "commit", "-m", "initial commit"])
+
+
+def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a bare remote repo and a local clone, return (remote, clone)."""
+    remote = tmp_path / "remote"
+    remote.mkdir(parents=True, exist_ok=True)
+    _git(remote, "init", "--bare", "--initial-branch=main")
+    clone = tmp_path / "clone"
+    clone.mkdir(parents=True, exist_ok=True)
+    _git(clone, "init", "--initial-branch=main")
+    _git(clone, "config", "user.email", "test@example.test")
+    _git(clone, "config", "user.name", "Test User")
+    _git(clone, "config", "commit.gpgSign", "false")
+    _git(clone, "remote", "add", "origin", str(remote))
+    (clone / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(clone, "add", "README.md")
+    _git(clone, "commit", "-m", "initial commit")
+    _git(clone, "push", "-u", "origin", "main")
+    return remote, clone
+
+
+def _setup_completed_worktree(
+    repo_root: Path, issue_number: int, dirty: bool = False
+) -> tuple[Path, str]:
+    """Create a worktree with one commit beyond origin/main. Return (worktree_path, branch)."""
+    branch = f"agent/issue-{issue_number}"
+    info = create_worktree(repo_root, branch, base_ref="origin/main")
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit")
+    if dirty:
+        (info.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+    return info.path, branch
