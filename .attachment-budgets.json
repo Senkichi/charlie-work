@@ -41,6 +41,14 @@
    "member_count": 55
   },
   {
+   "boundary": 32.0,
+   "bumps": [],
+   "file": "tests/test_backlog_reachability.py",
+   "identity": "tests/test_backlog_reachability.py::module",
+   "kind": "test_module",
+   "member_count": 33
+  },
+  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_charlie_work.py",
@@ -64,6 +72,22 @@
    "member_count": 47
   },
   {
+   "boundary": 32.0,
+   "bumps": [],
+   "file": "tests/test_citation_check.py",
+   "identity": "tests/test_citation_check.py::module",
+   "kind": "test_module",
+   "member_count": 37
+  },
+  {
+   "boundary": 32.0,
+   "bumps": [],
+   "file": "tests/test_closing_reference.py",
+   "identity": "tests/test_closing_reference.py::module",
+   "kind": "test_module",
+   "member_count": 33
+  },
+  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_collect_only_gate.py",
@@ -78,6 +102,14 @@
    "identity": "tests/test_config.py::module",
    "kind": "test_module",
    "member_count": 114
+  },
+  {
+   "boundary": 32.0,
+   "bumps": [],
+   "file": "tests/test_cross_repo_gate.py",
+   "identity": "tests/test_cross_repo_gate.py::module",
+   "kind": "test_module",
+   "member_count": 35
   },
   {
    "boundary": 41.0,
@@ -118,6 +150,14 @@
    "identity": "tests/test_instrumentation.py::module",
    "kind": "test_module",
    "member_count": 58
+  },
+  {
+   "boundary": 32.0,
+   "bumps": [],
+   "file": "tests/test_local_issues.py",
+   "identity": "tests/test_local_issues.py::module",
+   "kind": "test_module",
+   "member_count": 37
   },
   {
    "boundary": 41.0,
@@ -167,6 +207,14 @@
    "member_count": 58
   },
   {
+   "boundary": 32.0,
+   "bumps": [],
+   "file": "tests/test_prompt_skills.py",
+   "identity": "tests/test_prompt_skills.py::module",
+   "kind": "test_module",
+   "member_count": 35
+  },
+  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_safe_ref.py",
@@ -181,6 +229,14 @@
    "identity": "tests/test_state_dir_migration.py::module",
    "kind": "test_module",
    "member_count": 60
+  },
+  {
+   "boundary": 32.0,
+   "bumps": [],
+   "file": "tests/test_wedge_watchdog.py",
+   "identity": "tests/test_wedge_watchdog.py::module",
+   "kind": "test_module",
+   "member_count": 36
   },
   {
    "boundary": 41.0,
@@ -211,21 +267,6 @@
    "identity": "tests/test_worker_health.py::module",
    "kind": "test_module",
    "member_count": 55
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1409",
-     "actor": "worker",
-     "reason": "growth from PR #1409 + identifier scrub; operator decision 2026-09-02, issue 1458",
-     "to": 53
-    }
-   ],
-   "file": "tests/test_worker_stop_gate.py",
-   "identity": "tests/test_worker_stop_gate.py::module",
-   "kind": "test_module",
-   "member_count": 49
   },
   {
    "boundary": 41.0,

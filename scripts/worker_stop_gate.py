@@ -68,7 +68,7 @@ the hook process's cwd: Claude Code runs hooks from the session's
 into a worktree, and a cwd-relative ``.venv/...`` then resolves against a
 tree that has no venv and dies with bash's "No such file or directory" on
 every subsequent turn (observed 2026-09-03 in a downstream repo that ports
-this gate). ``tests/test_worker_stop_gate.py`` pins that invariant: every
+this gate). ``tests/test_worker_stop_gate_hook_command.py`` pins that invariant: every
 path token in the command must be absolute once ``$CLAUDE_PROJECT_DIR``
 is expanded.
 A third, empirically-confirmed limitation (review round, #1259; resolved as
