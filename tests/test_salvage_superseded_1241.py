@@ -391,7 +391,7 @@ def test_reconcile_salvage_skips_when_commits_reachable(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # event-kind registry contract: salvage_skip_event_kind only returns
 # literals registered in _LEVEL_BY_KIND. This is the verification the
-# _ALLOWED_UNRESOLVED_KIND_SITES entries in test_instrumentation.py point at:
+# _ALLOWED_UNRESOLVED_KIND_SITES entries in tests/_instrumentation_kind_scanner.py point at:
 # the dynamic ``salvage_skip_event_kind(skip_reason)`` call sites in
 # dead_worker_reap._attempt_salvage and reconcile.apply_fixes resolve to one
 # of these two registered literals, so they cannot escape the level registry.

@@ -43,7 +43,6 @@
   "tests/test_git_push_lint_hook.py": 1000,
   "tests/test_github.py": 1600,
   "tests/test_githublike_protocol.py": 1000,
-  "tests/test_instrumentation.py": 2200,
   "tests/test_issue_1229_stale_branch_name_collision.py": 1000,
   "tests/test_issue_1684_quota_classifier.py": 1000,
   "tests/test_merge_preflight_hook.py": 1200,

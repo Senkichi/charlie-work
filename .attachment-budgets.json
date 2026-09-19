@@ -64,6 +64,14 @@
    "member_count": 47
   },
   {
+   "boundary": 34.5,
+   "bumps": [],
+   "file": "tests/test_citation_check.py",
+   "identity": "tests/test_citation_check.py::module",
+   "kind": "test_module",
+   "member_count": 37
+  },
+  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_cli.py",
@@ -86,6 +94,14 @@
    "identity": "tests/test_config.py::module",
    "kind": "test_module",
    "member_count": 114
+  },
+  {
+   "boundary": 34.5,
+   "bumps": [],
+   "file": "tests/test_cross_repo_gate.py",
+   "identity": "tests/test_cross_repo_gate.py::module",
+   "kind": "test_module",
+   "member_count": 35
   },
   {
    "boundary": 41.0,
@@ -120,12 +136,12 @@
    "member_count": 42
   },
   {
-   "boundary": 41.0,
+   "boundary": 34.5,
    "bumps": [],
-   "file": "tests/test_instrumentation.py",
-   "identity": "tests/test_instrumentation.py::module",
+   "file": "tests/test_local_issues.py",
+   "identity": "tests/test_local_issues.py::module",
    "kind": "test_module",
-   "member_count": 58
+   "member_count": 37
   },
   {
    "boundary": 41.0,
@@ -175,6 +191,14 @@
    "member_count": 58
   },
   {
+   "boundary": 34.5,
+   "bumps": [],
+   "file": "tests/test_prompt_skills.py",
+   "identity": "tests/test_prompt_skills.py::module",
+   "kind": "test_module",
+   "member_count": 35
+  },
+  {
    "boundary": 41.0,
    "bumps": [
     {
@@ -219,6 +243,14 @@
    "identity": "tests/test_supervise.py::module",
    "kind": "test_module",
    "member_count": 99
+  },
+  {
+   "boundary": 34.5,
+   "bumps": [],
+   "file": "tests/test_wedge_watchdog.py",
+   "identity": "tests/test_wedge_watchdog.py::module",
+   "kind": "test_module",
+   "member_count": 36
   },
   {
    "boundary": 41.0,
