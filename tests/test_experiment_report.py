@@ -209,23 +209,34 @@ def test_event_merged_pr_counts_when_state_agrees_or_not() -> None:
     events = [
         _round(52, "approved", "x", ts="2026-08-02T00:00:00Z"),
         _round(53, "approved", "x", ts="2026-08-02T00:00:00Z"),
+        _round(54, "approved", "x", ts="2026-08-02T00:00:00Z"),
         _evt(
             "2026-08-04T00:00:00Z",
             "merge_succeeded",
             {"pr_number": 52, "issue_number": 1},
         ),
+        _evt(
+            "2026-08-05T00:00:00Z",
+            "merge_succeeded",
+            {"pr_number": 54, "issue_number": 1},
+        ),
     ]
     state_prs = {
         52: {"status": "merged", "merged_at": "2026-08-04T00:00:00Z"},
         53: {"status": "merged", "merged_at": "2026-08-05T00:00:00Z"},
+        # state actively disagrees with the merge event: still open
+        54: {"status": "open"},
     }
     report = build_report(events, KEY, state_prs=state_prs, min_prs_per_arm=1)
     c = report["merge_coverage"]["per_arm"]["x"]
-    # 52 merged by both sources; 53 merged by state only (no event)
-    assert c["merged_total"] == 2
+    # 52 merged by both sources; 53 merged by state only (no event);
+    # 54 merged by event only (state says open) -- the union counts all 3
+    assert c["merged_total"] == 3
     assert c["state_merged"] == 2
     assert c["state_merged_event_observed"] == 1
-    assert report["metrics"]["merge_rate"]["per_arm"]["x"]["k"] == 2
+    assert c["event_merged_only"] == 1
+    merged = report["metrics"]["merge_rate"]["per_arm"]["x"]
+    assert merged["k"] == 3 and merged["n"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +272,60 @@ def test_since_and_until_are_inclusive() -> None:
         min_prs_per_arm=1,
     )
     assert report["per_arm"]["a"]["prs_with_rounds"] == 2
+
+
+def test_state_merged_at_is_window_filtered_and_fail_open() -> None:
+    """Regression (PR #1714 round-3 review): a state-sourced merge counts
+    only when its merged_at survives the same --since/--until/
+    --exclude-window filter event timestamps get.  An out-of-window
+    merged_at drops the PR from merge_rate, merge_coverage.state_merged,
+    and dispatch_to_merge_seconds_median; an absent or unparseable
+    merged_at is fail-open (counted, matching _in_window on events)."""
+    prs = (90, 91, 92, 93, 94, 95)
+    events = [
+        _evt(
+            "2026-08-01T00:00:00Z",
+            "review_dispatch",
+            {"launched": list(prs), "failed": []},
+        ),
+        *[_round(pr, "approved", "x", ts="2026-08-02T00:00:00Z") for pr in prs],
+    ]
+    state_prs = {
+        90: {"status": "merged", "merged_at": "2026-08-04T12:00:00Z"},  # in exclude-window
+        91: {"status": "merged", "merged_at": "2026-07-15T00:00:00Z"},  # before --since
+        92: {"status": "merged", "merged_at": "2026-08-20T00:00:00Z"},  # after --until
+        93: {"status": "merged"},  # absent merged_at -> fail-open, counted
+        94: {"status": "merged", "merged_at": "not-a-timestamp"},  # unparseable -> counted
+        95: {"status": "merged", "merged_at": "2026-08-03T00:00:00Z"},  # inside window
+    }
+    report = build_report(
+        events,
+        KEY,
+        state_prs=state_prs,
+        since=parse_window_bound("2026-08-01T00:00:00Z"),
+        until=parse_window_bound("2026-08-10T00:00:00Z"),
+        exclude_windows=[
+            (
+                parse_window_bound("2026-08-04T00:00:00Z"),
+                parse_window_bound("2026-08-05T00:00:00Z"),
+            )
+        ],
+        min_prs_per_arm=1,
+    )
+    # every PR stays assigned (all events are inside the window); only
+    # 93/94/95 count as merged
+    merged = report["metrics"]["merge_rate"]["per_arm"]["x"]
+    assert merged["k"] == 3 and merged["n"] == 6
+    cov = report["merge_coverage"]["per_arm"]["x"]
+    assert cov["merged_total"] == 3
+    assert cov["state_merged"] == 3
+    d2m = report["metrics"]["dispatch_to_merge_seconds_median"]["per_arm"]["x"]
+    # 95 is the only PR with both a dispatch ts and a usable merge ts:
+    # the windowed-out PRs contribute neither, and the fail-open PRs
+    # (93/94) count in merge_rate but carry no merge timestamp.
+    # dispatch 08-01T00:00 -> state merged_at 08-03T00:00 = 48h
+    assert d2m["n"] == 1
+    assert d2m["value"] == pytest.approx(172800.0)
 
 
 # ---------------------------------------------------------------------------
