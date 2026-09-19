@@ -233,9 +233,10 @@ def _fake_stop_gate(
     fake = types.ModuleType("fake_stop_gate")
 
     class _ChangedFile:
-        def __init__(self, path: str, deleted: bool = False) -> None:
+        def __init__(self, path: str, deleted: bool = False, untracked: bool = False) -> None:
             self.path = path
             self.deleted = deleted
+            self.untracked = untracked
 
     class _GateResult:
         def __init__(self, block: bool, reason: str = "") -> None:
@@ -251,11 +252,27 @@ def _fake_stop_gate(
     def _all_changed_files(repo_root: Path) -> tuple[Any, ...]:
         return changed
 
+    def _ruff_lint_paths(changed_files: tuple[Any, ...]) -> tuple[str, ...]:
+        # Mirrors the real worker_stop_gate._ruff_lint_paths predicate;
+        # getattr because several tests pass ad-hoc CF objects that carry
+        # no ``untracked`` attribute (treated as tracked, like the real
+        # dataclass's ``untracked=False`` default).
+        return tuple(
+            sorted(
+                cf.path
+                for cf in changed_files
+                if not cf.deleted
+                and cf.path.endswith(".py")
+                and not getattr(cf, "untracked", False)
+            )
+        )
+
     def _run_ruff(repo_root: Path, py_files: tuple[str, ...]) -> Any:
         return _GateResult(block=ruff_block, reason=ruff_reason)
 
     fake._repo_root = _repo_root  # type: ignore[attr-defined]
     fake._all_changed_files = _all_changed_files  # type: ignore[attr-defined]
+    fake._ruff_lint_paths = _ruff_lint_paths  # type: ignore[attr-defined]
     fake._run_ruff = _run_ruff  # type: ignore[attr-defined]
     return fake
 
