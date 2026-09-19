@@ -25,12 +25,28 @@
    "member_count": 9
   },
   {
+   "boundary": 29.5,
+   "bumps": [],
+   "file": "tests/attachment_contracts/test_archetypes.py",
+   "identity": "tests/attachment_contracts/test_archetypes.py::module",
+   "kind": "test_module",
+   "member_count": 31
+  },
+  {
    "boundary": 37.0,
    "bumps": [],
    "file": "tests/attachment_contracts/test_baseline.py",
    "identity": "tests/attachment_contracts/test_baseline.py::module",
    "kind": "test_module",
    "member_count": 41
+  },
+  {
+   "boundary": 29.5,
+   "bumps": [],
+   "file": "tests/test_ast_equivalence_gate.py",
+   "identity": "tests/test_ast_equivalence_gate.py::module",
+   "kind": "test_module",
+   "member_count": 30
   },
   {
    "boundary": 32.0,
@@ -41,12 +57,12 @@
    "member_count": 33
   },
   {
-   "boundary": 31.0,
+   "boundary": 29.5,
    "bumps": [],
    "file": "tests/test_charlie_work.py",
    "identity": "tests/test_charlie_work.py::module",
    "kind": "test_module",
-   "member_count": 417
+   "member_count": 248
   },
   {
    "boundary": 41.0,
@@ -136,6 +152,14 @@
    "member_count": 32
   },
   {
+   "boundary": 29.5,
+   "bumps": [],
+   "file": "tests/test_janitor_verdict.py",
+   "identity": "tests/test_janitor_verdict.py::module",
+   "kind": "test_module",
+   "member_count": 30
+  },
+  {
    "boundary": 34.5,
    "bumps": [],
    "file": "tests/test_local_issues.py",
@@ -197,6 +221,14 @@
    "identity": "tests/test_worktree.py::module",
    "kind": "test_module",
    "member_count": 222
+  },
+  {
+   "boundary": 29.5,
+   "bumps": [],
+   "file": "tests/test_write_gate_enforcement.py",
+   "identity": "tests/test_write_gate_enforcement.py::module",
+   "kind": "test_module",
+   "member_count": 30
   }
  ],
  "floor": 4,
