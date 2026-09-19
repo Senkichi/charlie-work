@@ -33,14 +33,6 @@
    "member_count": 41
   },
   {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_api_budget.py",
-   "identity": "tests/test_api_budget.py::module",
-   "kind": "test_module",
-   "member_count": 55
-  },
-  {
    "boundary": 32.0,
    "bumps": [],
    "file": "tests/test_backlog_reachability.py",
@@ -110,14 +102,6 @@
    "identity": "tests/test_cross_repo_gate.py::module",
    "kind": "test_module",
    "member_count": 35
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_git_push_lint_hook.py",
-   "identity": "tests/test_git_push_lint_hook.py::module",
-   "kind": "test_module",
-   "member_count": 42
   },
   {
    "boundary": 41.0,
