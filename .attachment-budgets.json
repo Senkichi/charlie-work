@@ -25,14 +25,6 @@
    "member_count": 9
   },
   {
-   "boundary": 39.5,
-   "bumps": [],
-   "file": "tests/attachment_contracts/test_baseline.py",
-   "identity": "tests/attachment_contracts/test_baseline.py::module",
-   "kind": "test_module",
-   "member_count": 41
-  },
-  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_api_budget.py",

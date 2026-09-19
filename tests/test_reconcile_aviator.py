@@ -1,8 +1,7 @@
 """Aviator stale-``blocked``-label tests for ``reconcile``.
 
 Split out of ``tests/test_reconcile.py`` (issue #1559, Track-1):
-``detect_aviator_stale_blocked`` (job-cannon #1387/#1400/#1398/#1392)
-and the matching ``apply_fixes`` lanes.
+``detect_aviator_stale_blocked`` and the matching ``apply_fixes`` lanes.
 """
 
 from __future__ import annotations
