@@ -209,7 +209,7 @@ silently forgotten.
 Mirror the per-adapter test pattern: new `tests/test_api_worker.py`,
 `tests/test_api_budget.py` (the per-issue selection layer's own test file was
 deleted along with it — see §5); third-arm additions to
-`tests/test_worker.py` / `tests/test_worker_health.py`; `dispatch_sessions`
+`tests/test_worker.py` / `tests/test_worker_health_api_budget.py`; `dispatch_sessions`
 partition coverage alongside the existing adapter glue tests. Routing and
 budget are pure functions over frozen inputs — exhaustively testable. No
 live-API calls in tests; provider env resolution tested against fake env.
