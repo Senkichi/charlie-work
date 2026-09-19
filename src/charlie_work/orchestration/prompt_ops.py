@@ -30,10 +30,16 @@ from charlie_work.prompts import (
     assert_no_merge_contract,
     prompt_template_digest,
 )
+from charlie_work.prompt_skills import active_prompt_variants
+from charlie_work.prompt_test_command import prompt_test_command_values
 
 
-def _render(self, template_name: str, values: dict[str, Any]) -> str:
-    return _wf.render_prompt(template_name, values, search_dirs=self.prompt_dirs)
+def _render(
+    self, template_name: str, values: dict[str, Any], *, variants: tuple[str, ...] = ()
+) -> str:
+    return _wf.render_prompt(
+        template_name, values, search_dirs=self.prompt_dirs, variants=variants
+    )
 
 
 def _write_worker_prompt(self, issue: dict[str, Any], *, dry_run: bool = False) -> Path:
@@ -70,7 +76,16 @@ def _write_worker_prompt(self, issue: dict[str, Any], *, dry_run: bool = False) 
             # string (omitted clause) plus a
             # ``worker_attachment_budget_failed`` warning event.
             "attachment_budget": self._build_attachment_budget_value(issue_number),
+            # The test command, derived from the consumer (dispatch.test_command,
+            # else its pyproject.toml). ``prompt_test_command`` is the single point
+            # of enforcement: no template hardcodes a runner.
+            **prompt_test_command_values(self.config.dispatch.test_command, self.repo_root),
         },
+        # Slash-command skills are named only when the consumer ships them for
+        # this harness; otherwise the plain git/gh loop renders. See prompt_skills.
+        variants=active_prompt_variants(
+            self.config.worker.harness, self.repo_root, self.prompt_dirs
+        ),
     )
     # Issue #714: enforce the no-merge contract on the *rendered output*
     # so a repo-local flat override that drops $section_no_merge_contract

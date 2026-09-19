@@ -55,9 +55,10 @@ $section_config_parity
    module/function/symbol your production diff touched and run every
    matching test file — not just the tests you wrote:
    ```bash
-   uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short
+   $targeted_test_command
    ```
    $section_execution_contract
+   $section_repo_commands_precedence
    **You share this host's cores and RAM with other concurrent workers** — if you use `pytest-xdist`, bound
    the pool (e.g. `-n 2`, not `-n auto`) so the fleet stays near one worker
    per core instead of paging the machine into swap.

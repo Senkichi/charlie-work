@@ -88,6 +88,7 @@ from .janitor import (
 from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
 from .labels import TransitionOutcome, transition
 from .paths import RuntimePaths, resolved_layout
+from .prompt_sections import section_variant_names
 from .prompts import (
     PromptTemplateError,
     render_prompt,  # noqa: F401  (deliberate re-export; patched on the workflow module in tests, reached via _wf.render_prompt by orchestration/prompt_ops.py -- Tier D, #1627)
@@ -3069,6 +3070,11 @@ WORKER_PROMPT_KEYS: frozenset[str] = frozenset(
         # the rework lane receives budget findings via the review packet's
         # `$attachment_budget_section` instead.
         "attachment_budget",
+        # The test command, resolved by ``prompt_test_command`` (config
+        # override, else derived from the consumer's pyproject.toml, else a
+        # pointer to the repository's own docs). Always supplied, never empty.
+        "targeted_test_command",
+        "full_suite_command",
     }
 )
 REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
@@ -3083,6 +3089,9 @@ REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
         "dispatch_note_block",
         "required_changes_section",
         "branch_name",
+        # Same resolution as the worker prompt's (``prompt_test_command``).
+        "targeted_test_command",
+        "full_suite_command",
     }
 )
 
@@ -3194,7 +3203,14 @@ def check_prompt_template_drift(
         resolved = resolve_template(template_name, search_dirs)
         if not resolved.is_file():
             continue
-        missing = unsupplied_placeholders(template_name, keys, search_dirs=search_dirs)
+        # A partial inside a section variant is reachable only when that variant
+        # is active, so a stale placeholder there would stay armed until the
+        # matching consumer dispatches. Check the base set and every variant on disk.
+        missing: set[str] = set()
+        for variants in ((), *((name,) for name in section_variant_names(search_dirs))):
+            missing |= unsupplied_placeholders(
+                template_name, keys, search_dirs=search_dirs, variants=variants
+            )
         if missing:
             errors.append(PromptTemplateError(resolved, missing))
     return errors

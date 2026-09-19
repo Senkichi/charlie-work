@@ -54,9 +54,7 @@ not make it for them.
   when auto-update is off.
 - Preserve the original issue scope.
 - Add or update tests for the review findings.
-- Before pushing, run `/preflight` (ruff + ruff-format + pre-commit) and COMMIT anything
-  it fixes. Pushing to an existing PR is gated the same as opening one — a CI-dirty tree
-  (uncommitted reflow, un-normalized fixture) will be blocked.
+$section_rework_preflight
 - Re-run verification and update the PR body or comment with results.
 - If you disagree with a finding, explain with evidence in the PR instead of ignoring it.
 
@@ -101,9 +99,10 @@ After your final commit:
    touched, plus `grep tests/` for every module/function/symbol the diff
    touched — not just the tests you wrote:
    ```bash
-   uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short
+   $targeted_test_command
    ```
    $section_execution_contract
+   $section_repo_commands_precedence
 2. Push your branch:
    ```bash
    git push origin $branch_name
