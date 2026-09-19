@@ -373,9 +373,13 @@ def test_claude_code_worker_prompt_includes_push_then_verify() -> None:
     assert "git rev-parse HEAD" in prompt
 
 
-def test_worker_and_rework_templates_reference_the_same_test_command_placeholders() -> None:
+def test_worker_and_rework_templates_contain_identical_canonical_test_command() -> None:
     """worker.md, worker_claude_code.md and rework.md take the test command from the
     same two placeholders, and none of them hardcodes a runner.
+
+    The name is unchanged from when the command was a literal in each template: the
+    invariant (one canonical command shared by every template) is the same, only its
+    representation moved to a placeholder.
 
     This prevents silent drift where one template uses the full command and the other
     a partial variant (issue #91). The command used to be a literal in each template;
