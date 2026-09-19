@@ -44,7 +44,6 @@
   "tests/test_issue_1684_quota_classifier.py": 1000,
   "tests/test_merge_preflight_hook.py": 1200,
   "tests/test_prompt_render_contract.py": 1200,
-  "tests/test_prompt_sections.py": 1200,
   "tests/test_reconcile.py": 1000,
   "tests/test_rework_prompts_split.py": 1000,
   "tests/test_stale_checks_retrigger.py": 1000,
