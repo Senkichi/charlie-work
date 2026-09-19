@@ -49,7 +49,7 @@
   "tests/test_process_utils.py": 1400,
   "tests/test_prompt_render_contract.py": 1200,
   "tests/test_prompt_sections.py": 1200,
-  "tests/test_reconcile.py": 5400,
+  "tests/test_reconcile.py": 1000,
   "tests/test_rework_prompts_split.py": 1000,
   "tests/test_stale_checks_retrigger.py": 1000,
   "tests/test_state_dir_migration.py": 1600,
@@ -57,7 +57,6 @@
   "tests/test_verdict_provenance_enforcement.py": 1000,
   "tests/test_wedge_watchdog.py": 1600,
   "tests/test_worker.py": 2800,
-  "tests/test_worker_health.py": 2400,
   "tests/test_worker_stop_gate.py": 1200,
   "tests/test_worktree.py": 8800,
   "tests/test_write_gate_enforcement.py": 2000
