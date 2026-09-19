@@ -20626,7 +20626,7 @@ def test_classify_dead_sessions_worker_blocked_log_tail_fallback_escalates_and_s
     `if (worker_blocked or len(redispatch_at) > ...)` mutation at
     workflow.py's _classify_dead_sessions_and_update_throttle_state; it also
     independently covers post_mortem.classify_and_record's log-tail fallback
-    branch (see test_post_mortem.py's
+    branch (see test_post_mortem_log_tail_fallback.py's
     test_classify_and_record_log_tail_fallback_detects_worker_blocked_when_db_unavailable
     for that mutation gate's verbatim transcript).
     """
