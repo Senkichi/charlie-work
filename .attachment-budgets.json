@@ -46,7 +46,7 @@
    "file": "tests/test_charlie_work.py",
    "identity": "tests/test_charlie_work.py::module",
    "kind": "test_module",
-   "member_count": 995
+   "member_count": 851
   },
   {
    "boundary": 41.0,
@@ -62,21 +62,6 @@
    "identity": "tests/test_checks.py::module",
    "kind": "test_module",
    "member_count": 47
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1522",
-     "actor": "worker",
-     "reason": "growth from PRs #1522 #1449; operator decision 2026-09-02, issue 1458",
-     "to": 141
-    }
-   ],
-   "file": "tests/test_claude_code_adapter.py",
-   "identity": "tests/test_claude_code_adapter.py::module",
-   "kind": "test_module",
-   "member_count": 130
   },
   {
    "boundary": 41.0,
