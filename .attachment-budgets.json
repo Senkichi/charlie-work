@@ -114,14 +114,6 @@
   {
    "boundary": 41.0,
    "bumps": [],
-   "file": "tests/test_fix_reconcile.py",
-   "identity": "tests/test_fix_reconcile.py::module",
-   "kind": "test_module",
-   "member_count": 47
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
    "file": "tests/test_git_push_lint_hook.py",
    "identity": "tests/test_git_push_lint_hook.py::module",
    "kind": "test_module",
@@ -158,14 +150,6 @@
    "identity": "tests/test_private_slug_gate.py::module",
    "kind": "test_module",
    "member_count": 39
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_prompt_sections.py",
-   "identity": "tests/test_prompt_sections.py::module",
-   "kind": "test_module",
-   "member_count": 58
   },
   {
    "boundary": 34.5,
