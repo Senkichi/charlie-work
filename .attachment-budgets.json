@@ -57,14 +57,6 @@
    "member_count": 33
   },
   {
-   "boundary": 29.5,
-   "bumps": [],
-   "file": "tests/test_charlie_work.py",
-   "identity": "tests/test_charlie_work.py::module",
-   "kind": "test_module",
-   "member_count": 248
-  },
-  {
    "boundary": 41.0,
    "bumps": [
     {
@@ -118,6 +110,22 @@
    "identity": "tests/test_cross_repo_gate.py::module",
    "kind": "test_module",
    "member_count": 35
+  },
+  {
+   "boundary": 28.5,
+   "bumps": [],
+   "file": "tests/test_deescalation.py",
+   "identity": "tests/test_deescalation.py::module",
+   "kind": "test_module",
+   "member_count": 29
+  },
+  {
+   "boundary": 28.5,
+   "bumps": [],
+   "file": "tests/test_fix_escalation_paths.py",
+   "identity": "tests/test_fix_escalation_paths.py::module",
+   "kind": "test_module",
+   "member_count": 29
   },
   {
    "boundary": 41.0,
@@ -206,6 +214,14 @@
    "identity": "tests/test_wedge_watchdog.py::module",
    "kind": "test_module",
    "member_count": 36
+  },
+  {
+   "boundary": 28.5,
+   "bumps": [],
+   "file": "tests/test_worker.py",
+   "identity": "tests/test_worker.py::module",
+   "kind": "test_module",
+   "member_count": 29
   },
   {
    "boundary": 41.0,

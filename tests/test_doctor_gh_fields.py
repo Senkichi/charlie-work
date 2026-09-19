@@ -98,12 +98,13 @@ def test_fake_github_payloads_align_with_field_constants() -> None:
     reconcile_pr_fields = set(github_module.RECONCILE_PR_FIELDS.split(","))
     reconcile_issue_fields = set(github_module.RECONCILE_ISSUE_FIELDS.split(","))
 
-    # Check the main FakeGitHub in test_charlie_work.py
+    # Check the main FakeGitHub, hoisted to _fakes_github.py in #1284 (the
+    # test_charlie_work.py monolith itself was fully split in #1554).
     # Import dynamically to avoid module import issues
-    test_charlie_work_path = Path(__file__).parent / "test_charlie_work.py"
-    test_charlie_work = load_script_module(test_charlie_work_path, "test_charlie_work")
+    fakes_path = Path(__file__).parent / "_fakes_github.py"
+    fakes_module = load_script_module(fakes_path, "_fakes_github")
 
-    MainFakeGitHub = test_charlie_work.FakeGitHub
+    MainFakeGitHub = fakes_module.FakeGitHub
     fake_gh = MainFakeGitHub()
 
     # Verify PR payload keys are subset of PR_LIST_FIELDS

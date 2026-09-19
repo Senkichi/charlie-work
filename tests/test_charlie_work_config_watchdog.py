@@ -196,3 +196,22 @@ def test_config_watchdog_accepts_new_fields(tmp_path: Path) -> None:
     assert config.watchdog.wall_clock_kill is True
     assert config.watchdog.loop_stall_multiplier == 3
     assert config.watchdog.loop_kill is True
+
+
+def test_watchdog_config_additive_redispatch_fields(tmp_path: Path) -> None:
+    """Test that WatchdogConfig loads with defaults when new fields are missing (issue #165)."""
+    # Create a config file without the new fields
+    config_path = tmp_path / "orchestrator.yaml"
+    config_content = """
+watchdog:
+  enabled: true
+  stall_minutes: 20
+"""
+    config_path.write_text(config_content, encoding="utf-8")
+
+    # Load the config - should not raise ConfigError
+    config = load_config(config_path)
+
+    # Verify defaults are applied
+    assert config.watchdog.redispatch_window_minutes == 240
+    assert config.watchdog.max_auto_redispatch == 3

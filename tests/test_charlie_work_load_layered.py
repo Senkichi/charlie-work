@@ -208,3 +208,60 @@ def test_load_layered_config_require_global_present_but_invalid_keeps_per_repo(
     )
     assert warning, "discarding an invalid global layer must be logged as a warning"
     assert str(global_config_path) in warning, "the warning must name the global path"
+
+
+def test_layered_config_logs_whether_global_layer_was_read(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The provenance line must report *readership*, not resolved values.
+
+    A section that is missing from the global file and a global file that was
+    never read produce byte-identical resolved config -- pristine dataclass
+    defaults -- but demand opposite fixes. Issue #590 stalled on exactly that
+    ambiguity, so this asserts the one fact that separates them survives in the
+    log even when the resulting config looks entirely ordinary.
+    """
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Absent global layer: resolved config is all defaults, and the log says why.
+    with caplog.at_level(logging.DEBUG, logger="charlie_work.global_config"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+    absent_line = "\n".join(
+        r.getMessage() for r in caplog.records if "Layered config" in r.getMessage()
+    )
+    assert "absent" in absent_line, f"absent global layer not reported: {absent_line!r}"
+    assert str(fleet_dir_path / "config.yaml") in absent_line, "the path itself must be logged"
+
+    # Present global layer: same call, and the log distinguishes it.
+    caplog.clear()
+    (fleet_dir_path / "config.yaml").write_text(
+        "dispatch:\n  max_concurrent_sessions: 5\n", encoding="utf-8"
+    )
+    with caplog.at_level(logging.DEBUG, logger="charlie_work.global_config"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+    present_line = "\n".join(
+        r.getMessage() for r in caplog.records if "Layered config" in r.getMessage()
+    )
+    assert "present" in present_line, f"present global layer not reported: {present_line!r}"
+    assert "absent" not in present_line, "a present layer must not read as absent"
+    assert "dispatch" in present_line, "the sections actually read must be named"
+    assert "bytes=" in present_line, "same vocabulary as the supervisor's INFO line"
+
+    # An empty global file resolves to pristine defaults with zero sections --
+    # indistinguishable from an absent one on the resolved config alone, and the
+    # reason this line carries a byte count rather than a bare "present".
+    caplog.clear()
+    (fleet_dir_path / "config.yaml").write_text("", encoding="utf-8")
+    with caplog.at_level(logging.DEBUG, logger="charlie_work.global_config"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+    empty_line = "\n".join(
+        r.getMessage() for r in caplog.records if "Layered config" in r.getMessage()
+    )
+    assert "bytes=0" in empty_line, f"a truncated global layer must be visible: {empty_line!r}"
+    assert "absent" not in empty_line, "an empty file is present-but-empty, not absent"
+    assert "(none)" in empty_line, "an empty file contributes no sections"
