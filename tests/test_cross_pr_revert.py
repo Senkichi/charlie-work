@@ -40,7 +40,7 @@ def _green_pr(**overrides) -> dict:
     """Minimal green-PR dict for the cross-PR revert gate.
 
     ``detect_cross_pr_revert`` only reads ``body``, ``headRefName`` and
-    ``baseRefName``; the remaining fields mirror ``tests/test_janitor.py``'s
+    ``baseRefName``; the remaining fields mirror ``tests/_janitor_fixtures.py``'s
     ``_green_pr`` shape for consistency.
     """
     base = {
