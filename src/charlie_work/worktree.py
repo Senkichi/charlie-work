@@ -67,13 +67,23 @@ _DEFAULT_TIMEOUT_SECONDS = 60
 _REMOTE_TIMEOUT_SECONDS = 20
 
 
-def _run_remote_captured(command: list[str], cwd: Path) -> RunResult:
-    """Run a network-touching git command with a short, retryable timeout."""
-    result = run_captured(command, cwd=cwd, timeout_seconds=_REMOTE_TIMEOUT_SECONDS)
+def _run_remote_captured(
+    command: list[str], cwd: Path, *, extra_env: dict[str, str] | None = None
+) -> RunResult:
+    """Run a network-touching git command with a short, retryable timeout.
+
+    ``extra_env`` is only forwarded to ``run_captured`` when a caller actually
+    supplies one -- several tests monkeypatch ``worktree.run_captured`` with a
+    narrow ``(command, *, cwd, timeout_seconds)`` stub, and unconditionally
+    passing ``extra_env=None`` through would break every one of those call
+    sites even though they never asked for extra env vars.
+    """
+    kwargs: dict[str, Any] = {"extra_env": extra_env} if extra_env else {}
+    result = run_captured(command, cwd=cwd, timeout_seconds=_REMOTE_TIMEOUT_SECONDS, **kwargs)
     # Retry once on timeout: a transient network stall should not permanently
     # block reclaim of a pristine worktree.
     if result.timed_out:
-        result = run_captured(command, cwd=cwd, timeout_seconds=_REMOTE_TIMEOUT_SECONDS)
+        result = run_captured(command, cwd=cwd, timeout_seconds=_REMOTE_TIMEOUT_SECONDS, **kwargs)
     return result
 
 
@@ -5342,16 +5352,41 @@ def clean_worktrees(
                 # `_worktree_refuse_to_reset_reason`: a check whose shape counts
                 # the expected post-merge topology as danger.
                 #
-                # Known limitation, deliberately left fail-closed: the containment
-                # test needs `merged_head_sha` to still be in the local object
-                # store. For a squash-merged PR whose remote branch was deleted,
-                # nothing references that SHA once the local branch sits behind it,
-                # so a `git gc` can prune it and the object-presence gate below
-                # starts refusing. That is the safe direction (refuse, don't
-                # remove), and it reports its own distinct reason string — if
-                # worktree-clean ever "stops removing things" again, read the
-                # reasons before re-deriving anything.
+                # The containment test needs `merged_head_sha` to still be in
+                # the local object store. For a squash-merged PR whose remote
+                # branch was deleted, nothing references that SHA once the
+                # local branch sits behind it, so a `git gc` can prune it (or
+                # this repo may simply never have fetched a branch that ever
+                # pointed at it), and the object-presence gate below starts
+                # refusing every otherwise-reclaimable worktree, permanently
+                # (37 of 63 candidates in one live sweep; root growing without
+                # bound). GitHub still serves the commit via
+                # `refs/pull/<N>/head` even after the head branch is deleted —
+                # unlike a raw-SHA fetch, which most servers (GitHub included)
+                # refuse to advertise — so attempt one bounded, non-interactive
+                # fetch of that ref and re-check before failing closed. The
+                # fetch only adds objects: it never moves a branch, touches a
+                # worktree, or leaves FETCH_HEAD in a state some other call
+                # site depends on, so it is safe to run unconditionally,
+                # including under `--dry-run` — every other eligibility probe
+                # in this function (gh pr view, rev-parse, the ancestor check
+                # below) already runs regardless of `dry_run`, so withholding
+                # just this fetch would make a dry-run preview under-report
+                # what a real run could actually reclaim.
+                if not _object_exists(repo_root, merged_head_sha) and _has_origin_remote(
+                    repo_root
+                ):
+                    _run_remote_captured(
+                        ["git", "fetch", "origin", f"refs/pull/{pr_number}/head"],
+                        cwd=repo_root,
+                        extra_env={"GIT_TERMINAL_PROMPT": "0"},
+                    )
                 if not _object_exists(repo_root, merged_head_sha):
+                    # Still absent -- no origin remote, no such PR ref on the
+                    # remote, or the fetch itself failed/timed out.
+                    # `_run_remote_captured` never raises, so a network
+                    # failure here degrades to this same fail-closed skip
+                    # rather than aborting the sweep.
                     skipped.append(
                         {
                             "worktree": str(wt_path),
