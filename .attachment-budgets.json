@@ -25,6 +25,14 @@
    "member_count": 9
   },
   {
+   "boundary": 37.0,
+   "bumps": [],
+   "file": "tests/attachment_contracts/test_baseline.py",
+   "identity": "tests/attachment_contracts/test_baseline.py::module",
+   "kind": "test_module",
+   "member_count": 41
+  },
+  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_api_budget.py",
@@ -158,6 +166,14 @@
    "member_count": 59
   },
   {
+   "boundary": 37.0,
+   "bumps": [],
+   "file": "tests/test_private_slug_gate.py",
+   "identity": "tests/test_private_slug_gate.py::module",
+   "kind": "test_module",
+   "member_count": 39
+  },
+  {
    "boundary": 41.0,
    "bumps": [],
    "file": "tests/test_process_utils.py",
@@ -195,14 +211,6 @@
    "identity": "tests/test_safe_ref.py::module",
    "kind": "test_module",
    "member_count": 44
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_state_dir_migration.py",
-   "identity": "tests/test_state_dir_migration.py::module",
-   "kind": "test_module",
-   "member_count": 60
   },
   {
    "boundary": 41.0,
