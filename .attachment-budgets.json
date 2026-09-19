@@ -41,12 +41,12 @@
    "member_count": 55
   },
   {
-   "boundary": 41.0,
+   "boundary": 37.0,
    "bumps": [],
    "file": "tests/test_charlie_work.py",
    "identity": "tests/test_charlie_work.py::module",
    "kind": "test_module",
-   "member_count": 851
+   "member_count": 744
   },
   {
    "boundary": 41.0,
@@ -134,14 +134,6 @@
    "identity": "tests/test_local_issues.py::module",
    "kind": "test_module",
    "member_count": 37
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_post_mortem.py",
-   "identity": "tests/test_post_mortem.py::module",
-   "kind": "test_module",
-   "member_count": 59
   },
   {
    "boundary": 37.0,

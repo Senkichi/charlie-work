@@ -14,9 +14,16 @@ import json
 from pathlib import Path
 from typing import Any
 
-from _fakes_github import FakeGitHub
+from _fakes_github import FakeGitHub, FakeGitHubWithChecks
+from _helpers import _STALE_CI_REQUIRED
 from charlie_work.claude_code import ClaudeWorkerRecord
-from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig
+from charlie_work.config import (
+    AutoMergeConfig,
+    OrchestratorConfig,
+    ReviewConfig,
+    ReviewDispatchConfig,
+    TestAdequacyConfig,
+)
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
@@ -243,3 +250,107 @@ def _round_dir(paths: Any, round_number: int) -> Path:
 
 def _pr_dir(paths: Any) -> Path:
     return paths.prs / f"pr-{_PR_NUMBER}"
+
+
+# --- Helpers hoisted from test_charlie_work.py (issue #1549, wave 3/8) -------
+
+
+def _load_external_fixture(name: str) -> list[dict[str, Any]]:
+    """Return a live-payload-shaped external findings fixture by name."""
+    path = Path(__file__).parent / "fixtures" / "external_findings" / f"{name}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _review_queue_app(
+    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None, dry_run: bool = True
+) -> OrchestratorApp:
+    """Build an OrchestratorApp with FakeGitHub and a default state file.
+
+    ``dry_run`` defaults to ``True`` (unchanged from every existing caller of
+    this helper). Issue #784 AC-8 Case 2's stranded-verdict repair is
+    intentionally gated on ``not self.dry_run`` (it mutates state and GitHub
+    labels), so tests exercising that repair pass ``dry_run=False`` explicitly.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    if prs is not None:
+        fake_gh.prs = prs
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
+
+
+def _review_queue_carry_forward_app(
+    tmp_path: Path,
+    *,
+    prs: list[dict[str, Any]] | None = None,
+    dry_run: bool = False,
+) -> OrchestratorApp:
+    """Build an OrchestratorApp for carry-forward tests."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    if prs is not None:
+        fake_gh.prs = prs
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
+
+
+def _stale_ci_review_queue_app(
+    tmp_path: Path,
+    *,
+    prs: list[dict[str, Any]],
+    checks: list[dict[str, Any]],
+    dry_run: bool = False,
+) -> OrchestratorApp:
+    """Build an OrchestratorApp with a configured ``required_checks`` set and
+    a ``FakeGitHubWithChecks`` fixture, for issue #1111's stale-CI-verdict
+    ``review_queue()`` tests. ``required_check_citation_names``/
+    ``is_stale_ci_verdict`` only fire when ``config.auto_merge.required_checks``
+    is non-empty, which the default ``OrchestratorConfig()`` used by the
+    sibling carry-forward helper does not set."""
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(required_checks=_STALE_CI_REQUIRED))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHubWithChecks(checks=checks)
+    fake_gh.prs = prs
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
+
+
+def _stale_ci_pr(pr_number: int, issue_number: int, head: str) -> dict[str, Any]:
+    return {
+        "number": pr_number,
+        "title": f"Fix #{issue_number}",
+        "url": f"https://example.test/pull/{pr_number}",
+        "headRefName": f"agent/issue-{issue_number}-fix",
+        "baseRefName": "main",
+        "headRefOid": head,
+        "mergeStateStatus": "CLEAN",
+        "body": f"Closes #{issue_number}",
+        "labels": [],
+        "isCrossRepository": False,
+        "state": "OPEN",
+    }
+
+
+def _test_adequacy_app(
+    tmp_path: Path, *, enabled: bool, max_rework_cycles: int = 2
+) -> OrchestratorApp:
+    config = OrchestratorConfig(
+        test_adequacy=TestAdequacyConfig(enabled=enabled, exempt_marker="Test-exempt:"),
+        review=ReviewConfig(max_rework_cycles=max_rework_cycles),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    return OrchestratorApp(tmp_path, paths, config, FakeGitHub())
