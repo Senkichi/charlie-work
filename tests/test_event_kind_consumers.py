@@ -130,7 +130,7 @@ _PENDING_RE = re.compile(r"^pending(?:\s+#(?P<num>\d+))?\b")
 
 # ---------------------------------------------------------------------------
 # AST scope/assignment helpers -- mirrors the proven approach in
-# tests/test_instrumentation.py's _resolve_literal (a different concern,
+# tests/_instrumentation_kind_scanner.py's _resolve_literal (a different concern,
 # registry completeness, built to solve the identical "reduce this
 # expression to a finite literal string set, or admit failure" problem).
 # Kept as an independent copy here rather than a cross-module import so this
