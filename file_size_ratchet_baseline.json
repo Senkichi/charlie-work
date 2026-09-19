@@ -48,7 +48,7 @@
   "tests/test_verdict_parsing_split.py": 1000,
   "tests/test_verdict_provenance_enforcement.py": 1000,
   "tests/test_wedge_watchdog.py": 1600,
-  "tests/test_worker.py": 2800,
+  "tests/test_worker.py": 1400,
   "tests/test_worktree.py": 8800,
   "tests/test_write_gate_enforcement.py": 2000
 }
