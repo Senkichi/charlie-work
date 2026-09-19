@@ -49,12 +49,12 @@
    "member_count": 33
   },
   {
-   "boundary": 41.0,
+   "boundary": 37.0,
    "bumps": [],
    "file": "tests/test_charlie_work.py",
    "identity": "tests/test_charlie_work.py::module",
    "kind": "test_module",
-   "member_count": 851
+   "member_count": 744
   },
   {
    "boundary": 41.0,
@@ -167,14 +167,6 @@
    "member_count": 54
   },
   {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_post_mortem.py",
-   "identity": "tests/test_post_mortem.py::module",
-   "kind": "test_module",
-   "member_count": 59
-  },
-  {
    "boundary": 37.0,
    "bumps": [],
    "file": "tests/test_private_slug_gate.py",
@@ -183,12 +175,12 @@
    "member_count": 39
   },
   {
-   "boundary": 41.0,
+   "boundary": 37.0,
    "bumps": [],
-   "file": "tests/test_process_utils.py",
-   "identity": "tests/test_process_utils.py::module",
+   "file": "tests/test_private_slug_gate.py",
+   "identity": "tests/test_private_slug_gate.py::module",
    "kind": "test_module",
-   "member_count": 47
+   "member_count": 39
   },
   {
    "boundary": 41.0,
