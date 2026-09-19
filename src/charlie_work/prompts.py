@@ -310,6 +310,7 @@ def unsupplied_placeholders(
     supplied_keys: Iterable[str],
     *,
     search_dirs: Sequence[Path] = (),
+    variants: Sequence[str] = (),
 ) -> set[str]:
     """Placeholders the resolved template references that nothing supplies.
 
@@ -329,6 +330,11 @@ def unsupplied_placeholders(
     ``$required_changes_section``. The reverse direction (every supplied key
     used) is not an error; at most a lint.
 
+    ``variants`` names the section overlays to resolve under (see
+    :func:`prompt_sections.section_variables`). A partial inside an overlay is only
+    reachable when its variant is active, so a caller guarding the whole template
+    surface must check the base set and each variant, not just the base.
+
     No dispatch, no worker, no network: this reads template and section files
     off disk only, so it can run at supervisor startup and in CI to catch a
     drifting override *before* it crashes a live dispatch with an uncaught
@@ -338,7 +344,7 @@ def unsupplied_placeholders(
 
     template_path = resolve_template(template_name, search_dirs)
     template_text = template_path.read_text(encoding="utf-8")
-    sections = section_variables(search_dirs=tuple(search_dirs))
+    sections = section_variables(search_dirs=tuple(search_dirs), variants=tuple(variants))
     available = set(supplied_keys) | set(sections)
     return _missing_placeholders(template_text, sections, available)
 
@@ -349,6 +355,7 @@ def render_prompt(
     *,
     search_dirs: Sequence[Path] = (),
     strict: bool = True,
+    variants: Sequence[str] = (),
 ) -> str:
     """Render ``template_name`` against ``values``.
 
@@ -356,13 +363,16 @@ def render_prompt(
     nothing supplies raises :class:`PromptTemplateError` instead of emitting the
     literal ``$placeholder``. Callers that genuinely want partial rendering must
     opt out explicitly.
+
+    ``variants`` selects section overlays (``worker_sections/<variant>/``); see
+    :func:`prompt_sections.section_variables`.
     """
     from .prompt_sections import section_variables
 
     template_path = resolve_template(template_name, search_dirs)
     template_text = template_path.read_text(encoding="utf-8")
     template = Template(template_text)
-    sections = section_variables(search_dirs=tuple(search_dirs))
+    sections = section_variables(search_dirs=tuple(search_dirs), variants=tuple(variants))
     # Explicit values win over section text on any future key collision.
     merged = {**sections, **values}
     safe_values = {key: str(value) for key, value in merged.items()}

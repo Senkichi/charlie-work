@@ -36,21 +36,11 @@ $section_parallel_investigation
 
 $section_config_parity
 
-## Available skills
-
-The following skills are available to help you complete this task:
-
-- `/create-branch` - Ensure the branch is created and checked out
-- `/commit` - Create a conventional commit with proper formatting
-- `/test` - Run the test suite and verify all tests pass (only if it wraps the canonical command below)
-- `/preflight` - Match CI (ruff + ruff-format + pre-commit) before pushing
-- `/push` - Push the branch to GitHub
-- `/create-pr` - Create a pull request with proper formatting
-- `/complete` - Finalize the session and verify cleanup
+$section_available_skills
 
 ## Required implementation loop
 
-1. Use `/create-branch` to ensure you're on the correct branch.
+1. $section_loop_branch_step
 2. Read `CLAUDE.md`, `CONTRIBUTING.md`, the issue, and relevant code.
 3. Reproduce or precisely explain the defect/requirement.
 4. Implement the smallest correct change.
@@ -61,21 +51,14 @@ The following skills are available to help you complete this task:
    module/function/symbol your production diff touched and run every
    matching test file — not just the tests you wrote:
    ```bash
-   uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short
+   $targeted_test_command
    ```
    $section_execution_contract
-   The `/test` skill is a convenience shortcut but may not cover
-   every impacted file — always use the explicit command for final
-   verification.
+   $section_loop_test_skill_note
+   $section_repo_commands_precedence
 6. Add or update regression tests unless not applicable.
 7. $section_ruff_preflight
-8. Use `/commit` to commit your changes with conventional format.
-9. Use `/preflight` to match CI (ruff, ruff-format, pre-commit). Commit anything it
-   fixes — an uncommitted reflow or an un-normalized fixture is the #1 cause of a
-   green-locally / red-on-CI PR, and the push/PR gate will block you on it.
-10. Use `/push` to push your branch to GitHub.
-11. Use `/create-pr` to create a pull request with proper formatting.
-12. Use `/complete` to finalize the session.
+$section_loop_finish_steps
 
 $section_mutation_check
 

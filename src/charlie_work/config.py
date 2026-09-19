@@ -317,6 +317,14 @@ class DispatchConfig:
     # Package template rendered for rework prompts. Mirrors worker_template so the
     # orchestrator has a single source of truth for the rework prompt filename.
     rework_template: str = "rework.md"
+    # Runner prefix the worker/rework prompts tell workers to run, e.g.
+    # "uv run --directory server pytest" for a repo whose pyproject.toml is not at
+    # the root. The prompt appends the impacted test files and "-q --tb=short".
+    # Empty (default) derives it from the repo's own pyproject.toml -- the extra or
+    # dependency group that declares pytest -- and, when nothing is derivable,
+    # tells the worker to use the command the repository documents in CLAUDE.md.
+    # See prompt_test_command.
+    test_command: str = ""
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
     max_concurrent_sessions: int = 0
@@ -2217,6 +2225,15 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'dispatch' key 'base_ref' must be a string, "
             f"got {type(base_ref).__name__}"
         )
+    test_command = dispatch_data.get("test_command")
+    if test_command is not None and not isinstance(test_command, str):
+        raise ConfigError(
+            "config section 'dispatch' key 'test_command' must be a string, "
+            f"got {type(test_command).__name__}"
+        )
+    # A key left blank in YAML (``test_command:``) parses to None; the field is a str
+    # whose empty value means "derive it", so normalize here rather than at each reader.
+    dispatch_data["test_command"] = test_command or ""
     order = dispatch_data.get("order")
     if order is not None and not isinstance(order, str):
         raise ConfigError(
