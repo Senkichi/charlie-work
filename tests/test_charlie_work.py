@@ -20626,7 +20626,7 @@ def test_classify_dead_sessions_worker_blocked_log_tail_fallback_escalates_and_s
     `if (worker_blocked or len(redispatch_at) > ...)` mutation at
     workflow.py's _classify_dead_sessions_and_update_throttle_state; it also
     independently covers post_mortem.classify_and_record's log-tail fallback
-    branch (see test_post_mortem.py's
+    branch (see test_post_mortem_log_tail_fallback.py's
     test_classify_and_record_log_tail_fallback_detects_worker_blocked_when_db_unavailable
     for that mutation gate's verbatim transcript).
     """
@@ -34417,7 +34417,7 @@ def test_classify_dead_sessions_launch_failed_api_session_settles_budget_ledger(
 # ``elif w.adapter_kind == "api"`` branches threaded through workflow.py /
 # reconcile.py). The pure helpers (_classify_session_failure,
 # _api_session_over_budget) are tested in test_claude_code_adapter.py /
-# test_worker_health.py; these tests exercise the production call sites so a
+# test_worker_health_api_budget.py; these tests exercise the production call sites so a
 # wiring regression that drops the api branch or the budget-kill block is
 # caught.
 # ---------------------------------------------------------------------------

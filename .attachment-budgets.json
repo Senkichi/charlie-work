@@ -64,7 +64,7 @@
    "member_count": 47
   },
   {
-   "boundary": 32.0,
+   "boundary": 34.5,
    "bumps": [],
    "file": "tests/test_citation_check.py",
    "identity": "tests/test_citation_check.py::module",
@@ -96,7 +96,7 @@
    "member_count": 114
   },
   {
-   "boundary": 32.0,
+   "boundary": 34.5,
    "bumps": [],
    "file": "tests/test_cross_repo_gate.py",
    "identity": "tests/test_cross_repo_gate.py::module",
@@ -136,15 +136,15 @@
    "member_count": 42
   },
   {
-   "boundary": 41.0,
+   "boundary": 32.0,
    "bumps": [],
    "file": "tests/test_instrumentation.py",
    "identity": "tests/test_instrumentation.py::module",
    "kind": "test_module",
-   "member_count": 58
+   "member_count": 34
   },
   {
-   "boundary": 32.0,
+   "boundary": 34.5,
    "bumps": [],
    "file": "tests/test_local_issues.py",
    "identity": "tests/test_local_issues.py::module",
@@ -165,14 +165,6 @@
    "identity": "tests/test_merge_preflight_hook.py::module",
    "kind": "test_module",
    "member_count": 54
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_post_mortem.py",
-   "identity": "tests/test_post_mortem.py::module",
-   "kind": "test_module",
-   "member_count": 59
   },
   {
    "boundary": 37.0,
@@ -199,27 +191,12 @@
    "member_count": 58
   },
   {
-   "boundary": 32.0,
+   "boundary": 34.5,
    "bumps": [],
    "file": "tests/test_prompt_skills.py",
    "identity": "tests/test_prompt_skills.py::module",
    "kind": "test_module",
    "member_count": 35
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1480",
-     "actor": "worker",
-     "reason": "growth from PRs #1480 #1395 #1431; operator decision 2026-09-02, issue 1458",
-     "to": 153
-    }
-   ],
-   "file": "tests/test_reconcile.py",
-   "identity": "tests/test_reconcile.py::module",
-   "kind": "test_module",
-   "member_count": 135
   },
   {
    "boundary": 41.0,
@@ -238,7 +215,7 @@
    "member_count": 60
   },
   {
-   "boundary": 32.0,
+   "boundary": 34.5,
    "bumps": [],
    "file": "tests/test_wedge_watchdog.py",
    "identity": "tests/test_wedge_watchdog.py::module",
@@ -259,21 +236,6 @@
    "identity": "tests/test_worker.py::module",
    "kind": "test_module",
    "member_count": 48
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1426",
-     "actor": "worker",
-     "reason": "pre-freeze artifact: PR #1426, not shadow-week accretion; operator decision 2026-09-02, issue 1458",
-     "to": 59
-    }
-   ],
-   "file": "tests/test_worker_health.py",
-   "identity": "tests/test_worker_health.py::module",
-   "kind": "test_module",
-   "member_count": 55
   },
   {
    "boundary": 41.0,
