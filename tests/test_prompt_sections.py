@@ -8,7 +8,14 @@ import pytest
 
 from charlie_work.markdown_fence import fenced_block
 from charlie_work.prompt_sections import section_variables
+from charlie_work.prompt_test_command import prompt_test_command_values
 from charlie_work.prompts import render_prompt
+
+# The test-command placeholders every worker/rework writer supplies. Taken from the
+# production function (no repo, no override -> the unresolved form) so these hand-built
+# fixtures cannot drift from what the real writers pass; strict rendering refuses a
+# template whose ``$targeted_test_command`` / ``$full_suite_command`` nothing supplies.
+TEST_COMMAND_VALUES = dict(prompt_test_command_values("", None))
 
 ISSUE_VALUES = {
     "issue_number": 123,
@@ -31,16 +38,18 @@ ISSUE_VALUES = {
     "dispatch_note": "Fix the typo in the search function.",
     "dispatch_note_block": fenced_block("Fix the typo in the search function.", "md"),
     "required_changes_section": "",
+    **TEST_COMMAND_VALUES,
 }
 
 
-def _render_worker_with_sections(template_name: str) -> str:
+def _render_worker_with_sections(template_name: str, variants: tuple[str, ...] = ()) -> str:
     """Render a worker prompt with section variables merged in.
 
     `render_prompt` now handles section resolution internally, so this helper
-    just passes the issue values directly.
+    just passes the issue values directly. ``variants`` selects section overlays
+    (the slash-command ``skills`` loop is one; the default is the plain git/gh loop).
     """
-    return render_prompt(template_name, ISSUE_VALUES)
+    return render_prompt(template_name, ISSUE_VALUES, variants=variants)
 
 
 def test_section_variables_discovers_package_sections() -> None:
@@ -69,9 +78,15 @@ def test_execution_contract_section_present_and_rendered() -> None:
     assert "CI runs it on every push and is the merge gate" in contract
     assert "Quote the exact command you ran" in contract
 
+    # The partial names the full-suite command through a placeholder; the rendered
+    # prompt carries it with the resolved command spliced in.
+    assert "$full_suite_command" in contract
+    rendered_contract = contract.replace(
+        "$full_suite_command", TEST_COMMAND_VALUES["full_suite_command"]
+    )
     for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
         prompt = _render_worker_with_sections(template_name)
-        assert contract in prompt
+        assert rendered_contract in prompt
 
 
 def test_api_shape_validation_section_present_and_rendered() -> None:
@@ -190,6 +205,7 @@ def test_attacker_controlled_placeholders_not_expanded() -> None:
         "issue_comments": "",
         "module_map": "",
         "attachment_budget": "",
+        **TEST_COMMAND_VALUES,
     }
 
     for template_name in ("worker.md", "worker_claude_code.md"):
@@ -236,6 +252,7 @@ def test_rework_prompt_includes_conditional_base_merge_instruction() -> None:
         "dispatch_note_block": fenced_block("Fix the typo in the search function.", "md"),
         "required_changes_section": "",
         "branch_name": "agent/issue-123-fix-search",
+        **TEST_COMMAND_VALUES,
     }
     # The rework.md template is in the package prompts dir, not repo-local
     prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
@@ -268,6 +285,13 @@ def test_rework_prompt_includes_push_then_verify_final_step() -> None:
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
+        # A consumer whose ``dev`` extra lists pytest: the derived runner is what the
+        # rework prompt must carry (``prompt_test_command``), not a hardcoded string.
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "x"\nversion = "0"\n'
+            '[project.optional-dependencies]\ndev = ["pytest>=8"]\n',
+            encoding="utf-8",
+        )
         config = OrchestratorConfig(
             devin=DevinConfig(),
         )
@@ -298,7 +322,8 @@ def test_rework_prompt_includes_push_then_verify_final_step() -> None:
         assert "Committing locally is NOT done" in prompt
         # Verify the canonical targeted test command (operator directive
         # 2026-07-11: local runs are targeted only, full suite stays on CI)
-        assert "uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short" in prompt
+        assert "uv run --extra dev pytest <impacted test files> -q --tb=short" in prompt
+        assert "test_<touched_module>" not in prompt
         # Verify the push instruction with RESOLVED branch name (from headRefName)
         assert "git push origin agent/issue-123-fix-search" in prompt
         # Verify the PR head verification with RESOLVED PR number
@@ -349,36 +374,70 @@ def test_claude_code_worker_prompt_includes_push_then_verify() -> None:
 
 
 def test_worker_and_rework_templates_contain_identical_canonical_test_command() -> None:
-    """Verify that worker.md and rework.md contain the exact same canonical test command string.
+    """worker.md, worker_claude_code.md and rework.md take the test command from the
+    same two placeholders, and none of them hardcodes a runner.
+
+    The name is unchanged from when the command was a literal in each template: the
+    invariant (one canonical command shared by every template) is the same, only its
+    representation moved to a placeholder.
 
     This prevents silent drift where one template uses the full command and the other
-    uses a partial variant (issue #91).
+    a partial variant (issue #91). The command used to be a literal in each template;
+    it is now one derivation (``prompt_test_command``) spliced in through
+    ``$targeted_test_command`` / ``$full_suite_command``, so drift means a template that
+    stopped referencing them, or grew its own literal again.
     """
     prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
-    canonical_command = "uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short"
+    sections_dir = prompts_dir / "worker_sections"
 
     for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
         text = (prompts_dir / template_name).read_text(encoding="utf-8")
-        assert canonical_command in text, (
-            f"Template {template_name} does not contain the canonical test command. "
-            f"Expected to find: {canonical_command}"
+        assert "$targeted_test_command" in text, (
+            f"Template {template_name} does not reference $targeted_test_command"
         )
+        assert "uv run --extra" not in text, f"Template {template_name} hardcodes a runner"
+        assert "test_<touched_module>" not in text, (
+            f"Template {template_name} still names the flat test_<touched_module>.py shape"
+        )
+    # The full-suite command is spliced in by the shared execution-contract partial,
+    # which every one of those templates includes.
+    contract = (sections_dir / "execution_contract.md").read_text(encoding="utf-8")
+    assert "$full_suite_command" in contract
+    assert "uv run --extra" not in contract
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+        text = (prompts_dir / template_name).read_text(encoding="utf-8")
+        assert "$section_execution_contract" in text
 
 
-def test_rendered_worker_prompts_contain_canonical_test_command() -> None:
-    """Verify that rendered worker prompts contain the canonical test command.
+def test_rendered_worker_prompts_contain_canonical_test_command(tmp_path: Path) -> None:
+    """Rendered worker and rework prompts all carry the same derived test command.
 
-    This test goes through the real render_prompt call to ensure the command
-    appears in the final rendered output that workers actually see.
+    A repo whose ``dev`` extra lists pytest yields
+    ``uv run --extra dev pytest <impacted test files> -q --tb=short``; the full-suite
+    parenthetical uses the same runner. This goes through the real ``render_prompt`` so
+    the command is asserted in the output workers actually see (issue #91: the fresh and
+    rework lanes must not drift on the command).
     """
-    canonical_command = "uv run --extra dev pytest tests/test_<touched_module>.py -q --tb=short"
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nversion = "0"\n'
+        '[project.optional-dependencies]\ndev = ["pytest>=8"]\n',
+        encoding="utf-8",
+    )
+    values = {**ISSUE_VALUES, **prompt_test_command_values("", tmp_path)}
+    canonical_command = "uv run --extra dev pytest <impacted test files> -q --tb=short"
+    full_suite = "(`uv run --extra dev pytest -q --tb=short`)"
 
-    for template_name in ("worker.md", "worker_claude_code.md"):
-        prompt = _render_worker_with_sections(template_name)
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+        prompt = render_prompt(template_name, values)
         assert canonical_command in prompt, (
             f"Rendered {template_name} does not contain the canonical test command. "
             f"Expected to find: {canonical_command}"
         )
+        assert full_suite in prompt, (
+            f"Rendered {template_name} does not carry the derived full-suite command. "
+            f"Expected to find: {full_suite}"
+        )
+        assert "test_<touched_module>" not in prompt
 
 
 def test_rendered_worker_prompts_require_completion_report_with_command_and_count() -> None:
@@ -400,7 +459,9 @@ def test_rendered_worker_prompt_qualified_test_bullet() -> None:
     no longer advertises unqualified /test (issue #95, AC2). The mutation gate:
     reverting the worker.md bullet edit must fail this test.
     """
-    prompt = _render_worker_with_sections("worker.md")
+    # The skills list only renders under the ``skills`` variant: a consumer that ships
+    # no skills gets the plain git/gh loop and no bullet at all (see prompt_skills).
+    prompt = _render_worker_with_sections("worker.md", variants=("skills",))
 
     # Verify the qualified bullet text is present
     qualified_bullet = "`/test` - Run the test suite and verify all tests pass (only if it wraps the canonical command below)"

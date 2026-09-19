@@ -181,11 +181,14 @@ the two shipped profiles:
 
 | Profile | Worker runtime | Notes |
 |---|---|---|
-| `orchestrator.config.devin.yaml` | Devin sessions | skills-based worker loop, no automated reviewer dispatch |
+| `orchestrator.config.devin.yaml` | Devin sessions | skills-based worker loop when the repo ships the skills (plain git/gh loop otherwise), no automated reviewer dispatch |
 | `orchestrator.config.claude-code.yaml` | Claude Code | direct-shell worker loop, Claude-only review |
 
 Key knobs: `labels.*` (state-machine label names), `dispatch.default_limit` /
-`branch_prefix` / `worker_template` / `order` (`oldest` | `newest`),
+`branch_prefix` / `worker_template` / `order` (`oldest` | `newest`) /
+`test_command` (runner prefix the worker prompts tell workers to run, e.g.
+`uv run --directory server pytest`; derived from the repo's `pyproject.toml`
+when empty),
 `review.max_rework_cycles` (past this many `request_changes` cycles a PR
 escalates to `agent:human-needed`), `auto_merge.required_checks` (verify with
 `doctor`), `runtime.prompts_dir` (repo-local template overrides),
@@ -338,6 +341,22 @@ explicit template is given. Blocks shared across worker templates
 live as partials under `prompts/worker_sections/` and render as
 `$section_<stem>` — repo-local `worker_sections/` dirs override by filename
 too, so a shared change lands in one place instead of drifting across forks.
+
+Two parts of the worker/rework prompts come from the consumer repo rather than
+being hardcoded. The **test command** is `dispatch.test_command` if set, else
+derived from the repo-root `pyproject.toml`, else the prompt points the worker
+at the repo's own `CLAUDE.md` / `CONTRIBUTING.md` (whose commands take
+precedence over the generic ones). The **slash-command skills loop** in
+`worker.md` / `rework.md` (`/create-branch`, `/commit`, `/preflight`, …) renders
+only when the worker harness loads project skills and the repo itself ships
+*every* skill listed in `worker_sections/skills/available_skills.md` under
+`.devin/skills/` or `.claude/skills/`; otherwise a plain git/gh loop renders
+from the same template. That is done with *section variants*:
+`worker_sections/<variant>/<stem>.md` overlays `worker_sections/<stem>.md` while
+the variant (currently `skills`) is active, a partial that exists only inside a
+variant directory renders empty while it is inactive, and repo-local partials
+still win over package ones. See
+[docs/QUICKSTART.md](docs/QUICKSTART.md#7-prompt-templates).
 
 ## State
 
