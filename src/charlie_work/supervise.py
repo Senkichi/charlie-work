@@ -1189,7 +1189,11 @@ def _pull_ci_fleet_sibling(
 
     Fail-safe preconditions, checked here rather than trusted from config: the
     sibling must be on ``main`` with a clean tree, else the pull is skipped
-    and the skip reason recorded. Every outcome -- pulled, unchanged, skipped,
+    and the skip reason recorded. Under the published-wheel deployment there
+    is no sibling checkout at all -- ``declared_ci_fleet_sibling_root``
+    abstains and this records a skip, rather than running ``git`` inside the
+    venv where it would resolve against whatever repository happens to contain
+    it. Every outcome -- pulled, unchanged, skipped,
     failed -- lands in events.db as ``self_deploy_ci_fleet_pull`` so sibling
     staleness is observable instead of silent; failures additionally log at
     WARNING. Deliberately excluded from the ``self_deploy_alarm`` failure
@@ -1200,13 +1204,12 @@ def _pull_ci_fleet_sibling(
     """
     payload: dict[str, object] = {"ok": False}
     try:
-        from .ci_fleet_anchor import declared_ci_fleet_root
+        from .ci_fleet_anchor import declared_ci_fleet_sibling_root
 
-        declared_src = declared_ci_fleet_root()
-        if declared_src is None:
+        sibling = declared_ci_fleet_sibling_root()
+        if sibling is None:
             payload["skipped_reason"] = "no declared ci-fleet path source to pull"
         else:
-            sibling = declared_src.parent
             branch_res = run_command(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=sibling, timeout_seconds=timeout
             )
