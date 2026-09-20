@@ -548,6 +548,149 @@ def test_build_fleet_attention_digest_forwards_registered_repo_keys(
     assert _load_fleet_health_state(state_file) == {}
 
 
+def test_filter_fleet_health_transitions_none_registered_keys_disables_membership_gc(
+    tmp_path: Path,
+) -> None:
+    """Issue #1755 round-2: ``registered_repo_keys=None`` disables the
+    registry-membership GC entirely. ``fleet_loop`` hands ``None`` whenever
+    the registry cannot be positively read as non-empty, so ``None`` must
+    never be read as "zero registered repos". The #817 observed-repo
+    reconcile still runs under ``None`` -- the ``owner/repo:5`` drop below
+    proves the filter is not just short-circuiting on an empty reconcile.
+    """
+    from charlie_work.fleet_dispatch import (
+        _fleet_health_state_path,
+        _filter_fleet_health_transitions,
+        _load_fleet_health_state,
+    )
+    from charlie_work.notify import AttentionEntry
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    entries = [
+        AttentionEntry(
+            issue_number=-1,
+            adapter_kind="owner/ghost",
+            health="ERROR",
+            previous_health=None,
+            last_log_line="lane error",
+            pid=None,
+        ),
+        AttentionEntry(
+            issue_number=5,
+            adapter_kind="owner/repo",
+            health="ERROR",
+            previous_health=None,
+            last_log_line="stalled",
+            pid=None,
+        ),
+        AttentionEntry(
+            issue_number=-1,
+            adapter_kind="self-deploy",
+            health="ERROR",
+            previous_health=None,
+            last_log_line="pull failed",
+            pid=None,
+        ),
+    ]
+    _filter_fleet_health_transitions(entries, state_file)
+    assert _load_fleet_health_state(state_file) == {
+        "owner/ghost:-1": "ERROR",
+        "owner/repo:5": "ERROR",
+        "self-deploy:-1": "ERROR",
+    }
+
+    result = _filter_fleet_health_transitions(
+        [],
+        state_file,
+        observed_repo_keys=frozenset({"owner/repo"}),
+        registered_repo_keys=None,
+    )
+    assert result == []
+    # owner/repo:5 fell to the #817 observed reconcile (its repo's lane ran);
+    # owner/ghost:-1 survives ONLY because the membership GC is off under
+    # None -- under the pre-round-2 code an empty registered set would have
+    # deleted it.
+    assert _load_fleet_health_state(state_file) == {
+        "owner/ghost:-1": "ERROR",
+        "self-deploy:-1": "ERROR",
+    }
+
+
+def test_filter_fleet_health_transitions_empty_registered_keys_disables_membership_gc(
+    tmp_path: Path,
+) -> None:
+    """Issue #1755 round-2: an EMPTY ``registered_repo_keys`` set is treated
+    identically to ``None`` -- the membership GC requires positive evidence
+    of at least one registered repo. ``fleet_registry._load_registry``
+    collapses a missing, corrupt, or empty ``fleet.json`` into
+    ``{"repos": {}}``, so a zero-repo registry is indistinguishable from an
+    unreadable one; reading ``frozenset()`` as "positively zero repos" would
+    let a transient registry failure delete every repo-shaped baseline key.
+    Pinning this at the filter layer defends the invariant even if a future
+    caller forgets to coerce ``the_set or None`` at the boundary.
+    """
+    from charlie_work.fleet_dispatch import (
+        _fleet_health_state_path,
+        _filter_fleet_health_transitions,
+        _load_fleet_health_state,
+    )
+    from charlie_work.notify import AttentionEntry
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    entries = [
+        AttentionEntry(
+            issue_number=-1,
+            adapter_kind="owner/ghost",
+            health="ERROR",
+            previous_health=None,
+            last_log_line="lane error",
+            pid=None,
+        ),
+    ]
+    _filter_fleet_health_transitions(entries, state_file)
+    assert _load_fleet_health_state(state_file) == {"owner/ghost:-1": "ERROR"}
+
+    result = _filter_fleet_health_transitions(
+        [],
+        state_file,
+        observed_repo_keys=frozenset(),
+        registered_repo_keys=frozenset(),
+    )
+    assert result == []
+    assert _load_fleet_health_state(state_file) == {"owner/ghost:-1": "ERROR"}
+
+
+def test_reconcile_fleet_health_baselines_pure_contract() -> None:
+    """Issue #1755 round-2: the extracted pure function returns
+    ``(new_baselines, dropped_keys)`` where ``dropped_keys`` lists only the
+    registry-membership GC drops -- the #817 observed-repo reconcile clears
+    silently by design (a healthy re-check has no event to attach a recovery
+    to) and is not listed. Non-repo-shaped keys (``self-deploy``) are
+    untouched by membership GC.
+    """
+    from charlie_work.fleet_dispatch import reconcile_fleet_health_baselines
+
+    new_baselines, dropped = reconcile_fleet_health_baselines(
+        {
+            "owner/ghost:-1": "ERROR",
+            "owner/repo:5": "ERROR",
+            "owner/registered:7": "ERROR",
+            "self-deploy:-1": "OK",
+        },
+        touched_keys=frozenset({"owner/registered:7"}),
+        observed_repo_keys=frozenset({"owner/repo"}),
+        registered_repo_keys=frozenset({"owner/registered"}),
+    )
+    # owner/repo:5 -> observed reconcile (silent); owner/ghost:-1 ->
+    # membership GC (listed); owner/registered:7 -> touched this pass, kept;
+    # self-deploy:-1 -> not repo-shaped, kept.
+    assert new_baselines == {
+        "owner/registered:7": "ERROR",
+        "self-deploy:-1": "OK",
+    }
+    assert dropped == ["owner/ghost:-1"]
+
+
 def test_digest_renders_event_types_that_have_no_explicit_branch() -> None:
     """An unmapped event type must not vanish.
 
