@@ -200,14 +200,6 @@
    "member_count": 44
   },
   {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_state_dir_migration.py",
-   "identity": "tests/test_state_dir_migration.py::module",
-   "kind": "test_module",
-   "member_count": 60
-  },
-  {
    "boundary": 34.5,
    "bumps": [],
    "file": "tests/test_wedge_watchdog.py",
