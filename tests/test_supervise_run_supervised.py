@@ -185,8 +185,8 @@ def test_run_supervised_records_ci_fleet_provenance(tmp_path: Path) -> None:
     # ci_fleet is importable in this venv, so __file__ is always set.
     assert payload["ci_fleet_file"] is not None
     # All six fields from the shared payload helper must be present (None is a
-    # valid value for the sibling fields when declared_ci_fleet_root abstains
-    # from a worktree).
+    # valid value for the sibling fields when declared_ci_fleet_sibling_root
+    # abstains -- e.g. the published-wheel deployment has no sibling checkout).
     for key in (
         "ci_fleet_file",
         "sibling_root",
