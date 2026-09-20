@@ -57,21 +57,6 @@
    "member_count": 33
   },
   {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1421",
-     "actor": "worker",
-     "reason": "pre-freeze artifact: PR #1421, not shadow-week accretion; operator decision 2026-09-02, issue 1458",
-     "to": 60
-    }
-   ],
-   "file": "tests/test_checks.py",
-   "identity": "tests/test_checks.py::module",
-   "kind": "test_module",
-   "member_count": 47
-  },
-  {
    "boundary": 34.5,
    "bumps": [],
    "file": "tests/test_citation_check.py",
