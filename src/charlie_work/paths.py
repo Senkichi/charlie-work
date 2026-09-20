@@ -184,6 +184,9 @@ def runtime_paths(repo_root: Path, state_dir: str, *, check_phantom: bool = True
     from lifecycle ``log_event()`` writes (issue #1754).  For that root the
     heuristic's premise ("an earlier invocation resolved the wrong repo
     root") is false by construction, so the warning is unactionable noise.
+    Callers resolving that root must use
+    :func:`charlie_work.supervise.supervisor_runtime_paths` rather than
+    passing the flag inline, so the binding lives in exactly one place.
     """
     root = Path(state_dir)
     if not root.is_absolute():

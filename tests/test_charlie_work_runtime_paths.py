@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any
+
+import pytest
 from charlie_work.paths import runtime_paths
 
 
@@ -57,6 +59,33 @@ def test_runtime_paths_check_phantom_false_suppresses_warning(tmp_path: Path, ca
         runtime_paths(tmp_path, ".var/charlie-work", check_phantom=False)
 
     assert not caplog.records
+
+
+def test_supervisor_runtime_paths_suppresses_phantom_warning(
+    tmp_path: Path, caplog: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1754: ``supervisor_runtime_paths`` is the single binding of
+    ``orchestrator_root()`` + ``check_phantom=False`` that every supervisor
+    bookkeeping call site goes through.  Against a tmp orchestrator root
+    whose state dir holds events.db but no state.json — the exact fixture
+    that proves the warning fires by default — the helper must emit no
+    phantom-state-dir warning.  Dropping the opt-out inside the helper (or
+    reverting a call site to a bare ``runtime_paths(orchestrator_root(), ...)``)
+    reintroduces the warning and fails this test."""
+    from charlie_work import supervise
+
+    monkeypatch.setattr(supervise, "_ORCHESTRATOR_ROOT", tmp_path)
+    state_dir = tmp_path / ".var" / "charlie-work"
+    state_dir.mkdir(parents=True)
+    (state_dir / "events.db").write_bytes(b"")
+    (state_dir / "state.json.lock").write_text("", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        paths = supervise.supervisor_runtime_paths(".var/charlie-work")
+
+    assert paths.root == state_dir.resolve()
+    phantom_warnings = [r for r in caplog.records if "sibling artifacts" in r.message]
+    assert not phantom_warnings
 
 
 def test_runtime_paths_silent_without_sibling_artifacts(tmp_path: Path, caplog: Any) -> None:
