@@ -44,6 +44,7 @@ from ci_fleet.charlie_work_adapter import (
     UNATTENDED_ALLOCATION_SOURCE,
     load_allocation_stamp,
 )
+from ci_fleet.provenance import REFUSAL_STATE_FILENAME, load_refusal_streak
 from .supervise import try_acquire_supervisor_lock
 
 
@@ -815,6 +816,74 @@ def _check_runner_allocation(
     )
 
 
+def _check_provenance_refusal_streak(add: Any, fleet_dir_override: str | None = None) -> None:
+    """Surface ci_fleet's provenance refusal streak (issue #1753).
+
+    ``ci_fleet.runner_allocation_pass`` calls ``check_provenance`` before
+    actuating and records every non-``ok`` verdict in
+    ``provenance-refusals.json`` beside ``runner-allocation.json`` in the
+    host-wide fleet dir. ``mismatch`` blocks actuation and escalates after
+    three consecutive passes; ``no_anchor`` is an abstention that proceeds but
+    escalates once its ``first_seen``→``last_seen`` span exceeds 24h. The
+    escalation itself is only ever emitted as a ``runner_allocation_refused``
+    event *inside the installed ci_fleet package* — structurally outside
+    ``tests/test_event_kind_consumers.py``'s ``src/charlie_work`` scan (issue
+    #1364) — so until this check the streak had no consumer at all: a
+    ``no_anchor`` streak sat escalated for 22 days while ``charlie doctor``
+    reported the fleet green.
+
+    The read goes through ci_fleet's own ``load_refusal_streak`` and the
+    verdict through ``RefusalStreak.escalated``, so the escalation thresholds
+    (count for ``mismatch``, wall-clock for ``no_anchor``) are never re-derived
+    here — a stale copy of the constants would silently disagree with the
+    writer the moment ci_fleet retuned them. A corrupt file reads as "no
+    streak", matching the loader's deliberate fail-quiet contract: a guard
+    whose bookkeeping can manufacture a finding teaches operators to distrust
+    its findings. When the file exists but does not parse, the detail says so
+    rather than reporting a clean absence.
+
+    Unconditional — deliberately *not* gated on
+    ``config.runner_allocation.enabled`` the way ``_check_runner_allocation``
+    is. That gate exists because "expected to run" is a per-repo config
+    property; the streak file is host-wide state recorded by whichever
+    supervisor ran the pass, so gating its consumption on one repo's config
+    would re-hide the exact signal this check exists to surface.
+
+    Read-only: ``load_refusal_streak`` parses the file and nothing else.
+    """
+    state_dir = fleet_dir(override=fleet_dir_override)
+    path = state_dir / REFUSAL_STATE_FILENAME
+    streak = load_refusal_streak(state_dir)
+
+    if streak is None:
+        add(
+            "ci_fleet provenance",
+            True,
+            f"{path} exists but did not parse — read as no recorded streak"
+            if path.exists()
+            else f"no recorded refusal streak ({path} absent)",
+        )
+        return
+
+    if streak.escalated:
+        add(
+            "ci_fleet provenance",
+            False,
+            f"refusal streak escalated: status={streak.status}, "
+            f"consecutive={streak.consecutive}, first_seen={streak.first_seen}, "
+            f"last_seen={streak.last_seen} — {streak.detail} (issue #1753)",
+            severity="warning",
+        )
+        return
+
+    add(
+        "ci_fleet provenance",
+        True,
+        f"streak below the escalation threshold: status={streak.status}, "
+        f"consecutive={streak.consecutive}, last_seen={streak.last_seen}",
+    )
+
+
 def _check_fleet_dir_virtualization(add: Any, fleet_dir_override: str | None = None) -> None:
     """Warn when the fleet directory is per-process virtualized (issue #624).
 
@@ -1500,6 +1569,13 @@ def run_doctor(
     # Read-only: compares the allocation state file's age against the pass
     # interval. Never starts, parks, or plans anything.
     _check_runner_allocation(add, config, fleet_dir_override=fleet_dir_override, now=resolved_now)
+
+    # -- ci_fleet provenance refusal streak (issue #1753) ---------------------
+    # Read-only: parses the host-wide streak file via ci_fleet's own loader.
+    # Not gated on runner_allocation.enabled — the file is host-wide state
+    # written by whichever supervisor ran the pass, and gating its consumer on
+    # one repo's config would re-hide the signal this check exists to surface.
+    _check_provenance_refusal_streak(add, fleet_dir_override=fleet_dir_override)
 
     # -- recent lane-startup failures (#6-G) ---------------------------------
     # Read-only: queries this repo's own events.db for past
