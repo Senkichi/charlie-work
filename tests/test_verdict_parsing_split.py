@@ -553,7 +553,8 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     - ``_validate_review_verdict``, ``_extract_verdict_from_text``,
       ``_parse_review_verdict_from_files``: all three imported together in
       one parenthesized block at ``tests/test_fix_fabricated_verdicts.py:26``.
-    - ``_parse_review_verdict_from_log``: ``tests/test_charlie_work.py``.
+    - ``_parse_review_verdict_from_log``: ``tests/test_charlie_work_verdict_parsing.py``
+      (moved by the wave-8 split, #1554; was ``tests/test_charlie_work.py``).
     - ``_parse_review_verdict_from_events``: ``tests/test_fix_verdict_stream_json.py``.
     - ``_extract_review_session_summary``: ``tests/test_fix_escalated_dispatch_gate.py``.
 
@@ -588,7 +589,10 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     )
 
     assert "_parse_review_verdict_from_log" in referenced
-    assert referenced["_parse_review_verdict_from_log"] == "tests/test_charlie_work.py"
+    assert (
+        referenced["_parse_review_verdict_from_log"]
+        == "tests/test_charlie_work_verdict_parsing.py"
+    )
 
     assert "_parse_review_verdict_from_events" in referenced
     assert (

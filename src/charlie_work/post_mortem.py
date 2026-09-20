@@ -526,7 +526,8 @@ def _normalize_working_directory(path: str) -> tuple[str, ...]:
 # Widening this to include a repo-identifying segment (e.g. 5 segments to
 # reach ``<repo-dir>/.var/charlie-work/worktrees/<slug>``) was considered and
 # rejected: production evidence (``test_real_activity_for_worker_matches_
-# real_fleet_working_directory_shape`` in tests/test_post_mortem.py, sampled
+# real_fleet_working_directory_shape`` in tests/test_post_mortem_real_activity.py,
+# sampled
 # from a live sessions.db 2026-07-13) shows the Devin CLI's recorded
 # ``working_directory`` is frequently rooted under an unrelated
 # ``AppData\Local\Temp\...`` session directory that preserves *none* of the

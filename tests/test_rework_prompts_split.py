@@ -513,12 +513,18 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     Anchors verified by direct grep against this tree (not merely copied
     from the recon):
 
-    - ``_render_required_changes_section``: real top-of-file import at
-      ``tests/test_charlie_work.py:123`` (``sorted(root.rglob("*.py"))``
-      visits ``tests/`` before ``scripts/``, and within ``tests/`` this file
-      sorts ahead of the production consumer's own test file, so the found
-      import wins over ``scripts/ac1b_findings_actionability.py:72`` even
-      though both are real).
+    - ``_render_required_changes_section``: real function-local import at
+      ``tests/test_charlie_work_record_review_findings.py:434`` (inside
+      ``test_record_review_derived_with_external_findings_preserves_both``). The
+      issue-#1553 wave-7 split moved this name's last matching form out of
+      ``tests/test_charlie_work.py`` -- the tests that carried its
+      top-of-file import now live in ``tests/test_charlie_work_render.py``
+      (line 11), which loses the ``found.setdefault`` race to the
+      earlier-sorting ``record_review_findings`` file (``record`` precedes
+      ``render``). ``sorted(root.rglob("*.py"))`` still visits ``tests/``
+      before ``scripts/``, so the found import wins over
+      ``scripts/ac1b_findings_actionability.py:72`` even though both are
+      real.
     - ``_is_verdict_newer_than_brief``: real import at
       ``tests/test_backfill_stale_rework_briefs.py:23``.
     - ``_read_review_decision``: NOT imported by name in
@@ -531,18 +537,27 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     - ``_write_text_atomic``: real import at
       ``tests/test_review_event_payload.py:46``.
     - ``_write_rework_prompt``: the scan's winning match is
-      ``tests/test_charlie_work.py``, but -- unlike the five anchors above --
-      this one is NOT a real import in that file. It is a parenthesized
-      prose mention in a docstring, ``(workflow._write_rework_prompt)`` at
-      line 26358, that is not backtick-quoted and so is not excluded by the
-      backtick-mention control below (which only excludes RST-style
+      ``tests/test_charlie_work_classify_dead_rework.py``, but -- unlike the
+      five anchors above -- this one is NOT a real import in that file. It
+      is a parenthesized prose mention in a docstring,
+      ``(workflow._write_rework_prompt)`` at line 189 (inside
+      ``test_classify_dead_rework_session_stale_prompt_does_not_reopen_approved_head``,
+      whose body -- docstring included -- the issue-#1551 wave-5 split moved
+      verbatim out of ``tests/test_charlie_work.py``, where the mention sat
+      at line 26358), that is not backtick-quoted and so is not excluded by
+      the backtick-mention control below (which only excludes RST-style
       backtick cross-references, the one false-positive class this family's
-      own precedent already hit once). ``test_charlie_work.py`` sorts ahead
-      of this name's REAL import sites (``tests/test_markdown_fence.py``,
-      ``tests/test_prompt_render_contract.py:41``,
-      ``tests/test_prompt_template_drift_check.py:38``), so
-      ``found.setdefault`` locks in the docstring mention first. This is the
-      mirror image of the verdict_parsing precedent's own control for
+      own precedent already hit once). ``tests/test_charlie_work.py`` still
+      sorts first (``.`` precedes ``_``), but the split stripped it of every
+      matching form -- its surviving ``_write_rework_prompt`` mentions are
+      bare prose and ``app.``-prefixed attribute access, neither of which
+      the scan's patterns recognize -- so ``found.setdefault`` falls through
+      to the earliest-sorted ``test_charlie_work_*`` file, which still locks
+      in ahead of this name's REAL import sites
+      (``tests/test_markdown_fence.py:40``,
+      ``tests/test_prompt_render_contract.py:43``,
+      ``tests/test_prompt_template_drift_check.py:38``). This is the mirror
+      image of the verdict_parsing precedent's own control for
       ``_escalate_issue``/``_extract_verdict_from_text`` (where the ordering
       quirk ran the other way) -- re-derived here rather than assumed, since
       the winner differs per name and per file tree.
@@ -554,7 +569,10 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     )
 
     assert "_render_required_changes_section" in referenced
-    assert referenced["_render_required_changes_section"] == "tests/test_charlie_work.py"
+    assert (
+        referenced["_render_required_changes_section"]
+        == "tests/test_charlie_work_record_review_findings.py"
+    )
 
     assert "_is_verdict_newer_than_brief" in referenced
     assert (
@@ -575,7 +593,7 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     assert referenced["_write_text_atomic"] == "tests/test_review_event_payload.py"
 
     assert "_write_rework_prompt" in referenced
-    assert referenced["_write_rework_prompt"] == "tests/test_charlie_work.py"
+    assert referenced["_write_rework_prompt"] == "tests/test_charlie_work_classify_dead_rework.py"
 
 
 @pytest.mark.parametrize(

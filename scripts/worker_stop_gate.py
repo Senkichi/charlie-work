@@ -25,11 +25,11 @@ session is about to stop, feeding it a JSON payload on stdin. It:
    session that didn't touch it. Skips ruff entirely when the changed set
    contains no ``.py`` files.
 4. Derives a targeted test set from the same changed-file union: any changed
-   ``tests/*.py`` file, plus (W4/#1262) ``tests/test_instrumentation.py``
+   ``tests/*.py`` file, plus (W4/#1262) ``tests/test_instrumentation_event_kind_registry.py``
    whenever a changed ``src/*.py`` file's *content* matches an event-emit
    call (``log_event(``, ``append_event(``, ``_record_event(``). W4's issue
    is explicit that the event-kind registry deriver already exists
-   (``tests/test_instrumentation.py::test_event_kind_registry_exhaustive``,
+   (``tests/test_instrumentation_event_kind_registry.py::test_event_kind_registry_exhaustive``,
    AST-scanning ``src/``) -- this script does not reimplement it, it only
    pulls the existing test earlier (inside the session, before push) instead
    of leaving the omission for CI to catch a round late. No hardcoded
@@ -68,7 +68,7 @@ the hook process's cwd: Claude Code runs hooks from the session's
 into a worktree, and a cwd-relative ``.venv/...`` then resolves against a
 tree that has no venv and dies with bash's "No such file or directory" on
 every subsequent turn (observed 2026-09-03 in a downstream repo that ports
-this gate). ``tests/test_worker_stop_gate.py`` pins that invariant: every
+this gate). ``tests/test_worker_stop_gate_hook_command.py`` pins that invariant: every
 path token in the command must be absolute once ``$CLAUDE_PROJECT_DIR``
 is expanded.
 A third, empirically-confirmed limitation (review round, #1259; resolved as
@@ -145,8 +145,10 @@ PYTEST_TIMEOUT_SECONDS = 300
 #: worker session forever. 14 days comfortably outlives any single session.
 STATE_FILE_MAX_AGE_SECONDS = 14 * 24 * 60 * 60
 
-#: W4/#1262 target: the existing exhaustive event-kind registry test.
-INSTRUMENTATION_TEST_PATH = "tests/test_instrumentation.py"
+#: W4/#1262 target: the existing exhaustive event-kind registry test. The
+#: test moved out of tests/test_instrumentation.py in the #1569 Track-1
+#: seam split; this path follows the member.
+INSTRUMENTATION_TEST_PATH = "tests/test_instrumentation_event_kind_registry.py"
 
 #: W4/#1262 rule: a changed src file whose *content* calls one of these three
 #: emit functions must pull INSTRUMENTATION_TEST_PATH into this session's

@@ -22,7 +22,7 @@ def test_post_mortem_config_defaults() -> None:
     PreToolUse hook block — distinct from the "Tool blocked:" prefix that
     appears in sessions.db message-node content — and drives
     post_mortem.classify_and_record's log-tail fallback when the DB is
-    unavailable (see test_post_mortem.py's log-tail fallback tests).
+    unavailable (see test_post_mortem_log_tail_fallback.py's log-tail fallback tests).
     """
     config = load_config()
     assert isinstance(config.post_mortem, PostMortemConfig)
