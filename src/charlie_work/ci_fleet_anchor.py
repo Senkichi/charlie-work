@@ -24,7 +24,10 @@ by one command cannot cross-check each other.
 ``pyproject.toml`` is independent. It lives in this repo, it is the input to
 the install rather than its output, it is under version control where a change
 to it is reviewable, and no ``.pth`` file can move it. That makes it the only
-declaration on this box that can disagree with a wrong install.
+*checkout* declaration on this box that can disagree with a wrong install.
+When there is no checkout declaration at all -- the published-wheel
+deployment -- the interpreter's own install scheme plays the same role; see
+"The published-wheel anchor" below.
 
 What this does not prove
 ------------------------
@@ -64,6 +67,27 @@ Note the asymmetry this preserves: a genuinely repointed install still fails
 loudly, because ``pyproject.toml`` read from the main checkout still names a
 directory that exists and the comparison still happens.
 
+The published-wheel anchor: the interpreter's own ``purelib``
+-------------------------------------------------------------
+
+When ``[tool.uv.sources]`` names no ``ci-fleet`` entry at all -- the normal
+state since the 2026-08-28 switch to the published PyPI wheel -- there is no
+sibling checkout to declare, but the expectation is not unknowable: a
+wheel-installed ``ci_fleet`` must load from the running interpreter's
+``site-packages``. ``sysconfig.get_path("purelib")`` names that directory from
+the interpreter's install scheme and ``sys.prefix`` -- not from
+``ci_fleet.__file__``, ``find_spec``, or any artifact the install wrote -- so
+it satisfies the same independence requirement ``pyproject.toml`` does: a
+leftover editable ``.pth`` repointing ``ci_fleet`` at a stale sibling checkout
+moves ``import_root()`` but cannot move this answer, and the comparison still
+reports ``mismatch``.
+
+Returning ``None`` here instead -- as this module did until #1752 -- turned a
+deploy window into a permanent condition: ``no_anchor`` was designed as the
+state between this module landing and the provider installing its half, but
+under the wheel model the provider's answer never changes, so the escalation
+clock ran forever against a deployment that was never wrong.
+
 Raising rather than returning ``None``
 --------------------------------------
 
@@ -71,14 +95,16 @@ Structural failures are deliberately left to propagate. ``check_provenance``
 wraps the anchor call and reports the exception type and message as the
 ``no_anchor`` detail, so a missing ``pyproject.toml`` surfaces with its real
 exception rather than as an undifferentiated "could not determine". ``None``
-is reserved for the cases that are real answers rather than breakage: ci-fleet
-not being declared as a local path dependency at all (the normal state since
-the 2026-08-28 switch to the published PyPI wheel -- no ``[tool.uv.sources]``
-table, module loads from site-packages), and the resolved root not existing.
+is reserved for the cases that are real answers rather than breakage: a
+``ci-fleet`` source entry that declares no ``path`` (a workspace, git, or
+registry override names no sibling checkout), and a declared path whose
+``src`` does not exist. The no-entry case is not among them -- it has had a
+real answer since the wheel switch, per the section above.
 """
 
 from __future__ import annotations
 
+import sysconfig
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -92,6 +118,7 @@ __all__ = [
     "ci_fleet_provenance_payload",
     "ci_fleet_provenance_snapshot",
     "declared_ci_fleet_root",
+    "declared_ci_fleet_sibling_root",
     "repo_root",
 ]
 
@@ -113,40 +140,98 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
-def declared_ci_fleet_root() -> Path | None:
-    """The directory ``ci_fleet`` is declared to be imported from.
+def _uv_source_table(root: Path) -> dict[str, Any]:
+    """The ``[tool.uv.sources]`` table from ``<root>/pyproject.toml``.
 
-    Returns the ``src`` directory, because that is what ``ci_fleet`` compares
-    against: its own ``import_root()`` is the parent of the ``ci_fleet``
-    package directory, i.e. ``<checkout>/src``.
-
-    ``None`` in the two cases where there is genuinely nothing to compare
-    against, both of which are abstentions rather than failures: ``ci-fleet``
-    is not declared as a local path dependency, or the declared root does not
-    exist because this module is running from a worktree that is not a sibling
-    of the real checkout. See the module docstring -- reporting the latter as a
-    disagreement would block fleet actuation from every worktree.
+    Missing tables collapse to ``{}`` -- a ``pyproject.toml`` without a
+    ``[tool.uv.sources]`` table is the normal published-wheel shape, not
+    breakage. An unreadable or malformed ``pyproject.toml`` raises, which
+    callers deliberately let propagate (the module docstring's "raising rather
+    than returning ``None``" policy).
     """
-    root = repo_root()
     with (root / "pyproject.toml").open("rb") as handle:
         pyproject = tomllib.load(handle)
-    # Since 2026-08-28 ci-fleet is a published PyPI dependency and the
-    # [tool.uv.sources] path override is gone from pyproject entirely. An
-    # absent table (or absent entry) IS the "not declared as a local path
-    # dependency" abstention the docstring reserves None for -- the module
-    # loads from site-packages and there is no sibling tree to compare
-    # against. Only a present-but-malformed entry should still raise.
-    sources = pyproject.get("tool", {}).get("uv", {}).get("sources", {})
-    source = sources.get(_SOURCE_NAME)
+    return pyproject.get("tool", {}).get("uv", {}).get("sources", {})
+
+
+def _sibling_checkout(root: Path, source: Any) -> Path | None:
+    """Resolve one ``[tool.uv.sources]`` ``ci-fleet`` entry to its checkout root.
+
+    ``None`` for every "no usable sibling declaration" case: no entry at all,
+    an entry without a ``path`` key (a workspace, git, or registry source names
+    no sibling checkout), or a declared ``<path>/src`` that does not exist --
+    the worktree abstention the module docstring describes. A malformed
+    non-table entry raises on ``source.get`` rather than being read as an
+    answer; that is breakage, not an abstention.
+    """
     if source is None:
         return None
     declared = source.get("path")
     if declared is None:
         return None
-    expected = (root / declared / "src").resolve()
-    if not expected.is_dir():
+    checkout = (root / declared).resolve()
+    if not (checkout / "src").is_dir():
         return None
-    return expected
+    return checkout
+
+
+def _venv_site_packages() -> Path:
+    """The directory this interpreter loads wheel-installed packages from.
+
+    ``sysconfig`` derives ``purelib`` from the interpreter's install scheme
+    and ``sys.prefix`` -- not from ``ci_fleet.__file__``, ``find_spec``, or any
+    artifact the install wrote -- so a ``.pth`` repointing ``ci_fleet`` at a
+    stale sibling checkout moves ``import_root()`` but not this answer, and
+    the comparison still reports ``mismatch``. ``resolve()`` matches
+    ``import_root()``'s own normalization: worktree ``.venv`` entries on this
+    box are Windows junctions, and both sides must land on the real path.
+    """
+    return Path(sysconfig.get_path("purelib")).resolve()
+
+
+def declared_ci_fleet_root() -> Path | None:
+    """The directory ``ci_fleet`` is expected to be imported from.
+
+    ``ci_fleet.provenance`` compares this against its own ``import_root()`` --
+    the parent of the ``ci_fleet`` package directory, i.e. ``<checkout>/src``
+    for a declared sibling and ``site-packages`` for a wheel.
+
+    When ``[tool.uv.sources]`` names no ``ci-fleet`` entry at all -- the normal
+    state since the 2026-08-28 switch to the published PyPI wheel -- the
+    expectation is the running interpreter's own ``purelib``; see the module
+    docstring for why that answer is independent enough to check against, and
+    for why abstaining here made ``no_anchor`` a permanent condition (#1752).
+
+    ``None`` remains for the genuine abstentions: a ``ci-fleet`` entry with no
+    ``path`` key (nothing local to name), and a declared root that does not
+    exist because this module is running from a worktree that is not a sibling
+    of the real checkout -- reporting the latter as a disagreement would block
+    fleet actuation from every worktree.
+    """
+    root = repo_root()
+    source = _uv_source_table(root).get(_SOURCE_NAME)
+    if source is None:
+        return _venv_site_packages()
+    checkout = _sibling_checkout(root, source)
+    return (checkout / "src").resolve() if checkout is not None else None
+
+
+def declared_ci_fleet_sibling_root() -> Path | None:
+    """The sibling checkout ``ci_fleet`` is declared to load from, if one exists.
+
+    Returns the checkout *root* (the resolved ``path`` value), or ``None`` in
+    the same cases :func:`_sibling_checkout` abstains: no ``ci-fleet`` entry,
+    an entry without ``path``, or a declared checkout whose ``src`` does not
+    exist from here.
+
+    Consumers that want the sibling *checkout* -- to probe or pull it -- must
+    use this rather than :func:`declared_ci_fleet_root`: under the wheel model
+    the latter answers the venv's site-packages, whose parent is not a
+    checkout, and running ``git`` there would silently resolve against whatever
+    repository happens to contain the venv.
+    """
+    root = repo_root()
+    return _sibling_checkout(root, _uv_source_table(root).get(_SOURCE_NAME))
 
 
 #: Timeout for the sibling ``git`` probes. A local rev-parse / porcelain is
@@ -172,10 +257,11 @@ class CiFleetProvenanceSnapshot:
     Fields:
     - ``ci_fleet_file``: ``ci_fleet.__file__`` -- where the module actually
       loaded from. ``None`` if ``ci_fleet`` could not be imported.
-    - ``sibling_root``: the sibling checkout root (``declared_ci_fleet_root()
-      .parent``), or ``None`` if no local path dependency is declared /
-      resolvable (e.g. running from a worktree that is not a sibling of the
-      real checkout -- the same abstention as ``declared_ci_fleet_root``).
+    - ``sibling_root``: the sibling checkout root
+      (``declared_ci_fleet_sibling_root()``), or ``None`` if no local path
+      dependency is declared / resolvable -- the published-wheel deployment
+      has no sibling checkout at all, and a worktree that is not a sibling of
+      the real checkout cannot resolve one.
     - ``sibling_head``: ``git rev-parse HEAD`` in the sibling, or ``None`` if
       the probe could not run.
     - ``sibling_branch``: ``git rev-parse --abbrev-ref HEAD`` in the sibling,
@@ -228,11 +314,13 @@ def ci_fleet_provenance_snapshot(
     break the supervisor's entry path. ``run_command`` is injectable for tests
     (defaults to :func:`run_captured`); production callers pass nothing.
 
-    Abstention mirrors :func:`declared_ci_fleet_root`: when no local path
-    dependency is declared or the resolved root does not exist (e.g. a
-    worktree that is not a sibling of the real checkout), the sibling fields
-    are ``None`` and ``error`` is ``None`` -- the honest answer is "from here
-    we cannot tell", not "something is wrong".
+    Abstention mirrors :func:`declared_ci_fleet_sibling_root`: when no local
+    path dependency is declared -- the published-wheel deployment, whose
+    expected root is the venv's own site-packages and has no sibling checkout
+    to inspect -- or the resolved root does not exist (e.g. a worktree that is
+    not a sibling of the real checkout), the sibling fields are ``None`` and
+    ``error`` is ``None`` -- the honest answer is "from here we cannot tell",
+    not "something is wrong".
     """
     if run_command is None:
         run_command = run_captured
@@ -252,11 +340,11 @@ def ci_fleet_provenance_snapshot(
             error=f"import ci_fleet raised {type(exc).__name__}: {exc}",
         )
 
-    declared_src = declared_ci_fleet_root()
-    if declared_src is None:
-        # Abstention, not failure: same condition declared_ci_fleet_root
-        # abstains on (no declared path source, or unresolvable from a
-        # worktree). ci_fleet_file is still recorded -- it is the one fact
+    sibling = declared_ci_fleet_sibling_root()
+    if sibling is None:
+        # Abstention, not failure: no declared path source (the published-wheel
+        # deployment names no sibling checkout) or unresolvable from a
+        # worktree. ci_fleet_file is still recorded -- it is the one fact
         # available without the sibling.
         return CiFleetProvenanceSnapshot(
             ci_fleet_file=ci_fleet_file,
@@ -265,8 +353,6 @@ def ci_fleet_provenance_snapshot(
             sibling_branch=None,
             sibling_dirty=None,
         )
-
-    sibling = declared_src.parent
     try:
         head_res = run_command(["git", "rev-parse", "HEAD"], cwd=sibling, timeout_seconds=timeout)
         branch_res = run_command(
