@@ -70,7 +70,7 @@ from .quiesce import check_quiescence
 from .state import StateLockBusy, load_state_locked, utc_now
 from .subprocess_runner import run_captured
 from .state_migration import apply_state_dir_migration, gather_migration_inputs
-from .supervise import orchestrator_root, self_deploy
+from .supervise import orchestrator_root, self_deploy, supervisor_runtime_paths
 from ci_fleet.charlie_work_adapter import (
     CLI_ALLOCATION_SOURCE,
     UNATTENDED_ALLOCATION_SOURCE,
@@ -1375,7 +1375,9 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     state_dir = (
         global_config.runtime.state_dir if global_config is not None else layout.DEFAULT_STATE_DIR
     )
-    state_root = runtime_paths(orchestrator_root(), state_dir).root
+    # The supervisor's own bookkeeping root is resolved via the dedicated
+    # helper, which binds the phantom-state-dir opt-out (issue #1754).
+    state_root = supervisor_runtime_paths(state_dir).root
     deploy = self_deploy(
         orchestrator_root(),
         state_root=state_root,
