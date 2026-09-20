@@ -734,3 +734,48 @@ class FakeGitHubWithMissingRequiredAndRuns(FakeGitHubWithMissingRequired):
 
     def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None:
         return self._runs
+
+
+class _IssueViewCountingGitHub(FakeGitHub):
+    """FakeGitHub subclass that records every ``issue_view`` call so tests can
+    assert the merge-hold check reuses review()'s own per-pass issue fetch
+    instead of issuing a redundant second ``gh issue view`` call."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.issue_view_calls: list[int] = []
+
+    def issue_view(self, number: int):
+        self.issue_view_calls.append(number)
+        return super().issue_view(number)
+
+
+class FakeGitHubWithRerunCapture(FakeGitHubWithChecks):
+    """FakeGitHub that captures gh run rerun calls and can simulate failures."""
+
+    def __init__(
+        self,
+        checks: list[dict[str, Any]] | None = None,
+        *,
+        rerun_ok: bool = True,
+        rerun_error: str = "This workflow run cannot be retried",
+    ) -> None:
+        super().__init__(checks)
+        self.rerun_ok = rerun_ok
+        self.rerun_error = rerun_error
+        self.rerun_calls: list[list[str]] = []
+
+    def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):  # noqa: ANN202
+        if len(args) >= 2 and args[0] == "run" and args[1] == "rerun":
+            self.rerun_calls.append(list(args))
+            if self.rerun_ok:
+                return "DRY-RUN: gh run rerun " + " ".join(args[2:])
+            return github_module.GitHubRunResult(
+                ok=False,
+                returncode=1,
+                stdout="",
+                stderr=self.rerun_error,
+                value=None,
+                error=self.rerun_error,
+            )
+        return super().run(args, json_output=json_output, allow_failure=allow_failure)

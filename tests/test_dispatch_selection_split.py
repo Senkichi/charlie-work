@@ -390,7 +390,7 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     referenced = _consumer_referenced_names(candidates, [_REPO_ROOT / "tests"])
 
     assert "_windowed_redispatch_at" in referenced
-    assert referenced["_windowed_redispatch_at"] == "tests/test_charlie_work.py"
+    assert referenced["_windowed_redispatch_at"] == "tests/test_charlie_work_redispatch_windows.py"
 
     assert "_is_review_dispatchable" in referenced
     assert referenced["_is_review_dispatchable"] == "tests/test_fix_probe_livelock.py"

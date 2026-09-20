@@ -293,18 +293,25 @@ def _load_baseline() -> dict[str, int]:
 
 
 def test_baseline_includes_the_two_named_monoliths() -> None:
-    """AC1: the baseline is derived (not hand-listed) but the two files the
-    issue names -- workflow.py and test_charlie_work.py -- must be present.
-    They are the dominant monoliths the ratchet exists to bind; their absence
-    would mean the derivation is broken or the baseline was hand-pruned."""
+    """AC1: the baseline is derived (not hand-listed) but the monolith the
+    issue names -- workflow.py -- must be present. Its absence would mean the
+    derivation is broken or the baseline was hand-pruned.
+
+    test_charlie_work.py -- the other monolith #1442 named -- is now the
+    opposite kind of evidence: the Track-1 campaign (#1546) split it
+    completely, and the wave-8 PR (#1554) deleted the emptied file, so the
+    baseline's own fixed-point refresh correctly dropped its mark. Asserting
+    its *absence* keeps this test honest: a baseline that still carried a mark
+    for a deleted file would mean the refresh was skipped."""
     baseline = _load_baseline()
     assert "src/charlie_work/workflow.py" in baseline, (
         "workflow.py (the monolith issue #1442 is about) is missing from the "
         "baseline -- the derivation is broken or the file was hand-pruned"
     )
-    assert "tests/test_charlie_work.py" in baseline, (
-        "test_charlie_work.py (the test monolith issue #1442 names) is missing "
-        "from the baseline -- the derivation is broken or the file was hand-pruned"
+    assert "tests/test_charlie_work.py" not in baseline, (
+        "test_charlie_work.py was fully split and deleted by #1554 -- a "
+        "lingering baseline mark means refresh_file_size_ratchet.py was not "
+        "run in this PR"
     )
 
 

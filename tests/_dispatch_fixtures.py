@@ -12,6 +12,8 @@ can import them:
 - ``_requests`` / ``_seed_backdated_dispatch_event`` / ``_fail_if_launched`` /
   ``_make_stalled_sidecar`` / ``_cross_repo_issue_body`` -- plain helpers used
   by the moved tests (some also by tests that stayed behind).
+- ``_reconcile_pass_app`` / ``_main_ci_reclaim_app`` -- ``OrchestratorApp``
+  builders for the cadence-gated-lane wiring tests (issue #1553, wave 7).
 """
 
 from __future__ import annotations
@@ -23,7 +25,11 @@ from typing import Any
 
 import pytest
 
+from _fakes_github import FakeGitHub
+from charlie_work.config import OrchestratorConfig
 from charlie_work.instrumentation import log_event
+from charlie_work.paths import runtime_paths
+from charlie_work.workflow import OrchestratorApp
 
 
 @pytest.fixture(autouse=True)
@@ -167,3 +173,55 @@ def _cross_repo_issue_body() -> str:
         "of a repo that does not contain the file it was asked to change, went to "
         "`C:\\Users\\operator\\repos\\ci_runners` — the **shared main checkout** — and worked there."
     )
+
+
+def _reconcile_pass_app(
+    tmp_path: Path,
+    *,
+    interval_minutes: int = 30,
+    enabled: bool = True,
+    gh: Any = None,
+) -> OrchestratorApp:
+    from charlie_work.config import ReconcilePassConfig
+
+    config = OrchestratorConfig(
+        reconcile_pass=ReconcilePassConfig(enabled=enabled, interval_minutes=interval_minutes)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    if gh is None:
+        gh = FakeGitHub()
+        # Wiring tests for _maybe_reconcile_drift expect a clean repo. The
+        # default FakeGitHub carries a sample issue/PR that now resolve through
+        # the paginated REST snapshots and would produce unrelated drift.
+        gh.issues = []
+        gh.prs = []
+    return OrchestratorApp(tmp_path, paths, config, gh)
+
+
+def _main_ci_reclaim_app(
+    tmp_path: Path,
+    *,
+    enabled: bool = True,
+    workflow_filename: str = "ci.yml",
+    gh: Any = None,
+) -> OrchestratorApp:
+    """Wiring-test fixture for _maybe_reclaim_superseded_main_ci (#863/#815).
+
+    Deliberately mirrors _reconcile_pass_app's shape. These wiring tests
+    monkeypatch charlie_work.workflow.reclaim_superseded_main_ci_runs itself
+    rather than exercising real git/gh calls -- the safety-property logic
+    (ancestor checks, tip exemption, race-safety re-fetch) already has
+    dedicated coverage in tests/test_main_ci_reclaim.py. This fixture's job
+    is only to prove the OrchestratorApp method is wired correctly: gated on
+    config.enabled, records the right event for each outcome, and is
+    actually called from loop().
+    """
+    from charlie_work.config import MainCiReclaimConfig
+
+    config = OrchestratorConfig(
+        main_ci_reclaim=MainCiReclaimConfig(enabled=enabled, workflow_filename=workflow_filename)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    return OrchestratorApp(tmp_path, paths, config, gh if gh is not None else FakeGitHub())

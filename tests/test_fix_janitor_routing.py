@@ -826,7 +826,7 @@ def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
 # cap, rescue tier never even attempted because the cap check was
 # unreachable). These tests inject an already-elapsed
 # "{attempts_key}_stall_since" timestamp directly into state -- the same
-# past-timestamp-injection pattern test_worker_health.py uses for
+# past-timestamp-injection pattern test_worker_health_classification.py uses for
 # stall_minutes -- rather than sleeping or monkeypatching utc_now.
 # ---------------------------------------------------------------------------
 

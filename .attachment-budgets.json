@@ -25,6 +25,14 @@
    "member_count": 9
   },
   {
+   "boundary": 29.5,
+   "bumps": [],
+   "file": "tests/attachment_contracts/test_archetypes.py",
+   "identity": "tests/attachment_contracts/test_archetypes.py::module",
+   "kind": "test_module",
+   "member_count": 31
+  },
+  {
    "boundary": 37.0,
    "bumps": [],
    "file": "tests/attachment_contracts/test_baseline.py",
@@ -33,20 +41,20 @@
    "member_count": 41
   },
   {
-   "boundary": 41.0,
+   "boundary": 29.5,
    "bumps": [],
-   "file": "tests/test_api_budget.py",
-   "identity": "tests/test_api_budget.py::module",
+   "file": "tests/test_ast_equivalence_gate.py",
+   "identity": "tests/test_ast_equivalence_gate.py::module",
    "kind": "test_module",
-   "member_count": 55
+   "member_count": 30
   },
   {
-   "boundary": 41.0,
+   "boundary": 32.0,
    "bumps": [],
-   "file": "tests/test_charlie_work.py",
-   "identity": "tests/test_charlie_work.py::module",
+   "file": "tests/test_backlog_reachability.py",
+   "identity": "tests/test_backlog_reachability.py::module",
    "kind": "test_module",
-   "member_count": 851
+   "member_count": 33
   },
   {
    "boundary": 41.0,
@@ -64,12 +72,20 @@
    "member_count": 47
   },
   {
-   "boundary": 41.0,
+   "boundary": 34.5,
    "bumps": [],
-   "file": "tests/test_cli.py",
-   "identity": "tests/test_cli.py::module",
+   "file": "tests/test_citation_check.py",
+   "identity": "tests/test_citation_check.py::module",
    "kind": "test_module",
-   "member_count": 103
+   "member_count": 37
+  },
+  {
+   "boundary": 32.0,
+   "bumps": [],
+   "file": "tests/test_closing_reference.py",
+   "identity": "tests/test_closing_reference.py::module",
+   "kind": "test_module",
+   "member_count": 33
   },
   {
    "boundary": 41.0,
@@ -88,43 +104,28 @@
    "member_count": 114
   },
   {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1509",
-     "actor": "worker",
-     "reason": "role-config migration growth + PR #1509; operator decision 2026-09-02, issue 1458",
-     "to": 89
-    }
-   ],
-   "file": "tests/test_doctor.py",
-   "identity": "tests/test_doctor.py::module",
+   "boundary": 34.5,
+   "bumps": [],
+   "file": "tests/test_cross_repo_gate.py",
+   "identity": "tests/test_cross_repo_gate.py::module",
    "kind": "test_module",
-   "member_count": 82
+   "member_count": 35
   },
   {
-   "boundary": 41.0,
+   "boundary": 28.5,
    "bumps": [],
-   "file": "tests/test_fix_reconcile.py",
-   "identity": "tests/test_fix_reconcile.py::module",
+   "file": "tests/test_deescalation.py",
+   "identity": "tests/test_deescalation.py::module",
    "kind": "test_module",
-   "member_count": 47
+   "member_count": 29
   },
   {
-   "boundary": 41.0,
+   "boundary": 28.5,
    "bumps": [],
-   "file": "tests/test_git_push_lint_hook.py",
-   "identity": "tests/test_git_push_lint_hook.py::module",
+   "file": "tests/test_fix_escalation_paths.py",
+   "identity": "tests/test_fix_escalation_paths.py::module",
    "kind": "test_module",
-   "member_count": 42
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_github.py",
-   "identity": "tests/test_github.py::module",
-   "kind": "test_module",
-   "member_count": 55
+   "member_count": 29
   },
   {
    "boundary": 41.0,
@@ -135,35 +136,44 @@
    "member_count": 42
   },
   {
-   "boundary": 41.0,
+   "boundary": 31.0,
+   "bumps": [],
+   "file": "tests/test_human_merge_labels_1598.py",
+   "identity": "tests/test_human_merge_labels_1598.py::module",
+   "kind": "test_module",
+   "member_count": 32
+  },
+  {
+   "boundary": 32.0,
    "bumps": [],
    "file": "tests/test_instrumentation.py",
    "identity": "tests/test_instrumentation.py::module",
    "kind": "test_module",
-   "member_count": 58
+   "member_count": 34
   },
   {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1420",
-     "actor": "worker",
-     "reason": "pre-freeze artifact: PR #1420 merged 08-24, baseline frozen 08-25 stale, not shadow-week accretion; operator decision 2026-09-02, issue 1458",
-     "to": 84
-    }
-   ],
-   "file": "tests/test_merge_preflight_hook.py",
-   "identity": "tests/test_merge_preflight_hook.py::module",
-   "kind": "test_module",
-   "member_count": 54
-  },
-  {
-   "boundary": 41.0,
+   "boundary": 31.0,
    "bumps": [],
-   "file": "tests/test_post_mortem.py",
-   "identity": "tests/test_post_mortem.py::module",
+   "file": "tests/test_issue_1314_operator_queue_followups.py",
+   "identity": "tests/test_issue_1314_operator_queue_followups.py::module",
    "kind": "test_module",
-   "member_count": 59
+   "member_count": 32
+  },
+  {
+   "boundary": 29.5,
+   "bumps": [],
+   "file": "tests/test_janitor_verdict.py",
+   "identity": "tests/test_janitor_verdict.py::module",
+   "kind": "test_module",
+   "member_count": 30
+  },
+  {
+   "boundary": 34.5,
+   "bumps": [],
+   "file": "tests/test_local_issues.py",
+   "identity": "tests/test_local_issues.py::module",
+   "kind": "test_module",
+   "member_count": 37
   },
   {
    "boundary": 37.0,
@@ -174,35 +184,12 @@
    "member_count": 39
   },
   {
-   "boundary": 41.0,
+   "boundary": 34.5,
    "bumps": [],
-   "file": "tests/test_process_utils.py",
-   "identity": "tests/test_process_utils.py::module",
+   "file": "tests/test_prompt_skills.py",
+   "identity": "tests/test_prompt_skills.py::module",
    "kind": "test_module",
-   "member_count": 47
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [],
-   "file": "tests/test_prompt_sections.py",
-   "identity": "tests/test_prompt_sections.py::module",
-   "kind": "test_module",
-   "member_count": 58
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1480",
-     "actor": "worker",
-     "reason": "growth from PRs #1480 #1395 #1431; operator decision 2026-09-02, issue 1458",
-     "to": 153
-    }
-   ],
-   "file": "tests/test_reconcile.py",
-   "identity": "tests/test_reconcile.py::module",
-   "kind": "test_module",
-   "member_count": 135
+   "member_count": 35
   },
   {
    "boundary": 41.0,
@@ -213,64 +200,20 @@
    "member_count": 44
   },
   {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1486",
-     "actor": "worker",
-     "reason": "growth from PR #1486; operator decision 2026-09-02, issue 1458",
-     "to": 100
-    }
-   ],
-   "file": "tests/test_supervise.py",
-   "identity": "tests/test_supervise.py::module",
+   "boundary": 34.5,
+   "bumps": [],
+   "file": "tests/test_wedge_watchdog.py",
+   "identity": "tests/test_wedge_watchdog.py::module",
    "kind": "test_module",
-   "member_count": 99
+   "member_count": 36
   },
   {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1449",
-     "actor": "worker",
-     "reason": "growth from PRs #1449 #1412; operator decision 2026-09-02, issue 1458",
-     "to": 52
-    }
-   ],
+   "boundary": 28.5,
+   "bumps": [],
    "file": "tests/test_worker.py",
    "identity": "tests/test_worker.py::module",
    "kind": "test_module",
-   "member_count": 48
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1426",
-     "actor": "worker",
-     "reason": "pre-freeze artifact: PR #1426, not shadow-week accretion; operator decision 2026-09-02, issue 1458",
-     "to": 59
-    }
-   ],
-   "file": "tests/test_worker_health.py",
-   "identity": "tests/test_worker_health.py::module",
-   "kind": "test_module",
-   "member_count": 55
-  },
-  {
-   "boundary": 41.0,
-   "bumps": [
-    {
-     "ack": "#1409",
-     "actor": "worker",
-     "reason": "growth from PR #1409 + identifier scrub; operator decision 2026-09-02, issue 1458",
-     "to": 53
-    }
-   ],
-   "file": "tests/test_worker_stop_gate.py",
-   "identity": "tests/test_worker_stop_gate.py::module",
-   "kind": "test_module",
-   "member_count": 49
+   "member_count": 29
   },
   {
    "boundary": 41.0,
@@ -286,6 +229,14 @@
    "identity": "tests/test_worktree.py::module",
    "kind": "test_module",
    "member_count": 222
+  },
+  {
+   "boundary": 29.5,
+   "bumps": [],
+   "file": "tests/test_write_gate_enforcement.py",
+   "identity": "tests/test_write_gate_enforcement.py::module",
+   "kind": "test_module",
+   "member_count": 30
   }
  ],
  "floor": 4,
