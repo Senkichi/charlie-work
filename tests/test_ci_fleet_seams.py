@@ -333,10 +333,17 @@ def test_the_anchor_reads_the_declaration_not_the_install_artifacts() -> None:
         sources = tomllib.load(handle).get("tool", {}).get("uv", {}).get("sources", {})
     declared = sources.get("ci-fleet", {}).get("path")
 
-    if declared is None:
+    if "ci-fleet" not in sources:
         # Since 2026-08-28 ci-fleet is a published PyPI dependency and pyproject
-        # declares no path source at all: the anchor must abstain, because the
-        # module loads from site-packages and there is no sibling tree to name.
+        # declares no path source at all: the anchor names the interpreter's
+        # own purelib -- where a wheel-installed ci_fleet must load from
+        # (#1752). Abstaining here made no_anchor permanent.
+        import sysconfig
+
+        assert declared_ci_fleet_root() == Path(sysconfig.get_path("purelib")).resolve()
+    elif declared is None:
+        # A ci-fleet entry with no path key (workspace/git/registry source)
+        # names no sibling checkout -- still an abstention.
         assert declared_ci_fleet_root() is None
     else:
         expected = (root / declared / "src").resolve()
@@ -408,6 +415,148 @@ def test_a_resolvable_declaration_is_still_checked(
     verdict = check_provenance(anchor=anchor_mod.declared_ci_fleet_root)
     assert verdict.status == "mismatch", verdict.detail
     assert verdict.blocks_actuation
+
+
+def test_no_source_entry_anchor_names_the_interpreter_purelib(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The published-wheel case must answer, not abstain (issue #1752).
+
+    With no ``ci-fleet`` entry in ``[tool.uv.sources]`` -- this repo's real
+    shape since 2026-08-28 -- the anchor used to return ``None``, which made
+    ``no_anchor`` a permanent condition: the escalation clock was designed as
+    a deploy window and the window never closed. The wheel-installed
+    expectation is the running interpreter's own ``purelib``.
+    """
+    import sysconfig
+
+    import charlie_work.ci_fleet_anchor as anchor_mod
+
+    fake_repo = tmp_path / "charlie-work"
+    fake_repo.mkdir()
+    (fake_repo / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["ci-fleet>=0.1.0"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(anchor_mod, "repo_root", lambda: fake_repo)
+
+    declared = anchor_mod.declared_ci_fleet_root()
+
+    assert declared == Path(sysconfig.get_path("purelib")).resolve()
+    assert declared is not None and declared.is_dir()
+    # And there is no sibling checkout to name.
+    assert anchor_mod.declared_ci_fleet_sibling_root() is None
+
+
+def test_purelib_anchor_is_not_derived_from_ci_fleet_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The expected side must not be computed from the measured side.
+
+    If the anchor re-derived its answer from ``ci_fleet.__file__`` /
+    ``find_spec`` the comparison would be tautological -- always ``ok``,
+    proving nothing, the same defect the module docstring names for
+    ``direct_url.json``. Pointing ``ci_fleet.__file__`` at a bogus tree must
+    leave the declaration unmoved.
+    """
+    import sysconfig
+
+    import charlie_work.ci_fleet_anchor as anchor_mod
+
+    import ci_fleet
+
+    fake_repo = tmp_path / "charlie-work"
+    fake_repo.mkdir()
+    (fake_repo / "pyproject.toml").write_text('[project]\nname = "x"\n', encoding="utf-8")
+    monkeypatch.setattr(anchor_mod, "repo_root", lambda: fake_repo)
+    monkeypatch.setattr(
+        ci_fleet, "__file__", str(tmp_path / "elsewhere" / "ci_fleet" / "__init__.py")
+    )
+
+    assert anchor_mod.declared_ci_fleet_root() == Path(sysconfig.get_path("purelib")).resolve()
+
+
+def test_purelib_anchor_still_reports_mismatch_for_repointed_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control: the wheel anchor is not vacuously permissive.
+
+    The hazard the check now genuinely covers is a leftover editable ``.pth``
+    landing ``ci_fleet`` outside this venv. Simulating that import root must
+    produce ``mismatch`` -- the blocking verdict -- not ``ok``.
+    """
+    import charlie_work.ci_fleet_anchor as anchor_mod
+
+    import ci_fleet.provenance
+    from ci_fleet.provenance import check_provenance
+
+    fake_repo = tmp_path / "charlie-work"
+    fake_repo.mkdir()
+    (fake_repo / "pyproject.toml").write_text('[project]\nname = "x"\n', encoding="utf-8")
+    monkeypatch.setattr(anchor_mod, "repo_root", lambda: fake_repo)
+
+    stale_sibling_src = tmp_path / "stale-sibling" / "src"
+    stale_sibling_src.mkdir(parents=True)
+    monkeypatch.setattr(ci_fleet.provenance, "import_root", lambda: stale_sibling_src)
+
+    verdict = check_provenance(anchor=anchor_mod.declared_ci_fleet_root)
+
+    assert verdict.status == "mismatch", verdict.detail
+    assert verdict.blocks_actuation
+
+
+def test_source_entry_without_path_still_abstains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``ci-fleet`` entry with no ``path`` key names no sibling checkout.
+
+    Workspace/git/registry sources install into the venv like the wheel does,
+    but a workspace member's location is not derivable from the entry alone --
+    so the entry-present-without-path case stays an abstention; #1752's fix is
+    scoped to the no-entry case only.
+    """
+    import charlie_work.ci_fleet_anchor as anchor_mod
+
+    from ci_fleet.provenance import check_provenance
+
+    fake_repo = tmp_path / "charlie-work"
+    fake_repo.mkdir()
+    (fake_repo / "pyproject.toml").write_text(
+        "[tool.uv.sources]\nci-fleet = { workspace = true }\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(anchor_mod, "repo_root", lambda: fake_repo)
+
+    assert anchor_mod.declared_ci_fleet_root() is None
+    assert anchor_mod.declared_ci_fleet_sibling_root() is None
+
+    verdict = check_provenance(anchor=anchor_mod.declared_ci_fleet_root)
+    assert verdict.status == "no_anchor", verdict.detail
+    assert not verdict.blocks_actuation
+
+
+def test_sibling_root_names_the_checkout_for_a_declared_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``declared_ci_fleet_sibling_root`` returns the checkout, not its ``src``.
+
+    The two accessors answer different questions: the anchor names the import
+    root (``<checkout>/src``) for the provenance comparison; the sibling
+    accessor names the checkout itself for git probes and self-deploy pulls.
+    """
+    import charlie_work.ci_fleet_anchor as anchor_mod
+
+    fake_repo = tmp_path / "charlie-work"
+    fake_repo.mkdir()
+    (tmp_path / "ci-fleet-src" / "src").mkdir(parents=True)
+    (fake_repo / "pyproject.toml").write_text(
+        '[tool.uv.sources]\nci-fleet = { path = "../ci-fleet-src", editable = true }\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(anchor_mod, "repo_root", lambda: fake_repo)
+
+    assert anchor_mod.declared_ci_fleet_sibling_root() == (tmp_path / "ci-fleet-src").resolve()
+    assert anchor_mod.declared_ci_fleet_root() == (tmp_path / "ci-fleet-src" / "src").resolve()
 
 
 # ---------------------------------------------------------------------------

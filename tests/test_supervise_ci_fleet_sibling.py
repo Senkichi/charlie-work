@@ -34,14 +34,16 @@ def captured_log_events(monkeypatch: Any) -> list[tuple[Path, str, dict[str, Any
     return calls
 
 
-def _fake_declared_root(monkeypatch: Any, sibling_src: Path | None) -> None:
-    """Patch declared_ci_fleet_root at its source module.
+def _fake_declared_root(monkeypatch: Any, sibling: Path | None) -> None:
+    """Patch declared_ci_fleet_sibling_root at its source module.
 
     ``_pull_ci_fleet_sibling`` imports it lazily inside its body
-    (``from .ci_fleet_anchor import declared_ci_fleet_root``), so it must be
+    (``from .ci_fleet_anchor import declared_ci_fleet_sibling_root``), so it must be
     patched at ``charlie_work.ci_fleet_anchor``, not at ``charlie_work.supervise``.
     """
-    monkeypatch.setattr("charlie_work.ci_fleet_anchor.declared_ci_fleet_root", lambda: sibling_src)
+    monkeypatch.setattr(
+        "charlie_work.ci_fleet_anchor.declared_ci_fleet_sibling_root", lambda: sibling
+    )
 
 
 def test_pull_ci_fleet_sibling_happy_path(
@@ -51,7 +53,7 @@ def test_pull_ci_fleet_sibling_happy_path(
 ) -> None:
     """Clean main sibling, sha moves -> one ok/changed events.db entry."""
     sibling = tmp_path / "ci-fleet"
-    _fake_declared_root(monkeypatch, sibling / "src")
+    _fake_declared_root(monkeypatch, sibling)
 
     runner, calls = _make_fake_runner(
         [
@@ -85,7 +87,7 @@ def test_pull_ci_fleet_sibling_unchanged_pull(
 ) -> None:
     """Pull succeeds but the sha does not move -> ok True, changed False."""
     sibling = tmp_path / "ci-fleet"
-    _fake_declared_root(monkeypatch, sibling / "src")
+    _fake_declared_root(monkeypatch, sibling)
 
     runner, _ = _make_fake_runner(
         [
@@ -119,7 +121,7 @@ def test_pull_ci_fleet_sibling_skips_non_main_branch(
     would raise ``IndexError``, failing the test.
     """
     sibling = tmp_path / "ci-fleet"
-    _fake_declared_root(monkeypatch, sibling / "src")
+    _fake_declared_root(monkeypatch, sibling)
 
     runner, calls = _make_fake_runner(
         [
@@ -149,7 +151,7 @@ def test_pull_ci_fleet_sibling_skips_dirty_tree(
     way as the non-main-branch case above.
     """
     sibling = tmp_path / "ci-fleet"
-    _fake_declared_root(monkeypatch, sibling / "src")
+    _fake_declared_root(monkeypatch, sibling)
 
     runner, calls = _make_fake_runner(
         [
@@ -194,7 +196,7 @@ def test_pull_ci_fleet_sibling_pull_failure_is_non_fatal(
 ) -> None:
     """A failed pull is recorded with an error, event still emitted, no raise."""
     sibling = tmp_path / "ci-fleet"
-    _fake_declared_root(monkeypatch, sibling / "src")
+    _fake_declared_root(monkeypatch, sibling)
 
     runner, _ = _make_fake_runner(
         [
@@ -221,12 +223,12 @@ def test_pull_ci_fleet_sibling_declared_root_raises_is_caught(
     monkeypatch: Any,
     captured_log_events: list[tuple[Path, str, dict[str, Any]]],
 ) -> None:
-    """An exception from declared_ci_fleet_root is caught, logged, never propagates."""
+    """An exception from declared_ci_fleet_sibling_root is caught, logged, never propagates."""
 
     def _boom() -> Path | None:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("charlie_work.ci_fleet_anchor.declared_ci_fleet_root", _boom)
+    monkeypatch.setattr("charlie_work.ci_fleet_anchor.declared_ci_fleet_sibling_root", _boom)
 
     runner, calls = _make_fake_runner([])
 

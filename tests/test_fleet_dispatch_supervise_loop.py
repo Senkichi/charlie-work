@@ -437,7 +437,8 @@ def test_run_fleet_supervise_records_ci_fleet_provenance(
     commit. This event makes that coupling attributable: it stamps
     ``ci_fleet.__file__``, the sibling repo's HEAD/branch/dirty-state into the
     fleet-level events.db at every supervisor start. The event is recorded
-    even when ``declared_ci_fleet_root`` abstains (e.g. from a worktree), so
+    even when ``declared_ci_fleet_sibling_root`` abstains (no declared sibling
+    checkout -- e.g. the published-wheel deployment), so
     the ``ci_fleet_file`` field is the one fact always present.
     """
     mock_load_config.return_value = OrchestratorConfig(
@@ -463,7 +464,7 @@ def test_run_fleet_supervise_records_ci_fleet_provenance(
     # ci_fleet is importable in this venv, so __file__ is always set.
     assert payload["ci_fleet_file"] is not None
     # All fields are present (None is a valid value for the sibling fields
-    # when declared_ci_fleet_root abstains from a worktree).
+    # when declared_ci_fleet_sibling_root abstains -- no declared checkout).
     for key in (
         "sibling_root",
         "sibling_head",
