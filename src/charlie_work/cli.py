@@ -1375,7 +1375,10 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     state_dir = (
         global_config.runtime.state_dir if global_config is not None else layout.DEFAULT_STATE_DIR
     )
-    state_root = runtime_paths(orchestrator_root(), state_dir).root
+    # orchestrator_root() is the supervisor's own bookkeeping root, not a
+    # per-repo root -- it never gets a state.json, so the phantom-state-dir
+    # heuristic would false-positive here (issue #1754).
+    state_root = runtime_paths(orchestrator_root(), state_dir, check_phantom=False).root
     deploy = self_deploy(
         orchestrator_root(),
         state_root=state_root,

@@ -2604,7 +2604,9 @@ def run_fleet_supervise(
     if not anchor.ok:
         logger.error("VENV EDITABLE ANCHOR VIOLATION: %s", anchor.detail)
         log_event(
-            runtime_paths(orchestrator_root(), layout.DEFAULT_STATE_DIR).state_file,
+            runtime_paths(
+                orchestrator_root(), layout.DEFAULT_STATE_DIR, check_phantom=False
+            ).state_file,
             "venv_editable_anchor_violation",
             {"detail": anchor.detail},
         )
@@ -2666,7 +2668,14 @@ def run_fleet_supervise(
     if max_runtime_override is not None:
         overrides["max_runtime_minutes"] = max_runtime_override
     cfg = replace(global_config.supervisor, **overrides)
-    supervisor_runtime_paths = runtime_paths(orchestrator_root(), global_config.runtime.state_dir)
+    # orchestrator_root() is the supervisor's private self-bookkeeping root --
+    # the per-repo loop never runs against it, so state.json is never created
+    # there while events.db legitimately accumulates. That is exactly the
+    # phantom-state-dir signature; check_phantom=False keeps this intentional
+    # root out of a heuristic meant for misresolved per-repo roots (#1754).
+    supervisor_runtime_paths = runtime_paths(
+        orchestrator_root(), global_config.runtime.state_dir, check_phantom=False
+    )
     state_root = supervisor_runtime_paths.root
 
     # Issue #1363: supervisor-startup preflight. Runs once, before the lock is
