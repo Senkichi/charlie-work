@@ -434,6 +434,120 @@ def test_filter_fleet_health_transitions_self_deploy_key_survives_repo_reconcili
     assert _load_fleet_health_state(state_file) == {"self-deploy:-1": "ERROR"}
 
 
+def test_filter_fleet_health_transitions_drops_key_for_unregistered_repo(
+    tmp_path: Path,
+) -> None:
+    """Issue #1755: a baseline key whose repo is not in the current fleet
+    registry can never appear in any pass's ``observed_repo_keys`` (only
+    selected registry entries run lanes), so the #817 reconciliation alone
+    retains it forever -- the live ``owner/repo:-1`` ERROR entry.
+    ``registered_repo_keys`` is the GC signal for those keys.
+
+    A registered-but-unobserved key keeps the #817 protection (absence of a
+    check this pass is not evidence of health), and a non-repo-shaped key
+    (``self-deploy`` -- fleet-internal namespaces never contain ``/``, while
+    every ``name_with_owner`` does) is not a repo key and must not be GC'd
+    by registry membership.
+    """
+    from charlie_work.fleet_dispatch import (
+        _fleet_health_state_path,
+        _filter_fleet_health_transitions,
+        _load_fleet_health_state,
+    )
+    from charlie_work.notify import AttentionEntry
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    entries = [
+        AttentionEntry(
+            issue_number=-1,
+            adapter_kind="owner/removed-repo",
+            health="ERROR",
+            previous_health=None,
+            last_log_line="lane error",
+            pid=None,
+        ),
+        AttentionEntry(
+            issue_number=7,
+            adapter_kind="owner/registered-repo",
+            health="ERROR",
+            previous_health=None,
+            last_log_line="stalled",
+            pid=None,
+        ),
+        AttentionEntry(
+            issue_number=-1,
+            adapter_kind="self-deploy",
+            health="ERROR",
+            previous_health=None,
+            last_log_line="pull failed",
+            pid=None,
+        ),
+    ]
+    _filter_fleet_health_transitions(entries, state_file)
+    assert _load_fleet_health_state(state_file) == {
+        "owner/removed-repo:-1": "ERROR",
+        "owner/registered-repo:7": "ERROR",
+        "self-deploy:-1": "ERROR",
+    }
+
+    # Next pass: no lanes were observed (empty observed set), and the
+    # registry only contains owner/registered-repo. The ghost key is dropped
+    # on membership alone; the other two survive for different reasons.
+    result = _filter_fleet_health_transitions(
+        [],
+        state_file,
+        observed_repo_keys=frozenset(),
+        registered_repo_keys=frozenset({"owner/registered-repo"}),
+    )
+    assert result == []
+    assert _load_fleet_health_state(state_file) == {
+        "owner/registered-repo:7": "ERROR",
+        "self-deploy:-1": "ERROR",
+    }
+
+
+def test_build_fleet_attention_digest_forwards_registered_repo_keys(
+    tmp_path: Path,
+) -> None:
+    """Issue #1755: ``_build_fleet_attention_digest`` forwards
+    ``registered_repo_keys`` through to ``_filter_fleet_health_transitions``,
+    so ``fleet_loop``'s registry-membership GC actually reaches the baseline
+    sidecar rather than being silently dropped somewhere in between -- the
+    same plumbing gap class the #817 forwarding test above pins for
+    ``observed_repo_keys``.
+    """
+    from charlie_work.fleet_dispatch import (
+        _build_fleet_attention_digest,
+        _fleet_health_state_path,
+        _load_fleet_health_state,
+    )
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    events = [
+        {
+            "repo_key": "owner/ghost",
+            "type": "error",
+            "issue_number": -1,
+            "error": "lane error from a repo later removed from the registry",
+        }
+    ]
+    digest1 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest1.transitions) == 1
+    assert _load_fleet_health_state(state_file) == {"owner/ghost:-1": "ERROR"}
+
+    # Next pass: owner/ghost is absent from the registry, so it can never
+    # enter observed_repo_keys; membership GC drops it even though nothing
+    # ran for it this pass.
+    digest2 = _build_fleet_attention_digest(
+        [],
+        state_file=state_file,
+        observed_repo_keys=frozenset({"owner/repo"}),
+        registered_repo_keys=frozenset({"owner/repo"}),
+    )
+    assert digest2.transitions == ()
+    assert _load_fleet_health_state(state_file) == {}
+
+
 def test_digest_renders_event_types_that_have_no_explicit_branch() -> None:
     """An unmapped event type must not vanish.
 

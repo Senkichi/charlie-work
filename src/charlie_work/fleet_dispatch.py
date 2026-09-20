@@ -1423,6 +1423,7 @@ def _filter_fleet_health_transitions(
     *,
     persistent_mask: list[bool] | None = None,
     observed_repo_keys: frozenset[str] | None = None,
+    registered_repo_keys: frozenset[str] | None = None,
 ) -> list[AttentionEntry]:
     """Stateful filter: keep only persistent-health entries whose health changed.
 
@@ -1472,6 +1473,24 @@ def _filter_fleet_health_transitions(
     repo_root, supervisor lock held, an unhandled per-repo exception) is not
     in ``observed_repo_keys``, so its keys are left untouched -- absence of
     a check is not evidence of health.
+
+    ``registered_repo_keys`` (issue #1755) is the set of repo keys currently
+    in the fleet registry (``fleet.json``'s ``repos`` map). The
+    ``observed_repo_keys`` rule above can only ever clear a key once its
+    repo's lane runs to completion -- a key whose ``adapter_kind`` names a
+    repo that is not, or is no longer, a registry member can never appear in
+    any pass's ``observed_repo_keys`` (only selected registry entries run
+    lanes) and would otherwise be retained forever: the same "latched
+    permanently" defect class #817 fixed for the repo-recovers case, but for
+    the repo-removed / never-registered case. A persisted key whose
+    ``adapter_kind`` is repo-shaped -- every ``name_with_owner`` contains
+    ``/`` (``owner/name`` from GitHub, ``local/<name>`` for local-file
+    repos), while fleet-internal namespaces like ``self-deploy`` never do --
+    and is absent from ``registered_repo_keys`` is dropped outright: it is
+    residue, not a health signal. Keys for repos that ARE registered but
+    did not run this pass are still left untouched -- registry membership
+    does not weaken #817's "absence of a check is not evidence of health"
+    protection.
     """
     emitted: list[AttentionEntry] = []
     touched_keys: set[str] = set()
@@ -1495,13 +1514,28 @@ def _filter_fleet_health_transitions(
                 continue
             emitted.append(replace(entry, previous_health=last))
             baselines[key] = entry.health
-        if observed_repo_keys:
+        if observed_repo_keys or registered_repo_keys is not None:
+            dropped_unregistered: list[str] = []
             for key in list(baselines):
                 if key in touched_keys:
                     continue
                 adapter_kind = key.split(":", 1)[0]
-                if adapter_kind in observed_repo_keys:
+                if observed_repo_keys and adapter_kind in observed_repo_keys:
                     del baselines[key]
+                elif (
+                    registered_repo_keys is not None
+                    and "/" in adapter_kind
+                    and adapter_kind not in registered_repo_keys
+                ):
+                    dropped_unregistered.append(key)
+                    del baselines[key]
+            if dropped_unregistered:
+                logger.info(
+                    "fleet health baseline: dropped %d key(s) whose repo is "
+                    "not in the current fleet registry: %s",
+                    len(dropped_unregistered),
+                    ", ".join(sorted(dropped_unregistered)),
+                )
         _save_fleet_health_state(state_file, baselines)
     return emitted
 
@@ -1543,6 +1577,7 @@ def _build_fleet_attention_digest(
     attention_events: list[dict[str, Any]],
     state_file: Path | None = None,
     observed_repo_keys: frozenset[str] | None = None,
+    registered_repo_keys: frozenset[str] | None = None,
 ) -> AttentionDigest:
     """Convert fleet-aggregated event dicts into a single AttentionDigest.
 
@@ -1574,6 +1609,11 @@ def _build_fleet_attention_digest(
     issue was genuinely re-checked this pass and found healthy is reconciled
     away instead of latching at its last unhealthy value forever -- see that
     function's docstring for the exact semantics.
+
+    ``registered_repo_keys`` (issue #1755) is likewise forwarded so a key
+    whose repo is no longer in the fleet registry at all is garbage-collected
+    rather than retained forever -- ``observed_repo_keys`` alone can never
+    clear it, since only registry members run lanes.
     """
     entries: list[AttentionEntry] = []
     # Parallel to ``entries``: True for persistent-health event types subject
@@ -1719,6 +1759,7 @@ def _build_fleet_attention_digest(
             state_file,
             persistent_mask=persistent_mask,
             observed_repo_keys=observed_repo_keys,
+            registered_repo_keys=registered_repo_keys,
         )
 
     return AttentionDigest(
@@ -2189,10 +2230,16 @@ def fleet_loop(
     # stays outermost so no digest is built when notify is off.
     if notify_config is not None and getattr(notify_config, "enabled", False):
         health_state_file = _fleet_health_state_path(fleet_dir_override)
+        # Re-load the registry now (post-prune, post-lane) rather than reuse
+        # the pass-start snapshot, so baseline keys for repos removed this
+        # pass -- or never registered at all -- are garbage-collected by
+        # issue #1755's membership check against the registry as it stands
+        # when the baseline is written.
         attention_digest = _build_fleet_attention_digest(
             attention_events,
             state_file=health_state_file,
             observed_repo_keys=frozenset(observed_repo_keys),
+            registered_repo_keys=frozenset(_load_registry(fleet_json_path).get("repos", {})),
         )
         if attention_digest.transitions:
             notify_result = emit_digest(notify_config, attention_digest)
