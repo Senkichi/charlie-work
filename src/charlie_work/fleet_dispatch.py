@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import datetime
 import importlib.util
-import json
 import logging
 import os
 import subprocess
@@ -24,6 +23,19 @@ from .capacity_starvation_escalation import (
     CAPACITY_STARVATION_ESCALATION_KIND,
     build_capacity_starvation_attention_entry,
     detect_capacity_starvation_escalation,
+)
+from .fleet_health_baseline import (
+    _filter_fleet_health_transitions,
+    _fleet_health_state_path,
+)
+
+# Re-exported so the extraction (issue #1755 round-2 review) keeps the
+# ``fleet_dispatch.<name>`` facade intact for existing callers/tests; the
+# implementations live in the fleet_health_baseline domain module.
+from .fleet_health_baseline import (  # noqa: F401  (deliberate re-export)
+    _load_fleet_health_state,
+    _save_fleet_health_state,
+    reconcile_fleet_health_baselines,
 )
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .fleet_registry import _load_registry, count_fleet_runners
@@ -1369,144 +1381,6 @@ def _add_launch_failures(
 _PERSISTENT_HEALTH_EVENT_TYPES = frozenset({"stalled", "error", "health_transition"})
 
 
-def _fleet_health_state_path(fleet_dir_override: str | None) -> Path:
-    """Return the fleet-level notify health baseline sidecar path.
-
-    This sidecar persists the last-known health per (adapter_kind, issue_number)
-    so the fleet digest can emit only on real transitions instead of re-firing
-    every pass with ``previous_health: null`` (issue #554). It lives in the
-    fleet directory alongside ``fleet.json``.
-    """
-    return layout.notify_health_state_path(override=fleet_dir_override)
-
-
-def _load_fleet_health_state(path: Path) -> dict[str, str]:
-    """Load the fleet health baseline sidecar.
-
-    Returns an empty dict when the file is missing or unparseable (a corrupt
-    sidecar is non-fatal: the worst case is one extra transition emission on
-    the next pass, which is exactly the degraded mode we are fixing away from).
-    """
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8-sig") as handle:
-            data = json.load(handle)
-    except (json.JSONDecodeError, LookupError, ValueError, OSError):
-        logger.warning("Fleet health state %s unreadable; starting fresh", path)
-        return {}
-    issues = data.get("issues") if isinstance(data, dict) else None
-    if not isinstance(issues, dict):
-        return {}
-    # Coerce values to str; keys are already "adapter_kind:issue_number" strings.
-    return {str(k): str(v) for k, v in issues.items() if isinstance(v, str)}
-
-
-def _save_fleet_health_state(path: Path, issues: dict[str, str]) -> None:
-    """Atomically persist the fleet health baseline sidecar.
-
-    Temp-file + ``replace()`` per the project's atomic-write invariant. Warns
-    on fleet-dir virtualization (issue #624) but never blocks the write.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    warn_fleet_dir_virtualization_on_write(path.parent, context="writing notify_health_state.json")
-    payload = {"version": 1, "generated_at": utc_now(), "issues": issues}
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
-
-
-def _filter_fleet_health_transitions(
-    entries: list[AttentionEntry],
-    state_file: Path,
-    *,
-    persistent_mask: list[bool] | None = None,
-    observed_repo_keys: frozenset[str] | None = None,
-) -> list[AttentionEntry]:
-    """Stateful filter: keep only persistent-health entries whose health changed.
-
-    Reads the fleet health baseline sidecar (``notify_health_state.json``)
-    mapping ``"adapter_kind:issue_number"`` to the last-emitted health. For
-    each *persistent* entry, only keeps it when the health differs from the
-    persisted baseline, setting ``previous_health`` to that prior value.
-    Updates and atomically persists the new baselines.
-
-    This is the fleet-level analogue of ``workflow._build_attention_digest``'s
-    per-issue transition dedup. Without it, every fleet pass re-emits the same
-    ERROR/STALLED entries with ``previous_health: null`` (issue #554).
-
-    ``persistent_mask`` (parallel to ``entries``) marks which entries represent
-    a persistent health state subject to cross-pass dedup. Entries marked
-    ``False`` are occurrence-style events (review_verdict_recorded/missed,
-    skipped, live_worker_redispatch_averted, operational fallback) and pass
-    through unchanged every call — they never consult nor update the baseline,
-    so a constant-health confirmation keeps firing as a heartbeat (PR #669
-    review). When ``persistent_mask`` is ``None`` every entry is treated as
-    persistent (the self-deploy ERROR/REPAIRED path, which is always
-    persistent).
-
-    Entries are processed in order so a within-pass health change (e.g.
-    ERROR then OK for the same issue) emits both transitions; the persisted
-    baseline ends at the final health.
-
-    ``observed_repo_keys`` (issue #817 item 2) reconciles the baseline
-    against issues that were genuinely re-checked this pass and found
-    healthy. Persistent-health entries only ever exist for *unhealthy*
-    observations (stalled/error/health_transition) -- a healthy issue
-    produces no event at all, so without this the baseline can only ever
-    move *into* an unhealthy value and never back out, latching every
-    tracked issue at its first failure forever (the same defect item 1 fixes
-    for self-deploy, whose producer always has a distinct success value to
-    feed; issue health has no such value to hang a recovery entry on). After
-    the loop above, any *other* persisted key whose ``adapter_kind`` (the
-    part before the first ``:``) is in ``observed_repo_keys`` -- meaning
-    that repo's lane ran to completion this pass, so every issue it tracks
-    was genuinely looked at -- and that was not itself re-affirmed unhealthy
-    in this same call is silently cleared, not re-emitted as a recovery
-    entry (there is no "issue confirmed healthy" event to attach one to).
-    This does not create a false transition; it lets the *next* unhealthy
-    observation for that key read ``previous_health: null`` and emit as a
-    fresh incident instead of being suppressed by a latch that could never
-    leave its last value. A repo lane that did not run this pass (missing
-    repo_root, supervisor lock held, an unhandled per-repo exception) is not
-    in ``observed_repo_keys``, so its keys are left untouched -- absence of
-    a check is not evidence of health.
-    """
-    emitted: list[AttentionEntry] = []
-    touched_keys: set[str] = set()
-    # Ensure the parent directory exists before state_lock tries to create the
-    # sibling .lock file (advisory_file_lock touches it directly).
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    with state_lock(state_file):
-        baselines = _load_fleet_health_state(state_file)
-        for idx, entry in enumerate(entries):
-            is_persistent = persistent_mask[idx] if persistent_mask is not None else True
-            if not is_persistent:
-                # Occurrence-style event: emit every time and leave the
-                # persisted baseline untouched (it tracks persistent health
-                # only, so a one-shot confirmation must not poison it).
-                emitted.append(entry)
-                continue
-            key = f"{entry.adapter_kind}:{entry.issue_number}"
-            touched_keys.add(key)
-            last = baselines.get(key)
-            if last == entry.health:
-                continue
-            emitted.append(replace(entry, previous_health=last))
-            baselines[key] = entry.health
-        if observed_repo_keys:
-            for key in list(baselines):
-                if key in touched_keys:
-                    continue
-                adapter_kind = key.split(":", 1)[0]
-                if adapter_kind in observed_repo_keys:
-                    del baselines[key]
-        _save_fleet_health_state(state_file, baselines)
-    return emitted
-
-
 def _emit_fleet_transition(
     notify_config: Any,
     entry: AttentionEntry,
@@ -1544,6 +1418,7 @@ def _build_fleet_attention_digest(
     attention_events: list[dict[str, Any]],
     state_file: Path | None = None,
     observed_repo_keys: frozenset[str] | None = None,
+    registered_repo_keys: frozenset[str] | None = None,
 ) -> AttentionDigest:
     """Convert fleet-aggregated event dicts into a single AttentionDigest.
 
@@ -1575,6 +1450,13 @@ def _build_fleet_attention_digest(
     issue was genuinely re-checked this pass and found healthy is reconciled
     away instead of latching at its last unhealthy value forever -- see that
     function's docstring for the exact semantics.
+
+    ``registered_repo_keys`` (issue #1755) is likewise forwarded so a key
+    whose repo is no longer in the fleet registry at all is garbage-collected
+    rather than retained forever -- ``observed_repo_keys`` alone can never
+    clear it, since only registry members run lanes. ``None`` (or an empty
+    set) disables that GC; ``fleet_loop`` passes ``None`` whenever the
+    registry cannot be positively read as non-empty.
     """
     entries: list[AttentionEntry] = []
     # Parallel to ``entries``: True for persistent-health event types subject
@@ -1720,6 +1602,7 @@ def _build_fleet_attention_digest(
             state_file,
             persistent_mask=persistent_mask,
             observed_repo_keys=observed_repo_keys,
+            registered_repo_keys=registered_repo_keys,
         )
 
     return AttentionDigest(
@@ -2190,10 +2073,27 @@ def fleet_loop(
     # stays outermost so no digest is built when notify is off.
     if notify_config is not None and getattr(notify_config, "enabled", False):
         health_state_file = _fleet_health_state_path(fleet_dir_override)
+        # Issue #1755 (round-2 review): derive the registered-repo set from
+        # the pass-start registry snapshot minus entries pruned this pass --
+        # not a second, unlocked _load_registry re-read. Fail CLOSED:
+        # _load_registry collapses a missing, corrupt, or empty fleet.json
+        # into {"repos": {}}, so an empty registry is indistinguishable from
+        # an unreadable one. Handing the filter frozenset() would delete
+        # every repo-shaped baseline key; pass None instead, which disables
+        # the membership GC outright (reconcile_fleet_health_baselines treats
+        # an empty set identically, so the boundary is defended at both
+        # layers).
+        registry_repos = registry.get("repos")
+        live_repo_keys = (
+            frozenset(registry_repos) - frozenset(pruned_keys)
+            if isinstance(registry_repos, dict)
+            else frozenset()
+        )
         attention_digest = _build_fleet_attention_digest(
             attention_events,
             state_file=health_state_file,
             observed_repo_keys=frozenset(observed_repo_keys),
+            registered_repo_keys=live_repo_keys or None,
         )
         if attention_digest.transitions:
             notify_result = emit_digest(notify_config, attention_digest)
