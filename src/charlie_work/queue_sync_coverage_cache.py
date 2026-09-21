@@ -19,18 +19,46 @@ SAFETY (this is #502-tripwire-adjacent, security-relevant code):
   ``covered=False`` (whether determined-not-covered or indeterminate/fetch-
   failed) is NEVER cached -- an uncovered or ambiguous merge must be
   re-examined every single pass, exactly as before this module existed.
-* The cache key is the exact triple the four-condition predicate is a
+* The cache key is the exact quadruple the four-condition predicate is a
   function of: ``pr_number`` (which PR), ``reviewed_head_sha`` (which
-  approval), ``live_head_sha`` (which merged head). A new push to a PR's
-  branch, a rewritten review decision, or a brand-new merged PR number all
-  produce a key never seen before, so the cache cannot suppress detection of
-  any of those -- it can only ever skip re-deriving an answer already reached
-  for the exact same three facts.
+  approval), ``live_head_sha`` (which merged head), and the *effective*
+  ``queue_bot_login`` (condition 4 of the predicate, and the config value
+  that gates the whole check -- ``queue_sync_coverage._queue_sync_merge_
+  covered`` returns ``covered=False`` outright when it is unset). Issue
+  #1473 review finding 1: an earlier revision left this out of the key, so
+  rotating or unsetting ``queue_bot_login`` (bot identity migration, or
+  disabling recognition entirely because the bot account is suspected
+  compromised) could not re-arm a merge already memoized under the old
+  value -- the kill switch was a no-op for exactly the merges it exists to
+  re-arm. Including it in the key is necessary but not sufficient by
+  itself: :func:`charlie_work.orchestration.instrumentation_ops.
+  OrchestratorApp._queue_sync_merge_covered` additionally skips the cache
+  lookup outright when ``queue_bot_login`` is falsy, so the kill switch is
+  enforced at the earliest point rather than only by key mismatch. A new
+  push to a PR's branch, a rewritten review decision, a brand-new merged PR
+  number, or a changed bot login all produce a key never seen before, so
+  the cache cannot suppress detection of any of those -- it can only ever
+  skip re-deriving an answer already reached for the exact same facts.
 * A missing, unreadable, or structurally-corrupt cache file degrades to an
   EMPTY cache (fail closed): every triple reads as a miss, so the caller
   re-verifies from ``gh`` exactly as if memoization did not exist. Corruption
   can only cost extra API calls, never suppress a finding or fabricate a
   ``covered=True`` verdict.
+* The write path (:func:`record_covered`) is best-effort in the same
+  fail-safe direction: ``StateLockBusy`` *and* ``OSError`` (disk full, a
+  read-only state dir, or -- on Windows -- a concurrent reader holding the
+  destination open across ``Path.replace()``) are both caught, logged, and
+  turned into a ``False`` return, never raised. Issue #1473 review finding
+  2: catching only ``StateLockBusy`` let a transient write failure escape
+  this function, and from there ``_detect_unauthorized_merges`` (which
+  guards ``GitHubError`` only) and ``reap_loop.py`` (which guards nothing at
+  that call site) -- so a disk-full condition could abort the whole reap
+  pass instead of merely costing one avoidable re-check next pass.
+* The caller is responsible for never consulting the cache at all under
+  ``--dry-run`` (issue #1473 review finding 5): a dry-run pass must have the
+  same events.db/state.json footprint as a caller that never ran, and a raw
+  file write here bypasses ``WriteGate`` entirely, so this module cannot
+  enforce that on its own.
 
 Persistence follows this repo's existing sidecar-cache shape
 (``api_budget.settle_session_to_disk`` / ``fleet_health_baseline``): a small
@@ -48,6 +76,15 @@ window becomes dead weight (never looked up again), but the file stays a
 small flat map of short strings -- even several thousand entries is a
 trivially small JSON file, and pruning it would need to duplicate
 ``merged_pr_list()``'s own windowing policy for no operational benefit.
+
+Batch preload: :func:`load_cache_map` loads the whole file once so a caller
+iterating several candidate PRs in one pass (``_detect_unauthorized_merges``)
+can pass the same in-memory map to every :func:`is_covered_cached` call via
+its ``preloaded`` parameter, instead of re-``open``-ing and re-``json.load``-
+ing the file once per candidate (issue #1473 review finding 4 -- the file
+is never pruned, so a per-candidate re-parse re-introduces a smaller version
+of the same "unbounded per-pass work for an unchanging answer" shape the
+issue is about).
 """
 
 from __future__ import annotations
@@ -61,25 +98,37 @@ from .state import StateLockBusy, advisory_file_lock, utc_now
 logger = logging.getLogger(__name__)
 
 
-def _cache_key(pr_number: int, reviewed_head_sha: str, live_head_sha: str) -> str:
+def _cache_key(
+    pr_number: int, reviewed_head_sha: str, live_head_sha: str, queue_bot_login: str
+) -> str:
     """Build the memoization key for one coverage verdict.
 
-    All three components are load-bearing: dropping ``live_head_sha`` would
+    All four components are load-bearing: dropping ``live_head_sha`` would
     let a later force-push to a merged PR's (undeleted) branch keep reading
     the old verdict; dropping ``reviewed_head_sha`` would let a corrected or
     re-written review decision keep reading a verdict computed against a
-    different approval.
+    different approval; dropping ``queue_bot_login`` (issue #1473 review
+    finding 1) would let a verdict memoized under one bot identity keep
+    reading as covered after the operator rotates or unsets it -- see the
+    module docstring's SAFETY section.
     """
-    return f"{pr_number}:{reviewed_head_sha}:{live_head_sha}"
+    return f"{pr_number}:{reviewed_head_sha}:{live_head_sha}:{queue_bot_login}"
 
 
-def _load_cache(path: Path) -> dict[str, str]:
-    """Load the durable covered-verdict cache.
+def load_cache_map(path: Path) -> dict[str, str]:
+    """Load the durable covered-verdict cache as a plain ``{key: timestamp}`` map.
 
     Returns ``{}`` (every triple a miss) on a missing, unreadable, or
     structurally wrong-shaped file. This is the fail-closed path described in
     the module docstring: a corrupt cache degrades to "verify everything
     again", never to "assume it is covered".
+
+    Public (unlike the rest of this module's read/write helpers) so a caller
+    that will look up several keys in one pass -- ``_detect_unauthorized_
+    merges`` -- can load the file once and pass the result to every
+    :func:`is_covered_cached` call via its ``preloaded`` parameter, rather
+    than re-parsing the file once per candidate PR (issue #1473 review
+    finding 4).
     """
     if not path.exists():
         return {}
@@ -116,17 +165,27 @@ def is_covered_cached(
     pr_number: int,
     reviewed_head_sha: str,
     live_head_sha: str,
+    queue_bot_login: str,
+    preloaded: dict[str, str] | None = None,
 ) -> bool:
-    """Return ``True`` iff this exact triple was already determined covered.
+    """Return ``True`` iff this exact quadruple was already determined covered.
 
     Lock-free read: the on-disk file is only ever replaced atomically (see
     :func:`_save_cache`), so a concurrent writer can never be observed
     mid-write. There is no code path that writes a ``False`` entry, so a
     ``True`` here is proof a prior pass ran the full four-condition check and
-    it fully passed.
+    it fully passed under this exact ``queue_bot_login``.
+
+    ``preloaded``, when given, is used in place of re-reading ``path`` (issue
+    #1473 review finding 4) -- pass the result of one :func:`load_cache_map`
+    call shared across every candidate PR in a single
+    ``_detect_unauthorized_merges`` pass. ``None`` (the default) falls back
+    to loading the file fresh, preserving this function's original
+    single-call contract for any other caller.
     """
-    key = _cache_key(pr_number, reviewed_head_sha, live_head_sha)
-    return key in _load_cache(path)
+    key = _cache_key(pr_number, reviewed_head_sha, live_head_sha, queue_bot_login)
+    entries = preloaded if preloaded is not None else load_cache_map(path)
+    return key in entries
 
 
 def record_covered(
@@ -135,6 +194,7 @@ def record_covered(
     pr_number: int,
     reviewed_head_sha: str,
     live_head_sha: str,
+    queue_bot_login: str,
 ) -> bool:
     """Durably record a freshly-determined ``covered=True`` verdict.
 
@@ -143,32 +203,42 @@ def record_covered(
     different PRs' verdicts cannot lose one another's entry. Idempotent --
     recording an already-present key is a no-op.
 
-    Best-effort: if the advisory lock is busy, the entry is simply not
-    persisted this pass (logged, ``False`` returned, never raised). This
-    pass's caller has already received its ``covered=True`` answer from the
-    real check before calling this function, so a skipped memoization only
-    costs one avoidable re-check on the *next* pass -- it never changes any
-    pass's ``unauthorized_merge_detected`` verdict.
+    Best-effort in the fail-safe direction: if the advisory lock is busy, or
+    any step of the write (``mkdir``, opening the temp file, ``json.dump``,
+    or the atomic ``replace()``) raises ``OSError`` -- disk full, a
+    read-only state dir, or on Windows a concurrent reader holding the
+    destination open across ``replace()`` -- the entry is simply not
+    persisted this pass (logged, ``False`` returned, never raised). Issue
+    #1473 review finding 2: this used to catch only ``StateLockBusy``, so an
+    ``OSError`` from the write path escaped uncaught into
+    ``_detect_unauthorized_merges`` (which guards ``GitHubError`` only) and
+    from there into callers with no guard at all -- turning a memoization
+    optimization into an aborted reap pass. This pass's caller has already
+    received its ``covered=True`` answer from the real check before calling
+    this function, so a skipped memoization only costs one avoidable
+    re-check on the *next* pass -- it never changes any pass's
+    ``unauthorized_merge_detected`` verdict.
     """
-    key = _cache_key(pr_number, reviewed_head_sha, live_head_sha)
+    key = _cache_key(pr_number, reviewed_head_sha, live_head_sha, queue_bot_login)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with advisory_file_lock(path):
-            entries = _load_cache(path)
+            entries = load_cache_map(path)
             if key in entries:
                 return True
             entries = {**entries, key: utc_now()}
             _save_cache(path, entries)
-    except StateLockBusy:
+    except (StateLockBusy, OSError) as exc:
         logger.warning(
-            "queue-sync coverage cache lock busy at %s; skipping memoization "
-            "of pr=%s (this pass's verdict is unaffected -- the check simply "
-            "repeats next pass)",
+            "queue-sync coverage cache write failed at %s; skipping "
+            "memoization of pr=%s (%s) (this pass's verdict is unaffected -- "
+            "the check simply repeats next pass)",
             path,
             pr_number,
+            exc,
         )
         return False
     return True
 
 
-__all__ = ["is_covered_cached", "record_covered"]
+__all__ = ["is_covered_cached", "load_cache_map", "record_covered"]

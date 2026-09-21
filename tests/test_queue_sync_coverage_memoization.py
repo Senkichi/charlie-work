@@ -283,37 +283,186 @@ def test_corrupt_cache_file_degrades_to_reverify(tmp_path: Path) -> None:
     assert len(restored["covered"]) == 1
 
 
+def test_cache_hit_does_not_survive_bot_login_config_change(tmp_path: Path) -> None:
+    """Review finding 1: a policy change to ``auto_merge.queue_bot_login``
+    (rotating the bot identity, swapping mergequeue providers, or unsetting
+    it entirely because the bot account is suspected compromised) must
+    re-arm every merge already memoized under the old value -- the kill
+    switch documented in ``queue_sync_coverage._queue_sync_merge_covered``
+    must not be a no-op for merges the cache already answered.
+
+    Against the pre-fix code (cache key = triple, no login, and no
+    ``bool(queue_bot_login)`` gate) this test fails: the second pass reads
+    the cache hit from the first pass and returns ``[]`` instead of a fresh
+    ``not_covered`` finding.
+    """
+    app, paths, fake_gh = _app(tmp_path)
+    _arm_covered_queue_sync_fixture(fake_gh, paths)
+
+    first = app._detect_unauthorized_merges()
+    assert first == []
+    assert len(query_events(paths.state_file, kind="unauthorized_merge_queue_sync_covered")) == 1
+
+    # Rebuild against the SAME state root (the on-disk cache persists) with
+    # queue_bot_login unset -- the documented kill switch.
+    unset_config = OrchestratorConfig(auto_merge=AutoMergeConfig(queue_bot_login=None))
+    app_unset = OrchestratorApp(tmp_path, paths, unset_config, fake_gh)
+
+    second = app_unset._detect_unauthorized_merges()
+    assert len(second) == 1
+    assert second[0]["pr"] == 701
+    assert second[0]["coverage_check"] == "not_covered"
+    assert second[0]["coverage_reason"] == "auto_merge.queue_bot_login not configured"
+    # No second covered event: the kill switch stopped the check before it
+    # could ever reach a covered verdict.
+    assert len(query_events(paths.state_file, kind="unauthorized_merge_queue_sync_covered")) == 1
+
+
+def test_indeterminate_verdict_never_memoized(tmp_path: Path, monkeypatch: Any) -> None:
+    """Review finding 3's explicit non-goal: an indeterminate verdict (every
+    retry of a fetch leg fails) must never be memoized. Two successive
+    passes over the same permanently-unfetchable live head each
+    independently pay the full retry budget and each surface
+    ``coverage_check == "indeterminate"``; the cache file is never created.
+
+    Against a hypothetical regression that cached on ``not result.covered
+    == False`` (i.e. anything that isn't a determined not-covered) instead
+    of ``result.covered`` this test's second-pass call-count assertion
+    would fail: the second pass would short-circuit before ever calling
+    ``gh.commit()`` again.
+    """
+    from charlie_work import queue_sync_coverage as queue_sync_coverage_module
+
+    monkeypatch.setattr(
+        queue_sync_coverage_module,
+        "_QUEUE_SYNC_RETRY_SLEEP",
+        lambda _seconds: None,
+        raising=False,
+    )
+
+    app, paths, fake_gh = _app(tmp_path)
+    pr = _covered_pr(fake_gh, paths)
+    fake_gh.prs = [pr]
+    # Delete the live-head commit AFTER wiring the fixture (assigning `prs`
+    # would otherwise re-synthesize it via FakeGitHub._record_pr_heads) so
+    # every gh.commit() attempt for it is a genuine FETCH failure, not a
+    # determined shape.
+    del fake_gh.commits["sha-syncmerge"]
+
+    first = app._detect_unauthorized_merges()
+    assert len(first) == 1
+    assert first[0]["coverage_check"] == "indeterminate"
+    assert fake_gh.commit_calls["sha-syncmerge"] == 3
+
+    cache_path = layout.queue_sync_coverage_cache_path(paths.root)
+    assert not cache_path.exists()
+
+    second = app._detect_unauthorized_merges()
+    assert len(second) == 1
+    assert second[0]["coverage_check"] == "indeterminate"
+    # Fully re-attempted, not short-circuited: an indeterminate verdict buys
+    # no memoization, unlike a covered=True verdict.
+    assert fake_gh.commit_calls["sha-syncmerge"] == 6
+    assert not cache_path.exists()
+
+
+def test_reap_pass_survives_os_error_during_cache_write(tmp_path: Path, monkeypatch: Any) -> None:
+    """Review finding 2, integration level: an ``OSError`` raised while
+    memoizing a freshly-covered verdict must not abort
+    ``_detect_unauthorized_merges`` -- neither it nor its caller guards
+    ``OSError``, so an unwidened ``except StateLockBusy:`` would propagate
+    out and crash the whole reap pass over a transient disk condition.
+    """
+    from charlie_work import queue_sync_coverage_cache as cache_module
+
+    app, paths, fake_gh = _app(tmp_path)
+    _arm_covered_queue_sync_fixture(fake_gh, paths)
+
+    def _boom(path_arg: Path, entries: dict[str, str]) -> None:  # noqa: ANN001
+        raise OSError("simulated ENOSPC")
+
+    monkeypatch.setattr(cache_module, "_save_cache", _boom)
+
+    result = app._detect_unauthorized_merges()
+    # The covered verdict itself is unaffected by the memoization failure.
+    assert result == []
+    assert len(query_events(paths.state_file, kind="unauthorized_merge_queue_sync_covered")) == 1
+
+
+def test_dry_run_pass_does_not_touch_coverage_cache(tmp_path: Path) -> None:
+    """Review finding 5: a ``--dry-run`` pass must neither read nor write
+    the coverage cache, so it has exactly the same events.db/state.json
+    footprint as a caller that never ran (``write_gate.py``'s stated
+    contract) and can never suppress a later *real* pass's audit event by
+    having silently pre-memoized a verdict.
+    """
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(queue_bot_login=_BOT_LOGIN))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    _arm_unauthorized_merge_tripwire(paths)
+    fake_gh = CountingFakeGitHub()
+    dry_app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    _arm_covered_queue_sync_fixture(fake_gh, paths)
+
+    result = dry_app._detect_unauthorized_merges()
+    assert result == []
+    # The dry-run pass still evaluates the real predicate (only the CACHE
+    # lookup/write is skipped) and its pre-existing, not-yet-WriteGate-
+    # migrated log_event call still fires -- see the module docstring's note
+    # that this function was not fully dry-run-clean before this fix either.
+    # That one event is not what this test is pinning.
+    assert fake_gh.commit_calls == {"sha-syncmerge": 1, "sha-landing": 1}
+
+    cache_path = layout.queue_sync_coverage_cache_path(paths.root)
+    assert not cache_path.exists()
+
+    # The point of the fix: a subsequent REAL pass must still independently
+    # verify from gh (not read a cache hit the dry-run pass silently wrote)
+    # and must still emit ITS OWN audit event -- nothing from the dry-run
+    # pass suppressed it.
+    real_app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    real_result = real_app._detect_unauthorized_merges()
+    assert real_result == []
+    assert fake_gh.commit_calls == {"sha-syncmerge": 2, "sha-landing": 2}
+    assert len(query_events(paths.state_file, kind="unauthorized_merge_queue_sync_covered")) == 2
+    # The real pass (and only the real pass) durably memoized the verdict.
+    assert cache_path.exists()
+
+
 # ---------------------------------------------------------------------------
 # Unit: queue_sync_coverage_cache module itself
 # ---------------------------------------------------------------------------
 
 
+_BOT_LOGIN = "aviator-app[bot]"
+
+
 def test_is_covered_cached_round_trips_through_record_covered(tmp_path: Path) -> None:
     path = tmp_path / "queue-sync-coverage-cache.json"
     assert not queue_sync_coverage_cache.is_covered_cached(
-        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b"
+        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b", queue_bot_login=_BOT_LOGIN
     )
 
     assert queue_sync_coverage_cache.record_covered(
-        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b"
+        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b", queue_bot_login=_BOT_LOGIN
     )
 
     assert queue_sync_coverage_cache.is_covered_cached(
-        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b"
+        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b", queue_bot_login=_BOT_LOGIN
     )
     # A different live-head SHA (e.g. a later push) is an unrelated key.
     assert not queue_sync_coverage_cache.is_covered_cached(
-        path, pr_number=1, reviewed_head_sha="a", live_head_sha="c"
+        path, pr_number=1, reviewed_head_sha="a", live_head_sha="c", queue_bot_login=_BOT_LOGIN
     )
 
 
 def test_record_covered_is_idempotent(tmp_path: Path) -> None:
     path = tmp_path / "cache.json"
     assert queue_sync_coverage_cache.record_covered(
-        path, pr_number=5, reviewed_head_sha="x", live_head_sha="y"
+        path, pr_number=5, reviewed_head_sha="x", live_head_sha="y", queue_bot_login=_BOT_LOGIN
     )
     assert queue_sync_coverage_cache.record_covered(
-        path, pr_number=5, reviewed_head_sha="x", live_head_sha="y"
+        path, pr_number=5, reviewed_head_sha="x", live_head_sha="y", queue_bot_login=_BOT_LOGIN
     )
     data = json.loads(path.read_text(encoding="utf-8"))
     assert len(data["covered"]) == 1
@@ -322,7 +471,7 @@ def test_record_covered_is_idempotent(tmp_path: Path) -> None:
 def test_is_covered_cached_false_for_missing_file(tmp_path: Path) -> None:
     path = tmp_path / "does-not-exist.json"
     assert not queue_sync_coverage_cache.is_covered_cached(
-        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b"
+        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b", queue_bot_login=_BOT_LOGIN
     )
 
 
@@ -330,7 +479,7 @@ def test_is_covered_cached_false_for_corrupt_file(tmp_path: Path) -> None:
     path = tmp_path / "cache.json"
     path.write_text("not json at all", encoding="utf-8")
     assert not queue_sync_coverage_cache.is_covered_cached(
-        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b"
+        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b", queue_bot_login=_BOT_LOGIN
     )
 
 
@@ -338,5 +487,74 @@ def test_is_covered_cached_false_for_wrong_shaped_file(tmp_path: Path) -> None:
     path = tmp_path / "cache.json"
     path.write_text(json.dumps({"covered": "not-a-dict"}), encoding="utf-8")
     assert not queue_sync_coverage_cache.is_covered_cached(
-        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b"
+        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b", queue_bot_login=_BOT_LOGIN
     )
+
+
+def test_is_covered_cached_scoped_to_queue_bot_login(tmp_path: Path) -> None:
+    """Review finding 1 (unit level): the cache key must include the
+    effective ``queue_bot_login``, not just the (pr, reviewed, live) triple
+    -- a verdict memoized under one bot identity must read as a MISS under a
+    different (or unset) one, never a hit.
+    """
+    path = tmp_path / "cache.json"
+    assert queue_sync_coverage_cache.record_covered(
+        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b", queue_bot_login=_BOT_LOGIN
+    )
+
+    assert queue_sync_coverage_cache.is_covered_cached(
+        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b", queue_bot_login=_BOT_LOGIN
+    )
+    assert not queue_sync_coverage_cache.is_covered_cached(
+        path,
+        pr_number=1,
+        reviewed_head_sha="a",
+        live_head_sha="b",
+        queue_bot_login="a-different-bot[bot]",
+    )
+    assert not queue_sync_coverage_cache.is_covered_cached(
+        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b", queue_bot_login=""
+    )
+
+
+def test_record_covered_returns_false_when_lock_busy(tmp_path: Path, monkeypatch: Any) -> None:
+    """Pre-existing behavior, now also explicitly pinned (review finding 3
+    called this an untested path): a busy advisory lock degrades to
+    ``False``, never raises, and never writes.
+    """
+    from charlie_work import queue_sync_coverage_cache as cache_module
+    from charlie_work.state import StateLockBusy
+
+    def _always_busy(path_arg: Path):  # noqa: ANN001
+        raise StateLockBusy("simulated contention")
+
+    monkeypatch.setattr(cache_module, "advisory_file_lock", _always_busy)
+
+    path = tmp_path / "cache.json"
+    result = queue_sync_coverage_cache.record_covered(
+        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b", queue_bot_login=_BOT_LOGIN
+    )
+    assert result is False
+    assert not path.exists()
+
+
+def test_record_covered_returns_false_on_os_error(tmp_path: Path, monkeypatch: Any) -> None:
+    """Review finding 2: an ``OSError`` anywhere in the write path (disk
+    full, a read-only state dir, a Windows ``WinError 32`` concurrent-reader
+    ``replace()`` failure) must degrade to ``False``, never raise. Against
+    the pre-fix ``except StateLockBusy:``-only clause this test raises
+    instead of returning.
+    """
+    from charlie_work import queue_sync_coverage_cache as cache_module
+
+    def _boom(path_arg: Path, entries: dict[str, str]) -> None:  # noqa: ANN001
+        raise OSError("simulated ENOSPC")
+
+    monkeypatch.setattr(cache_module, "_save_cache", _boom)
+
+    path = tmp_path / "cache.json"
+    result = queue_sync_coverage_cache.record_covered(
+        path, pr_number=1, reviewed_head_sha="a", live_head_sha="b", queue_bot_login=_BOT_LOGIN
+    )
+    assert result is False
+    assert not path.exists()

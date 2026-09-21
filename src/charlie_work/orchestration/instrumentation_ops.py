@@ -220,6 +220,8 @@ def _queue_sync_merge_covered(
     pr: dict[str, Any],
     reviewed_head_sha: str | None,
     live_head_sha: str | None,
+    *,
+    preloaded_cache: dict[str, str] | None = None,
 ) -> _QueueSyncCoverageResult:
     """Thin delegate to ``queue_sync_coverage._queue_sync_merge_covered``.
 
@@ -237,22 +239,47 @@ def _queue_sync_merge_covered(
     already counted) before the extraction.
 
     Issue #1473: a merged PR's coverage verdict is a fact about immutable
-    git objects, so once this triple (``pr_number``, ``reviewed_head_sha``,
-    ``live_head_sha``) is determined ``covered=True`` it can never become
-    false. ``queue_sync_coverage_cache`` durably memoizes only that
-    ``covered=True`` outcome (never a not-covered or indeterminate one, and
-    never a different triple), so a repeat pass over the same already-merged
-    PR skips the 3 ``gh`` API calls and the audit event re-emission entirely.
-    A cache miss -- including a missing PR number, a brand-new merged PR, a
-    changed head, or an unreadable cache file -- always falls through to the
-    real check below; the cache can only ever remove redundant work, never
-    suppress a finding.
+    git objects, so once this quadruple (``pr_number``, ``reviewed_head_sha``,
+    ``live_head_sha``, ``queue_bot_login``) is determined ``covered=True`` it
+    can never become false. ``queue_sync_coverage_cache`` durably memoizes
+    only that ``covered=True`` outcome (never a not-covered or indeterminate
+    one, and never a different quadruple), so a repeat pass over the same
+    already-merged PR under the same bot-login config skips the 3 ``gh`` API
+    calls and the audit event re-emission entirely. A cache miss --
+    including a missing PR number, a brand-new merged PR, a changed head, an
+    unreadable cache file, or a changed/unset ``queue_bot_login`` -- always
+    falls through to the real check below; the cache can only ever remove
+    redundant work, never suppress a finding.
+
+    The cache is deliberately bypassed altogether (``cache_ready=False``)
+    under two conditions, both issue #1473 review findings:
+
+    * ``not queue_bot_login`` (finding 1) -- ``queue_bot_login`` is itself
+      condition 4 of the predicate and the config value that disables
+      recognition entirely when unset (``queue_sync_coverage.py``'s
+      documented kill switch). Including it in the cache key alone is not
+      enough: without this early skip, unsetting the login would still read
+      back a ``True`` for any triple memoized under the previous value until
+      the key genuinely mismatches, which it never does when the login is
+      simply absent from a lookup built the same way. Skipping the lookup
+      outright (rather than relying only on the key) enforces the kill
+      switch at the earliest point.
+    * ``self.dry_run`` (finding 5) -- a dry-run pass must have exactly the
+      same events.db/state.json footprint as a caller that never ran
+      (``write_gate.py``'s stated contract). The cache write here is a raw
+      file write, not one of ``WriteGate``'s seven gated primitives, so a
+      dry-run loop pass would otherwise durably memoize a verdict (and a
+      later *real* pass would then silently skip both the re-check and the
+      ``unauthorized_merge_queue_sync_covered`` audit event for that merge)
+      unless this method itself refuses to touch the cache under dry-run.
     """
     queue_bot_login = self.config.auto_merge.queue_bot_login
     cache_path = layout.queue_sync_coverage_cache_path(self.paths.root)
     pr_number = pr.get("number")
     cache_ready = (
-        isinstance(pr_number, int)
+        not self.dry_run
+        and bool(queue_bot_login)
+        and isinstance(pr_number, int)
         and not isinstance(pr_number, bool)
         and reviewed_head_sha
         and live_head_sha
@@ -262,6 +289,8 @@ def _queue_sync_merge_covered(
         pr_number=pr_number,
         reviewed_head_sha=reviewed_head_sha,
         live_head_sha=live_head_sha,
+        queue_bot_login=queue_bot_login,
+        preloaded=preloaded_cache,
     ):
         return _QueueSyncCoverageResult(covered=True)
     result = _wf._queue_sync_merge_covered(
@@ -290,6 +319,7 @@ def _queue_sync_merge_covered(
                 pr_number=pr_number,
                 reviewed_head_sha=reviewed_head_sha,
                 live_head_sha=live_head_sha,
+                queue_bot_login=queue_bot_login,
             )
     return result
 
