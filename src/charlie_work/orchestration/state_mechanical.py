@@ -12,7 +12,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from charlie_work.labels import TransitionOutcome
-from charlie_work.state import PASSIVE_OPEN_STATUS, arm_deescalation_pass, is_deescalation_due
+from charlie_work.state import (
+    PASSIVE_OPEN_STATUS,
+    SINK_STATUSES,
+    arm_deescalation_pass,
+    is_deescalation_due,
+)
 from charlie_work.worktree import WORKTREE_UNSAFE_KINDS
 import charlie_work.workflow as _wf
 
@@ -100,7 +105,7 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
     issue_entry = state.get("issues", {}).get(issue_key, {})
     if not isinstance(issue_entry, dict):
         return _wf._deescalation_skip("invalid_issue_entry", issue_number)
-    if issue_entry.get("status") not in ("escalated", "blocked"):
+    if issue_entry.get("status") not in SINK_STATUSES:
         # already resolved by something else since the snapshot
         return _wf._deescalation_skip("not_escalated", issue_number)
     if issue_entry.get("reason_class") != "mechanical":
@@ -228,7 +233,7 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
             }
         fresh_issue_entry = fresh_state["issues"].get(issue_key)
         if not isinstance(fresh_issue_entry, dict) or (
-            fresh_issue_entry.get("status") not in ("escalated", "blocked")
+            fresh_issue_entry.get("status") not in SINK_STATUSES
             or fresh_issue_entry.get("reason_class") != "mechanical"
         ):
             # Changed concurrently since the snapshot (human unescalate,
@@ -414,7 +419,7 @@ def _maybe_deescalate_mechanical(self) -> None:
             int(num)
             for num, entry in state.get("issues", {}).items()
             if isinstance(entry, dict)
-            and entry.get("status") in ("escalated", "blocked")
+            and entry.get("status") in SINK_STATUSES
             and entry.get("reason_class") == "mechanical"
             and str(num).isdigit()
         )

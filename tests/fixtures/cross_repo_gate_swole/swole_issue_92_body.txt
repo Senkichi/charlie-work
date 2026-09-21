@@ -1,0 +1,21 @@
+## Summary
+
+Three separate notes from the last 30 days, all pointing at the same UX gap — not a logic bug. Compiled with root-cause investigation in `docs/uat/feedback-2026-08-26.md` (PR #91).
+
+- 2026-07-29 (`9340dc14`, upper-heavy, triceps-pushdown): *"these supersets are still weird. the rest breaks between them don't make sense, like the rest shouldn't increase if you kiss target on the first."*
+- 2026-07-29 (`9340dc14`, suitcase-carry): *"why did that previous rest not have a specific time limit?"*
+- 2026-08-01 (`d388b5b7`, upper-volume, single-arm-dumbbell-row): *"These rest breaks feel very short"*
+
+## Investigation
+
+None of these is a rest-computation defect:
+
+- The rest-extension rule (`SessionEngine.kt:205-214`, driven by `coach/config.yaml`'s `restPolicy`) only extends rest on a **missed rep floor**, never on hitting/exceeding target, and is unit-tested as such (`hittingRepTargetLeavesRestUnextendedWithPolicyActive`). The actual logged rows for the 07-29 superset show both exercises missing their rep floor on both sets — not "kissing target" — so no extend-on-hit defect exists.
+- `suitcase-carry`'s `rest_sec: null` is intentional (`schemas/coach.py:117`, "None = as needed"), the standing convention for carry-type slots across every template.
+- 90s for single-arm-dumbbell-row matches the template's standard rest for that rep range elsewhere (`full-a.yaml:42,56,74`).
+
+**What's real:** the app never surfaces *why* a rest period is what it is. Supersets alternate a short intra-exercise rest with a longer between-round rest with no on-screen label distinguishing them; a `null` rest_sec renders with no explanation that "no timer" means "as needed" by design rather than missing data; the "Extended — missed target" cue only appears when extension fires, with nothing confirming a *normal* rest is normal.
+
+## Fix shape
+
+Label the rest screen with which kind of rest is currently showing (intra-round / between-round / extended-for-miss / as-needed), and add an explicit "rest as needed — no timer" state instead of just omitting the timer.

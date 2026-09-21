@@ -676,6 +676,58 @@ def record_review(
                     }
                     _wf.clear_escalation(issue_entry)
                     _wf.clear_escalation_on_issue_prs(state, issue_number)
+                    # Issue #1784 (job-cannon #1320 follow-up): the reset
+                    # below used to gate on ``head_advanced`` (a SHA
+                    # comparison) alone, and its comment claimed
+                    # record_review only ever reaches this branch on
+                    # content a reviewer actually read. Neither half of
+                    # that held: ``ci_gate_auto_reject``/
+                    # ``test_adequacy_auto_reject`` short-circuits (and the
+                    # first-review case, where ``reviewed_head_sha`` starts
+                    # as None) reach here with no reviewer involved at all,
+                    # and a pure sync-merge can move the head SHA with zero
+                    # content change. Reached by a CI-red short-circuit
+                    # specifically, that combination made the cap this
+                    # reset exists to protect UNREACHABLE for exactly the
+                    # stuck-worker population it is meant to catch (every
+                    # cycle's reset firing on a no-op sync-merge).
+                    #
+                    # The actual predicate the code enforces now: a
+                    # *patch-id* advance (unlike a SHA, immune to a
+                    # sync-merge that changes nothing but the merge-base)
+                    # from a verdict whose ``verdict_provenance`` names a
+                    # mechanism that read the diff at all
+                    # (``NO_OP_RESET_PROVENANCES`` -- see its docstring for
+                    # why each excluded value is excluded). That is
+                    # evidence the issue actually moved forward since the
+                    # checkpoint, so the no-op/death-loop caps'
+                    # windowed reads (``_windowed_redispatch_at``,
+                    # ``_windowed_worker_death_at``) should stop counting
+                    # redispatches/deaths from before it.
+                    #
+                    # This does NOT truncate ``redispatch_at``/
+                    # ``worker_death_at`` themselves (finding 2 of the
+                    # #1784 review): those two arrays are shared inputs to
+                    # five independent caps across
+                    # ``state_dispatch_rework.py`` and
+                    # ``dead_worker_reap.py`` -- e.g. the plain redispatch
+                    # cap and the worker-death-loop cap -- not an
+                    # issue-level no-op counter this function alone owns.
+                    # Clearing them here would silently reset all five.
+                    # Instead, stamp a checkpoint timestamp that
+                    # ``_windowed_redispatch_at``/``_windowed_worker_death_at``
+                    # apply as a floor on top of the ordinary rolling
+                    # window, so every consumer still sees its own full
+                    # history up to the checkpoint -- only the no-op-cap's
+                    # "counts from before this review no longer describe
+                    # the issue's CURRENT stall state" no longer needs the
+                    # data destroyed to say so.
+                    prior_patch_id = pr_state.get("reviewed_patch_id")
+                    content_advanced = (
+                        bool(reviewed_patch_id) and reviewed_patch_id != prior_patch_id
+                    )
+                    if content_advanced and verdict_provenance in _wf.NO_OP_RESET_PROVENANCES:
+                        issue_entry["no_op_checkpoint_at"] = _wf.utc_now()
                     state["issues"][str(issue_number)] = issue_entry
                 else:
                     # Clear rework_requested status when escalated to prevent selection

@@ -104,7 +104,11 @@ from .config import (
     OrchestratorConfig,
 )
 from .cross_repo_gate import cross_repo_scope_gate
-from .dispatch_selection import _windowed_redispatch_at, _windowed_worker_death_at
+from .dispatch_selection import (
+    _credit_worker_death,
+    _windowed_redispatch_at,
+    _windowed_worker_death_at,
+)
 from .escalation import _escalate_issue, _escalation_edge
 from .fleet_registry import managed_repo_names
 from .github import (
@@ -117,6 +121,7 @@ from .issue_linking import linked_issue_number
 from .instrumentation import log_event
 from .labels import TransitionOutcome
 from .local_work_park import park_unpublishable_work
+from .no_op_checkpoint import _paired_death_count
 from .paths import resolved_layout
 from .pr_create_retry import create_pr_with_retry
 from .process_utils import (
@@ -1332,22 +1337,32 @@ def _reap_restore_rework_requested(
         # Issue #1134: a worker that died before pushing leaves the PR head
         # unchanged, but that is NOT a no-op — the worker may have completed
         # its work and died mid-push with salvageable stranded commits.
-        # Record this death in worker_death_at (parallel to the orphan sweep
-        # at ~line 4245), and separate the death count from the no-op count
-        # in the cap check below.  A death-loop escalates with
-        # worker_death_loop (triage: "check the worktree for stranded work")
-        # instead of redispatch_cap_exceeded (triage: "worker is spinning").
-        worker_death_at = _windowed_worker_death_at(
-            entry, window_minutes=config.watchdog.redispatch_window_minutes
-        )
+        # Record this death in worker_death_at through the same
+        # ``_credit_worker_death`` helper the orphan sweep uses (single
+        # point of enforcement for the append), and separate the death
+        # count from the no-op count in the cap check below.  A death-loop
+        # escalates with worker_death_loop (triage: "check the worktree for
+        # stranded work") instead of redispatch_cap_exceeded (triage:
+        # "worker is spinning").
         if not immediate_escalation and not provider_throttled:
-            worker_death_at = worker_death_at + [
-                datetime.now(UTC).isoformat().replace("+00:00", "Z")
-            ]
+            worker_death_at = _credit_worker_death(entry)
+        else:
+            worker_death_at = _windowed_worker_death_at(
+                entry, window_minutes=config.watchdog.redispatch_window_minutes
+            )
 
         no_op_count = max(0, len(redispatch_at) - len(worker_death_at))
         death_count = len(worker_death_at)
-        death_loop = not immediate_escalation and death_count > config.watchdog.max_auto_redispatch
+        # Issue #1784 finding 3: paired against redispatch_at so a death
+        # credited without a matching redispatch (the orphan sweep's
+        # advance-to-pr-open lane, on the ORIGINAL implementer dispatch)
+        # cannot escalate a death-loop before this many redispatches
+        # actually happened. See ``_paired_death_count``'s docstring.
+        death_loop = (
+            not immediate_escalation
+            and _paired_death_count(redispatch_at=redispatch_at, worker_death_at=worker_death_at)
+            > config.watchdog.max_auto_redispatch
+        )
         no_op_loop = (
             not immediate_escalation
             and not death_loop
@@ -2447,7 +2462,24 @@ def _dispatching_repo_name(gh: GitHubLike, repo_root: Path) -> str:
     directory name) when the GitHub lookup fails (offline, gh missing) —
     the directory name is usually the same as the GitHub repo name, and a
     mismatch only means the scope gate cannot attribute the issue, which
-    is the safe direction (pass, not block).
+    is the safe direction (pass, not block) *for that gate*.
+
+    That "safe direction" reasoning does not carry over unchanged to this
+    return value's second, opposite-polarity consumer:
+    ``cross_repo_gate.py``'s :func:`~charlie_work.cross_repo_gate._find_owning_repo`
+    (added by the #1756-#1758 positive-evidence redesign) uses this same
+    name to *exclude* the dispatching repo's own registered entry from the
+    sibling-repo search. There, a mismatch (this fallback returning a
+    deployment directory name like ``charlie-work-daemon`` that does not
+    match the registry's ``charlie-work`` key) would let the dispatching
+    repo's own entry be searched as a "sibling" and escalate the repo
+    against itself — a *block*, not a pass. ``_find_owning_repo`` guards
+    against exactly this by also excluding a managed-roots entry whose
+    resolved root is (or contains) the dispatching repo's actual
+    ``repo_root``, independent of whatever name this function returns
+    (review finding 3) — so a caller adding a third name-keyed consumer of
+    this value should not assume a mismatch is automatically safe there
+    too; check which direction that consumer's decision points first.
     """
     try:
         nwo = gh.name_with_owner()

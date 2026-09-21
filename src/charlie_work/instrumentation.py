@@ -282,6 +282,10 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # comment is the signal, not a hold -- but a repeating burst on one issue
         # means its citations keep rotting faster than anyone corrects them.
         "dispatch_citation_drift_flagged": "warning",
+        # Issues #1756/#1758: an operator-applied override label skipped both
+        # cross-repo gates for this issue. Warning, not info: a safety gate was
+        # deliberately bypassed, and the dispatch that follows is unguarded.
+        "dispatch_cross_repo_gate_overridden": "warning",
         "dispatch_merged_pr_mention_flagged": "warning",
         "dispatch_merged_pr_references_closed": "warning",
         "dispatch_skip_blocked": "warning",
@@ -337,6 +341,16 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # (workflow.py), never from pr_create_retry.py itself -- that module
         # has no state_file/fingerprint state to dedup against.
         "pr_create_failed_branch_stranded": "warning",
+        # Issue #1766: the merge lane's per-PR loop could not resolve a
+        # linked issue for an open PR (e.g. Dependabot's own branch/body
+        # convention) and skipped it -- edge-triggered, so this fires once
+        # on first sight and again only when the PR's material state
+        # changes. Warning, not info: the operator-facing signal the issue
+        # asks for must actually reach `charlie doctor`/heartbeat checks,
+        # which only look at warning/error levels; not error, since nothing
+        # is broken -- the PR is simply outside the pipeline's unit of work
+        # and stays queryable via `charlie status`'s `unlinked_prs`.
+        "pr_unlinked_skipped": "warning",
         # Issue #1363: a non-fatal preflight check (clock_sanity) failed at
         # the top of a loop pass. Warning, not error: the pass still ran
         # (_loop_body was not skipped) -- this is a tripwire for an operator

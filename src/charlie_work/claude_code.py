@@ -1365,9 +1365,26 @@ def launch_claude_worker(
     # leaks from the orchestrator and to isolate GitHub CLI credentials
     # (GH_TOKEN/GITHUB_TOKEN dropped, GH_CONFIG_DIR forced to a worktree-local
     # empty directory) so workers do not inherit the orchestrator's admin token
-    # or stored gh auth state (issue #502). To give workers a scoped GitHub
+    # or stored gh auth state (issue #502), and to give this session its own
+    # TMP/TEMP/TMPDIR so a concurrent session on the same host cannot collide
+    # on a shared temp path (issue #1767). To give workers a scoped GitHub
     # token, set claude_code.worker_env={"GH_TOKEN": "<scoped-PAT>"}.
-    sanitized_env = sanitize_env(worktree.path)
+    try:
+        sanitized_env = sanitize_env(worktree.path)
+    except OSError as exc:
+        _teardown_on_launch_failure()
+        record = _error_record(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree.path),
+            prompt_path=str(prompt_path),
+            command=command_template,
+            log_path=str(log_path),
+            error=f"failed to prepare worker environment: {exc}",
+            adapter_kind=adapter_kind,
+            provider=provider,
+        )
+        return _write_record(sessions_dir, record)
     worker_env = {
         **sanitized_env,
         **{str(k): str(v) for k, v in (env or {}).items()},

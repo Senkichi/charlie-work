@@ -64,6 +64,7 @@ SUPERVISOR_LOCK_FILENAME = "supervisor.lock"
 PENDING_SYNC_FILENAME = "pending-sync.json"
 SELF_DEPLOY_FAILURE_STATE_FILENAME = "self-deploy-failures.json"
 ZERO_PASS_STREAK_STATE_FILENAME = "zero-pass-streak.json"
+QUEUE_SYNC_COVERAGE_CACHE_FILENAME = "queue-sync-coverage-cache.json"
 
 ISSUES_DIRNAME = "issues"
 PRS_DIRNAME = "prs"
@@ -84,6 +85,18 @@ SESSION_RESULTS_FILENAME = "session-results.json"
 #: clobber ambient credentials. It is keyed on the worktree path, not on
 #: ``runtime.state_dir``, and must stay that way — see :func:`gh_config_dir`.
 GH_CONFIG_DIRNAME = "gh-config"
+
+#: Per-worktree isolated temp-directory name (issue #1767).
+#:
+#: Concurrent worker sessions on the same host previously shared the host's
+#: ambient TMP/TEMP (or, on Windows-with-Git-Bash, a literal ``/tmp``),
+#: letting one session silently read back another's scratch file (observed:
+#: a worker fetched a PR body to ``/tmp/pr-body.md`` and read back a
+#: different session's body). Deliberately keyed on the *worktree* path, like
+#: :data:`GH_CONFIG_DIRNAME` above, not on ``runtime.state_dir`` — each
+#: worktree is already unique per active session, so this needs no separate
+#: session-id parameter to be collision-free. See :func:`worker_tmp_dir`.
+WORKER_TMP_DIRNAME = "worker-tmp"
 
 _VAR_DIRNAME = ".var"
 
@@ -106,6 +119,7 @@ _ENFORCED_DIRNAMES = (
     WORKTREES_DIRNAME,
     SESSIONS_DIRNAME,
     GH_CONFIG_DIRNAME,
+    WORKER_TMP_DIRNAME,
     _VAR_DIRNAME,
 )
 
@@ -178,6 +192,19 @@ def zero_pass_streak_state_path(state_root: Path) -> Path:
     atomic-write contract.
     """
     return state_root / ZERO_PASS_STREAK_STATE_FILENAME
+
+
+def queue_sync_coverage_cache_path(state_root: Path) -> Path:
+    """Return the queue-sync coverage verdict cache path under ``state_root``.
+
+    Issue #1473: durably memoizes a determined ``covered=True`` verdict from
+    ``_queue_sync_merge_covered`` per (pr_number, reviewed_head_sha,
+    live_head_sha), so the unauthorized-merge tripwire's 3-``gh``-API-call
+    coverage check is paid once per merge instead of once per loop pass
+    forever. Sibling of :func:`self_deploy_failure_state_path` -- same
+    directory, same atomic-write contract.
+    """
+    return state_root / QUEUE_SYNC_COVERAGE_CACHE_FILENAME
 
 
 def worktrees_dir(state_root: Path) -> Path:
@@ -276,6 +303,28 @@ def gh_config_dir(target_path: Path) -> Path:
     centralised here for discoverability, not to make it configurable.
     """
     return target_path / _VAR_DIRNAME / GH_CONFIG_DIRNAME
+
+
+def worker_tmp_dir(target_path: Path) -> Path:
+    """Return the worktree-local, session-scoped temp dir for ``target_path``
+    (issue #1767).
+
+    Mirrors :func:`gh_config_dir`: keyed on the *worktree* path rather than a
+    separate session id, because each worktree is already the unique per-session
+    identity every other worker-isolation mechanism in this module relies on.
+    Consumed by ``env_sanitize.sanitize_env``, which points TMP/TEMP/TMPDIR at
+    this directory so two concurrent worker subprocesses on the same host
+    cannot collide on a predictable shared temp path.
+
+    Note for future debugging: this nests under ``target_path``, so a deeply
+    nested worktree root (e.g. a long repo path combined with a long branch
+    name under ``.claude/worktrees/``) plus whatever a tool writes beneath
+    ``TMP`` could in principle approach Windows' legacy ~260-char ``MAX_PATH``
+    limit sooner than the old host-wide temp dir did. No case of this has been
+    observed; if a worker ever fails with a Windows path-length error, check
+    the resolved length of this path first.
+    """
+    return target_path / _VAR_DIRNAME / WORKER_TMP_DIRNAME
 
 
 # --- fleet-dir layout ------------------------------------------------------

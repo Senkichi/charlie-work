@@ -1050,8 +1050,15 @@ _RATCHET_BASELINE: dict[str, int] = {
     # slack held at 5 (measured out-of-predicate raw count after the move is 50, so
     # 55 = 50 + 5), and dispatch_state.py's entry equals its relocated live count
     # exactly (28, slack 0). The baseline-dict sum stays 247 and no ceiling loosens.
+    # PR #1792 (issue #1758): the cross-repo-gate override-label valve adds one
+    # new out-of-predicate save_state+append_event pair directly in
+    # orchestration/dispatch_state.py (not relocated from elsewhere), raising
+    # its entry from 28 to 30. This is a genuine new raw site, reviewed and
+    # accepted here rather than routed through WriteGate, because it sits in
+    # the same dispatch-transition code path as the other 28 already-accepted
+    # raw sites in this module.
     "workflow.py": 55,
-    "orchestration/dispatch_state.py": 28,
+    "orchestration/dispatch_state.py": 30,
     "orchestration/reap_loop.py": 5,
     # Issue #1770: +1 raw log_event call in _apply_concurrency_governor's new
     # CI-headroom clamp branch (the dispatch_backpressure event recorded when

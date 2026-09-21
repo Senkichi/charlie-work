@@ -55,6 +55,7 @@ from .github import (
     parse_blockers,
 )
 from .issue_linking import linked_issue_number
+from .pr_unlinked_visibility import summarize_unlinked_prs
 
 # LOAD-BEARING RE-EXPORT -- NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
@@ -122,6 +123,7 @@ from .unescalate_reset_fields import (
 from .merge_finalize import _merged_issue_fields  # noqa: F401  (deliberate re-export; used by moved merge-finalization delegates via _wf.)
 from .state import (
     PASSIVE_OPEN_STATUS,
+    SINK_STATUSES,
     StateLockBusy,
     append_event,
     arm_operator_queue_review,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
@@ -199,12 +201,14 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
     _apply_local_review_cap,
     _windowed_redispatch_at,
     _windowed_worker_death_at,
+    _credit_worker_death,
     _windowed_orphan_redispatch_at,
     _windowed_blocked_environment_at,
     _windowed_foreign_writer_reaps,
     _is_review_dispatchable,
     _select_review_dispatch_candidates,
 )
+from .no_op_checkpoint import _paired_death_count  # noqa: F401  (deliberate re-export)
 from . import orchestration as _orchestration
 from .workflow_delegation import _install_delegates, discover_delegate_modules
 
@@ -1473,7 +1477,13 @@ def _touch_foreign_issue_ref_marker(state_file: Path, pr_number: int, issue_numb
 # the de-escalation sweep selects on the same pair (``_maybe_deescalate_mechanical``).
 # Centralized so the sink census and the sweep cannot drift apart on what
 # "in the sink" means. Issue #1083.
-_SINK_STATUSES: frozenset[str] = frozenset({"escalated", "blocked"})
+#
+# Relocated to ``state.SINK_STATUSES`` (issue #1765) so ``unescalate()`` and
+# both escalated-label self-heal sweeps (dispatch-side and reconcile-side)
+# share this exact set instead of each keeping their own "escalated"-only
+# literal. Kept as a module-level alias since this name predates the move
+# and nothing outside this module needs to change.
+_SINK_STATUSES: frozenset[str] = SINK_STATUSES
 
 # Issue #1383: cross-pass infra_blocked escalation tracking. The
 # OrchestratorApp instance is rebuilt per repo per pass (fleet_loop), so
@@ -2300,10 +2310,10 @@ def _detect_and_handle_orphaned_workers(
                             # (worker_death_loop) lets the operator triage
                             # "check the worktree" vs. "worker is spinning."
                             death_ts = utc_now()
-                            prior_deaths = entry.get("worker_death_at")
-                            if not isinstance(prior_deaths, list):
-                                prior_deaths = []
-                            entry["worker_death_at"] = prior_deaths + [death_ts]
+                            entry["worker_death_at"] = _credit_worker_death(
+                                entry,
+                                at=death_ts,
+                            )
                             sweep_events.append(
                                 (
                                     "orphaned_worker_recovered",
@@ -2452,10 +2462,10 @@ def _detect_and_handle_orphaned_workers(
                             entry["status"] = "rework_requested"
                             entry["dispatched_at"] = None
                             death_ts = utc_now()
-                            prior_deaths = entry.get("worker_death_at")
-                            if not isinstance(prior_deaths, list):
-                                prior_deaths = []
-                            entry["worker_death_at"] = prior_deaths + [death_ts]
+                            entry["worker_death_at"] = _credit_worker_death(
+                                entry,
+                                at=death_ts,
+                            )
                             sweep_events.append(
                                 (
                                     "orphaned_worker_recovered",
@@ -2510,6 +2520,24 @@ def _detect_and_handle_orphaned_workers(
                                     # later regression on this issue re-surfaces.
                                     entry["orphan_drift_fingerprint"] = None
                                     entry["orphan_drift_at"] = None
+                                    # Issue #1134's death-crediting invariant
+                                    # applies here too: this worker died just
+                                    # as much as the request_changes/approved
+                                    # branches above, and its issue can still
+                                    # return to ``rework_requested`` once the
+                                    # PR is eventually reviewed (a salvage-
+                                    # opened PR with no verdict yet is exactly
+                                    # this case). Before this fix, this was
+                                    # the one dead-worker branch that never
+                                    # touched ``worker_death_at`` -- a
+                                    # redispatch caused by THIS death read
+                                    # back as an uncredited no-op on every
+                                    # later no-op-rework-cap check.
+                                    death_ts = utc_now()
+                                    entry["worker_death_at"] = _credit_worker_death(
+                                        entry,
+                                        at=death_ts,
+                                    )
                                     sweep_events.append(
                                         (
                                             "orphaned_worker_advanced_to_pr_open",
@@ -2524,6 +2552,7 @@ def _detect_and_handle_orphaned_workers(
                                                 "exit_code": terminal_exit_code,
                                                 "duration_seconds": terminal_duration_seconds,
                                                 "label_write_ok": True,
+                                                "worker_death_at": death_ts,
                                             },
                                         )
                                     )
@@ -3191,6 +3220,32 @@ VERDICT_PROVENANCE_VALUES: frozenset[str] = frozenset(
         "carried_forward",
     }
 )
+
+# Issue #1784 (job-cannon #1320 follow-up): the subset of
+# ``VERDICT_PROVENANCE_VALUES`` that constitutes proof someone -- human or
+# LLM -- actually examined content, as opposed to a deterministic gate
+# auto-rejecting without reading anything. ``record_review``'s no-op-cap
+# checkpoint reset (state_record_review.py) only fires for a
+# ``request_changes`` verdict carrying one of these:
+#   fresh_llm_review -- a live reviewer read the diff.
+#   operator_manual  -- a human explicitly ran ``charlie verdict``.
+# Deliberately excluded, and why -- fails CLOSED by design (an allowlist,
+# not a denylist: a future provenance value defaults to untrusted, not
+# trusted):
+#   ci_gate_auto_reject/test_adequacy_auto_reject -- deterministic gates;
+#     neither one is a reviewer reading the diff for genuine progress (the
+#     concrete false-escalation-inversion bug this constant fixes was a
+#     CI-red short-circuit resetting the counters on every sync-merge-only
+#     head).
+#   stranded_reconciliation -- re-labels whatever provenance the original,
+#     now-lost verdict actually had (which could itself have been one of
+#     the two gates above); this constant cannot see through that.
+#   rescue_review -- only ever recorded for an "approved" decision (see
+#     state_rescue.py), so it never reaches the request_changes branch this
+#     constant gates; omitted rather than included-but-dead.
+#   carried_forward -- never reaches record_review at all (see the mapping
+#     comment above).
+NO_OP_RESET_PROVENANCES: frozenset[str] = frozenset({"fresh_llm_review", "operator_manual"})
 
 
 class PromptOverrideDriftError(RuntimeError):
@@ -4166,6 +4221,13 @@ class OrchestratorApp:
                 # Don't fail status() if runner observation fails
                 runners_data = None
 
+        # Issue #1766 review: `linked_prs` and `unlinked_prs` must resolve a
+        # PR's issue with the SAME validator the merge lane itself uses
+        # (`reap_loop._loop_body`'s `branch_validator`), or a stale
+        # `agent/issue-709-...` branch (#1229) can resolve differently on
+        # each side -- appearing in both lists, or in neither, instead of
+        # exactly one.
+        branch_validator = self._make_branch_issue_validator()
         linked_prs = [
             self._summarize_pr(pr)
             for pr in prs
@@ -4173,9 +4235,24 @@ class OrchestratorApp:
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
+                branch_issue_validator=branch_validator,
             )
             is not None
         ]
+        # Issue #1766: the merge lane's per-PR loop skips
+        # any open PR with no resolvable linked issue before it ever touches
+        # `linked_prs` above -- such a PR is otherwise invisible to every
+        # operator-facing surface. This is the "current set at any time"
+        # view (the edge-triggered `pr_unlinked_skipped` event is the
+        # complementary transition log); reads only this call's own already-
+        # fetched `prs` and `state["prs"]`, so it adds no GitHub calls.
+        unlinked_prs = summarize_unlinked_prs(
+            prs,
+            state.get("prs", {}),
+            branch_prefix=self.config.dispatch.branch_prefix,
+            now=now,
+            branch_issue_validator=branch_validator,
+        )
         data = {
             "ready_issue_count": len(issues),
             "available_issue_count": len(truly_available),
@@ -4185,6 +4262,8 @@ class OrchestratorApp:
             "auto_merge_enabled": self.config.auto_merge.enabled,
             "issues": [self._summarize_issue(issue) for issue in issues],
             "prs": linked_prs,
+            "unlinked_prs": unlinked_prs,
+            "unlinked_pr_count": len(unlinked_prs),
             "last_generated_at": state.get("generated_at"),
             "blocked": [
                 {"issue": issue_number, "blockers": blockers}

@@ -265,7 +265,14 @@ def _dispatch_rework_impl(
                     if no_op_count >= self.config.watchdog.max_auto_redispatch:
                         dry_no_op_rework_escalated.append(issue_number)
                         continue
-                    if len(prior_deaths) >= self.config.watchdog.max_auto_redispatch:
+                    # Issue #1784 finding 3: paired against redispatch_at --
+                    # see ``_paired_death_count``'s docstring.
+                    if (
+                        _wf._paired_death_count(
+                            redispatch_at=prior_redispatch, worker_death_at=prior_deaths
+                        )
+                        >= self.config.watchdog.max_auto_redispatch
+                    ):
                         dry_worker_death_escalated.append(issue_number)
                         continue
                 dry_filtered_candidates.append(issue)
@@ -541,7 +548,14 @@ def _dispatch_rework_impl(
                 if no_op_count >= self.config.watchdog.max_auto_redispatch:
                     no_op_rework_escalated.append(issue_number)
                     continue
-                if len(prior_deaths) >= self.config.watchdog.max_auto_redispatch:
+                # Issue #1784 finding 3: paired against redispatch_at -- see
+                # ``_paired_death_count``'s docstring.
+                if (
+                    _wf._paired_death_count(
+                        redispatch_at=prior_redispatch, worker_death_at=prior_deaths
+                    )
+                    >= self.config.watchdog.max_auto_redispatch
+                ):
                     # Issue #1239: before escalating a death-loop, attempt
                     # to salvage-push stranded commits from the dead
                     # worker's worktree — the same sanctioned-git path the

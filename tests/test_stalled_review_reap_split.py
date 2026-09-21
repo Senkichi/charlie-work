@@ -519,6 +519,14 @@ def test_ci_findings_header_ratio_still_matches_the_bands_own_justification() ->
     header estimate it recorded for the NEW module was a range deliberately
     anchored above the precedent figure, and 46 still sits inside the
     judgment call that produced it.
+
+    Re-measured again at issue #1769: the dispatch-staleness sub-cluster's
+    module docstring gained a paragraph describing the durable-marker
+    baseline fix, and its import line swapped ``.instrumentation.query_events``
+    for two names from ``.state``, growing the header to 55 lines (9 more)
+    and the total to 680. No unit was added or removed -- this is docstring
+    and import-line growth within existing units, still comfortably inside
+    the same [50, 80]-line judgment call the #1686 update reconfirmed.
     """
     ci_findings_source = _CI_FINDINGS_PATH.read_text(encoding="utf-8")
     ci_findings_lines = ci_findings_source.splitlines()
@@ -533,14 +541,14 @@ def test_ci_findings_header_ratio_still_matches_the_bands_own_justification() ->
     # the exact arithmetic (which involved manual line-classification at
     # Preflight time, e.g. deciding a bare `)` closing a multi-line import
     # counts toward "import block" but not toward "docstring").
-    assert header_length == 46, (
-        f"ci_findings.py's header length is now {header_length} lines, expected 46 -- "
+    assert header_length == 55, (
+        f"ci_findings.py's header length is now {header_length} lines, expected 55 -- "
         "the cap-exemption band this file asserts was derived from that figure; if "
         "ci_findings.py has genuinely changed shape, the band needs re-deriving, not "
         "this guard silently loosened"
     )
-    assert len(ci_findings_lines) == 623, (
-        f"ci_findings.py is now {len(ci_findings_lines)} lines total, expected 623 -- "
+    assert len(ci_findings_lines) == 680, (
+        f"ci_findings.py is now {len(ci_findings_lines)} lines total, expected 680 -- "
         "same drift-guard rationale as the header-length assertion above"
     )
 
