@@ -22,7 +22,7 @@ from datetime import datetime
 from typing import Any
 
 from .config import OrchestratorConfig
-from .github import GitHubLike, label_names, parse_blockers
+from .github import GitHubError, GitHubLike, label_names, parse_blockers
 
 
 @dataclass(frozen=True)
@@ -45,12 +45,23 @@ class OperatorQueueImpact:
     ``state.json``'s per-issue ``terminal_since``, not from GitHub) rather
     than computed here, so this module stays a pure GitHub/label reader
     with no ``state.json`` shape knowledge.
+
+    ``observed`` (issue #1768 review findings 1/2) is False when the
+    ``gh.issue_list`` fetch failed or came back ambiguously empty --
+    mirroring ``classify_backlog_reachability``'s ``observed`` field for
+    the identical fetch. Callers MUST treat ``observed=False`` as
+    "unknown", never as a genuine zero-impact reading: the other fields
+    are still populated (roots, zero counts) so a caller that forgets the
+    check gets an inert-looking-but-wrong result rather than a crash, but
+    the whole point of this field is that they should not forget the
+    check.
     """
 
     roots: tuple[int, ...]
     blocked_ready_issue_numbers: tuple[int, ...]
     blocked_ready_count: int
     oldest_root_age_days: float | None
+    observed: bool = True
 
 
 def compute_operator_queue_impact(
@@ -78,18 +89,33 @@ def compute_operator_queue_impact(
     here is a cache hit whenever ``classify_backlog_reachability`` already
     ran this pass, and a single new list call (not an N+1) otherwise.
 
-    Fail-open, matching ``classify_backlog_reachability``'s advisory
-    contract: an empty/failed fetch or an empty root set yields a
-    zero-impact result rather than raising -- an impact-measurement
-    failure must never block or crash the orchestrator loop.
+    Fails **unobserved**, not open, on a failed or ambiguously-empty fetch
+    (issue #1768 review findings 1/2) -- never raises, matching
+    ``classify_backlog_reachability``'s advisory contract, but also never
+    reports a fetch failure as a genuine zero. ``GitHubClient.run``
+    (reached through ``issue_list`` -> ``_list_json``) *raises*
+    ``GitHubError`` on a ``gh`` timeout, a missing binary, or a
+    non-zero/unparseable exit; this used to be a pure ``state.json`` dict
+    scan with zero network I/O, so an uncaught ``GitHubError`` here would
+    crash an otherwise-fully-completed loop pass over what is meant to be
+    an advisory signal. A ``gh`` call that returns successfully with an
+    empty list is *equally* ambiguous with a failed one at this layer (the
+    same reasoning ``classify_backlog_reachability`` documents for the
+    identical fetch), so it is treated the same way. An empty *root* set,
+    by contrast, is unambiguous -- there is nothing to measure, not a
+    measurement that failed -- and is reported as a normal, observed,
+    zero-impact result.
     """
     sorted_roots = tuple(sorted(roots))
     if not roots:
-        return OperatorQueueImpact((), (), 0, oldest_root_age_days)
+        return OperatorQueueImpact((), (), 0, oldest_root_age_days, observed=True)
 
-    issues = gh.issue_list(state="open")
+    try:
+        issues = gh.issue_list(state="open")
+    except GitHubError:
+        return OperatorQueueImpact(sorted_roots, (), 0, oldest_root_age_days, observed=False)
     if not issues:
-        return OperatorQueueImpact(sorted_roots, (), 0, oldest_root_age_days)
+        return OperatorQueueImpact(sorted_roots, (), 0, oldest_root_age_days, observed=False)
 
     ready_label = config.labels.ready
     dependents: dict[int, set[int]] = {}
@@ -116,7 +142,7 @@ def compute_operator_queue_impact(
 
     blocked_ready = tuple(sorted(seen & ready_numbers))
     return OperatorQueueImpact(
-        sorted_roots, blocked_ready, len(blocked_ready), oldest_root_age_days
+        sorted_roots, blocked_ready, len(blocked_ready), oldest_root_age_days, observed=True
     )
 
 
@@ -175,6 +201,7 @@ def should_fire_operator_queue_impact(
     current: dict[str, Any],
     *,
     now: datetime,
+    qualifies: bool = True,
     reminder_hours: float = LOW_RATE_REMINDER_HOURS,
 ) -> bool:
     """Edge-detection gate (issue #1768), mirroring the #817
@@ -182,12 +209,14 @@ def should_fire_operator_queue_impact(
     repo-level scope instead of per-worker scope.
 
     Fires when:
-      (a) there is no recorded baseline yet -- the first observation of a
-          non-empty root set is itself a material change from "no known
-          state" (this is what makes a brand-new single-root queue, e.g.
-          the fresh-eyes shape, fire on its very first occurrence even
-          though a lone root would never cross a raw-count threshold);
-      (b) the root set changed;
+      (a) there is no recorded baseline yet AND ``qualifies`` -- the first
+          observation of a non-empty root set is itself a material change
+          from "no known state" (this is what makes a brand-new
+          single-root queue, e.g. the fresh-eyes shape, fire on its very
+          first occurrence even though a lone root would never cross a
+          raw-count threshold), but only when that first observation
+          actually carries impact;
+      (b) the root set changed AND ``qualifies``;
       (c) the impact-vs-threshold side flipped; or
       (d) the age bucket changed.
 
@@ -196,11 +225,26 @@ def should_fire_operator_queue_impact(
     -- the bounded "still true, no change" visibility AC1 permits, driven
     from a durable marker (never re-derived by rescanning events.db, per
     the policy this issue also establishes).
+
+    ``qualifies`` (issue #1768 review finding 7) is normally
+    ``over_threshold or blocked_ready_count > 0``, computed by the caller
+    (this pure function does not see the raw count -- see
+    ``operator_queue_impact_signature``'s docstring for why). Gating arms
+    (a)/(b) on it stops a brand-new sink arrival or an unrelated root-set
+    change with zero transitive impact from producing a
+    zero-information warning by itself. Arms (c)/(d) are never gated on
+    it: an ``over_threshold`` flip is meaningful in either direction
+    (arriving at or clearing the threshold implies ``qualifies`` was true
+    for at least one side), and an age-bucket crossing only exists when a
+    root -- and therefore some prior qualifying state -- is already
+    present. Defaults to ``True`` so this pure function's own direct unit
+    tests are unaffected by the parameter's addition; the emitter always
+    passes the real computed value.
     """
     if baseline is None:
-        return True
+        return qualifies
     if current["root_issue_numbers"] != baseline.get("root_issue_numbers"):
-        return True
+        return qualifies
     if current["over_threshold"] != baseline.get("over_threshold"):
         return True
     if current["age_bucket"] != baseline.get("age_bucket"):

@@ -743,6 +743,30 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
         ),
         in_predicate=False,
     ),
+    # Issue #1768 review finding 1: outer defense-in-depth around
+    # `self._maybe_emit_operator_queue_impact()`, added inside `_loop_impl`
+    # immediately alongside the `_loop_impl` preflight-warning site directly
+    # above -- same function, same reasoning. Routing this through
+    # `self.write_gate.log_event(...)` would flip `_loop_impl` into R9's
+    # in-predicate exclusive-use bucket, which would then flag that sibling
+    # site (and the `loop_started`/`loop_completed` telemetry
+    # `test_write_gate_dry_run_loop.py` documents as deliberately orthogonal
+    # to the wave) as violations too -- an out-of-scope conversion of a
+    # function this wave never targets, exactly as the sibling entry's own
+    # comment explains. `in_predicate=False` matches the real scan (the
+    # function makes no direct `self.write_gate.*`/`write_gate.*` call).
+    _RawPrimitiveSite(
+        path="orchestration/instrumentation_ops.py",
+        scope="_loop_impl",
+        primitive="log_event",
+        call_source=(
+            "log_event(self.paths.state_file, "
+            "'operator_queue_impact_check_failed', "
+            "{'error': f'{type(exc).__name__}: {exc}'}, "
+            "repo=self.repo_root.name, correlation_id=cid, level='warning')"
+        ),
+        in_predicate=False,
+    ),
     # Issue #1374 AC3: `emit_preflight_refusal` (preflight.py) is the
     # best-effort refusal emitter for FATAL preflight failures (disk full,
     # clock skew, venv drift). Its documented contract is "must never

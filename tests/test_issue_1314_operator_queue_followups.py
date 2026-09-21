@@ -18,6 +18,7 @@ Covers all four #1314 items plus #1768:
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from charlie_work.config import (
     PostMortemConfig,
 )
 from charlie_work.event_kinds import EXPECTED_OPERATIONAL_KINDS
+from charlie_work.github import GitHubError
 from charlie_work.instrumentation import _LEVEL_BY_KIND, query_events
 from charlie_work.notify import _DESKTOP_SEVERITIES
 from charlie_work.operator_queue_impact import (
@@ -50,10 +52,24 @@ from charlie_work.state import (
     empty_state,
     is_operator_queue_review_due,
     load_state,
+    operator_queue_impact_baseline,
     save_state,
     state_lock,
 )
-from charlie_work.workflow import OrchestratorApp, operator_queue_depth
+from charlie_work.workflow import OrchestratorApp, is_operator_queue_issue, operator_queue_depth
+
+# Imported after ``charlie_work.workflow`` deliberately: ``state_maintenance``
+# does ``import charlie_work.workflow as _wf`` at module level, so importing
+# it directly *before* ``charlie_work.workflow`` has been fully imported
+# triggers Python's circular-import partial-module hazard --
+# ``workflow``'s own module-level ``discover_delegate_modules`` call would
+# then reimport this already-in-progress module and see only the portion
+# defined above the ``import charlie_work.workflow as _wf`` line, silently
+# dropping every delegate defined below it (including
+# ``_maybe_emit_operator_queue_impact``) from ``OrchestratorApp``. Importing
+# ``charlie_work.workflow`` first (immediately above) guarantees delegate
+# installation has already completed by the time this line runs.
+from charlie_work.orchestration.state_maintenance import _BLOCKED_READY_ISSUE_NUMBERS_LIMIT  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +257,18 @@ def test_operator_queue_depth_counts_mechanical_escalated(tmp_path: Path) -> Non
     assert depth == {101, 102}
 
 
+def test_is_operator_queue_issue_predicate() -> None:
+    """Issue #1768 review finding 3: ``is_operator_queue_issue`` is the
+    single shared predicate behind both ``operator_queue_depth`` (this
+    module) and ``operator_queue`` command's state-side numbers
+    (``github_ops_operator_queue.py``). Direct unit coverage on the
+    predicate itself, independent of either caller."""
+    assert is_operator_queue_issue({"status": "escalated", "reason_class": "mechanical"}) is True
+    assert is_operator_queue_issue({"status": "escalated", "reason_class": "judgment"}) is False
+    assert is_operator_queue_issue({"status": "blocked", "reason_class": "mechanical"}) is False
+    assert is_operator_queue_issue({}) is False
+
+
 def test_operator_queue_depth_empty_state(tmp_path: Path) -> None:
     """An empty state must produce an empty depth set, not an error."""
     app = _app(tmp_path)
@@ -338,9 +366,27 @@ def test_compute_impact_empty_roots_is_zero_impact_no_gh_call() -> None:
     assert call_count["n"] == 0
 
 
-def test_compute_impact_empty_open_issue_list_fails_open() -> None:
-    """A fetch that returns no open issues at all yields zero impact rather
-    than raising -- fail-open, matching ``classify_backlog_reachability``."""
+def test_compute_impact_success_is_observed() -> None:
+    """A successful fetch (even with dependents) must report ``observed=True``
+    -- the normal, trustworthy-zero-or-nonzero case."""
+    config = OrchestratorConfig()
+    ready = config.labels.ready
+    gh = FakeGitHub()
+    gh.issues = [_issue(1, []), _blocked_issue(2, [ready], blocked_by=1)]
+
+    impact = compute_operator_queue_impact(gh, config, {1})
+
+    assert impact.observed is True
+
+
+def test_compute_impact_empty_open_issue_list_reports_unobserved() -> None:
+    """Issue #1768 review finding 2: an ambiguously-empty fetch (a ``gh``
+    call that succeeds but returns no open issues at all, while a non-empty
+    root set exists) must report ``observed=False``, not a trustworthy zero
+    -- mirroring ``classify_backlog_reachability``'s identical reasoning for
+    the identical fetch. A genuinely trustworthy zero can only come from an
+    empty *root* set (see ``test_compute_impact_empty_roots_is_zero_impact_no_gh_call``),
+    never from an empty issue list."""
     config = OrchestratorConfig()
     gh = FakeGitHub()
     gh.issues = []
@@ -349,6 +395,28 @@ def test_compute_impact_empty_open_issue_list_fails_open() -> None:
 
     assert impact.roots == (99,)
     assert impact.blocked_ready_count == 0
+    assert impact.observed is False
+
+
+def test_compute_impact_github_error_reports_unobserved() -> None:
+    """Issue #1768 review finding 1: a ``GitHubError`` raised by
+    ``gh.issue_list`` (timeout, missing binary, non-zero exit) must be
+    contained and reported as ``observed=False``, never propagated -- this
+    check runs every loop pass and must never be able to crash an otherwise
+    fully-completed pass over an advisory signal."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub()
+
+    def _raising_issue_list(*args: Any, **kwargs: Any) -> Any:
+        raise GitHubError("gh: command timed out")
+
+    gh.issue_list = _raising_issue_list  # type: ignore[method-assign]
+
+    impact = compute_operator_queue_impact(gh, config, {99})
+
+    assert impact.roots == (99,)
+    assert impact.blocked_ready_count == 0
+    assert impact.observed is False
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +521,60 @@ def test_should_fire_unchanged_over_threshold_reminder_elapsed() -> None:
         "alerted_at": (now - timedelta(hours=25)).isoformat().replace("+00:00", "Z"),
     }
     assert should_fire_operator_queue_impact(baseline, signature, now=now) is True
+
+
+def test_should_fire_no_baseline_not_qualifying_does_not_fire() -> None:
+    """Issue #1768 review finding 7: a first-ever observation with zero
+    impact (``qualifies=False``) must NOT fire -- a brand-new sink arrival
+    that blocks nothing is not itself alert-worthy."""
+    current = operator_queue_impact_signature(
+        root_issue_numbers=[12], over_threshold=False, age_bucket="<1d"
+    )
+    assert (
+        should_fire_operator_queue_impact(None, current, now=datetime.now(UTC), qualifies=False)
+        is False
+    )
+
+
+def test_should_fire_root_set_change_not_qualifying_does_not_fire() -> None:
+    """Issue #1768 review finding 7: a root-set change that still carries
+    zero impact must NOT fire."""
+    baseline = {
+        **operator_queue_impact_signature(
+            root_issue_numbers=[12], over_threshold=False, age_bucket="<1d"
+        ),
+        "alerted_at": "2026-01-01T00:00:00Z",
+    }
+    current = operator_queue_impact_signature(
+        root_issue_numbers=[12, 13], over_threshold=False, age_bucket="<1d"
+    )
+    assert (
+        should_fire_operator_queue_impact(
+            baseline, current, now=datetime.now(UTC), qualifies=False
+        )
+        is False
+    )
+
+
+def test_should_fire_threshold_crossing_fires_even_when_not_qualifying() -> None:
+    """An ``over_threshold`` flip must fire regardless of ``qualifies`` --
+    crossing the threshold in either direction is meaningful on its own
+    (issue #1768 review finding 7's docstring)."""
+    baseline = {
+        **operator_queue_impact_signature(
+            root_issue_numbers=[12], over_threshold=False, age_bucket="<1d"
+        ),
+        "alerted_at": "2026-01-01T00:00:00Z",
+    }
+    current = operator_queue_impact_signature(
+        root_issue_numbers=[12], over_threshold=True, age_bucket="<1d"
+    )
+    assert (
+        should_fire_operator_queue_impact(
+            baseline, current, now=datetime.now(UTC), qualifies=False
+        )
+        is True
+    )
 
 
 def test_should_fire_malformed_alerted_at_fires() -> None:
@@ -795,6 +917,287 @@ def test_impact_silent_under_dry_run_with_high_impact_queue(tmp_path: Path) -> N
     )
 
 
+def _raising_gh() -> FakeGitHub:
+    gh = FakeGitHub()
+
+    def _raise(*args: Any, **kwargs: Any) -> Any:
+        raise GitHubError("gh: command timed out")
+
+    gh.issue_list = _raise  # type: ignore[method-assign]
+    return gh
+
+
+def test_impact_check_failure_does_not_fire_or_touch_baseline(tmp_path: Path) -> None:
+    """Issue #1768 review findings 1/2, end-to-end: a ``gh.issue_list``
+    failure must not emit an event, must not record a baseline, and must
+    not raise out of ``_maybe_emit_operator_queue_impact`` -- a fabricated
+    zero here would flip ``over_threshold`` to False and cause a false
+    "resolved" alert on the next successful pass."""
+    app = _app(
+        tmp_path,
+        gh=_raising_gh(),
+        deescalation=DeescalationConfig(enabled=False, operator_queue_depth_threshold=5),
+    )
+    _seed_operator_queue_issue(
+        app, 12, terminal_since="2026-01-01T00:00:00Z", reason_class="judgment"
+    )
+
+    app._maybe_emit_operator_queue_impact()
+
+    assert query_events(app.paths.state_file, kind="operator_queue_impact") == []
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+    assert operator_queue_impact_baseline(state) is None
+
+
+def test_impact_check_failure_still_rearms_review_cadence(tmp_path: Path) -> None:
+    """A failing check must still re-arm ``operator_queue_review_interval_minutes``
+    (issue #1768 review finding 4) so a persistently failing ``gh`` binary
+    is retried on the configured cadence, not hammered every single pass."""
+    app = _app(
+        tmp_path,
+        gh=_raising_gh(),
+        deescalation=DeescalationConfig(
+            enabled=False,
+            operator_queue_depth_threshold=5,
+            operator_queue_review_interval_minutes=30,
+        ),
+    )
+    _seed_operator_queue_issue(
+        app, 12, terminal_since="2026-01-01T00:00:00Z", reason_class="judgment"
+    )
+
+    app._maybe_emit_operator_queue_impact()
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+    assert is_operator_queue_review_due(state) is False
+
+
+def test_impact_rearms_cadence_on_non_firing_pass(tmp_path: Path) -> None:
+    """Issue #1768 review finding 4: the cadence marker must re-arm on
+    every *completed* check, not only on the fire path -- otherwise the
+    steady state (checked, materially unchanged) is permanently "due" and
+    the GitHub fetch + whole-backlog walk runs every single pass forever,
+    exactly the per-pass cost this knob exists to bound."""
+    config = OrchestratorConfig()
+    gh = _fresh_eyes_gh(12, config.labels.ready, range(13, 29))
+    app = _app(
+        tmp_path,
+        gh=gh,
+        deescalation=DeescalationConfig(
+            enabled=False,
+            operator_queue_depth_threshold=5,
+            operator_queue_review_interval_minutes=30,
+        ),
+    )
+    _seed_operator_queue_issue(
+        app, 12, terminal_since="2026-01-01T00:00:00Z", reason_class="judgment"
+    )
+
+    # First pass fires and arms the cadence marker.
+    app._maybe_emit_operator_queue_impact()
+    assert len(query_events(app.paths.state_file, kind="operator_queue_impact")) == 1
+
+    # Force the cadence due again, then run a second, materially-unchanged
+    # (non-firing) pass.
+    forced_past = (datetime.now(UTC) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state = arm_operator_queue_review(state, forced_past)
+        save_state(app.paths.state_file, state)
+
+    app._maybe_emit_operator_queue_impact()
+
+    # Still exactly one event (non-firing pass), but the cadence marker
+    # must have moved forward past "now" again -- not stayed stuck at the
+    # forced-past value, which is what the pre-fix "only re-arm on the fire
+    # path" bug would leave behind on a non-firing pass.
+    assert len(query_events(app.paths.state_file, kind="operator_queue_impact")) == 1
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+    second_next_review = state["deescalation_pass"]["next_operator_queue_review_at"]
+    assert is_operator_queue_review_due(state) is False
+    assert second_next_review != forced_past
+
+
+def test_impact_zero_impact_root_never_fires(tmp_path: Path) -> None:
+    """Issue #1768 review finding 7, end-to-end: a sink root with zero
+    transitive automated-ready impact must never fire -- neither on its
+    first observation nor across a root-set change -- and must never
+    record a baseline."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub()
+    # A non-empty, but wholly unrelated, open-issue list: keeps the fetch
+    # genuinely "observed" (an empty list is itself ambiguous -- see
+    # test_compute_impact_empty_open_issue_list_reports_unobserved) while
+    # having zero dependents on either sink root below.
+    gh.issues = [_issue(999, [config.labels.ready])]
+    app = _app(
+        tmp_path,
+        gh=gh,
+        deescalation=DeescalationConfig(enabled=False, operator_queue_depth_threshold=5),
+    )
+    _seed_operator_queue_issue(
+        app, 50, terminal_since="2026-01-01T00:00:00Z", reason_class="judgment"
+    )
+
+    app._maybe_emit_operator_queue_impact()
+    assert query_events(app.paths.state_file, kind="operator_queue_impact") == []
+
+    _seed_operator_queue_issue(
+        app, 51, terminal_since="2026-01-02T00:00:00Z", reason_class="mechanical"
+    )
+    app._maybe_emit_operator_queue_impact()
+
+    assert query_events(app.paths.state_file, kind="operator_queue_impact") == []
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+    assert operator_queue_impact_baseline(state) is None
+
+
+def test_impact_digest_includes_blocked_issue_numbers(tmp_path: Path) -> None:
+    """Issue #1768 review finding 8: the digest's log line must actually
+    carry the blocked-ready issue numbers the emitter computed, not just
+    the count -- ``blocked_ready_issue_numbers`` had no consumer before
+    this fix."""
+    config = OrchestratorConfig()
+    gh = _fresh_eyes_gh(12, config.labels.ready, range(13, 16))  # 3 dependents
+    app = _app(
+        tmp_path,
+        gh=gh,
+        deescalation=DeescalationConfig(enabled=False, operator_queue_depth_threshold=1),
+        notify=NotifyConfig(enabled=True, sink="file", file_path=str(tmp_path / "digest.jsonl")),
+    )
+    _seed_operator_queue_issue(
+        app, 12, terminal_since="2026-01-01T00:00:00Z", reason_class="judgment"
+    )
+
+    app._maybe_emit_operator_queue_impact()
+
+    digest_lines = (tmp_path / "digest.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(digest_lines) == 1
+    last_log_line = json.loads(digest_lines[0])["transitions"][0]["last_log_line"]
+    assert "blocked_issues=" in last_log_line
+    for number in (13, 14, 15):
+        assert str(number) in last_log_line
+
+
+def test_impact_payload_bounds_blocked_ready_issue_numbers(tmp_path: Path) -> None:
+    """Issue #1768 review finding 9: the ring-resident event payload's
+    ``blocked_ready_issue_numbers`` must be bounded, with an explicit
+    ``blocked_ready_truncated`` count -- mirroring
+    ``summarize_loop_errors``'s bounded-list-plus-truncated-count
+    precedent. The scalar ``blocked_ready_count`` stays the true,
+    uncapped count."""
+    total_dependents = _BLOCKED_READY_ISSUE_NUMBERS_LIMIT + 10
+    config = OrchestratorConfig()
+    gh = _fresh_eyes_gh(12, config.labels.ready, range(13, 13 + total_dependents))
+    app = _app(
+        tmp_path,
+        gh=gh,
+        deescalation=DeescalationConfig(enabled=False, operator_queue_depth_threshold=5),
+    )
+    _seed_operator_queue_issue(
+        app, 12, terminal_since="2026-01-01T00:00:00Z", reason_class="judgment"
+    )
+
+    app._maybe_emit_operator_queue_impact()
+
+    events = query_events(app.paths.state_file, kind="operator_queue_impact")
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["blocked_ready_count"] == total_dependents
+    assert len(payload["blocked_ready_issue_numbers"]) == _BLOCKED_READY_ISSUE_NUMBERS_LIMIT
+    assert payload["blocked_ready_truncated"] == 10
+
+
+def test_impact_file_sink_end_to_end(tmp_path: Path) -> None:
+    """Issue #1768 review finding 6: a real, unmocked ``sink: file`` delivery
+    -- every fleet repo runs this sink today, not desktop toast, so this is
+    the actual delivery path AC2 needs covered, not just the
+    ``_DESKTOP_SEVERITIES`` frozenset-membership check."""
+    config = OrchestratorConfig()
+    gh = _fresh_eyes_gh(12, config.labels.ready, range(13, 29))
+    digest_path = tmp_path / "digest.jsonl"
+    app = _app(
+        tmp_path,
+        gh=gh,
+        deescalation=DeescalationConfig(enabled=False, operator_queue_depth_threshold=5),
+        notify=NotifyConfig(enabled=True, sink="file", file_path=str(digest_path)),
+    )
+    _seed_operator_queue_issue(
+        app, 12, terminal_since="2026-01-01T00:00:00Z", reason_class="judgment"
+    )
+
+    app._maybe_emit_operator_queue_impact()
+
+    assert digest_path.exists()
+    lines = digest_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["repo"] == tmp_path.name
+    assert len(record["transitions"]) == 1
+    entry = record["transitions"][0]
+    assert entry["health"] == "OPERATOR_QUEUE_IMPACT"
+    assert entry["adapter_kind"] == "operator_queue"
+    assert "16" in entry["last_log_line"]
+
+
+def test_impact_emitter_low_rate_reminder(tmp_path: Path) -> None:
+    """Issue #1768 review finding 10: ``LOW_RATE_REMINDER_HOURS`` must also
+    be exercised at the ``_maybe_emit_operator_queue_impact`` emitter
+    level, not only through ``should_fire_operator_queue_impact``'s direct
+    unit tests -- a materially-unchanged, still-over-threshold queue must
+    re-fire once the reminder window has elapsed."""
+    config = OrchestratorConfig()
+    gh = _fresh_eyes_gh(12, config.labels.ready, range(13, 29))
+    app = _app(
+        tmp_path,
+        gh=gh,
+        deescalation=DeescalationConfig(enabled=False, operator_queue_depth_threshold=5),
+    )
+    _seed_operator_queue_issue(
+        app, 12, terminal_since="2026-01-01T00:00:00Z", reason_class="judgment"
+    )
+
+    app._maybe_emit_operator_queue_impact()
+    assert len(query_events(app.paths.state_file, kind="operator_queue_impact")) == 1
+
+    # Rewrite the durable marker to look like it fired 25h ago (past the 24h
+    # reminder window), with the identical signature.
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        stale_alerted_at = (
+            (datetime.now(UTC) - timedelta(hours=25)).isoformat().replace("+00:00", "Z")
+        )
+        state = _wf_record_signature_at(state, stale_alerted_at)
+        save_state(app.paths.state_file, state)
+
+    app._maybe_emit_operator_queue_impact()
+
+    assert len(query_events(app.paths.state_file, kind="operator_queue_impact")) == 2, (
+        "an unchanged, still-over-threshold queue must re-fire once the "
+        "low-rate reminder window has elapsed"
+    )
+
+
+def _wf_record_signature_at(state: dict[str, Any], alerted_at: str) -> dict[str, Any]:
+    """Test helper: overwrite the recorded operator-queue-impact baseline's
+    ``alerted_at`` while keeping the rest of the signature identical."""
+    from charlie_work.state import record_operator_queue_impact_signature
+
+    baseline = operator_queue_impact_baseline(state)
+    assert baseline is not None
+    return record_operator_queue_impact_signature(
+        state,
+        root_issue_numbers=baseline["root_issue_numbers"],
+        over_threshold=baseline["over_threshold"],
+        age_bucket=baseline["age_bucket"],
+        alerted_at=alerted_at,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Item 2: state helpers for the review cadence
 # ---------------------------------------------------------------------------
@@ -943,6 +1346,20 @@ def test_deescalation_config_rejects_non_int_threshold(tmp_path: Path) -> None:
     from charlie_work.config import ConfigError, build_config_from_data
 
     with pytest.raises(ConfigError, match="operator_queue_depth_threshold"):
+        build_config_from_data({"deescalation": {"operator_queue_depth_threshold": "five"}})
+
+
+def test_deescalation_config_threshold_errors_name_the_unit(tmp_path: Path) -> None:
+    """Issue #1768 review finding 5: ``operator_queue_depth_threshold``
+    silently changed units (root-count -> blocked-ready-issue-count) with
+    this PR. The validation error messages must say so, since an operator
+    reading a rejection message has no other way to learn the unit
+    changed."""
+    from charlie_work.config import ConfigError, build_config_from_data
+
+    with pytest.raises(ConfigError, match="blocked-ready-issue count"):
+        build_config_from_data({"deescalation": {"operator_queue_depth_threshold": -1}})
+    with pytest.raises(ConfigError, match="blocked-ready-issue count"):
         build_config_from_data({"deescalation": {"operator_queue_depth_threshold": "five"}})
 
 

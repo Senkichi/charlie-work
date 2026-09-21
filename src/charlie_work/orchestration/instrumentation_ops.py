@@ -726,7 +726,26 @@ def _loop_impl(
         # self-counted by any post-pass event query. Shares this pass's
         # correlation ID so a fire is attributable to the same pass as the
         # sink census above. Edge-triggered: most passes emit nothing.
-        self._maybe_emit_operator_queue_impact()
+        #
+        # Outer defense-in-depth (issue #1768 review finding 1): the
+        # ``gh.issue_list`` fetch inside ``compute_operator_queue_impact``
+        # already contains ``GitHubError`` and reports ``observed=False``
+        # rather than raising, but this advisory signal must not be able
+        # to crash an otherwise-successful pass through any *other*
+        # exception either -- the same containment
+        # ``_maybe_reconcile_drift``/``ensure_labels`` already apply to
+        # their own best-effort passes elsewhere in this loop tick.
+        try:
+            self._maybe_emit_operator_queue_impact()
+        except Exception as exc:  # noqa: BLE001 - containment is deliberate; see docstring
+            log_event(
+                self.paths.state_file,
+                "operator_queue_impact_check_failed",
+                {"error": f"{type(exc).__name__}: {exc}"},
+                repo=self.repo_root.name,
+                correlation_id=cid,
+                level="warning",
+            )
         log_event(
             self.paths.state_file,
             "loop_completed",

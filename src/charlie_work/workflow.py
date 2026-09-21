@@ -1487,15 +1487,36 @@ def sink_census(state: dict[str, Any]) -> set[int]:
     return parked
 
 
+def is_operator_queue_issue(entry: dict[str, Any]) -> bool:
+    """True when a ``state.json`` issue entry matches the operator-queue
+    criteria: a mechanical escalation (``status == "escalated"`` and
+    ``reason_class == "mechanical"``) -- the in-state mirror of the
+    ``agent:operator-queue`` GitHub label (issue #1266). ``status ==
+    "blocked"`` is never mechanical (``blocked`` is a reviewer verdict,
+    always ``reason_class == "judgment"``), so a blocked entry never
+    matches.
+
+    Single point of enforcement for this predicate (issue #1768 review
+    finding 3): both ``operator_queue_depth`` below and the ``charlie
+    operator-queue`` CLI command (``orchestration.github_ops_operator_queue``)
+    read it, instead of each re-declaring the same two-field check and
+    risking the two drifting apart on what "the operator queue" means.
+    """
+    return entry.get("status") == "escalated" and entry.get("reason_class") == "mechanical"
+
+
 def operator_queue_depth(state: dict[str, Any]) -> set[int]:
     """Return the set of issue numbers currently parked on the operator queue.
 
     Issue #1314 item 3. The operator queue is the subset of the sink
-    (``sink_census``) whose entries carry ``reason_class == "mechanical"`` --
-    the in-state mirror of the ``agent:operator-queue`` GitHub label (issue
-    #1266). ``status == "blocked"`` is never mechanical (``blocked`` is a
-    reviewer verdict, always ``reason_class == "judgment"``), so only
-    ``status == "escalated"`` entries with the mechanical class are counted.
+    (``sink_census``) matching ``is_operator_queue_issue`` -- narrower than
+    the sink, which also includes judgment escalations
+    (``agent:human-needed``) and reviewer-``blocked`` verdicts. Issue
+    #1768's ``operator_queue_impact`` signal deliberately measures the
+    broader sink, not this narrower set (the real "fresh-eyes" root that
+    motivated #1768 is itself a judgment escalation), so a root that alert
+    names may not appear in this function's result or in ``charlie
+    operator-queue``'s listing -- look the issue number up directly.
 
     This is a point-in-time census read directly from ``state.json``'s
     ``issues`` map, deliberately not a GitHub-label query: it is cheap,
@@ -1510,11 +1531,7 @@ def operator_queue_depth(state: dict[str, Any]) -> set[int]:
     for num, entry in issues.items():
         if not isinstance(entry, dict):
             continue
-        if (
-            entry.get("status") == "escalated"
-            and entry.get("reason_class") == "mechanical"
-            and str(num).isdigit()
-        ):
+        if is_operator_queue_issue(entry) and str(num).isdigit():
             queued.add(int(num))
     return queued
 

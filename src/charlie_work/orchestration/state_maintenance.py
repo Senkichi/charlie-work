@@ -12,6 +12,14 @@ from typing import Any
 
 import charlie_work.workflow as _wf
 
+# Cap on the blocked-ready issue-number list carried in the ring-resident
+# ``operator_queue_impact`` event payload and the fire-path digest payload
+# (issue #1768 review finding 9), mirroring ``summarize_loop_errors``'s
+# ``_LOOP_ERROR_MAX_PRS`` bounded-list-plus-truncated-count precedent. The
+# full, unbounded list stays queryable via ``compute_operator_queue_impact``
+# on demand; only the durable/ring-resident copies are bounded.
+_BLOCKED_READY_ISSUE_NUMBERS_LIMIT = 50
+
 
 def _maybe_probe_quota_recovery(self, *, now: datetime | None = None) -> None:
     """Flat-interval Haiku probe for early quota/rate-limit throttle recovery.
@@ -549,15 +557,41 @@ def _maybe_emit_operator_queue_impact(self) -> None:
     blocked behind the sink roots (``compute_operator_queue_impact``,
     reusing the same ``gh.issue_list(state="open")`` fetch
     ``classify_backlog_reachability`` already makes each pass -- no new
-    GitHub call), not a plain tally of root issues.
+    GitHub call), not a plain tally of root issues. This is deliberately
+    the broader sink population, not the narrower ``reason_class ==
+    "mechanical"`` set ``charlie operator-queue`` lists
+    (``workflow.operator_queue_depth`` / ``is_operator_queue_issue``): the
+    real "fresh-eyes" root that motivated issue #1768 is itself a
+    judgment escalation, so narrowing to mechanical-only would blind this
+    alert to its own primary case. A root this alert names may therefore
+    not appear in ``charlie operator-queue``'s listing -- the event and
+    digest payload carry the exact issue numbers, so look them up
+    directly (issue #1768 review finding 3).
+
+    Root-set changes and first-ever observations additionally require a
+    non-zero ``blocked_ready_count`` (or an already-over-threshold count)
+    to fire -- a brand-new sink arrival with zero transitive impact is not
+    itself alert-worthy (issue #1768 review finding 7).
+
+    ``compute_operator_queue_impact`` fails **unobserved**, not open, on a
+    ``gh`` fetch failure or an ambiguously-empty result (issue #1768
+    review findings 1/2): this check makes a real GitHub call where the
+    old gauge was a pure ``state.json`` scan, so it needs the same
+    "an empty/failed fetch is not a zero" containment
+    ``classify_backlog_reachability`` already has. ``observed=False``
+    never fires and never touches the baseline here -- persisting a
+    fabricated ``blocked_ready_count=0`` would flip ``over_threshold`` to
+    False, fire a false "resolved" alert, and re-fire again on the next
+    successful pass.
 
     On a genuine fire, the richer payload (root numbers, blocked-ready
-    count and issue numbers, oldest-root age) is both dual-written to
-    ``events.db`` (via ``self._record_event``) and delivered to the
-    desktop-toast pipeline via ``notify.AttentionDigest`` -- the same
-    channel worker-health transitions already use -- so the payload the
-    emitter computes actually reaches the operator instead of being
-    discarded after a heartbeat-line bucket count (AC2).
+    count and a bounded issue-number list, oldest-root age) is both
+    dual-written to ``events.db`` (via ``self._record_event``) and
+    delivered through ``notify.emit_digest`` on whatever sink the repo has
+    configured -- every fleet repo today runs ``sink: file``
+    (``digest.jsonl``), not desktop toast, though
+    ``OPERATOR_QUEUE_IMPACT`` is also registered for the desktop sink for
+    any repo that opts into it (AC2, issue #1768 review finding 6).
 
     Threshold 0 disables the alert entirely (no event emitted regardless
     of impact), preserving the pre-feature silent-queue behavior for
@@ -566,6 +600,15 @@ def _maybe_emit_operator_queue_impact(self) -> None:
     blocked-ready-issue-count units rather than root-count units) rather
     than introducing a new config key, since no fleet repo currently
     overrides it.
+
+    The ``operator_queue_review_interval_minutes`` cadence marker re-arms
+    on every *completed* check, whether or not it goes on to fire below
+    (issue #1768 review finding 4) -- arming only on the fire path (the
+    pre-#1768 gauge's structure, safe when its non-fire path was a free
+    dict scan) would leave the steady state ("checked, nothing materially
+    changed") permanently "due", running the GitHub fetch and
+    whole-backlog blocker-graph walk every single pass forever, exactly
+    the per-pass cost this knob exists to bound.
 
     ``dry_run`` short-circuits the entire check before any lock, state
     read, or GitHub call: preserves the C1.2 "byte-identical to a pass
@@ -595,7 +638,7 @@ def _maybe_emit_operator_queue_impact(self) -> None:
             # as the pre-#1768 gauge's silent "nothing parked" pass.
             cleared = _wf.clear_operator_queue_impact_baseline(state)
             if cleared is not state:
-                _wf.save_state(state_file, cleared)
+                self.write_gate.save_state(cleared)
             return
 
         state_issues = state.get("issues", {})
@@ -613,26 +656,11 @@ def _maybe_emit_operator_queue_impact(self) -> None:
             roots,
             oldest_root_age_days=oldest_root_age_days,
         )
-        over_threshold = impact.blocked_ready_count > threshold
-        age_bucket = _wf.age_bucket_label(oldest_root_age_days)
-        current_signature = _wf.operator_queue_impact_signature(
-            root_issue_numbers=sorted(roots),
-            over_threshold=over_threshold,
-            age_bucket=age_bucket,
-        )
-        baseline = _wf.operator_queue_impact_baseline(state)
         now = datetime.now(UTC)
-        if not _wf.should_fire_operator_queue_impact(baseline, current_signature, now=now):
-            # Materially unchanged (and not yet due for a low-rate
-            # reminder): mirrors the old gauge's "depth <= threshold"
-            # early return -- no state write, no event, most passes take
-            # this path.
-            return
 
-        # Fire path only from here -- the cadence re-arm and the baseline
-        # write both happen only when something actually changed, matching
-        # the pre-#1768 gauge's structure (it too only ever armed
-        # ``next_operator_queue_review_at`` on its own emit path).
+        # Re-arm the cadence marker on every completed check, independent
+        # of whether it goes on to fire below -- see this method's
+        # docstring (issue #1768 review finding 4).
         if review_interval > 0:
             next_review_at = (
                 (now + timedelta(minutes=review_interval))
@@ -641,6 +669,40 @@ def _maybe_emit_operator_queue_impact(self) -> None:
                 .replace("+00:00", "Z")
             )
             state = _wf.arm_operator_queue_review(state, next_review_at)
+
+        if not impact.observed:
+            # The GitHub fetch failed or came back ambiguously empty
+            # (issue #1768 review findings 1/2): never fire, never touch
+            # the baseline. Save state only if the cadence re-arm above
+            # actually changed something.
+            if review_interval > 0:
+                self.write_gate.save_state(state)
+            return
+
+        over_threshold = impact.blocked_ready_count > threshold
+        age_bucket = _wf.age_bucket_label(oldest_root_age_days)
+        current_signature = _wf.operator_queue_impact_signature(
+            root_issue_numbers=sorted(roots),
+            over_threshold=over_threshold,
+            age_bucket=age_bucket,
+        )
+        baseline = _wf.operator_queue_impact_baseline(state)
+        # A root-set change or a first-ever observation is only
+        # alert-worthy when it actually carries impact (issue #1768
+        # review finding 7).
+        qualifies = over_threshold or impact.blocked_ready_count > 0
+        if not _wf.should_fire_operator_queue_impact(
+            baseline, current_signature, now=now, qualifies=qualifies
+        ):
+            # Materially unchanged (and not yet due for a low-rate
+            # reminder), or a non-qualifying change: mirrors the old
+            # gauge's "depth <= threshold" early return -- no baseline
+            # write, no event. The cadence re-arm above already happened.
+            if review_interval > 0:
+                self.write_gate.save_state(state)
+            return
+
+        # Fire path only from here.
         alerted_at = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         state = _wf.record_operator_queue_impact_signature(
             state,
@@ -649,13 +711,20 @@ def _maybe_emit_operator_queue_impact(self) -> None:
             age_bucket=age_bucket,
             alerted_at=alerted_at,
         )
+        # Issue #1768 review finding 9: bound the ring-resident issue list
+        # the same way summarize_loop_errors bounds its PR list -- an
+        # explicit *_truncated count rather than a silent drop.
+        all_blocked_ready = list(impact.blocked_ready_issue_numbers)
+        bounded_blocked_ready = all_blocked_ready[:_BLOCKED_READY_ISSUE_NUMBERS_LIMIT]
+        blocked_ready_truncated = len(all_blocked_ready) - len(bounded_blocked_ready)
         state = self._record_event(
             state,
             "operator_queue_impact",
             {
                 "root_issue_numbers": sorted(roots),
                 "blocked_ready_count": impact.blocked_ready_count,
-                "blocked_ready_issue_numbers": list(impact.blocked_ready_issue_numbers),
+                "blocked_ready_issue_numbers": bounded_blocked_ready,
+                "blocked_ready_truncated": blocked_ready_truncated,
                 "oldest_root_age_days": oldest_root_age_days,
                 "threshold": threshold,
             },
@@ -663,11 +732,25 @@ def _maybe_emit_operator_queue_impact(self) -> None:
         fire_payload = {
             "root_issue_numbers": sorted(roots),
             "blocked_ready_count": impact.blocked_ready_count,
+            "blocked_ready_issue_numbers": bounded_blocked_ready,
+            "blocked_ready_truncated": blocked_ready_truncated,
             "oldest_root_age_days": oldest_root_age_days,
         }
-        _wf.save_state(state_file, state)
+        self.write_gate.save_state(state)
 
     if fire_payload is not None and self.config.notify.enabled:
+        # Issue #1768 review finding 8: the digest line must actually
+        # carry the blocked-ready issue numbers -- the payload the
+        # emitter goes out of its way to compute must reach the reader,
+        # not just events.db.
+        blocked_issues_text = "".join(
+            [
+                str(fire_payload["blocked_ready_issue_numbers"]),
+                f" (+{fire_payload['blocked_ready_truncated']} more)"
+                if fire_payload["blocked_ready_truncated"]
+                else "",
+            ]
+        )
         _wf.emit_digest(
             self._layout.notify,
             _wf.AttentionDigest(
@@ -682,6 +765,7 @@ def _maybe_emit_operator_queue_impact(self) -> None:
                         last_log_line=(
                             f"blocked_ready={fire_payload['blocked_ready_count']} "
                             f"roots={fire_payload['root_issue_numbers']} "
+                            f"blocked_issues={blocked_issues_text} "
                             f"oldest_age_days={fire_payload['oldest_root_age_days']}"
                         ),
                         pid=None,

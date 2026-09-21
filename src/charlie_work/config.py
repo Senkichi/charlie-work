@@ -2658,11 +2658,13 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     ):
         raise ConfigError(
             "config section 'deescalation' key 'operator_queue_depth_threshold' "
+            "(blocked-ready-issue count, not root-issue count -- see issue #1768) "
             f"must be an int, got {type(oq_threshold).__name__}"
         )
     if oq_threshold is not None and oq_threshold < 0:
         raise ConfigError(
             "config section 'deescalation' key 'operator_queue_depth_threshold' "
+            "(blocked-ready-issue count, not root-issue count -- see issue #1768) "
             f"must be >= 0, got {oq_threshold}"
         )
     deescalation_overrides: dict[str, Any] = {}
