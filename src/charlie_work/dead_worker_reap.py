@@ -2534,6 +2534,12 @@ def _open_salvage_pr(
             drafted_title = candidate_title.strip()
         candidate_body = worker_outcome.get("pr_body")
         if isinstance(candidate_body, str) and candidate_body.strip():
+            # Non-empty is checked via .strip(), but the value used is the
+            # unstripped original (unlike drafted_title above) -- a PR body
+            # is markdown, so worker-authored leading/trailing structure
+            # (blank lines around a heading, a trailing signature block) is
+            # preserved rather than collapsed. GitHub renders incidental
+            # leading/trailing whitespace as a cosmetic no-op either way.
             drafted_body = candidate_body
 
     if drafted_title is not None:

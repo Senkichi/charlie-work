@@ -337,6 +337,7 @@ def test_orphaned_worker_pushed_branch_uses_worker_drafted_pr_content(tmp_path: 
     entry = state["issues"]["935"]
     assert entry.get("status") == PASSIVE_OPEN_STATUS
     assert entry.get("pr_number") == 9001
+    assert entry.get("branch_name") == branch
 
     assert len(fake_gh.prs_created) == 1
     created = fake_gh.prs_created[0]
