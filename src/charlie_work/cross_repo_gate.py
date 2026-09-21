@@ -104,6 +104,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import LAUNCHER_OWNED_DIRS
+from .cross_repo_gate_shorthand import _is_dotdot_shorthand, _resolve_list_shorthand
 from .safe_path import contains
 from .subprocess_runner import run_captured
 
@@ -303,20 +304,6 @@ _CITATION_SECTION_HEADING_RE = re.compile(
     r"^\s*(?:provenance|references|sources|see\s+also)\s*[:.]?\s*$",
     re.IGNORECASE,
 )
-
-# Shared-prefix shorthand continuations (issue #1761): a candidate whose
-# first non-separator segment is all dots (``..``, ``...``, longer) is a
-# shorthand continuation marker, never a real path segment — no file or
-# directory is literally named ``...``. Neutral by construction, whether or
-# not list context is available.
-_DOTDOT_FIRST_SEGMENT_RE = re.compile(r"[\\/]*\.{2,}(?:[\\/]|$)")
-
-# Characters permitted between backtick spans in a shared-prefix citation
-# run: commas and whitespace, per the convention
-# `` `dir/sub/a.json`,\n`/b.json` `` (issue #1761). Anything else — a word,
-# a colon, a bullet marker — ends the run: a candidate separated from the
-# previous span by prose is cited on its own terms, not as a continuation.
-_RUN_SEPARATOR_CHARS = " \t\r\n,"
 
 
 def _current_clause(text_before_in_paragraph: str) -> str:
@@ -563,89 +550,6 @@ def _is_launcher_owned_path(candidate: str) -> bool:
     """
     segments = re.split(r"[\\/]+", candidate, maxsplit=1)
     return bool(segments) and segments[0] in LAUNCHER_OWNED_DIRS
-
-
-def _is_dotdot_shorthand(candidate: str) -> bool:
-    """Return ``True`` when *candidate*'s first non-separator segment is all
-    dots (``..``, ``...``, longer) — the shared-prefix shorthand marker
-    (issue #1761).
-
-    An all-dots leading segment can never name a real file, so the
-    candidate is neutral by construction, whether or not it sits in a
-    backtick-span run. ``..`` is included with ``...``: a dispatch target
-    is always cited repo-relative, so a candidate that only makes sense
-    relative to some unstated anchor is shorthand, not evidence.
-    """
-    return bool(_DOTDOT_FIRST_SEGMENT_RE.match(candidate))
-
-
-def _backtick_run_anchor_dir(stripped: str, start: int) -> str | None:
-    """Return the directory prefix a shared-prefix shorthand item resolves
-    against, or ``None`` when the candidate at ``start`` does not continue a
-    backtick-span run (issue #1761).
-
-    A "run" is a sequence of backtick-quoted spans separated only by commas
-    and whitespace — the shared-prefix citation shape
-    (`` `dir/sub/a.json`, `/b.json`, `/c.json` ``). The anchor is the
-    directory part of the nearest preceding span in the run whose content
-    is a non-shorthand path: shorthand spans (leading ``/`` or an all-dots
-    first segment) and spans with no separator are skipped, so in
-    `` `dir/a.json`, `/.claude.json`, `/sessions/30392.json` `` the last
-    item resolves against ``dir``'s prefix rather than ``/.claude.json``'s
-    empty one.
-    """
-    # Locate the opening backtick of the candidate's own span. ``_TICK_PATH``
-    # matches include both ticks, so ``stripped[start]`` is the opener; a
-    # ``_REL_PATH`` match that began just inside the span starts one
-    # character after it.
-    if stripped[start : start + 1] == "`":
-        tick = start
-    elif stripped[start - 1 : start] == "`":
-        tick = start - 1
-    else:
-        return None
-    pos = tick
-    while True:
-        i = pos - 1
-        while i >= 0 and stripped[i] in _RUN_SEPARATOR_CHARS:
-            i -= 1
-        if i < 0 or stripped[i] != "`":
-            return None
-        opener = stripped.rfind("`", 0, i)
-        if opener < 0:
-            return None
-        content = re.sub(r":\d+$", "", stripped[opener + 1 : i])
-        if not content.startswith(("/", "\\")) and not _is_dotdot_shorthand(content):
-            sep = max(content.rfind("/"), content.rfind("\\"))
-            if sep > 0:
-                return content[:sep]
-        pos = opener
-
-
-def _resolve_list_shorthand(candidate: str, stripped: str, start: int) -> str | None:
-    """Resolve a leading-separator shorthand continuation to the full path
-    it denotes (issue #1761), or return ``None`` when the candidate is not
-    shorthand.
-
-    The resolved path is the directory prefix of the nearest preceding
-    non-shorthand span in the candidate's comma/whitespace-separated
-    backtick-span run, plus the candidate's own segments:
-    `` `logs/run/a.json`, `/sessions/30392.json` `` resolves to
-    ``logs/run/sessions/30392.json``. The shorthand item then behaves
-    exactly as if the full path had been spelled out — a resolved path
-    that is gitignored or exists is neutral/pass evidence, a resolved path
-    that is missing still escalates.
-
-    A leading-separator candidate with no preceding backtick span returns
-    ``None``: cited standalone it is a genuine absolute path (``/home/
-    user/repo/x.py``), not shorthand, and keeps its existing verdict.
-    """
-    if not candidate.startswith(("/", "\\")):
-        return None
-    anchor = _backtick_run_anchor_dir(stripped, start)
-    if anchor is None:
-        return None
-    return anchor.rstrip("/\\") + "/" + candidate.lstrip("/\\").replace("\\", "/")
 
 
 def _path_exists_in_repo(path_str: str, repo_root: Path) -> bool:
