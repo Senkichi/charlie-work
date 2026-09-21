@@ -103,7 +103,7 @@ def _record_unlinked_pr_skips(
                 state["prs"][str(pr_number)] = pr_state
                 state = self._record_event(
                     state,
-                    UNLINKED_PR_SKIPPED_EVENT_KIND,
+                    UNLINKED_PR_SKIPPED_EVENT_KIND,  # event-consumer: audit-only -- imported constant (defined in pr_unlinked_visibility.py) rather than a same-file literal, so the AST scanner cannot resolve it; registered "warning" in _LEVEL_BY_KIND and read via query_events(kind="pr_unlinked_skipped") in tests/test_issue_1766_unlinked_pr_visibility.py.
                     {
                         "pr_number": pr_number,
                         "author": author,

@@ -64,7 +64,10 @@ _PRE_CAMPAIGN_MEMBER_SURFACE = 133
 # - ``review_verdict_guard`` (issue #1695): the why-charlie-hate CLI guard
 #   that refuses to regenerate a review packet when the recorded verdict is
 #   still valid.
-_POST_CAMPAIGN_SURFACE_ADDITIONS = frozenset({"review_verdict_guard"})
+# - ``_record_unlinked_pr_skips`` (issue #1766): batches the edge-triggered
+#   ``pr_unlinked_skipped`` notice for issue-less PRs the merge lane skips,
+#   installed from the new ``orchestration/github_ops_unlinked_prs.py`` leaf.
+_POST_CAMPAIGN_SURFACE_ADDITIONS = frozenset({"review_verdict_guard", "_record_unlinked_pr_skips"})
 
 
 def _apc_orchestratorapp_member_count() -> int:
