@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 import charlie_work.workflow as _wf
-from charlie_work import status_snapshot
+from charlie_work import layout, queue_sync_coverage_cache, status_snapshot
 from charlie_work.attachment_budget_prompt import (
     ATTACHMENT_BUDGET_CLAUSE as _ATTACHMENT_BUDGET_CLAUSE,
 )
@@ -235,8 +235,35 @@ def _queue_sync_merge_covered(
     ``unauthorized_merge_queue_sync_covered`` audit event itself on a
     covered result, exactly where that raw call already lived (and was
     already counted) before the extraction.
+
+    Issue #1473: a merged PR's coverage verdict is a fact about immutable
+    git objects, so once this triple (``pr_number``, ``reviewed_head_sha``,
+    ``live_head_sha``) is determined ``covered=True`` it can never become
+    false. ``queue_sync_coverage_cache`` durably memoizes only that
+    ``covered=True`` outcome (never a not-covered or indeterminate one, and
+    never a different triple), so a repeat pass over the same already-merged
+    PR skips the 3 ``gh`` API calls and the audit event re-emission entirely.
+    A cache miss -- including a missing PR number, a brand-new merged PR, a
+    changed head, or an unreadable cache file -- always falls through to the
+    real check below; the cache can only ever remove redundant work, never
+    suppress a finding.
     """
     queue_bot_login = self.config.auto_merge.queue_bot_login
+    cache_path = layout.queue_sync_coverage_cache_path(self.paths.root)
+    pr_number = pr.get("number")
+    cache_ready = (
+        isinstance(pr_number, int)
+        and not isinstance(pr_number, bool)
+        and reviewed_head_sha
+        and live_head_sha
+    )
+    if cache_ready and queue_sync_coverage_cache.is_covered_cached(
+        cache_path,
+        pr_number=pr_number,
+        reviewed_head_sha=reviewed_head_sha,
+        live_head_sha=live_head_sha,
+    ):
+        return _QueueSyncCoverageResult(covered=True)
     result = _wf._queue_sync_merge_covered(
         self.gh,
         queue_bot_login,
@@ -249,7 +276,7 @@ def _queue_sync_merge_covered(
             self.paths.state_file,
             "unauthorized_merge_queue_sync_covered",
             {
-                "pr": pr.get("number"),
+                "pr": pr_number,
                 "reviewed_head_sha": reviewed_head_sha,
                 "live_head_sha": live_head_sha,
                 "sync_parent": result.sync_parent,
@@ -257,6 +284,13 @@ def _queue_sync_merge_covered(
                 "queue_bot_login": queue_bot_login,
             },
         )
+        if cache_ready:
+            queue_sync_coverage_cache.record_covered(
+                cache_path,
+                pr_number=pr_number,
+                reviewed_head_sha=reviewed_head_sha,
+                live_head_sha=live_head_sha,
+            )
     return result
 
 
