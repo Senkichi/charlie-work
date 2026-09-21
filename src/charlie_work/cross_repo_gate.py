@@ -71,8 +71,26 @@ production:
   heading like ``## Code References That Must Change`` (which contains
   ``references`` as a substring) does NOT neutralize the genuine dispatch
   targets listed under it.
+- **Shared-prefix shorthand citation items** (issue #1761) — a comma- or
+  newline-separated run of backtick spans that spells a directory out once
+  and then repeats only the remainder, prefixed with ``/`` or ``...``
+  (`` `dir/sub/a.json`, `/b.json`, `.../c.json` ``). No file is literally
+  named ``/b.json`` or ``.../c.json``, so the shorthand items extract as
+  bogus missing candidates that survive every other neutralization arm. A
+  candidate whose first non-separator segment is three or more dots
+  (``...``/longer) is neutral by construction — it is never a real path
+  segment. ``..`` is deliberately NOT shorthand: it is the real
+  parent-directory segment, so ``../sibling-repo/x.py`` still escalates as
+  a cross-repo target. A
+  leading-separator candidate (``/x`` or ``/x/y``) that continues a
+  backtick-span run is resolved against the nearest preceding
+  non-shorthand span's directory prefix and the *resolved* path is
+  classified through the normal pipeline — so `` `/a.json`, `/b.json` ``
+  behaves exactly as if ``b.json`` had been spelled out in full, while a
+  leading-``/`` candidate cited standalone (or one whose resolved form is
+  genuinely missing) still escalates as before.
 
-All three shapes are classified **neutral**: excluded from the pass/escalate
+All of these shapes are classified **neutral**: excluded from the pass/escalate
 decision and reported separately (``CrossRepoGateResult.neutral_paths``)
 rather than folded into ``referenced_paths``/``missing_paths``. When every
 extracted candidate is neutral, the gate abstains (``passed=True``) — the
@@ -89,6 +107,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import LAUNCHER_OWNED_DIRS
+from .cross_repo_gate_shorthand import _is_dotdot_shorthand, _resolve_list_shorthand
 from .safe_path import contains
 from .subprocess_runner import run_captured
 
@@ -718,29 +737,43 @@ def _is_gitignored(candidate: str, repo_root: Path) -> bool:
     return result.returncode == 0
 
 
-def _split_survivors_and_neutral(issue_body: str, repo_root: Path) -> tuple[list[str], list[str]]:
+def _split_survivors_and_neutral(
+    issue_body: str, repo_root: Path
+) -> tuple[list[tuple[str, str]], list[str]]:
     """Partition extracted candidates into survivors and neutral candidates.
 
-    Survivors are the candidates that still count toward the pass/escalate
-    decision. Neutral candidates (gitignored runtime artifacts,
-    evidence/authority citations, or candidates under a citation-section
-    heading — see the module docstring) are excluded entirely;
+    ``survivors`` is a list of ``(raw, effective)`` pairs: ``raw`` is the
+    candidate as written (what ``referenced_paths``/``missing_paths``
+    report) and ``effective`` is the path it denotes after shared-prefix
+    shorthand resolution (issue #1761) — identical to ``raw`` for every
+    non-shorthand candidate. Existence, gitignore, and repo-shape checks
+    run against ``effective`` so a shorthand item behaves exactly as if the
+    full path had been spelled out.
+
+    Neutral candidates (gitignored runtime artifacts, evidence/authority
+    citations, candidates under a citation-section heading, or shared-prefix
+    shorthand items — see the module docstring) are excluded entirely;
     :func:`cross_repo_gate` reports them separately via
     ``CrossRepoGateResult.neutral_paths``.
     """
     candidates, stripped = _iter_candidate_matches(issue_body)
-    survivors: list[str] = []
+    survivors: list[tuple[str, str]] = []
     neutral: list[str] = []
     for raw, start, end in candidates:
         before, after = _paragraph_span(stripped, start, end)
+        if _is_dotdot_shorthand(raw):
+            neutral.append(raw)
+            continue
+        resolved = _resolve_list_shorthand(raw, stripped, start)
+        effective = resolved if resolved is not None else raw
         if (
             _is_context_neutral(before, after)
             or _is_in_citation_section(stripped[:start])
-            or _is_gitignored(raw, repo_root)
+            or _is_gitignored(effective, repo_root)
         ):
             neutral.append(raw)
         else:
-            survivors.append(raw)
+            survivors.append((raw, effective))
     return survivors, neutral
 
 
@@ -798,14 +831,16 @@ def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
             ),
             neutral_paths=tuple(neutral),
         )
-    missing = tuple(p for p in survivors if not _path_exists_in_repo(p, repo_root))
+    missing = tuple(
+        raw for raw, effective in survivors if not _path_exists_in_repo(effective, repo_root)
+    )
     # Block only when EVERY surviving path is absent — the issue's subject
     # code is not in this repo at all.  If even one survivor exists, the
     # worker has something to work on here and the gate passes.
     if len(missing) < len(survivors):
         return CrossRepoGateResult(
             passed=True,
-            referenced_paths=tuple(survivors),
+            referenced_paths=tuple(raw for raw, _ in survivors),
             missing_paths=missing,
             reason="at least one referenced path exists in the target repo",
             neutral_paths=tuple(neutral),
@@ -818,16 +853,16 @@ def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
     # ``_is_absolute_path`` for the full rationale.
     if (
         len(survivors) == 1
-        and not _is_absolute_path(survivors[0])
-        and not _is_repo_shaped_relative_candidate(survivors[0], repo_root)
+        and not _is_absolute_path(survivors[0][1])
+        and not _is_repo_shaped_relative_candidate(survivors[0][1], repo_root)
     ):
         return CrossRepoGateResult(
             passed=True,
-            referenced_paths=tuple(survivors),
+            referenced_paths=(survivors[0][0],),
             missing_paths=missing,
             reason=(
                 "single ambiguous candidate "
-                f"({survivors[0]!r}) is not a repo-shaped relative path — "
+                f"({survivors[0][0]!r}) is not a repo-shaped relative path — "
                 "abstaining rather than escalating on weak evidence"
             ),
             neutral_paths=tuple(neutral),
@@ -836,7 +871,7 @@ def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
     # this repo.  Escalate instead of dispatching a worker that will wander.
     return CrossRepoGateResult(
         passed=False,
-        referenced_paths=tuple(survivors),
+        referenced_paths=tuple(raw for raw, _ in survivors),
         missing_paths=missing,
         reason=(
             f"cross_repo_target: all {len(missing)} referenced file path(s) "
