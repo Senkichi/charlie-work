@@ -7,7 +7,11 @@ Track-1 wave 8/8).
 from __future__ import annotations
 
 from pathlib import Path
-from _dispatch_fixtures import _cross_repo_issue_body
+from _dispatch_fixtures import (
+    _cross_repo_issue_body,
+    _write_fleet_registry,
+    _write_sibling_repo_file,
+)
 from _fakes_github import FakeGitHub
 from charlie_work.config import (
     ClaudeCodeConfig,
@@ -356,12 +360,24 @@ def test_dry_run_dispatch_cross_repo_gate_reports_without_mutating(tmp_path: Pat
     Drives the dry-run branch of ``_dispatch_impl`` (the path that populates
     ``cross_repo_escalated_issue_numbers`` in the planning payload), not
     ``cross_repo_gate`` in isolation.
+
+    Issues #1756-#1758 (positive-evidence redesign): also the call-site
+    threading regression test for the dry-run branch's
+    ``managed_repo_roots``/``dispatching_repo_name`` -- without a registered
+    sibling repo that actually contains the missing path, the gate abstains
+    instead of escalating and ``selected_count`` would go non-zero.
     """
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.prs[0]["state"] = "CLOSED"
     fake_gh.issues[0]["body"] = _cross_repo_issue_body()
+    sibling_root = tmp_path / "sibling-ci-runners"
+    _write_sibling_repo_file(sibling_root, "src/ci_fleet/suite_coverage.py")
+    _write_fleet_registry(
+        tmp_path / "fleet",
+        {"owner/ci-runners": {"repo_root": str(sibling_root)}},
+    )
     app = OrchestratorApp(
         repo_root=tmp_path,
         paths=paths,

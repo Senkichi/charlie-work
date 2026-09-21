@@ -233,6 +233,19 @@ class LabelConfig:
     # "local_work_ready" edge, so -- like ``operator_queue`` above -- it is a
     # ``workflow_labels`` member (a re-arm strips it) and in ``all``.
     review_ready: str = "agent:review-ready"
+    # Issues #1756-#1758 (cross_repo_gate positive-evidence redesign, design
+    # doc "cross_repo_gate: root cause, precision audit, and redesign
+    # recommendation", Option B): the operator's one-step recovery valve for
+    # a residual cross-repo-gate false positive. Checked by
+    # ``dispatch_state.py`` *before* either cross-repo gate runs -- when an
+    # issue carries this label, both ``cross_repo_gate`` and
+    # ``cross_repo_scope_gate`` are skipped entirely for that issue and
+    # dispatch proceeds normally. Member of ``all`` so ``bootstrap_labels``/
+    # the automatic startup ensure creates it on every managed repo, and
+    # deliberately NOT of ``workflow_labels``, ``terminal``, or ``active``:
+    # like ``collect_gate_exempt``, this is a human-applied escape hatch, not
+    # a state the label-transition machine ever adds or removes on its own.
+    cross_repo_override: str = "agent:cross-repo-override"
 
     @property
     def terminal(self) -> set[str]:
@@ -266,6 +279,7 @@ class LabelConfig:
             self.operator_queue,
             self.collect_gate_exempt,
             self.review_ready,
+            self.cross_repo_override,
         ]
 
     @property

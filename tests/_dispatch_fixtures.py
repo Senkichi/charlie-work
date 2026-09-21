@@ -160,19 +160,49 @@ def _make_stalled_sidecar(
 
 
 def _cross_repo_issue_body() -> str:
-    """Issue body whose every referenced file path is absent from the target repo.
+    """Issue body whose referenced file path is absent from the target repo
+    but present under a registered sibling repo's root.
 
     Mirrors the #1010/#953 scenario: the subject code lives in a sibling repo,
-    so every path the issue references is missing from the repo the worker is
-    dispatched against.
+    not the repo the worker is dispatched against. Since the positive-evidence
+    redesign (issues #1756-#1758), a caller must register the sibling under
+    ``managed_repo_roots`` for the referenced path to be positive evidence of
+    a cross-repo target -- see :func:`_write_fleet_registry` and
+    :func:`_write_sibling_repo_file`, which both consumers of this fixture use
+    to make ``src/ci_fleet/suite_coverage.py`` resolve under a fake
+    ``ci_runners`` sibling.
     """
     return (
-        "But **#953's code does not live in this repo.** `suite_coverage.py` is at "
-        "`C:/Users/operator/repos/ci_runners/src/ci_fleet/suite_coverage.py`; there is no "
-        "`src/charlie_work/suite_coverage.py`. The worker, handed an isolated checkout "
-        "of a repo that does not contain the file it was asked to change, went to "
-        "`C:\\Users\\operator\\repos\\ci_runners` — the **shared main checkout** — and worked there."
+        "But **#953's code does not live in this repo.** The fix belongs in "
+        "`src/ci_fleet/suite_coverage.py`, not `src/charlie_work/suite_coverage.py` "
+        "here. The worker, handed an isolated checkout of a repo that does not "
+        "contain the file it was asked to change, went to the sibling repo's "
+        "**shared main checkout** and worked there."
     )
+
+
+def _write_fleet_registry(fleet_dir: Path, repos: dict[str, dict[str, str]]) -> None:
+    """Write a minimal ``fleet.json`` with the given repo entries.
+
+    ``repos`` is keyed by ``owner/repo`` (mirroring the real registry's
+    ``nameWithOwner`` keys), each value at least a ``{"repo_root": ...}``
+    dict. Used by cross-repo-gate positive-evidence tests (issues
+    #1756-#1758) that need ``managed_repo_roots``/``managed_repo_names`` to
+    see a registered sibling repo.
+    """
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    (fleet_dir / "fleet.json").write_text(
+        json.dumps({"version": 1, "repos": repos}), encoding="utf-8"
+    )
+
+
+def _write_sibling_repo_file(sibling_root: Path, relative_path: str) -> None:
+    """Create ``relative_path`` under ``sibling_root``, for a fake sibling
+    repo a cross-repo-gate positive-evidence test registers via
+    :func:`_write_fleet_registry`."""
+    target = sibling_root / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("# fixture file\n", encoding="utf-8")
 
 
 def _reconcile_pass_app(
