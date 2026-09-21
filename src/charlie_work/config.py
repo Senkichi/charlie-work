@@ -341,16 +341,32 @@ class DispatchConfig:
     # Issue #1770: CI-capacity headroom for fresh-issue dispatch. When > 0,
     # fresh dispatch additionally clamps to ci_headroom_available()'s reading
     # for this repo -- floor(registered_runner_capacity * ratio) minus live
-    # queued+in_progress CI demand, both already measured by ci_fleet's
+    # queued+in_progress CI *job* demand, both already measured by ci_fleet's
     # runner_allocation pass (see orchestration/ci_headroom.py; no new
     # GitHub calls). Paces fresh PR creation to the repo's actual CI
     # throughput instead of only to worker concurrency, so the in-flight-PR
     # queue stops outrunning what CI can drain (runner-starvation.md
-    # Option C). Repos with no self-hosted runner_allocation entry (e.g.
-    # public charlie-work's hosted-runner repos) have no reading to clamp
-    # against and are silently unaffected -- ci_headroom_available() returns
+    # Option C).
+    #
+    # This is a runner-SLOT headroom, not a PR count: one PR can fan out to
+    # several CI jobs (a matrix workflow), and that fan-out factor is
+    # repo-specific and not represented in the ratio. A ratio of 1.0 means
+    # "stop dispatching once every runner is busy", which halts fresh
+    # dispatch on a repo whose runners are simply keeping up with healthy
+    # load (demand == capacity, zero queue is NOT saturation) -- pick a
+    # ratio meaningfully above 1.0 for a repo with multi-job PRs, and expect
+    # to tune it per repo rather than reusing one value fleet-wide. See
+    # orchestration/ci_headroom.py's module docstring for the full rationale.
+    #
+    # Repos with no self-hosted runner_allocation entry (e.g. public
+    # charlie-work's hosted-runner repos) have no reading to clamp against,
+    # so dispatch itself is unaffected -- ci_headroom_available() returns
     # None (fail-open, never a hard 0) for them, derived from whether
-    # ci_fleet's plan carries the repo at all, never a repo-name list.
+    # ci_fleet's plan carries the repo at all, never a repo-name list. This
+    # is NOT silent, though: an unclamped repo still gets a rate-limited
+    # ci_headroom_unavailable diagnostic event in its own events.db (at most
+    # once per reason per max_data_age_minutes) so the fail-open condition
+    # stays visible without flooding the store.
     # Rework, conflict-rework, recovery, and review dispatch are NOT gated,
     # same rationale as max_open_agent_prs -- they reduce WIP rather than
     # adding to it. 0 = off, preserving current behavior.

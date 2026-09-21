@@ -913,6 +913,29 @@ class ConcurrencyGovernorResult:
         """Return True if the CI-headroom clamp is enabled (ci_headroom_ratio > 0)."""
         return self.ci_headroom_ratio > 0
 
+    @property
+    def any_term_enabled(self) -> bool:
+        """Return True if any governor term is enabled.
+
+        Single point of enforcement (issue #1770 review finding 1): every
+        call site that decides whether to splat ``report_fields()`` into a
+        ``CommandResult.data`` dict must gate on this property, never on a
+        hand-written ``or``-chain of the individual ``*_enabled`` flags. A
+        hand-written chain silently stops covering new terms the moment one
+        is added -- exactly what happened when ``ci_headroom_enabled`` shipped
+        without being added to the ten pre-existing
+        ``gov.enabled or gov.fleet_enabled or gov.open_pr_enabled`` sites, so
+        a repo that opted into *only* the CI-headroom clamp (the other three
+        left at 0, precisely the "opt into just the new clamp" rollout the
+        config comment advertises) got its ``dispatch_limit`` clamped to 0
+        with no ``ci_headroom``/``clamped_by`` field in the result to explain
+        why. Deriving this from the flags themselves means the next new term
+        cannot repeat that gap.
+        """
+        return (
+            self.enabled or self.fleet_enabled or self.open_pr_enabled or self.ci_headroom_enabled
+        )
+
     def report_fields(self) -> dict[str, Any]:
         """Return the fields to include in CommandResult.data when clamped."""
         fields: dict[str, Any] = {

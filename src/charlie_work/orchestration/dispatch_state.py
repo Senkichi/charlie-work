@@ -324,7 +324,7 @@ def _dispatch_impl(
                 "deferred_reason": "provider_throttled",
                 "throttled_until": throttled_until,
             }
-            if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
+            if gov.any_term_enabled:
                 data.update(gov.report_fields())
             return _wf.CommandResult(
                 False,
@@ -562,7 +562,7 @@ def _dispatch_impl(
             ],
             "stalled": stalled_entries,
         }
-        if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
+        if gov.any_term_enabled:
             data.update(gov.report_fields())
         return _wf.CommandResult(
             True,
@@ -1809,7 +1809,7 @@ def _dispatch_impl(
         ],
         "operator_claimed_ready": sorted(operator_claimed_ready),
     }
-    if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
+    if gov.any_term_enabled:
         data.update(gov.report_fields())
 
     # Emit notification digest if there are health transitions (stalled sessions)

@@ -707,7 +707,7 @@ def _loop_body(
         "parked_prs": parked_prs,
     }
     # Propagate concurrency info from dispatch results
-    if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
+    if gov.any_term_enabled:
         data.update(gov.report_fields())
     # Prefer the dispatch-scoped governor values (they reflect sidecars
     # written by this pass and the most accurate fleet-wide live count).

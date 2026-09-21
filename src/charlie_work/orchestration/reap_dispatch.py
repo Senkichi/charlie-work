@@ -116,15 +116,23 @@ def _apply_concurrency_governor(
     Args:
         dispatch_limit: The requested dispatch limit
         live_count: Optional pre-computed live worker count. If None and
-            max_concurrent > 0, this will compute it via _count_live_sessions.
+            max_concurrent > 0 or ci_capacity_headroom_ratio > 0, this will
+            compute it via _count_live_sessions -- the CI-headroom clamp
+            below needs it too, as a floor on demand ci_fleet's last
+            allocation pass has not measured yet (issue #1770 review
+            finding 3), independent of whether max_concurrent itself is
+            enabled.
         apply_open_pr_backpressure: When True (fresh-issue dispatch only),
             also clamp to ``max(0, max_open_agent_prs - open_pr_count)``
             where ``open_pr_count`` is the number of open agent PRs whose
             head ref matches ``dispatch.branch_prefix``, and (issue #1770)
             to the repo's live CI headroom (see ``ci_capacity_headroom_ratio``
-            below). Rework, recovery, and loop-level callers leave this
-            False -- they reduce verification debt (open-PR count, CI
-            demand) rather than adding to it (issue #1129).
+            below) -- ``open_pr_count`` is likewise computed whenever either
+            of those two terms is enabled, not only ``max_open_agent_prs``,
+            for the same floor-on-demand reason. Rework, recovery, and
+            loop-level callers leave this False -- they reduce verification
+            debt (open-PR count, CI demand) rather than adding to it (issue
+            #1129).
     """
     max_concurrent = self.config.dispatch.max_concurrent_sessions
     fleet_max = self.config.fleet.global_max_concurrent_sessions
@@ -132,6 +140,15 @@ def _apply_concurrency_governor(
     ci_headroom_ratio = (
         self.config.dispatch.ci_capacity_headroom_ratio if apply_open_pr_backpressure else 0.0
     )
+    # Issue #1770 review finding 10: captured once, before any term below can
+    # tighten ``dispatch_limit``, so every ``dispatch_backpressure`` event
+    # this call writes reports the same "requested" baseline -- the caller's
+    # original ask -- rather than whatever the running value happened to be
+    # when that particular term fired. Two clamps firing in one pass (e.g.
+    # open_pr_max then ci_headroom) would otherwise write two events with
+    # different, unlabelled "requested_limit" values, and reconstructing the
+    # pass would require knowing the term order.
+    original_dispatch_limit = dispatch_limit
     available_slots = dispatch_limit
     clamped = False
     clamped_by: str | None = None
@@ -139,11 +156,21 @@ def _apply_concurrency_governor(
     open_pr_count = 0
     ci_headroom: int | None = None
 
-    if max_concurrent > 0:
+    # Issue #1770 review finding 3: live_count/open_pr_count are also the
+    # cheapest available floor on "demand ci_fleet's last allocation pass
+    # cannot see yet" (a freshly dispatched worker, or an already-open PR,
+    # neither of which necessarily has a queued/in_progress Actions run at
+    # the instant of that snapshot). Computed whenever the CI-headroom clamp
+    # is live, not only when its own governor term (max_concurrent/
+    # open_pr_max) is independently enabled, so the floor is populated even
+    # for a repo that opted into *only* the CI-headroom clamp.
+    if max_concurrent > 0 or ci_headroom_ratio > 0:
         if live_count is None:
             sessions_dir = self._layout.sessions_dir
             live_count = _wf._count_live_sessions(sessions_dir, self.paths.state_file)
-        available_slots = max(0, max_concurrent - live_count)
+
+    if max_concurrent > 0:
+        available_slots = max(0, max_concurrent - (live_count or 0))
         if available_slots < dispatch_limit:
             dispatch_limit = available_slots
             clamped = True
@@ -157,7 +184,7 @@ def _apply_concurrency_governor(
             clamped = True
             clamped_by = "fleet_max"
 
-    if open_pr_max > 0:
+    if open_pr_max > 0 or ci_headroom_ratio > 0:
         # Issue #1129: count open agent PRs from live GitHub state (the
         # same pr_list() + branch_prefix derivation _merge_train_candidates
         # and the reconciler use). No new state; the count is recomputed
@@ -168,6 +195,8 @@ def _apply_concurrency_governor(
             for pr in self.gh.pr_list()
             if str(pr.get("headRefName") or "").startswith(branch_prefix)
         )
+
+    if open_pr_max > 0:
         open_pr_available = max(0, open_pr_max - open_pr_count)
         if open_pr_available < dispatch_limit:
             # Record a dispatch_backpressure event so "0 dispatched with N
@@ -193,7 +222,7 @@ def _apply_concurrency_governor(
                     {
                         "open_pr_count": open_pr_count,
                         "max_open_agent_prs": open_pr_max,
-                        "requested_limit": dispatch_limit,
+                        "requested_limit": original_dispatch_limit,
                         "clamped_limit": open_pr_available,
                     },
                     repo=self.repo_root.name,
@@ -217,6 +246,19 @@ def _apply_concurrency_governor(
             _safe_repo_slug(self.gh),
             headroom_ratio=ci_headroom_ratio,
             fleet_state_path=fleet_state_path,
+            # Finding 3: floor demand at the local work already in flight
+            # for this repo (live worker sessions + already-open agent PRs)
+            # so a burst of fresh dispatch cannot keep re-granting the same
+            # full headroom pass after pass while ci_fleet's own snapshot
+            # still lags behind it.
+            min_in_flight_demand=(live_count or 0) + open_pr_count,
+            # Finding 8: route the fail-open diagnostic to THIS repo's own
+            # events.db under the same repo spelling dispatch_backpressure
+            # below uses, not the fleet-wide store the runner_allocation
+            # read above requires -- so both halves of one clamp decision
+            # are discoverable together from one repo's event store.
+            diagnostic_state_path=self.paths.state_file,
+            diagnostic_repo=self.repo_root.name,
         )
         if ci_headroom is not None and ci_headroom < dispatch_limit:
             # Same dispatch_backpressure event kind open_pr_max writes to
@@ -233,7 +275,7 @@ def _apply_concurrency_governor(
                         "clamped_by": "ci_headroom",
                         "ci_headroom": ci_headroom,
                         "ci_headroom_ratio": ci_headroom_ratio,
-                        "requested_limit": dispatch_limit,
+                        "requested_limit": original_dispatch_limit,
                         "clamped_limit": ci_headroom,
                     },
                     repo=self.repo_root.name,
