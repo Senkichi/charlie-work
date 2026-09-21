@@ -311,3 +311,74 @@ def test_windowed_redispatch_at_handles_corrupted_state(tmp_path: Path) -> None:
     entry = {"redispatch_at": [old_iso]}
     result = _windowed_redispatch_at(entry, window_minutes=240)
     assert result == []
+
+
+def test_paired_death_count_gates_on_the_smaller_of_the_two_histories(tmp_path: Path) -> None:
+    """Issue #1784 finding 3: ``_paired_death_count`` must return
+    ``min(len(worker_death_at), len(redispatch_at))``, not the raw death
+    count. The orphan sweep's advance-to-pr-open lane credits a worker
+    death with no matching ``redispatch_at`` entry (that lane recovers the
+    ORIGINAL implementer dispatch, which ``dispatch_work`` never stamps into
+    ``redispatch_at`` -- see workflow.py). Without pairing, a single issue
+    that dies this way ``max_auto_redispatch`` times would trip the
+    death-loop cap having gone through zero actual redispatches.
+
+    Without the fix (``len(worker_death_at)`` alone), this assertion fails:
+    3 != 1.
+    """
+    from charlie_work.no_op_checkpoint import _paired_death_count
+
+    assert (
+        _paired_death_count(
+            redispatch_at=["t1"],
+            worker_death_at=["t1", "t2", "t3"],
+        )
+        == 1
+    )
+    # Symmetric case: deaths are the limiting factor when redispatches
+    # outnumber them.
+    assert (
+        _paired_death_count(
+            redispatch_at=["t1", "t2", "t3"],
+            worker_death_at=["t1"],
+        )
+        == 1
+    )
+    # Equal histories: pairing is a no-op.
+    assert (
+        _paired_death_count(
+            redispatch_at=["t1", "t2"],
+            worker_death_at=["t1", "t2"],
+        )
+        == 2
+    )
+    # No deaths at all: paired count is zero regardless of redispatch count.
+    assert _paired_death_count(redispatch_at=["t1", "t2"], worker_death_at=[]) == 0
+
+
+def test_credit_worker_death_preserves_full_history_at_write_time(tmp_path: Path) -> None:
+    """Issue #1784 finding 4: ``_credit_worker_death`` must append to the
+    FULL persisted history, not a pre-windowed subset -- windowing is a
+    read-time concern (``_windowed_worker_death_at``), applied fresh by
+    every consumer with its own ``window_minutes``. Pre-filtering at write
+    time would permanently discard a timestamp that a caller using a wider
+    window (or a checkpoint-narrowed effective window) should still see.
+
+    Without the fix, a death recorded with the (now-removed) windowing
+    behavior would drop timestamps older than the window from the returned
+    list, so an old-but-real entry would silently vanish from state instead
+    of merely being excluded from a windowed read.
+    """
+    from charlie_work.dispatch_selection import _credit_worker_death
+
+    old_iso = (datetime.now(UTC) - timedelta(hours=10)).isoformat().replace("+00:00", "Z")
+    entry = {"worker_death_at": [old_iso]}
+    result = _credit_worker_death(entry, at="2024-06-01T00:00:00Z")
+    # The old entry (well outside any reasonable window) survives the
+    # write untouched -- only a fresh timestamp is appended.
+    assert result == [old_iso, "2024-06-01T00:00:00Z"]
+
+    # A malformed prior entry is dropped by the normalizer, not the window.
+    entry = {"worker_death_at": ["not-a-date", 123, None]}
+    result = _credit_worker_death(entry, at="2024-06-01T00:00:00Z")
+    assert result == ["2024-06-01T00:00:00Z"]
