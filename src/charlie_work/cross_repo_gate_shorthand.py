@@ -18,9 +18,12 @@ well-scoped single-repo issues as ``cross_repo_target``.
 
 Two neutralization shapes live here:
 
-- **All-dots first segment** (``..``/``...``/longer): neutral by
-  construction — never a real path segment — whether or not list context
-  is available (:func:`_is_dotdot_shorthand`).
+- **All-dots first segment of three or more dots** (``...``/longer):
+  neutral by construction — never a real path segment — whether or not
+  list context is available (:func:`_is_dotdot_shorthand`). ``..`` is
+  deliberately excluded: it is the real parent-directory segment, so
+  ``../sibling-repo/x.py`` is a genuine cross-repo citation, not
+  shorthand, and still escalates.
 - **Leading-separator run continuation** (``/x`` or ``/x/y`` following a
   comma/whitespace-separated backtick-span run): resolved against the
   nearest preceding non-shorthand span's directory prefix
@@ -33,11 +36,14 @@ from __future__ import annotations
 
 import re
 
-# A candidate whose first non-separator segment is all dots (``..``,
-# ``...``, longer) is a shorthand continuation marker, never a real path
+# A candidate whose first non-separator segment is three or more dots
+# (``...``, longer) is a shorthand continuation marker, never a real path
 # segment — no file or directory is literally named ``...``. Neutral by
-# construction, whether or not list context is available.
-_DOTDOT_FIRST_SEGMENT_RE = re.compile(r"[\\/]*\.{2,}(?:[\\/]|$)")
+# construction, whether or not list context is available. ``..`` is
+# deliberately NOT shorthand: it is the real parent-directory segment, so
+# ``../sibling-repo/x.py`` citations still reach the pass/escalate
+# decision exactly as they did before this module existed.
+_DOTDOT_FIRST_SEGMENT_RE = re.compile(r"[\\/]*\.{3,}(?:[\\/]|$)")
 
 # Characters permitted between backtick spans in a shared-prefix citation
 # run: commas and whitespace, per the convention
@@ -48,15 +54,16 @@ _RUN_SEPARATOR_CHARS = " \t\r\n,"
 
 
 def _is_dotdot_shorthand(candidate: str) -> bool:
-    """Return ``True`` when *candidate*'s first non-separator segment is all
-    dots (``..``, ``...``, longer) — the shared-prefix shorthand marker
-    (issue #1761).
+    """Return ``True`` when *candidate*'s first non-separator segment is
+    three or more dots (``...``, longer) — the shared-prefix shorthand
+    marker (issue #1761).
 
-    An all-dots leading segment can never name a real file, so the
-    candidate is neutral by construction, whether or not it sits in a
-    backtick-span run. ``..`` is included with ``...``: a dispatch target
-    is always cited repo-relative, so a candidate that only makes sense
-    relative to some unstated anchor is shorthand, not evidence.
+    An all-dots leading segment of three or more dots can never name a
+    real file, so the candidate is neutral by construction, whether or not
+    it sits in a backtick-span run. ``..`` is deliberately excluded: it is
+    the real parent-directory segment — ``../sibling-repo/x.py`` is a
+    genuine cross-repo citation that must still reach the pass/escalate
+    decision, not a shorthand marker.
     """
     return bool(_DOTDOT_FIRST_SEGMENT_RE.match(candidate))
 

@@ -264,3 +264,68 @@ def test_prose_separated_slash_path_is_not_a_continuation(tmp_path: Path) -> Non
     assert result.passed is False
     assert result.missing_paths == ("/etc/x.py",)
     assert result.neutral_paths == ("logs/run/a.json",)
+
+
+def test_parent_relative_sibling_repo_run_still_escalates(
+    tmp_path: Path,
+) -> None:
+    """``..`` is the real parent-directory segment, not a shorthand marker:
+    a comma-separated run of ``../sibling-repo/`` citations still escalates
+    as ``cross_repo_target``, exactly as it did before the shorthand
+    machinery existed (round-2 review regression — a ``\\.{2,}``
+    threshold would neutralize these and dispatch into the wrong repo)."""
+    repo = _init_git_repo_with_logs_gitignore(tmp_path / "repo")
+    body = "Edit `../other-repo/a.py`, `../other-repo/b.py`."
+
+    result = cross_repo_gate(body, repo)
+
+    assert result.passed is False
+    assert set(result.missing_paths) == {
+        "../other-repo/a.py",
+        "../other-repo/b.py",
+    }
+    assert result.neutral_paths == ()
+    assert "cross_repo_target" in result.reason
+
+
+def test_parent_relative_citations_prose_separated_still_escalate(
+    tmp_path: Path,
+) -> None:
+    """Same guard outside list context: two ``../sibling-repo/`` citations
+    separated by prose still escalate — ``..`` neutrality must not depend
+    on run shape either."""
+    repo = _init_git_repo_with_logs_gitignore(tmp_path / "repo")
+    body = "Edit `../other-repo/a.py`. The helper it calls lives in `../other-repo/b.py`."
+
+    result = cross_repo_gate(body, repo)
+
+    assert result.passed is False
+    assert set(result.missing_paths) == {
+        "../other-repo/a.py",
+        "../other-repo/b.py",
+    }
+    assert result.neutral_paths == ()
+    assert "cross_repo_target" in result.reason
+
+
+def test_parent_relative_continuation_after_repo_anchor_still_escalates(
+    tmp_path: Path,
+) -> None:
+    """Pins the kept ``..`` behavior: ``..`` is NEVER shorthand, even when
+    the candidate directly continues a comma-separated backtick-span run
+    anchored by a non-shorthand span — `` `src/x.py`, `../sibling/y.py` ``
+    keeps ``../sibling/y.py`` a real missing candidate, so the sibling-repo
+    target still escalates instead of being silently neutralized."""
+    repo = _init_git_repo_with_logs_gitignore(tmp_path / "repo")
+    (repo / "src").mkdir()
+    body = "Fix `src/missing_a.py`, `../sibling-repo/missing_b.py`."
+
+    result = cross_repo_gate(body, repo)
+
+    assert result.passed is False
+    assert set(result.missing_paths) == {
+        "src/missing_a.py",
+        "../sibling-repo/missing_b.py",
+    }
+    assert result.neutral_paths == ()
+    assert "cross_repo_target" in result.reason

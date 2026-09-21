@@ -77,8 +77,11 @@ production:
   (`` `dir/sub/a.json`, `/b.json`, `.../c.json` ``). No file is literally
   named ``/b.json`` or ``.../c.json``, so the shorthand items extract as
   bogus missing candidates that survive every other neutralization arm. A
-  candidate whose first non-separator segment is all dots (``..``/``...``)
-  is neutral by construction — it is never a real path segment. A
+  candidate whose first non-separator segment is three or more dots
+  (``...``/longer) is neutral by construction — it is never a real path
+  segment. ``..`` is deliberately NOT shorthand: it is the real
+  parent-directory segment, so ``../sibling-repo/x.py`` still escalates as
+  a cross-repo target. A
   leading-separator candidate (``/x`` or ``/x/y``) that continues a
   backtick-span run is resolved against the nearest preceding
   non-shorthand span's directory prefix and the *resolved* path is
