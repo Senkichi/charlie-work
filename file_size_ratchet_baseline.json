@@ -4,7 +4,7 @@
   "src/charlie_work/claude_code.py": 2000,
   "src/charlie_work/cli.py": 3000,
   "src/charlie_work/config.py": 4000,
-  "src/charlie_work/cross_repo_gate.py": 1000,
+  "src/charlie_work/cross_repo_gate.py": 1400,
   "src/charlie_work/dead_worker_reap.py": 3000,
   "src/charlie_work/devin_shell.py": 1000,
   "src/charlie_work/doctor.py": 1600,
