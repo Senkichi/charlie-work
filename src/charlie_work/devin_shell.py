@@ -595,6 +595,29 @@ def launch_devin_session(
                 repo_root, worktree.path, force=True, branch=None if rework else branch
             )
 
+    def _fail(error: str) -> SessionRecord:
+        # Shared by the three post-worktree-creation failure paths below
+        # (rework-conflict-notice, command-rendering, env-sanitization): each
+        # already called _teardown_worktree() and just needs an identically
+        # shaped SessionRecord (pid/failure_kind at their defaults) persisted
+        # and returned. Deliberately not reused by the worktree-creation
+        # except-block above, which branches on failure_kind/pid per
+        # exception type, or the launch except-block below, which does not
+        # return immediately.
+        record = SessionRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree.path),
+            prompt_path=str(prompt_path),
+            command=command_template,
+            pid=None,
+            started_at=utc_now(),
+            log_path=str(log_path),
+            error=error,
+        )
+        _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
+        return record
+
     # A redispatch may have just preserved the prior attempt's branch tip
     # (issue #261) — fold that into whatever post-mortem sidecar already
     # exists for this issue so the ref is discoverable alongside the block
@@ -618,19 +641,7 @@ def launch_devin_session(
             )
         except OSError as exc:
             _teardown_worktree()
-            record = SessionRecord(
-                issue_number=issue_number,
-                branch=branch,
-                worktree_path=str(worktree.path),
-                prompt_path=str(prompt_path),
-                command=command_template,
-                pid=None,
-                started_at=utc_now(),
-                log_path=str(log_path),
-                error=f"failed to append rework conflict notice to prompt file: {exc}",
-            )
-            _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
-            return record
+            return _fail(f"failed to append rework conflict notice to prompt file: {exc}")
 
     # --- command rendering (prompt_path is caller-supplied, lives outside wt) -
     try:
@@ -643,19 +654,7 @@ def launch_devin_session(
         )
     except (KeyError, IndexError, ValueError) as exc:
         _teardown_worktree()
-        record = SessionRecord(
-            issue_number=issue_number,
-            branch=branch,
-            worktree_path=str(worktree.path),
-            prompt_path=str(prompt_path),
-            command=command_template,
-            pid=None,
-            started_at=utc_now(),
-            log_path=str(log_path),
-            error=f"command template rendering failed: {exc}",
-        )
-        _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
-        return record
+        return _fail(f"command template rendering failed: {exc}")
 
     # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator,
     # then merge user-provided worker_env overrides on top (e.g. PYTEST_XDIST_AUTO_NUM_WORKERS).
@@ -669,19 +668,7 @@ def launch_devin_session(
         sanitized_env = sanitize_env(worktree.path)
     except OSError as exc:
         _teardown_worktree()
-        record = SessionRecord(
-            issue_number=issue_number,
-            branch=branch,
-            worktree_path=str(worktree.path),
-            prompt_path=str(prompt_path),
-            command=command_template,
-            pid=None,
-            started_at=utc_now(),
-            log_path=str(log_path),
-            error=f"failed to prepare worker environment: {exc}",
-        )
-        _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
-        return record
+        return _fail(f"failed to prepare worker environment: {exc}")
     worker_env_dict = {
         **sanitized_env,
         **{str(k): str(v) for k, v in (worker_env or {}).items()},
