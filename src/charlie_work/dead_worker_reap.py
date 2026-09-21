@@ -121,6 +121,7 @@ from .issue_linking import linked_issue_number
 from .instrumentation import log_event
 from .labels import TransitionOutcome
 from .local_work_park import park_unpublishable_work
+from .no_op_checkpoint import _paired_death_count
 from .paths import resolved_layout
 from .pr_create_retry import create_pr_with_retry
 from .process_utils import (
@@ -1344,9 +1345,7 @@ def _reap_restore_rework_requested(
         # stranded work") instead of redispatch_cap_exceeded (triage:
         # "worker is spinning").
         if not immediate_escalation and not provider_throttled:
-            worker_death_at = _credit_worker_death(
-                entry, window_minutes=config.watchdog.redispatch_window_minutes
-            )
+            worker_death_at = _credit_worker_death(entry)
         else:
             worker_death_at = _windowed_worker_death_at(
                 entry, window_minutes=config.watchdog.redispatch_window_minutes
@@ -1354,7 +1353,16 @@ def _reap_restore_rework_requested(
 
         no_op_count = max(0, len(redispatch_at) - len(worker_death_at))
         death_count = len(worker_death_at)
-        death_loop = not immediate_escalation and death_count > config.watchdog.max_auto_redispatch
+        # Issue #1784 finding 3: paired against redispatch_at so a death
+        # credited without a matching redispatch (the orphan sweep's
+        # advance-to-pr-open lane, on the ORIGINAL implementer dispatch)
+        # cannot escalate a death-loop before this many redispatches
+        # actually happened. See ``_paired_death_count``'s docstring.
+        death_loop = (
+            not immediate_escalation
+            and _paired_death_count(redispatch_at=redispatch_at, worker_death_at=worker_death_at)
+            > config.watchdog.max_auto_redispatch
+        )
         no_op_loop = (
             not immediate_escalation
             and not death_loop

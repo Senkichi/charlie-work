@@ -413,6 +413,98 @@ def test_dispatch_rework_deaths_below_cap_still_dispatched(tmp_path: Path) -> No
     assert result.data.get("selected_count", 0) >= 1
 
 
+def test_dispatch_rework_death_loop_does_not_escalate_before_matching_redispatches(
+    tmp_path: Path,
+) -> None:
+    """Issue #1784 finding 3: the orphan sweep's advance-to-pr-open lane
+    credits a worker death with no matching ``redispatch_at`` entry (that
+    lane recovers the ORIGINAL implementer dispatch, which ``dispatch_work``
+    intentionally never stamps into ``redispatch_at`` -- see
+    ``test_orphaned_worker_unreviewed_open_pr_credits_worker_death``). With
+    3 deaths, only 1 redispatch, and cap=2, the death-loop cap must NOT
+    escalate: the paired count (``min(3, 1) = 1``) is below the cap, even
+    though the raw death count (3) is not.
+
+    Without the fix (gating on the raw ``len(worker_death_at)`` instead of
+    ``_paired_death_count``), this issue would incorrectly escalate as
+    ``worker_death_loop``.
+    """
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [now_iso],
+            "worker_death_at": [now_iso, now_iso, now_iso],
+            "branch_name": "agent/issue-123-fix-search",
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "rework-prompt.md").write_text("Fix the issues", encoding="utf-8")
+
+    from charlie_work.adapters import SessionDispatchResult
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=True,
+                pid=99999,
+                process_start_time=datetime.now(UTC).isoformat(),
+            )
+            for request in requests
+        ]
+
+    import charlie_work.workflow as workflow_module
+
+    original = workflow_module.dispatch_sessions
+    workflow_module.dispatch_sessions = fake_dispatch_sessions
+    try:
+        app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+        result = app.dispatch_rework()
+    finally:
+        workflow_module.dispatch_sessions = original
+
+    assert result.ok is True
+    # Not escalated by either cap: no_op_count = max(0, 1 - 3) = 0, and the
+    # paired death count = min(3, 1) = 1, both below cap(2).
+    assert 123 not in result.data.get("no_op_rework_escalated", [])
+    assert 123 not in result.data.get("worker_death_escalated", [])
+    assert result.data.get("selected_count", 0) >= 1
+
+
 def test_dispatch_rework_worker_death_loop_includes_stranded_commits(
     tmp_path: Path,
 ) -> None:
@@ -792,30 +884,50 @@ def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
 def test_dispatch_rework_jc1320_timeline_no_op_reset_avoids_false_escalation(
     tmp_path: Path,
 ) -> None:
-    """Job-cannon #1320 / PR #2148: reproduces the reported false-escalation
-    timeline end to end through the real production entry points --
-    ``record_review`` and the orphan-worker sweep -- rather than hand-
-    setting the final counters.
+    """Job-cannon #1320 / PR #2148 / issue #1784: reproduces the reported
+    false-escalation timeline end to end through the real production entry
+    points -- ``record_review`` and the orphan-worker sweep -- rather than
+    hand-setting the final counters.
 
     Three redispatch attempts occur for the same issue: the first ends in a
     worker death with the PR never yet reviewed (credited via the orphan
     sweep's previously-uncredited pr-open lane -- see
     ``test_orphaned_worker_unreviewed_open_pr_credits_worker_death``), and
-    the next two each push genuinely new content and are followed by a
-    request_changes verdict against the newly-advanced head (each of which
-    resets the issue-level no-op counters -- see
+    the next two each push genuinely new content (a distinct patch-id, not
+    just an advanced head SHA) and are followed by a request_changes verdict
+    against that new content (each of which stamps a ``no_op_checkpoint_at``
+    -- see
     ``test_record_review_request_changes_resets_no_op_counters_on_head_advance``).
 
     Without either fix this accumulates to ``redispatch_at`` holding all
     three timestamps and ``worker_death_at`` staying empty (the death was
     never credited), giving ``no_op_count = 3 - 0 = 3 >= max_auto_redispatch
-    (2)`` -- exactly the false escalation reported. With both fixes, the
-    two genuine-progress resets clear the history before the third
-    redispatch is even considered, so only that single attempt survives to
-    the final no-op check below and the issue is not escalated.
+    (2)`` -- exactly the false escalation reported. With both fixes, the two
+    genuine-progress checkpoints mean the windowed reads the pre-launch
+    no-op check actually consumes see none of the pre-checkpoint history, so
+    only the third attempt survives to the final no-op check below and the
+    issue is not escalated.
+
+    ``redispatch_at`` is only ever appended to in this timeline (never
+    reassigned) -- issue #1784 finding 5: the raw array is shared history
+    other caps depend on, and reassigning it mid-test would silently discard
+    the first redispatch instead of exercising the checkpoint's read-time
+    filtering. A 1.1s sleep separates every phase: ``no_op_checkpoint_at``
+    is stamped via ``utc_now()`` (whole-second precision), while
+    redispatch/death timestamps use full microsecond precision, so without a
+    gap of at least a second, a timestamp recorded a few milliseconds before
+    a same-second checkpoint would incorrectly compare as "after" it once
+    the checkpoint's fractional seconds are truncated away.
     """
+    import time
     from datetime import UTC, datetime
     from unittest.mock import patch
+
+    from charlie_work.dispatch_selection import (
+        _windowed_redispatch_at,
+        _windowed_worker_death_at,
+    )
+    from charlie_work.janitor import _calculate_patch_id
 
     config = OrchestratorConfig(
         devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
@@ -874,12 +986,21 @@ def test_dispatch_rework_jc1320_timeline_no_op_reset_avoids_false_escalation(
     assert state["issues"]["123"]["status"] == PASSIVE_OPEN_STATUS
     assert len(state["issues"]["123"].get("worker_death_at", [])) == 1
 
-    # --- Review round 1: the reviewer finds real, new content and requests
-    # further changes. head_advanced=True (no prior reviewed_head_sha)
-    # resets both counters -- the credited death and redispatch #1 no
-    # longer describe the issue's state going forward.
+    # Separate the redispatch/death timestamps above from round 1's
+    # checkpoint by more than a second -- see the docstring's note on
+    # utc_now()'s whole-second truncation.
+    time.sleep(1.1)
+
+    # --- Review round 1: the reviewer finds real, new content (a genuinely
+    # different patch-id, not just an advanced head SHA) and requests
+    # further changes. This is the PR's first review (no prior
+    # reviewed_patch_id), so the content-advanced gate is satisfied and a
+    # no_op_checkpoint_at is stamped -- the credited death and redispatch #1
+    # no longer count toward the no-op cap's windowed view going forward.
+    diff_round1 = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+r1"
     fake_gh.pr_head_shas[456] = "sha-1"
     fake_gh.prs[0]["headRefOid"] = "sha-1"
+    fake_gh.diffs[456] = diff_round1
     result = app.record_review(
         456,
         "request_changes",
@@ -890,18 +1011,32 @@ def test_dispatch_rework_jc1320_timeline_no_op_reset_avoids_false_escalation(
     assert result.data["escalated"] is False
 
     state = load_state(paths.state_file)
-    assert state["issues"]["123"]["status"] == "rework_requested"
-    assert state["issues"]["123"]["redispatch_at"] == []
-    assert state["issues"]["123"]["worker_death_at"] == []
+    entry = state["issues"]["123"]
+    assert entry["status"] == "rework_requested"
+    assert entry.get("no_op_checkpoint_at") is not None
+    window_minutes = config.watchdog.redispatch_window_minutes
+    assert _windowed_redispatch_at(entry, window_minutes=window_minutes) == []
+    assert _windowed_worker_death_at(entry, window_minutes=window_minutes) == []
+
+    time.sleep(1.1)
 
     # --- Redispatch #2: dispatched again, pushes more genuinely new content.
+    # Appended, never reassigned -- redispatch_at is shared history other
+    # caps depend on (issue #1784 finding 5).
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
-        state["issues"]["123"]["redispatch_at"] = [ts()]
+        state["issues"]["123"]["redispatch_at"] = state["issues"]["123"].get(
+            "redispatch_at", []
+        ) + [ts()]
         save_state(paths.state_file, state)
 
+    time.sleep(1.1)
+
+    diff_round2 = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+r2"
+    assert _calculate_patch_id(diff_round2) != _calculate_patch_id(diff_round1)
     fake_gh.pr_head_shas[456] = "sha-2"
     fake_gh.prs[0]["headRefOid"] = "sha-2"
+    fake_gh.diffs[456] = diff_round2
     result = app.record_review(
         456,
         "request_changes",
@@ -912,16 +1047,21 @@ def test_dispatch_rework_jc1320_timeline_no_op_reset_avoids_false_escalation(
     assert result.data["escalated"] is False
 
     state = load_state(paths.state_file)
-    assert state["issues"]["123"]["redispatch_at"] == []
-    assert state["issues"]["123"]["worker_death_at"] == []
+    entry = state["issues"]["123"]
+    assert _windowed_redispatch_at(entry, window_minutes=window_minutes) == []
+    assert _windowed_worker_death_at(entry, window_minutes=window_minutes) == []
 
-    # --- Redispatch #3: one more attempt is recorded. The head has not
-    # moved since round 2's review, so a dispatch_rework pass evaluating
-    # whether to launch a 4th attempt runs the pre-launch no-op check
-    # against exactly this one surviving redispatch.
+    time.sleep(1.1)
+
+    # --- Redispatch #3: one more attempt is recorded (appended). The head
+    # has not moved since round 2's review, so a dispatch_rework pass
+    # evaluating whether to launch a 4th attempt runs the pre-launch no-op
+    # check against exactly this one surviving (post-checkpoint) redispatch.
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
-        state["issues"]["123"]["redispatch_at"] = [ts()]
+        state["issues"]["123"]["redispatch_at"] = state["issues"]["123"].get(
+            "redispatch_at", []
+        ) + [ts()]
         save_state(paths.state_file, state)
 
     pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"

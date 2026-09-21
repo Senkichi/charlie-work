@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import ReviewDispatchConfig
+from .no_op_checkpoint import _no_op_window_start, _normalized_timestamps
 from .process_utils import is_pid_alive
 from .state import (
     _REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES,
@@ -357,16 +358,16 @@ def _windowed_redispatch_at(
     """Return redispatch timestamps within the configured window, type-safely.
 
     Normalizes ``entry["redispatch_at"]`` to a list of strings, filtering out
-    non-string entries and timestamps older than ``window_minutes`` from now.
-    This prevents crashes when the persisted value is corrupted (e.g., a string
-    instead of a list — ``list("abc")`` would yield individual characters that
-    crash ``datetime.fromisoformat``).
+    non-string entries and timestamps older than ``window_minutes`` from now
+    (or older than a no-op checkpoint on ``entry``, if later -- see
+    ``_no_op_window_start``). This prevents crashes when the persisted value
+    is corrupted (e.g., a string instead of a list — ``list("abc")`` would
+    yield individual characters that crash ``datetime.fromisoformat``).
     """
     raw = entry.get("redispatch_at")
     if not isinstance(raw, list):
         return []
-    now = datetime.now(UTC)
-    window_start = now - timedelta(minutes=window_minutes)
+    window_start = _no_op_window_start(entry, window_minutes=window_minutes)
     result: list[str] = []
     for t in raw:
         if not isinstance(t, str):
@@ -393,13 +394,13 @@ def _windowed_worker_death_at(
     have completed its work but died before pushing.  Counting deaths
     against the no-op rework cap mislabels salvageable stranded work as
     "worker produced nothing."  This helper lets the no-op cap check
-    separate death redispatches from genuine no-op redispatches.
+    separate death redispatches from genuine no-op redispatches. Also
+    respects a no-op checkpoint on ``entry`` (see ``_no_op_window_start``).
     """
     raw = entry.get("worker_death_at")
     if not isinstance(raw, list):
         return []
-    now = datetime.now(UTC)
-    window_start = now - timedelta(minutes=window_minutes)
+    window_start = _no_op_window_start(entry, window_minutes=window_minutes)
     result: list[str] = []
     for t in raw:
         if not isinstance(t, str):
@@ -415,7 +416,6 @@ def _windowed_worker_death_at(
 def _credit_worker_death(
     entry: dict[str, Any],
     *,
-    window_minutes: int,
     at: str | None = None,
 ) -> list[str]:
     """Return ``entry``'s ``worker_death_at`` timestamps with one death appended.
@@ -434,12 +434,17 @@ def _credit_worker_death(
     ``worker_death_at`` — a death that happened there was silently
     indistinguishable from a genuine no-op redispatch, understating
     ``worker_death_at`` and overstating ``no_op_count`` for every later pass.
-    Windows the existing timestamps the same way ``_windowed_worker_death_at``
-    does before appending, so the persisted list itself never grows past the
-    window regardless of which call site last wrote it.
+
+    Appends to the raw, type-normalized history (``_normalized_timestamps``)
+    rather than windowing it first (issue #1784 finding 4): the two
+    pre-existing call sites this helper replaced persisted the full
+    ``prior_deaths + [death_ts]`` array, and pre-truncating by the current
+    ``redispatch_window_minutes`` at write time silently discards
+    timestamps a later, wider window would want to see. Only the read-time
+    windowed accessors bound what a cap check considers "recent".
     """
     timestamp = at if at is not None else datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    return _windowed_worker_death_at(entry, window_minutes=window_minutes) + [timestamp]
+    return _normalized_timestamps(entry.get("worker_death_at")) + [timestamp]
 
 
 def _windowed_orphan_redispatch_at(

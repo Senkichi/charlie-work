@@ -311,26 +311,41 @@ def test_record_review_request_changes_updates_issue_status_to_rework_requested(
 def test_record_review_request_changes_resets_no_op_counters_on_head_advance(
     tmp_path: Path,
 ) -> None:
-    """Job-cannon #1320: a request_changes verdict against a head that has
-    genuinely moved since the last review is conclusive proof every
-    redispatch counted so far produced real content -- dispatch_rework's
-    own pre-routing check and the janitor gate's no-op detector both refuse
-    to route an unchanged (or sync-merge-only) head to a fresh review, so
-    reaching this branch with an advanced head means content was actually
-    reviewed. state_dispatch_rework's no-op cap sums ``redispatch_at`` over
+    """Job-cannon #1320 / issue #1784: a request_changes verdict against a
+    *patch-id* that has genuinely advanced since the last review -- from a
+    provenance that names a mechanism which actually read the diff
+    (``NO_OP_RESET_PROVENANCES``) -- is conclusive proof real content was
+    examined. state_dispatch_rework's no-op cap sums ``redispatch_at`` over
     a rolling time window with no notion of "already confirmed productive
-    by a review in between", so record_review is the single point that
-    resets those issue-level counters once a review clears them. Without
-    this reset, stale pre-checkpoint redispatch/death timestamps survive
+    by a review in between", so record_review stamps ``no_op_checkpoint_at``
+    as the single point that resets the no-op cap's *effective view* of
+    those issue-level counters once a review clears them (see
+    ``_no_op_window_start``'s docstring in dispatch_selection.py). Without
+    this checkpoint, stale pre-review redispatch/death timestamps survive
     indefinitely and can false-escalate an issue that is actually making
     progress (the reported false escalation of job-cannon issue #1320).
+
+    Unlike the pre-#1784 design, the raw ``redispatch_at``/``worker_death_at``
+    arrays are never destroyed here -- they are shared inputs to four other
+    caps (see the comment above the checkpoint stamp in
+    state_record_review.py) -- only the checkpoint is set, and only the
+    *windowed* read is expected to reflect the reset.
     """
+    from charlie_work.dispatch_selection import (
+        _windowed_redispatch_at,
+        _windowed_worker_death_at,
+    )
+    from charlie_work.janitor import _calculate_patch_id
+
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     stale_ts = "2026-01-01T00:00:00Z"
+    old_diff = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+prior"
+    old_patch_id = _calculate_patch_id(old_diff)
+    assert old_patch_id, "fixture must produce a non-empty prior patch id"
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["issues"]["123"] = {
@@ -345,12 +360,18 @@ def test_record_review_request_changes_resets_no_op_counters_on_head_advance(
             "number": 456,
             "issue_number": 123,
             "reviewed_head_sha": "sha-old",
+            "reviewed_patch_id": old_patch_id,
         }
         save_state(paths.state_file, state)
 
-    # A worker pushed genuinely new content -- the live head has moved past
-    # what was last reviewed ("sha-old").
+    # A worker pushed genuinely new content -- both the live head and the
+    # live diff (and therefore its patch-id) have moved past what was last
+    # reviewed.
     fake_gh.pr_head_shas[456] = "sha-abc123"
+    new_diff = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    fake_gh.diffs[456] = new_diff
+    new_patch_id = _calculate_patch_id(new_diff)
+    assert new_patch_id != old_patch_id, "fixture must produce a genuinely different patch id"
     result = app.record_review(
         456,
         "request_changes",
@@ -362,18 +383,95 @@ def test_record_review_request_changes_resets_no_op_counters_on_head_advance(
 
     state = load_state(paths.state_file)
     entry = state["issues"]["123"]
-    assert entry["redispatch_at"] == []
-    assert entry["worker_death_at"] == []
+    # Raw history survives untouched -- it is shared with other caps.
+    assert entry["redispatch_at"] == [stale_ts, stale_ts]
+    assert entry["worker_death_at"] == [stale_ts]
+    # But the checkpoint was stamped, so the windowed reads the no-op/
+    # death-loop caps actually consume see none of the pre-review history.
+    assert entry.get("no_op_checkpoint_at") is not None
+    assert (
+        _windowed_redispatch_at(entry, window_minutes=config.watchdog.redispatch_window_minutes)
+        == []
+    )
+    assert (
+        _windowed_worker_death_at(entry, window_minutes=config.watchdog.redispatch_window_minutes)
+        == []
+    )
+
+
+def test_record_review_ci_gate_auto_reject_does_not_reset_no_op_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """Issue #1784 BLOCKER finding 1: a ``ci_gate_auto_reject`` verdict must
+    NOT stamp a no-op checkpoint, even against a genuinely advancing
+    patch-id. ``ci_gate_auto_reject`` is a deterministic, content-blind gate
+    (CI failed) -- it is not evidence a reviewer examined the diff, and a
+    stuck worker that keeps pushing trivially-differing content into a
+    perpetually-red PR is exactly the population the no-op cap exists to
+    catch. Resetting on every such cycle (the original bug reported against
+    job-cannon #1320) made the cap unreachable for that population.
+
+    Without the fix (gating the checkpoint on ``head_advanced``/patch-id
+    alone, with no provenance check), this assertion fails: the checkpoint
+    would be set despite the auto-reject provenance.
+    """
+    from charlie_work.janitor import _calculate_patch_id
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    stale_ts = "2026-01-01T00:00:00Z"
+    old_diff = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+prior"
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [stale_ts, stale_ts],
+            "worker_death_at": [stale_ts],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "reviewed_head_sha": "sha-old",
+            "reviewed_patch_id": _calculate_patch_id(old_diff),
+        }
+        save_state(paths.state_file, state)
+
+    # A genuinely different diff lands (a new patch-id), but the verdict
+    # comes from the CI-gate auto-reject short-circuit, not a reviewer.
+    fake_gh.pr_head_shas[456] = "sha-abc123"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="CI failed",
+        verdict_provenance="ci_gate_auto_reject",
+    )
+    assert result.ok is True
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry.get("no_op_checkpoint_at") is None
+    assert entry["redispatch_at"] == [stale_ts, stale_ts]
+    assert entry["worker_death_at"] == [stale_ts]
 
 
 def test_record_review_request_changes_keeps_no_op_counters_when_head_unchanged(
     tmp_path: Path,
 ) -> None:
-    """Companion guard for the job-cannon #1320 fix: when the live head has
-    NOT moved since the last review, a request_changes verdict must NOT
-    reset the no-op counters. Resetting here would let a reviewer who
-    merely re-affirms the same stalled head erase genuine no-op evidence,
-    permanently defeating the cap for real stagnation.
+    """Companion guard for the job-cannon #1320 / issue #1784 fix: when the
+    live diff has NOT produced a new patch-id (FakeGitHub's default diff has
+    no ``@@`` hunk, so ``_calculate_patch_id`` is empty), a request_changes
+    verdict must NOT stamp a no-op checkpoint. Resetting here would let a
+    reviewer who merely re-affirms the same stalled head erase genuine
+    no-op evidence, permanently defeating the cap for real stagnation.
     """
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -413,6 +511,7 @@ def test_record_review_request_changes_keeps_no_op_counters_when_head_unchanged(
     entry = state["issues"]["123"]
     assert entry["redispatch_at"] == [stale_ts, stale_ts]
     assert entry["worker_death_at"] == [stale_ts]
+    assert entry.get("no_op_checkpoint_at") is None
 
 
 def test_record_review_persists_escalated_in_decision_file(tmp_path: Path) -> None:

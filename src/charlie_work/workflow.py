@@ -206,6 +206,7 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
     _is_review_dispatchable,
     _select_review_dispatch_candidates,
 )
+from .no_op_checkpoint import _paired_death_count  # noqa: F401  (deliberate re-export)
 from . import orchestration as _orchestration
 from .workflow_delegation import _install_delegates, discover_delegate_modules
 
@@ -2251,7 +2252,6 @@ def _detect_and_handle_orphaned_workers(
                             death_ts = utc_now()
                             entry["worker_death_at"] = _credit_worker_death(
                                 entry,
-                                window_minutes=config.watchdog.redispatch_window_minutes,
                                 at=death_ts,
                             )
                             sweep_events.append(
@@ -2404,7 +2404,6 @@ def _detect_and_handle_orphaned_workers(
                             death_ts = utc_now()
                             entry["worker_death_at"] = _credit_worker_death(
                                 entry,
-                                window_minutes=config.watchdog.redispatch_window_minutes,
                                 at=death_ts,
                             )
                             sweep_events.append(
@@ -2477,7 +2476,6 @@ def _detect_and_handle_orphaned_workers(
                                     death_ts = utc_now()
                                     entry["worker_death_at"] = _credit_worker_death(
                                         entry,
-                                        window_minutes=config.watchdog.redispatch_window_minutes,
                                         at=death_ts,
                                     )
                                     sweep_events.append(
@@ -3162,6 +3160,32 @@ VERDICT_PROVENANCE_VALUES: frozenset[str] = frozenset(
         "carried_forward",
     }
 )
+
+# Issue #1784 (job-cannon #1320 follow-up): the subset of
+# ``VERDICT_PROVENANCE_VALUES`` that constitutes proof someone -- human or
+# LLM -- actually examined content, as opposed to a deterministic gate
+# auto-rejecting without reading anything. ``record_review``'s no-op-cap
+# checkpoint reset (state_record_review.py) only fires for a
+# ``request_changes`` verdict carrying one of these:
+#   fresh_llm_review -- a live reviewer read the diff.
+#   operator_manual  -- a human explicitly ran ``charlie verdict``.
+# Deliberately excluded, and why -- fails CLOSED by design (an allowlist,
+# not a denylist: a future provenance value defaults to untrusted, not
+# trusted):
+#   ci_gate_auto_reject/test_adequacy_auto_reject -- deterministic gates;
+#     neither one is a reviewer reading the diff for genuine progress (the
+#     concrete false-escalation-inversion bug this constant fixes was a
+#     CI-red short-circuit resetting the counters on every sync-merge-only
+#     head).
+#   stranded_reconciliation -- re-labels whatever provenance the original,
+#     now-lost verdict actually had (which could itself have been one of
+#     the two gates above); this constant cannot see through that.
+#   rescue_review -- only ever recorded for an "approved" decision (see
+#     state_rescue.py), so it never reaches the request_changes branch this
+#     constant gates; omitted rather than included-but-dead.
+#   carried_forward -- never reaches record_review at all (see the mapping
+#     comment above).
+NO_OP_RESET_PROVENANCES: frozenset[str] = frozenset({"fresh_llm_review", "operator_manual"})
 
 
 class PromptOverrideDriftError(RuntimeError):
