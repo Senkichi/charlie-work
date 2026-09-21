@@ -30,16 +30,19 @@ from charlie_work.escalation import (
 )
 from charlie_work.github import label_names
 from charlie_work.labels import TransitionOutcome
+from charlie_work.state import SINK_STATUSES
 
 
 def _repair_escalated_labels(self) -> dict[str, Any]:
-    """Re-apply the ``agent:human-needed`` edge for escalated issues that lack it.
+    """Re-apply the sink-status label edge for parked issues that lack it.
 
     Issue #586 established this self-heal: the edge is applied once at
     escalation time, and if that ``transition()`` failed -- or the issue was
-    escalated by a path predating the edge -- the issue sits ``escalated`` in
-    ``state.json`` and invisible on GitHub, permanently excluded from dispatch
-    with no human-visible signal that operator action is required.
+    escalated by a path predating the edge -- the issue sits parked in
+    ``state.json`` (``status`` in ``state.SINK_STATUSES``: "escalated" or,
+    since #1642, "blocked") and invisible on GitHub, permanently excluded
+    from dispatch with no human-visible signal that operator action is
+    required.
 
     Issue #1088 is that the sweep is unreachable whenever review dispatch is
     off. Its subject set was built inside ``dispatch_reviews``'
@@ -125,9 +128,25 @@ def _repair_escalated_labels(self) -> dict[str, Any]:
             # issue's reason_class (rather than hardcoding "escalated"
             # here) is what stops this sweep from clobbering a correctly
             # operator-queued issue back to human_needed every pass.
+            #
+            # Issue #1765: the base edge name is likewise derived from the
+            # issue's own status rather than hardcoded to "escalated" -- a
+            # "blocked" verdict (#1642) owes the identical label edge (see
+            # _escalation_edge's docstring: "blocked" always passes through
+            # unchanged) and must be repairable here too, or a transient
+            # label-write failure on a blocked verdict has no self-heal path
+            # at all. Falls back to "escalated" only if the fresh read finds
+            # a status outside the sink (e.g. a concurrent unescalate raced
+            # this read) -- _escalated_label_needs_repair already re-checked
+            # this immediately above, so that fallback is unreachable in
+            # practice and exists only to keep this call well-typed.
             fresh_issue_entry = fresh.get("issues", {}).get(str(issue_number), {})
             repair_reason_class = _repair_reason_class(fresh_issue_entry)
-            edge = _escalation_edge("escalated", repair_reason_class)
+            issue_status = fresh_issue_entry.get("status")
+            edge = _escalation_edge(
+                issue_status if issue_status in SINK_STATUSES else "escalated",
+                repair_reason_class,
+            )
             expected_label = _escalation_label(self.config.labels, edge)
             issue_view = self.gh.issue_view(int(issue_number))
             if expected_label is not None and expected_label in label_names(issue_view):

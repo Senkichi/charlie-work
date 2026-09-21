@@ -17,7 +17,7 @@ import json
 from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
 from charlie_work.review_decision import record_decision
-from charlie_work.state import PASSIVE_OPEN_STATUS
+from charlie_work.state import PASSIVE_OPEN_STATUS, SINK_STATUSES
 from charlie_work.worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
@@ -261,7 +261,7 @@ def unescalate(
     *,
     dry_run: bool = False,
 ) -> _wf.CommandResult:
-    """Operator re-arm for an escalated (or janitor-blocked) PR/issue.
+    """Operator re-arm for a PR/issue parked in the human/operator sink.
 
     Escalation is deliberately terminal for every automated path (review()
     and record_review() both hard-stop on it); until this command existed
@@ -279,9 +279,20 @@ def unescalate(
       baseline and strip workflow labels (``unescalated_requeued``) so
       dispatch treats it as fresh.
 
-    Idempotent: a record that is not escalated/janitor_blocked is a no-op
-    (ok=True). ``dry_run`` computes and reports the full transition map
-    without touching state, labels, or events.
+    "Stuck" is derived from ``state.SINK_STATUSES`` (currently "escalated"
+    and "blocked" -- both map to the same ``agent:human-needed`` label edge
+    in ``labels.py``) plus the PR-only "janitor_blocked" status, rather than
+    a second hardcoded list here: issue #1765 found that "blocked" (added by
+    #1642's human-decision-marker verdict path) had been left out of this
+    predicate, so ``unescalate`` silently no-op'd (ok=True) on exactly the
+    records an operator was trying to re-arm. Deriving from the shared set
+    means a future sink status cannot be missed by this command alone.
+
+    Idempotent: a record whose status is outside the sink (and, for a PR,
+    not "janitor_blocked") is a no-op (ok=True) -- this is the legitimate,
+    tested "nothing to do" case, distinct from the #1765 bug above. ``dry_run``
+    computes and reports the full transition map without touching state,
+    labels, or events.
     """
     if pr_number is None and issue_number is None:
         return _wf.CommandResult(False, "unescalate requires --pr and/or --issue", {})
@@ -307,8 +318,9 @@ def unescalate(
         state.get("issues", {}).get(str(issue_number), {}) if issue_number is not None else {}
     )
 
-    pr_stuck = pr_state.get("status") in ("escalated", "janitor_blocked")
-    issue_stuck = issue_state.get("status") == "escalated"
+    pr_status = pr_state.get("status")
+    pr_stuck = pr_status in SINK_STATUSES or pr_status == "janitor_blocked"
+    issue_stuck = issue_state.get("status") in SINK_STATUSES
     if not pr_stuck and not issue_stuck:
         return _wf.CommandResult(
             True,

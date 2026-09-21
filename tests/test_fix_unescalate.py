@@ -208,6 +208,53 @@ def test_unescalate_janitor_blocked_pr_uses_same_rearm_path(tmp_path: Path) -> N
     assert (123, app.config.labels.pr_open) in app.gh.labels_added
 
 
+def test_unescalate_blocked_pr_resets_and_relabels(tmp_path: Path) -> None:
+    """Issue #1765: a "blocked" verdict (#1642's human-decision-marker path)
+    must be re-armable exactly like "escalated" -- both map to the identical
+    ``agent:human-needed`` label edge in labels.py. Before the fix,
+    ``unescalate``'s stuck predicate only recognized "escalated"/
+    "janitor_blocked", so this exact fixture silently no-op'd (ok=True,
+    changed=False) instead of re-arming the PR/issue.
+    """
+    app = _app(tmp_path)
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "blocked",
+            "review_dispatch_attempt_count": 2,
+            "escalation_reason": "review_blocked",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "blocked",
+            "escalation_reason": "review_blocked",
+            "reason_class": "judgment",
+            "label_error": {"edge": "blocked", "outcome": "partial_failure"},
+        }
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(pr_number=456)
+
+    assert result.ok is True
+    assert result.data["changed"] is True
+    state = load_state(app.paths.state_file)
+    pr_entry = state["prs"]["456"]
+    assert pr_entry["status"] == PASSIVE_OPEN_STATUS
+    assert pr_entry["review_dispatch_attempt_count"] == 0
+    assert "escalation_reason" not in pr_entry
+
+    issue_entry = state["issues"]["123"]
+    assert issue_entry["status"] == PASSIVE_OPEN_STATUS
+    for stale_field in ("escalation_reason", "label_error"):
+        assert stale_field not in issue_entry, stale_field
+
+    assert (123, app.config.labels.pr_open) in app.gh.labels_added
+    assert (123, app.config.labels.human_needed) in app.gh.labels_removed
+    assert len(_events(state, "unescalate")) == 1
+
+
 def test_unescalate_merged_pr_normalizes_status_without_label_edge(tmp_path: Path) -> None:
     app = _app(tmp_path)
     app.gh.prs[0]["state"] = "MERGED"

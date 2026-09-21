@@ -653,6 +653,98 @@ def test_escalated_label_repair_runs_with_review_dispatch_disabled(tmp_path: Pat
     assert repair_events[0]["payload"]["issue_numbers"] == [123]
 
 
+def test_escalated_label_repair_covers_blocked_status(tmp_path: Path) -> None:
+    """Issue #1765: a "blocked" verdict (#1642) owes the identical
+    ``agent:human-needed`` label edge an "escalated" status owes, and must be
+    repairable by this same self-heal sweep if the original ``transition()``
+    failed. Before the fix, ``_collect_escalated_label_subjects`` and
+    ``_escalated_label_needs_repair`` both gated on a bare
+    ``status == "escalated"``, so a "blocked" issue with a missing label had
+    no self-heal path at all -- exactly the swole PR #268 / issue #194 gap
+    (blocked 2.5 days, label never applied, no staleness alert).
+    """
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "blocked",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "blocked",
+            "reason_class": "judgment",
+            # label_error absent: the original transition() in
+            # state_record_review.py's "blocked" branch never persisted it
+            # (issue #1765) -- this is the "never attempted" arm.
+        }
+        save_state(paths.state_file, state)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["label_error"] is None
+    assert result.data["escalated_labels_repaired"]["issue_numbers"] == [123]
+    repair_events = _events(state, "escalated_label_repaired")
+    assert len(repair_events) == 1
+    assert repair_events[0]["payload"]["issue_numbers"] == [123]
+
+
+def test_collect_escalated_label_subjects_includes_blocked_status() -> None:
+    """Direct unit test for the #1765 widening: a "blocked" PR/issue must be
+    collected as a subject, not just "escalated" ones."""
+    state = {"prs": {"456": {"status": "blocked", "issue_number": 123}}, "issues": {}}
+    assert _collect_escalated_label_subjects(state) == [(456, 123)]
+
+    state = {"prs": {}, "issues": {"123": {"status": "blocked"}}}
+    assert _collect_escalated_label_subjects(state) == [(None, 123)]
+
+
+class _FailingAddGitHub(FakeGitHub):
+    """A FakeGitHub whose ``add_issue_label`` always reports failure, so the
+    self-heal sweep's ``transition()`` call returns PARTIAL_FAILURE and
+    persists a ``label_error`` dict -- the only place the repair's ``edge``
+    choice is directly observable, since "escalated" and "blocked" happen to
+    resolve to the identical label set on success (labels.py's edges)."""
+
+    def add_issue_label(self, number: int, label: str) -> bool:
+        self.labels_added.append((number, label))
+        return False
+
+
+def test_escalated_label_repair_records_the_actual_status_as_the_edge(
+    tmp_path: Path,
+) -> None:
+    """Issue #1765: the repaired edge name persisted in ``label_error`` must
+    reflect the issue's own status ("blocked"), not a hardcoded "escalated".
+    The two edges apply the identical label on success, which is exactly why
+    this must be checked via a forced failure -- a success-path assertion
+    cannot distinguish "derived from status" from "hardcoded to escalated".
+    """
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _FailingAddGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {"number": 456, "issue_number": 123, "status": "blocked"}
+        state["issues"]["123"] = {"number": 123, "status": "blocked", "reason_class": "judgment"}
+        save_state(paths.state_file, state)
+
+    app.dispatch_reviews()
+
+    state = load_state(paths.state_file)
+    label_error = state["issues"]["123"]["label_error"]
+    assert label_error is not None
+    assert label_error["edge"] == "blocked"
+
+
 def test_escalated_label_repair_is_bounded_per_pass(tmp_path: Path) -> None:
     """The per-pass cap defers the overflow rather than either starving forever
     or blowing through the whole backlog in one pass. Five escalated subjects

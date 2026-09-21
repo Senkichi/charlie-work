@@ -66,6 +66,7 @@ from .state import (
     ESCALATION_REASON_CLASSES,
     ORCHESTRATOR_OWNED_ISSUE_STATUSES,
     PASSIVE_OPEN_STATUS,
+    SINK_STATUSES,
     append_event,
     is_claim_stale,
     set_throttled_until,
@@ -225,7 +226,7 @@ DORMANT_CONVERGENCE_EXCLUDED_STATUSES: frozenset[str] = frozenset({"escalated"})
 #
 # "escalated" is deliberately NOT a member, and its absence is load-bearing
 # even though it is currently unobservable. Escalated issues never reach this
-# predicate at all -- the `tracked_status == "escalated"` branch above
+# predicate at all -- the `tracked_status in SINK_STATUSES` branch above
 # converges labels from state and `continue`s, and its comment names this rule
 # as the thing it is protecting against ("the zero-label shape the open-PR
 # self-heal below would otherwise silently re-arm"). Listing it as STALE would
@@ -1938,13 +1939,14 @@ def detect_drift(
         terminal_present = issue_labels & labels_cfg.terminal
 
         # Escalation is terminal-until-human, and state.json is its ground
-        # truth: every escalation call site writes status="escalated" first,
-        # then applies the human_needed label as a separate step, so a crash
-        # or label-API failure between the two leaves an escalated issue
-        # with no workflow labels at all -- exactly the zero-label shape the
-        # open-PR self-heal below would otherwise silently re-arm (and the
-        # no-open-PR repair would relabel dispatchable). Converge the labels
-        # from state instead, and never self-heal an escalated issue; only
+        # truth: every escalation call site writes status="escalated" (or,
+        # since #1642, "blocked") first, then applies the human_needed label
+        # as a separate step, so a crash or label-API failure between the two
+        # leaves a parked issue (status in SINK_STATUSES) with no workflow
+        # labels at all -- exactly the zero-label shape the open-PR self-heal
+        # below would otherwise silently re-arm (and the no-open-PR repair
+        # would relabel dispatchable). Converge the labels from state
+        # instead, and never self-heal a parked issue; only
         # `charlie unescalate` re-enters the machine.
         tracked_entry = state.get("issues", {}).get(str(issue_number))
         tracked_status = tracked_entry.get("status") if isinstance(tracked_entry, dict) else None
@@ -1956,7 +1958,7 @@ def detect_drift(
         # every path that can apply the label (``escalated``, ``blocked``,
         # ``redispatch_escalated``, ``merged_pr_mention_flagged``, or a
         # manual add with no state.json entry at all), and placed before the
-        # ``tracked_status == "escalated"`` branch below because that branch
+        # ``tracked_status in SINK_STATUSES`` branch below because that branch
         # unconditionally ``continue``s -- inserting after it would silently
         # skip the common case.
         #
@@ -2048,18 +2050,31 @@ def detect_drift(
                     )
                 )
 
-        if tracked_status == "escalated" and _issue_state(issue) == "OPEN":
+        if tracked_status in SINK_STATUSES and _issue_state(issue) == "OPEN":
             # Issue #1266: a mechanical escalation's correct label is
             # operator_queue, not human_needed -- deriving the target from
             # the issue's reason_class (via the same helpers the label-repair
             # self-heal sweep uses) is what stops this convergence check from
             # clobbering a correctly operator-queued issue back to
             # human_needed on every reconcile pass.
+            #
+            # Issue #1765: the gate above and the edge derived here both
+            # cover every member of ``state.SINK_STATUSES`` ("escalated" and
+            # "blocked"), not just "escalated" -- a "blocked" verdict (#1642)
+            # owes the identical human_needed label edge and, before this
+            # fix, had no reconcile-side repair at all if the original
+            # transition() failed: swole PR #268 / issue #194 sat "blocked"
+            # in state.json for 2.5 days with no human_needed label and thus
+            # no staleness alert (the #947 check above is correctly
+            # label-gated, so an unlabeled issue is invisible to it too).
+            # ``_escalation_edge`` accepts "blocked" and passes it through
+            # unchanged for every reason_class (see its docstring), so
+            # passing the actual tracked status through here is safe.
             repair_reason_class = _repair_reason_class(
                 tracked_entry if isinstance(tracked_entry, dict) else None
             )
             expected_label = _escalation_label(
-                labels_cfg, _escalation_edge("escalated", repair_reason_class)
+                labels_cfg, _escalation_edge(tracked_status, repair_reason_class)
             )
             needs_expected_label = (
                 expected_label is not None and expected_label not in issue_labels
@@ -2078,7 +2093,7 @@ def detect_drift(
                         issue_number=issue_number,
                         pr_number=None,
                         detail=(
-                            f"issue #{issue_number} has status 'escalated' in state but "
+                            f"issue #{issue_number} has status {tracked_status!r} in state but "
                             f"its labels {sorted(issue_labels)} do not reflect it; "
                             "converging labels from state ground truth"
                         ),

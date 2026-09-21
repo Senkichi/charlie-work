@@ -106,6 +106,22 @@ ORCHESTRATOR_OWNED_ISSUE_STATUSES: frozenset[str] = (
     VALID_ISSUE_STATUSES - EXTERNALLY_DERIVED_ISSUE_STATUSES
 )
 
+# The two statuses that park an issue (or its bound PR) in the
+# ``agent:human-needed`` sink awaiting an operator decision -- the in-state
+# mirror of labels.py's ``_edges()`` table, where "escalated" and "blocked"
+# both map to the identical human_needed label edge. Originally defined only
+# as workflow.py's private ``_SINK_STATUSES`` for ``sink_census()``; promoted
+# here as the single, importable source of truth after issue #1765 found
+# three independent call sites -- ``unescalate()``'s stuck predicate, the
+# dispatch-time label self-heal sweep (``escalation._collect_escalated_label_
+# subjects``/``_escalated_label_needs_repair``), and reconcile's
+# ``escalated_labels_converged`` drift check -- each hardcoding a
+# ``== "escalated"`` check that silently missed "blocked" the moment #1642
+# introduced it. Every consumer that needs "is this stuck in the human/
+# operator sink" must derive from this one set, so a future status added to
+# the sink cannot again be missed by some but not all of them.
+SINK_STATUSES: frozenset[str] = frozenset({"escalated", "blocked"})
+
 # Issue #955: this used to be the literal string "reviewing" -- the same
 # value ``review()`` writes (guarded by ``review_dispatch.enabled``, see
 # workflow.py's two ``dispatch_disabled`` call sites) to mean "a fresh review
