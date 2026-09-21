@@ -272,6 +272,10 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # comment is the signal, not a hold -- but a repeating burst on one issue
         # means its citations keep rotting faster than anyone corrects them.
         "dispatch_citation_drift_flagged": "warning",
+        # Issues #1756/#1758: an operator-applied override label skipped both
+        # cross-repo gates for this issue. Warning, not info: a safety gate was
+        # deliberately bypassed, and the dispatch that follows is unguarded.
+        "dispatch_cross_repo_gate_overridden": "warning",
         "dispatch_merged_pr_mention_flagged": "warning",
         "dispatch_merged_pr_references_closed": "warning",
         "dispatch_skip_blocked": "warning",

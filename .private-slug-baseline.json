@@ -10,11 +10,12 @@
     "scripts/heartbeat-suppressions.yaml": 1,
     "src/charlie_work/ci_fleet_anchor.py": 3,
     "src/charlie_work/cli.py": 2,
+    "src/charlie_work/cross_repo_gate.py": 4,
     "src/charlie_work/fleet_dispatch.py": 2,
     "src/charlie_work/pr_unlinked_visibility.py": 1,
     "src/charlie_work/venv_anchor.py": 1,
     "src/charlie_work/worktree.py": 3,
-    "tests/_dispatch_fixtures.py": 2,
+    "tests/_dispatch_fixtures.py": 1,
     "tests/_reconcile_fixtures.py": 1,
     "tests/test_backfill_stale_rework_briefs.py": 2,
     "tests/test_capacity_starvation_escalation.py": 2,
@@ -28,8 +29,10 @@
     "tests/test_citation_check.py": 1,
     "tests/test_cli_bootstrap.py": 5,
     "tests/test_cli_runners_allocate.py": 1,
-    "tests/test_cross_repo_gate.py": 5,
+    "tests/test_cross_repo_gate.py": 9,
     "tests/test_cross_repo_gate_shorthand_citations.py": 5,
+    "tests/test_cross_repo_gate_sibling_repo.py": 20,
+    "tests/test_cross_repo_gate_swole_regression.py": 1,
     "tests/test_cross_repo_scope_gate.py": 26,
     "tests/test_deescalation.py": 1,
     "tests/test_doctor_layout.py": 2,
@@ -60,5 +63,5 @@
     "tests/test_worker_declared_blocked.py": 2,
     "tests/test_worktree.py": 11
   },
-  "total": 180
+  "total": 208
 }

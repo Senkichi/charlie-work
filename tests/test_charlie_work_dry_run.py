@@ -7,7 +7,11 @@ Track-1 wave 8/8).
 from __future__ import annotations
 
 from pathlib import Path
-from _dispatch_fixtures import _cross_repo_issue_body
+from _dispatch_fixtures import (
+    _cross_repo_issue_body,
+    _write_fleet_registry,
+    _write_sibling_repo_file,
+)
 from _fakes_github import FakeGitHub
 from charlie_work.config import (
     ClaudeCodeConfig,
@@ -356,12 +360,24 @@ def test_dry_run_dispatch_cross_repo_gate_reports_without_mutating(tmp_path: Pat
     Drives the dry-run branch of ``_dispatch_impl`` (the path that populates
     ``cross_repo_escalated_issue_numbers`` in the planning payload), not
     ``cross_repo_gate`` in isolation.
+
+    Issues #1756-#1758 (positive-evidence redesign): also the call-site
+    threading regression test for the dry-run branch's
+    ``managed_repo_roots``/``dispatching_repo_name`` -- without a registered
+    sibling repo that actually contains the missing path, the gate abstains
+    instead of escalating and ``selected_count`` would go non-zero.
     """
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.prs[0]["state"] = "CLOSED"
     fake_gh.issues[0]["body"] = _cross_repo_issue_body()
+    sibling_root = tmp_path / "sibling-ci-runners"
+    _write_sibling_repo_file(sibling_root, "src/ci_fleet/suite_coverage.py")
+    _write_fleet_registry(
+        tmp_path / "fleet",
+        {"owner/ci-runners": {"repo_root": str(sibling_root)}},
+    )
     app = OrchestratorApp(
         repo_root=tmp_path,
         paths=paths,
@@ -381,6 +397,56 @@ def test_dry_run_dispatch_cross_repo_gate_reports_without_mutating(tmp_path: Pat
 
     # Dry-run must not mutate labels, state, or events.
     assert (123, "agent:human-needed") not in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    assert state["issues"] == {}
+    assert state["events"] == []
+
+
+def test_dry_run_cross_repo_override_label_skips_both_gates(tmp_path: Path) -> None:
+    """Review finding 4 (dry-run): an issue carrying the cross-repo override
+    label is reported as dispatch-planned, not escalated, in the dry-run
+    payload -- the override short-circuits both gates in the dry-run branch
+    too, mirroring the real-dispatch override valve
+    (``test_dispatch_cross_repo_override_label_skips_both_gates`` in
+    ``test_charlie_work_dispatch_blockers.py``).
+
+    Uses the SAME issue body and sibling registration as
+    ``test_dry_run_dispatch_cross_repo_gate_reports_without_mutating`` --
+    which reports the issue as escalated without the label -- so this test
+    isolates the label as what changes the outcome.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    fake_gh.issues[0]["body"] = _cross_repo_issue_body()
+    fake_gh.issues[0]["labels"].append({"name": config.labels.cross_repo_override})
+    sibling_root = tmp_path / "sibling-ci-runners"
+    _write_sibling_repo_file(sibling_root, "src/ci_fleet/suite_coverage.py")
+    _write_fleet_registry(
+        tmp_path / "fleet",
+        {"owner/ci-runners": {"repo_root": str(sibling_root)}},
+    )
+    app = OrchestratorApp(
+        repo_root=tmp_path,
+        paths=paths,
+        config=config,
+        gh=fake_gh,
+        dry_run=True,
+    )
+
+    result = app.dispatch()
+
+    # The issue is reported as override-planned, not escalated.
+    assert result.ok is True
+    assert result.data["cross_repo_escalated_issue_numbers"] == []
+    assert result.data["cross_repo_override_issue_numbers"] == [123]
+    assert result.data["selected_count"] == 1
+    session_issue_numbers = {session["issue_number"] for session in result.data["sessions"]}
+    assert 123 in session_issue_numbers
+
+    # Dry-run must not mutate labels, state, or events -- unchanged by the
+    # override valve.
     state = load_state(paths.state_file)
     assert state["issues"] == {}
     assert state["events"] == []

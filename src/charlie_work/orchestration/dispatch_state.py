@@ -77,7 +77,8 @@ from charlie_work.dispatch_selection import (
 )
 from charlie_work.env_sanitize import worker_github_token_findings
 from charlie_work.escalation import _escalate_issue, _escalation_edge
-from charlie_work.fleet_registry import managed_repo_names
+from charlie_work.fleet_registry import managed_repo_names, managed_repo_roots
+from charlie_work.github import label_names
 from charlie_work.labels import TransitionOutcome
 from charlie_work.state import (
     clear_escalation,
@@ -496,30 +497,49 @@ def _dispatch_impl(
         # be escalated without mutating state or labels.
         # Issue #1244: dry-run cross-repo *scope* gate — report issues whose
         # title names another managed repo.
+        # Issues #1756-#1758: the gate's decision rule needs the fleet's
+        # managed repo roots (never a hardcoded repo list) to check a
+        # missing path for positive sibling-repo evidence — see
+        # cross_repo_gate.py's "Positive-evidence redesign" docstring.
         dry_run_cross_repo_escalated: dict[int, str] = {}
+        dry_run_cross_repo_overridden: list[int] = []
         fleet_repos = managed_repo_names(self.fleet_dir_override)
+        fleet_repo_roots = managed_repo_roots(self.fleet_dir_override)
         dispatching_repo_name = _dispatching_repo_name(self.gh, self.repo_root)
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
             branch_name = self._branch_name(full_issue)
 
-            # Pre-flight gate: report cross-repo targets without escalating.
-            gate_result = cross_repo_gate(str(full_issue.get("body") or ""), self.repo_root)
-            if not gate_result.passed:
-                dry_run_cross_repo_escalated[issue_number] = gate_result.reason
-                continue
+            # Issue #1758's override valve: an issue carrying the cross-repo
+            # override label skips BOTH gates entirely — the operator's
+            # one-step recovery for a residual false positive, applied
+            # before either gate runs so it also short-circuits the scope
+            # gate, not just the file-path gate.
+            if self.config.labels.cross_repo_override in label_names(full_issue):
+                dry_run_cross_repo_overridden.append(issue_number)
+            else:
+                # Pre-flight gate: report cross-repo targets without escalating.
+                gate_result = cross_repo_gate(
+                    str(full_issue.get("body") or ""),
+                    self.repo_root,
+                    fleet_repo_roots,
+                    dispatching_repo_name,
+                )
+                if not gate_result.passed:
+                    dry_run_cross_repo_escalated[issue_number] = gate_result.reason
+                    continue
 
-            # Pre-flight scope gate: report cross-repo scope targets.
-            scope_result = cross_repo_scope_gate(
-                str(full_issue.get("title") or ""),
-                str(full_issue.get("body") or ""),
-                dispatching_repo_name,
-                fleet_repos,
-            )
-            if not scope_result.passed:
-                dry_run_cross_repo_escalated[issue_number] = scope_result.reason
-                continue
+                # Pre-flight scope gate: report cross-repo scope targets.
+                scope_result = cross_repo_scope_gate(
+                    str(full_issue.get("title") or ""),
+                    str(full_issue.get("body") or ""),
+                    dispatching_repo_name,
+                    fleet_repos,
+                )
+                if not scope_result.passed:
+                    dry_run_cross_repo_escalated[issue_number] = scope_result.reason
+                    continue
 
             prompt_path = self._write_worker_prompt(full_issue, dry_run=True)
 
@@ -554,6 +574,7 @@ def _dispatch_impl(
             "merged_pr_mention_rearmed_issue_numbers": sorted(rearmed_mention_issues),
             "label_errors": [],
             "cross_repo_escalated_issue_numbers": sorted(dry_run_cross_repo_escalated),
+            "cross_repo_override_issue_numbers": sorted(dry_run_cross_repo_overridden),
             "sessions": [asdict(request) for request in session_requests],
             "dispatch_results": [],
             "blocked": [
@@ -1062,32 +1083,51 @@ def _dispatch_impl(
     # escalated too — their deliverables live in that repo, not this one,
     # so the dispatching lane can never finalize them.  The managed-repo
     # set is derived from the fleet registry, never a hardcoded list.
+    # Issues #1756-#1758: the gate's decision rule needs the fleet's managed
+    # repo roots (never a hardcoded repo list) to check a missing path for
+    # positive sibling-repo evidence — see cross_repo_gate.py's
+    # "Positive-evidence redesign" docstring.
     cross_repo_escalated: dict[int, CrossRepoGateResult] = {}
+    cross_repo_overridden: list[int] = []
     fleet_repos = managed_repo_names(self.fleet_dir_override)
+    fleet_repo_roots = managed_repo_roots(self.fleet_dir_override)
     dispatching_repo_name = _dispatching_repo_name(self.gh, self.repo_root)
     for issue_number in selected_issue_numbers:
         full_issue = self.gh.issue_view(issue_number)
         full_issues[issue_number] = full_issue
         branch_name = self._branch_name(full_issue)
 
-        # Pre-flight gate: refuse to dispatch when the issue's referenced
-        # code does not exist in this repo (issue #1010).
-        gate_result = cross_repo_gate(str(full_issue.get("body") or ""), self.repo_root)
-        if not gate_result.passed:
-            cross_repo_escalated[issue_number] = gate_result
-            continue
+        # Issue #1758's override valve: an issue carrying the cross-repo
+        # override label skips BOTH gates entirely — the operator's
+        # one-step recovery for a residual false positive, applied before
+        # either gate runs so it also short-circuits the scope gate, not
+        # just the file-path gate.
+        if self.config.labels.cross_repo_override in label_names(full_issue):
+            cross_repo_overridden.append(issue_number)
+        else:
+            # Pre-flight gate: refuse to dispatch when the issue's referenced
+            # code does not exist in this repo (issue #1010).
+            gate_result = cross_repo_gate(
+                str(full_issue.get("body") or ""),
+                self.repo_root,
+                fleet_repo_roots,
+                dispatching_repo_name,
+            )
+            if not gate_result.passed:
+                cross_repo_escalated[issue_number] = gate_result
+                continue
 
-        # Pre-flight scope gate: refuse to dispatch when the issue's title
-        # names another managed repo (issue #1244).
-        scope_result = cross_repo_scope_gate(
-            str(full_issue.get("title") or ""),
-            str(full_issue.get("body") or ""),
-            dispatching_repo_name,
-            fleet_repos,
-        )
-        if not scope_result.passed:
-            cross_repo_escalated[issue_number] = scope_result
-            continue
+            # Pre-flight scope gate: refuse to dispatch when the issue's title
+            # names another managed repo (issue #1244).
+            scope_result = cross_repo_scope_gate(
+                str(full_issue.get("title") or ""),
+                str(full_issue.get("body") or ""),
+                dispatching_repo_name,
+                fleet_repos,
+            )
+            if not scope_result.passed:
+                cross_repo_escalated[issue_number] = scope_result
+                continue
 
         prompt_path = self._write_worker_prompt(full_issue)
 
@@ -1599,6 +1639,12 @@ def _dispatch_impl(
             # are empty by construction -- the scope gate does not deal
             # in file paths -- so the fields are present but empty,
             # which is accurate.
+            # Issues #1756-#1758: also surface ``found_in_repo`` -- the
+            # single sibling repo the positive-evidence check matched --
+            # so the event alone turns a blind "go check other repos"
+            # triage action into a one-glance fix. ``None`` for a
+            # cross_repo_scope_gate escalation, which has no notion of a
+            # missing path's owning repo.
             state = _wf.append_event(
                 state,
                 "dispatch_cross_repo_escalated",
@@ -1607,6 +1653,7 @@ def _dispatch_impl(
                     "reason": reason,
                     "neutral_paths": list(gate_result.neutral_paths),
                     "missing_paths": list(gate_result.missing_paths),
+                    "found_in_repo": gate_result.found_in_repo,
                 },
                 state_path=self.paths.state_file,
             )
@@ -1633,6 +1680,20 @@ def _dispatch_impl(
                 label_errors.append(issue_number)
                 label_error_failures[issue_number] = _wf._label_error_reason(label_error)
                 _wf.save_state(self.paths.state_file, state)
+
+        # Issue #1758: audit event for the cross-repo gate override valve.
+        # The issue already skipped both gates during the network-call loop
+        # above and proceeded through the normal dispatch path unchanged —
+        # this only records that the override fired, it does not escalate,
+        # transition labels, or otherwise alter dispatch outcome.
+        for issue_number in sorted(cross_repo_overridden):
+            state = _wf.append_event(
+                state,
+                "dispatch_cross_repo_gate_overridden",
+                {"issue_number": issue_number},
+                state_path=self.paths.state_file,
+            )
+            _wf.save_state(self.paths.state_file, state)
 
         # Build dispatch-alert transitions for the notify digest. Averted
         # redispatches surface as DISPATCH_AVERTED; a later successful or
@@ -1721,6 +1782,7 @@ def _dispatch_impl(
                 "failed_issue_numbers": sorted(failed_issue_numbers),
                 "foreign_writer_issue_numbers": sorted(foreign_writer_issue_numbers),
                 "cross_repo_escalated_issue_numbers": sorted(cross_repo_escalated),
+                "cross_repo_override_issue_numbers": sorted(cross_repo_overridden),
                 "label_errors": sorted(label_errors),
                 "skipped_issue_numbers": skipped_issue_numbers,
                 "deferred_by_concurrency": deferred_by_concurrency,
@@ -1778,6 +1840,8 @@ def _dispatch_impl(
         )
     if cross_repo_escalated:
         message += f" (cross-repo escalated: {sorted(cross_repo_escalated)})"
+    if cross_repo_overridden:
+        message += f" (cross-repo gate overridden: {sorted(cross_repo_overridden)})"
     data = {
         "selected_count": len(successful_issue_numbers),
         "attempted_count": len(session_requests),
@@ -1788,6 +1852,7 @@ def _dispatch_impl(
         "phantom_live_worker_issue_numbers": sorted(phantom_live_worker_issue_numbers),
         "foreign_writer_count": len(foreign_writer_issue_numbers),
         "cross_repo_escalated_issue_numbers": sorted(cross_repo_escalated),
+        "cross_repo_override_issue_numbers": sorted(cross_repo_overridden),
         "skipped_issue_numbers": skipped_issue_numbers,
         "deferred_by_concurrency": deferred_by_concurrency,
         "deferred_by_concurrency_count": deferred_by_concurrency_count,
