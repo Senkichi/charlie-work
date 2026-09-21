@@ -81,6 +81,7 @@ from charlie_work.fleet_registry import managed_repo_names
 from charlie_work.labels import TransitionOutcome
 from charlie_work.state import (
     arm_dispatch_stale_alert,
+    backfill_dispatch_baseline,
     clear_dispatch_stale_alert,
     clear_escalation,
     clear_escalation_on_issue_prs,
@@ -1721,6 +1722,13 @@ def _dispatch_impl(
             state = record_non_empty_dispatch(
                 state, dispatch_cadence_now_iso, sorted(successful_issue_numbers)
             )
+        # Issue #1769 review follow-up: a repo that was already mid-stall (or
+        # already existed) before the durable marker was introduced never
+        # takes the write path above on its own -- a stalled repo dispatches
+        # nothing by definition. One-time recovery from events.db history so
+        # that case does not report `no_baseline` forever. No-ops instantly
+        # once a baseline exists or a prior attempt already ran.
+        state = backfill_dispatch_baseline(state, self.paths.state_file)
         dispatch_staleness = check_dispatch_staleness(
             state,
             self.config.dispatch,
@@ -1728,6 +1736,14 @@ def _dispatch_impl(
             recent_issue_numbers=sorted(successful_issue_numbers),
             now=dispatch_cadence_now,
         )
+        # `should_emit` is this method's own control-flow answer, not a fact
+        # worth persisting: it is `True` on every `dispatch_stale` row by
+        # construction (the event is only ever recorded when it's `True`),
+        # so embedding it in the payload/ring entry can never discriminate
+        # anything a reader doesn't already know (review finding #7).
+        dispatch_staleness_for_event = {
+            key: value for key, value in dispatch_staleness.items() if key != "should_emit"
+        }
         if dispatch_staleness["stale"]:
             # Issue #1769: edge-triggered + bounded low-rate reminder, not
             # an unconditional re-fire every pass the condition holds (the
@@ -1735,12 +1751,14 @@ def _dispatch_impl(
             # encodes both the stall-onset edge and the reminder cadence.
             if dispatch_staleness["should_emit"]:
                 state = arm_dispatch_stale_alert(state, dispatch_cadence_now_iso)
-                state = self._record_event(state, "dispatch_stale", dispatch_staleness)
+                state = self._record_event(state, "dispatch_stale", dispatch_staleness_for_event)
         else:
-            # Resolved (for whatever reason) -- reset the alert marker so
-            # the next stall onset is a fresh edge, not throttled by a
-            # previous unrelated episode's reminder cadence.
-            state = clear_dispatch_stale_alert(state)
+            # Reset the alert marker only on a genuine resolution -- an
+            # "unknown" reading (backlog_not_observed, no_baseline,
+            # threshold_disabled) must not be mistaken for one, or a
+            # transient blip resets the edge and the very next real
+            # observation re-fires immediately (review finding #4).
+            state = clear_dispatch_stale_alert(state, reason=dispatch_staleness["reason"])
         state = _wf.append_event(
             state,
             "dispatch",
@@ -1765,8 +1783,10 @@ def _dispatch_impl(
                 # this one describes the backlog that query cannot see.
                 "backlog_reachability": backlog_reachability,
                 # Issue #946: cadence-staleness diagnostic, always present so
-                # the capped state.json ring carries the signal.
-                "dispatch_staleness": dispatch_staleness,
+                # the capped state.json ring carries the signal. Uses the
+                # `should_emit`-stripped copy (review finding #7): the
+                # control-flow field carries no information here either.
+                "dispatch_staleness": dispatch_staleness_for_event,
                 # Issue #1005: the capacity axis. backlog_reachability answers
                 # "why zero" for supply (which issues exist/are reachable);
                 # this answers it for capacity (whether there was a slot to put

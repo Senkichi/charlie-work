@@ -210,10 +210,25 @@ def _latest_non_empty_dispatch(state: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _parse_iso_ts(ts: str) -> datetime | None:
+    """Parse an ISO-8601 timestamp, rejecting anything that is not tz-aware.
+
+    Review follow-up (issue #1769): a parsed-but-timezone-naive datetime used
+    to be returned as-is, and the caller's ``now - last_ts`` subtraction
+    against an aware ``now`` raises an uncaught ``TypeError``. Every writer
+    of this field in this codebase stamps a trailing ``Z``
+    (``utc_now()``/the ``dispatch_cadence_now_iso`` formula), so a naive
+    value here only ever comes from external corruption (a hand-edited
+    ``state.json``, a merge, a future writer that forgets the suffix) --
+    treated the same as an unparseable string: ``None``, which the caller
+    already maps to the safe ``no_baseline`` reason rather than crashing.
+    """
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
 
 
 def check_dispatch_staleness(
@@ -258,12 +273,17 @@ def check_dispatch_staleness(
     Issue #1769: ``should_emit`` answers a second, orthogonal question --
     given that ``stale`` is true, should the caller actually record a
     ``dispatch_stale`` event *this pass*? It is edge-triggered (true on
-    stall onset) plus a bounded low-rate reminder (true again once
-    ``config.dispatch_staleness_minutes`` have elapsed since the last
-    emitted alert), reusing the staleness threshold itself as the reminder
-    cadence rather than introducing a second config knob for it. It is
-    always ``False`` when ``stale`` is ``False`` -- there is nothing to
-    (re-)emit for a healthy pass.
+    stall onset) plus a bounded low-rate reminder (true again once the
+    reminder interval has elapsed since the last emitted alert), reusing
+    the staleness threshold itself as the reminder cadence -- floored at a
+    fixed 4 hours -- rather than introducing a second config knob for it.
+    The floor matters because ``dispatch_staleness_minutes`` is an
+    operator-tunable *detection* threshold (validated only to be ``>= 0``):
+    a repo configured for fast detection (e.g. 15 minutes) would otherwise
+    also get a 15-minute re-alert cadence, silently reintroducing
+    near-per-pass spam for the exact condition this section exists to
+    bound. It is always ``False`` when ``stale`` is ``False`` -- there is
+    nothing to (re-)emit for a healthy pass.
     """
     result: dict[str, Any] = {
         "stale": False,
@@ -355,9 +375,16 @@ def check_dispatch_staleness(
         # Issue #1769 section 6 policy: edge-triggered + bounded low-rate
         # reminder, not an unconditional re-fire every pass the condition
         # holds. Reuses the staleness threshold itself as the reminder
-        # interval (see docstring) rather than a second config knob.
+        # interval (see docstring), floored at 4 hours (review finding #8)
+        # so a fast detection threshold cannot also mean a fast re-alert
+        # cadence -- rather than a second config knob. A local, not
+        # module-level, constant: this file is a verbatim #1283 Phase-A
+        # extraction whose top-level names are pinned to exactly the moved
+        # function set by tests/test_ci_findings_split.py.
+        min_reminder_minutes = 240
+        reminder_minutes = max(threshold_minutes, min_reminder_minutes)
         result["should_emit"] = is_dispatch_stale_alert_due(
-            state, now=now, reminder_minutes=threshold_minutes
+            state, now=now, reminder_minutes=reminder_minutes
         )
     else:
         result["reason"] = "within_threshold"

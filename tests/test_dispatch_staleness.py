@@ -30,7 +30,11 @@ from typing import Any
 
 from charlie_work.config import DispatchConfig
 from charlie_work.instrumentation import log_event, query_events
-from charlie_work.state import arm_dispatch_stale_alert, record_non_empty_dispatch
+from charlie_work.state import (
+    arm_dispatch_stale_alert,
+    backfill_dispatch_baseline,
+    record_non_empty_dispatch,
+)
 from charlie_work.workflow import check_dispatch_staleness
 
 
@@ -281,16 +285,25 @@ def test_stale_when_dispatchable_issues_exist_despite_some_blocked() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_stale_survives_far_more_passes_than_the_old_100_row_lookback() -> None:
+def test_stale_survives_far_more_passes_than_the_old_100_row_lookback(tmp_path: Path) -> None:
     """Reproduces the live charlie-work scenario from issue #1769: a real
     non-empty dispatch, followed by many more than 100 subsequent empty
     dispatch passes, must still report ``stale: True`` (never
-    ``no_baseline``) once the threshold has elapsed. The old events.db
-    ``limit=100`` scan would have scrolled the real baseline out of its
-    window well before pass 100; the durable marker cannot, because nothing
-    but a genuinely non-empty dispatch pass ever rewrites it, and none of
-    the simulated passes below are non-empty.
+    ``no_baseline``) once the threshold has elapsed.
+
+    Review finding #5: a prior version of this test looped 145 times over a
+    pure function with an unchanging state dict and a frozen clock -- every
+    iteration after the first exercised nothing new, so it passed identically
+    with ``range(1)`` and could not distinguish "the durable marker survives
+    145 empty passes" from "this function is deterministic". This version is
+    a genuine positive control: it actually writes 145 empty ``dispatch``
+    rows to ``events.db`` between checks -- the exact mechanism (event-count
+    volume) that exhausted the old ``limit=100`` windowed scan -- and proves
+    ``check_dispatch_staleness`` (which reads only the in-memory ``state``
+    dict, never ``events.db``) is unaffected by that volume, unlike the
+    lookback it replaced.
     """
+    state_path = tmp_path / "state.json"
     now = datetime.now(UTC).replace(microsecond=0)
     threshold_minutes = 240
     config = DispatchConfig(dispatch_staleness_minutes=threshold_minutes)
@@ -299,12 +312,14 @@ def test_stale_survives_far_more_passes_than_the_old_100_row_lookback() -> None:
 
     result: dict[str, Any] = {}
     for _ in range(145):
+        log_event(state_path, "dispatch", {"issue_numbers": []})
         result = check_dispatch_staleness(state, config, _backlog(nonempty=True), now=now)
         assert result["stale"] is True, result
         assert result["reason"] == "dispatch_stale"
         assert result["last_dispatch_at"] == old
 
     assert result["age_seconds"] == (threshold_minutes + 60) * 60
+    assert len(query_events(state_path, kind="dispatch")) == 145
 
 
 # ---------------------------------------------------------------------------
@@ -348,9 +363,13 @@ def test_should_emit_false_while_within_reminder_window() -> None:
 
 def test_should_emit_true_again_once_reminder_interval_elapses() -> None:
     """A stall that outlives the reminder interval fires again -- a long
-    stall is not fully silent forever after the first alert."""
+    stall is not fully silent forever after the first alert. Uses a
+    configured threshold above the 240-minute reminder floor (review
+    finding #8) so this exercises the "threshold reused as reminder" path
+    directly; the floor-clamped path is covered by
+    ``test_should_emit_true_once_the_reminder_floor_itself_elapses``."""
     now = datetime.now(UTC).replace(microsecond=0)
-    threshold_minutes = 60
+    threshold_minutes = 300
     config = DispatchConfig(dispatch_staleness_minutes=threshold_minutes)
     old = _iso_now(now - timedelta(minutes=threshold_minutes * 3))
     state = _state_with_baseline(old, [1])
@@ -402,3 +421,103 @@ def test_should_emit_false_when_not_stale() -> None:
 
     assert result["stale"] is False
     assert result["should_emit"] is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #1769 review finding #8: the reminder cadence must not degrade to
+# per-pass spam just because an operator configured a short detection
+# threshold -- it is floored independently of `dispatch_staleness_minutes`.
+# ---------------------------------------------------------------------------
+
+
+def test_should_emit_false_within_reminder_floor_despite_short_threshold() -> None:
+    """A short detection threshold (fast alarms) must not also mean a short
+    re-alert cadence (frequent reminders) -- without the floor, this would
+    have been ``should_emit is True`` (20 minutes elapsed > the 15-minute
+    threshold reused as the reminder interval), degrading to near-per-pass
+    spam for the duration of any long stall."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    threshold_minutes = 15
+    config = DispatchConfig(dispatch_staleness_minutes=threshold_minutes)
+    old = _iso_now(now - timedelta(minutes=threshold_minutes + 5))
+    state = _state_with_baseline(old, [1])
+    state = arm_dispatch_stale_alert(state, _iso_now(now - timedelta(minutes=20)))
+
+    result = check_dispatch_staleness(state, config, _backlog(nonempty=True), now=now)
+
+    assert result["stale"] is True
+    assert result["should_emit"] is False
+
+
+def test_should_emit_true_once_the_reminder_floor_itself_elapses() -> None:
+    """The floor is a minimum, not an override of a longer configured
+    threshold: once past the (floored) 240-minute reminder interval, the
+    alarm still re-fires."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    threshold_minutes = 15
+    config = DispatchConfig(dispatch_staleness_minutes=threshold_minutes)
+    old = _iso_now(now - timedelta(minutes=threshold_minutes + 300))
+    state = _state_with_baseline(old, [1])
+    state = arm_dispatch_stale_alert(state, _iso_now(now - timedelta(minutes=241)))
+
+    result = check_dispatch_staleness(state, config, _backlog(nonempty=True), now=now)
+
+    assert result["stale"] is True
+    assert result["should_emit"] is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #1769 review BLOCKER: the durable marker is only ever written going
+# forward. A repo already mid-stall (or that already existed) before this
+# marker existed must recover a real baseline from events.db history exactly
+# once, rather than reporting `no_baseline` forever.
+# ---------------------------------------------------------------------------
+
+
+def test_backfilled_baseline_reports_stale_not_no_baseline(tmp_path: Path) -> None:
+    """The BLOCKER's required scenario: a state dict with **no**
+    ``dispatch_cadence`` key, plus an aged non-empty ``dispatch`` row already
+    in events.db (the pre-existing-repo / already-mid-stall case). After
+    backfill, the detector must report ``stale: True``, not ``no_baseline``.
+    """
+    state_path = tmp_path / "state.json"
+    now = datetime.now(UTC).replace(microsecond=0)
+    threshold_minutes = 60
+    config = DispatchConfig(dispatch_staleness_minutes=threshold_minutes)
+    old = _iso_now(now - timedelta(minutes=threshold_minutes + 30))
+    log_event(state_path, "dispatch", {"issue_numbers": [1761]})
+    # Force that row's timestamp to the aged value: log_event always stamps
+    # "now", so overwrite it directly the way a real historical row would
+    # read.
+    import sqlite3
+
+    conn = sqlite3.connect(state_path.parent / "events.db")
+    conn.execute("UPDATE events SET ts = ? WHERE kind = 'dispatch'", (old,))
+    conn.commit()
+    conn.close()
+
+    state: dict[str, Any] = {}
+    assert "dispatch_cadence" not in state
+
+    state = backfill_dispatch_baseline(state, state_path)
+    result = check_dispatch_staleness(state, config, _backlog(nonempty=True), now=now)
+
+    assert result["stale"] is True
+    assert result["reason"] == "dispatch_stale"
+    assert result["last_dispatch_at"] == old
+
+
+def test_no_backfill_candidate_still_reports_no_baseline(tmp_path: Path) -> None:
+    """Negative counterpart: a repo with genuinely no non-empty dispatch
+    anywhere in its history stays ``no_baseline`` after backfill -- recovery
+    finds real history, it does not fabricate one."""
+    state_path = tmp_path / "state.json"
+    now = datetime.now(UTC).replace(microsecond=0)
+    config = DispatchConfig(dispatch_staleness_minutes=60)
+    log_event(state_path, "dispatch", {"issue_numbers": []})
+
+    state = backfill_dispatch_baseline({}, state_path)
+    result = check_dispatch_staleness(state, config, _backlog(nonempty=True), now=now)
+
+    assert result["stale"] is False
+    assert result["reason"] == "no_baseline"

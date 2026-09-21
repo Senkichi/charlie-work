@@ -36,7 +36,7 @@ from charlie_work.config import (
     WorkerRoleConfig,
     load_config,
 )
-from charlie_work.instrumentation import query_events
+from charlie_work.instrumentation import log_event, query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     load_state,
@@ -489,6 +489,149 @@ def test_dispatch_pass_does_not_emit_dispatch_stale_when_within_threshold(
     assert result.data["selected_count"] == 0
     stale_events = query_events(paths.state_file, kind="dispatch_stale")
     assert stale_events == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #1769 review finding #3 (L3 wiring gap): the tests above exercise
+# check_dispatch_staleness directly against hand-seeded state, and
+# tests/test_dispatch_cadence_state.py exercises the state.py primitives
+# directly -- nothing previously drove a real `app.dispatch()` pass and
+# proved `_dispatch_impl` actually calls `record_non_empty_dispatch` /
+# `clear_dispatch_stale_alert` / `backfill_dispatch_baseline`. Deleting any
+# of those calls from dispatch_state.py left the whole suite green before
+# these tests existed.
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_pass_persists_baseline_marker_on_successful_dispatch(tmp_path: Path) -> None:
+    """A pass that actually launches an issue must persist the durable
+    baseline marker -- the single write the whole #1769 design depends on.
+    Deleting the ``record_non_empty_dispatch`` call in ``dispatch_state.py``
+    would leave this failing (every other test seeds the marker by hand)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.gh.prs[0]["state"] = "CLOSED"  # issue 123 becomes dispatchable
+
+    # The persisted marker is second-precision (`.replace(microsecond=0)` in
+    # dispatch_state.py), so bracket it with a floor/ceiling a whole second
+    # apart rather than comparing directly against sub-second `datetime.now()`
+    # reads, which could otherwise land on either side of the rounding.
+    before = datetime.now(UTC).replace(microsecond=0)
+    result = app.dispatch(limit=1)
+    after = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    state = load_state(paths.state_file)
+    marker_ts = state["dispatch_cadence"]["last_non_empty_dispatch_at"]
+    assert marker_ts is not None
+    marker_time = datetime.fromisoformat(marker_ts.replace("Z", "+00:00"))
+    assert before <= marker_time <= after
+    assert state["dispatch_cadence"]["last_non_empty_dispatch_issue_numbers"] == [123]
+
+
+def test_dispatch_pass_emits_dispatch_stale_only_once_within_reminder_window(
+    tmp_path: Path,
+) -> None:
+    """Two consecutive real dispatch passes, both stale, inside one reminder
+    window must record exactly one ``dispatch_stale`` event -- not one test
+    calling the pure function twice, but two actual ``app.dispatch()``
+    passes through the real state-lock/save path."""
+    config = OrchestratorConfig(dispatch=DispatchConfig(dispatch_staleness_minutes=60))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    assert app.gh.prs[0]["state"] == "OPEN"
+    old_ts = (
+        (datetime.now(UTC) - timedelta(minutes=90))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    _seed_backdated_dispatch_event(paths.state_file, old_ts, [999])
+
+    first = app.dispatch(limit=1)
+    second = app.dispatch(limit=1)
+
+    assert first.ok is True
+    assert second.ok is True
+    assert first.data["selected_count"] == 0
+    assert second.data["selected_count"] == 0
+    stale_events = query_events(paths.state_file, kind="dispatch_stale")
+    assert len(stale_events) == 1, stale_events
+
+
+def test_dispatch_stale_alert_clears_once_pass_actually_dispatches(tmp_path: Path) -> None:
+    """After an armed stale alert, a pass that genuinely resolves the stall
+    (this pass itself dispatches -- reason ``current_pass_dispatched``) must
+    reset ``last_stale_alert_at`` so the next, unrelated stall is a fresh
+    edge rather than inheriting this episode's reminder cadence."""
+    config = OrchestratorConfig(dispatch=DispatchConfig(dispatch_staleness_minutes=60))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    old_ts = (
+        (datetime.now(UTC) - timedelta(minutes=90))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    _seed_backdated_dispatch_event(paths.state_file, old_ts, [999])
+    assert app.gh.prs[0]["state"] == "OPEN"
+
+    first = app.dispatch(limit=1)
+    assert first.data["selected_count"] == 0
+    state = load_state(paths.state_file)
+    assert state["dispatch_cadence"]["last_stale_alert_at"] is not None
+
+    app.gh.prs[0]["state"] = "CLOSED"
+    second = app.dispatch(limit=1)
+    assert second.data["selected_count"] == 1
+
+    state = load_state(paths.state_file)
+    assert state["dispatch_cadence"]["last_stale_alert_at"] is None
+
+
+def test_dispatch_pass_backfills_baseline_from_events_db_history(tmp_path: Path) -> None:
+    """Wiring proof for the review BLOCKER fix: ``state.json`` starts with no
+    ``dispatch_cadence`` key at all (a repo that already existed, or was
+    already mid-stall, before this marker shipped), but ``events.db``
+    already carries an aged non-empty ``dispatch`` row from before the
+    marker existed. A real ``dispatch()`` pass must recover it and report
+    staleness correctly instead of permanently reporting ``no_baseline``."""
+    import sqlite3
+
+    config = OrchestratorConfig(dispatch=DispatchConfig(dispatch_staleness_minutes=60))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    assert app.gh.prs[0]["state"] == "OPEN"
+
+    old_ts = (
+        (datetime.now(UTC) - timedelta(minutes=90))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    log_event(paths.state_file, "dispatch", {"issue_numbers": [777]})
+    conn = sqlite3.connect(paths.state_file.parent / "events.db")
+    conn.execute("UPDATE events SET ts = ? WHERE kind = 'dispatch'", (old_ts,))
+    conn.commit()
+    conn.close()
+    assert "dispatch_cadence" not in load_state(paths.state_file)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    assert state["dispatch_cadence"]["baseline_backfill_attempted"] is True
+    assert state["dispatch_cadence"]["last_non_empty_dispatch_at"] == old_ts
+    stale_events = query_events(paths.state_file, kind="dispatch_stale")
+    assert len(stale_events) == 1, stale_events
 
 
 def test_dispatch_isolates_label_write_failure(tmp_path: Path, monkeypatch) -> None:
