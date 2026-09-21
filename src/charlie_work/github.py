@@ -732,7 +732,7 @@ def is_transient_repo_resolution_failure(error: str) -> bool:
 
 
 # _is_transient_gh_error's allowlist moved to transient_errors.py (issue
-# TBD): raw `git` network calls (git_retry.py) hit the identical failure
+# #1773): raw `git` network calls (git_retry.py) hit the identical failure
 # class over the identical network path and need the identical
 # classification, so this is now a thin alias onto the shared definition
 # rather than a second, independently-maintained copy of the allowlist. See

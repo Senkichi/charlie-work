@@ -45,7 +45,7 @@ from ci_fleet.charlie_work_adapter import (
     load_allocation_stamp,
 )
 from ci_fleet.provenance import REFUSAL_STATE_FILENAME, load_refusal_streak
-from .supervise import try_acquire_supervisor_lock
+from .supervise import _self_deploy_state_path, orchestrator_root, try_acquire_supervisor_lock
 
 
 @dataclass(frozen=True)
@@ -1269,6 +1269,79 @@ def _check_recent_lane_failures(add: Any, paths: RuntimePaths) -> None:
     )
 
 
+_GIT_NETWORK_RETRY_LOOKBACK_HOURS = 24
+
+
+def _check_git_network_retries(add: Any, paths: RuntimePaths) -> None:
+    """Surface recent ``git_network_retry`` events (issue #1777).
+
+    ``git_network_retry`` is registered in ``instrumentation._LEVEL_BY_KIND``
+    and emitted from three call sites (``main_ci_reclaim``'s fetch,
+    ``self_deploy``'s own pull and its post-repair retry, and the ci-fleet
+    sibling pull), but before this check had no consumer beyond an ad-hoc SQL
+    query against events.db -- this repo's own "signal without a consumer"
+    antipattern, memory-documented as its #1 real defect class. An ``ok:
+    false`` row (retries exhausted -- a blip that outlasted the whole backoff
+    budget) is exactly the thing that should surface at preflight, and before
+    this it surfaced nowhere an operator would see it.
+
+    Queried from two places, because the events live in two different
+    events.db files: ``main_ci_reclaim`` logs against *this* repo's own
+    ``paths.state_file`` (scoped per-repo like every other fleet-lane event),
+    while ``self_deploy`` always operates on the orchestrator's own checkout
+    (``orchestrator_root()``) and logs there regardless of which repo
+    ``doctor`` was invoked for -- so a doctor run against, say, job-cannon
+    still needs to look at charlie-work's own state file to see
+    self-deploy's retries. Deduplicated when the two coincide (running
+    doctor against the orchestrator checkout itself).
+
+    Read-only and silent when there is nothing to report: ``query_events()``
+    itself never raises and returns ``[]`` on any query failure, and an empty
+    window adds no check at all (mirrors ``_check_recent_lane_failures``) --
+    "no recent retries" is not itself noteworthy.
+    """
+    cutoff = (
+        (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(hours=_GIT_NETWORK_RETRY_LOOKBACK_HOURS)
+        )
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state_paths = {paths.state_file, _self_deploy_state_path(orchestrator_root())}
+    events: list[dict[str, Any]] = []
+    for state_path in state_paths:
+        events.extend(query_events(state_path, kind="git_network_retry", since=cutoff))
+    if not events:
+        return
+
+    def _is_exhausted(event: dict[str, Any]) -> bool:
+        payload = event.get("payload")
+        return isinstance(payload, dict) and payload.get("ok") is False
+
+    exhausted = [event for event in events if _is_exhausted(event)]
+    if exhausted:
+        latest = exhausted[-1]
+        payload = latest.get("payload") if isinstance(latest.get("payload"), dict) else {}
+        add(
+            "git network retries",
+            False,
+            f"{len(exhausted)} of {len(events)} git_network_retry event(s) in the last "
+            f"{_GIT_NETWORK_RETRY_LOOKBACK_HOURS}h exhausted retries (blip outlasted the "
+            f"backoff budget), most recent site={payload.get('site')} "
+            f"attempts={payload.get('attempts')} at {latest.get('ts')}",
+            severity="warning",
+        )
+    else:
+        add(
+            "git network retries",
+            True,
+            f"{len(events)} git_network_retry event(s) in the last "
+            f"{_GIT_NETWORK_RETRY_LOOKBACK_HOURS}h, all recovered",
+        )
+
+
 def run_doctor(
     repo_root: Path,
     paths: RuntimePaths,
@@ -1582,6 +1655,12 @@ def run_doctor(
     # fleet_pass_config_error records. Never raises: query_events() itself
     # returns [] rather than propagating on a query error.
     _check_recent_lane_failures(add, paths)
+
+    # -- recent git_network_retry events (issue #1777) -----------------------
+    # Read-only: queries events.db for both this repo's own state file and
+    # the orchestrator's self-deploy state file. Flags exhausted retries
+    # (ok: false) as a warning; adds nothing when the window is empty.
+    _check_git_network_retries(add, paths)
 
     hard_failures = [check for check in checks if not check.ok and check.severity == "error"]
     return (not hard_failures, checks)

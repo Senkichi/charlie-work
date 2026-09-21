@@ -11,6 +11,8 @@ silently diverge back into a second copy of the allowlist.
 
 from __future__ import annotations
 
+import pytest
+
 import charlie_work.github as github_module
 from charlie_work.transient_errors import is_transient_network_error
 
@@ -42,16 +44,111 @@ def test_could_not_resolve_host_is_transient() -> None:
     )
 
 
-def test_connectex_is_transient() -> None:
-    # Windows Winsock's own transport error text, likewise git-specific.
+def test_connectex_is_transient_for_gh() -> None:
+    # Windows Winsock's transport error text, surfaced through Go's own
+    # syscall-level wrapping -- gh's net/http backend on Windows, not git:
+    # git never emits this token (see the module docstring and finding 1 of
+    # the git-retry-primitive review). Real shape from this fleet's own
+    # events.db (a gh-side main_ci_reclaim_failed row).
     assert (
         is_transient_network_error(
-            "fatal: unable to access 'https://github.com/x/y.git/': "
-            "Failed to connect to github.com port 443: Recv failure: Connection was reset"
-            " (connectex)"
+            "dial tcp 172.182.252.137:443: connectex: No connection could be made "
+            "because the target machine actively refused it."
         )
         is True
     )
+
+
+# Real git/libcurl/OpenSSL/schannel/Winsock transport error text, most pinned
+# against this host's own real `git fetch` against an unroutable remote
+# (`git fetch origin main` with the remote pointed at 127.0.0.1:1) or the
+# libcurl/schannel/OpenSSL docs' own verbatim wording. Before the fix these
+# 8 of 10 realistic shapes classified as terminal (False) even though every
+# one of them is the exact class of transient blip this module exists to
+# retry -- a classifier ported verbatim from gh's Go-idiom text was inert for
+# git. See transient_errors.py's module docstring.
+_REAL_GIT_TRANSIENT_STDERRS = [
+    pytest.param(
+        "fatal: unable to access 'https://127.0.0.1:1/x/y.git/': Failed to connect to "
+        "127.0.0.1 port 1 after 2093 ms: Couldn't connect to server",
+        id="couldnt_connect_to_server",
+    ),
+    pytest.param(
+        "OpenSSL SSL_read: Connection was reset, errno 10054",
+        id="ssl_read_connection_was_reset",
+    ),
+    pytest.param(
+        "error: RPC failed; curl 56 Recv failure: Connection was reset",
+        id="recv_failure_connection_reset",
+    ),
+    pytest.param(
+        "The requested URL returned error: 502",
+        id="requested_url_returned_error_502",
+    ),
+    pytest.param(
+        "Operation timed out after 120000 milliseconds with 0 bytes received",
+        id="operation_timed_out_after",
+    ),
+    pytest.param(
+        "schannel: failed to receive handshake, SSL/TLS connection failed",
+        id="schannel_handshake_failed",
+    ),
+    pytest.param(
+        "fatal: the remote end hung up unexpectedly",
+        id="remote_end_hung_up",
+    ),
+    pytest.param(
+        "fatal: unable to access 'https://github.com/x/y.git/': Could not resolve "
+        "host: github.com",
+        id="could_not_resolve_host",
+    ),
+]
+
+
+@pytest.mark.parametrize("stderr", _REAL_GIT_TRANSIENT_STDERRS)
+def test_real_git_transport_shape_is_transient(stderr: str) -> None:
+    assert is_transient_network_error(stderr) is True
+
+
+# Additional libcurl/OpenSSL/GnuTLS shapes documented by those tools' own
+# error text (not in the review's positive-control table above, but part of
+# the same required-fix pattern list) -- send-side mirror of recv failure,
+# the SSL_connect (as opposed to SSL_read) OpenSSL phase, curl's error 52,
+# and a GnuTLS-backed libcurl build's handshake failure.
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        pytest.param(
+            "error: RPC failed; curl 55 Send failure: Connection was reset",
+            id="send_failure",
+        ),
+        pytest.param(
+            "OpenSSL SSL_connect: Connection was reset, errno 10054",
+            id="ssl_connect",
+        ),
+        pytest.param(
+            "The requested URL returned error: 429",
+            id="requested_url_returned_error_429",
+        ),
+        pytest.param(
+            "curl: (52) Empty reply from server",
+            id="empty_reply_from_server",
+        ),
+        pytest.param(
+            "gnutls_handshake() failed: Error in the pull function",
+            id="gnutls_handshake_failed",
+        ),
+    ],
+)
+def test_additional_libcurl_shapes_are_transient(stderr: str) -> None:
+    assert is_transient_network_error(stderr) is True
+
+
+def test_generic_exit_code_text_is_not_itself_transient() -> None:
+    # The shadowed generic `.error` string `run_captured` always sets on a
+    # non-zero exit (issue #1777 finding 3) carries no transport information
+    # at all -- it must never be misread as a transient shape by accident.
+    assert is_transient_network_error("command exited 128") is False
 
 
 def test_http_5xx_is_transient() -> None:

@@ -494,7 +494,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "fleet_canary": "info",
         "fleet_job_observations": "info",
         "fleet_lane_completed": "info",
-        # Issue TBD: a network-touching `git` call (fetch, ff-only pull)
+        # Issue #1773: a network-touching `git` call (fetch, ff-only pull)
         # needed `git_retry.run_git_with_retry` to recover from a transient
         # TLS/connection blip. Info, not warning: this is the retry
         # mechanism working as designed -- the pass-level `*_failed` kinds

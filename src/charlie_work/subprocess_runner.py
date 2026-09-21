@@ -175,6 +175,30 @@ class RunResult:
         return self.returncode == 0 and self.error is None
 
 
+def command_failure_message(command: list[str], result: RunResult, fallback: str) -> str:
+    """Build a diagnostic failure message that prefers the specific stderr.
+
+    ``run_captured`` (the real production runner) always populates
+    ``RunResult.error`` on any non-zero exit with a generic
+    ``"command exited {code}"``. Under a naive ``result.error or result.stderr``
+    fallback chain that generic string is always truthy and permanently
+    shadows ``.stderr`` in production, even when stderr carries the actual
+    diagnostic -- e.g. ``git pull --ff-only`` names the exact colliding paths
+    on a dirty-tree collision, and that name was unreachable (issue #817
+    item 3). Prefer ``.stderr``; fall back to ``.error``, then to
+    ``fallback``, only when stderr is empty. The failing argv is always
+    included so the message is actionable without cross-referencing a log.
+
+    This is the repo's single implementation of that ordering -- every
+    caller building a failure message from a ``RunResult`` should route
+    through here rather than re-deriving its own ``or`` chain, which is
+    exactly how the shadowing bug above went unnoticed at a second call site
+    (``main_ci_reclaim.py``, issue #1777) after it was already fixed here.
+    """
+    detail = (result.stderr or "").strip() or (result.error or "").strip() or fallback
+    return f"{' '.join(command)}: {detail}"
+
+
 def _as_text(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", "replace")

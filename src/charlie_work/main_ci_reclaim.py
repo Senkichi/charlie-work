@@ -69,7 +69,7 @@ from pathlib import Path
 
 from .git_retry import RetryOutcome, run_git_with_retry
 from .github import GitHubLike, GitHubRunResult
-from .subprocess_runner import run_captured
+from .subprocess_runner import command_failure_message, run_captured
 
 # Ported verbatim (semantics, not literal syntax) from reclaim-main-ci.yml:
 #
@@ -195,7 +195,7 @@ def reclaim_superseded_main_ci_runs(
     commit pushed moments ago by Aviator or a direct merge would read as
     "unknown object" and every candidate would be skipped until some other
     codepath happens to fetch it. Wrapped in ``run_git_with_retry`` (issue
-    TBD): a fetch is read-only/idempotent, so a transient TLS/connection
+    #1773): a fetch is read-only/idempotent, so a transient TLS/connection
     blip -- previously a whole-pass failure -- is retried in place instead.
     """
     fetch_attempts = 1
@@ -213,7 +213,18 @@ def reclaim_superseded_main_ci_runs(
     if not fetch_result.ok:
         return MainCiReclaimResult(
             ok=False,
-            error=f"git fetch origin {default_branch} failed: {fetch_result.error or fetch_result.stderr}",
+            # command_failure_message prefers .stderr over .error (issue
+            # #1777): run_captured always sets .error to a generic "command
+            # exited N" on any non-zero exit, which would otherwise
+            # permanently shadow git's actual, classifiable stderr text --
+            # the exact bug this fetch's own retry classifier depends on
+            # being able to see (finding 1's positive control needs real
+            # stderr in events.db to validate against, not "exited 128").
+            error=command_failure_message(
+                ["git", "fetch", "origin", default_branch],
+                fetch_result,
+                "fetch failed",
+            ),
             fetch_attempts=fetch_attempts,
         )
 

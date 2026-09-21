@@ -18,11 +18,13 @@ from _supervise_fixtures import (
     no_fleet_live_sessions as no_fleet_live_sessions,
 )
 from charlie_work import layout
+from charlie_work.git_retry import RetryOutcome
 from charlie_work.instrumentation import query_events
 from charlie_work.subprocess_runner import RunResult
 from charlie_work.supervise import (
     SelfDeployResult,
     _command_failure_message,
+    _log_self_deploy_git_retry,
     _pending_sync_marker_path,
     _self_deploy_state_path,
     orchestrator_root,
@@ -415,7 +417,7 @@ def test_self_deploy_pull_failure_surfaces_stderr_over_generic_error(
 
 
 def test_self_deploy_pull_retries_transient_failure_then_succeeds(
-    tmp_path: Path, no_fleet_live_sessions: None
+    tmp_path: Path, no_fleet_live_sessions: None, monkeypatch: Any
 ) -> None:
     """A transient git-network blip on the pull is retried in place (raw
     ``git`` calls previously had zero retry, unlike ``GitHub.run()``'s ``gh``
@@ -427,7 +429,16 @@ def test_self_deploy_pull_retries_transient_failure_then_succeeds(
     hand the transient-failure ``RunResult`` straight back as the pull's
     final result instead of retrying, and the queued "after HEAD"/"diff"
     responses would never be consumed.
+
+    ``git_retry``'s own ``time.sleep`` is monkeypatched out (issue #1777
+    finding 8): ``self_deploy`` -> ``run_git_with_retry`` does not expose a
+    ``sleep=`` seam of its own, so without this the real ~0.75-1.25s backoff
+    would run for real on every pass of this test.
     """
+    import charlie_work.git_retry as git_retry_module
+
+    monkeypatch.setattr(git_retry_module.time, "sleep", lambda _seconds: None)
+
     state_path = _self_deploy_state_path(tmp_path)
     runner, calls = _make_fake_runner(
         [
@@ -435,8 +446,14 @@ def test_self_deploy_pull_retries_transient_failure_then_succeeds(
             RunResult(
                 returncode=128,
                 stdout="",
-                stderr="fatal: unable to access 'https://github.com/x/y.git/': connectex",
-            ),  # pull attempt 1: transient
+                stderr=(
+                    "fatal: unable to access 'https://github.com/x/y.git/': Failed to "
+                    "connect to github.com port 443 after 2093 ms: Couldn't connect to "
+                    "server"
+                ),
+            ),  # pull attempt 1: transient (real curl/schannel shape, not the
+            # hand-assembled `connectex` hybrid no tool actually emits --
+            # issue #1777 finding 2)
             RunResult(0, "", ""),  # pull attempt 2 (retry): ok
             RunResult(0, "def456\n", ""),  # after HEAD
             RunResult(0, "src/foo.py\n", ""),  # diff (code-only)
@@ -454,9 +471,53 @@ def test_self_deploy_pull_retries_transient_failure_then_succeeds(
 
     retries = query_events(state_path, kind="git_network_retry")
     assert len(retries) == 1
-    assert retries[0]["payload"]["site"] == "self_deploy"
+    # site is call-site-specific (issue #1777 finding 4), not a shared
+    # "self_deploy" literal indistinguishable from the after-repair retry or
+    # the ci-fleet sibling pull.
+    assert retries[0]["payload"]["site"] == "self_deploy_pull"
+    assert retries[0]["payload"]["cwd"] == str(tmp_path)
     assert retries[0]["payload"]["attempts"] == 2
     assert retries[0]["payload"]["ok"] is True
+
+
+def test_log_self_deploy_git_retry_site_and_cwd_distinguish_call_sites(
+    tmp_path: Path,
+) -> None:
+    """Issue #1777 finding 4: the orchestrator's own pull, its post-repair
+    retry of that same pull, and the ci-fleet sibling pull all log to this
+    one state path and (before this fix) all shared a hardcoded
+    ``site="self_deploy"`` -- indistinguishable in events.db despite the
+    first two also sharing a byte-identical ``command`` string. ``site`` is
+    now a required keyword-only parameter (not a default), and ``cwd``
+    carries the checkout the command actually ran in.
+
+    Calling with the old two-positional-argument signature would now raise
+    ``TypeError`` (missing keyword-only ``site``), which is itself a strong
+    signal this test would fail against the pre-fix code -- confirmed by
+    inspection of the pre-fix signature (``repo_root, command, outcome``
+    only).
+    """
+    sibling = tmp_path / "ci-fleet"
+    for site, cwd in (
+        ("self_deploy_pull", tmp_path),
+        ("self_deploy_pull_after_repair", tmp_path),
+        ("ci_fleet_sibling_pull", sibling),
+    ):
+        _log_self_deploy_git_retry(
+            tmp_path,
+            ["git", "pull", "--ff-only", "origin", "main"],
+            RetryOutcome(attempts=2, ok=True, error=None),
+            site=site,
+            cwd=cwd,
+        )
+
+    events = query_events(_self_deploy_state_path(tmp_path), kind="git_network_retry")
+    assert [e["payload"]["site"] for e in events] == [
+        "self_deploy_pull",
+        "self_deploy_pull_after_repair",
+        "ci_fleet_sibling_pull",
+    ]
+    assert [e["payload"]["cwd"] for e in events] == [str(tmp_path), str(tmp_path), str(sibling)]
 
 
 def test_command_failure_message_falls_back_to_error_then_fallback() -> None:

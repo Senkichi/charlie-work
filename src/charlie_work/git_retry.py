@@ -29,6 +29,13 @@ Scope, deliberately narrow -- callers must not point this at anything else:
   :func:`charlie_work.transient_errors.is_transient_network_error`'s
   allowlist, so the loop below never retries them -- this is enforced by
   the classifier, not by a second check here.
+- ``worktree.py``'s ``_run_remote_captured`` -- the repo's own chokepoint
+  fronting ~15 more read-only ``git fetch``/``git ls-remote`` call sites,
+  including the phantom-reap ``ls-remote`` probes -- is deliberately not
+  wrapped by this landing either; it hits the identical failure class over
+  the identical network path and is exactly the kind of call this primitive
+  is for, but wiring it is scoped out as its own focused change (issue
+  #1778) rather than folded into this one.
 """
 
 from __future__ import annotations
@@ -40,7 +47,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .subprocess_runner import RunResult, run_captured
+from . import subprocess_runner
+from .subprocess_runner import RunResult
 from .transient_errors import is_transient_network_error
 
 logger = logging.getLogger(__name__)
@@ -84,50 +92,80 @@ def run_git_with_retry(
     *,
     cwd: Path | str,
     timeout_seconds: int,
-    run_command: Callable[..., RunResult] = run_captured,
+    run_command: Callable[..., RunResult] | None = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
     base_delay_seconds: float = DEFAULT_BASE_DELAY_SECONDS,
     max_elapsed_seconds: float = DEFAULT_MAX_ELAPSED_SECONDS,
     is_retryable: Callable[[str], bool] = is_transient_network_error,
-    sleep: Callable[[float], None] = time.sleep,
-    random_uniform: Callable[[float, float], float] = random.uniform,
+    sleep: Callable[[float], None] | None = None,
+    random_uniform: Callable[[float, float], float] | None = None,
     on_retry: Callable[[RetryOutcome], None] | None = None,
 ) -> RunResult:
     """Run one idempotent, network-touching ``git`` command with retry.
 
-    Never raises: ``run_command`` (default ``run_captured``) already
-    guarantees "errors come back as values", and this wrapper preserves that
-    contract exactly -- the returned ``RunResult`` is whatever the last
-    attempt produced.
+    Never raises: ``run_command`` (default ``subprocess_runner.run_captured``)
+    already guarantees "errors come back as values", and this wrapper
+    preserves that contract exactly -- the returned ``RunResult`` is whatever
+    the last attempt produced.
 
     Classification runs against ``result.stderr`` first, falling back to
     ``result.error`` only when stderr is empty (mirrors
-    ``supervise._command_failure_message``'s own fix for the same shadowing
-    bug, issue #817 item 3: ``run_captured`` always sets ``.error`` to a
-    generic ``"command exited N"`` on any non-zero exit, which would
+    ``subprocess_runner.command_failure_message``'s own fix for the same
+    shadowing bug, issue #817 item 3: ``run_captured`` always sets ``.error``
+    to a generic ``"command exited N"`` on any non-zero exit, which would
     otherwise permanently shadow git's actual, classifiable stderr text).
+
+    ``run_command``, ``sleep``, and ``random_uniform`` each default to
+    ``None`` and are resolved -- to ``subprocess_runner.run_captured``,
+    ``time.sleep``, and ``random.uniform`` respectively -- *inside* the
+    function body below, rather than bound as a default-argument value (the
+    literal ``= run_captured`` this signature used to carry). A default
+    argument value is evaluated exactly once, at import time, and captured
+    into the function object; monkeypatching the module attribute afterward
+    (e.g. ``charlie_work.subprocess_runner.run_captured`` or
+    ``charlie_work.git_retry.time.sleep`` -- the usual seams in this repo)
+    then has no effect on a caller that does not pass the keyword explicitly,
+    because the stale, already-bound reference is what actually gets called.
+    Resolving inside the body instead means the *module attribute* is looked
+    up fresh on every call, so both seams work.
 
     Bounded two ways, independently:
 
     - ``max_retries`` caps the number of *additional* attempts (so
       ``max_retries=3`` means at most 4 attempts total, matching
       ``GitHub.run()``'s ``gh_max_retries`` default).
-    - ``max_elapsed_seconds`` is a wall-clock ceiling checked before every
-      retry sleep. Some call sites configure a generous per-attempt
-      ``timeout_seconds`` (main_ci_reclaim's fetch uses 120s) for the rare
-      case of a genuinely slow-but-working connection; without this second
-      bound, several such timeouts stacked back to back could still make one
-      call run long. In practice a hard timeout is not retried at all --
+    - ``max_elapsed_seconds`` gates *entering* another retry: elapsed time so
+      far plus the backoff sleep about to happen must still fit the budget,
+      checked immediately before that sleep (not merely "elapsed so far",
+      which would let the loop commit to a sleep that itself blows the
+      budget). It is not a wall-clock guarantee on the call's total
+      duration, and cannot be made one without either capping each
+      individual attempt's own ``timeout_seconds`` against the remaining
+      budget (shrinking a caller-chosen value) or abandoning long
+      per-attempt timeouts for genuinely slow-but-working connections
+      entirely -- either of which would defeat the call sites (e.g.
+      main_ci_reclaim's 120s fetch timeout, nearly 6x this bound's own
+      default) that most need the retry. A single slow-but-not-yet-failed
+      attempt can still occupy its full ``timeout_seconds`` regardless of
+      this bound; in practice a hard timeout is not retried at all --
       ``run_captured`` reports it as ``"command timed out after Ns"``, which
-      matches none of the transient allowlist's substrings -- so this bound
-      is defense-in-depth, not the mechanism that keeps a hang from being
-      retried.
+      matches none of the transient allowlist's substrings -- so the common
+      case this bound actually guards is repeated *fast* transient failures
+      (each well under a second) piling up more backoff sleep than the
+      budget allows, not a slow attempt's own timeout.
 
     ``on_retry``, when given, is called exactly once, after the loop
     concludes, and only if at least one retry happened (``attempts > 1``).
     It never fires for a call that succeeded or failed terminally on the
     first attempt.
     """
+    if run_command is None:
+        run_command = subprocess_runner.run_captured
+    if sleep is None:
+        sleep = time.sleep
+    if random_uniform is None:
+        random_uniform = random.uniform
+
     start = time.monotonic()
     result = run_command(command, cwd=cwd, timeout_seconds=timeout_seconds)
     attempts = 1
@@ -136,11 +174,12 @@ def run_git_with_retry(
         not result.ok
         and attempts <= max_retries
         and is_retryable((result.stderr or result.error or "").strip())
-        and (time.monotonic() - start) < max_elapsed_seconds
     ):
         delay = base_delay_seconds * (2 ** (attempts - 1))
         jitter = random_uniform(-_JITTER_FRACTION * delay, _JITTER_FRACTION * delay)
         sleep_seconds = max(0.0, delay + jitter)
+        if (time.monotonic() - start) + sleep_seconds >= max_elapsed_seconds:
+            break
         logger.warning(
             "Transient git error (attempt %d/%d): %s; retrying in %.2fs",
             attempts,
