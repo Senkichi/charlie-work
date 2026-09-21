@@ -193,6 +193,27 @@ def _maybe_reclaim_superseded_main_ci(self) -> None:
         logger.warning("main_ci_reclaim pass raised an exception", exc_info=True)
         return
 
+    if result.fetch_attempts > 1:
+        # One event per retried call, never per attempt (git_retry.py's own
+        # on_retry contract) -- so this only fires on the rare pass where the
+        # leading `git fetch` actually hit a transient network blip.
+        # Recorded regardless of the pass's eventual ok/failure outcome
+        # below: the retry is a fact about the fetch, independent of what a
+        # later step in the same pass does.
+        with _wf.state_lock(state_file):
+            state = _wf.load_state(state_file)
+            state = self._record_event(
+                state,
+                "git_network_retry",
+                {
+                    "site": "main_ci_reclaim",
+                    "command": "git fetch",
+                    "attempts": result.fetch_attempts,
+                    "ok": result.ok,
+                },
+            )
+            self.write_gate.save_state(state)
+
     if not result.ok:
         with _wf.state_lock(state_file):
             state = _wf.load_state(state_file)
@@ -543,6 +564,18 @@ def _maybe_emit_operator_queue_impact(self) -> None:
     transitively blocking 17 of 21 open issues) never crossed a raw-count
     threshold at all, so the highest-blast-radius scenario in the fleet
     was exactly the one this gauge could never alarm on.
+
+    Issue #1769 moved ``dispatch_stale`` off "checked every pass, emitted
+    only when the condition holds" (which re-fires every single pass a
+    stall continues) onto the same edge-triggered-plus-bounded-reminder
+    shape this function now also uses (``state.is_dispatch_stale_alert_due``/
+    ``arm_dispatch_stale_alert``/``clear_dispatch_stale_alert`` there;
+    ``should_fire_operator_queue_impact``/``operator_queue_impact_baseline``/
+    ``record_operator_queue_impact_signature`` here) -- this docstring used
+    to point forward at ``dispatch_stale`` as a model this gauge should
+    someday follow; issue #1768 is that follow-through, so a future reader
+    should treat the two as sibling implementations of the same pattern,
+    not read one as still-pending relative to the other.
 
     The sink (``sink_census``: issues parked ``agent:human-needed`` /
     ``agent:operator-queue`` / reviewer-``blocked``) is measured every

@@ -1,0 +1,11 @@
+## Summary
+
+2026-08-13 (`2c31dd27`, full-b), leg-press note: *"should probably take superset out of the name when we postpone the exercise."* Compiled in `docs/uat/feedback-2026-08-26.md` (PR #91).
+
+## Description
+
+When one exercise in a superset slot is deferred ("Do later" — `SessionEngine.deferExercise()`), the remaining exercise is no longer actually paired with anything for that round, but its on-screen label still frames it as a superset.
+
+## Fix shape
+
+The exercise name/label building in `SessionScreen.kt` (masthead / set-card title) should drop the superset framing once a round is down to one active exercise for that slot — i.e. it should reflect the *current* pairing state, not the slot's original authored shape.

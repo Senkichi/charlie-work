@@ -19,7 +19,6 @@ can import them:
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +26,8 @@ import pytest
 
 from _fakes_github import FakeGitHub
 from charlie_work.config import OrchestratorConfig
-from charlie_work.instrumentation import log_event
 from charlie_work.paths import runtime_paths
+from charlie_work.state import load_state, record_non_empty_dispatch, save_state
 from charlie_work.workflow import OrchestratorApp
 
 
@@ -85,23 +84,18 @@ def _requests(count: int, tmp_path: Path) -> list:
 
 
 def _seed_backdated_dispatch_event(state_path: Path, ts: str, issue_numbers: list[int]) -> None:
-    """Write one ``dispatch`` event to events.db with a caller-chosen ``ts``.
+    """Persist a caller-chosen non-empty-dispatch baseline directly to state.json.
 
-    ``log_event`` always stamps real wall-clock time, so this inserts
-    normally and then backdates the row -- the same pattern
-    ``tests/test_dispatch_staleness.py`` uses to build a staleness baseline.
+    Issue #1769: ``check_dispatch_staleness``'s baseline lookup now reads the
+    durable ``dispatch_cadence`` marker in state.json (written by
+    ``record_non_empty_dispatch`` at real dispatch time) instead of scanning
+    events.db for the newest non-empty ``dispatch`` row, so seeding a test
+    baseline means writing that marker directly -- the same durable-field
+    approach ``tests/test_dispatch_staleness.py`` uses.
     """
-    log_event(state_path, "dispatch", {"issue_numbers": issue_numbers})
-    db_path = state_path.parent / "events.db"
-    conn = sqlite3.connect(str(db_path))
-    try:
-        cursor = conn.execute("SELECT MAX(id) FROM events WHERE kind = 'dispatch'")
-        row = cursor.fetchone()
-        if row and row[0]:
-            conn.execute("UPDATE events SET ts = ? WHERE id = ?", (ts, row[0]))
-            conn.commit()
-    finally:
-        conn.close()
+    data = load_state(state_path)
+    data = record_non_empty_dispatch(data, ts, issue_numbers)
+    save_state(state_path, data)
 
 
 def _fail_if_launched(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
@@ -160,19 +154,49 @@ def _make_stalled_sidecar(
 
 
 def _cross_repo_issue_body() -> str:
-    """Issue body whose every referenced file path is absent from the target repo.
+    """Issue body whose referenced file path is absent from the target repo
+    but present under a registered sibling repo's root.
 
     Mirrors the #1010/#953 scenario: the subject code lives in a sibling repo,
-    so every path the issue references is missing from the repo the worker is
-    dispatched against.
+    not the repo the worker is dispatched against. Since the positive-evidence
+    redesign (issues #1756-#1758), a caller must register the sibling under
+    ``managed_repo_roots`` for the referenced path to be positive evidence of
+    a cross-repo target -- see :func:`_write_fleet_registry` and
+    :func:`_write_sibling_repo_file`, which both consumers of this fixture use
+    to make ``src/ci_fleet/suite_coverage.py`` resolve under a fake
+    ``ci_runners`` sibling.
     """
     return (
-        "But **#953's code does not live in this repo.** `suite_coverage.py` is at "
-        "`C:/Users/operator/repos/ci_runners/src/ci_fleet/suite_coverage.py`; there is no "
-        "`src/charlie_work/suite_coverage.py`. The worker, handed an isolated checkout "
-        "of a repo that does not contain the file it was asked to change, went to "
-        "`C:\\Users\\operator\\repos\\ci_runners` — the **shared main checkout** — and worked there."
+        "But **#953's code does not live in this repo.** The fix belongs in "
+        "`src/ci_fleet/suite_coverage.py`, not `src/charlie_work/suite_coverage.py` "
+        "here. The worker, handed an isolated checkout of a repo that does not "
+        "contain the file it was asked to change, went to the sibling repo's "
+        "**shared main checkout** and worked there."
     )
+
+
+def _write_fleet_registry(fleet_dir: Path, repos: dict[str, dict[str, str]]) -> None:
+    """Write a minimal ``fleet.json`` with the given repo entries.
+
+    ``repos`` is keyed by ``owner/repo`` (mirroring the real registry's
+    ``nameWithOwner`` keys), each value at least a ``{"repo_root": ...}``
+    dict. Used by cross-repo-gate positive-evidence tests (issues
+    #1756-#1758) that need ``managed_repo_roots``/``managed_repo_names`` to
+    see a registered sibling repo.
+    """
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    (fleet_dir / "fleet.json").write_text(
+        json.dumps({"version": 1, "repos": repos}), encoding="utf-8"
+    )
+
+
+def _write_sibling_repo_file(sibling_root: Path, relative_path: str) -> None:
+    """Create ``relative_path`` under ``sibling_root``, for a fake sibling
+    repo a cross-repo-gate positive-evidence test registers via
+    :func:`_write_fleet_registry`."""
+    target = sibling_root / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("# fixture file\n", encoding="utf-8")
 
 
 def _reconcile_pass_app(

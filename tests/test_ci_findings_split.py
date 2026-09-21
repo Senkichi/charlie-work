@@ -692,9 +692,11 @@ def _write_event_call_sites(source: str, *, filename: str = "<string>") -> list[
     AST ``Call`` nodes, not a raw substring/regex ``findall`` over the whole
     source -- this family's own docstrings discuss the atomic-write and
     event-instrumentation invariants by name in several places (e.g.
-    ``check_dispatch_staleness``'s docstring references events.db and the
-    ``dispatch_stale`` warning event it produces upstream of this function,
-    in ``OrchestratorApp``), which a raw text search would miscount as call
+    ``_latest_non_empty_dispatch``'s docstring still references events.db
+    (issue #1769's now-replaced windowed lookback), and
+    ``check_dispatch_staleness``'s docstring discusses the ``dispatch_stale``
+    warning event it produces upstream of this function, in
+    ``OrchestratorApp``), which a raw text search would miscount as call
     sites. Walking real ``Call`` nodes only counts code that actually
     executes.
 

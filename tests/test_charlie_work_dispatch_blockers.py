@@ -12,7 +12,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from _dispatch_fixtures import _cross_repo_issue_body
+from _dispatch_fixtures import (
+    _cross_repo_issue_body,
+    _write_fleet_registry,
+    _write_sibling_repo_file,
+)
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from charlie_work.config import (
@@ -614,6 +618,14 @@ def test_dispatch_cross_repo_gate_escalates_when_all_paths_absent(tmp_path: Path
     exclusion from ``session_requests`` (``selected_count == 0``). A regression
     in the wiring that calls the gate would silently reintroduce the exact bug
     this PR fixes with every unit test green, so this test exercises the wiring.
+
+    Issues #1756-#1758 (positive-evidence redesign): bare absence no longer
+    escalates on its own -- a sibling repo must be registered in the fleet
+    AND actually contain the missing path. This is also the call-site
+    threading regression test for ``managed_repo_roots``/
+    ``dispatching_repo_name``: dropping either argument at the real dispatch
+    call site would make this fall back to abstaining (``selected_count``
+    would go non-zero) with every other assertion in this file still green.
     """
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -621,8 +633,15 @@ def test_dispatch_cross_repo_gate_escalates_when_all_paths_absent(tmp_path: Path
     # The default fixture PR is open and linked to issue #123, which would
     # exclude the issue via the open-PR guard; close it so #123 is selectable.
     fake_gh.prs[0]["state"] = "CLOSED"
-    # Every referenced path is absent from tmp_path (the repo root).
+    # Every referenced path is absent from tmp_path (the repo root); one of
+    # them is positively present under a registered sibling repo's root.
     fake_gh.issues[0]["body"] = _cross_repo_issue_body()
+    sibling_root = tmp_path / "sibling-ci-runners"
+    _write_sibling_repo_file(sibling_root, "src/ci_fleet/suite_coverage.py")
+    _write_fleet_registry(
+        tmp_path / "fleet",
+        {"owner/ci-runners": {"repo_root": str(sibling_root)}},
+    )
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     result = app.dispatch(limit=1)
@@ -658,6 +677,62 @@ def test_dispatch_cross_repo_gate_escalates_when_all_paths_absent(tmp_path: Path
     # candidates, so neutral_paths is empty and missing_paths is non-empty.
     assert payload["neutral_paths"] == []
     assert payload["missing_paths"]
+    # Issues #1756-#1758: the event names the sibling the positive-evidence
+    # check matched, turning a blind triage action into a one-glance fix.
+    assert payload["found_in_repo"] == "ci-runners"
 
     # The issue is terminal in state, not left dispatch_pending.
     assert state["issues"]["123"]["status"] == "escalated"
+
+
+def test_dispatch_cross_repo_override_label_skips_both_gates(tmp_path: Path) -> None:
+    """Review finding 4: an issue carrying the cross-repo override label
+    (``agent:cross-repo-override``) skips BOTH the cross-repo file-path
+    gate and the cross-repo scope gate entirely and dispatches normally --
+    the operator's one-step recovery for a residual false-positive
+    escalation (issue #1758's own valve). This branch had zero test
+    coverage before this test: a regression that made the override check
+    always fail, or a copy-paste that only guarded one of the two gates,
+    would go undetected with every other cross-repo test in this file
+    green, since none of them carry the override label.
+
+    Uses the SAME issue body and sibling registration as
+    ``test_dispatch_cross_repo_gate_escalates_when_all_paths_absent`` --
+    which escalates without the label -- so this test isolates the label
+    as what changes the outcome, not some other fixture difference.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    fake_gh.issues[0]["body"] = _cross_repo_issue_body()
+    fake_gh.issues[0]["labels"].append({"name": config.labels.cross_repo_override})
+    sibling_root = tmp_path / "sibling-ci-runners"
+    _write_sibling_repo_file(sibling_root, "src/ci_fleet/suite_coverage.py")
+    _write_fleet_registry(
+        tmp_path / "fleet",
+        {"owner/ci-runners": {"repo_root": str(sibling_root)}},
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    # The issue was dispatched normally -- the override short-circuited
+    # both gates before either could escalate it.
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["cross_repo_escalated_issue_numbers"] == []
+
+    # No operator-queue escalation label was applied.
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_added
+
+    # The override valve fired its own audit event; no escalation event
+    # was recorded for the same issue.
+    state = load_state(paths.state_file)
+    overridden_events = [
+        e for e in state["events"] if e["kind"] == "dispatch_cross_repo_gate_overridden"
+    ]
+    assert len(overridden_events) == 1
+    assert overridden_events[0]["payload"]["issue_number"] == 123
+    escalated_events = [e for e in state["events"] if e["kind"] == "dispatch_cross_repo_escalated"]
+    assert escalated_events == []

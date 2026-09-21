@@ -844,7 +844,13 @@ _RATCHET_BASELINE: dict[str, int] = {
     # the same block). The ratchet holds at the new count.
     "reconcile.py": 6,
     "state_migration.py": 1,
-    "supervise.py": 11,
+    # Issue #1777: +1 raw log_event call in _log_self_deploy_git_retry, the
+    # on_retry hook wired into every self-deploy/ci-fleet-sibling
+    # run_git_with_retry call site. Out-of-wave raw territory, same class as
+    # the pre-existing 11 -- self-deploy's own log_event calls are not routed
+    # through WriteGate (CLAUDE.md's "outside state-lock contexts, call
+    # log_event() directly" convention). The ratchet holds at the new count.
+    "supervise.py": 12,
     "supervisor_lifecycle.py": 3,
     # Issue #1131: +2 raw primitives in record_review's rework-label-skip
     # guard (_record_event + save_state for rework_label_skipped_issue_closed).
@@ -1074,10 +1080,35 @@ _RATCHET_BASELINE: dict[str, int] = {
     # slack held at 5 (measured out-of-predicate raw count after the move is 50, so
     # 55 = 50 + 5), and dispatch_state.py's entry equals its relocated live count
     # exactly (28, slack 0). The baseline-dict sum stays 247 and no ceiling loosens.
+    # PR #1792 (issue #1758): the cross-repo-gate override-label valve adds one
+    # new out-of-predicate save_state+append_event pair directly in
+    # orchestration/dispatch_state.py (not relocated from elsewhere), raising
+    # its entry from 28 to 30. This is a genuine new raw site, reviewed and
+    # accepted here rather than routed through WriteGate, because it sits in
+    # the same dispatch-transition code path as the other 28 already-accepted
+    # raw sites in this module.
     "workflow.py": 55,
-    "orchestration/dispatch_state.py": 28,
+    "orchestration/dispatch_state.py": 30,
     "orchestration/reap_loop.py": 5,
-    "orchestration/reap_dispatch.py": 1,
+    # Issue #1770: +1 raw log_event call in _apply_concurrency_governor's new
+    # CI-headroom clamp branch (the dispatch_backpressure event recorded when
+    # ci_headroom_available()'s reading clamps fresh dispatch, mirroring the
+    # pre-existing open_pr_max clamp's own raw log_event call in the same
+    # function). Same out-of-wave class as that pre-existing site -- the
+    # ratchet holds at the new count (1 -> 2).
+    "orchestration/reap_dispatch.py": 2,
+    # Issue #1770: +1 raw log_event call in ci_headroom_available's
+    # _log_unavailable helper (the ci_headroom_unavailable diagnostic event).
+    # A standalone function in a new module, not an OrchestratorApp method,
+    # so it has no self.write_gate receiver -- same out-of-wave pattern as
+    # capacity_starvation_escalation.py below. Lives at top-level
+    # charlie_work/ci_headroom.py (not under orchestration/): that package is
+    # reserved for the Track 2 Phase B delegation installer's destination
+    # modules (every top-level def in a flat orchestration/ submodule is
+    # auto-installed onto OrchestratorApp -- see workflow_delegation.py), and
+    # this module's functions are plain standalone helpers with no ``self``,
+    # never meant to become OrchestratorApp members.
+    "ci_headroom.py": 1,
     "orchestration/instrumentation_ops.py": 11,
     "orchestration/state_rework_routing.py": 8,
     "orchestration/state_stale_checks.py": 9,

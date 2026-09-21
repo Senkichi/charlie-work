@@ -321,6 +321,48 @@ def test_escalated_issue_never_reaches_the_open_pr_self_heal() -> None:
     assert "escalated_labels_converged" in escalated_kinds
 
 
+def test_blocked_issue_never_reaches_the_open_pr_self_heal() -> None:
+    """Issue #1765: "blocked" is a ``state.SINK_STATUSES`` member exactly like
+    "escalated" (both map to the identical human_needed label edge), so it
+    must get the same terminal-status protection here. Before the fix, the
+    upstream gate was a bare ``tracked_status == "escalated"`` check, so a
+    "blocked" issue with this fixture's shape (stale active label, open PR)
+    fell through to ``issue_active_label_with_open_pr`` -- which is not just
+    "no repair for blocked", it is reconcile actively resetting a blocked
+    issue's status back to PASSIVE_OPEN_STATUS while the stale active label
+    remains, silently un-blocking it. It must instead take the same
+    label-converging path "escalated" already does.
+    """
+    config = OrchestratorConfig()
+
+    def probe(status: str) -> list[DriftItem]:
+        gh = FakeGitHub(
+            prs=[_pr(3, "OPEN", head_ref="agent/issue-30-x")],
+            issues=[_issue(30, [config.labels.needs_rework])],
+        )
+        state = empty_state()
+        state["issues"]["30"] = {"number": 30, "status": status}
+        return detect_drift(gh, state, config)
+
+    # Positive control, shared with the escalated test above: the same
+    # fixture DOES arm issue_active_label_with_open_pr for a non-sink status.
+    control_kinds = [item.kind for item in probe("dispatch_failed")]
+    assert "issue_active_label_with_open_pr" in control_kinds
+
+    blocked_items = probe("blocked")
+    blocked_kinds = [item.kind for item in blocked_items]
+    assert "issue_active_label_with_open_pr" not in blocked_kinds
+    assert "escalated_labels_converged" in blocked_kinds
+
+    converged = next(item for item in blocked_items if item.kind == "escalated_labels_converged")
+    # Judgment is the fallback reason_class (no reason_class on the tracked
+    # entry), so the expected label is human_needed, not operator_queue.
+    assert converged.add_labels == (config.labels.human_needed,)
+    # The message must name the actual status, not a hardcoded "escalated".
+    assert "'blocked'" in converged.detail
+    assert "'escalated'" not in converged.detail
+
+
 def test_reconcile_and_github_share_list_limit_constant() -> None:
     """Issue #45: reconcile and github.py must derive limits from the same constant."""
     assert reconcile_list_limit == github_list_limit

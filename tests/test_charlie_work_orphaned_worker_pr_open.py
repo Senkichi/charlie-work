@@ -485,6 +485,109 @@ def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) 
     assert len(advance_events) == 1, "advance must not be re-emitted on the second pass"
 
 
+def test_orphaned_worker_unreviewed_open_pr_credits_worker_death(tmp_path: Path) -> None:
+    """Job-cannon #1320: before this fix, the #1128 advance-to-pr-open lane
+    was the one dead-worker branch (of four across this file and
+    ``dead_worker_reap.py``) that never touched ``worker_death_at`` -- a
+    redispatch that ended here read back as an uncredited no-op on every
+    later no-op-rework-cap check in ``state_dispatch_rework.py``
+    (``no_op_count = len(redispatch_at) - len(worker_death_at)``),
+    overstating the count and contributing to false escalation. Assert the
+    death is now credited here exactly as it already was in the
+    request_changes/approved sibling branches.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    in_progress = config.labels.in_progress
+    pr_open = config.labels.pr_open
+
+    state = load_state(paths.state_file)
+    state["issues"]["1578"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+        "redispatch_at": ["2026-01-01T00:00:00Z"],
+    }
+    # No ``decision`` key -- the PR has not been reviewed yet.
+    state["prs"]["1585"] = {
+        "reviewed_head_sha": None,
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 1578,
+                    "title": "Salvage wedge",
+                    "url": "https://example.test/issues/1578",
+                    "body": "Dead worker with open unreviewed PR",
+                    "labels": [{"name": in_progress}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = [
+                {
+                    "number": 1585,
+                    "title": "Salvaged work for #1578",
+                    "url": "https://example.test/pull/1585",
+                    "headRefName": "agent/issue-1578-salvage-wedge",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-deadbeef",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Closes #1578\n\nTests: regression coverage added.",
+                    "labels": [],
+                    "isCrossRepository": False,
+                    "state": "OPEN",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1578"]
+    assert entry["status"] == PASSIVE_OPEN_STATUS
+
+    # The core assertion: this death must now be credited. Before the fix,
+    # this list stayed empty regardless of how many workers died here.
+    assert len(entry.get("worker_death_at", [])) == 1
+    # redispatch_at is untouched by this branch -- only worker_death_at is
+    # the crediting mechanism's job.
+    assert entry["redispatch_at"] == ["2026-01-01T00:00:00Z"]
+
+    events = state.get("events", [])
+    advance_events = [e for e in events if e.get("kind") == "orphaned_worker_advanced_to_pr_open"]
+    assert len(advance_events) == 1
+    payload = advance_events[0]["payload"]
+    assert payload["reason"] == "dead_worker_unsafe_to_auto_reset_open_unreviewed_pr"
+    # The event payload records the credited timestamp too, matching the
+    # shape of the request_changes/approved sibling branches' events.
+    assert "worker_death_at" in payload
+
+    # The label swap mirrors the orphaned_worker_opened_pr lane.
+    assert (1578, in_progress) in fake_gh.labels_removed
+    assert (1578, pr_open) in fake_gh.labels_added
+
+
 def test_orphaned_worker_unreviewed_open_pr_label_failure_falls_back_to_drift(
     tmp_path: Path,
 ) -> None:

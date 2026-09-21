@@ -1,0 +1,94 @@
+## Summary
+
+Move the design system — `ui/design/*` (17 files; `FormPanel.kt` already moved in #217) and
+`ui/theme/*` (4 files) — from `swole/app/mobile/src/main/kotlin/dev/senki/swole/ui/` into
+`shared/src/commonMain` with the same package names, replacing the one Android-only call in the
+whole set (`Motion.kt`'s `rememberInkMotionEnabled()`) with an `expect`/`actual` seam and porting
+`Formats.kt`'s `java.time` use to `kotlinx-datetime`. Nothing else changes: these files carry no
+Hilt annotations, no view models and no Android import beyond `androidx.compose.*`, so the Android
+app keeps compiling against them through `mobile`'s dependency on `shared`, and every existing
+design/theme test in `mobile/src/test` — including the screenshot tests — stays where it is and
+passes unchanged. Out of scope: the nine screens, their view models and `SwoleNavHost`
+(#220); the animation call sites (#217).
+
+## Why
+
+The design system is the base every screen composes, and it is the one part of the UI graph with
+no dependency on the engine/sync port (#215, #216) — it can land as soon as the
+shared module exists, and it takes the 21 design/theme files out of the screen-port PR
+(#220), which is otherwise the largest single change in the plan. Android and iOS ship
+together on a shared Compose Multiplatform client —
+[spec §1](https://github.com/Senkichi/swole/blob/28afd7dad9e040760ba9cc045d7306b286068a1b/docs/superpowers/specs/2026-09-17-swole-public-release-plan-design.md#1-founder-decisions-this-plan-is-built-on-2026-09-17)
+and [spec §3.5](https://github.com/Senkichi/swole/blob/28afd7dad9e040760ba9cc045d7306b286068a1b/docs/superpowers/specs/2026-09-17-swole-public-release-plan-design.md#35-client)
+— so the design system has to be common code before any screen can be:
+[spec W2](https://github.com/Senkichi/swole/blob/28afd7dad9e040760ba9cc045d7306b286068a1b/docs/superpowers/specs/2026-09-17-swole-public-release-plan-design.md#w2--multiplatform-port-billing-launch)
+item 2.2.
+
+## Fix shape
+
+1. **The one seam.** `ui/design/Motion.kt`'s `rememberInkMotionEnabled()` reads
+   `Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE,
+   1f)` via `LocalContext.current` (`android.provider.Settings`, `androidx.compose.ui.platform.
+   LocalContext` — the latter is an Android-only `CompositionLocal`, not part of Compose
+   Multiplatform's common surface). Replace it with `@Composable expect fun
+   rememberInkMotionEnabled(): Boolean` in `shared/src/commonMain/kotlin/dev/senki/swole/ui/design/
+   Motion.kt`; the `androidMain actual` keeps today's body verbatim; the `iosMain actual` reads
+   `platform.UIKit.UIAccessibility.isReduceMotionEnabled` inside `remember { ... }`, preserving the
+   same one-shot-at-first-composition semantics (neither platform's screenshot tests need it to
+   react live).
+2. **The move.** Move `ui/design/*` (`AccentRule.kt`, `DrawnCheck.kt`, `Formats.kt`,
+   `InkProgressBar.kt`, `LedgerRow.kt`, `LjIcons.kt`, `LjLabel.kt`, `Masthead.kt`, `Motion.kt`,
+   `PrimaryCta.kt`, `RestDial.kt`, `RingButton.kt`, `SetDisplay.kt`, `StampBadge.kt`,
+   `StepperBox.kt`, `SwoleNavBar.kt`, `WeekTabs.kt`) and `ui/theme/*` (`Color.kt`, `Shapes.kt`,
+   `SwoleTheme.kt`, `Type.kt`) to the matching packages under `shared/src/commonMain` unchanged —
+   every `androidx.*` import across both packages is `androidx.compose.*`
+   (runtime/ui/material3/foundation/animation), which Compose Multiplatform publishes under the
+   same package names for every target, and `isSystemInDarkTheme()` (`SwoleTheme.kt:82`) is itself
+   part of that common surface. Verify the claim before moving, not after: `grep -rn "^import
+   android\.\|^import androidx\." swole/app/mobile/src/main/kotlin/dev/senki/swole/ui/{design,theme}
+   | grep -v "androidx\.compose"` must list only `Motion.kt`'s two imports from step 1.
+3. **`java.time` → `kotlinx-datetime`.** `ui/design/Formats.kt` imports `java.time.Instant`,
+   `ZoneId` and `DateTimeFormatter`. Port them to `kotlinx.datetime.Instant`, `TimeZone` and the
+   `LocalDate.Format { ... }` / `LocalDateTime.Format { ... }` builders for each
+   `DateTimeFormatter` pattern, keeping every function's output byte-identical — the design and
+   screenshot tests below are the regression check, and any test that starts failing on a
+   formatted string is a port error, not a test to update. Use the same
+   `kotlinx-datetime` dependency #210's scaffold already declares for `commonMain`.
+4. **Delete the originals.** Remove the 21 files from `swole/app/mobile/src/main/kotlin/dev/senki/
+   swole/ui/{design,theme}/`. Every consumer in `mobile` (the nine screens, `SwoleNavHost.kt`,
+   `MainActivity.kt`) keeps compiling unchanged because the package names are unchanged and
+   `mobile` now resolves the composables from `shared`. `grep -rln "package dev.senki.swole.ui.design\|
+   package dev.senki.swole.ui.theme" swole/app/mobile/src/main` must return nothing afterwards.
+5. **Tests stay put.** The design/theme tests in `swole/app/mobile/src/test/kotlin/dev/senki/swole/ui/`
+   — `design/{InkPrimitivesTest,JournalFurnitureTest,SetDisplayTest,StepperBoxTest,SwoleNavBarTest,
+   WeekTabsTest}.kt`, `theme/{SwoleThemeTest,TokenParityTest}.kt`, and the screenshot tests
+   `screenshot/{InkPrimitivesScreenshotTest,JournalFurnitureScreenshotTest,
+   ThemeSpecimenScreenshotTest,ContractComponentsScreenshotTest}.kt` with their `PaperScreenshot.kt`
+   helper — are Robolectric- and `androidx.compose.ui.test.junit4`-based and exercise the moved
+   composables through `mobile`'s dependency on `shared` without any edit. They move to
+   `shared/src/androidUnitTest` together with the screen tests in #220, not here, so this
+   PR's diff is production files only and the golden images are compared from exactly the place
+   they were recorded.
+
+## Acceptance
+
+- `cd swole/app && ./gradlew :mobile:testDebugUnitTest --rerun-tasks` passes, including every
+  screenshot test in step 5 against unchanged golden images — `--rerun-tasks` is load-bearing
+  (Roborazzi's verify task can report green without re-comparing pixels on an unchanged-inputs
+  cache hit).
+- `cd swole/app && ./gradlew :shared:compileKotlinAndroid` succeeds with all 21 files in
+  `commonMain`.
+- `cd swole/app && ./gradlew :mobile:assembleDebug` succeeds with no `ui/design` or `ui/theme`
+  source left in `mobile`.
+- `grep -rln "java.time\|LocalContext" swole/app/shared/src/commonMain/kotlin/dev/senki/swole/ui`
+  returns nothing.
+- `cd swole/app && ./gradlew :shared:compileKotlinIosSimulatorArm64` compiles clean, proving the
+  design system and its one seam are valid common code. Needs a macOS host with Xcode; if
+  unavailable, defer this specific check to #222's macOS host and say so in the PR.
+- CI gates: `uv run pytest -q --tb=short` and `uv run ruff check . ; uv run ruff format --check .`
+  stay green — no Python file changes. swole's CI has no Gradle job, so the Gradle output above is
+  not machine-enforced and belongs in the PR description.
+
+## Blocked by
+
+Blocked by #210, #217

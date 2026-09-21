@@ -30,11 +30,12 @@ from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from . import fleet_registry, git_pull_blockers, layout, worktree
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
+from .git_retry import RetryOutcome, run_git_with_retry
 from .instrumentation import log_event
 from .paths import RuntimePaths, runtime_paths
 from .safe_path import contains
 from .state import state_lock
-from .subprocess_runner import RunResult, run_captured
+from .subprocess_runner import RunResult, command_failure_message, run_captured
 from .worker import iter_workers
 
 logger = logging.getLogger(__name__)
@@ -592,22 +593,56 @@ def _check_venv(repo_root: Path) -> SelfDeployResult:
     )
 
 
-def _command_failure_message(command: Sequence[str], result: RunResult, fallback: str) -> str:
-    """Build a diagnostic failure message that prefers the specific stderr.
+def _log_self_deploy_git_retry(
+    repo_root: Path,
+    command: Sequence[str],
+    outcome: RetryOutcome,
+    *,
+    site: str,
+    cwd: Path,
+) -> None:
+    """Record that a self-deploy network ``git`` call needed a retry.
 
-    ``run_captured`` (the real production runner) always populates
-    ``RunResult.error`` on any non-zero exit with a generic
-    ``"command exited {code}"``. Under the old ``result.error or result.stderr``
-    fallback chain that generic string was always truthy and permanently
-    shadowed ``.stderr`` in production, even when stderr carried the actual
-    diagnostic -- e.g. ``git pull --ff-only`` names the exact colliding paths
-    on a dirty-tree collision, and that name was unreachable (issue #817 item
-    3). Prefer ``.stderr``; fall back to ``.error``, then to ``fallback``, only
-    when stderr is empty. The failing argv is always included so the message
-    is actionable without cross-referencing a log.
+    Wired as ``run_git_with_retry``'s ``on_retry`` at every self-deploy call
+    site -- the orchestrator's own pull (``site="self_deploy_pull"``), its
+    lossless-blocker-repair retry of that same pull
+    (``site="self_deploy_pull_after_repair"``), and the ci-fleet sibling pull
+    (``site="ci_fleet_sibling_pull"``) -- it only fires once per call, and
+    only when a retry actually happened, per that function's own contract.
+
+    ``site`` and ``cwd`` are both required, not defaulted: all three call
+    sites share this one state path (issue #1777 finding 4) and the first
+    two additionally share a byte-identical ``command`` string
+    (``git pull --ff-only origin main``), so without a discriminating field a
+    recurring blip's rows are indistinguishable -- an operator investigating
+    which checkout is flapping is the only question this event exists to
+    answer. ``cwd`` carries the checkout the command actually ran in
+    (``repo_root`` for the first two, the sibling root for the third), since
+    ``site`` alone still leaves "which path" implicit.
+
+    Best-effort like every other ``log_event`` call in this module: a
+    logging failure must never fail a deploy that worked.
     """
-    detail = (result.stderr or "").strip() or (result.error or "").strip() or fallback
-    return f"{' '.join(command)}: {detail}"
+    log_event(
+        _self_deploy_state_path(repo_root),
+        "git_network_retry",
+        {
+            "site": site,
+            "cwd": str(cwd),
+            "command": " ".join(command),
+            "attempts": outcome.attempts,
+            "ok": outcome.ok,
+        },
+    )
+
+
+# Moved to subprocess_runner.command_failure_message (issue #1777) so
+# main_ci_reclaim.py -- which has no other reason to import this module --
+# can reuse the exact same stderr-preferred ordering instead of carrying a
+# third ad-hoc `or` chain. Kept as a module-level alias (mirrors
+# github.py's `_is_transient_gh_error = is_transient_network_error`) so
+# every existing call site and test import in this module is unaffected.
+_command_failure_message = command_failure_message
 
 
 def _self_deploy_preview(
@@ -1250,10 +1285,19 @@ def _pull_ci_fleet_sibling(
                 before = run_command(
                     ["git", "rev-parse", "HEAD"], cwd=sibling, timeout_seconds=timeout
                 )
-                pull_res = run_command(
-                    ["git", "pull", "--ff-only", "origin", "main"],
+                sibling_pull_cmd = ["git", "pull", "--ff-only", "origin", "main"]
+                pull_res = run_git_with_retry(
+                    sibling_pull_cmd,
                     cwd=sibling,
                     timeout_seconds=timeout,
+                    run_command=run_command,
+                    on_retry=lambda outcome: _log_self_deploy_git_retry(
+                        repo_root,
+                        sibling_pull_cmd,
+                        outcome,
+                        site="ci_fleet_sibling_pull",
+                        cwd=sibling,
+                    ),
                 )
                 after = run_command(
                     ["git", "rev-parse", "HEAD"], cwd=sibling, timeout_seconds=timeout
@@ -1267,7 +1311,7 @@ def _pull_ci_fleet_sibling(
                     )
                 else:
                     payload["error"] = _command_failure_message(
-                        ["git", "pull", "--ff-only", "origin", "main"],
+                        sibling_pull_cmd,
                         pull_res,
                         "ci-fleet sibling pull failed",
                     )
@@ -1315,7 +1359,15 @@ def _self_deploy_attempt(
         before_sha = before_res.stdout.strip()
 
         pull_cmd = ["git", "pull", "--ff-only", "origin", "main"]
-        pull_res = run_command(pull_cmd, cwd=repo_root, timeout_seconds=pull_timeout)
+        pull_res = run_git_with_retry(
+            pull_cmd,
+            cwd=repo_root,
+            timeout_seconds=pull_timeout,
+            run_command=run_command,
+            on_retry=lambda outcome: _log_self_deploy_git_retry(
+                repo_root, pull_cmd, outcome, site="self_deploy_pull", cwd=repo_root
+            ),
+        )
         if not pull_res.ok:
             repair = _repair_lossless_pull_blockers(
                 repo_root, run_command=run_command, timeout=pull_timeout
@@ -1324,7 +1376,19 @@ def _self_deploy_attempt(
                 # Exactly one retry, never a loop: the blocker set is recomputed
                 # from scratch on the next pass anyway, so looping here only
                 # hammers a tree that is genuinely stuck.
-                pull_res = run_command(pull_cmd, cwd=repo_root, timeout_seconds=pull_timeout)
+                pull_res = run_git_with_retry(
+                    pull_cmd,
+                    cwd=repo_root,
+                    timeout_seconds=pull_timeout,
+                    run_command=run_command,
+                    on_retry=lambda outcome: _log_self_deploy_git_retry(
+                        repo_root,
+                        pull_cmd,
+                        outcome,
+                        site="self_deploy_pull_after_repair",
+                        cwd=repo_root,
+                    ),
+                )
                 # A repair that WORKS is otherwise completely invisible: the
                 # wedge simply stops happening and the pass logs an ordinary
                 # success. That would make this fix a mask -- whatever keeps

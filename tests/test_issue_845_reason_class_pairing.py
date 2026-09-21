@@ -105,6 +105,40 @@ def test_escalate_issue_and_clear_escalation_pair_fields() -> None:
         )
 
 
+def test_escalate_issue_rejects_blocked_with_non_judgment_reason_class() -> None:
+    """Issue #1765 finding 5: ``status="blocked"`` requires
+    ``reason_class="judgment"``, enforced at the single writer.
+
+    ``_escalation_edge`` has no mechanical counterpart for the "blocked"
+    edge, so a "blocked but mechanical" entry would resolve to
+    ``human_needed`` where every other mechanical escalation resolves to
+    ``operator_queued`` -- silently reintroducing the #1266 clobber the
+    moment such an entry reached the label-repair sweep or reconcile's
+    drift converger. Without this, that combination is never actually
+    written today (the sole call site hardcodes "judgment"), so this test
+    would pass equally well before and after the fix if it only checked
+    live callers -- it has to construct the forbidden combination directly.
+    """
+    with pytest.raises(ValueError, match="blocked"):
+        _escalate_issue(
+            {"issues": {"1": {"number": 1}}, "prs": {}},
+            1,
+            reason="x",
+            reason_class="mechanical",
+            status="blocked",
+        )
+
+    # The one reason_class the taxonomy allows for "blocked" still succeeds.
+    state = _escalate_issue(
+        {"issues": {"1": {"number": 1}}, "prs": {}},
+        1,
+        reason="x",
+        reason_class="judgment",
+        status="blocked",
+    )
+    assert state["issues"]["1"]["status"] == "blocked"
+
+
 def test_state_integrity_no_paired_field_without_the_other() -> None:
     """A state-integrity assertion: ``escalation_reason`` and ``reason_class``
     must appear and disappear as a pair on escalated/block issue entries, and

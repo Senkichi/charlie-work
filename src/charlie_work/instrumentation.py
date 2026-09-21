@@ -248,6 +248,16 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # see that launches are being held by the budget, not silently dropped.
         "api_budget_refused": "warning",
         "ci_fleet_worktree_dirty": "warning",
+        # Issue #1770: ci_headroom_available (ci_headroom.py)
+        # could not compute a repo's CI dispatch headroom from the freshest
+        # runner_allocation event (missing, stale, unconfigured repo, a
+        # pinned/unmeasurable demand reading, or a malformed payload).
+        # Warning, not error: the caller fails OPEN on this (no clamp
+        # applied) precisely so a CI-observability outage never becomes a
+        # dispatch outage -- but a live fleet should be writing a fresh
+        # runner_allocation event every pass, so a repeating burst here means
+        # that channel itself needs attention.
+        "ci_headroom_unavailable": "warning",
         # Issue #1260: the diff-coverage static probe (W3) flagged one or more
         # non-test files whose added branch logic outran the diff's added
         # tests. Warning, not error: the probe is advisory-only and never
@@ -272,6 +282,10 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # comment is the signal, not a hold -- but a repeating burst on one issue
         # means its citations keep rotting faster than anyone corrects them.
         "dispatch_citation_drift_flagged": "warning",
+        # Issues #1756/#1758: an operator-applied override label skipped both
+        # cross-repo gates for this issue. Warning, not info: a safety gate was
+        # deliberately bypassed, and the dispatch that follows is unguarded.
+        "dispatch_cross_repo_gate_overridden": "warning",
         "dispatch_merged_pr_mention_flagged": "warning",
         "dispatch_merged_pr_references_closed": "warning",
         "dispatch_skip_blocked": "warning",
@@ -328,6 +342,16 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # (workflow.py), never from pr_create_retry.py itself -- that module
         # has no state_file/fingerprint state to dedup against.
         "pr_create_failed_branch_stranded": "warning",
+        # Issue #1766: the merge lane's per-PR loop could not resolve a
+        # linked issue for an open PR (e.g. Dependabot's own branch/body
+        # convention) and skipped it -- edge-triggered, so this fires once
+        # on first sight and again only when the PR's material state
+        # changes. Warning, not info: the operator-facing signal the issue
+        # asks for must actually reach `charlie doctor`/heartbeat checks,
+        # which only look at warning/error levels; not error, since nothing
+        # is broken -- the PR is simply outside the pipeline's unit of work
+        # and stays queryable via `charlie status`'s `unlinked_prs`.
+        "pr_unlinked_skipped": "warning",
         # Issue #1363: a non-fatal preflight check (clock_sanity) failed at
         # the top of a loop pass. Warning, not error: the pass still ran
         # (_loop_body was not skipped) -- this is a tripwire for an operator
@@ -495,6 +519,16 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "fleet_canary": "info",
         "fleet_job_observations": "info",
         "fleet_lane_completed": "info",
+        # Issue #1773: a network-touching `git` call (fetch, ff-only pull)
+        # needed `git_retry.run_git_with_retry` to recover from a transient
+        # TLS/connection blip. Info, not warning: this is the retry
+        # mechanism working as designed -- the pass-level `*_failed` kinds
+        # (main_ci_reclaim_failed, self_deploy_failed) already carry the
+        # warning/error severity for the rarer case where retries are
+        # exhausted. Emitted at most once per retried call (never once per
+        # attempt) by `RetryOutcome`'s own contract; the `ok` payload field
+        # distinguishes "recovered" from "exhausted" without a second kind.
+        "git_network_retry": "info",
         "head_moved": "info",
         "infra_rerun_triggered": "info",
         "intake": "info",
