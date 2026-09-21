@@ -1,0 +1,206 @@
+## Summary
+
+Add `server/src/swole/coacheval/artifacts.py` (the frozen `RunArtifacts` dataclass, `capture()`,
+`save()`, `load()`) and `server/src/swole/coacheval/exemplar.py` (`apply_exemplar()`) per
+[plan §5](https://github.com/Senkichi/swole/blob/599e6fd0c5a5c1208d6426f6373470c3d5900fd5/docs/superpowers/plans/2026-09-18-evidence-coach-remaining-issues.md#5-interface-contracts-shared-across-issues).
+`capture()` turns the `EvalTree` #275 produces plus a post-run coach tree into a
+`RunArtifacts`: the new journal entry, the working-tree diff, and what the server's own release
+gates say about the tree — all found relative to `tree.base_sha`, never the tree's current git
+`HEAD`, because a real coach run ends in `swole release`, which commits. `apply_exemplar()` is
+the offline stand-in for that real run: it writes a hand-authored `journal.md` as the newest
+entry and layers an optional `coach/` overlay onto the tree, with no model call and no commit.
+
+## Why
+
+[Spec — Eval harness](https://github.com/Senkichi/swole/blob/599e6fd0c5a5c1208d6426f6373470c3d5900fd5/docs/superpowers/specs/2026-08-27-evidence-coach-design.md#eval-harness)
+calls for a runner that "captures the journal entry" after a coach run and scores it. Decision E3
+([plan §4](https://github.com/Senkichi/swole/blob/599e6fd0c5a5c1208d6426f6373470c3d5900fd5/docs/superpowers/plans/2026-09-18-evidence-coach-remaining-issues.md#4-decisions-made-here-and-deviations-from-the-spec))
+is what makes that testable in CI without a model: every scenario ships a `pass/` and one
+`fail-<dimension>/` exemplar, and pytest proves the pass exemplar passes and each fail exemplar
+fails on exactly that dimension. `apply_exemplar` is the one function that turns a static exemplar
+directory into something `capture()` can process exactly as if a real coach run had produced it.
+
+## Fix shape
+
+**`server/src/swole/coacheval/artifacts.py`** (new):
+
+```python
+@dataclass(frozen=True)
+class RunArtifacts:
+    scenario_id: str
+    run_index: int
+    coach_dir: Path
+    base_sha: str
+    journal_entry: str | None
+    coach_diff: str
+    release_errors: tuple[str, ...]
+    timed_out: bool
+    error: str | None
+    model: str | None
+    usage: dict | None
+
+
+def journal_entries_at(coach_dir: Path, rev: str) -> list[tuple[tuple[int, int], str]]:
+    """[(week, body)] parsed at an explicit git rev — NOT `prevstate.
+    _load_head_journal_entries` (prevstate.py:345), which hardcodes the
+    literal ref "HEAD:JOURNAL.md" and would read the WRONG state once a
+    real coach run's `swole release` has committed past `rev`. Same
+    `_HEADING` split as `coachbrief._journal_entries` (coachbrief.py:896)."""
+    from ..coachbrief import _HEADING
+    proc = subprocess.run(
+        ["git", "show", f"{rev}:JOURNAL.md"], cwd=coach_dir,
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    if proc.returncode != 0:
+        return []
+    entries: list[tuple[tuple[int, int], list[str]]] = []
+    for line in proc.stdout.splitlines():
+        m = _HEADING.match(line)
+        if m:
+            entries.append(((int(m.group(1)), int(m.group(2))), []))
+        elif entries:
+            entries[-1][1].append(line)
+    return [(wk, "\n".join(body)) for wk, body in entries]
+
+
+def _gate_errors(tree: EvalTree) -> tuple[str, ...]:
+    """The release gates' verdict on the run's WHOLE change, relative to
+    base_sha. The gates read the literal HEAD (prevstate.load_head_state),
+    and a live run ends in `swole release`, which commits — so HEAD is moved
+    back to base_sha for the dry run and restored afterwards. A soft reset
+    touches neither the index nor the working tree."""
+    from ..coachrepo import CoachRepo, CoachValidationError
+
+    head = _git(tree.coach_dir, "rev-parse", "HEAD")
+    moved = head != tree.base_sha
+    if moved:
+        _git(tree.coach_dir, "reset", "--soft", tree.base_sha)
+    try:
+        CoachRepo(tree.coach_dir, tree.exercise_dir).release(
+            "coach-eval: dry-run gate check", dry_run=True
+        )
+        return ()
+    except CoachValidationError as e:
+        return tuple(e.errors)
+    finally:
+        if moved:
+            _git(tree.coach_dir, "reset", "--soft", head)
+
+
+def capture(tree: EvalTree, *, scenario_id: str, run_index: int, **run_facts) -> RunArtifacts:
+    from ..bakeoff.artifacts import coach_diff
+    from ..journalgate import parse_new_run_entry
+
+    head_entries = journal_entries_at(tree.coach_dir, tree.base_sha)
+    run_entry = parse_new_run_entry(tree.coach_dir / "JOURNAL.md", head_entries)
+
+    release_errors = _gate_errors(tree)
+
+    return RunArtifacts(
+        scenario_id=scenario_id, run_index=run_index, coach_dir=tree.coach_dir,
+        base_sha=tree.base_sha, journal_entry=run_entry.body if run_entry else None,
+        coach_diff=coach_diff(tree.coach_dir, tree.base_sha), release_errors=release_errors,
+        **run_facts,  # timed_out, error, model, usage — caller-supplied; offline callers pass False/None/None/None
+    )
+```
+
+`CoachRepo.release(message, dry_run=True)` (coachrepo.py:632-787, gate region coachrepo.py:654-713)
+runs `load()` plus every release-time gate and writes nothing; `CoachValidationError.errors:
+list[str]` (coachrepo.py:44-47) is the exact list `release()` would otherwise raise.
+
+**Trap — the gates read the literal `HEAD`.** `release()`'s own `load_head_state` call is pinned
+to `"HEAD"` (coachrepo.py:669-684). On the offline path `HEAD` never moves past `base_sha`, so a
+plain dry run is right. A live run (#280) has already committed through `swole release` by
+the time `capture()` runs, and a dry run against that tree would read the run's own commit as
+history, find no new journal entry, and skip the journal and evidence gates without a word —
+`release_errors == ()` for a run that may have committed around the gates with a raw
+`git commit`. `_gate_errors` above closes that at the source rather than leaving it to each
+caller: it moves `HEAD` back to `base_sha` with `git reset --soft`, runs the dry run, and restores
+`HEAD` in a `finally`. A soft reset leaves the index and the working tree alone, so the gates see
+the run's whole change as uncommitted work, exactly as they do offline; `release()` has no gate
+on the `REVISION` file itself (coachrepo.py:776-780 only writes it), so the bumped value in the
+working tree is inert. `tree.coach_dir` is always a throwaway — a materialised temp tree or a
+sandbox clone, never the live `coach/` — which is what makes moving its `HEAD` acceptable.
+`_git(cwd, *args) -> str` is a module-local helper (`subprocess.run(["git", *args], cwd=cwd,
+check=True, capture_output=True, text=True, encoding="utf-8").stdout.strip()`), the same shape
+#275's `materialise` uses.
+
+`save(artifacts, run_dir)` / `load(run_dir)` — `save` first copies the tree,
+`shutil.copytree(artifacts.coach_dir, run_dir / "coach", dirs_exist_ok=True)`, `.git` included so
+`coach_diff`/`must_not` re-checks need no model on rescore, and only then writes
+`run_dir/artifacts.json` (every field except `coach_dir`, replaced with the literal `"coach"`)
+through a sibling temp file and `os.replace`. **The order is a contract:** `artifacts.json` is
+the last write of a run, so its presence means the run directory is complete — #280's
+resume logic treats a run directory without one as half-written and repeats it. `load` reverses
+both steps, setting `coach_dir=run_dir / "coach"`. Trap: on Windows, copying an open git repo's `.git`
+directory can hit a locked pack/index file if any subprocess against `coach_dir` is still alive —
+close every `subprocess.run` handle before `save()` runs (matching the `contextlib.closing`
+discipline `coachrepo.py:736` already uses for the same class of Windows file-lock issue).
+
+**`server/src/swole/coacheval/exemplar.py`** (new):
+
+```python
+def apply_exemplar(tree: EvalTree, exemplar_dir: Path) -> None:
+    """Offline stand-in for a real coach run (E3): appends the exemplar's
+    journal.md as the newest JOURNAL.md entry and layers its optional
+    coach/ overlay onto the tree. No commit, no model call — tree.base_sha
+    stays the pre-exemplar HEAD, so capture()'s journal_entries_at(...,
+    tree.base_sha) sees the appended entry as new."""
+    overlay = exemplar_dir / "coach"
+    if overlay.is_dir():
+        assert not (overlay / "JOURNAL.md").exists(), (
+            "the overlay supplies rules.yaml/evidence/templates changes only —"
+            " the new entry itself comes from journal.md, appended below"
+        )
+        shutil.copytree(overlay, tree.coach_dir, dirs_exist_ok=True)
+
+    journal_path = tree.coach_dir / "JOURNAL.md"
+    existing = journal_path.read_text(encoding="utf-8") if journal_path.exists() else ""
+    new_entry = (exemplar_dir / "journal.md").read_text(encoding="utf-8")
+    sep = "" if not existing else ("\n" if existing.endswith("\n") else "\n\n")
+    journal_path.write_text(existing + sep + new_entry, encoding="utf-8")
+```
+
+Design decision this issue is making, since no exemplar fixtures exist yet to copy the shape
+from: `journal.md` carries the FULL new entry text, including its own `## YYYY-Www` heading and
+a line-anchored `SESSION RUN <id>` (or `IDLE RUN <date>` for an `idle`-trigger scenario) marker —
+`journalgate.parse_new_run_entry` (journalgate.py:410) returns `None` outright when no such
+marker is present (journalgate.py:439-443), so a marker-less exemplar produces no capturable
+`journal_entry` at all. `_HEADING`'s parse (`^## (\d{4})-W(\d{2})\b`) does not require blank-line
+separation between entries, so the appended-entry separator above is cosmetic only.
+
+**Tests** (`server/tests/test_coacheval_artifacts.py`), each against a real `CoachRepo.init_repo()`
+git tree under `tmp_path` (never a mocked git):
+
+- `test_capture_finds_new_entry_relative_to_base_sha_not_head` — the regression case: commit the
+  exemplar's journal entry onto the tree (simulating that `swole release` already ran) so `HEAD`
+  has moved past `tree.base_sha`, then assert `capture().journal_entry` still returns the new
+  entry's body instead of `None`.
+- `test_capture_release_errors_survive_a_committed_run` — apply a gate-violating exemplar, commit
+  it with a raw `git commit` so `HEAD` moves past `tree.base_sha`, then assert
+  `capture().release_errors` still carries the gate's message and that `git rev-parse HEAD` is
+  the same commit after `capture()` as before it.
+- `test_save_writes_artifacts_json_last` — with `shutil.copytree` patched to raise, no
+  `artifacts.json` exists afterwards.
+- `test_capture_release_errors_empty_on_a_clean_exemplar`
+- `test_capture_release_errors_nonempty_on_a_broken_exemplar` — a journal body missing the
+  `Hypotheses:` block, asserting the same message `CoachValidationError` would raise.
+- `test_coach_diff_reflects_both_committed_and_uncommitted_changes`
+- `test_save_load_round_trip_preserves_every_field_and_the_coach_tree_git_history`
+- `test_apply_exemplar_produces_a_capturable_run_entry` — end to end: `materialise()` an
+  `EvalTree`, `apply_exemplar()` a `pass/` fixture into it, `capture()` it, assert
+  `journal_entry` is non-`None` and contains the fixture's own hypothesis text.
+- `test_apply_exemplar_rejects_an_overlay_that_carries_its_own_journal`
+- `test_apply_exemplar_is_a_noop_overlay_when_coach_fixture_dir_is_absent`
+
+## Acceptance
+
+- `server/tests/test_coacheval_artifacts.py::test_capture_finds_new_entry_relative_to_base_sha_not_head` passes — this is the wired proof that `capture()` calls `journal_entries_at(..., tree.base_sha)`, not any HEAD-pinned reader.
+- `server/tests/test_coacheval_artifacts.py::test_capture_release_errors_survive_a_committed_run` passes — the same invariant for the gate verdict: a committed run cannot hide from the release gates.
+- `server/tests/test_coacheval_artifacts.py::test_apply_exemplar_produces_a_capturable_run_entry` passes — proves `apply_exemplar()` and `capture()` compose into one real, model-free coach-run stand-in.
+- `uv run pytest -q --tb=short` green for the whole `server/` suite.
+- `uv run ruff check . ; uv run ruff format --check .` clean.
+
+## Blocked by
+
+Blocked by #275

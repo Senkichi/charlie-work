@@ -122,6 +122,7 @@ from .unescalate_reset_fields import (
 from .merge_finalize import _merged_issue_fields  # noqa: F401  (deliberate re-export; used by moved merge-finalization delegates via _wf.)
 from .state import (
     PASSIVE_OPEN_STATUS,
+    SINK_STATUSES,
     StateLockBusy,
     append_event,
     arm_operator_queue_review,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
@@ -1421,7 +1422,13 @@ def _touch_foreign_issue_ref_marker(state_file: Path, pr_number: int, issue_numb
 # the de-escalation sweep selects on the same pair (``_maybe_deescalate_mechanical``).
 # Centralized so the sink census and the sweep cannot drift apart on what
 # "in the sink" means. Issue #1083.
-_SINK_STATUSES: frozenset[str] = frozenset({"escalated", "blocked"})
+#
+# Relocated to ``state.SINK_STATUSES`` (issue #1765) so ``unescalate()`` and
+# both escalated-label self-heal sweeps (dispatch-side and reconcile-side)
+# share this exact set instead of each keeping their own "escalated"-only
+# literal. Kept as a module-level alias since this name predates the move
+# and nothing outside this module needs to change.
+_SINK_STATUSES: frozenset[str] = SINK_STATUSES
 
 # Issue #1383: cross-pass infra_blocked escalation tracking. The
 # OrchestratorApp instance is rebuilt per repo per pass (fleet_loop), so

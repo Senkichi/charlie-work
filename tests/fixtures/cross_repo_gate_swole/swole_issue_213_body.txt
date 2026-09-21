@@ -1,0 +1,117 @@
+## Summary
+
+Move `data/repo/SettingsRepository.kt`, `update/UpdateRepository.kt` and `data/repo/
+CoachRepository.kt` into `shared/src/commonMain`, replacing each one's `Context`-derived DataStore
+delegate or `context.filesDir`/`context.assets` file access with an `expect`/`actual` seam. None of
+the three touches Room, so this issue does not require #212: it only needs the `data/model`
+types #210 already moved (`CoachBundle`, `CoachJson`, `WorkoutTemplate`). `content/
+ContentSyncRepository.kt` stays out of scope: unlike `UpdateRepository.kt`, it genuinely needs
+`context.filesDir` for animation-file writes and a YAML parse, and no issue in this manifest yet
+owns turning it into a shared implementation (#216 gives it a one-method port interface
+without moving its body).
+
+## Why
+
+"DataStore KMP" is one of the four things the client port moves into the shared module, per
+[spec §3.5](https://github.com/Senkichi/swole/blob/28afd7dad9e040760ba9cc045d7306b286068a1b/docs/superpowers/specs/2026-09-17-swole-public-release-plan-design.md#35-client) and
+[spec W2](https://github.com/Senkichi/swole/blob/28afd7dad9e040760ba9cc045d7306b286068a1b/docs/superpowers/specs/2026-09-17-swole-public-release-plan-design.md#w2--multiplatform-port-billing-launch)
+item 2.2 ("shared module: Room KMP, DataStore KMP, OkHttp → Ktor, the Kotlin twins, session/sync
+logic"). `CoachRepository`'s bundle-file persistence rides along with it: it is the same
+`Context`-scoped-storage shape as the two DataStore repositories, just backed by a plain file
+instead of a `Preferences` store, and moving it separately later would leave the coach-bundle read
+path Android-only well past the point the rest of the client compiles for both platforms.
+
+## Fix shape
+
+1. Move `data/repo/SettingsRepository.kt` (37 lines) to
+   `shared/src/commonMain/kotlin/dev/senki/swole/data/repo/SettingsRepository.kt`, taking the
+   `DataStore<Preferences>` as a plain constructor parameter (drop the `@Inject`/`@ApplicationContext`
+   secondary constructor and the `private val Context.dataStore by preferencesDataStore(...)`
+   delegate; keep the `serverUrl`/`token` `Flow` properties and the `DEFAULT_SERVER_URL` companion
+   constant unchanged). Add `expect fun createSettingsDataStore(): DataStore<Preferences>`;
+   `shared/src/androidMain/.../SettingsDataStore.kt`: `actual fun createSettingsDataStore():
+   DataStore<Preferences>` using `PreferenceDataStoreFactory.createWithPath` (Room/DataStore KMP's
+   documented Android path helper) pointed at the app's files dir with name `"settings"`,
+   preserving today's on-disk file name so an upgrading install's existing preferences load
+   unchanged; `shared/src/iosMain/.../SettingsDataStore.kt`: `actual fun
+   createSettingsDataStore(): DataStore<Preferences>` using the same
+   `PreferenceDataStoreFactory.createWithPath` API pointed at a path under `NSHomeDirectory()` —
+   this target is never executed on the Windows CI runner today, so this actual is unverified by
+   any run in this PR. `swole/app/mobile/src/main/kotlin/dev/senki/swole/di/` gains a small
+   `@Provides` function (in the existing DI module that today provides `SettingsRepository`, or a
+   new small module beside it) supplying the Android `DataStore<Preferences>` via
+   `createSettingsDataStore()` and constructing the shared `SettingsRepository` from it, keeping
+   Hilt injection working for `mobile`'s other consumers (`di/SettingsRepository`'s current
+   consumers are unaffected by this constructor-shape change since Hilt still resolves the same
+   type).
+2. Move `update/UpdateRepository.kt` (67 lines) to
+   `shared/src/commonMain/kotlin/dev/senki/swole/update/UpdateRepository.kt`, mirroring step 1:
+   per #209's inventory, `UpdateRepository`'s only Android dependency is the
+   `Context.updaterStore` DataStore delegate its `@Inject` secondary constructor uses — its public
+   API (`available: Flow<UpdateUi?>`, `checkForUpdate(api: SyncApi, nowMs: Long)`) and the
+   `UpdateUi` data class it returns are already plain Kotlin. Drop `@Inject`/`@ApplicationContext`;
+   keep the plain primary constructor `UpdateRepository(store: DataStore<Preferences>,
+   installedVersionCode: Int)` unchanged. Add `expect fun createUpdaterDataStore():
+   DataStore<Preferences>`; `androidMain actual` uses the same
+   `PreferenceDataStoreFactory.createWithPath` pattern as step 1, name `"updater"`, plus
+   `BuildConfig.VERSION_CODE` (read in `mobile`, passed in) for `installedVersionCode`; `iosMain
+   actual` mirrors step 1's iOS seam. `swole/app/mobile/.../di/` gains a small `@Provides`
+   function supplying the Android `DataStore<Preferences>` and `BuildConfig.VERSION_CODE` to the
+   shared constructor, the same way step 1 wires `SettingsRepository`. `checkForUpdate`'s `SyncApi`
+   parameter stays the Retrofit-era type from `sync/SyncApi.kt` — #214 has not landed a
+   shared `SyncApi` at the point this issue lands, and this issue does not require it — so no
+   further seam is needed here; `checkForUpdate`'s existing `response.code()`/`response.body()`
+   calls are unchanged.
+3. Move `data/repo/CoachRepository.kt` (70 lines) to
+   `shared/src/commonMain/kotlin/dev/senki/swole/data/repo/CoachRepository.kt`, replacing its
+   `context.filesDir`/`context.assets.open(...)` file access with an injected
+   `expect class CoachFiles { fun bundleFile(): CoachBundleFile; fun readBundledAsset(): String }`
+   seam, where `CoachBundleFile` is a small `expect class` wrapping a platform path with `exists():
+   Boolean`, `readText(): String`, `writeText(text: String)` and `renameTo(target:
+   CoachBundleFile): Boolean` (the four operations `load()`/`save()` need — matching the atomic-
+   rename-then-swap shape `save()` already uses at `tmp.renameTo(bundleFile)`). `androidMain
+   actual class CoachFiles(private val context: Context)` wraps `context.filesDir`/
+   `context.assets`; `androidMain actual class CoachBundleFile` wraps `java.io.File`. `iosMain
+   actual class CoachFiles` wraps `NSFileManager.defaultManager` and the app bundle's resource
+   path for the bundled seed asset; `iosMain actual class CoachBundleFile` wraps `NSFileManager`
+   read/write/move calls — this target is never executed on the Windows CI runner today, so this
+   actual is unverified by any run in this PR. `CoachRepository`'s public API (`bundle:
+   Flow<CoachBundle>`, `load()`, `save(raw: String)`, `templateForDay(...)`) and its exact
+   sequencing (parse before writing the temp file, so a malformed bundle never overwrites the
+   last-good one; atomic rename over the live file; `_bundle` `MutableStateFlow` updated only after
+   the write succeeds) are unchanged. `swole/app/mobile/.../di/` gains a small `@Provides` function
+   supplying the Android `CoachFiles(context)` and constructing the shared `CoachRepository` from
+   it.
+
+## Acceptance
+
+- `./gradlew :shared:compileKotlinAndroid` succeeds with `SettingsRepository`, `UpdateRepository`
+  and `CoachRepository` all in `commonMain`.
+- `data/repo/CoachRepositoryTest.kt` (today under `swole/app/mobile/src/test/kotlin/dev/senki/
+  swole/data/repo/`, Robolectric + Truth) moves to `shared/src/androidUnitTest/kotlin/dev/senki/
+  swole/data/repo/` — it stays Android-only (Truth and Robolectric have no Kotlin/Native artifact)
+  rather than `commonTest` — with its three `CoachRepository(ctx)` call sites updated to construct
+  through the new `androidMain` `CoachFiles` seam, and passes with the same three assertions
+  (`loadsBundledAssetWhenNoFileYet`, `saveReplacesBundleAtomically`,
+  `invalidSaveThrowsAndKeepsPriorBundle`).
+- A new `SettingsRepositoryTest` (none exists today) constructs the shared `SettingsRepository`
+  with a fake `DataStore<Preferences>` (`PreferenceDataStoreFactory.create` over a temp file, the
+  same per-test-isolated-store pattern `update/UpdateRepositoryTest.kt` already uses) and asserts
+  `serverUrl`/`token` default to `SettingsRepository.DEFAULT_SERVER_URL`/`""` and round-trip through
+  `setServerUrl`/`setToken`.
+- `update/UpdateRepositoryTest.kt` stays in `mobile/src/test` unmodified and passes: it already
+  constructs `UpdateRepository` through the same plain primary constructor this step keeps, so
+  unlike `CoachRepositoryTest.kt` above it needs no call-site change to keep working against the
+  now-shared type (it also calls `SyncApiFactory.create`, the Retrofit-era factory, which stays in
+  `mobile` until #214 lands — this issue does not touch it). Its four existing assertions
+  (`newerPublishedBuildSurfaces`, `equalOrOlderBuildStaysQuiet`, `notFoundClearsAnEarlierOffer`,
+  `serverErrorKeepsTheCachedOffer`) are unaffected.
+- `./gradlew :mobile:testDebugUnitTest` still passes; the small `@Provides` functions added to
+  `mobile`'s DI modules compile and Hilt still resolves `SettingsRepository`/`UpdateRepository`/
+  `CoachRepository` for every existing injection site.
+- `uv run pytest -q --tb=short` and `uv run ruff check . ; uv run ruff format --check .` (from
+  `server/`) stay green — this issue touches no Python.
+
+## Blocked by
+
+Blocked by #210
