@@ -67,6 +67,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .git_retry import RetryOutcome, run_git_with_retry
 from .github import GitHubLike, GitHubRunResult
 from .subprocess_runner import run_captured
 
@@ -106,6 +107,13 @@ class MainCiReclaimResult:
     workflow's own ``core.warning`` + continue on a failed
     ``cancelWorkflowRun`` call -- one uncancellable run must not abort the
     rest of the pass).
+
+    ``fetch_attempts`` is how many attempts the leading ``git fetch`` took
+    (1 when it succeeded outright, >1 when :func:`charlie_work.git_retry.
+    run_git_with_retry` recovered from a transient network blip). Carried
+    regardless of ``ok`` so a caller can emit a dedicated retry-observability
+    event even when a *later* step in the same pass is what ultimately
+    failed.
     """
 
     ok: bool
@@ -116,6 +124,7 @@ class MainCiReclaimResult:
     skipped_not_ancestor: int = 0
     skipped_started_before_cancel: int = 0
     cancel_errors: tuple[str, ...] = ()
+    fetch_attempts: int = 1
 
 
 def _object_exists(repo_root: Path, sha: str) -> bool:
@@ -185,17 +194,27 @@ def reclaim_superseded_main_ci_runs(
     the strict-ancestor check below has the objects it needs; without it, a
     commit pushed moments ago by Aviator or a direct merge would read as
     "unknown object" and every candidate would be skipped until some other
-    codepath happens to fetch it.
+    codepath happens to fetch it. Wrapped in ``run_git_with_retry`` (issue
+    TBD): a fetch is read-only/idempotent, so a transient TLS/connection
+    blip -- previously a whole-pass failure -- is retried in place instead.
     """
-    fetch_result = run_captured(
+    fetch_attempts = 1
+
+    def _capture_fetch_retry(outcome: RetryOutcome) -> None:
+        nonlocal fetch_attempts
+        fetch_attempts = outcome.attempts
+
+    fetch_result = run_git_with_retry(
         ["git", "fetch", "origin", default_branch],
         cwd=repo_root,
         timeout_seconds=_FETCH_TIMEOUT_SECONDS,
+        on_retry=_capture_fetch_retry,
     )
     if not fetch_result.ok:
         return MainCiReclaimResult(
             ok=False,
             error=f"git fetch origin {default_branch} failed: {fetch_result.error or fetch_result.stderr}",
+            fetch_attempts=fetch_attempts,
         )
 
     tip_result = gh.commit(default_branch)
@@ -218,12 +237,14 @@ def reclaim_superseded_main_ci_runs(
             ok=False,
             error=f"failed to resolve current tip sha for {default_branch}"
             f": {tip_error or 'no sha in response'}",
+            fetch_attempts=fetch_attempts,
         )
     if not _object_exists(repo_root, tip_sha):
         return MainCiReclaimResult(
             ok=False,
             error=f"tip sha {tip_sha} not present in local object store after fetch",
             tip_sha=tip_sha,
+            fetch_attempts=fetch_attempts,
         )
 
     runs_result = gh.run(
@@ -241,6 +262,7 @@ def reclaim_superseded_main_ci_runs(
                 ok=False,
                 error=f"failed to list workflow runs: {runs_result.error}",
                 tip_sha=tip_sha,
+                fetch_attempts=fetch_attempts,
             )
         runs_payload = runs_result.value
     elif isinstance(runs_result, dict):
@@ -250,6 +272,7 @@ def reclaim_superseded_main_ci_runs(
             ok=False,
             error=f"unexpected response listing workflow runs: {type(runs_result).__name__}",
             tip_sha=tip_sha,
+            fetch_attempts=fetch_attempts,
         )
 
     workflow_runs = runs_payload.get("workflow_runs")
@@ -335,4 +358,5 @@ def reclaim_superseded_main_ci_runs(
         skipped_not_ancestor=skipped_not_ancestor,
         skipped_started_before_cancel=skipped_started_before_cancel,
         cancel_errors=tuple(cancel_errors),
+        fetch_attempts=fetch_attempts,
     )

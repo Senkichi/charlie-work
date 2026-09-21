@@ -185,6 +185,27 @@ def _maybe_reclaim_superseded_main_ci(self) -> None:
         logger.warning("main_ci_reclaim pass raised an exception", exc_info=True)
         return
 
+    if result.fetch_attempts > 1:
+        # One event per retried call, never per attempt (git_retry.py's own
+        # on_retry contract) -- so this only fires on the rare pass where the
+        # leading `git fetch` actually hit a transient network blip.
+        # Recorded regardless of the pass's eventual ok/failure outcome
+        # below: the retry is a fact about the fetch, independent of what a
+        # later step in the same pass does.
+        with _wf.state_lock(state_file):
+            state = _wf.load_state(state_file)
+            state = self._record_event(
+                state,
+                "git_network_retry",
+                {
+                    "site": "main_ci_reclaim",
+                    "command": "git fetch",
+                    "attempts": result.fetch_attempts,
+                    "ok": result.ok,
+                },
+            )
+            self.write_gate.save_state(state)
+
     if not result.ok:
         with _wf.state_lock(state_file):
             state = _wf.load_state(state_file)

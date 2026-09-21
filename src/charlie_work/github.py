@@ -92,6 +92,7 @@ from .github_delegation import _ROUTES, _SIGNATURE_SOURCE, _make_delegate  # noq
 # no longer reachable through ``charlie_work.github``.
 from .issue_linking import _CLOSING_KEYWORDS_ALT
 from .subprocess_runner import no_console_window_kwargs
+from .transient_errors import is_transient_network_error
 
 logger = logging.getLogger(__name__)
 
@@ -730,62 +731,16 @@ def is_transient_repo_resolution_failure(error: str) -> bool:
     return "could not resolve to a repository" in error.lower()
 
 
-def _is_transient_gh_error(error: str) -> bool:
-    """Classify a gh stderr/stdout string as a transient (retryable) failure.
-
-    Transient signals are an allowlist; anything not explicitly listed is treated
-    as terminal so genuine logic/auth/validation errors still fail fast.
-    """
-    text = error.lower()
-
-    # Terminal signals that must never be retried.
-    if "bad credentials" in text:
-        return False
-    if "could not resolve to a" in text or "not_found" in text:
-        return False
-    if re.search(r"\bhttp 401\b", text):
-        return False
-    # 403 is terminal unless it is a rate-limit/secondary-rate-limit response.
-    if re.search(r"\bhttp 403\b", text) and not (
-        "rate limit" in text
-        or "secondary rate limit" in text
-        or "was submitted too quickly" in text
-    ):
-        return False
-    if re.search(r"\bhttp 422\b", text):
-        return False
-
-    # Transient allowlist.
-    if "tls handshake timeout" in text:
-        return True
-    if "net/http:" in text:
-        return True
-    if "connection reset" in text:
-        return True
-    if "connection refused" in text:
-        return True
-    if "i/o timeout" in text:
-        return True
-    if re.search(r"\beof\b", text):
-        return True
-    if "timeout awaiting response headers" in text:
-        return True
-    if re.search(r"\bhttp (?:502|503|504|429)\b", text):
-        return True
-    if "was submitted too quickly" in text:
-        return True
-    if "you have exceeded a secondary rate limit" in text:
-        return True
-    # Primary and other GitHub rate-limit responses (often HTTP 403 or 429).
-    if "rate limit" in text:
-        return True
-    if "error connecting to" in text:
-        return True
-    if "could not connect" in text:
-        return True
-
-    # Unknown errors are terminal by default.
-    return False
+# _is_transient_gh_error's allowlist moved to transient_errors.py (issue
+# TBD): raw `git` network calls (git_retry.py) hit the identical failure
+# class over the identical network path and need the identical
+# classification, so this is now a thin alias onto the shared definition
+# rather than a second, independently-maintained copy of the allowlist. See
+# that module's docstring for the full rationale, including why the two
+# git-specific patterns it adds ("could not resolve host", "connectex") are
+# inert for gh's own Go-idiom error text and so do not change this
+# function's behavior for any error gh can actually produce.
+_is_transient_gh_error = is_transient_network_error
 
 
 def _is_pre_connection_error(error: str) -> bool:

@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from . import fleet_registry, git_pull_blockers, layout, worktree
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
+from .git_retry import RetryOutcome, run_git_with_retry
 from .instrumentation import log_event
 from .paths import RuntimePaths, runtime_paths
 from .safe_path import contains
@@ -589,6 +590,30 @@ def _check_venv(repo_root: Path) -> SelfDeployResult:
         synced=False,
         venv_repaired=True,
         message=f"venv editable target repaired: {venv_message}",
+    )
+
+
+def _log_self_deploy_git_retry(
+    repo_root: Path, command: Sequence[str], outcome: RetryOutcome
+) -> None:
+    """Record that a self-deploy network ``git`` call needed a retry.
+
+    Wired as ``run_git_with_retry``'s ``on_retry`` at every self-deploy call
+    site (the orchestrator's own pull, its lossless-blocker-repair retry, and
+    the ci-fleet sibling pull) -- it only fires once per call, and only when
+    a retry actually happened, per that function's own contract. Best-effort
+    like every other ``log_event`` call in this module: a logging failure
+    must never fail a deploy that worked.
+    """
+    log_event(
+        _self_deploy_state_path(repo_root),
+        "git_network_retry",
+        {
+            "site": "self_deploy",
+            "command": " ".join(command),
+            "attempts": outcome.attempts,
+            "ok": outcome.ok,
+        },
     )
 
 
@@ -1250,10 +1275,15 @@ def _pull_ci_fleet_sibling(
                 before = run_command(
                     ["git", "rev-parse", "HEAD"], cwd=sibling, timeout_seconds=timeout
                 )
-                pull_res = run_command(
-                    ["git", "pull", "--ff-only", "origin", "main"],
+                sibling_pull_cmd = ["git", "pull", "--ff-only", "origin", "main"]
+                pull_res = run_git_with_retry(
+                    sibling_pull_cmd,
                     cwd=sibling,
                     timeout_seconds=timeout,
+                    run_command=run_command,
+                    on_retry=lambda outcome: _log_self_deploy_git_retry(
+                        repo_root, sibling_pull_cmd, outcome
+                    ),
                 )
                 after = run_command(
                     ["git", "rev-parse", "HEAD"], cwd=sibling, timeout_seconds=timeout
@@ -1267,7 +1297,7 @@ def _pull_ci_fleet_sibling(
                     )
                 else:
                     payload["error"] = _command_failure_message(
-                        ["git", "pull", "--ff-only", "origin", "main"],
+                        sibling_pull_cmd,
                         pull_res,
                         "ci-fleet sibling pull failed",
                     )
@@ -1315,7 +1345,13 @@ def _self_deploy_attempt(
         before_sha = before_res.stdout.strip()
 
         pull_cmd = ["git", "pull", "--ff-only", "origin", "main"]
-        pull_res = run_command(pull_cmd, cwd=repo_root, timeout_seconds=pull_timeout)
+        pull_res = run_git_with_retry(
+            pull_cmd,
+            cwd=repo_root,
+            timeout_seconds=pull_timeout,
+            run_command=run_command,
+            on_retry=lambda outcome: _log_self_deploy_git_retry(repo_root, pull_cmd, outcome),
+        )
         if not pull_res.ok:
             repair = _repair_lossless_pull_blockers(
                 repo_root, run_command=run_command, timeout=pull_timeout
@@ -1324,7 +1360,15 @@ def _self_deploy_attempt(
                 # Exactly one retry, never a loop: the blocker set is recomputed
                 # from scratch on the next pass anyway, so looping here only
                 # hammers a tree that is genuinely stuck.
-                pull_res = run_command(pull_cmd, cwd=repo_root, timeout_seconds=pull_timeout)
+                pull_res = run_git_with_retry(
+                    pull_cmd,
+                    cwd=repo_root,
+                    timeout_seconds=pull_timeout,
+                    run_command=run_command,
+                    on_retry=lambda outcome: _log_self_deploy_git_retry(
+                        repo_root, pull_cmd, outcome
+                    ),
+                )
                 # A repair that WORKS is otherwise completely invisible: the
                 # wedge simply stops happening and the pass logs an ordinary
                 # success. That would make this fix a mask -- whatever keeps

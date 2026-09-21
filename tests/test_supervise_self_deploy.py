@@ -414,6 +414,51 @@ def test_self_deploy_pull_failure_surfaces_stderr_over_generic_error(
     assert len(calls) == 5
 
 
+def test_self_deploy_pull_retries_transient_failure_then_succeeds(
+    tmp_path: Path, no_fleet_live_sessions: None
+) -> None:
+    """A transient git-network blip on the pull is retried in place (raw
+    ``git`` calls previously had zero retry, unlike ``GitHub.run()``'s ``gh``
+    calls) rather than failing the whole pass -- and exactly one
+    ``git_network_retry`` event lands in events.db, not one per attempt.
+
+    If the pull call site were reverted to a bare ``run_command`` call (no
+    ``run_git_with_retry`` wrapping), this test fails: the fake runner would
+    hand the transient-failure ``RunResult`` straight back as the pull's
+    final result instead of retrying, and the queued "after HEAD"/"diff"
+    responses would never be consumed.
+    """
+    state_path = _self_deploy_state_path(tmp_path)
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),  # before HEAD
+            RunResult(
+                returncode=128,
+                stdout="",
+                stderr="fatal: unable to access 'https://github.com/x/y.git/': connectex",
+            ),  # pull attempt 1: transient
+            RunResult(0, "", ""),  # pull attempt 2 (retry): ok
+            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "src/foo.py\n", ""),  # diff (code-only)
+        ]
+    )
+
+    result = self_deploy(tmp_path, run_command=runner)
+
+    assert result.ok is True
+    assert result.pulled is True
+    assert result.from_sha == "abc123"
+    assert result.to_sha == "def456"
+    assert len(calls) == 5
+    assert calls[1][0] == ["git", "pull", "--ff-only", "origin", "main"]
+
+    retries = query_events(state_path, kind="git_network_retry")
+    assert len(retries) == 1
+    assert retries[0]["payload"]["site"] == "self_deploy"
+    assert retries[0]["payload"]["attempts"] == 2
+    assert retries[0]["payload"]["ok"] is True
+
+
 def test_command_failure_message_falls_back_to_error_then_fallback() -> None:
     """``_command_failure_message`` prefers stderr, then .error, then fallback."""
     stderr_result = RunResult(1, "", "  stderr detail  ")
