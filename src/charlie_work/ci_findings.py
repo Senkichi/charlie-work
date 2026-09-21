@@ -3,12 +3,21 @@
 Extracted verbatim from ``workflow.py``: two functions that render the
 review packet's CI-status section from already-fetched check data
 (``_ci_status_section``, ``_non_required_check_findings``); four functions
-that detect a stalled dispatch cadence from events.db
+that detect a stalled dispatch cadence
 (``_backlog_is_non_empty``, ``_latest_non_empty_dispatch``,
 ``_parse_iso_ts``, ``check_dispatch_staleness``); and two functions that
 turn a failing required check's GitHub annotations into
 ``required_changes`` entries (``_annotation_to_required_change``,
 ``_required_changes_from_checks``).
+
+Issue #1769: the dispatch-staleness baseline (``_latest_non_empty_dispatch``)
+used to scan the most recent 100 ``dispatch`` events.db rows for the last
+non-empty one -- bounded by event COUNT, which a sustained real stall could
+exhaust, silently flipping a genuine alarm to ``no_baseline``. It now reads
+the durable ``dispatch_cadence`` marker in the already-loaded state dict
+(``state.record_non_empty_dispatch``/``last_non_empty_dispatch``) instead,
+so this sub-cluster no longer touches events.db at all -- it reads only the
+in-memory state dict its caller already holds.
 
 These 8 names are NOT one call-graph-connected cluster -- they are three
 mutually disconnected sub-clusters (no call edges between them, and the
@@ -41,7 +50,7 @@ from .checks import (
 from .collect_only_gate import COLLECT_ONLY_GATE_CHECK_NAME, parse_exemption_log_marker
 from .config import DispatchConfig
 from .github import _job_id_from_link, label_names
-from .instrumentation import query_events
+from .state import is_dispatch_stale_alert_due, last_non_empty_dispatch
 
 
 def _ci_status_section(
@@ -177,30 +186,27 @@ def _backlog_is_non_empty(reachability: dict[str, Any]) -> bool:
     return reachability.get("open_total", 0) > 0
 
 
-def _latest_non_empty_dispatch(state_path: Path) -> dict[str, Any] | None:
-    """Return the most recent ``dispatch`` event whose ``issue_numbers`` is non-empty.
+def _latest_non_empty_dispatch(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the durable ``{"ts", "issue_numbers"}`` baseline dispatch reading.
 
-    Empty-payload dispatch events happen on every healthy zero-dispatch pass,
-    so they cannot be used to measure cadence. We scan newest-first.
+    Issue #1769: this used to scan the most recent 100 ``dispatch`` rows in
+    events.db for the newest one with non-empty ``issue_numbers`` -- bounded
+    by event COUNT, not by "does a non-empty one exist". During a sustained
+    stall the empty-payload passes (which happen on every healthy
+    zero-dispatch pass too, so they can't be used to measure cadence
+    themselves) accumulate past that bound and the lookup goes silent
+    (``no_baseline``) even though the real stall is ongoing -- exactly when
+    the alarm matters most, and reintroducing an unbounded scan would bring
+    back the full-table-scan cost the 100-row bound existed to avoid.
 
-    Bounded to the most recent 100 ``dispatch`` rows: ``query_events``'s
-    ``limit=`` selects with ``ORDER BY id DESC LIMIT ?`` and then re-orders
-    the result ascending, so this returns the newest 100 rows (oldest of
-    that 100 first) -- exactly what "scan newest-first" below needs, not
-    the oldest 100. Without a bound this ran an unindexed-by-limit full
-    scan of every ``dispatch`` row on every dispatch pass; this repo's own
-    events.db already holds thousands of them and the table grows without
-    bound. 100 is generous headroom: even at a 5-minute dispatch cadence,
-    the default 240-minute ``dispatch_staleness_minutes`` threshold only
-    needs to look back ~48 dispatch events to find the most recent
-    non-empty one.
+    Delegates to ``state.last_non_empty_dispatch``, which reads a durable
+    marker set by ``state.record_non_empty_dispatch`` whenever a dispatch
+    pass actually launches issues: an O(1) dict read that cannot fall out of
+    a rolling window no matter how long the stall runs. ``state`` is the
+    caller's already-loaded, in-memory state dict -- this function performs
+    no I/O of its own.
     """
-    events = query_events(state_path, kind="dispatch", limit=100)
-    for event in reversed(events):
-        issue_numbers = event.get("payload", {}).get("issue_numbers")
-        if isinstance(issue_numbers, list) and issue_numbers:
-            return event
-    return None
+    return last_non_empty_dispatch(state)
 
 
 def _parse_iso_ts(ts: str) -> datetime | None:
@@ -211,7 +217,7 @@ def _parse_iso_ts(ts: str) -> datetime | None:
 
 
 def check_dispatch_staleness(
-    state_path: Path,
+    state: dict[str, Any],
     config: DispatchConfig,
     backlog_reachability: dict[str, Any],
     *,
@@ -220,11 +226,17 @@ def check_dispatch_staleness(
 ) -> dict[str, Any]:
     """Issue #946: detect when a non-empty backlog has had no dispatch for too long.
 
-    Reads events.db for the most recent ``dispatch`` event whose payload
-    ``issue_numbers`` is non-empty. When that event is older than
-    ``config.dispatch_staleness_minutes`` and the unfiltered backlog is observed
-    to be non-empty, returns a stale diagnostic. Otherwise returns a no-op
-    diagnostic with ``stale: False``.
+    Reads the caller's already-loaded state dict for the durable baseline
+    marker (see ``_latest_non_empty_dispatch``) of the most recent dispatch
+    pass whose ``issue_numbers`` was non-empty. When that reading is older
+    than ``config.dispatch_staleness_minutes`` and the unfiltered backlog is
+    observed to be non-empty, returns a stale diagnostic. Otherwise returns
+    a no-op diagnostic with ``stale: False``. This function performs no I/O
+    and mutates nothing -- it is a pure read of ``state`` and
+    ``backlog_reachability``; the caller is responsible for persisting the
+    baseline marker (``state.record_non_empty_dispatch``) and for acting on
+    ``should_emit`` (``state.arm_dispatch_stale_alert`` /
+    ``clear_dispatch_stale_alert``).
 
     ``backlog_reachability`` must come from ``classify_backlog_reachability``.
     The ``observed: False`` case is treated as "unknown", not "empty", so a
@@ -242,9 +254,20 @@ def check_dispatch_staleness(
     four-day stall this detector exists to catch. The #944 detection stays
     intact: when ``dispatchable == 0`` and ``blocked_by_open_dependency == 0``
     (no ready issues at all, e.g. all ``missing_ready``), the alarm still fires.
+
+    Issue #1769: ``should_emit`` answers a second, orthogonal question --
+    given that ``stale`` is true, should the caller actually record a
+    ``dispatch_stale`` event *this pass*? It is edge-triggered (true on
+    stall onset) plus a bounded low-rate reminder (true again once
+    ``config.dispatch_staleness_minutes`` have elapsed since the last
+    emitted alert), reusing the staleness threshold itself as the reminder
+    cadence rather than introducing a second config knob for it. It is
+    always ``False`` when ``stale`` is ``False`` -- there is nothing to
+    (re-)emit for a healthy pass.
     """
     result: dict[str, Any] = {
         "stale": False,
+        "should_emit": False,
         "last_dispatch_at": None,
         "last_dispatch_issue_numbers": None,
         "age_seconds": None,
@@ -311,7 +334,7 @@ def check_dispatch_staleness(
         result["reason"] = "all_ready_blocked_by_dependencies"
         return result
 
-    latest = _latest_non_empty_dispatch(state_path)
+    latest = _latest_non_empty_dispatch(state)
     if latest is None:
         result["reason"] = "no_baseline"
         return result
@@ -323,12 +346,19 @@ def check_dispatch_staleness(
 
     age_seconds = int((now - last_ts).total_seconds())
     result["last_dispatch_at"] = latest["ts"]
-    result["last_dispatch_issue_numbers"] = list(latest["payload"].get("issue_numbers", []))
+    result["last_dispatch_issue_numbers"] = list(latest["issue_numbers"])
     result["age_seconds"] = age_seconds
 
     if age_seconds > result["threshold_seconds"]:
         result["stale"] = True
         result["reason"] = "dispatch_stale"
+        # Issue #1769 section 6 policy: edge-triggered + bounded low-rate
+        # reminder, not an unconditional re-fire every pass the condition
+        # holds. Reuses the staleness threshold itself as the reminder
+        # interval (see docstring) rather than a second config knob.
+        result["should_emit"] = is_dispatch_stale_alert_due(
+            state, now=now, reminder_minutes=threshold_minutes
+        )
     else:
         result["reason"] = "within_threshold"
 

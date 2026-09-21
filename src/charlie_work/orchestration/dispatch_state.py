@@ -80,11 +80,14 @@ from charlie_work.escalation import _escalate_issue, _escalation_edge
 from charlie_work.fleet_registry import managed_repo_names
 from charlie_work.labels import TransitionOutcome
 from charlie_work.state import (
+    arm_dispatch_stale_alert,
+    clear_dispatch_stale_alert,
     clear_escalation,
     clear_escalation_on_issue_prs,
     escalation_reason_class,
     is_throttled,
     operator_claimed_issues,
+    record_non_empty_dispatch,
 )
 
 
@@ -1702,15 +1705,42 @@ def _dispatch_impl(
         )
         # Issue #946: warn when a non-empty backlog has not produced a
         # non-empty dispatch event for longer than the configured threshold.
+        # Issue #1769: a single frozen clock read for this whole cluster --
+        # the durable baseline marker, the staleness check, and the alert
+        # cadence marker all timestamp against the same instant, mirroring
+        # the #828/#838 single-frozen-clock-per-pass invariant.
+        dispatch_cadence_now = datetime.now(UTC)
+        dispatch_cadence_now_iso = (
+            dispatch_cadence_now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
+        if successful_issue_numbers:
+            # Durable baseline marker (issue #1769): persisted here,
+            # whenever a pass actually dispatches, instead of re-derived by
+            # scanning events.db -- a durable field cannot fall out of a
+            # rolling window the way a count-bounded lookback can.
+            state = record_non_empty_dispatch(
+                state, dispatch_cadence_now_iso, sorted(successful_issue_numbers)
+            )
         dispatch_staleness = check_dispatch_staleness(
-            self.paths.state_file,
+            state,
             self.config.dispatch,
             backlog_reachability,
             recent_issue_numbers=sorted(successful_issue_numbers),
-            now=datetime.now(UTC),
+            now=dispatch_cadence_now,
         )
         if dispatch_staleness["stale"]:
-            state = self._record_event(state, "dispatch_stale", dispatch_staleness)
+            # Issue #1769: edge-triggered + bounded low-rate reminder, not
+            # an unconditional re-fire every pass the condition holds (the
+            # design artifact's section 6 policy). `should_emit` already
+            # encodes both the stall-onset edge and the reminder cadence.
+            if dispatch_staleness["should_emit"]:
+                state = arm_dispatch_stale_alert(state, dispatch_cadence_now_iso)
+                state = self._record_event(state, "dispatch_stale", dispatch_staleness)
+        else:
+            # Resolved (for whatever reason) -- reset the alert marker so
+            # the next stall onset is a fresh edge, not throttled by a
+            # previous unrelated episode's reminder cadence.
+            state = clear_dispatch_stale_alert(state)
         state = _wf.append_event(
             state,
             "dispatch",

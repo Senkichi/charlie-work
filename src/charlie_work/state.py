@@ -1287,6 +1287,125 @@ def arm_operator_queue_review(
     return {**data, "deescalation_pass": section}
 
 
+def _dispatch_cadence(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the dispatch-cadence bookkeeping sub-dict from ``data``.
+
+    Issue #1769: durable, non-count-bounded replacement for
+    ``ci_findings._latest_non_empty_dispatch``'s prior events.db
+    ``query_events(kind="dispatch", limit=100)`` lookback, which could
+    scroll the last real non-empty dispatch out of its window during a
+    sustained stall -- the exact failure mode this section exists to make
+    structurally impossible: a durable field cannot fall out of a rolling
+    window no matter how long the stall runs. Also carries the
+    edge-triggered ``dispatch_stale`` alert bookkeeping
+    (``last_stale_alert_at``) so the warning fires once at stall onset plus
+    a bounded low-rate reminder, never unconditionally every pass while the
+    condition still holds.
+
+    Ensures a mutable copy so callers can build new state without mutating
+    ``data``, mirroring ``_deescalation_pass``.
+    """
+    section = data.get("dispatch_cadence")
+    if not isinstance(section, dict):
+        return {}
+    return dict(section)
+
+
+def record_non_empty_dispatch(
+    data: dict[str, Any], at: str, issue_numbers: list[int]
+) -> dict[str, Any]:
+    """Persist the durable baseline marker for the latest non-empty dispatch.
+
+    Callers record this every time a dispatch pass actually launches one or
+    more issues (issue #1769). ``ci_findings.check_dispatch_staleness``
+    reads it back directly instead of re-deriving "when did dispatch last do
+    something" from a windowed events.db scan -- an O(1) dict read that
+    cannot degrade no matter how many empty dispatch passes accumulate
+    afterward, unlike the count-bounded lookback it replaces.
+
+    Returns a new state dict; does not mutate ``data``.
+    """
+    section = _dispatch_cadence(data)
+    section["last_non_empty_dispatch_at"] = at
+    section["last_non_empty_dispatch_issue_numbers"] = sorted(issue_numbers)
+    return {**data, "dispatch_cadence": section}
+
+
+def last_non_empty_dispatch(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the durable ``{"ts", "issue_numbers"}`` baseline, or ``None``.
+
+    ``None`` means no non-empty dispatch has ever been recorded through
+    :func:`record_non_empty_dispatch` for this repo (a fresh deploy, or a
+    repo that has not yet had a dispatch pass since this marker was
+    introduced) -- callers treat that the same as the prior ``no_baseline``
+    reason.
+    """
+    section = _dispatch_cadence(data)
+    at = section.get("last_non_empty_dispatch_at")
+    if not at:
+        return None
+    return {
+        "ts": at,
+        "issue_numbers": list(section.get("last_non_empty_dispatch_issue_numbers", [])),
+    }
+
+
+def is_dispatch_stale_alert_due(
+    data: dict[str, Any], *, now: datetime, reminder_minutes: int
+) -> bool:
+    """True when a ``dispatch_stale`` warning should be (re-)emitted now.
+
+    Issue #1769 (design artifact section 6 policy): a warning describing a
+    *condition* that continues to hold across passes must be edge-triggered,
+    never re-fired every pass merely because the condition still holds. An
+    absent ``last_stale_alert_at`` means this is a fresh stall onset (the
+    edge) -- always due. Otherwise due once ``reminder_minutes`` have
+    elapsed since the last alert, a bounded low-rate reminder so a
+    long-running stall does not go fully silent between edges. A malformed
+    timestamp or a non-positive ``reminder_minutes`` is treated as due,
+    mirroring ``is_reconcile_due``'s "corrupt/unset schedule is due
+    immediately" contract, so neither can silently suppress the alarm
+    forever.
+    """
+    last_at = _dispatch_cadence(data).get("last_stale_alert_at")
+    if not last_at or reminder_minutes <= 0:
+        return True
+    try:
+        last_time = datetime.fromisoformat(str(last_at).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return True
+    return now >= last_time + timedelta(minutes=reminder_minutes)
+
+
+def arm_dispatch_stale_alert(data: dict[str, Any], at: str) -> dict[str, Any]:
+    """Record that a ``dispatch_stale`` warning was just emitted at ``at``.
+
+    Returns a new state dict; does not mutate ``data``.
+    """
+    section = _dispatch_cadence(data)
+    section["last_stale_alert_at"] = at
+    return {**data, "dispatch_cadence": section}
+
+
+def clear_dispatch_stale_alert(data: dict[str, Any]) -> dict[str, Any]:
+    """Reset the alert marker once the backlog is no longer stale.
+
+    Called every pass the condition does not hold, regardless of reason
+    (resolved, backlog empty, dependency-blocked, current-pass short
+    circuit, ...). The next stall onset is then a fresh edge --
+    ``is_dispatch_stale_alert_due`` returns ``True`` immediately -- instead
+    of inheriting the reminder cadence of a previous, unrelated stall.
+    Leaves the ``last_non_empty_dispatch_at`` baseline marker untouched;
+    only the alert-cadence field is reset. Returns a new state dict; does
+    not mutate ``data``.
+    """
+    section = _dispatch_cadence(data)
+    if section.get("last_stale_alert_at") is None:
+        return data
+    section["last_stale_alert_at"] = None
+    return {**data, "dispatch_cadence": section}
+
+
 def any_quota_exhausted_indicator(data: dict[str, Any]) -> bool:
     """True when either throttle mechanism is currently active.
 

@@ -19,7 +19,6 @@ can import them:
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +26,8 @@ import pytest
 
 from _fakes_github import FakeGitHub
 from charlie_work.config import OrchestratorConfig
-from charlie_work.instrumentation import log_event
 from charlie_work.paths import runtime_paths
+from charlie_work.state import load_state, record_non_empty_dispatch, save_state
 from charlie_work.workflow import OrchestratorApp
 
 
@@ -85,23 +84,18 @@ def _requests(count: int, tmp_path: Path) -> list:
 
 
 def _seed_backdated_dispatch_event(state_path: Path, ts: str, issue_numbers: list[int]) -> None:
-    """Write one ``dispatch`` event to events.db with a caller-chosen ``ts``.
+    """Persist a caller-chosen non-empty-dispatch baseline directly to state.json.
 
-    ``log_event`` always stamps real wall-clock time, so this inserts
-    normally and then backdates the row -- the same pattern
-    ``tests/test_dispatch_staleness.py`` uses to build a staleness baseline.
+    Issue #1769: ``check_dispatch_staleness``'s baseline lookup now reads the
+    durable ``dispatch_cadence`` marker in state.json (written by
+    ``record_non_empty_dispatch`` at real dispatch time) instead of scanning
+    events.db for the newest non-empty ``dispatch`` row, so seeding a test
+    baseline means writing that marker directly -- the same durable-field
+    approach ``tests/test_dispatch_staleness.py`` uses.
     """
-    log_event(state_path, "dispatch", {"issue_numbers": issue_numbers})
-    db_path = state_path.parent / "events.db"
-    conn = sqlite3.connect(str(db_path))
-    try:
-        cursor = conn.execute("SELECT MAX(id) FROM events WHERE kind = 'dispatch'")
-        row = cursor.fetchone()
-        if row and row[0]:
-            conn.execute("UPDATE events SET ts = ? WHERE id = ?", (ts, row[0]))
-            conn.commit()
-    finally:
-        conn.close()
+    data = load_state(state_path)
+    data = record_non_empty_dispatch(data, ts, issue_numbers)
+    save_state(state_path, data)
 
 
 def _fail_if_launched(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
