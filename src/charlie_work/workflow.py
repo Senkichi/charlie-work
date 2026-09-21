@@ -879,7 +879,7 @@ class ConcurrencyGovernorResult:
     # rework/recovery/loop paths regardless of the configured ratio.
     # ``ci_headroom`` is the ``ci_headroom_available()`` reading: ``None``
     # when the ratio is 0 (clamp off) or the data could not be trusted this
-    # pass (fail-open -- see ``orchestration.ci_headroom``'s docstring), an
+    # pass (fail-open -- see ``ci_headroom``'s docstring), an
     # int otherwise.
     ci_headroom: int | None = None
     ci_headroom_ratio: float = 0.0

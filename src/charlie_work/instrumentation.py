@@ -248,7 +248,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # see that launches are being held by the budget, not silently dropped.
         "api_budget_refused": "warning",
         "ci_fleet_worktree_dirty": "warning",
-        # Issue #1770: ci_headroom_available (orchestration/ci_headroom.py)
+        # Issue #1770: ci_headroom_available (ci_headroom.py)
         # could not compute a repo's CI dispatch headroom from the freshest
         # runner_allocation event (missing, stale, unconfigured repo, a
         # pinned/unmeasurable demand reading, or a malformed payload).

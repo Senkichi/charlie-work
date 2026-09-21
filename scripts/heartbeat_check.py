@@ -2322,7 +2322,7 @@ def check_draft_pr_blocked_events(report: Report, repo: RepoInfo, baseline: date
 def check_ci_headroom_unavailable(report: Report, repo: RepoInfo, baseline: datetime) -> None:
     """Surface ``ci_headroom_unavailable`` events periodically (issue #1770).
 
-    ``ci_headroom_available()`` (``orchestration/ci_headroom.py``) records
+    ``ci_headroom_available()`` (``charlie_work/ci_headroom.py``) records
     this warning-level event whenever it cannot trust the freshest
     ``runner_allocation`` reading for a repo that has opted into the
     CI-headroom clamp (``dispatch.ci_capacity_headroom_ratio > 0``) -- the

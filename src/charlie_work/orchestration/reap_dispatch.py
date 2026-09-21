@@ -25,12 +25,12 @@ from typing import Any
 
 import charlie_work.workflow as _wf
 from charlie_work import layout
+from charlie_work.ci_headroom import ci_headroom_available
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.github import GitHubError, GraphQLBudgetError
 from charlie_work.instrumentation import log_event
 from charlie_work.janitor import JanitorVerdict
-from charlie_work.orchestration.ci_headroom import ci_headroom_available
 from charlie_work.safe_ref import require_valid_sha
 from charlie_work.state import StateLockBusy
 from charlie_work.dead_worker_reap import _is_pr_updated_at_older_than, _safe_repo_slug

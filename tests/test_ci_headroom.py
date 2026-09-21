@@ -14,11 +14,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from charlie_work.instrumentation import log_event, query_events
-from charlie_work.orchestration.ci_headroom import (
+from charlie_work.ci_headroom import (
     ALLOCATION_EVENT_KIND,
     ci_headroom_available,
 )
+from charlie_work.instrumentation import log_event, query_events
 
 
 def _log_allocation(

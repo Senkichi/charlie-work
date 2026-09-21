@@ -15,6 +15,7 @@
     "src/charlie_work/worktree.py": 3,
     "tests/_dispatch_fixtures.py": 2,
     "tests/_reconcile_fixtures.py": 1,
+    "tests/_state_dir_migration_fixtures.py": 3,
     "tests/test_backfill_stale_rework_briefs.py": 2,
     "tests/test_capacity_starvation_escalation.py": 2,
     "tests/test_charlie_work_orphaned_worker_reclaim.py": 1,
@@ -22,8 +23,10 @@
     "tests/test_charlie_work_review_dispatch.py": 1,
     "tests/test_charlie_work_session_lifecycle_reap.py": 1,
     "tests/test_charlie_work_stalled_reviews.py": 1,
+    "tests/test_ci_capacity_backpressure.py": 1,
     "tests/test_ci_fleet_provenance.py": 7,
     "tests/test_ci_fleet_seams.py": 7,
+    "tests/test_ci_headroom.py": 40,
     "tests/test_citation_check.py": 1,
     "tests/test_cli_bootstrap.py": 5,
     "tests/test_cli_runners_allocate.py": 1,
@@ -54,10 +57,12 @@
     "tests/test_reconcile_aviator.py": 1,
     "tests/test_reconcile_drift_state.py": 1,
     "tests/test_stale_checks_detection_regression.py": 1,
-    "tests/test_state_dir_migration.py": 10,
+    "tests/test_state_dir_migration_model.py": 3,
+    "tests/test_state_dir_migration_plan.py": 2,
+    "tests/test_state_dir_migration_rewrite.py": 2,
     "tests/test_supervise_venv_repair.py": 3,
     "tests/test_worker_declared_blocked.py": 2,
     "tests/test_worktree.py": 11
   },
-  "total": 179
+  "total": 220
 }

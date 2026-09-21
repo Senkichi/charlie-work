@@ -342,7 +342,7 @@ class DispatchConfig:
     # fresh dispatch additionally clamps to ci_headroom_available()'s reading
     # for this repo -- floor(registered_runner_capacity * ratio) minus live
     # queued+in_progress CI *job* demand, both already measured by ci_fleet's
-    # runner_allocation pass (see orchestration/ci_headroom.py; no new
+    # runner_allocation pass (see ci_headroom.py; no new
     # GitHub calls). Paces fresh PR creation to the repo's actual CI
     # throughput instead of only to worker concurrency, so the in-flight-PR
     # queue stops outrunning what CI can drain (runner-starvation.md
@@ -356,7 +356,7 @@ class DispatchConfig:
     # load (demand == capacity, zero queue is NOT saturation) -- pick a
     # ratio meaningfully above 1.0 for a repo with multi-job PRs, and expect
     # to tune it per repo rather than reusing one value fleet-wide. See
-    # orchestration/ci_headroom.py's module docstring for the full rationale.
+    # ci_headroom.py's module docstring for the full rationale.
     #
     # Repos with no self-hosted runner_allocation entry (e.g. public
     # charlie-work's hosted-runner repos) have no reading to clamp against,

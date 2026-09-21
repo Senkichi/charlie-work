@@ -19,10 +19,10 @@ from pathlib import Path
 from typing import Any
 
 from _fakes_github import FakeGitHub
+from charlie_work.ci_headroom import ALLOCATION_EVENT_KIND
 from charlie_work.config import DevinConfig, DispatchConfig, OrchestratorConfig
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.instrumentation import log_event, query_events
-from charlie_work.orchestration.ci_headroom import ALLOCATION_EVENT_KIND
 from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
 from charlie_work import layout
