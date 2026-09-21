@@ -55,6 +55,7 @@ from .github import (
     parse_blockers,
 )
 from .issue_linking import linked_issue_number
+from .pr_unlinked_visibility import summarize_unlinked_prs
 
 # LOAD-BEARING RE-EXPORT -- NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
@@ -4124,6 +4125,19 @@ class OrchestratorApp:
             )
             is not None
         ]
+        # Issue #1766: the merge lane's per-PR loop skips
+        # any open PR with no resolvable linked issue before it ever touches
+        # `linked_prs` above -- such a PR is otherwise invisible to every
+        # operator-facing surface. This is the "current set at any time"
+        # view (the edge-triggered `pr_unlinked_skipped` event is the
+        # complementary transition log); reads only this call's own already-
+        # fetched `prs` and `state["prs"]`, so it adds no GitHub calls.
+        unlinked_prs = summarize_unlinked_prs(
+            prs,
+            state.get("prs", {}),
+            branch_prefix=self.config.dispatch.branch_prefix,
+            now=now,
+        )
         data = {
             "ready_issue_count": len(issues),
             "available_issue_count": len(truly_available),
@@ -4133,6 +4147,8 @@ class OrchestratorApp:
             "auto_merge_enabled": self.config.auto_merge.enabled,
             "issues": [self._summarize_issue(issue) for issue in issues],
             "prs": linked_prs,
+            "unlinked_prs": unlinked_prs,
+            "unlinked_pr_count": len(unlinked_prs),
             "last_generated_at": state.get("generated_at"),
             "blocked": [
                 {"issue": issue_number, "blockers": blockers}

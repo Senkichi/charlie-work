@@ -307,6 +307,14 @@ def _loop_body(
             branch_issue_validator=branch_validator,
         )
         if issue_number is None:
+            # Previously a bare `continue` with zero instrumentation -- no
+            # event, no operator signal, so a PR with no resolvable linked
+            # issue (e.g. Dependabot's own branch/body convention) could rot
+            # unreviewed indefinitely with nothing in events.db to show for
+            # it. Edge-triggered: fires once on first sight and again only
+            # when the PR's material state changes -- see
+            # `_record_unlinked_pr_skip`'s docstring.
+            self._record_unlinked_pr_skip(pr, int(pr["number"]), now=loop_now)
             continue
         pr_number = int(pr["number"])
         parked = (state_snapshot["prs"].get(str(pr_number)) or {}).get("foreign_issue_ref") or {}
