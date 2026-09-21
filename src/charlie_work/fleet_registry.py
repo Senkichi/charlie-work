@@ -5,8 +5,10 @@ import logging
 import os
 import tempfile
 import threading
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from . import layout
@@ -561,7 +563,7 @@ def managed_repo_names(fleet_dir_override: str | None) -> frozenset[str]:
     return frozenset(_repo_name_segment(name) for name in repos)
 
 
-def managed_repo_roots(fleet_dir_override: str | None) -> dict[str, Path]:
+def managed_repo_roots(fleet_dir_override: str | None) -> Mapping[str, Path]:
     """Return ``{repo_name: repo_root}`` for every repo managed by the fleet.
 
     Mirrors :func:`managed_repo_names`'s name extraction (the shared
@@ -577,14 +579,43 @@ def managed_repo_roots(fleet_dir_override: str | None) -> dict[str, Path]:
     (should not happen in practice — ``touch_repo`` always writes one) is
     skipped rather than mapping the name to a placeholder path that could
     spuriously "contain" every relative candidate.
+
+    Two entries whose ``owner/repo`` keys share the same repo-name segment
+    (``ownerA/foo`` and ``ownerB/foo``) collapse to one dict key; unlike
+    :func:`managed_repo_names` (a set, where the collapse is lossless), one
+    of the two roots here is silently dropped and never searched by the
+    cross-repo gate. A collision is logged (review finding 7) so it is at
+    least observable; the fix for a fleet that legitimately manages two
+    same-named repos under different owners is to key the cross-repo
+    search by the full ``owner/repo`` instead, which is a larger,
+    cross-module change tracked separately. Returns a read-only
+    :class:`~types.MappingProxyType` — like ``managed_repo_names``'s
+    ``frozenset``, callers must not expect to mutate the fleet's view of
+    its own managed repos.
     """
     fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     data = _load_registry(fleet_json_path)
     repos = data.get("repos", {})
     roots: dict[str, Path] = {}
+    owners_by_name: dict[str, str] = {}
     for name_with_owner, entry in repos.items():
         repo_root_str = entry.get("repo_root")
         if not repo_root_str:
             continue
-        roots[_repo_name_segment(name_with_owner)] = Path(repo_root_str)
-    return roots
+        name = _repo_name_segment(name_with_owner)
+        existing_owner = owners_by_name.get(name)
+        if existing_owner is not None and existing_owner != name_with_owner:
+            logger.warning(
+                "managed_repo_roots: repo-name collision on %r -- %r and %r "
+                "both map to this name; keeping %r, dropping %r's root from "
+                "the cross-repo gate's sibling search entirely.",
+                name,
+                existing_owner,
+                name_with_owner,
+                existing_owner,
+                name_with_owner,
+            )
+            continue
+        owners_by_name[name] = name_with_owner
+        roots[name] = Path(repo_root_str)
+    return MappingProxyType(roots)

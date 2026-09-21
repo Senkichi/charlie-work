@@ -112,33 +112,59 @@ def test_absolute_path_inside_repo_passes(tmp_path: Path) -> None:
 
 
 def test_absolute_path_outside_repo_blocks(tmp_path: Path) -> None:
-    """An absolute path to a different repo now abstains rather than blocks
-    when no fleet registry is supplied — positive sibling-repo evidence is
-    required to escalate (issues #1756-#1758), so an unregistered absolute
-    path is "not found anywhere in the fleet" rather than automatic
-    cross-repo evidence. (Name kept for history; see
-    ``test_missing_path_found_in_sibling_repo_blocks`` for the escalating
-    case with a registered sibling.)"""
-    body = "The file is at `C:/Users/operator/repos/ci_runners/src/ci_fleet/suite_coverage.py`."
-    result = cross_repo_gate(body, tmp_path)
-    assert result.passed
-    assert "abstaining" in result.reason
+    """Restored by review finding 5 (the founding #1010/#953 protection): a
+    real, on-disk absolute path outside the target repo is positive
+    evidence of a foreign checkout on its own terms
+    (:func:`_is_confirmed_foreign_absolute_path`) — independent of the
+    fleet registry, so this blocks even with no ``managed_repo_roots``
+    supplied. That is the exact #1010 shape: the offending sibling
+    (``ci_runners``) was never a registered fleet member either.
+
+    Earlier revisions of this test used the literal, fictional
+    ``C:/Users/operator/...`` string from the original issue report, which
+    does not exist on the machine actually running the test — under the
+    positive-evidence redesign (issues #1756-#1758) that reads as "not
+    found anywhere," so it abstained rather than blocked. This version
+    builds a real on-disk sibling file so ``path.exists()`` is genuinely
+    ``True``, which is what makes it positive evidence rather than merely
+    an absolute-looking string.
+    """
+    this_repo = tmp_path / "charlie-work"
+    this_repo.mkdir()
+    sibling_root = tmp_path / "ci_runners"
+    (sibling_root / "src" / "ci_fleet").mkdir(parents=True)
+    sibling_file = sibling_root / "src" / "ci_fleet" / "suite_coverage.py"
+    sibling_file.write_text("# suite_coverage", encoding="utf-8")
+
+    body = f"The file is at `{sibling_file.as_posix()}`."
+    result = cross_repo_gate(body, this_repo)
+    assert not result.passed
+    assert "positive evidence of a foreign checkout" in result.reason
 
 
 def test_posix_style_absolute_path_outside_repo_blocks(tmp_path: Path) -> None:
-    """A POSIX-style absolute path (no drive letter) also now abstains
-    without a fleet registry, rather than blocking.
+    """A POSIX-style absolute path (no drive letter) still abstains here,
+    unlike its drive-letter sibling above — a sandboxing constraint, not a
+    gap in the finding-5 fix itself.
 
     ``Path(candidate).is_absolute()`` is platform-dependent: on Windows a
     POSIX-style absolute path like ``/home/user/other-repo/foo.py`` reports
-    ``is_absolute() is False`` (no drive letter). The single-ambiguous-
-    candidate branch this test originally guarded no longer exists — the
-    positive-evidence redesign (issues #1756-#1758) removed it entirely in
-    favor of the sibling-repo check — but ``_is_absolute_path`` is still
-    load-bearing inside ``_find_owning_repo``/``_resolve_within_root``, so
-    this pins that a POSIX-style absolute candidate is still correctly
-    recognized as absolute (not silently mis-joined onto a repo root) even
-    though the outcome here, with no registry supplied, is abstain.
+    ``is_absolute() is False`` (no drive letter); ``_is_absolute_path``
+    (used by :func:`_is_confirmed_foreign_absolute_path`,
+    :func:`_find_owning_repo`, and :func:`_resolve_within_root`) corrects
+    for that. But this test cannot build a *real*, on-disk fixture for it
+    the way ``test_absolute_path_outside_repo_blocks`` does: joining a
+    POSIX-style absolute string onto a Windows path drops everything but the
+    drive (``Path("C:/tmp") / Path("/home/x.py") == Path("C:/home/x.py")``),
+    and writing a real file at a fixed POSIX-style absolute location (e.g.
+    ``/home/operator/other-repo/foo.py``, which resolves to
+    ``<current-drive>:\\home\\operator\\other-repo\\foo.py`` on this host)
+    would write outside both ``tmp_path`` and the worktree, which nothing
+    in this suite is allowed to do. So this test still exercises only the
+    abstain path (the candidate is recognized as absolute but does not
+    exist on disk) — it pins that ``_is_absolute_path`` correctly
+    identifies the candidate as absolute (not silently mis-joined onto
+    ``tmp_path``) rather than pinning the escalation outcome itself.
     """
     body = "The bug is in /home/operator/other-repo/foo.py."
     result = cross_repo_gate(body, tmp_path)
@@ -277,21 +303,37 @@ def test_single_repo_shaped_relative_candidate_still_escalates(tmp_path: Path) -
 
 def test_issue_953_scenario_blocks(tmp_path: Path) -> None:
     """The exact scenario from issue #1010/#953: issue body references
-    ``suite_coverage.py`` at a path in a sibling repo, with no matching file
-    in the target repo, and no fleet registry supplied — abstains rather
-    than blocks (positive-evidence redesign, #1756-#1758). See
-    ``test_missing_path_found_in_sibling_repo_blocks`` for the same body
-    shape WITH a registered sibling repo, which escalates."""
+    ``suite_coverage.py`` at an absolute path in a sibling repo, with no
+    matching file in the target repo. Restored to a real block by review
+    finding 5's founding-incident protection
+    (:func:`_is_confirmed_foreign_absolute_path`) — no fleet registry is
+    supplied, matching the original incident (``ci_runners`` was never a
+    registered fleet member), so this is independent evidence, not the
+    sibling-registry search.
+
+    Built with a real on-disk sibling file (see
+    ``test_absolute_path_outside_repo_blocks``) rather than the original
+    issue's literal ``C:/Users/operator/...`` text, which does not exist on
+    the machine running the test and would otherwise abstain under the
+    positive-evidence redesign (issues #1756-#1758).
+    """
+    this_repo = tmp_path / "charlie-work"
+    this_repo.mkdir()
+    sibling_root = tmp_path / "ci_runners"
+    (sibling_root / "src" / "ci_fleet").mkdir(parents=True)
+    sibling_file = sibling_root / "src" / "ci_fleet" / "suite_coverage.py"
+    sibling_file.write_text("# suite_coverage", encoding="utf-8")
+
     body = (
         "But **#953's code does not live in this repo.** `suite_coverage.py` is at "
-        "`C:/Users/operator/repos/ci_runners/src/ci_fleet/suite_coverage.py`; there is no "
+        f"`{sibling_file.as_posix()}`; there is no "
         "`src/charlie_work/suite_coverage.py`. The worker, handed an isolated checkout "
         "of a repo that does not contain the file it was asked to change, went to "
-        "`C:\\Users\\operator\\repos\\ci_runners` — the **shared main checkout** — and worked there."
+        f"`{sibling_root.as_posix()}` — the **shared main checkout** — and worked there."
     )
-    result = cross_repo_gate(body, tmp_path)
-    assert result.passed
-    assert "abstaining" in result.reason
+    result = cross_repo_gate(body, this_repo)
+    assert not result.passed
+    assert "positive evidence of a foreign checkout" in result.reason
 
 
 def test_domain_token_adjacent_to_real_path_does_not_swallow_it(

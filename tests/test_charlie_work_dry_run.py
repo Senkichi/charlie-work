@@ -400,3 +400,53 @@ def test_dry_run_dispatch_cross_repo_gate_reports_without_mutating(tmp_path: Pat
     state = load_state(paths.state_file)
     assert state["issues"] == {}
     assert state["events"] == []
+
+
+def test_dry_run_cross_repo_override_label_skips_both_gates(tmp_path: Path) -> None:
+    """Review finding 4 (dry-run): an issue carrying the cross-repo override
+    label is reported as dispatch-planned, not escalated, in the dry-run
+    payload -- the override short-circuits both gates in the dry-run branch
+    too, mirroring the real-dispatch override valve
+    (``test_dispatch_cross_repo_override_label_skips_both_gates`` in
+    ``test_charlie_work_dispatch_blockers.py``).
+
+    Uses the SAME issue body and sibling registration as
+    ``test_dry_run_dispatch_cross_repo_gate_reports_without_mutating`` --
+    which reports the issue as escalated without the label -- so this test
+    isolates the label as what changes the outcome.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    fake_gh.issues[0]["body"] = _cross_repo_issue_body()
+    fake_gh.issues[0]["labels"].append({"name": config.labels.cross_repo_override})
+    sibling_root = tmp_path / "sibling-ci-runners"
+    _write_sibling_repo_file(sibling_root, "src/ci_fleet/suite_coverage.py")
+    _write_fleet_registry(
+        tmp_path / "fleet",
+        {"owner/ci-runners": {"repo_root": str(sibling_root)}},
+    )
+    app = OrchestratorApp(
+        repo_root=tmp_path,
+        paths=paths,
+        config=config,
+        gh=fake_gh,
+        dry_run=True,
+    )
+
+    result = app.dispatch()
+
+    # The issue is reported as override-planned, not escalated.
+    assert result.ok is True
+    assert result.data["cross_repo_escalated_issue_numbers"] == []
+    assert result.data["cross_repo_override_issue_numbers"] == [123]
+    assert result.data["selected_count"] == 1
+    session_issue_numbers = {session["issue_number"] for session in result.data["sessions"]}
+    assert 123 in session_issue_numbers
+
+    # Dry-run must not mutate labels, state, or events -- unchanged by the
+    # override valve.
+    state = load_state(paths.state_file)
+    assert state["issues"] == {}
+    assert state["events"] == []

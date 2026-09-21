@@ -124,6 +124,33 @@ segment-boundary suffix-match helper, :func:`_segment_boundary_suffix_match`,
 used today by :func:`_find_owning_repo` and written so #1757's fix can
 reuse it rather than duplicate the segment-boundary logic.)
 
+Founding #1010/#953 protection, restored unconditionally (2026-09-21
+review of the positive-evidence redesign, finding 5): narrowing escalation
+to "found under one of the fleet's *registered* siblings" silently dropped
+the original protection for a foreign checkout that is not itself a
+managed fleet repo — exactly the founding incident's own shape
+(``ci_runners`` was never registered). Independent of
+``managed_repo_roots`` entirely, a missing survivor that is an absolute
+path resolving outside ``repo_root`` and that exists on disk right now
+(:func:`_is_confirmed_foreign_absolute_path`) escalates on its own terms —
+a real, on-disk absolute path elsewhere is positive evidence of a foreign
+checkout without needing a fleet registry lookup to confirm it.
+
+The sibling-repo search itself is now also root-aware, not name-only
+(review finding 3): :func:`_find_owning_repo` excludes a ``managed_roots``
+entry both by ``dispatching_repo_name`` (the computed name, which can
+mismatch the registry key on a transient lookup failure) and by whether
+the entry's root resolves to (or contains) the dispatching repo's actual
+``repo_root`` — so a name mismatch can never turn the dispatching repo
+into its own reported "sibling". Each sibling's file listing
+(:func:`_repo_tracked_files`, ``git ls-files`` — tracked files only, so a
+nested ``.claude/worktrees/`` or ``.venv`` copy of the same leaf filename
+never makes the suffix match ambiguous, review finding 2) is computed at
+most once per root per :func:`cross_repo_gate` call, not once per missing
+candidate (review finding 1: an uncached, unpruned full-tree walk repeated
+per candidate measured 37 seconds against this fleet's largest managed
+repo).
+
 Also added as cheap defense-in-depth: a candidate containing *any* embedded
 whitespace (not just runs of 2+, issue #1756's own narrower proposal) is
 dropped at extraction, alongside the existing glob/placeholder/launcher-owned
@@ -145,6 +172,7 @@ existing pass/escalate rule above applies to the survivors unchanged.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from collections.abc import Mapping
@@ -156,10 +184,20 @@ from .cross_repo_gate_shorthand import _is_dotdot_shorthand, _resolve_list_short
 from .safe_path import contains
 from .subprocess_runner import run_captured
 
+logger = logging.getLogger(__name__)
+
 #: Timeout for the ``git check-ignore`` invocation used to classify a
 #: candidate as a gitignored runtime artifact. A single-path lookup is
 #: sub-second in practice; this is a backstop against a wedged index lock.
 _CHECK_IGNORE_TIMEOUT_SECONDS = 5
+
+#: Timeout for the ``git ls-files`` invocation used to list a sibling
+#: repo's tracked files for the segment-boundary suffix match (review
+#: findings 1/2). A single listing is sub-second in practice even against
+#: a 750k-file tree (measured against this fleet's largest managed repo,
+#: job-cannon) since git already indexes the tree; this is a backstop
+#: against a wedged index lock, not the expected runtime.
+_LS_FILES_TIMEOUT_SECONDS = 15
 
 # A file extension: 1-10 word characters after a dot.  Bounds the length so
 # the regex does not match version strings like ``1.2.3.4.5.6.7.8.9.0``.
@@ -699,18 +737,36 @@ def _resolve_within_root(root: Path, path_str: str) -> Path | None:
 def _all_repo_files(repo_root: Path) -> list[str]:
     """Return every file under ``repo_root``, POSIX-separated and relative.
 
+    Fallback listing used by :func:`_repo_tracked_files` when ``git
+    ls-files`` fails (``repo_root`` is not a git repository, the git binary
+    is missing, or the call times out) — see there for the primary listing
+    every real call site uses today. Only ``.git`` is pruned during the
+    walk (not filtered afterward), so unlike the tracked-files listing this
+    can surface untracked/vendored duplicates (a nested ``.claude/worktrees/``
+    or ``.venv`` copy of the same leaf filename); :func:`_segment_boundary_suffix_match`
+    treats that ambiguity the same as "not found" rather than guessing, so
+    this fallback degrades to strictly *less* precise, never wrong.
+
     Derived fresh from the live filesystem — never cached across calls —
     mirroring the rest of this module's "ask the filesystem, don't
-    hand-maintain a list" convention. ``.git`` is pruned during the walk
-    (not filtered afterward) so a large history does not slow down every
-    lookup; a real source file is never inside ``.git``. Best-effort: an
-    ``OSError`` mid-walk (a repo root that vanishes concurrently) returns
-    whatever was collected so far rather than raising, matching
-    ``_top_level_dirs``'s historical "empty/partial on error" contract.
+    hand-maintain a list" convention. Best-effort: an unreadable
+    subdirectory is skipped (logged, not silently dropped) rather than
+    aborting the whole listing, and an ``OSError`` mid-walk (a repo root
+    that vanishes concurrently) returns whatever was collected so far
+    rather than raising, matching ``_top_level_dirs``'s historical
+    "empty/partial on error" contract.
     """
     files: list[str] = []
+
+    def _log_walk_error(exc: OSError) -> None:
+        logger.debug(
+            "cross_repo_gate: os.walk fallback skipped an unreadable path under %s: %s",
+            repo_root,
+            exc,
+        )
+
     try:
-        for dirpath, dirnames, filenames in os.walk(repo_root):
+        for dirpath, dirnames, filenames in os.walk(repo_root, onerror=_log_walk_error):
             dirnames[:] = [d for d in dirnames if d != ".git"]
             for filename in filenames:
                 rel = Path(dirpath, filename).relative_to(repo_root).as_posix()
@@ -718,6 +774,36 @@ def _all_repo_files(repo_root: Path) -> list[str]:
     except OSError:
         return files
     return files
+
+
+def _repo_tracked_files(repo_root: Path) -> list[str]:
+    """Return every git-tracked file under ``repo_root``, POSIX-separated
+    and relative to it.
+
+    Uses ``git ls-files`` — one subprocess call, sub-second even against a
+    750k-file repo (job-cannon, measured) — instead of walking the
+    filesystem: tracked-only is worktree/``.venv``/``node_modules``/build-
+    output-free *by construction*, with no prune list to hand-maintain and
+    no chance of it drifting out of sync (review findings 1/2: an
+    unpruned, uncached ``os.walk`` was both a 37-second-per-call liveness
+    hazard against this fleet's largest repo and made every real candidate
+    "ambiguous" for :func:`_segment_boundary_suffix_match` — every managed
+    repo on this fleet has at least one nested ``.claude/worktrees/`` or
+    ``.venv`` copy of *something*, so 2+ matches was the norm, not the
+    exception).
+
+    Falls back to :func:`_all_repo_files` (a pruned ``os.walk``) when ``git
+    ls-files`` fails. The fallback is strictly noisier, never wrong: see
+    its own docstring.
+    """
+    result = run_captured(
+        ["git", "ls-files"],
+        cwd=repo_root,
+        timeout_seconds=_LS_FILES_TIMEOUT_SECONDS,
+    )
+    if result.ok:
+        return [line.replace("\\", "/") for line in result.stdout.splitlines() if line]
+    return _all_repo_files(repo_root)
 
 
 def _segment_boundary_suffix_match(candidate: str, files: list[str]) -> str | None:
@@ -749,21 +835,62 @@ def _segment_boundary_suffix_match(candidate: str, files: list[str]) -> str | No
     return None
 
 
+def _excludes_dispatching_root(root: Path, dispatching_repo_root: Path) -> bool:
+    """Return ``True`` when ``root`` is the dispatching repo's own root.
+
+    Review finding 3: name-based exclusion alone (``repo_name == exclude``
+    in :func:`_find_owning_repo`) compares ``_dispatching_repo_name``'s
+    *computed* name against the registry key. That computation falls back
+    to ``repo_root.name`` when the ``gh`` lookup fails (a transient API
+    blip, offline), which need not match the repo's registered
+    ``owner/repo`` segment — a mismatch there would otherwise let the
+    dispatching repo's own registered entry be searched as if it were a
+    foreign sibling, escalating the repo against itself. Root equality (or
+    containment, via :func:`charlie_work.safe_path.contains`) is checked
+    independently of whatever name was computed, so this exclusion holds
+    even when the name-based one fails.
+
+    Deliberately one-directional: only "the dispatching root is inside (or
+    equal to) this candidate sibling root" excludes. The reverse — a
+    genuine sibling repo that happens to live in a subdirectory of the
+    dispatching repo's own tree — is not excluded, since that is real
+    sibling-repo topology, not the dispatching repo appearing under its
+    own name.
+    """
+    try:
+        return contains(root, dispatching_repo_root)
+    except (OSError, ValueError):
+        return False
+
+
 def _find_owning_repo(
-    path_str: str, managed_roots: Mapping[str, Path], exclude: str
+    path_str: str,
+    managed_roots: Mapping[str, Path],
+    exclude: str,
+    dispatching_repo_root: Path,
+    file_listings: dict[str, list[str]],
 ) -> str | None:
     """Return the name of the single *other* managed repo that owns ``path_str``.
 
-    Checks ``path_str`` against every repo in ``managed_roots`` except
-    ``exclude`` (the dispatching repo itself), both as a literal
-    repo-root-relative/absolute path (via :func:`_resolve_within_root`,
-    which containment-checks before any ``exists()`` call — a ``..``
-    traversal or an absolute path can never be reported as resolving into a
-    root it does not actually resolve into) and, when that misses, via
-    :func:`_segment_boundary_suffix_match` against that repo's full file
-    listing — the module-relative-citation shape from issues #1757/#1758
-    (``shared/.../SettingsRepository.kt`` citing the real, more deeply
-    nested ``swole/app/mobile/.../SettingsRepository.kt``).
+    Checks ``path_str`` against every repo in ``managed_roots`` except the
+    dispatching repo itself — excluded both by name (``exclude``) and,
+    independently, by resolved root (:func:`_excludes_dispatching_root`,
+    review finding 3) — both as a literal repo-root-relative/absolute path
+    (via :func:`_resolve_within_root`, which containment-checks before any
+    ``exists()`` call — a ``..`` traversal or an absolute path can never be
+    reported as resolving into a root it does not actually resolve into)
+    and, when that misses, via :func:`_segment_boundary_suffix_match`
+    against that repo's tracked-file listing — the module-relative-citation
+    shape from issues #1757/#1758 (``shared/.../SettingsRepository.kt``
+    citing the real, more deeply nested
+    ``swole/app/mobile/.../SettingsRepository.kt``).
+
+    ``file_listings`` memoizes each sibling root's tracked-file listing
+    (:func:`_repo_tracked_files`) for the caller's lifetime — one listing
+    per root per :func:`cross_repo_gate` call, not one per (missing
+    candidate, root) pair (review finding 1). Callers share one dict across
+    every missing candidate checked in a single :func:`cross_repo_gate`
+    call.
 
     Returns the owning repo's name when exactly one *other* managed repo
     matches; ``None`` when zero or 2+ repos match. Ambiguous ownership is
@@ -775,15 +902,55 @@ def _find_owning_repo(
     for repo_name, root in managed_roots.items():
         if repo_name == exclude:
             continue
+        if _excludes_dispatching_root(root, dispatching_repo_root):
+            continue
         resolved = _resolve_within_root(root, path_str)
         if resolved is not None and resolved.exists():
             owners.add(repo_name)
             continue
-        if _segment_boundary_suffix_match(path_str, _all_repo_files(root)) is not None:
+        files = file_listings.get(repo_name)
+        if files is None:
+            files = _repo_tracked_files(root)
+            file_listings[repo_name] = files
+        if _segment_boundary_suffix_match(path_str, files) is not None:
             owners.add(repo_name)
     if len(owners) == 1:
         return next(iter(owners))
     return None
+
+
+def _is_confirmed_foreign_absolute_path(path_str: str, repo_root: Path) -> bool:
+    """Return ``True`` when ``path_str`` is an absolute candidate that
+    resolves outside ``repo_root`` and exists on disk right now.
+
+    Independent of the fleet registry entirely (review finding 5): a real,
+    on-disk absolute path outside the target repo is positive evidence of a
+    foreign checkout on its own terms — the exact founding #1010/#953
+    shape, where the offending sibling (``ci_runners``) was never even a
+    registered fleet member. The positive-evidence redesign's
+    managed-repo-roots search only ever escalates for one of the fleet's
+    *registered* siblings, which silently dropped this unconditional
+    protection for every other checkout under the operator's ``repos``
+    tree; this restores it as an independent, unconditional check that
+    runs whether or not a fleet registry was supplied.
+
+    Uses :func:`_is_absolute_path` (not ``Path.is_absolute()``) so a
+    POSIX-style absolute candidate (no drive letter) is still recognized as
+    absolute on Windows, matching :func:`_resolve_within_root`'s own
+    absolute-path handling.
+    """
+    if not _is_absolute_path(path_str):
+        return False
+    path = Path(path_str)
+    try:
+        if contains(repo_root, path):
+            # Resolves inside repo_root -- not foreign. Already excluded by
+            # the missing-survivor filter in the caller's normal flow; a
+            # redundant check here keeps this function correct standalone.
+            return False
+        return path.exists()
+    except (OSError, ValueError):
+        return False
 
 
 def _paragraph_span(text: str, start: int, end: int) -> tuple[str, str]:
@@ -915,13 +1082,17 @@ def cross_repo_gate(
     ``dispatching_repo_name`` (this repo's own name, excluded from the
     search) default to an empty mapping and the empty string — "no fleet
     information available" — which can only ever *abstain* on the
-    every-survivor-missing branch, never escalate: escalation requires
-    positive sibling-repo evidence that only a real registry lookup can
-    provide, so a caller that has not been wired to pass these two
-    (tracked separately: this gate's own decision rule vs. threading the
-    fleet registry through each call site) gets the strictly safer
-    "abstain when we don't know" behavior rather than a crash or the old,
-    imprecise "escalate on bare absence" rule.
+    every-survivor-missing branch's sibling-registry search, never
+    escalate from it: that half of the decision requires positive
+    sibling-repo evidence that only a real registry lookup can provide, so
+    a caller that has not been wired to pass these two (tracked
+    separately: this gate's own decision rule vs. threading the fleet
+    registry through each call site) gets the strictly safer "abstain when
+    we don't know" behavior rather than a crash or the old, imprecise
+    "escalate on bare absence" rule. The founding #1010/#953 absolute-path
+    protection (review finding 5, :func:`_is_confirmed_foreign_absolute_path`)
+    is independent of both arguments and can still escalate with neither
+    supplied.
     """
     referenced = extract_referenced_paths(issue_body)
     if not referenced:
@@ -971,11 +1142,38 @@ def cross_repo_gate(
     # candidate, a citation of a file this issue is about to create, or a
     # citation this fleet has never seen anywhere. Escalate only when a
     # missing survivor is positively found under exactly one *other*
-    # managed repo's root.
+    # managed repo's root, OR (review finding 5, the founding #1010/#953
+    # protection) is itself an absolute path that resolves outside
+    # repo_root and exists on disk right now -- positive evidence of a
+    # foreign checkout on its own terms, independent of whether that
+    # foreign repo happens to be a registered fleet member.
+    for raw, effective in missing_pairs:
+        if _is_confirmed_foreign_absolute_path(effective, repo_root):
+            return CrossRepoGateResult(
+                passed=False,
+                referenced_paths=tuple(r for r, _ in survivors),
+                missing_paths=missing,
+                reason=(
+                    f"cross_repo_target: {effective!r} is an absolute path "
+                    f"outside the target repo ({repo_root}) and exists on "
+                    "disk -- positive evidence of a foreign checkout"
+                ),
+                neutral_paths=tuple(neutral),
+            )
     found_in_repo: str | None = None
     if managed_repo_roots:
+        # One tracked-file listing per sibling root for this whole call
+        # (review finding 1) -- _find_owning_repo populates it lazily as
+        # each root is actually checked.
+        file_listings: dict[str, list[str]] = {}
         for raw, effective in missing_pairs:
-            owner = _find_owning_repo(effective, managed_repo_roots, dispatching_repo_name)
+            owner = _find_owning_repo(
+                effective,
+                managed_repo_roots,
+                dispatching_repo_name,
+                repo_root,
+                file_listings,
+            )
             if owner is not None:
                 found_in_repo = owner
                 break
