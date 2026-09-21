@@ -37,6 +37,7 @@ from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state, stat
 
 from _cli_fixtures import _FakeGitHub, _make_repo
 from _fakes_github import FakeGitHub
+from _review_fixtures import _write_review_packet
 
 
 # --- labels.py: the two new label edges, tested directly via transition() ---
@@ -255,6 +256,71 @@ def test_unescalate_blocked_pr_resets_and_relabels(tmp_path: Path) -> None:
     assert len(_events(state, "unescalate")) == 1
 
 
+def test_unescalate_blocked_pr_voids_verdict_and_rejoins_review_queue(tmp_path: Path) -> None:
+    """Issue #1765 finding 1: a "blocked" verdict pinned to the live head is
+    the defining property of the state ``unescalate`` was just widened to
+    re-arm -- so resetting the PR's status without also voiding that verdict
+    would report ``changed=True`` while leaving ``review_queue()`` skipping
+    the PR forever (``decision == "blocked"`` and ``reviewed_head_sha ==``
+    the live head is exactly review_queue's "nothing to do, still valid"
+    branch). That converts a *visible* park (``agent:human-needed``,
+    alerting) into an *invisible* one (``agent:pr-open``, no lane, no
+    alert) while reporting success.
+
+    Before the fix, ``unescalate`` never touched review-decision.json, so
+    this test's final assertion (PR #456 reachable in ``review_queue()``)
+    would fail: the recorded "blocked" verdict stays pinned to the
+    unchanged live head and review_queue's terminal-verdict-still-valid
+    branch keeps `continue`-ing past it.
+    """
+    app = _app(tmp_path)
+    live_head = "sha-abc123"  # FakeGitHub's default headRefOid for PR #456
+    _write_review_packet(
+        tmp_path,
+        456,
+        live_head,
+        decision={
+            "pr_number": 456,
+            "issue_number": 123,
+            "decision": "blocked",
+            "summary": "security concern",
+            "reviewed_head_sha": live_head,
+            "reviewed_at": "2026-09-01T00:00:00Z",
+            "verdict_provenance": "fresh_llm_review",
+        },
+    )
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "blocked",
+            "escalation_reason": "review_blocked",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "blocked",
+            "escalation_reason": "review_blocked",
+            "reason_class": "judgment",
+        }
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(pr_number=456)
+
+    assert result.ok is True
+    assert result.data["changed"] is True
+    assert result.data["verdict_voided"] is True
+
+    voided_decision = app._review_decision(456)
+    assert voided_decision["decision"] == "pending"
+    assert voided_decision["reviewed_head_sha"] == live_head
+
+    queue_result = app.review_queue()
+    assert queue_result.ok is True
+    queued_prs = {c["pr"] for c in queue_result.data["queue"]}
+    assert 456 in queued_prs, queue_result.data["queue"]
+
+
 def test_unescalate_merged_pr_normalizes_status_without_label_edge(tmp_path: Path) -> None:
     app = _app(tmp_path)
     app.gh.prs[0]["state"] = "MERGED"
@@ -330,6 +396,80 @@ def test_unescalate_escalated_issue_with_no_pr_drops_status_and_requeues(tmp_pat
     assert removed == app.config.labels.workflow_labels
 
 
+def test_unescalate_blocked_issue_with_no_pr_drops_status_and_requeues(tmp_path: Path) -> None:
+    """Issue #1765 finding 6: the ``--issue``-only shape is the one an
+    operator reaches for first, and it is the one that strips every
+    workflow label and makes the issue freshly dispatchable -- so a
+    "blocked" issue (a reviewer's product/security judgment call, not a
+    mechanical failure) must re-arm through this path exactly like an
+    "escalated" one, not silently no-op the way the pre-#1765 predicate did.
+    """
+    app = _app(tmp_path)
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "blocked",
+            "escalation_reason": "review_blocked",
+            "reason_class": "judgment",
+        }
+        # No entry in state["prs"] references issue 123 at all.
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(issue_number=123)
+
+    assert result.ok is True
+    assert result.data["changed"] is True
+    assert result.data["pr"] is None
+    state = load_state(app.paths.state_file)
+    issue_entry = state["issues"]["123"]
+    assert "status" not in issue_entry
+    assert "escalation_reason" not in issue_entry
+    assert "reason_class" not in issue_entry
+    assert app.gh.labels_added == []
+    removed = {label for (num, label) in app.gh.labels_removed if num == 123}
+    assert removed == app.config.labels.workflow_labels
+
+
+def test_unescalate_blocked_pr_merged_on_github_normalizes_and_drops_issue(
+    tmp_path: Path,
+) -> None:
+    """Issue #1765 finding 6: a "blocked" PR whose live GitHub state has
+    since gone MERGED must normalize like an "escalated" one -- and, since
+    no other open PR references the issue, drop the issue to baseline in
+    the same call (issue #1391) rather than leaving it parked until a
+    second, explicit ``unescalate --issue`` call."""
+    app = _app(tmp_path)
+    app.gh.prs[0]["state"] = "MERGED"
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "blocked",
+            "escalation_reason": "review_blocked",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "blocked",
+            "escalation_reason": "review_blocked",
+            "reason_class": "judgment",
+        }
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(pr_number=456)
+
+    assert result.ok is True
+    assert result.data["changed"] is True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["status"] == "merged"
+    issue_entry = state["issues"]["123"]
+    assert "status" not in issue_entry
+    assert "escalation_reason" not in issue_entry
+    removed = {label for (num, label) in app.gh.labels_removed if num == 123}
+    assert removed == app.config.labels.workflow_labels
+
+
 def test_unescalate_non_escalated_record_is_idempotent_noop(tmp_path: Path) -> None:
     app = _app(tmp_path)
     with state_lock(app.paths.state_file):
@@ -387,6 +527,64 @@ def test_unescalate_dry_run_reports_transitions_without_mutating_anything(
     assert after["events"] == before["events"]
     # No label-mutating gh calls; pr_view (read-only) is allowed since the
     # live PR state is what decides the re-entry point even in a dry run.
+    assert app.gh.labels_added == []
+    assert app.gh.labels_removed == []
+
+
+def test_unescalate_dry_run_on_blocked_reports_would_void_verdict_without_mutating(
+    tmp_path: Path,
+) -> None:
+    """Issue #1765 finding 6: ``dry_run`` on a "blocked" record must report
+    the finding-1 void it would perform (``verdict_would_be_voided``) without
+    writing to state, the decision file, or GitHub -- the same read-only
+    contract the pre-existing "escalated" dry-run test pins."""
+    app = _app(tmp_path)
+    live_head = "sha-abc123"
+    _write_review_packet(
+        tmp_path,
+        456,
+        live_head,
+        decision={
+            "pr_number": 456,
+            "issue_number": 123,
+            "decision": "blocked",
+            "summary": "security concern",
+            "reviewed_head_sha": live_head,
+            "reviewed_at": "2026-09-01T00:00:00Z",
+            "verdict_provenance": "fresh_llm_review",
+        },
+    )
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "blocked",
+            "escalation_reason": "review_blocked",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "blocked",
+            "escalation_reason": "review_blocked",
+            "reason_class": "judgment",
+        }
+        save_state(app.paths.state_file, state)
+    before = load_state(app.paths.state_file)
+    decision_before = app._review_decision(456)
+
+    result = app.unescalate(pr_number=456, dry_run=True)
+
+    assert result.ok is True
+    assert result.data["changed"] is False
+    assert result.data["verdict_would_be_voided"] is True
+    assert result.data["transitions"]["pr.status"] == ["blocked", PASSIVE_OPEN_STATUS]
+    assert result.data["transitions"]["pr.review_decision"] == ["blocked", "pending"]
+
+    after = load_state(app.paths.state_file)
+    assert after["prs"] == before["prs"]
+    assert after["issues"] == before["issues"]
+    assert after["events"] == before["events"]
+    assert app._review_decision(456) == decision_before
     assert app.gh.labels_added == []
     assert app.gh.labels_removed == []
 

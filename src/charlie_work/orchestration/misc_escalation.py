@@ -129,24 +129,31 @@ def _repair_escalated_labels(self) -> dict[str, Any]:
             # here) is what stops this sweep from clobbering a correctly
             # operator-queued issue back to human_needed every pass.
             #
-            # Issue #1765: the base edge name is likewise derived from the
-            # issue's own status rather than hardcoded to "escalated" -- a
-            # "blocked" verdict (#1642) owes the identical label edge (see
-            # _escalation_edge's docstring: "blocked" always passes through
-            # unchanged) and must be repairable here too, or a transient
-            # label-write failure on a blocked verdict has no self-heal path
-            # at all. Falls back to "escalated" only if the fresh read finds
-            # a status outside the sink (e.g. a concurrent unescalate raced
-            # this read) -- _escalated_label_needs_repair already re-checked
-            # this immediately above, so that fallback is unreachable in
-            # practice and exists only to keep this call well-typed.
+            # Issue #1765 finding 2: the base edge name is derived from the
+            # ISSUE's own status, and a status outside the sink now `continue`s
+            # rather than falling back to "escalated" -- that fallback was
+            # reachable, not "unreachable in practice" as originally claimed
+            # here: _escalated_label_needs_repair's check above is an OR over
+            # the PR and issue sides (see its docstring), so a subject
+            # qualifies on the PR's status ALONE. state.clear_escalation /
+            # clear_escalation_on_issue_prs pop escalation_reason from a
+            # linked PR record but never rewrite its `status`, so a PR that
+            # was once "blocked"/"escalated" can carry that status forever
+            # after its issue resolves through a DIFFERENT PR (approved,
+            # merged, closed, ...). The label edge below lands on the ISSUE
+            # (`transition(..., issue_number, edge)`), so guessing "escalated"
+            # for a status that contradicts sink membership would stamp
+            # agent:human-needed on an issue that is not parked at all --
+            # exactly the "fails open on a rephrased value" shape a fallback
+            # like that has. Skip instead: there is nothing to repair for an
+            # issue that is not actually in the sink, regardless of what a
+            # stale PR record says.
             fresh_issue_entry = fresh.get("issues", {}).get(str(issue_number), {})
-            repair_reason_class = _repair_reason_class(fresh_issue_entry)
             issue_status = fresh_issue_entry.get("status")
-            edge = _escalation_edge(
-                issue_status if issue_status in SINK_STATUSES else "escalated",
-                repair_reason_class,
-            )
+            if issue_status not in SINK_STATUSES:
+                continue
+            repair_reason_class = _repair_reason_class(fresh_issue_entry)
+            edge = _escalation_edge(issue_status, repair_reason_class)
             expected_label = _escalation_label(self.config.labels, edge)
             issue_view = self.gh.issue_view(int(issue_number))
             if expected_label is not None and expected_label in label_names(issue_view):

@@ -706,6 +706,60 @@ def test_collect_escalated_label_subjects_includes_blocked_status() -> None:
     assert _collect_escalated_label_subjects(state) == [(None, 123)]
 
 
+def test_escalated_label_repair_skips_blocked_pr_whose_issue_already_resolved(
+    tmp_path: Path,
+) -> None:
+    """Issue #1765 finding 2: ``_collect_escalated_label_subjects``/
+    ``_escalated_label_needs_repair`` are an OR over the PR and issue sides,
+    so a PR can qualify as a subject on its own status alone. ``state.
+    clear_escalation``/``clear_escalation_on_issue_prs`` pop
+    ``escalation_reason`` from a linked PR record but never rewrite its
+    ``status`` -- so a PR that was once "blocked" can carry that status
+    forever after its issue resolves through a DIFFERENT PR (approved here).
+    The repair sweep must gate the edge it applies on the ISSUE actually
+    being in the sink, or it stamps ``agent:human-needed`` on an issue that
+    is not parked at all. Before the fix, the ``else "escalated"`` fallback
+    made exactly that mistake: this fixture would have added
+    ``agent:human-needed`` to issue #123 and recorded ``label_error: None``
+    as if it were a successful repair.
+    """
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        # A stale PR record: still "blocked" from an old verdict, but its
+        # issue was since resolved through a different PR.
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "blocked",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "approved",
+            "merge_alert": "OK",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert fake_gh.labels_added == []
+    assert fake_gh.labels_removed == []
+    state = load_state(paths.state_file)
+    # No label_error write, no clobber of the resolved issue's status.
+    assert "label_error" not in state["issues"]["123"]
+    assert state["issues"]["123"]["status"] == "approved"
+    assert result.data["escalated_labels_repaired"] == {
+        "issue_numbers": [],
+        "failures": [],
+        "errored": [],
+        "deferred": 0,
+    }
+
+
 class _FailingAddGitHub(FakeGitHub):
     """A FakeGitHub whose ``add_issue_label`` always reports failure, so the
     self-heal sweep's ``transition()`` call returns PARTIAL_FAILURE and

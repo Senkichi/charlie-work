@@ -122,6 +122,36 @@ ORCHESTRATOR_OWNED_ISSUE_STATUSES: frozenset[str] = (
 # the sink cannot again be missed by some but not all of them.
 SINK_STATUSES: frozenset[str] = frozenset({"escalated", "blocked"})
 
+# Issue #1765 finding 3: three call sites deliberately keep a bare
+# ``== "escalated"`` check instead of deriving from SINK_STATUSES above, and
+# each is a different reason, not an oversight this constant's docstring
+# should be read as inviting a "fix":
+#
+# - ``escalation._escalation_flags`` (feeding ``review()``'s entry gate and
+#   ``merge_ready()``'s per-route escalation lanes, issues #384/#833/#776) and
+#   ``state_record_review.record_review``'s terminal-state reentrancy guard
+#   both exist to stop a *late-arriving write* from silently clobbering
+#   ``status="escalated"`` after a race with the attempt-cap escalation path
+#   (pr-lifecycle.md: non-durable escalation, PRs observed re-escalating
+#   2-3x). "blocked" has no equivalent race: it is a terminal decision
+#   ``record_review`` itself writes deliberately from a reviewer's own
+#   verdict, never overwritten by a concurrent state-only mutation the way
+#   "escalated" can be. Widening either guard to SINK_STATUSES would instead
+#   change review()/merge_ready()'s per-route escalation POLICY for blocked
+#   PRs -- a real design question (see finding 5), not a rename.
+# - ``dispatch_selection``'s ``escalated_skipped`` candidate filter checks
+#   the state ``status`` field specifically because a state-level escalation
+#   need not be reflected anywhere else. A "blocked" PR does not need the
+#   same belt: it is already excluded from ``dispatchable`` by
+#   ``_is_review_dispatchable``'s decision-cache lookup (a terminal
+#   "blocked" decision at the live head is never re-queued -- see
+#   ``github_ops_review_queue``). Adding SINK_STATUSES here would be a
+#   redundant second filter on the same fact, not a missing one.
+#
+# Every OTHER consumer -- unescalate()'s stuck predicate, the escalated-label
+# self-heal sweep, reconcile's drift check -- has no such downstream cover
+# and must keep deriving from this set.
+
 # Issue #955: this used to be the literal string "reviewing" -- the same
 # value ``review()`` writes (guarded by ``review_dispatch.enabled``, see
 # workflow.py's two ``dispatch_disabled`` call sites) to mean "a fresh review

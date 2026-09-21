@@ -225,7 +225,25 @@ def _escalate_issue(
     alongside ``escalation_reason`` by ``clear_escalation`` (state.py) and by
     ``charlie unescalate``'s reset-field tuples, so a de-escalated issue gets
     a genuinely fresh history on re-escalation.
+
+    Issue #1765 finding 5: ``status="blocked"`` requires
+    ``reason_class="judgment"``, enforced here rather than merely asserted in
+    ``_escalation_edge``'s docstring. ``_escalation_edge`` has no
+    ``"mechanical"`` counterpart for the ``"blocked"`` edge -- a
+    "blocked but mechanical" entry would resolve to ``human_needed`` where
+    every other mechanical escalation resolves to ``operator_queued``,
+    silently reintroducing the #1266 clobber (an operator-queued issue
+    stamped back to human-needed) the very first time such an entry reached
+    the label-repair sweep or reconcile's drift converger. This is the single
+    writer of ``status`` on an escalation, so failing loudly here is what
+    makes the "blocked implies judgment" taxonomy actually unrepresentable,
+    instead of true only by convention.
     """
+    if status == "blocked" and reason_class != "judgment":
+        raise ValueError(
+            f"_escalate_issue: status='blocked' requires reason_class="
+            f"'judgment' (got {reason_class!r}) -- see issue #1765 finding 5"
+        )
     state.setdefault("issues", {})
     state.setdefault("prs", {})
 

@@ -274,7 +274,17 @@ def unescalate(
     - PR open: reset status to the passive pr-open state, zero every
       attempt counter and frozen janitor/review cache, and apply the
       ``unescalated_pr_open`` label edge so the next pass re-reviews it
-      from scratch.
+      from scratch. If the PR also carries a terminal review verdict
+      (approved/request_changes/blocked) still valid at the live head --
+      the defining shape of a "blocked" record, and reachable for
+      "escalated" too -- that verdict is voided back to a "pending" stub
+      (issue #1765 finding 1) the same way ``review()``'s own stale-head
+      void does: archive it first, then overwrite with a head-stamped
+      pending placeholder. Without this, ``review_queue()`` treats the
+      still-valid verdict as "nothing to do" and skips the PR forever, so
+      resetting the status to passive-open would report changed=True while
+      leaving the PR permanently unreachable -- the alerting label is gone
+      but nothing re-queues it, an invisible park replacing a visible one.
     - Issue with no live PR: drop the issue back to the never-dispatched
       baseline and strip workflow labels (``unescalated_requeued``) so
       dispatch treats it as fresh.
@@ -432,6 +442,30 @@ def unescalate(
         else:
             pr_status_target = PASSIVE_OPEN_STATUS
 
+    # Issue #1765: resetting the PR to the passive-open state is meant to
+    # make review_queue() reachable again, but review_queue() skips any PR
+    # whose recorded verdict is a terminal decision (approved/
+    # request_changes/blocked) still valid at the live head -- exactly the
+    # property a "blocked" verdict pinned to an unmoved head has by
+    # construction (that is the defining shape of the state this branch
+    # widened ``pr_stuck`` to cover). Left alone, unescalate reports
+    # changed=True, strips the alerting ``agent:human-needed`` label, and
+    # leaves the PR permanently unreachable except via a second, explicit
+    # ``charlie verdict`` or ``why-charlie-hate --force-rereview`` call --
+    # an invisible park replacing a visible one, the same rc=0-silent-no-op
+    # class this command exists to fix, moved one hop downstream. Detected
+    # here (pre-lock, alongside the other network reads) via the same
+    # predicate ``review_verdict_guard`` uses to refuse a destructive
+    # re-review; the identity is re-checked inside the write lock below
+    # before anything is actually voided, so a verdict that changed
+    # underneath this call (e.g. a concurrent ``record_review``) is left
+    # alone rather than clobbered with a stale "pending" stub.
+    still_valid_verdict = (
+        self._still_valid_recorded_verdict(pr_number, live_pr.get("headRefOid"))
+        if pr_status_target == PASSIVE_OPEN_STATUS
+        else None
+    )
+
     def _apply_pr_reset(entry: dict[str, Any]) -> dict[str, Any]:
         updated = dict(entry)
         updated["status"] = pr_status_target
@@ -493,6 +527,8 @@ def unescalate(
         snapshot_new_pr = _apply_pr_reset(pr_state)
         if snapshot_new_pr.get("status") != pr_state.get("status"):
             transitions["pr.status"] = [pr_state.get("status"), snapshot_new_pr["status"]]
+    if still_valid_verdict is not None:
+        transitions["pr.review_decision"] = [still_valid_verdict[0].get("decision"), "pending"]
     if issue_number is not None:
         snapshot_new_issue = _apply_issue_reset(issue_state)
         if snapshot_new_issue.get("status") != issue_state.get("status"):
@@ -530,10 +566,12 @@ def unescalate(
                 "label_edge": label_edge,
                 "blocked_environment_at_reset": prior_blocked_environment_count > 0,
                 "blocked_environment_at_prior_count": prior_blocked_environment_count,
+                "verdict_would_be_voided": still_valid_verdict is not None,
                 "changed": False,
             },
         )
 
+    verdict_voided = False
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
         if pr_number is not None and pr_stuck:
@@ -542,6 +580,62 @@ def unescalate(
                 **_apply_pr_reset(fresh_pr if isinstance(fresh_pr, dict) else {}),
                 "number": pr_number,
             }
+        if still_valid_verdict is not None:
+            voided_decision, _reason = still_valid_verdict
+            # Compare-and-swap against the pre-lock snapshot (same guard
+            # ``_update_approval_head`` applies before its own record_decision
+            # call): a concurrent record_review landing a fresh verdict
+            # between the pre-lock read and this write must win, not be
+            # clobbered by a stale "pending" stub for a decision that no
+            # longer exists.
+            live_decision = self._review_decision(pr_number)
+            if live_decision.get("decision") == voided_decision.get(
+                "decision"
+            ) and live_decision.get("reviewed_head_sha") == voided_decision.get(
+                "reviewed_head_sha"
+            ):
+                pr_dir = self.paths.prs / f"pr-{pr_number}"
+                # Issue #1695 precedent (review()'s own stale-head void):
+                # preserve the verdict being voided in the rounds archive
+                # before the pending stub overwrites the flat file. A
+                # carried-forward re-pin lives ONLY in the flat file
+                # (``_update_approval_head`` writes ``archive_round=False``),
+                # so overwriting it without archiving first would destroy
+                # the sole copy. ``head_sha=None`` leaves the payload's own
+                # ``reviewed_head_sha`` untouched -- re-stamping it here
+                # would fabricate a verdict pin that was never recorded.
+                # Note: state.json's ``prs[N].decision``/``reviewed_head_sha``
+                # cache is deliberately NOT mirrored here -- only six
+                # sanctioned sites may write those keys
+                # (test_state_decision_cache_enforcement.py), and this write
+                # is not one of them. The next loop() pass's
+                # ``_refresh_pr_decision_cache`` boundary refresh resyncs it
+                # from this file, the same declared-cache path every other
+                # untracked-PR pass already relies on.
+                record_decision(
+                    pr_dir,
+                    {
+                        **voided_decision,
+                        "verdict_provenance": voided_decision.get("verdict_provenance"),
+                    },
+                    None,
+                    archive_round=True,
+                )
+                record_decision(
+                    pr_dir,
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "decision": "pending",
+                        "summary": "",
+                        "required_changes": [],
+                        "reviewed_at": None,
+                        "verdict_provenance": None,
+                    },
+                    live_pr.get("headRefOid"),
+                    archive_round=False,
+                )
+                verdict_voided = True
         if issue_number is not None:
             fresh_issue = state["issues"].get(str(issue_number), {})
             state["issues"][str(issue_number)] = {
@@ -558,6 +652,7 @@ def unescalate(
                 "label_edge": label_edge,
                 "blocked_environment_at_reset": prior_blocked_environment_count > 0,
                 "blocked_environment_at_prior_count": prior_blocked_environment_count,
+                "verdict_voided": verdict_voided,
             },
         )
         _wf.save_state(self.paths.state_file, state)
@@ -597,6 +692,7 @@ def unescalate(
             "transitions": transitions,
             "label_edge": label_edge,
             "label_error": label_error,
+            "verdict_voided": verdict_voided,
             "changed": True,
         },
     )
