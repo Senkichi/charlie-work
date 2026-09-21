@@ -534,9 +534,19 @@ def _maybe_emit_operator_queue_depth(self) -> None:
     every loop pass (or on the dedicated
     ``operator_queue_review_interval_minutes`` cadence if configured),
     and the ``operator_queue_depth`` warning event is emitted only when
-    the depth exceeds the configured ``operator_queue_depth_threshold``
-    -- the same "checked every pass, emitted only when the condition
-    holds" pattern ``dispatch_stale`` uses.
+    the depth exceeds the configured ``operator_queue_depth_threshold``.
+
+    Issue #1769 moved ``dispatch_stale`` off "checked every pass, emitted
+    only when the condition holds" (which re-fires every single pass a
+    stall continues) onto edge-triggered-plus-bounded-reminder: emit once
+    at threshold-crossing onset, then again only after a reminder interval
+    elapses, via ``state.is_dispatch_stale_alert_due``/
+    ``arm_dispatch_stale_alert``/``clear_dispatch_stale_alert``. This gauge
+    is the next candidate for that same treatment -- it still uses the
+    plain "every pass past threshold" shape today, so a chronically deep
+    queue emits one row per pass indefinitely; do not point a future
+    reader back at ``dispatch_stale`` as if it already matches this
+    function's current behavior.
 
     The consumer is ``heartbeat_check.py``'s ``check_warning_events``,
     which buckets the kind (registered in

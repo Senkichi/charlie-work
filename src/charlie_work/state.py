@@ -12,6 +12,19 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
+# Issue #1769 review follow-up / file-size ratchet (#1442): dispatch-cadence
+# bookkeeping moved to its own module; re-exported so import paths hold.
+from .dispatch_cadence import (  # noqa: F401 (deliberate re-export)
+    arm_dispatch_stale_alert,
+    backfill_dispatch_baseline,
+    clear_dispatch_stale_alert,
+    dispatch_baseline_needs_backfill,
+    is_dispatch_stale_alert_due,
+    last_non_empty_dispatch,
+    mark_dispatch_baseline_backfill_attempted,
+    record_non_empty_dispatch,
+)
+
 STATE_VERSION = 1
 
 # Cross-process lock timeout (seconds) — best-effort to prevent wedging
