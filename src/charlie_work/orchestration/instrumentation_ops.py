@@ -740,7 +740,7 @@ def _loop_impl(
         except Exception as exc:  # noqa: BLE001 - containment is deliberate; see docstring
             log_event(
                 self.paths.state_file,
-                "operator_queue_impact_check_failed",
+                "operator_queue_impact_check_failed",  # event-consumer: audit-only -- ad hoc containment record for issue #1768; the actionable behavior is this except block itself swallowing the exception so the pass survives, not a downstream reader of the event
                 {"error": f"{type(exc).__name__}: {exc}"},
                 repo=self.repo_root.name,
                 correlation_id=cid,
