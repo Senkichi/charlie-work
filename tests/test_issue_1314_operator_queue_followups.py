@@ -278,6 +278,193 @@ def test_operator_queue_depth_empty_state(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# #1314 leaf names restored against the #1768 edge-triggered signal
+# (issue #1538 collect-only gate).
+#
+# The four gates below (threshold<=0, review-cadence-not-due, dry_run) all
+# short-circuit ``_maybe_emit_operator_queue_impact`` *before* the impact
+# computation and its edge-detection logic ever run -- they are exactly as
+# unconditional under the #1768 rewrite as they were under the old
+# level-triggered gauge, so the original leaf names still honestly describe
+# what each test asserts (see the identically-behaved ``test_impact_*``
+# siblings below, which pin the same properties under the #1768 naming
+# convention -- both are kept: the old names for git-blame/history
+# continuity across the rewrite, per issue #1538's collect-only gate).
+#
+# ``test_depth_gauge_no_emit_when_below_threshold`` and
+# ``test_depth_gauge_no_emit_when_depth_equals_threshold`` are NOT restored
+# here: #1768 review finding 7 deliberately makes a first observation fire
+# whenever it carries *any* nonzero transitive impact, independent of the
+# configured threshold (see ``test_impact_fires_on_fresh_eyes_shape_first_occurrence``
+# and ``qualifies`` in ``should_fire_operator_queue_impact``). Restoring
+# those two names against the new function would assert something the
+# rewrite deliberately made false, not a still-true property under a new
+# name -- they are reported under NEEDS-EXEMPT instead. Likewise
+# ``test_operator_queue_depth_registered_as_warning`` and
+# ``test_operator_queue_depth_in_expected_operational_kinds`` assert
+# presence of a kind #1768 retired outright (see
+# ``test_operator_queue_depth_kind_fully_retired`` above), so restoring
+# them verbatim would also be a false statement.
+
+
+def test_depth_gauge_no_emit_when_threshold_disabled(tmp_path: Path) -> None:
+    """Threshold 0 disables the check entirely -- no event regardless of
+    impact. ``_maybe_emit_operator_queue_impact`` returns before any state
+    read or GitHub call when the threshold is non-positive, so this
+    property is unconditional and survived the #1768 rewrite unchanged
+    (see ``test_impact_disabled_when_threshold_zero``)."""
+    app = _app(
+        tmp_path,
+        deescalation=DeescalationConfig(
+            enabled=False,
+            operator_queue_depth_threshold=0,
+        ),
+    )
+    _seed_operator_queue_issue(app, 401, terminal_since="2026-01-01T00:00:00Z")
+    _seed_operator_queue_issue(app, 402, terminal_since="2026-01-02T00:00:00Z")
+
+    app._maybe_emit_operator_queue_impact()
+
+    events = query_events(app.paths.state_file, kind="operator_queue_impact")
+    assert events == []
+
+
+def test_depth_gauge_respects_review_cadence(tmp_path: Path) -> None:
+    """When ``operator_queue_review_interval_minutes > 0``, the check is
+    gated by ``next_operator_queue_review_at``. A future timestamp means
+    it is not due, even for a fresh-eyes-shaped root set that would
+    otherwise fire on first observation -- this gate runs before the
+    impact computation, so it is unconditional and survived the #1768
+    rewrite unchanged (see ``test_impact_respects_review_cadence``)."""
+    config = OrchestratorConfig()
+    gh = _fresh_eyes_gh(12, config.labels.ready, range(13, 29))
+    app = _app(
+        tmp_path,
+        gh=gh,
+        deescalation=DeescalationConfig(
+            enabled=False,
+            operator_queue_depth_threshold=5,
+            operator_queue_review_interval_minutes=30,
+        ),
+    )
+    _seed_operator_queue_issue(
+        app, 12, terminal_since="2026-01-01T00:00:00Z", reason_class="judgment"
+    )
+
+    future = (datetime.now(UTC) + timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state = arm_operator_queue_review(state, future)
+        save_state(app.paths.state_file, state)
+
+    app._maybe_emit_operator_queue_impact()
+
+    assert query_events(app.paths.state_file, kind="operator_queue_impact") == []
+
+
+def test_depth_gauge_emits_when_review_cadence_due(tmp_path: Path) -> None:
+    """When the review cadence is due (a past timestamp), the check fires
+    normally (see ``test_impact_emits_when_review_cadence_due``)."""
+    config = OrchestratorConfig()
+    gh = _fresh_eyes_gh(12, config.labels.ready, range(13, 29))
+    app = _app(
+        tmp_path,
+        gh=gh,
+        deescalation=DeescalationConfig(
+            enabled=False,
+            operator_queue_depth_threshold=5,
+            operator_queue_review_interval_minutes=30,
+        ),
+    )
+    _seed_operator_queue_issue(
+        app, 12, terminal_since="2026-01-01T00:00:00Z", reason_class="judgment"
+    )
+
+    past = (datetime.now(UTC) - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state = arm_operator_queue_review(state, past)
+        save_state(app.paths.state_file, state)
+
+    app._maybe_emit_operator_queue_impact()
+
+    events = query_events(app.paths.state_file, kind="operator_queue_impact")
+    assert len(events) == 1
+    assert events[0]["payload"]["blocked_ready_count"] == 16
+
+
+def test_depth_gauge_silent_under_dry_run_with_deep_queue(tmp_path: Path) -> None:
+    """``dry_run=True`` must short-circuit the check even for a "deep"
+    (high-impact) queue that would otherwise fire on its first observation
+    -- the C1.2 "byte-identical to a pass that never ran" dry-run invariant
+    this test originally pinned still holds unchanged under the #1768
+    rewrite (see ``test_impact_silent_under_dry_run_with_high_impact_queue``)."""
+    config = OrchestratorConfig()
+    gh = _fresh_eyes_gh(12, config.labels.ready, range(13, 29))
+    app = _app(
+        tmp_path,
+        gh=gh,
+        dry_run=True,
+        deescalation=DeescalationConfig(enabled=False, operator_queue_depth_threshold=5),
+    )
+    _seed_operator_queue_issue(
+        app, 12, terminal_since="2026-01-01T00:00:00Z", reason_class="judgment"
+    )
+
+    before_bytes = app.paths.state_file.read_bytes()
+
+    app._maybe_emit_operator_queue_impact()
+
+    events = query_events(app.paths.state_file, kind="operator_queue_impact")
+    assert events == [], (
+        "dry_run=True must not emit operator_queue_impact even for a deep, "
+        "first-occurrence fresh-eyes-shaped queue"
+    )
+    assert app.paths.state_file.read_bytes() == before_bytes, (
+        "dry_run=True must not mutate state.json"
+    )
+
+
+def test_depth_gauge_emits_when_threshold_exceeded(tmp_path: Path) -> None:
+    """The check must still fire on its first observation when the
+    transitive impact exceeds the configured threshold -- the core
+    property the old level-triggered gauge asserted for a raw root count,
+    now asserted for the broader blocked-ready-issue count the #1768
+    rewrite measures instead."""
+    config = OrchestratorConfig()
+    ready = config.labels.ready
+    gh = FakeGitHub()
+    gh.issues = [
+        _issue(201, []),
+        _blocked_issue(301, [ready], blocked_by=201),
+        _issue(202, []),
+        _blocked_issue(302, [ready], blocked_by=202),
+        _issue(203, []),
+        _blocked_issue(303, [ready], blocked_by=203),
+    ]
+    app = _app(
+        tmp_path,
+        gh=gh,
+        deescalation=DeescalationConfig(
+            enabled=False,
+            operator_queue_depth_threshold=2,
+        ),
+    )
+    _seed_operator_queue_issue(app, 201, terminal_since="2026-01-01T00:00:00Z")
+    _seed_operator_queue_issue(app, 202, terminal_since="2026-01-02T00:00:00Z")
+    _seed_operator_queue_issue(app, 203, terminal_since="2026-01-03T00:00:00Z")
+
+    app._maybe_emit_operator_queue_impact()
+
+    events = query_events(app.paths.state_file, kind="operator_queue_impact")
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["blocked_ready_count"] == 3
+    assert payload["threshold"] == 2
+    assert sorted(payload["root_issue_numbers"]) == [201, 202, 203]
+
+
+# ---------------------------------------------------------------------------
 # Issue #1768: compute_operator_queue_impact() transitive-closure unit tests
 # ---------------------------------------------------------------------------
 
