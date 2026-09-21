@@ -820,7 +820,13 @@ _RATCHET_BASELINE: dict[str, int] = {
     # the same block). The ratchet holds at the new count.
     "reconcile.py": 6,
     "state_migration.py": 1,
-    "supervise.py": 11,
+    # Issue #1777: +1 raw log_event call in _log_self_deploy_git_retry, the
+    # on_retry hook wired into every self-deploy/ci-fleet-sibling
+    # run_git_with_retry call site. Out-of-wave raw territory, same class as
+    # the pre-existing 11 -- self-deploy's own log_event calls are not routed
+    # through WriteGate (CLAUDE.md's "outside state-lock contexts, call
+    # log_event() directly" convention). The ratchet holds at the new count.
+    "supervise.py": 12,
     "supervisor_lifecycle.py": 3,
     # Issue #1131: +2 raw primitives in record_review's rework-label-skip
     # guard (_record_event + save_state for rework_label_skipped_issue_closed).

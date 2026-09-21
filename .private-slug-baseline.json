@@ -11,6 +11,7 @@
     "src/charlie_work/ci_fleet_anchor.py": 3,
     "src/charlie_work/cli.py": 2,
     "src/charlie_work/cross_repo_gate.py": 4,
+    "src/charlie_work/doctor.py": 1,
     "src/charlie_work/fleet_dispatch.py": 2,
     "src/charlie_work/no_op_checkpoint.py": 1,
     "src/charlie_work/orchestration/state_record_review.py": 1,
@@ -73,5 +74,5 @@
     "tests/test_worker_declared_blocked.py": 2,
     "tests/test_worktree.py": 11
   },
-  "total": 256
+  "total": 257
 }

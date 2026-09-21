@@ -518,6 +518,16 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "fleet_canary": "info",
         "fleet_job_observations": "info",
         "fleet_lane_completed": "info",
+        # Issue #1773: a network-touching `git` call (fetch, ff-only pull)
+        # needed `git_retry.run_git_with_retry` to recover from a transient
+        # TLS/connection blip. Info, not warning: this is the retry
+        # mechanism working as designed -- the pass-level `*_failed` kinds
+        # (main_ci_reclaim_failed, self_deploy_failed) already carry the
+        # warning/error severity for the rarer case where retries are
+        # exhausted. Emitted at most once per retried call (never once per
+        # attempt) by `RetryOutcome`'s own contract; the `ok` payload field
+        # distinguishes "recovered" from "exhausted" without a second kind.
+        "git_network_retry": "info",
         "head_moved": "info",
         "infra_rerun_triggered": "info",
         "intake": "info",
