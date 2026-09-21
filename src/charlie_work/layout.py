@@ -64,6 +64,7 @@ SUPERVISOR_LOCK_FILENAME = "supervisor.lock"
 PENDING_SYNC_FILENAME = "pending-sync.json"
 SELF_DEPLOY_FAILURE_STATE_FILENAME = "self-deploy-failures.json"
 ZERO_PASS_STREAK_STATE_FILENAME = "zero-pass-streak.json"
+QUEUE_SYNC_COVERAGE_CACHE_FILENAME = "queue-sync-coverage-cache.json"
 
 ISSUES_DIRNAME = "issues"
 PRS_DIRNAME = "prs"
@@ -178,6 +179,19 @@ def zero_pass_streak_state_path(state_root: Path) -> Path:
     atomic-write contract.
     """
     return state_root / ZERO_PASS_STREAK_STATE_FILENAME
+
+
+def queue_sync_coverage_cache_path(state_root: Path) -> Path:
+    """Return the queue-sync coverage verdict cache path under ``state_root``.
+
+    Issue #1473: durably memoizes a determined ``covered=True`` verdict from
+    ``_queue_sync_merge_covered`` per (pr_number, reviewed_head_sha,
+    live_head_sha), so the unauthorized-merge tripwire's 3-``gh``-API-call
+    coverage check is paid once per merge instead of once per loop pass
+    forever. Sibling of :func:`self_deploy_failure_state_path` -- same
+    directory, same atomic-write contract.
+    """
+    return state_root / QUEUE_SYNC_COVERAGE_CACHE_FILENAME
 
 
 def worktrees_dir(state_root: Path) -> Path:

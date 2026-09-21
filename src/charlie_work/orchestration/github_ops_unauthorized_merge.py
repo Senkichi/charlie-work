@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import charlie_work.workflow as _wf
 from typing import Any
+from charlie_work import layout, queue_sync_coverage_cache
 from charlie_work.github import GitHubError
 
 
@@ -38,6 +39,20 @@ def _detect_unauthorized_merges(
     """
     candidates: list[dict[str, Any]] = []
     prefix = self.config.dispatch.branch_prefix
+    # Issue #1473 review finding 4: preload the queue-sync coverage-verdict
+    # cache once for this whole pass instead of leaving each candidate PR's
+    # (lazy, per-PR) _queue_sync_merge_covered call re-open()+json.load() the
+    # same never-pruned file. The file is small (module docstring), so
+    # loading it unconditionally here is cheap even when no candidate below
+    # ends up needing it. Skipped under dry-run, where
+    # _queue_sync_merge_covered never consults the cache anyway (finding 5).
+    preloaded_coverage_cache = (
+        None
+        if self.dry_run
+        else queue_sync_coverage_cache.load_cache_map(
+            layout.queue_sync_coverage_cache_path(self.paths.root)
+        )
+    )
     # Capture the review-dispatch gate state at detection time so the finding
     # describes the moment it was made, not the moment it is later read back
     # (issue #975). Config is mutable and unversioned in events.db, so once
@@ -119,7 +134,12 @@ def _detect_unauthorized_merges(
         # head mismatch and no override, so the common paths (matching
         # head, unapproved, overridden) never pay its API calls.
         coverage_result = (
-            self._queue_sync_merge_covered(pr, reviewed_head_sha, live_head_sha)
+            self._queue_sync_merge_covered(
+                pr,
+                reviewed_head_sha,
+                live_head_sha,
+                preloaded_cache=preloaded_coverage_cache,
+            )
             if approved and not head_matches and not override_authorized
             else None
         )
