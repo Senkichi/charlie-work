@@ -19,8 +19,9 @@ import os
 import re
 import shutil
 import stat
+import time
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -2711,6 +2712,44 @@ def _robust_rmtree(path: Path) -> bool:
     return not path.exists() and not is_junction(path)
 
 
+# Issue #1767 follow-up: relocating worker TMP/TEMP/TMPDIR from the host temp
+# volume to <worktree>/.var/worker-tmp means a just-killed worker's child
+# process (pytest, npm, pip, a spawned build tool) can still hold a Windows
+# file handle open under that one subdirectory for a short window after the
+# parent dies -- long enough to fail the whole-worktree removal below even
+# though nothing else in the tree is locked. The handle-release window is
+# short, so a few short retries recover the common case.
+_WORKER_TMP_RECLAIM_ATTEMPTS = 3
+_WORKER_TMP_RECLAIM_BACKOFF_SECONDS = 0.3
+
+
+def _reclaim_worker_tmp_dir(
+    worktree_path: Path,
+    *,
+    attempts: int = _WORKER_TMP_RECLAIM_ATTEMPTS,
+    backoff_seconds: float = _WORKER_TMP_RECLAIM_BACKOFF_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Retry removing ``worktree_path``'s worker-tmp dir with a short backoff.
+
+    Returns True once the directory is gone (including if it never existed).
+    Used by :func:`remove_worktree` to unblock a whole-worktree removal that
+    a lingering handle under worker-tmp alone is holding up -- see the
+    module-level comment above for why this subdirectory specifically is a
+    new failure mode that did not exist before issue #1767 relocated worker
+    temp files inside the worktree.
+    """
+    tmp_dir = layout.worker_tmp_dir(worktree_path)
+    if not tmp_dir.exists() and not is_junction(tmp_dir):
+        return True
+    for attempt in range(attempts):
+        if _robust_rmtree(tmp_dir):
+            return True
+        if attempt < attempts - 1:
+            sleep(backoff_seconds * (attempt + 1))
+    return not tmp_dir.exists() and not is_junction(tmp_dir)
+
+
 def _create_junction_or_symlink(link_path: Path, target_path: Path) -> None:
     if link_path.exists() or is_junction(link_path):
         raise RuntimeError(f"venv link target already exists: {link_path}")
@@ -3929,7 +3968,12 @@ def create_worktree(
 
 
 def remove_worktree(
-    repo_root: Path, worktree_path: Path, *, force: bool = False, branch: str | None = None
+    repo_root: Path,
+    worktree_path: Path,
+    *,
+    force: bool = False,
+    branch: str | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> bool:
     """Remove a worktree, taking care never to follow reparse points into a
     shared virtualenv or other targets.
@@ -3946,12 +3990,21 @@ def remove_worktree(
       5. On failure, ``git worktree prune`` to clear stale metadata, then a
          reparse-point-safe ``shutil.rmtree`` fallback (only when ``force=True``
          so we do not destroy uncommitted work the caller asked us to keep).
-      6. Verify the directory is actually gone; if not, report failure.
+         If the worktree survives that, retry reclaiming just the relocated
+         worker-tmp dir (issue #1767 follow-up: a lingering child-process
+         file handle there alone can block the whole-tree rmtree) with a
+         short backoff, then retry the whole-tree rmtree once more.
+      6. Verify the directory is actually gone; if not, report failure and
+         log the worker-tmp dir explicitly when it is still the reason.
       7. If ``branch`` is provided, delete the branch with ``git branch -D``.
 
     Returns False for expected failures (real .venv dir without force, git
     command failure, directory survives); never raises for those. Programmer
     errors surface as False via a failed git command.
+
+    ``sleep`` is exposed purely for deterministic tests of the worker-tmp
+    reclaim backoff (see ``_reclaim_worker_tmp_dir``); production callers
+    never need to pass it.
     """
     venv_path = worktree_path / ".venv"
     if venv_path.exists() or is_junction(venv_path):
@@ -3991,12 +4044,37 @@ def remove_worktree(
         # delete a worktree that git refused to remove (e.g. uncommitted work).
         if force:
             _robust_rmtree(worktree_path)
+            if worktree_path.exists():
+                # Issue #1767 follow-up: relocating worker TMP/TEMP/TMPDIR
+                # inside the worktree means a lingering handle under that one
+                # subdirectory alone can block the whole-tree rmtree above.
+                # Retry reclaiming just worker-tmp (the Windows handle-
+                # release window is short), then retry the full removal once
+                # more if that unblocked it.
+                if _reclaim_worker_tmp_dir(worktree_path, sleep=sleep):
+                    _robust_rmtree(worktree_path)
 
     # Post-delete verification: report failure if the directory survived.
     if not git_result_ok and not force:
         worktree_removed = False
     else:
         worktree_removed = not worktree_path.exists() and not is_junction(worktree_path)
+
+    if not worktree_removed and force:
+        # Diagnostic per issue #1767 follow-up: name the likely cause instead
+        # of surfacing a generic, opaque worktree-removal failure. A worker-
+        # tmp dir that still exists here means the retry above did not
+        # unblock it (most likely a child process that has not yet released
+        # its file handle).
+        lingering_tmp_dir = layout.worker_tmp_dir(worktree_path)
+        if lingering_tmp_dir.exists():
+            logger.warning(
+                "worktree removal failed for %s after retrying worker-tmp "
+                "reclaim -- %s still exists, likely a lingering child-process "
+                "file handle (issue #1767)",
+                worktree_path,
+                lingering_tmp_dir,
+            )
 
     # Delete the branch if provided (to prevent branch leaks on launch failure)
     # Attempt branch deletion independently of worktree-removal success to avoid

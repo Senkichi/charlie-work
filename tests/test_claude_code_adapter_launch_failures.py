@@ -20,7 +20,7 @@ from _claude_adapter_fixtures import (
     _install_fake_create_worktree,
 )
 
-from charlie_work import claude_code
+from charlie_work import claude_code, layout
 from charlie_work.claude_code import launch_claude_worker
 from charlie_work.worktree import WorktreeForeignWriterError
 
@@ -419,7 +419,7 @@ def test_launch_claude_worker_tmp_dir_creation_failure_tears_down_worktree(
     original_mkdir = Path.mkdir
 
     def failing_mkdir(self, mode=0o777, parents=False, exist_ok=False):
-        if self.name == "worker-tmp":
+        if self.name == layout.WORKER_TMP_DIRNAME:
             raise OSError("Mock tmp dir creation failure")
         return original_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from charlie_work import layout
 from charlie_work import rescue as rescue_helpers
 from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
@@ -130,6 +131,14 @@ def _process_rescue_review(self, candidate: dict[str, Any]) -> _wf.CommandResult
         report_path=report_path,
         timeout_seconds=cfg.reviewer_timeout_seconds,
         head_ref_oid=head_sha,
+        # Issue #1767 finding #3: repo_root is the shared main checkout, not
+        # a per-session worktree, so the default sanitize_env derivation
+        # (keyed on repo_root) would give every rescue review of this repo
+        # the SAME never-cleaned directory. pr_dir is already this call's
+        # own per-PR scratch root (created above); give the review its own
+        # subdirectory of that instead, which run_cross_family_review
+        # reclaims once the subprocess finishes.
+        tmp_dir=pr_dir / layout.WORKER_TMP_DIRNAME,
     )
 
     verdict: dict[str, Any] | None = None

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import subprocess
 import time
 from collections.abc import Callable, Sequence
@@ -208,6 +209,7 @@ def run_cross_family_review(
     runner: Runner = subprocess.run,
     sleep: Callable[[float], None] = time.sleep,
     head_ref_oid: str | None = None,
+    tmp_dir: Path | None = None,
 ) -> CrossFamilyResult:
     """Write ``prompt_text`` to ``prompt_path``, run the cross-family model from
     ``repo_root`` (so it can read the real code), and capture stdout to
@@ -219,6 +221,18 @@ def run_cross_family_review(
     stub instead of a reusable success report.
 
     If ``dry_run`` is True, skip the subprocess and return a synthetic result.
+
+    ``tmp_dir``, when given, is passed to ``sanitize_env`` as its explicit
+    TMP/TEMP/TMPDIR override and is reclaimed (best-effort ``rmtree``) by this
+    function once the subprocess finishes, win or lose. This function's own
+    ``repo_root`` is the shared main checkout the rescue tier reviews from,
+    not a per-session worktree with its own create/teardown lifecycle -- so
+    unlike ``claude_code``/``devin_shell`` (whose worktree removal reclaims
+    their session tmp dir for free), nothing else would ever clean up a
+    directory derived from ``repo_root`` alone. Omitting ``tmp_dir`` falls
+    back to ``sanitize_env``'s own default (keyed on ``repo_root``), which
+    is intentionally not reclaimed here since the caller did not ask for it
+    to be -- pass ``tmp_dir`` for a caller that wants ownership of cleanup.
     """
     if dry_run:
         # Deliberately NOT routed through _fail(): that helper mkdirs and
@@ -264,72 +278,82 @@ def run_cross_family_review(
     # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator,
     # and to give this call its own TMP/TEMP/TMPDIR (issue #1767).
     try:
-        env = sanitize_env(repo_root)
+        env = sanitize_env(repo_root, tmp_dir=tmp_dir)
     except OSError as exc:
         return _fail(report_path, model, f"failed to prepare review environment: {exc}")
-    stdout = ""
-    for attempt in range(2):
-        try:
-            completed = runner(
-                rendered,
-                cwd=str(repo_root),
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
-                timeout=timeout_seconds,
-                shell=isinstance(rendered, str),
-                check=False,
-                env=env,
-                **no_console_window_kwargs(),
-            )
-        except subprocess.TimeoutExpired as exc:
-            partial = (
-                exc.stdout.decode("utf-8", "replace")
-                if isinstance(exc.stdout, bytes)
-                else (exc.stdout or "")
-            )
+
+    try:
+        stdout = ""
+        for attempt in range(2):
+            try:
+                completed = runner(
+                    rendered,
+                    cwd=str(repo_root),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    capture_output=True,
+                    timeout=timeout_seconds,
+                    shell=isinstance(rendered, str),
+                    check=False,
+                    env=env,
+                    **no_console_window_kwargs(),
+                )
+            except subprocess.TimeoutExpired as exc:
+                partial = (
+                    exc.stdout.decode("utf-8", "replace")
+                    if isinstance(exc.stdout, bytes)
+                    else (exc.stdout or "")
+                )
+                return _fail(
+                    report_path,
+                    model,
+                    f"cross-family review timed out after {timeout_seconds}s",
+                    partial=str(partial),
+                )
+            except OSError as exc:
+                return _fail(report_path, model, f"cross-family runner failed to start: {exc}")
+            except subprocess.SubprocessError as exc:  # any other subprocess failure
+                return _fail(report_path, model, f"cross-family review errored: {exc}")
+
+            stdout = completed.stdout or ""
+            if completed.returncode == 0:
+                break
+
+            detail = (completed.stderr or "").strip()
+            if attempt == 0 and _looks_transient(stdout, detail):
+                sleep(90.0)
+                continue
+
             return _fail(
                 report_path,
                 model,
-                f"cross-family review timed out after {timeout_seconds}s",
-                partial=str(partial),
+                f"cross-family runner exited {completed.returncode}"
+                + (f": {detail}" if detail else ""),
+                partial=stdout,
+                returncode=completed.returncode,
             )
-        except OSError as exc:
-            return _fail(report_path, model, f"cross-family runner failed to start: {exc}")
-        except subprocess.SubprocessError as exc:  # any other subprocess failure
-            return _fail(report_path, model, f"cross-family review errored: {exc}")
 
-        stdout = completed.stdout or ""
-        if completed.returncode == 0:
-            break
+        if not report_body_is_valid(stdout):
+            return _fail(
+                report_path,
+                model,
+                "cross-family review produced an empty or blocked report",
+                partial=stdout,
+                returncode=0,
+            )
 
-        detail = (completed.stderr or "").strip()
-        if attempt == 0 and _looks_transient(stdout, detail):
-            sleep(90.0)
-            continue
-
-        return _fail(
-            report_path,
-            model,
-            f"cross-family runner exited {completed.returncode}"
-            + (f": {detail}" if detail else ""),
-            partial=stdout,
-            returncode=completed.returncode,
-        )
-
-    if not report_body_is_valid(stdout):
-        return _fail(
-            report_path,
-            model,
-            "cross-family review produced an empty or blocked report",
-            partial=stdout,
-            returncode=0,
-        )
-
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(_report(model, stdout, head_ref_oid), encoding="utf-8")
-    return CrossFamilyResult(ok=True, report_path=str(report_path), model=model, returncode=0)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(_report(model, stdout, head_ref_oid), encoding="utf-8")
+        return CrossFamilyResult(ok=True, report_path=str(report_path), model=model, returncode=0)
+    finally:
+        # Issue #1767 finding #3: repo_root here is the shared main checkout,
+        # not a per-session worktree, so nothing else ever reclaims a
+        # caller-owned tmp_dir. Reclaim it ourselves, win or lose, so a
+        # cross-family review run does not accumulate scratch state in the
+        # operator's live checkout indefinitely.
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _report(model: str, body: str, head_ref_oid: str | None = None) -> str:

@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from _helpers import VALID_CROSS_FAMILY_REPORT
+from charlie_work import layout
 from charlie_work.rescue_review import (
     CrossFamilyVerdict,
     run_cross_family_review,
@@ -279,7 +280,7 @@ def test_run_cross_family_review_tmp_dir_creation_failure_returns_stub_not_raise
     original_mkdir = Path.mkdir
 
     def failing_mkdir(self, mode=0o777, parents=False, exist_ok=False):
-        if self.name == "worker-tmp":
+        if self.name == layout.WORKER_TMP_DIRNAME:
             raise OSError("Mock tmp dir creation failure")
         return original_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
 
@@ -297,6 +298,102 @@ def test_run_cross_family_review_tmp_dir_creation_failure_returns_stub_not_raise
 
     assert result.ok is False
     assert "failed to prepare review environment" in (result.error or "")
+
+
+def test_run_cross_family_review_reclaims_caller_supplied_tmp_dir_on_success(
+    tmp_path: Path,
+) -> None:
+    """Issue #1767 finding #3: repo_root is the shared main checkout, not a
+    per-session worktree with its own teardown, so nothing else would ever
+    reclaim a caller-supplied tmp_dir. run_cross_family_review must delete
+    it itself once the subprocess finishes -- proven by asserting the
+    directory used DURING the run (captured by the fake runner) is gone
+    afterward, not merely that some directory doesn't exist at the end."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    report = tmp_path / "report.md"
+    prompt = tmp_path / "prompt.md"
+    caller_tmp_dir = tmp_path / "prs" / "pr-1" / "worker-tmp"
+
+    seen_tmp_env: dict[str, str] = {}
+
+    def _runner(command, **kwargs):
+        # Capture what the subprocess actually saw while the directory was
+        # still alive -- this is the property under test, not the final
+        # env dict sanitize_env returned.
+        seen_tmp_env.update(kwargs["env"])
+        assert Path(seen_tmp_env["TMP"]).is_dir()
+        return subprocess.CompletedProcess(
+            command, 0, stdout="**MAJOR**\nx\n\nVerdict: safe", stderr=""
+        )
+
+    result = run_cross_family_review(
+        model="codex",
+        command=("devin",),
+        repo_root=repo_root,
+        prompt_text="attack this",
+        prompt_path=prompt,
+        report_path=report,
+        timeout_seconds=5,
+        runner=_runner,
+        tmp_dir=caller_tmp_dir,
+    )
+
+    assert result.ok is True
+    assert seen_tmp_env["TMP"] == str(caller_tmp_dir)
+    assert not caller_tmp_dir.exists()
+
+
+def test_run_cross_family_review_reclaims_caller_supplied_tmp_dir_on_failure(
+    tmp_path: Path,
+) -> None:
+    """The same reclaim must happen on a failed run too -- a provider outage
+    or non-zero exit must not leave the caller's scratch directory behind
+    (the reclaim lives in a finally, not only on the success path)."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    report = tmp_path / "report.md"
+    prompt = tmp_path / "prompt.md"
+    caller_tmp_dir = tmp_path / "prs" / "pr-2" / "worker-tmp"
+
+    result = run_cross_family_review(
+        model="codex",
+        command=("devin",),
+        repo_root=repo_root,
+        prompt_text="attack this",
+        prompt_path=prompt,
+        report_path=report,
+        timeout_seconds=5,
+        runner=_fake_completed(1, "boom", "provider outage"),
+        tmp_dir=caller_tmp_dir,
+    )
+
+    assert result.ok is False
+    assert not caller_tmp_dir.exists()
+
+
+def test_run_cross_family_review_does_not_reclaim_the_default_tmp_dir(tmp_path: Path) -> None:
+    """Omitting tmp_dir keeps sanitize_env's own default (keyed on
+    repo_root) -- a caller that did not ask for ownership of cleanup must
+    not have its directory deleted out from under it by this function."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    report = tmp_path / "report.md"
+    prompt = tmp_path / "prompt.md"
+
+    result = run_cross_family_review(
+        model="codex",
+        command=("devin",),
+        repo_root=repo_root,
+        prompt_text="attack this",
+        prompt_path=prompt,
+        report_path=report,
+        timeout_seconds=5,
+        runner=_fake_completed(0, "**MAJOR**\nx\n\nVerdict: safe"),
+    )
+
+    assert result.ok is True
+    assert layout.worker_tmp_dir(repo_root).is_dir()
 
 
 def test_cross_family_verdict_post_init_rejects_content_free_request_changes() -> None:

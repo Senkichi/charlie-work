@@ -301,6 +301,14 @@ def worker_tmp_dir(target_path: Path) -> Path:
     Consumed by ``env_sanitize.sanitize_env``, which points TMP/TEMP/TMPDIR at
     this directory so two concurrent worker subprocesses on the same host
     cannot collide on a predictable shared temp path.
+
+    Note for future debugging: this nests under ``target_path``, so a deeply
+    nested worktree root (e.g. a long repo path combined with a long branch
+    name under ``.claude/worktrees/``) plus whatever a tool writes beneath
+    ``TMP`` could in principle approach Windows' legacy ~260-char ``MAX_PATH``
+    limit sooner than the old host-wide temp dir did. No case of this has been
+    observed; if a worker ever fails with a Windows path-length error, check
+    the resolved length of this path first.
     """
     return target_path / _VAR_DIRNAME / WORKER_TMP_DIRNAME
 

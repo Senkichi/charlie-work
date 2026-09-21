@@ -27,20 +27,39 @@ See ``resolve_pytest_cap``/``resolve_uv_no_sync`` for the precedence helper used
 by callers that need to log which layer supplied the final value.
 
 Session-scoped temp isolation (issue #1767): ``sanitize_env`` points
-TMP/TEMP/TMPDIR at a worktree-local directory (``layout.worker_tmp_dir``) so
-two concurrent worker sessions on this host cannot collide on a predictable
-shared temp path -- the observed incident was a worker fetching a PR body to
-a literal ``/tmp/pr-body.md`` and reading back a different session's body.
-This covers every consumer that resolves a temp directory through the
-environment (``tempfile.gettempdir()``, Node's ``os.tmpdir()``, .NET's
+TMP/TEMP/TMPDIR at a worktree-local directory (``layout.worker_tmp_dir`` by
+default, or the caller-supplied ``tmp_dir`` for a caller with no worktree of
+its own -- see ``rescue_review.run_cross_family_review``) so two concurrent
+worker sessions on this host cannot collide on a predictable shared temp
+path -- the observed incident was a worker fetching a PR body to a literal
+``/tmp/pr-body.md`` and reading back a different session's body. This covers
+every consumer that resolves a temp directory through the environment
+(``tempfile.gettempdir()``, Node's ``os.tmpdir()``, .NET's
 ``Path.GetTempPath()``, ``cmd.exe``/PowerShell's ``%TEMP%``, ``mktemp``, ...).
+
+The directory is cleared (best-effort) immediately before each call recreates
+it, so a worktree that a rework dispatch reuses does not silently hand the
+new round the previous round's leftover scratch files at the same predictable
+path -- the same collision class #1767 was opened to eliminate, just cross-
+round instead of cross-session. It is also seeded with a ``.gitignore``
+containing ``*`` so its populated contents can never register as worker-
+authored dirt in a target repo whose own ``.gitignore`` does not happen to
+cover ``.var/`` -- a single point of enforcement independent of any target
+repo's config (verified: a nested ``.gitignore`` of ``*`` suppresses the
+directory, including the ``.gitignore`` file itself, from
+``git status --porcelain``).
+
 It does NOT retarget a literal ``/tmp/...`` path written from a process
 spawned by Git Bash on this host: MSYS caches its ``/tmp`` ("usertemp") mount
 in a shared, install-wide table seeded once while any ``bash.exe`` from that
 Git install is alive, and does not recompute it from a new process's own
 TMP/TEMP -- verified by launching a standalone ``bash.exe`` with TMP/TEMP
 overridden and observing ``cygpath -w /tmp`` still resolve to the pre-existing
-shared temp dir, unchanged. See issue #1767 for the full probe.
+shared temp dir, unchanged. See issue #1767 for the full probe, and issue
+#1780 for the tracked follow-up: a worker's Git-Bash shell commands (the
+common case for the ``claude-code``/``api`` adapters) must use ``$TMPDIR``
+and never a literal ``/tmp/...`` path, which this change cannot enforce by
+itself.
 
 Shared-venv confinement (issue #649): ``sanitize_env`` does not rely on a
 ``UV_PROJECT_ENVIRONMENT`` pin to protect a junctioned shared venv. Once the
@@ -59,6 +78,7 @@ project environment is already ``.venv`` in the project root.
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -129,7 +149,7 @@ def _is_git_worktree(path: Path) -> bool:
     return git_meta.exists() and not git_meta.is_dir()
 
 
-def sanitize_env(target_path: Path) -> dict[str, str]:
+def sanitize_env(target_path: Path, *, tmp_dir: Path | None = None) -> dict[str, str]:
     """Return a sanitized environment for worker subprocesses.
 
     Drops VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT from the parent environment
@@ -152,6 +172,18 @@ def sanitize_env(target_path: Path) -> dict[str, str]:
 
     Args:
         target_path: The worktree or repo path to check for a .venv directory.
+        tmp_dir: Override for the session-scoped TMP/TEMP/TMPDIR directory
+            (issue #1767). Defaults to ``layout.worker_tmp_dir(target_path)``,
+            which is keyed on ``target_path`` and correct for every caller
+            that owns a worktree's full create/teardown lifecycle
+            (``claude_code``, ``devin_shell``). A caller with no such
+            lifecycle of its own -- ``rescue_review.run_cross_family_review``,
+            whose ``target_path`` is the shared main checkout, not a
+            per-session worktree -- must pass an explicit, per-call directory
+            it creates and reclaims itself; otherwise every call against the
+            same ``target_path`` would derive the same shared, never-cleaned
+            directory. See :func:`layout.worker_tmp_dir` for the default
+            derivation.
 
     Returns:
         A sanitized environment dictionary.
@@ -206,17 +238,36 @@ def sanitize_env(target_path: Path) -> dict[str, str]:
     # Issue #1767: give every worker subprocess a session-scoped TMP/TEMP/
     # TMPDIR so two concurrent sessions on this host cannot collide on a
     # predictable shared temp path. Keyed on target_path like GH_CONFIG_DIR
-    # above -- each worktree is already unique per active session. Directory
-    # creation can fail (permissions, disk full, path length); this raises
-    # OSError rather than swallowing it, exactly like GH_CONFIG_DIR's mkdir
-    # above, so callers report a real launch failure instead of silently
-    # handing a worker an unusable/shared temp path. See the module docstring
-    # for the verified Git-Bash/MSYS caveat this does NOT cover.
-    tmp_dir = layout.worker_tmp_dir(target_path)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    env["TMP"] = str(tmp_dir)
-    env["TEMP"] = str(tmp_dir)
-    env["TMPDIR"] = str(tmp_dir)
+    # above (unless the caller passes an explicit override -- see the
+    # ``tmp_dir`` parameter docstring) -- each worktree is already unique per
+    # active session.
+    resolved_tmp_dir = tmp_dir if tmp_dir is not None else layout.worker_tmp_dir(target_path)
+    # Clear any leftover content before recreating: a rework dispatch reuses
+    # the same worktree (and therefore the same tmp_dir) round over round, so
+    # without this a new round's worker would start with the previous
+    # round's scratch files still in place at the same predictable path --
+    # the exact cross-session collision class #1767 exists to eliminate,
+    # just cross-round instead of cross-process. Best-effort, mirroring the
+    # reparse-point unlink above: a leftover locked file from a just-killed
+    # previous worker must not block this launch, and leaving one stray file
+    # behind is still strictly better isolation than the pre-fix shared host
+    # temp dir.
+    shutil.rmtree(resolved_tmp_dir, ignore_errors=True)
+    # Directory creation can fail (permissions, disk full, path length); this
+    # raises OSError rather than swallowing it, exactly like GH_CONFIG_DIR's
+    # mkdir above, so callers report a real launch failure instead of
+    # silently handing a worker an unusable/shared temp path. See the module
+    # docstring for the verified Git-Bash/MSYS caveat this does NOT cover.
+    resolved_tmp_dir.mkdir(parents=True, exist_ok=True)
+    # Self-ignoring regardless of the target repo's own .gitignore: a
+    # populated worker-tmp dir inside a worktree would otherwise register as
+    # worker-authored dirt on any repo whose .gitignore does not happen to
+    # cover .var/ (verified: a nested .gitignore of "*" suppresses the whole
+    # directory, including this file itself, from `git status --porcelain`).
+    (resolved_tmp_dir / ".gitignore").write_text("*\n", encoding="utf-8")
+    env["TMP"] = str(resolved_tmp_dir)
+    env["TEMP"] = str(resolved_tmp_dir)
+    env["TMPDIR"] = str(resolved_tmp_dir)
 
     # Issue #646: cap xdist worker fan-out and guard a real local .venv from a
     # concurrent uv sync. setdefault() so an already-exported ambient value

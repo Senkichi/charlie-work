@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from _devin_shell_fixtures import _install_fake_create_worktree
 
+from charlie_work import layout
 from charlie_work.devin_shell import launch_devin_session
 from charlie_work.env_sanitize import sanitize_env
 
@@ -260,7 +261,7 @@ def test_launch_devin_session_tmp_dir_creation_failure_returns_error(
     original_mkdir = Path.mkdir
 
     def failing_mkdir(self, mode=0o777, parents=False, exist_ok=False):
-        if self.name == "worker-tmp":
+        if self.name == layout.WORKER_TMP_DIRNAME:
             raise OSError("Mock tmp dir creation failure")
         return original_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
 
