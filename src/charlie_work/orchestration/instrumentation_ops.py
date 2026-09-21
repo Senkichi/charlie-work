@@ -55,6 +55,7 @@ from charlie_work.queue_sync_coverage import _QueueSyncCoverageResult
 from charlie_work.state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     ESCALATION_REASON_CLASS_BY_EVENT_KIND,
+    SINK_STATUSES,
 )
 from charlie_work.supervise import orchestrator_root
 
@@ -90,7 +91,7 @@ def _backfill_missing_reason_classes(self, state: dict[str, Any]) -> dict[str, A
     for issue_key, issue in list(state.get("issues", {}).items()):
         if not isinstance(issue, dict):
             continue
-        if issue.get("status") not in ("escalated", "blocked"):
+        if issue.get("status") not in SINK_STATUSES:
             continue
         if "reason_class" in issue:
             continue
