@@ -172,12 +172,28 @@ def find_repo_root(
     return start
 
 
-def runtime_paths(repo_root: Path, state_dir: str) -> RuntimePaths:
+def runtime_paths(repo_root: Path, state_dir: str, *, check_phantom: bool = True) -> RuntimePaths:
+    """Resolve the runtime-state directory layout for *repo_root*.
+
+    *check_phantom* controls the ``state.json``-missing heuristic in
+    :func:`_warn_if_phantom_state_dir` (issue #648).  Keep the default True
+    for every per-repo orchestrator root.  Pass False only for roots that
+    intentionally never run the per-repo loop and therefore never get a
+    ``state.json`` -- notably ``orchestrator_root()``'s own supervisor
+    self-bookkeeping root, which legitimately accumulates ``events.db``
+    from lifecycle ``log_event()`` writes (issue #1754).  For that root the
+    heuristic's premise ("an earlier invocation resolved the wrong repo
+    root") is false by construction, so the warning is unactionable noise.
+    Callers resolving that root must use
+    :func:`charlie_work.supervise.supervisor_runtime_paths` rather than
+    passing the flag inline, so the binding lives in exactly one place.
+    """
     root = Path(state_dir)
     if not root.is_absolute():
         root = repo_root / root
     root = root.resolve()
-    _warn_if_phantom_state_dir(root)
+    if check_phantom:
+        _warn_if_phantom_state_dir(root)
     return RuntimePaths(
         root=root,
         issues=root / layout.ISSUES_DIRNAME,

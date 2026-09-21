@@ -7,6 +7,7 @@ fixtures live in ``tests/_fleet_dispatch_fixtures.py``.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -565,6 +566,106 @@ def test_fleet_loop_empty_events_still_builds_digest_when_notify_on(
     # inner guard), so no envelope is written and emitted stays False.
     mock_emit_digest.assert_not_called()
     assert result.data["digest"]["emitted"] is False
+
+
+@patch("charlie_work.fleet_dispatch.emit_digest")
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_gc_health_baseline_for_unregistered_repo(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    mock_emit_digest: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #1755: ``fleet_loop`` supplies the live fleet registry to the
+    digest filter, so a persisted baseline key for a repo no longer in
+    ``fleet.json`` is garbage-collected on the next pass instead of latching
+    forever (the live ``owner/repo:-1`` ERROR entry).
+
+    Pins three outcomes at once: the unregistered ``owner/ghost`` key is
+    dropped; a registered repo whose lane was skipped this pass
+    (``owner/missing``, stale repo_root) keeps its key -- the #817 "absence
+    of a check is not evidence of health" protection; and the
+    ``self-deploy`` key survives because it is not a repo key at all.
+    """
+    from charlie_work.config import NotifyConfig
+    from charlie_work.fleet_dispatch import (
+        _fleet_health_state_path,
+        _load_fleet_health_state,
+    )
+
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    # owner/missing's repo_root does not exist: its lane is skipped as a
+    # stale registry entry (never observed), and with no last_seen it is not
+    # old enough to prune -- it stays a registered-but-unobserved member.
+    mock_load_registry.return_value = {
+        "repos": {
+            "owner/anchor": {
+                "repo_root": str(repo),
+                "config_path": "orchestrator.config.yaml",
+                "state_dir": str(repo / ".var" / "charlie-work"),
+            },
+            "owner/missing": {
+                "repo_root": str(tmp_path / "missing"),
+                "config_path": "orchestrator.config.yaml",
+                "state_dir": str(tmp_path / "missing" / ".var" / "charlie-work"),
+            },
+        }
+    }
+    mock_load_layered_config.return_value = OrchestratorConfig()
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+    mock_app = MagicMock()
+    mock_app.loop.return_value = CommandResult(True, "ok", {})
+    mock_app_class.return_value = mock_app
+    mock_gh_class.return_value = MagicMock()
+
+    fleet_dir = tmp_path / "fleet"
+    health_state = _fleet_health_state_path(str(fleet_dir))
+    health_state.parent.mkdir(parents=True, exist_ok=True)
+    health_state.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "issues": {
+                    "owner/ghost:-1": "ERROR",
+                    "owner/missing:9": "ERROR",
+                    "self-deploy:-1": "OK",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    global_config = OrchestratorConfig(
+        notify=NotifyConfig(
+            enabled=True,
+            sink="file",
+            file_path=str(tmp_path / "digest.jsonl"),
+        )
+    )
+
+    fleet_loop(
+        fleet_dir_override=str(fleet_dir),
+        global_config=global_config,
+        repos=None,
+        limit=1,
+        merge=False,
+        dry_run=False,
+        work_only=False,
+    )
+
+    assert _load_fleet_health_state(health_state) == {
+        "owner/missing:9": "ERROR",
+        "self-deploy:-1": "OK",
+    }
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")

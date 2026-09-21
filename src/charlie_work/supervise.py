@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable, Sequence
 from . import fleet_registry, git_pull_blockers, layout, worktree
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .instrumentation import log_event
+from .paths import RuntimePaths, runtime_paths
 from .safe_path import contains
 from .state import state_lock
 from .subprocess_runner import RunResult, run_captured
@@ -187,6 +188,24 @@ def orchestrator_root() -> Path:
     recomputed at every call site so file moves cannot silently break one copy.
     """
     return _ORCHESTRATOR_ROOT
+
+
+def supervisor_runtime_paths(state_dir: str) -> RuntimePaths:
+    """Resolve the runtime-state layout for the supervisor's own bookkeeping root.
+
+    ``orchestrator_root()`` is not a per-repo root: the per-repo loop never
+    runs against it, so ``state.json`` is never created there while
+    ``events.db`` legitimately accumulates from lifecycle ``log_event()``
+    writes.  That is exactly the phantom-state-dir signature, so this helper
+    binds ``check_phantom=False`` (issue #1754) -- for this root the
+    heuristic's premise ("an earlier invocation resolved the wrong repo
+    root") is false by construction and the warning is unactionable noise.
+
+    Every caller that needs the supervisor's bookkeeping paths must go
+    through here rather than spelling ``runtime_paths(orchestrator_root(),
+    ...)`` inline, so a new call site cannot forget the opt-out.
+    """
+    return runtime_paths(orchestrator_root(), state_dir, check_phantom=False)
 
 
 def read_head_sha(
