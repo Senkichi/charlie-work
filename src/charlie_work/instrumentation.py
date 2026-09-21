@@ -579,6 +579,18 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "orphaned_worker_drift": "info",
         "orphaned_worker_opened_pr": "info",
         "orphaned_worker_recovered": "info",
+        # cw#1771 steps 4-6: honest-naming sibling of
+        # ``orphaned_worker_opened_pr`` for the SAME call site's other branch
+        # -- a worker that pushed and wrote a valid ``.worker-outcome.json``
+        # confirming the push completed the handoff contract exactly as
+        # designed (see ``read_worker_outcome``'s docstring: workers never
+        # attempt ``gh pr create`` themselves by design). That is a
+        # successful handoff, not an orphan, so it gets its own kind rather
+        # than reusing the "orphaned_worker_*" vocabulary reserved for the
+        # true-anomaly case (a pushed branch inferred only from
+        # ``ahead_count``, with no worker confirmation). Info, same level as
+        # its sibling -- both are the sweep doing its job.
+        "worker_handoff_pr_opened": "info",
         # Issue #1248: a dead worker's committed-but-unpushed work was
         # published by the orphan sweep (fast-forward only). The sibling
         # ``salvage_push_failed`` is the attempted-but-failed case -- warning,

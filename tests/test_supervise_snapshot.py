@@ -135,6 +135,81 @@ def test_take_snapshot_excludes_launch_failure_sidecar(tmp_path: Path) -> None:
     assert len(snap.sidecar_mtimes) == 1
 
 
+def test_take_snapshot_outcome_mtimes_default_empty_without_worktrees_dir(
+    tmp_path: Path,
+) -> None:
+    """``worktrees_dir`` is optional -- omitting it must not raise, and must
+    produce an empty ``outcome_mtimes`` rather than tracking anything."""
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    prs = tmp_path / "prs"
+    prs.mkdir()
+    snap = take_snapshot(sessions, prs)
+    assert snap.outcome_mtimes == frozenset()
+
+
+def test_has_delta_new_outcome_file_returns_true(tmp_path: Path) -> None:
+    """cw#1771 steps 4-6: a worker's ``.worker-outcome.json`` (written in the
+    WORKTREE, not sessions_dir/prs_dir) must be visible to delta detection on
+    its own -- without this, a clean handoff is invisible until live_count
+    also drops (the process actually exits), which can lag the outcome-file
+    write and force the sweep to wait on the full_pass_interval fallback
+    instead of the very next poll.
+    """
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    prs = tmp_path / "prs"
+    prs.mkdir()
+    worktrees = tmp_path / "worktrees"
+    worktrees.mkdir()
+
+    snap1 = take_snapshot(sessions, prs, worktrees)
+    assert snap1.outcome_mtimes == frozenset()
+
+    wt_dir = worktrees / "agent-issue-1-x"
+    wt_dir.mkdir()
+    (wt_dir / ".worker-outcome.json").write_text(
+        '{"push_succeeded": true, "pr_created": false}', encoding="utf-8"
+    )
+    snap2 = take_snapshot(sessions, prs, worktrees)
+    assert len(snap2.outcome_mtimes) == 1
+    assert has_delta(snap1, snap2) is True
+
+
+def test_take_snapshot_outcome_mtimes_keys_on_worktree_parent_not_filename(
+    tmp_path: Path,
+) -> None:
+    """Two worktrees whose outcome files happen to share an identical mtime
+    must still produce two distinct snapshot entries -- keying on path.name
+    alone (always the constant ".worker-outcome.json") would collapse them,
+    mirroring the existing verdict_mtimes regression guard above.
+    """
+    import os
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    prs = tmp_path / "prs"
+    prs.mkdir()
+    worktrees = tmp_path / "worktrees"
+    worktrees.mkdir()
+
+    wt1 = worktrees / "agent-issue-1-x"
+    wt1.mkdir()
+    wt2 = worktrees / "agent-issue-2-y"
+    wt2.mkdir()
+    outcome1 = wt1 / ".worker-outcome.json"
+    outcome2 = wt2 / ".worker-outcome.json"
+    outcome1.write_text('{"push_succeeded": true, "pr_created": false}', encoding="utf-8")
+    outcome2.write_text('{"push_succeeded": true, "pr_created": false}', encoding="utf-8")
+
+    shared_mtime = 1_700_000_000.0
+    os.utime(outcome1, (shared_mtime, shared_mtime))
+    os.utime(outcome2, (shared_mtime, shared_mtime))
+
+    snap = take_snapshot(sessions, prs, worktrees)
+    assert len(snap.outcome_mtimes) == 2
+
+
 def test_take_snapshot_counts_alive_workers_not_sidecar_files(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

@@ -3238,6 +3238,20 @@ def apply_fixes(
                                 # + duplicate-PR guard instead of calling
                                 # gh.pr_create directly, matching workflow.py's
                                 # _open_salvage_pr (the other pr_create call site).
+                                #
+                                # cw#1771: unlike workflow.py's _open_salvage_pr,
+                                # this lane deliberately does NOT read
+                                # worker_outcome for a drafted title/body. This
+                                # branch fires for unpushed work -- the worker
+                                # died (or was reaped) before ever running
+                                # `git push` -- so any pr_title/pr_body the
+                                # worker drafted would describe a push that
+                                # never happened and may reference state (a PR
+                                # number, a verified head sha) that is false at
+                                # the head this code just pushed on the
+                                # worker's behalf. Synthesis-only is correct
+                                # here; do not "fix" this to match the
+                                # clean-handoff lane.
                                 retry_result = create_pr_with_retry(
                                     gh,
                                     head=item.branch,

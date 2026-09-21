@@ -143,6 +143,7 @@ from .worktree import (
     SalvagePushResult,
     inspect_worktree_state,
     push_branch,
+    read_worker_outcome,
     resolve_base_branch_name,
     salvage_push_stranded_commits,
     summarize_branch_work,
@@ -1935,6 +1936,15 @@ def _classify_dead_sessions_and_update_throttle_state(
                             # trip) and, worse, the caller already has the
                             # freshest snapshot.
                             issue=issue,
+                            # cw#1771: read from the REAL worktree dir, never
+                            # the ``repo_root`` fallback passed as
+                            # ``worktree_path`` above -- a stray
+                            # `.worker-outcome.json` at the main checkout root
+                            # must never be mistaken for this branch's drafted
+                            # PR content.
+                            worker_outcome=(
+                                read_worker_outcome(wt_path) if wt_path.is_dir() else None
+                            ),
                             write_gate=write_gate,
                         )
 
@@ -2241,6 +2251,10 @@ def _classify_dead_sessions_and_update_throttle_state(
                         failure_kind=failure_kind,
                         issue_title=issue.get("title") if issue else None,
                         issue=issue,
+                        # cw#1771: ``worktree_path`` here is the worker's own
+                        # recorded worktree dir (no repo_root fallback), so
+                        # reading the outcome file straight from it is safe.
+                        worker_outcome=read_worker_outcome(worktree_path),
                         write_gate=write_gate,
                     )
                     if salvaged:
@@ -2502,6 +2516,7 @@ def _open_salvage_pr(
     issue_title: str | None = None,
     source_description: str = "worker branch",
     state_file: Path | None = None,
+    worker_outcome: dict[str, Any] | None = None,
 ) -> tuple[int | None, str | None, ValidationResult | None]:
     """Open a PR for a salvaged worker branch and move issue labels toward ``pr_open``.
 
@@ -2526,39 +2541,75 @@ def _open_salvage_pr(
     never blocks the return -- this is the only verification surface that
     would catch it, since GitHub's own auto-close resolution can diverge from
     the text charlie-work wrote even when that text looks correct.
+
+    cw#1771: ``worker_outcome`` is the dict `~charlie_work.worktree.read_worker_outcome`
+    returned for this branch, when the caller has one. When it carries
+    non-empty ``pr_title``/``pr_body`` strings, those are used verbatim (the
+    worker's own drafted PR content, per the DEFAULT ``push_pr_outcome.md``
+    contract -- workers no longer attempt ``gh pr create`` themselves) --
+    still routed through ``validate_closing_reference`` below so a missing or
+    wrong closing line is corrected the same as a synthesized body. Title/body
+    synthesis (the ``"Salvaged work for #N"`` boilerplate below) is the
+    fallback for the genuine crash case: a worker that died before writing an
+    outcome file at all, so there is nothing drafted to prefer.
     """
     if repo_root is None:
         return None, "repo_root is required to open a salvage PR", None
 
     base_branch = resolve_base_branch_name(repo_root, base_ref)
 
-    title = (
-        f"Salvaged work for #{issue_number}: {issue_title}"
-        if issue_title
-        else f"Salvaged work for issue #{issue_number}"
-    )
-    # The body must satisfy the same janitor gate as a worker-authored one
-    # (`review.require_tests_or_rationale`). A fixed boilerplate string cannot:
-    # it carries no rationale token, so every salvage PR failed a gate on text
-    # the orchestrator itself wrote. Derive the rationale from the worker's own
-    # commit log instead of injecting the gate's keywords -- a branch with no
-    # commits still yields no summary, and still correctly fails.
-    body = f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a {source_description}."
-    # Pass the RESOLVED base branch, not the raw ``base_ref``. The orphaned-branch
-    # lane (``_open_pr_for_orphaned_branch``) sources ``base_ref`` straight from
-    # ``config.dispatch.base_ref``, whose default is ``""`` and which the live
-    # config leaves unset -- so production reaches here with the empty sentinel.
-    # ``require_valid_rev("")`` raises, ``summarize_branch_work`` returns "", and
-    # the body falls back to boilerplate that cannot pass the janitor gate: the
-    # exact defect this code exists to fix, on the lane that hits it most.
-    summary = summarize_branch_work(
-        repo_root,
-        branch,
-        base_branch,
-        test_path_globs=config.test_adequacy.test_path_globs,
-    )
-    if summary:
-        body = f"{body}\n\n{summary}"
+    drafted_title: str | None = None
+    drafted_body: str | None = None
+    if isinstance(worker_outcome, dict):
+        candidate_title = worker_outcome.get("pr_title")
+        if isinstance(candidate_title, str) and candidate_title.strip():
+            drafted_title = candidate_title.strip()
+        candidate_body = worker_outcome.get("pr_body")
+        if isinstance(candidate_body, str) and candidate_body.strip():
+            # Non-empty is checked via .strip(), but the value used is the
+            # unstripped original (unlike drafted_title above) -- a PR body
+            # is markdown, so worker-authored leading/trailing structure
+            # (blank lines around a heading, a trailing signature block) is
+            # preserved rather than collapsed. GitHub renders incidental
+            # leading/trailing whitespace as a cosmetic no-op either way.
+            drafted_body = candidate_body
+
+    if drafted_title is not None:
+        title = drafted_title
+    else:
+        title = (
+            f"Salvaged work for #{issue_number}: {issue_title}"
+            if issue_title
+            else f"Salvaged work for issue #{issue_number}"
+        )
+
+    if drafted_body is not None:
+        body = drafted_body
+    else:
+        # The body must satisfy the same janitor gate as a worker-authored one
+        # (`review.require_tests_or_rationale`). A fixed boilerplate string cannot:
+        # it carries no rationale token, so every salvage PR failed a gate on text
+        # the orchestrator itself wrote. Derive the rationale from the worker's own
+        # commit log instead of injecting the gate's keywords -- a branch with no
+        # commits still yields no summary, and still correctly fails.
+        body = (
+            f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a {source_description}."
+        )
+        # Pass the RESOLVED base branch, not the raw ``base_ref``. The orphaned-branch
+        # lane (``_open_pr_for_orphaned_branch``) sources ``base_ref`` straight from
+        # ``config.dispatch.base_ref``, whose default is ``""`` and which the live
+        # config leaves unset -- so production reaches here with the empty sentinel.
+        # ``require_valid_rev("")`` raises, ``summarize_branch_work`` returns "", and
+        # the body falls back to boilerplate that cannot pass the janitor gate: the
+        # exact defect this code exists to fix, on the lane that hits it most.
+        summary = summarize_branch_work(
+            repo_root,
+            branch,
+            base_branch,
+            test_path_globs=config.test_adequacy.test_path_globs,
+        )
+        if summary:
+            body = f"{body}\n\n{summary}"
 
     closing_ref = validate_closing_reference(body, issue_number, repo=_safe_repo_slug(gh), gh=gh)
     body = closing_ref.body
@@ -2708,6 +2759,7 @@ def _attempt_salvage(
     failure_kind: str | None,
     issue_title: str | None = None,
     issue: dict[str, Any] | None = None,
+    worker_outcome: dict[str, Any] | None = None,
     write_gate: WriteGate,
 ) -> tuple[bool, str | None]:
     """Push a completed branch and open a PR, then move labels to ``pr_open``.
@@ -2722,6 +2774,13 @@ def _attempt_salvage(
     can be stale, so before opening a PR we re-check live terminal state. A
     skip emits ``salvage_skipped_already_landed`` instead of opening a vestigial
     duplicate PR, and the caller treats it as "handled" (no redispatch).
+
+    ``worker_outcome`` (cw#1771) is passed straight through to
+    ``_open_salvage_pr``, which prefers its drafted ``pr_title``/``pr_body``
+    over synthesis when present. Callers pass the outcome file read from the
+    ISSUE's actual worktree directory -- never a repo_root fallback used when
+    that directory does not exist -- so a stray `.worker-outcome.json` at the
+    main checkout root is never mistaken for this branch's drafted content.
 
     NOTE (issue #1326): the ``push_branch`` call below threads
     ``dry_run=write_gate.dry_run`` so a dry-run invocation does not issue a
@@ -2797,6 +2856,7 @@ def _attempt_salvage(
         issue_title=issue_title,
         source_description="completed-but-unpublished worker worktree",
         state_file=state_file,
+        worker_outcome=worker_outcome,
     )
     if pr_number is None:
         return False, pr_error or "gh pr create failed or returned no PR number"
@@ -2833,6 +2893,7 @@ def _open_pr_for_orphaned_branch(
     issue_labels: set[str],
     issue_title: str | None = None,
     state_file: Path | None = None,
+    worker_outcome: dict[str, Any] | None = None,
 ) -> tuple[int | None, str | None, ValidationResult | None]:
     """Open a PR for a branch that the worker pushed but could not create a PR for.
 
@@ -2843,6 +2904,12 @@ def _open_pr_for_orphaned_branch(
     orchestrator, which is authenticated, creates the PR and moves the issue
     labels toward ``pr_open``. See `_open_salvage_pr` for the closing-
     reference validation and post-create verification this delegates to.
+
+    ``worker_outcome`` (cw#1771) is the caller's pre-read
+    ``.worker-outcome.json`` for this issue -- this is the dominant,
+    by-design case the outcome-file contract exists for (not a crash), so its
+    drafted ``pr_title``/``pr_body`` are almost always present here. See
+    `_open_salvage_pr` for how they are preferred over synthesis.
     """
     return _open_salvage_pr(
         gh=gh,
@@ -2856,6 +2923,7 @@ def _open_pr_for_orphaned_branch(
         issue_title=issue_title,
         source_description="worker branch that could not open a PR",
         state_file=state_file,
+        worker_outcome=worker_outcome,
     )
 
 

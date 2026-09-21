@@ -513,6 +513,43 @@ def test_take_fleet_snapshot_detects_delta_with_devin_sessions_dir_override(
     assert _has_fleet_delta(before, after) is True
 
 
+def test_take_fleet_snapshot_detects_delta_on_worker_outcome_file(
+    tmp_path: Path,
+) -> None:
+    """cw#1771 steps 4-6: a fresh ``.worker-outcome.json`` under a repo's
+    worktrees dir must register as a fleet-wide delta on its own, mirroring
+    the sessions-dir-override regression test above for the same reason --
+    without this, a clean handoff is invisible to the fleet supervisor until
+    live_count also drops, forcing a wait on the full_pass_interval fallback.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo = _make_repo(tmp_path, "repo", api_worker=None)
+
+    worktrees_dir = repo / ".var" / "charlie-work" / "worktrees"
+    wt_dir = worktrees_dir / "agent-issue-1-x"
+    wt_dir.mkdir(parents=True)
+
+    repos_map = {
+        "owner/repo": {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    before = _take_fleet_snapshot(fleet_dir_override=str(fleet_dir))
+
+    (wt_dir / ".worker-outcome.json").write_text(
+        _json.dumps({"push_succeeded": True, "pr_created": False}), encoding="utf-8"
+    )
+
+    after = _take_fleet_snapshot(fleet_dir_override=str(fleet_dir))
+
+    assert _has_fleet_delta(before, after) is True
+
+
 def test_take_fleet_snapshot_skips_repo_with_malformed_config(
     tmp_path: Path,
 ) -> None:

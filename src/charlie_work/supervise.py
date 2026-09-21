@@ -29,6 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from . import fleet_registry, git_pull_blockers, layout, worktree
+from .config import WORKER_OUTCOME_FILENAME
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .git_retry import RetryOutcome, run_git_with_retry
 from .instrumentation import log_event
@@ -59,10 +60,28 @@ class LocalSnapshot:
     live_count: int
     sidecar_mtimes: frozenset[tuple[str, float]]  # sessions/*.json name+mtime
     verdict_mtimes: frozenset[tuple[str, float]]  # prs/*/review-decision.json (pr-dir-name, mtime)
+    # cw#1771 steps 4-6: a worker that pushes and writes a valid
+    # `.worker-outcome.json` (a clean handoff) is otherwise invisible to this
+    # snapshot -- the file lives in the WORKTREE, not sessions_dir/prs_dir, so
+    # neither sidecar_mtimes nor verdict_mtimes changes when it appears, and
+    # live_count only drops once the process actually exits (which can lag
+    # the outcome-file write). Without this field, a clean handoff has to wait
+    # for the next full_pass_interval_seconds fallback (5 min default) rather
+    # than the next poll_interval_seconds tick (20s default) to be noticed at
+    # all. Defaulted so every existing direct construction (tests, and the
+    # no-worktrees-dir call shape below) keeps working unchanged.
+    outcome_mtimes: frozenset[tuple[str, float]] = frozenset()  # worktrees/*/.worker-outcome.json
 
 
-def take_snapshot(sessions_dir: Path, prs_dir: Path) -> LocalSnapshot:
-    """Capture a fresh ``LocalSnapshot`` from the filesystem (never raises)."""
+def take_snapshot(
+    sessions_dir: Path, prs_dir: Path, worktrees_dir: Path | None = None
+) -> LocalSnapshot:
+    """Capture a fresh ``LocalSnapshot`` from the filesystem (never raises).
+
+    ``worktrees_dir`` is optional (default ``None``) so existing callers that
+    do not have it in hand keep working unchanged, at the cost of not seeing
+    the outcome-file signal (see ``LocalSnapshot.outcome_mtimes``).
+    """
     # Live session count via sidecar files (adapter-agnostic)
     sidecar_mtimes: set[tuple[str, float]] = set()
     if sessions_dir.exists():
@@ -85,6 +104,18 @@ def take_snapshot(sessions_dir: Path, prs_dir: Path) -> LocalSnapshot:
             except OSError:
                 pass
 
+    # Outcome files: worktrees/<slug>/.worker-outcome.json — key on the
+    # worktree-unique parent directory name (the branch slug), mirroring the
+    # verdict-file keying above for the same reason (the filename itself is
+    # the same constant string for every worktree).
+    outcome_mtimes: set[tuple[str, float]] = set()
+    if worktrees_dir is not None and worktrees_dir.exists():
+        for path in worktrees_dir.glob(f"*/{WORKER_OUTCOME_FILENAME}"):
+            try:
+                outcome_mtimes.add((path.parent.name, path.stat().st_mtime))
+            except OSError:
+                pass
+
     # Count actual live workers, not just sidecar files. This correctly
     # excludes terminal launch-failure sidecars (pid=None, error set) and
     # dead workers while still using sidecar mtimes for delta detection.
@@ -101,6 +132,7 @@ def take_snapshot(sessions_dir: Path, prs_dir: Path) -> LocalSnapshot:
         live_count=live_count,
         sidecar_mtimes=frozenset(sidecar_mtimes),
         verdict_mtimes=frozenset(verdict_mtimes),
+        outcome_mtimes=frozenset(outcome_mtimes),
     )
 
 
@@ -110,6 +142,7 @@ def has_delta(before: LocalSnapshot, after: LocalSnapshot) -> bool:
         before.live_count != after.live_count
         or before.sidecar_mtimes != after.sidecar_mtimes
         or before.verdict_mtimes != after.verdict_mtimes
+        or before.outcome_mtimes != after.outcome_mtimes
     )
 
 
@@ -1661,6 +1694,7 @@ def run_supervised(
 
     sessions_dir = app.layout.sessions_dir
     prs_dir = app.paths.prs
+    worktrees_dir = app.layout.worktrees
 
     pass_number = 0
     total_dispatched = 0
@@ -1669,7 +1703,7 @@ def run_supervised(
     # Prime: subtract full_pass_interval so the first iteration fires immediately
     last_full_pass_at = start_time - full_pass_interval
 
-    snapshot = take_snapshot(sessions_dir, prs_dir)
+    snapshot = take_snapshot(sessions_dir, prs_dir, worktrees_dir)
 
     try:
         while True:
@@ -1686,7 +1720,7 @@ def run_supervised(
                 break
 
             # Delta + fallback check
-            new_snapshot = take_snapshot(sessions_dir, prs_dir)
+            new_snapshot = take_snapshot(sessions_dir, prs_dir, worktrees_dir)
             fallback_due = (now - last_full_pass_at) >= full_pass_interval
             run_pass = has_delta(snapshot, new_snapshot) or fallback_due
 
@@ -1703,7 +1737,7 @@ def run_supervised(
                 # guarantee a spurious extra pass whenever this pass's own
                 # side effects (e.g. a fresh dispatch writing a new sidecar
                 # file) show up as a "delta" on the very next poll.
-                snapshot = take_snapshot(sessions_dir, prs_dir)
+                snapshot = take_snapshot(sessions_dir, prs_dir, worktrees_dir)
                 live_count = snapshot.live_count
 
                 # Accumulate totals

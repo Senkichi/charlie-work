@@ -156,11 +156,218 @@ def test_orphaned_worker_pushed_branch_opens_pr(tmp_path: Path) -> None:
     assert open_pr_events[0]["payload"]["reason"] == "dead_worker_branch_pushed_no_pr"
     assert open_pr_events[0]["payload"]["pr_number"] == 9001
     assert open_pr_events[0]["payload"]["branch_name"] == branch
+    # cw#1771 steps 4-6: no outcome file exists here -- the branch is only
+    # inferred pushed via ahead_count -- so this stays the anomaly-path kind,
+    # never the additive honest-handoff kind.
+    assert open_pr_events[0]["payload"]["worker_reported"] is False
+    assert [e for e in events if e.get("kind") == "worker_handoff_pr_opened"] == []
 
     assert len(fake_gh.prs_created) == 1
     assert fake_gh.prs_created[0]["head"] == branch
     assert (935, in_progress) in fake_gh.labels_removed
     assert (935, pr_open) in fake_gh.labels_added
+
+
+def test_orphaned_worker_pushed_branch_uses_worker_drafted_pr_content(tmp_path: Path) -> None:
+    """cw#1771: when the dead worker's own outcome carries drafted ``pr_title``/
+    ``pr_body``, the orchestrator opens the PR with that text verbatim (routed
+    through closing-reference validation) instead of its own "Salvaged work
+    for #N" synthesis -- proving the end-to-end wiring from
+    ``_detect_and_handle_orphaned_workers``'s pre-computed ``worker_outcomes``
+    through to ``_open_pr_for_orphaned_branch`` -> ``_open_salvage_pr``.
+
+    cw#1771 steps 4-6 (honest naming): this scenario -- ``push_succeeded=True``,
+    a valid outcome file -- is the successful-handoff case, so it must emit the
+    additive ``worker_handoff_pr_opened`` info kind, NOT the anomaly-path
+    ``orphaned_worker_opened_pr`` kind that
+    ``test_orphaned_worker_pushed_branch_opens_pr`` (no outcome file, pushed
+    branch inferred only from ``ahead_count``) still emits unchanged.
+    """
+    import subprocess
+    from unittest.mock import patch
+
+    from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.process_utils import (
+        worker_terminal_status_path,
+        write_worker_terminal_status,
+    )
+    from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    remote_repo = tmp_path / "remote"
+    remote_repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--bare", str(remote_repo)], check=True, capture_output=True, text=True
+    )
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(repo_root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    for cmd in (
+        ["git", "config", "user.email", "test@example.test"],
+        ["git", "config", "user.name", "Test User"],
+    ):
+        subprocess.run(cmd, cwd=repo_root, check=True, capture_output=True, text=True)
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote_repo)],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    branch = "agent/issue-935-workers-push-a-finished-branch-but-cannot-open-t"
+    subprocess.run(
+        ["git", "checkout", "-b", branch],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (repo_root / "fix.txt").write_text("fix\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "fix"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", branch],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "main"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    state = load_state(paths.state_file)
+    state["issues"]["935"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+        "branch_name": branch,
+    }
+    save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    terminal_path = worker_terminal_status_path(sessions_dir, 935, "claude")
+    drafted_body = (
+        "Closes #935\n\nRan `pytest tests/test_fix.py` -- 1 passed.\nNo risks identified."
+    )
+    write_worker_terminal_status(
+        terminal_path,
+        pid=1234,
+        exit_code=0,
+        started_at="2026-07-30T00:00:00Z",
+        ended_at="2026-07-30T00:05:00Z",
+        duration_seconds=300.0,
+        worker_outcome={
+            "push_succeeded": True,
+            "pr_created": False,
+            "pr_title": "fix: workers push a finished branch but cannot open the PR",
+            "pr_body": drafted_body,
+        },
+    )
+
+    in_progress = config.labels.in_progress
+    pr_open = config.labels.pr_open
+
+    class FakeGitHubForPushedBranch(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(repo_root=repo_root, dry_run=False)
+            self.issues = [
+                {
+                    "number": 935,
+                    "title": "Workers push a finished branch but cannot open the PR",
+                    "url": "https://example.test/issues/935",
+                    "body": "Workers cannot open PRs because gh is unauthenticated.",
+                    "labels": [{"name": in_progress}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = []
+            self.pr_create_return = 9001
+
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForPushedBranch()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["935"]
+    assert entry.get("status") == PASSIVE_OPEN_STATUS
+    assert entry.get("pr_number") == 9001
+    assert entry.get("branch_name") == branch
+
+    assert len(fake_gh.prs_created) == 1
+    created = fake_gh.prs_created[0]
+    assert created["head"] == branch
+    assert created["title"] == "fix: workers push a finished branch but cannot open the PR"
+    assert created["body"] == drafted_body
+    assert "Salvaged work for" not in created["title"]
+    assert "Salvaged by the orchestrator" not in created["body"]
+    assert (935, in_progress) in fake_gh.labels_removed
+    assert (935, pr_open) in fake_gh.labels_added
+
+    # cw#1771 steps 4-6: confirmed handoff (worker declared push_succeeded via
+    # a valid outcome file) gets the honestly-named additive kind, not the
+    # anomaly-path "orphaned_worker_opened_pr".
+    events = state.get("events", [])
+    handoff_events = [e for e in events if e.get("kind") == "worker_handoff_pr_opened"]
+    assert len(handoff_events) == 1
+    payload = handoff_events[0]["payload"]
+    assert payload["reason"] == "worker_handoff_clean_exit"
+    assert payload["worker_reported"] is True
+    assert payload["pr_number"] == 9001
+    assert [e for e in events if e.get("kind") == "orphaned_worker_opened_pr"] == []
+
+    # cw#1771 steps 4-6: a clean handoff must not be counted as a worker
+    # death, nor consume any redispatch-cap bookkeeping -- both belong to
+    # code paths this success branch `continue`s past entirely.
+    assert "worker_death_at" not in entry
+    assert "orphan_redispatch_at" not in entry
+    assert "orphan_redispatch_head_sha" not in entry
+    assert "orphan_redispatch_counted_dispatch" not in entry
 
 
 def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(

@@ -2651,26 +2651,76 @@ def _detect_and_handle_orphaned_workers(
                         issue_labels=details.get("issue_labels", set()),
                         issue_title=(details.get("issue") or {}).get("title"),
                         state_file=state_file,
+                        # cw#1771: prefer the worker's own drafted PR title/body
+                        # (pre-computed above alongside this candidate) over the
+                        # orchestrator's "Salvaged work for #N" synthesis.
+                        worker_outcome=candidate.get("worker_outcome"),
                     )
                     if pr_number is not None:
                         entry["status"] = PASSIVE_OPEN_STATUS
                         entry["pr_number"] = pr_number
-                        sweep_events.append(
-                            (
-                                "orphaned_worker_opened_pr",
-                                {
-                                    "issue_number": issue_number,
-                                    "pr_number": pr_number,
-                                    "branch_name": candidate["branch"],
-                                    "worker_reported": candidate["reported_push"],
-                                    "ahead_count": candidate["ahead_count"],
-                                    "previous_status": "dispatched",
-                                    "reason": "dead_worker_branch_pushed_no_pr",
-                                    "label_write_ok": pr_error is None,
-                                    "pr_error": pr_error,
-                                },
+                        # cw#1771 steps 4-6 (honest naming): a worker that
+                        # pushed AND wrote a valid `.worker-outcome.json`
+                        # confirming push_succeeded/pr_created=False completed
+                        # the handoff contract exactly as designed (workers
+                        # never carry a `gh` credential and cannot open the PR
+                        # themselves by design -- see `read_worker_outcome`).
+                        # That is not an anomaly, so it is named and counted
+                        # separately from the true-anomaly case: a pushed
+                        # branch inferred ONLY from `ahead_count` with no
+                        # confirming outcome file (worker died before writing
+                        # one, or wrote one that didn't confirm the push).
+                        # This is additive -- the anomaly case keeps emitting
+                        # the original `orphaned_worker_opened_pr` kind
+                        # unchanged, at its existing info level, so every
+                        # existing consumer/dashboard/memory-documented query
+                        # filtering on it keeps matching exactly what it
+                        # always matched.
+                        # Two separate literal append sites (rather than a
+                        # `kind`/`reason` variable chosen above and passed
+                        # through) so the AST-based sweep-append scanner
+                        # (`_scan_sweep_append_kinds`, which resolves only the
+                        # literal at the `sweep_events.append((...))` call
+                        # site itself -- it does not trace local variable
+                        # assignments the way the main event-kind scanner
+                        # does) can prove each kind is registered. Matches
+                        # the literal-at-call-site convention used by every
+                        # other `sweep_events.append(...)` site in this repo
+                        # (see stalled_review_reap.py).
+                        if candidate["reported_push"]:
+                            sweep_events.append(
+                                (
+                                    "worker_handoff_pr_opened",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "branch_name": candidate["branch"],
+                                        "worker_reported": candidate["reported_push"],
+                                        "ahead_count": candidate["ahead_count"],
+                                        "previous_status": "dispatched",
+                                        "reason": "worker_handoff_clean_exit",
+                                        "label_write_ok": pr_error is None,
+                                        "pr_error": pr_error,
+                                    },
+                                )
                             )
-                        )
+                        else:
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_opened_pr",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "branch_name": candidate["branch"],
+                                        "worker_reported": candidate["reported_push"],
+                                        "ahead_count": candidate["ahead_count"],
+                                        "previous_status": "dispatched",
+                                        "reason": "dead_worker_branch_pushed_no_pr",
+                                        "label_write_ok": pr_error is None,
+                                        "pr_error": pr_error,
+                                    },
+                                )
+                            )
                         state["issues"][str(issue_number)] = entry
                         continue
 

@@ -1,8 +1,10 @@
 """Decide whether a worker prompt may tell the worker to use slash-command skills.
 
 ``worker.md`` used to state unconditionally that ``/create-branch``, ``/commit``,
-``/preflight``, ``/push``, ``/create-pr`` and ``/complete`` are available, and its
-implementation loop said to use them. They are not a property of the harness: they
+``/preflight``, ``/push`` and ``/complete`` are available, and its implementation
+loop said to use them. (``/create-pr`` was also in this set until cw#1771 made PR
+creation an orchestrator responsibility instead of a worker one -- see
+``push_pr_outcome.md``.) They are not a property of the harness: they
 exist only where the consumer ships ``<dir>/<name>/SKILL.md`` in a directory the
 harness loads skills from (``HarnessCapabilities.skill_dirs``). A devin-shell worker
 in a repo that ships none gets ``Skill "create-branch" not found`` back, having been
