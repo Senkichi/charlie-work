@@ -743,6 +743,30 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
         ),
         in_predicate=False,
     ),
+    # Issue #1768 review finding 1: outer defense-in-depth around
+    # `self._maybe_emit_operator_queue_impact()`, added inside `_loop_impl`
+    # immediately alongside the `_loop_impl` preflight-warning site directly
+    # above -- same function, same reasoning. Routing this through
+    # `self.write_gate.log_event(...)` would flip `_loop_impl` into R9's
+    # in-predicate exclusive-use bucket, which would then flag that sibling
+    # site (and the `loop_started`/`loop_completed` telemetry
+    # `test_write_gate_dry_run_loop.py` documents as deliberately orthogonal
+    # to the wave) as violations too -- an out-of-scope conversion of a
+    # function this wave never targets, exactly as the sibling entry's own
+    # comment explains. `in_predicate=False` matches the real scan (the
+    # function makes no direct `self.write_gate.*`/`write_gate.*` call).
+    _RawPrimitiveSite(
+        path="orchestration/instrumentation_ops.py",
+        scope="_loop_impl",
+        primitive="log_event",
+        call_source=(
+            "log_event(self.paths.state_file, "
+            "'operator_queue_impact_check_failed', "
+            "{'error': f'{type(exc).__name__}: {exc}'}, "
+            "repo=self.repo_root.name, correlation_id=cid, level='warning')"
+        ),
+        in_predicate=False,
+    ),
     # Issue #1374 AC3: `emit_preflight_refusal` (preflight.py) is the
     # best-effort refusal emitter for FATAL preflight failures (disk full,
     # clock skew, venv drift). Its documented contract is "must never
@@ -820,7 +844,13 @@ _RATCHET_BASELINE: dict[str, int] = {
     # the same block). The ratchet holds at the new count.
     "reconcile.py": 6,
     "state_migration.py": 1,
-    "supervise.py": 11,
+    # Issue #1777: +1 raw log_event call in _log_self_deploy_git_retry, the
+    # on_retry hook wired into every self-deploy/ci-fleet-sibling
+    # run_git_with_retry call site. Out-of-wave raw territory, same class as
+    # the pre-existing 11 -- self-deploy's own log_event calls are not routed
+    # through WriteGate (CLAUDE.md's "outside state-lock contexts, call
+    # log_event() directly" convention). The ratchet holds at the new count.
+    "supervise.py": 12,
     "supervisor_lifecycle.py": 3,
     # Issue #1131: +2 raw primitives in record_review's rework-label-skip
     # guard (_record_event + save_state for rework_label_skipped_issue_closed).
@@ -1050,10 +1080,35 @@ _RATCHET_BASELINE: dict[str, int] = {
     # slack held at 5 (measured out-of-predicate raw count after the move is 50, so
     # 55 = 50 + 5), and dispatch_state.py's entry equals its relocated live count
     # exactly (28, slack 0). The baseline-dict sum stays 247 and no ceiling loosens.
+    # PR #1792 (issue #1758): the cross-repo-gate override-label valve adds one
+    # new out-of-predicate save_state+append_event pair directly in
+    # orchestration/dispatch_state.py (not relocated from elsewhere), raising
+    # its entry from 28 to 30. This is a genuine new raw site, reviewed and
+    # accepted here rather than routed through WriteGate, because it sits in
+    # the same dispatch-transition code path as the other 28 already-accepted
+    # raw sites in this module.
     "workflow.py": 55,
-    "orchestration/dispatch_state.py": 28,
+    "orchestration/dispatch_state.py": 30,
     "orchestration/reap_loop.py": 5,
-    "orchestration/reap_dispatch.py": 1,
+    # Issue #1770: +1 raw log_event call in _apply_concurrency_governor's new
+    # CI-headroom clamp branch (the dispatch_backpressure event recorded when
+    # ci_headroom_available()'s reading clamps fresh dispatch, mirroring the
+    # pre-existing open_pr_max clamp's own raw log_event call in the same
+    # function). Same out-of-wave class as that pre-existing site -- the
+    # ratchet holds at the new count (1 -> 2).
+    "orchestration/reap_dispatch.py": 2,
+    # Issue #1770: +1 raw log_event call in ci_headroom_available's
+    # _log_unavailable helper (the ci_headroom_unavailable diagnostic event).
+    # A standalone function in a new module, not an OrchestratorApp method,
+    # so it has no self.write_gate receiver -- same out-of-wave pattern as
+    # capacity_starvation_escalation.py below. Lives at top-level
+    # charlie_work/ci_headroom.py (not under orchestration/): that package is
+    # reserved for the Track 2 Phase B delegation installer's destination
+    # modules (every top-level def in a flat orchestration/ submodule is
+    # auto-installed onto OrchestratorApp -- see workflow_delegation.py), and
+    # this module's functions are plain standalone helpers with no ``self``,
+    # never meant to become OrchestratorApp members.
+    "ci_headroom.py": 1,
     "orchestration/instrumentation_ops.py": 11,
     "orchestration/state_rework_routing.py": 8,
     "orchestration/state_stale_checks.py": 9,
@@ -1062,7 +1117,16 @@ _RATCHET_BASELINE: dict[str, int] = {
     "orchestration/state_rework_review.py": 2,
     "orchestration/state_rescue.py": 2,
     "orchestration/state_unauthorized_merge.py": 1,
-    "orchestration/state_maintenance.py": 8,
+    # Issue #1768: +1 raw save_state call in the rewritten
+    # _maybe_emit_operator_queue_impact (formerly _maybe_emit_operator_queue_depth).
+    # The edge-triggered rewrite added a second, distinct raw-save path: when
+    # the sink drains to empty, a stale baseline signature is cleared with its
+    # own save_state (so a later refill fires fresh rather than being silently
+    # suppressed by stale state) -- separate from the pre-existing raw
+    # save_state on the fire path (arming the review cadence + recording the
+    # new baseline). Same out-of-wave raw-site class as this function's
+    # existing #1314 raw call. The ratchet holds at the new count.
+    "orchestration/state_maintenance.py": 9,
     "orchestration/state_merge_train.py": 6,
     "orchestration/state_operator_commands.py": 6,
     "orchestration/state_approval.py": 4,

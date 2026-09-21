@@ -120,9 +120,12 @@ def test_authority_citation_alone_still_abstains_with_narrowed_markers(
 
 def test_1452_original_shape_no_evidence_marker_still_escalates(tmp_path: Path) -> None:
     """The #1452-ORIGINAL-body shape: several absent paths, cited plainly
-    (no evidence/authority marker words, no gitignored paths) -- still
-    escalates with the unchanged reason string. This is the guard that the
-    neutral classification does not swallow a genuine cross-repo report."""
+    (no evidence/authority marker words, no gitignored paths) -- all survive
+    neutral classification unchanged. Without a fleet registry the gate
+    abstains rather than escalating (positive-evidence redesign,
+    #1756-#1758); this is the guard that neutral classification does not
+    swallow the candidates outright -- they are absent from
+    ``neutral_paths`` and present in ``referenced_paths``/``missing_paths``."""
     repo = tmp_path / "repo"
     _init_git_repo_with_var_gitignore(repo)
     foreign_paths = (
@@ -140,42 +143,40 @@ def test_1452_original_shape_no_evidence_marker_still_escalates(tmp_path: Path) 
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert set(result.referenced_paths) == set(foreign_paths)
     assert set(result.missing_paths) == set(foreign_paths)
     assert result.neutral_paths == ()
-    assert (
-        f"cross_repo_target: all {len(foreign_paths)} referenced file path(s) "
-        "are absent from the target repo" in result.reason
-    )
+    assert "abstaining" in result.reason
 
 
 def test_plain_absent_path_body_still_escalates(tmp_path: Path) -> None:
     """Control from the brief: a body citing plain absent paths with no
-    evidence framing and no gitignored paths still escalates -- the neutral
-    classification does not swallow an ordinary cross-repo bug report."""
+    evidence framing and no gitignored paths survives neutral classification
+    unchanged -- it is not swallowed as an ordinary cross-repo bug report.
+    Without a fleet registry the gate abstains rather than escalating
+    (positive-evidence redesign, #1756-#1758)."""
     repo = tmp_path / "repo"
     _init_git_repo_with_var_gitignore(repo)
-    (repo / "src").mkdir()  # a real, non-ignored top-level dir -- keeps
-    # this genuinely repo-shaped-but-missing rather than tripping the
-    # unrelated single-candidate ambiguous-fragment exception.
+    (repo / "src").mkdir()  # a real, non-ignored top-level dir.
     body = "The bug is in `src/foo.py` and the regression test is `tests/test_foo.py`."
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert set(result.referenced_paths) == {"src/foo.py", "tests/test_foo.py"}
     assert result.neutral_paths == ()
+    assert "abstaining" in result.reason
 
 
 def test_see_and_line_pinpoint_citation_still_escalates(tmp_path: Path) -> None:
     """Review guard: "see `path` line N" is the ordinary way a bug report
     pinpoints the file the worker must EDIT, not an evidence/authority
     citation -- "see" and "line N" were deliberately dropped from the
-    marker vocabulary so this body does not go all-neutral and abstain
-    into dispatch against the wrong repo. Both candidates are repo-shaped
-    (real, non-ignored `src/`/`tests/` dirs exist) but missing -- the gate
-    must still escalate."""
+    marker vocabulary so this body's candidates are not classified neutral.
+    Both candidates are repo-shaped (real, non-ignored `src/`/`tests/` dirs
+    exist) but missing; without a fleet registry the gate abstains rather
+    than escalating (positive-evidence redesign, #1756-#1758)."""
     repo = tmp_path / "repo"
     _init_git_repo_with_var_gitignore(repo)
     (repo / "src").mkdir()
@@ -187,7 +188,7 @@ def test_see_and_line_pinpoint_citation_still_escalates(tmp_path: Path) -> None:
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert set(result.referenced_paths) == {
         "src/charlie_work/nonexistent_module.py",
         "tests/test_nonexistent.py",
@@ -197,13 +198,15 @@ def test_see_and_line_pinpoint_citation_still_escalates(tmp_path: Path) -> None:
         "tests/test_nonexistent.py",
     }
     assert result.neutral_paths == ()
+    assert "abstaining" in result.reason
 
 
 def test_mixed_evidence_and_plain_absent_paths_still_escalates(tmp_path: Path) -> None:
     """(d) A body mixing one evidence-cited absent path (neutral) with one
-    plain absent path (repo-shaped, survives) still escalates -- the plain
-    candidate alone is enough to trigger escalation once neutral candidates
-    are excluded."""
+    plain absent path (repo-shaped, survives) excludes only the evidence
+    citation -- the plain candidate alone remains once neutral candidates
+    are excluded. Without a fleet registry the gate abstains rather than
+    escalating on it (positive-evidence redesign, #1756-#1758)."""
     repo = tmp_path / "repo"
     _init_git_repo_with_var_gitignore(repo)
     (repo / "src").mkdir()
@@ -213,11 +216,11 @@ def test_mixed_evidence_and_plain_absent_paths_still_escalates(tmp_path: Path) -
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert result.referenced_paths == (plain_path,)
     assert result.missing_paths == (plain_path,)
     assert result.neutral_paths == (evidence_path,)
-    assert "cross_repo_target: all 1 referenced file path(s)" in result.reason
+    assert "abstaining" in result.reason
 
 
 # --- (e): git check-ignore fallback when repo_root is not a git repo -----
@@ -226,12 +229,14 @@ def test_mixed_evidence_and_plain_absent_paths_still_escalates(tmp_path: Path) -
 def test_check_ignore_fallback_when_repo_root_is_not_a_git_repo(tmp_path: Path) -> None:
     """When repo_root has no ``.git`` directory, ``git check-ignore`` fails
     ("not a git repository") and the fallback treats the candidate as NOT
-    ignored -- the narrower, safer default (keep escalating) rather than
+    ignored -- the narrower, safer default (keep it a survivor) rather than
     silently suppressing a candidate a broken git invocation could not
     classify. A wrong-polarity fallback ("assume ignored on error") would
-    flip this test's outcome to ``passed=True`` via the single-candidate
-    exception, so this test discriminates the fallback's direction, not
-    just its presence."""
+    drop both candidates into ``neutral_paths``/emptiness, so this test
+    discriminates the fallback's direction via ``referenced_paths``, not
+    just via the final pass/escalate decision (which, without a fleet
+    registry, abstains regardless per the positive-evidence redesign,
+    #1756-#1758)."""
     repo = tmp_path / "no_git_repo"
     repo.mkdir()
     (repo / ".gitignore").write_text(".var/\n", encoding="utf-8")
@@ -241,12 +246,13 @@ def test_check_ignore_fallback_when_repo_root_is_not_a_git_repo(tmp_path: Path) 
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert set(result.referenced_paths) == {
         ".var/charlie-work/state.json",
         "src/charlie_work/nonexistent.py",
     }
     assert result.neutral_paths == ()
+    assert "abstaining" in result.reason
 
 
 # --- (f): citation-section headings (issue #1583) ------------------------
@@ -332,24 +338,23 @@ def test_provenance_section_foreign_path_abstains(tmp_path: Path) -> None:
 def test_changes_section_missing_path_still_escalates(tmp_path: Path) -> None:
     """Guard that the citation-section fix does not widen the neutral set
     beyond citation sections: a body whose only path is in a ``## Changes``
-    section and missing still escalates. ``Changes`` is not a citation
-    heading, so the candidate survives and the gate blocks -- the fix must
-    not neutralize a genuine dispatch target just because it sits under a
-    heading."""
+    section and missing is not classified neutral. ``Changes`` is not a
+    citation heading, so the candidate survives as a referenced/missing path
+    -- the fix must not neutralize a genuine dispatch target just because it
+    sits under a heading. Without a fleet registry the gate abstains on it
+    rather than escalating (positive-evidence redesign, #1756-#1758)."""
     repo = tmp_path / "repo"
     _init_git_repo_with_var_gitignore(repo)
-    (repo / "src").mkdir()  # real, non-ignored top-level dir -- keeps the
-    # candidate genuinely repo-shaped-but-missing rather than tripping the
-    # single-candidate ambiguous-fragment exception.
+    (repo / "src").mkdir()  # real, non-ignored top-level dir.
     body = "## Changes\n\nThe fix is in `src/charlie_work/nonexistent.py`.\n"
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert result.referenced_paths == ("src/charlie_work/nonexistent.py",)
     assert result.missing_paths == ("src/charlie_work/nonexistent.py",)
     assert result.neutral_paths == ()
-    assert "cross_repo_target: all 1 referenced file path(s)" in result.reason
+    assert "abstaining" in result.reason
 
 
 def test_references_and_see_also_headings_also_neutral(tmp_path: Path) -> None:
@@ -396,31 +401,30 @@ def test_origin_git_remote_usage_does_not_neutralize_dispatch_target(
     ``_EVIDENCE_MARKER_RE`` because it is an ordinary git-remote name
     (``origin/main``, ``git push origin``) that appears constantly in issue
     bodies near genuine dispatch targets. A body where ``origin`` appears in
-    the same clause as a genuinely missing repo-shaped path must still
-    escalate -- the ``origin`` mention must NOT neutralize the dispatch
-    target. This is the exact false-negative (cross-repo contamination) the
-    module exists to prevent.
+    the same clause as a genuinely missing repo-shaped path must not have
+    that path classified neutral -- the ``origin`` mention must NOT
+    neutralize the dispatch target. This is the exact false-negative
+    (cross-repo contamination) the module exists to prevent.
 
     The body deliberately puts ``origin/main`` in the same clause (no
     clause-boundary punctuation before the path) as the dispatch target, so
     the old unscoped ``origin`` marker would have neutralized it. With
     ``origin`` removed from ``_EVIDENCE_MARKER_RE`` the candidate survives
-    and the gate escalates."""
+    as referenced/missing; without a fleet registry the gate abstains on it
+    rather than escalating (positive-evidence redesign, #1756-#1758)."""
     repo = tmp_path / "repo"
     _init_git_repo_with_var_gitignore(repo)
-    (repo / "src").mkdir()  # real, non-ignored top-level dir -- keeps the
-    # candidate genuinely repo-shaped-but-missing rather than tripping the
-    # single-candidate ambiguous-fragment exception.
+    (repo / "src").mkdir()  # real, non-ignored top-level dir.
     dispatch_target = "src/charlie_work/nonexistent.py"
     body = f"After merging origin/main the bug in `{dispatch_target}` still reproduces."
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert result.referenced_paths == (dispatch_target,)
     assert result.missing_paths == (dispatch_target,)
     assert result.neutral_paths == ()
-    assert "cross_repo_target" in result.reason
+    assert "abstaining" in result.reason
 
 
 def test_non_citation_heading_does_not_neutralize(tmp_path: Path) -> None:
@@ -428,7 +432,9 @@ def test_non_citation_heading_does_not_neutralize(tmp_path: Path) -> None:
     does not neutralize a candidate under it -- the section-scope signal is
     the heading *word*, not the presence of any heading. Without this guard
     the fix would over-neutralize every path that happens to sit under any
-    heading."""
+    heading. Without a fleet registry the gate abstains on the surviving
+    candidate rather than escalating (positive-evidence redesign,
+    #1756-#1758)."""
     repo = tmp_path / "repo"
     _init_git_repo_with_var_gitignore(repo)
     (repo / "src").mkdir()
@@ -436,9 +442,10 @@ def test_non_citation_heading_does_not_neutralize(tmp_path: Path) -> None:
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert result.referenced_paths == ("src/charlie_work/nonexistent.py",)
     assert result.neutral_paths == ()
+    assert "abstaining" in result.reason
 
 
 def test_heading_containing_citation_word_as_substring_does_not_neutralize(
@@ -451,12 +458,12 @@ def test_heading_containing_citation_word_as_substring_does_not_neutralize(
     meaning is about code that must change -- the paths listed under it are
     genuine dispatch targets, not citations. The old unanchored
     ``\\b...\\b`` search regex would have neutralized them; the anchored
-    ``^...$`` regex does not."""
+    ``^...$`` regex does not. Without a fleet registry the gate abstains on
+    the surviving candidate rather than escalating (positive-evidence
+    redesign, #1756-#1758)."""
     repo = tmp_path / "repo"
     _init_git_repo_with_var_gitignore(repo)
-    (repo / "src").mkdir()  # real, non-ignored top-level dir -- keeps the
-    # candidate genuinely repo-shaped-but-missing rather than tripping the
-    # single-candidate ambiguous-fragment exception.
+    (repo / "src").mkdir()  # real, non-ignored top-level dir.
     dispatch_target = "src/charlie_work/nonexistent.py"
     body = (
         f"## Code References That Must Change\n\nThe primary fix target is `{dispatch_target}`.\n"
@@ -464,11 +471,11 @@ def test_heading_containing_citation_word_as_substring_does_not_neutralize(
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert result.referenced_paths == (dispatch_target,)
     assert result.missing_paths == (dispatch_target,)
     assert result.neutral_paths == ()
-    assert "cross_repo_target" in result.reason
+    assert "abstaining" in result.reason
 
 
 def test_fenced_code_block_citation_heading_does_not_neutralize(
@@ -483,12 +490,12 @@ def test_fenced_code_block_citation_heading_does_not_neutralize(
     regardless of context, so the fenced ``# References`` became the
     "nearest preceding heading" and the dispatch target was wrongly
     neutralized -- the same cross-repo-contamination risk class round 1
-    already blocked twice, reopened via a third vector."""
+    already blocked twice, reopened via a third vector. Without a fleet
+    registry the gate abstains on the surviving candidate rather than
+    escalating (positive-evidence redesign, #1756-#1758)."""
     repo = tmp_path / "repo"
     _init_git_repo_with_var_gitignore(repo)
-    (repo / "src").mkdir()  # real, non-ignored top-level dir -- keeps the
-    # candidate genuinely repo-shaped-but-missing rather than tripping the
-    # single-candidate ambiguous-fragment exception.
+    (repo / "src").mkdir()  # real, non-ignored top-level dir.
     dispatch_target = "src/charlie_work/nonexistent.py"
     body = (
         "## Changes\n\n"
@@ -502,11 +509,11 @@ def test_fenced_code_block_citation_heading_does_not_neutralize(
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert result.referenced_paths == (dispatch_target,)
     assert result.missing_paths == (dispatch_target,)
     assert result.neutral_paths == ()
-    assert "cross_repo_target" in result.reason
+    assert "abstaining" in result.reason
 
 
 def test_indented_code_block_citation_heading_does_not_neutralize(
@@ -520,12 +527,12 @@ def test_indented_code_block_citation_heading_does_not_neutralize(
     listed after it. The old ``_HEADING_LINE_RE`` allowed arbitrary
     leading whitespace, so the indented ``# References`` matched as a
     heading and became the nearest preceding heading -- neutralizing the
-    dispatch target."""
+    dispatch target. Without a fleet registry the gate abstains on the
+    surviving candidate rather than escalating (positive-evidence redesign,
+    #1756-#1758)."""
     repo = tmp_path / "repo"
     _init_git_repo_with_var_gitignore(repo)
-    (repo / "src").mkdir()  # real, non-ignored top-level dir -- keeps the
-    # candidate genuinely repo-shaped-but-missing rather than tripping the
-    # single-candidate ambiguous-fragment exception.
+    (repo / "src").mkdir()  # real, non-ignored top-level dir.
     dispatch_target = "src/charlie_work/nonexistent.py"
     body = (
         "## Changes\n\n"
@@ -537,8 +544,8 @@ def test_indented_code_block_citation_heading_does_not_neutralize(
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert result.referenced_paths == (dispatch_target,)
     assert result.missing_paths == (dispatch_target,)
     assert result.neutral_paths == ()
-    assert "cross_repo_target" in result.reason
+    assert "abstaining" in result.reason

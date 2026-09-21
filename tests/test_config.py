@@ -1694,6 +1694,61 @@ def test_label_config_collect_gate_exempt_is_overridable(tmp_path: Path) -> None
     assert config.labels.collect_gate_exempt == "agent:collect-gate-exempt"
 
 
+# ---------------------------------------------------------------------------
+# LabelConfig — cross_repo_override (issues #1756-#1758: cross_repo_gate
+# positive-evidence redesign, Option B's operator recovery valve)
+# ---------------------------------------------------------------------------
+
+
+def test_label_config_cross_repo_override_default() -> None:
+    from charlie_work.config import LabelConfig
+
+    assert LabelConfig().cross_repo_override == "agent:cross-repo-override"
+
+
+def test_label_config_cross_repo_override_in_all_for_bootstrap() -> None:
+    """The label must exist on the repo for operators to apply it, so it is a
+    member of ``all`` (what ``bootstrap_labels`` creates)."""
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.cross_repo_override in labels.all
+
+
+def test_label_config_cross_repo_override_not_in_workflow_labels() -> None:
+    """The override label is operator-managed only: the label state machine
+    must never add it or strip it via ``_compute_remove`` -- it must persist
+    across ordinary transitions until a human removes it."""
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.cross_repo_override not in labels.workflow_labels
+
+
+def test_label_config_cross_repo_override_not_in_terminal_or_active() -> None:
+    """It is not an issue-lifecycle state -- it is a dispatch-time modifier
+    checked alongside, not instead of, the normal state machine."""
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.cross_repo_override not in labels.terminal
+    assert labels.cross_repo_override not in labels.active
+
+
+def test_label_config_cross_repo_override_is_overridable(tmp_path: Path) -> None:
+    """The label string is configurable via the labels: section like every
+    other label -- never hardcoded anywhere but here."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """labels:
+  cross_repo_override: agent:skip-cross-repo-gate
+""",
+    )
+    config = load_config(config_file)
+    assert config.labels.cross_repo_override == "agent:skip-cross-repo-gate"
+
+
 # --- Issue #600: runner_allocation is host-wide only; cross-validate floors ---
 
 
@@ -1884,6 +1939,36 @@ def test_build_config_from_data_require_worker_github_token_rejects_non_bool() -
     """Issue #1001: dispatch.require_worker_github_token must be a bool."""
     with pytest.raises(ConfigError, match="require_worker_github_token.*must be a bool"):
         build_config_from_data({"dispatch": {"require_worker_github_token": "true"}})
+
+
+def test_build_config_from_data_ci_capacity_headroom_ratio_rejects_non_number() -> None:
+    """Issue #1770: dispatch.ci_capacity_headroom_ratio must be a number."""
+    with pytest.raises(ConfigError, match="ci_capacity_headroom_ratio.*must be a number"):
+        build_config_from_data({"dispatch": {"ci_capacity_headroom_ratio": "1.5"}})
+
+
+def test_build_config_from_data_ci_capacity_headroom_ratio_rejects_bool() -> None:
+    """Issue #1770: bool is an int subclass -- must be rejected explicitly."""
+    with pytest.raises(ConfigError, match="ci_capacity_headroom_ratio.*must be a number"):
+        build_config_from_data({"dispatch": {"ci_capacity_headroom_ratio": True}})
+
+
+def test_build_config_from_data_ci_capacity_headroom_ratio_rejects_negative() -> None:
+    """Issue #1770: dispatch.ci_capacity_headroom_ratio must be >= 0."""
+    with pytest.raises(ConfigError, match="ci_capacity_headroom_ratio.*must be >= 0"):
+        build_config_from_data({"dispatch": {"ci_capacity_headroom_ratio": -0.5}})
+
+
+def test_build_config_from_data_ci_capacity_headroom_ratio_defaults_to_off() -> None:
+    """Issue #1770: unset ci_capacity_headroom_ratio preserves current behavior (0 = off)."""
+    config = build_config_from_data({})
+    assert config.dispatch.ci_capacity_headroom_ratio == 0.0
+
+
+def test_build_config_from_data_ci_capacity_headroom_ratio_accepts_float() -> None:
+    """Issue #1770: a configured ratio round-trips through build_config_from_data."""
+    config = build_config_from_data({"dispatch": {"ci_capacity_headroom_ratio": 1.5}})
+    assert config.dispatch.ci_capacity_headroom_ratio == 1.5
 
 
 # ---------------------------------------------------------------------------

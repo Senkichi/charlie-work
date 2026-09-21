@@ -2319,6 +2319,87 @@ def check_draft_pr_blocked_events(report: Report, repo: RepoInfo, baseline: date
         report.ok(check, facts)
 
 
+def check_ci_headroom_unavailable(report: Report, repo: RepoInfo, baseline: datetime) -> None:
+    """Surface ``ci_headroom_unavailable`` events periodically (issue #1770).
+
+    ``ci_headroom_available()`` (``charlie_work/ci_headroom.py``) records
+    this warning-level event whenever it cannot trust the freshest
+    ``runner_allocation`` reading for a repo that has opted into the
+    CI-headroom clamp (``dispatch.ci_capacity_headroom_ratio > 0``) -- the
+    emission site's own comment on the event's level registration
+    (``instrumentation.py``) says "a repeating burst here means that channel
+    itself needs attention", but before this check nothing read the kind
+    back: it had only a test-only consumer (review finding 6), the
+    ``signal-without-consumer`` shape this codebase's review history flags
+    as its most recurrent defect class. Mirrors
+    ``check_draft_pr_blocked_events`` exactly -- same db-availability
+    posture, same periodic ``report.warn`` (not ``report.anom``: a fail-open
+    reading is a diagnosability gap, not by itself a fleet emergency) --
+    since the emitter (issue #1770 review finding 2) is itself now
+    edge-triggered/rate-limited, so a burst here is meaningful rather than
+    an artifact of unconditional per-pass writes.
+
+    Same ISO-vs-SQLite comparison convention as ``check_draft_pr_blocked_
+    events``: timestamps are compared in Python against ``baseline``, never
+    in SQL, so an unparseable ``ts`` fails toward visibility, not silence.
+    """
+    check = f"ci-headroom-unavailable-events {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.anom(check, f"cannot check: no events.db at {db_path}")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"cannot check: events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.anom(check, "cannot check: events.db has no events table")
+                return
+            rows = conn.execute(
+                "SELECT ts, payload FROM events WHERE kind = ?",
+                ("ci_headroom_unavailable",),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            report.anom(check, f"cannot check: events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    new_unavailable: list[str] = []
+    reasons: dict[str, int] = {}
+    for ts, payload_json in rows:
+        ts_dt = parse_iso(ts)
+        if ts_dt is not None and ts_dt <= baseline:
+            continue
+        new_unavailable.append(ts)
+        reason = "unknown"
+        try:
+            parsed_payload = json.loads(payload_json)
+            if isinstance(parsed_payload, dict):
+                reason = str(parsed_payload.get("reason", "unknown"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        reasons[reason] = reasons.get(reason, 0) + 1
+
+    facts = f"unavailable_rows={len(rows)} new_since_last_beat={len(new_unavailable)}"
+    if new_unavailable:
+        report.warn(
+            check,
+            f"ci_headroom_unavailable since last beat: {len(new_unavailable)} event(s), "
+            f"reasons={reasons} ({facts})",
+        )
+    else:
+        report.ok(check, facts)
+
+
 def check_supervisor_venv_refusal(
     report: Report, repos: list[RepoInfo], baseline: datetime
 ) -> None:
@@ -2946,6 +3027,7 @@ def main() -> int:
         check_warning_events(report, repo, baseline)
         check_infra_blocked_events(report, repo, baseline)
         check_draft_pr_blocked_events(report, repo, baseline)
+        check_ci_headroom_unavailable(report, repo, baseline)
         check_log_freshness(report, repo, now=now)
         check_loop_pass_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)

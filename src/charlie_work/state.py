@@ -12,6 +12,19 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
+# Issue #1769 review follow-up / file-size ratchet (#1442): dispatch-cadence
+# bookkeeping moved to its own module; re-exported so import paths hold.
+from .dispatch_cadence import (  # noqa: F401 (deliberate re-export)
+    arm_dispatch_stale_alert,
+    backfill_dispatch_baseline,
+    clear_dispatch_stale_alert,
+    dispatch_baseline_needs_backfill,
+    is_dispatch_stale_alert_due,
+    last_non_empty_dispatch,
+    mark_dispatch_baseline_backfill_attempted,
+    record_non_empty_dispatch,
+)
+
 STATE_VERSION = 1
 
 # Cross-process lock timeout (seconds) — best-effort to prevent wedging
@@ -105,6 +118,52 @@ EXTERNALLY_DERIVED_ISSUE_STATUSES: frozenset[str] = frozenset({"closed"})
 ORCHESTRATOR_OWNED_ISSUE_STATUSES: frozenset[str] = (
     VALID_ISSUE_STATUSES - EXTERNALLY_DERIVED_ISSUE_STATUSES
 )
+
+# The two statuses that park an issue (or its bound PR) in the
+# ``agent:human-needed`` sink awaiting an operator decision -- the in-state
+# mirror of labels.py's ``_edges()`` table, where "escalated" and "blocked"
+# both map to the identical human_needed label edge. Originally defined only
+# as workflow.py's private ``_SINK_STATUSES`` for ``sink_census()``; promoted
+# here as the single, importable source of truth after issue #1765 found
+# three independent call sites -- ``unescalate()``'s stuck predicate, the
+# dispatch-time label self-heal sweep (``escalation._collect_escalated_label_
+# subjects``/``_escalated_label_needs_repair``), and reconcile's
+# ``escalated_labels_converged`` drift check -- each hardcoding a
+# ``== "escalated"`` check that silently missed "blocked" the moment #1642
+# introduced it. Every consumer that needs "is this stuck in the human/
+# operator sink" must derive from this one set, so a future status added to
+# the sink cannot again be missed by some but not all of them.
+SINK_STATUSES: frozenset[str] = frozenset({"escalated", "blocked"})
+
+# Issue #1765 finding 3: three call sites deliberately keep a bare
+# ``== "escalated"`` check instead of deriving from SINK_STATUSES above, and
+# each is a different reason, not an oversight this constant's docstring
+# should be read as inviting a "fix":
+#
+# - ``escalation._escalation_flags`` (feeding ``review()``'s entry gate and
+#   ``merge_ready()``'s per-route escalation lanes, issues #384/#833/#776) and
+#   ``state_record_review.record_review``'s terminal-state reentrancy guard
+#   both exist to stop a *late-arriving write* from silently clobbering
+#   ``status="escalated"`` after a race with the attempt-cap escalation path
+#   (pr-lifecycle.md: non-durable escalation, PRs observed re-escalating
+#   2-3x). "blocked" has no equivalent race: it is a terminal decision
+#   ``record_review`` itself writes deliberately from a reviewer's own
+#   verdict, never overwritten by a concurrent state-only mutation the way
+#   "escalated" can be. Widening either guard to SINK_STATUSES would instead
+#   change review()/merge_ready()'s per-route escalation POLICY for blocked
+#   PRs -- a real design question (see finding 5), not a rename.
+# - ``dispatch_selection``'s ``escalated_skipped`` candidate filter checks
+#   the state ``status`` field specifically because a state-level escalation
+#   need not be reflected anywhere else. A "blocked" PR does not need the
+#   same belt: it is already excluded from ``dispatchable`` by
+#   ``_is_review_dispatchable``'s decision-cache lookup (a terminal
+#   "blocked" decision at the live head is never re-queued -- see
+#   ``github_ops_review_queue``). Adding SINK_STATUSES here would be a
+#   redundant second filter on the same fact, not a missing one.
+#
+# Every OTHER consumer -- unescalate()'s stuck predicate, the escalated-label
+# self-heal sweep, reconcile's drift check -- has no such downstream cover
+# and must keep deriving from this set.
 
 # Issue #955: this used to be the literal string "reviewing" -- the same
 # value ``review()`` writes (guarded by ``review_dispatch.enabled``, see
@@ -364,6 +423,26 @@ def _thread_lock_for(path: Path) -> threading.Lock:
 
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def age_days_since(timestamp: str | None, *, now: datetime | None = None) -> float | None:
+    """Days elapsed since an ISO-8601 ``terminal_since``-shaped timestamp.
+
+    Shared helper for the ``terminal_since`` -> ``age_days`` arithmetic that
+    previously existed only inline in
+    ``orchestration.github_ops_operator_queue.operator_queue`` (issue #1768
+    step 3). Returns ``None`` for a missing, malformed, or non-string
+    timestamp rather than raising -- both callers treat "age unknown" as a
+    valid, displayable state, not an error.
+    """
+    if not timestamp:
+        return None
+    try:
+        since_dt = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    resolved_now = now if now is not None else datetime.now(UTC)
+    return round((resolved_now - since_dt).total_seconds() / 86400.0, 2)
 
 
 def without_review_dispatch_claim(pr_state: dict[str, Any]) -> dict[str, Any]:
@@ -1284,6 +1363,62 @@ def arm_operator_queue_review(
     """
     section = _deescalation_pass(data)
     section["next_operator_queue_review_at"] = next_operator_queue_review_at
+    return {**data, "deescalation_pass": section}
+
+
+def operator_queue_impact_baseline(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the last-recorded operator-queue-impact edge-detection signature.
+
+    Issue #1768. ``None`` when no signature has ever been recorded (a fresh
+    deploy, or a queue that was empty last time it was checked and got its
+    baseline cleared by ``clear_operator_queue_impact_baseline``) --
+    ``operator_queue_impact.should_fire_operator_queue_impact`` treats that
+    as "fire", so a brand-new occurrence is never silently swallowed.
+    """
+    section = _deescalation_pass(data)
+    baseline = section.get("operator_queue_impact_signature")
+    return dict(baseline) if isinstance(baseline, dict) else None
+
+
+def record_operator_queue_impact_signature(
+    data: dict[str, Any],
+    *,
+    root_issue_numbers: list[int],
+    over_threshold: bool,
+    age_bucket: str,
+    alerted_at: str,
+) -> dict[str, Any]:
+    """Persist the operator-queue-impact signature that just fired.
+
+    Returns a new state dict; does not mutate ``data``. Read back by
+    ``operator_queue_impact_baseline`` on the next pass so the emitter can
+    detect a materially unchanged condition and skip re-firing (issue
+    #1768's edge-triggering rewrite of the old level-triggered gauge).
+    """
+    section = _deescalation_pass(data)
+    section["operator_queue_impact_signature"] = {
+        "root_issue_numbers": sorted(root_issue_numbers),
+        "over_threshold": over_threshold,
+        "age_bucket": age_bucket,
+        "alerted_at": alerted_at,
+    }
+    return {**data, "deescalation_pass": section}
+
+
+def clear_operator_queue_impact_baseline(data: dict[str, Any]) -> dict[str, Any]:
+    """Drop the recorded signature once the queue drains to empty (issue #1768).
+
+    A future arrival then finds no baseline and fires unconditionally
+    (mirrors ``should_fire_operator_queue_impact``'s ``baseline is None``
+    branch) -- a queue that fully drains and later re-fills is a fresh
+    event, not a continuation of the old one. Returns ``data`` unchanged
+    (same object) when there was nothing to clear, so a no-op call never
+    forces a spurious ``state.json`` write.
+    """
+    section = _deescalation_pass(data)
+    if "operator_queue_impact_signature" not in section:
+        return data
+    section.pop("operator_queue_impact_signature", None)
     return {**data, "deescalation_pass": section}
 
 

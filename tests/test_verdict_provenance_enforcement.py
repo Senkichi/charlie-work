@@ -663,12 +663,16 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
     # the exemption census -- so a silent drop (the _wf. form evading the
     # receiver-sensitive matcher) could not be caught. Pinning the total
     # means a future drop fails loudly instead of eroding coverage quietly.
-    # Today there are exactly 5 sites: 4 checked (two in review in
+    # Today there are exactly 7 sites: 6 checked (two in review in
     # workflow.py -- the #1695 archive-before-void write and the
     # pending-stub write -- plus _update_approval_head in
-    # state_approval.py and record_review in state_record_review.py) + 1
+    # state_approval.py, record_review in state_record_review.py, and two
+    # new sites in unescalate() in state_operator_commands.py -- issue
+    # #1765 finding 1's own archive-before-void write and pending-stub
+    # write, the same two-call pattern review() already uses, applied here
+    # to void a still-valid terminal verdict before re-arming a PR) + 1
     # exempted (merge_authorize in state_operator_commands.py).
-    assert len(scanned_write_sites) + len(exempted_write_sites) == 5, {
+    assert len(scanned_write_sites) + len(exempted_write_sites) == 7, {
         "checked": scanned_write_sites,
         "exempted": exempted_write_sites,
     }

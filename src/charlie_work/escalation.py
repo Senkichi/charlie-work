@@ -19,6 +19,7 @@ from .labels import _edges
 from .state import (
     ESCALATION_REASON_CLASSES,
     PASSIVE_OPEN_STATUS,
+    SINK_STATUSES,
     escalation_reason_class,
     utc_now,
 )
@@ -224,7 +225,25 @@ def _escalate_issue(
     alongside ``escalation_reason`` by ``clear_escalation`` (state.py) and by
     ``charlie unescalate``'s reset-field tuples, so a de-escalated issue gets
     a genuinely fresh history on re-escalation.
+
+    Issue #1765 finding 5: ``status="blocked"`` requires
+    ``reason_class="judgment"``, enforced here rather than merely asserted in
+    ``_escalation_edge``'s docstring. ``_escalation_edge`` has no
+    ``"mechanical"`` counterpart for the ``"blocked"`` edge -- a
+    "blocked but mechanical" entry would resolve to ``human_needed`` where
+    every other mechanical escalation resolves to ``operator_queued``,
+    silently reintroducing the #1266 clobber (an operator-queued issue
+    stamped back to human-needed) the very first time such an entry reached
+    the label-repair sweep or reconcile's drift converger. This is the single
+    writer of ``status`` on an escalation, so failing loudly here is what
+    makes the "blocked implies judgment" taxonomy actually unrepresentable,
+    instead of true only by convention.
     """
+    if status == "blocked" and reason_class != "judgment":
+        raise ValueError(
+            f"_escalate_issue: status='blocked' requires reason_class="
+            f"'judgment' (got {reason_class!r}) -- see issue #1765 finding 5"
+        )
     state.setdefault("issues", {})
     state.setdefault("prs", {})
 
@@ -299,7 +318,12 @@ def _escalated_label_needs_repair(
     pr_number: int | None,
     issue_number: int | None,
 ) -> bool:
-    """Should the ``escalated`` label edge be re-applied for an already-escalated PR?
+    """Should the sink-status label edge be re-applied for an already-parked PR?
+
+    "Already-parked" means the PR or issue status is a member of
+    ``state.SINK_STATUSES`` (issue #1765) -- not just "escalated" -- since a
+    "blocked" verdict (#1642) owes the identical ``agent:human-needed`` label
+    edge and can fail to land it the same way an "escalated" transition can.
 
     ``pr_number`` may be ``None``: an issue can be escalated by a path that never
     produced a PR, and ``_collect_escalated_label_subjects`` yields those with no
@@ -334,7 +358,10 @@ def _escalated_label_needs_repair(
         pr_entry = {}
     if not isinstance(issue_entry, dict):
         issue_entry = {}
-    if pr_entry.get("status") != "escalated" and issue_entry.get("status") != "escalated":
+    if (
+        pr_entry.get("status") not in SINK_STATUSES
+        and issue_entry.get("status") not in SINK_STATUSES
+    ):
         return False
     return not ("label_error" in issue_entry and issue_entry["label_error"] is None)
 
@@ -342,7 +369,13 @@ def _escalated_label_needs_repair(
 def _collect_escalated_label_subjects(
     state: dict[str, Any],
 ) -> list[tuple[int | None, int]]:
-    """``(pr_number, issue_number)`` pairs whose ``escalated`` label edge may be owed.
+    """``(pr_number, issue_number)`` pairs whose sink-status label edge may be owed.
+
+    Membership is ``status in state.SINK_STATUSES`` (issue #1765), not a bare
+    ``== "escalated"`` check: a "blocked" verdict (#1642) owes the same
+    ``agent:human-needed`` label edge and must be repairable by this same
+    sweep, or a label-write failure on a blocked verdict has no self-heal
+    path at all (the gap swole PR #268 / issue #194 hit).
 
     Issue #1088. The set #586's self-heal sweep iterated was built inside
     ``dispatch_reviews``' candidate-filter loop, so its members were whatever the
@@ -367,7 +400,7 @@ def _collect_escalated_label_subjects(
     prs = state.get("prs", {})
     if isinstance(prs, dict):
         for pr_key, pr_entry in prs.items():
-            if not isinstance(pr_entry, dict) or pr_entry.get("status") != "escalated":
+            if not isinstance(pr_entry, dict) or pr_entry.get("status") not in SINK_STATUSES:
                 continue
             issue_number = pr_entry.get("issue_number")
             if issue_number is None:
@@ -379,7 +412,7 @@ def _collect_escalated_label_subjects(
     issues = state.get("issues", {})
     if isinstance(issues, dict):
         for issue_key, issue_entry in issues.items():
-            if not isinstance(issue_entry, dict) or issue_entry.get("status") != "escalated":
+            if not isinstance(issue_entry, dict) or issue_entry.get("status") not in SINK_STATUSES:
                 continue
             try:
                 issue_number = int(issue_key)

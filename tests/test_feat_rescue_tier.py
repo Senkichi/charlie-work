@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from charlie_work import layout
 from charlie_work.config import (
     OrchestratorConfig,
     RescueConfig,
@@ -408,6 +409,46 @@ def _fake_cross_family_review(decision: str, summary: str):
         return CrossFamilyResult(ok=True, report_path=str(report_path), model=model, returncode=0)
 
     return fake
+
+
+def test_process_rescue_review_passes_a_pr_scoped_reclaimable_tmp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1767 finding #3: repo_root (the shared main checkout used for
+    rescue review) has no per-session worktree lifecycle of its own, so a
+    tmp dir keyed on repo_root alone would give every rescue review of this
+    repo the same never-cleaned directory. _process_rescue_review must
+    instead pass a directory scoped to THIS PR's own pr_dir (already used
+    for the prompt/report files), so run_cross_family_review can own and
+    reclaim it -- this pins the actual wiring, not just that some tmp_dir
+    was passed."""
+    app = _rescue_marked_app(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake(*, tmp_dir=None, **kwargs):
+        captured["tmp_dir"] = tmp_dir
+        kwargs["report_path"].parent.mkdir(parents=True, exist_ok=True)
+        verdict = {"decision": "approved", "summary": "ok", "required_changes": []}
+        kwargs["report_path"].write_text(
+            "# Cross-family adversarial review\n\n---\n\n"
+            f"analysis text\n\n```json\n{json.dumps(verdict)}\n```\n",
+            encoding="utf-8",
+        )
+        return CrossFamilyResult(
+            ok=True, report_path=str(kwargs["report_path"]), model=kwargs["model"], returncode=0
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", fake)
+
+    app._process_rescue_review({"pr": 456, "issue": 123})
+
+    expected_tmp_dir = app.paths.prs / "pr-456" / layout.WORKER_TMP_DIRNAME
+    assert captured["tmp_dir"] == expected_tmp_dir
+    # Must be scoped to this PR's own directory, never bare repo_root --
+    # that would reproduce the shared, never-cleaned directory finding #3
+    # reported.
+    assert captured["tmp_dir"] != app.repo_root
+    assert captured["tmp_dir"] != layout.worker_tmp_dir(app.repo_root)
 
 
 def test_process_rescue_review_request_changes_escalates_with_both_artifacts(

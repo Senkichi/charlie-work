@@ -99,7 +99,21 @@ def _webhook_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
         return NotifyResult(ok=False, error=f"webhook unexpected error: {e}")
 
 
-_DESKTOP_SEVERITIES = frozenset({"STALLED", "RUNAWAY", "DEAD", "ERROR"})
+_DESKTOP_SEVERITIES = frozenset(
+    {
+        "STALLED",
+        "RUNAWAY",
+        "DEAD",
+        "ERROR",
+        # Issue #1768: the operator-queue-impact edge-triggered alert
+        # (``AttentionEntry(issue_number=0, adapter_kind="operator_queue",
+        # health="OPERATOR_QUEUE_IMPACT", ...)``) is genuinely rare by
+        # construction (edge-triggered, not level-triggered), matching the
+        # other members of this set -- it belongs in the desktop-toast path,
+        # not filtered out of it.
+        "OPERATOR_QUEUE_IMPACT",
+    }
+)
 _MAX_DESKTOP_REASON_LENGTH = 80
 
 
