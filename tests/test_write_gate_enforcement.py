@@ -743,6 +743,30 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
         ),
         in_predicate=False,
     ),
+    # Issue #1768 review finding 1: outer defense-in-depth around
+    # `self._maybe_emit_operator_queue_impact()`, added inside `_loop_impl`
+    # immediately alongside the `_loop_impl` preflight-warning site directly
+    # above -- same function, same reasoning. Routing this through
+    # `self.write_gate.log_event(...)` would flip `_loop_impl` into R9's
+    # in-predicate exclusive-use bucket, which would then flag that sibling
+    # site (and the `loop_started`/`loop_completed` telemetry
+    # `test_write_gate_dry_run_loop.py` documents as deliberately orthogonal
+    # to the wave) as violations too -- an out-of-scope conversion of a
+    # function this wave never targets, exactly as the sibling entry's own
+    # comment explains. `in_predicate=False` matches the real scan (the
+    # function makes no direct `self.write_gate.*`/`write_gate.*` call).
+    _RawPrimitiveSite(
+        path="orchestration/instrumentation_ops.py",
+        scope="_loop_impl",
+        primitive="log_event",
+        call_source=(
+            "log_event(self.paths.state_file, "
+            "'operator_queue_impact_check_failed', "
+            "{'error': f'{type(exc).__name__}: {exc}'}, "
+            "repo=self.repo_root.name, correlation_id=cid, level='warning')"
+        ),
+        in_predicate=False,
+    ),
     # Issue #1374 AC3: `emit_preflight_refusal` (preflight.py) is the
     # best-effort refusal emitter for FATAL preflight failures (disk full,
     # clock skew, venv drift). Its documented contract is "must never
@@ -1093,7 +1117,16 @@ _RATCHET_BASELINE: dict[str, int] = {
     "orchestration/state_rework_review.py": 2,
     "orchestration/state_rescue.py": 2,
     "orchestration/state_unauthorized_merge.py": 1,
-    "orchestration/state_maintenance.py": 8,
+    # Issue #1768: +1 raw save_state call in the rewritten
+    # _maybe_emit_operator_queue_impact (formerly _maybe_emit_operator_queue_depth).
+    # The edge-triggered rewrite added a second, distinct raw-save path: when
+    # the sink drains to empty, a stale baseline signature is cleared with its
+    # own save_state (so a later refill fires fresh rather than being silently
+    # suppressed by stale state) -- separate from the pre-existing raw
+    # save_state on the fire path (arming the review cadence + recording the
+    # new baseline). Same out-of-wave raw-site class as this function's
+    # existing #1314 raw call. The ratchet holds at the new count.
+    "orchestration/state_maintenance.py": 9,
     "orchestration/state_merge_train.py": 6,
     "orchestration/state_operator_commands.py": 6,
     "orchestration/state_approval.py": 4,

@@ -741,22 +741,27 @@ class DeescalationConfig:
     # a distinct one-time event (deescalation_cap_exhausted) makes the
     # terminal state diagnosable rather than a silently renamed one-way door.
     max_auto_deescalations: int = 2
-    # Issue #1314 item 2: dedicated cadence knob for the operator-queue
-    # depth gauge (item 3). The gauge currently rides the loop pass cadence
-    # (every pass); this knob lets operators slow it to a dedicated interval
-    # if the per-pass emission volume is too high for their fleet. 0 means
-    # "check every pass" (preserves the pre-knob behavior); > 0 means
-    # "check every N minutes", gated by a ``next_operator_queue_review_at``
-    # timestamp in ``state.json``'s ``deescalation_pass`` section.
+    # Issue #1314 item 2 (retained by #1768's rewrite): dedicated cadence
+    # knob for the operator-queue-impact check. The check currently rides
+    # the loop pass cadence (every pass); this knob lets operators slow it
+    # to a dedicated interval if per-pass overhead is too high for their
+    # fleet. 0 means "check every pass" (preserves the pre-knob behavior);
+    # > 0 means "check every N minutes", gated by a
+    # ``next_operator_queue_review_at`` timestamp in ``state.json``'s
+    # ``deescalation_pass`` section.
     operator_queue_review_interval_minutes: int = 0
-    # Issue #1314 item 3: alert threshold for the ``operator_queue_depth``
-    # gauge event. When the number of issues parked on
-    # ``agent:operator-queue`` (state entries with ``status == "escalated"``
-    # and ``reason_class == "mechanical"``) exceeds this threshold, a
-    # warning-level ``operator_queue_depth`` event is emitted to
-    # ``events.db`` so a silently growing queue is visible to
-    # ``heartbeat_check.py`` rather than only via label queries. 0 disables
-    # the alert (no event emitted regardless of depth).
+    # Issue #1768 (retired the #1314 item 3 raw-count gauge this field used
+    # to threshold): alert threshold for the operator-queue-impact signal,
+    # reused as-is rather than introduced as a new key since no fleet repo
+    # currently overrides it. Units changed from "number of operator-queue
+    # ROOT issues" to "number of transitively-blocked automated-ready open
+    # issues" (``OperatorQueueImpact.blocked_ready_count``) -- a single root
+    # issue can transitively block most of a small repo's backlog, which a
+    # root-count threshold could never alarm on (the "fresh-eyes" case: 1
+    # root, 17 of 21 open issues). The event now fires edge-triggered (a
+    # root-set change, a threshold crossing, or an age-bucket crossing),
+    # never unconditionally every pass the condition holds. 0 disables the
+    # alert entirely (no event emitted regardless of impact).
     operator_queue_depth_threshold: int = 5
 
 
@@ -2713,11 +2718,13 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     ):
         raise ConfigError(
             "config section 'deescalation' key 'operator_queue_depth_threshold' "
+            "(blocked-ready-issue count, not root-issue count -- see issue #1768) "
             f"must be an int, got {type(oq_threshold).__name__}"
         )
     if oq_threshold is not None and oq_threshold < 0:
         raise ConfigError(
             "config section 'deescalation' key 'operator_queue_depth_threshold' "
+            "(blocked-ready-issue count, not root-issue count -- see issue #1768) "
             f"must be >= 0, got {oq_threshold}"
         )
     deescalation_overrides: dict[str, Any] = {}
