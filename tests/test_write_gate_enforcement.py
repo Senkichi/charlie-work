@@ -1062,7 +1062,16 @@ _RATCHET_BASELINE: dict[str, int] = {
     "orchestration/state_rework_review.py": 2,
     "orchestration/state_rescue.py": 2,
     "orchestration/state_unauthorized_merge.py": 1,
-    "orchestration/state_maintenance.py": 8,
+    # Issue #1768: +1 raw save_state call in the rewritten
+    # _maybe_emit_operator_queue_impact (formerly _maybe_emit_operator_queue_depth).
+    # The edge-triggered rewrite added a second, distinct raw-save path: when
+    # the sink drains to empty, a stale baseline signature is cleared with its
+    # own save_state (so a later refill fires fresh rather than being silently
+    # suppressed by stale state) -- separate from the pre-existing raw
+    # save_state on the fire path (arming the review cadence + recording the
+    # new baseline). Same out-of-wave raw-site class as this function's
+    # existing #1314 raw call. The ratchet holds at the new count.
+    "orchestration/state_maintenance.py": 9,
     "orchestration/state_merge_train.py": 6,
     "orchestration/state_operator_commands.py": 6,
     "orchestration/state_approval.py": 4,

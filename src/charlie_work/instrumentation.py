@@ -292,16 +292,17 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "infra_rerun_failed": "warning",
         "janitor_rework_stalled": "warning",
         "main_ci_reclaim_failed": "warning",
-        # Issue #1314 item 3: the operator-queue depth gauge. Warning, not
-        # error: a deep queue is a growing backlog of mechanical escalations
-        # the de-escalation sweep has not yet cleared, not a fault that ended
-        # a lane or lost work. The event fires when depth exceeds the
-        # configured ``operator_queue_depth_threshold``; a chronically deep
-        # queue fires every pass the gauge is due, which is why the kind is
-        # also in ``EXPECTED_OPERATIONAL_KINDS`` -- ``heartbeat_check.py``
-        # buckets it into a summarized count instead of interleaving it with
-        # flat detailed listings of genuinely rare warnings.
-        "operator_queue_depth": "warning",
+        # Issue #1768 (replaces the #1314 item 3 "operator_queue_depth"
+        # gauge). Warning, not error: an operator-queue impact signal is a
+        # growing backlog of mechanical/judgment escalations blocking
+        # automated-ready work, not a fault that ended a lane or lost work.
+        # Edge-triggered (fires only on a root-set change, an
+        # impact-vs-threshold crossing, or a bounded low-rate reminder --
+        # never unconditionally every pass), so it is deliberately NOT in
+        # ``EXPECTED_OPERATIONAL_KINDS``: that bucket exists for kinds that
+        # routinely dominate warning volume, which this signal is designed
+        # not to do.
+        "operator_queue_impact": "warning",
         # cw#1263: the orchestrator's own salvage-PR-body builders had to
         # rewrite the ``Closes #N`` line before handing the body to
         # ``gh pr create``. Warning, not error: the rewrite happens before

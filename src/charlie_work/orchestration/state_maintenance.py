@@ -525,43 +525,52 @@ def _maybe_reconcile_drift(self, *, now: datetime | None = None) -> None:
         self.write_gate.save_state(state)
 
 
-def _maybe_emit_operator_queue_depth(self) -> None:
-    """Emit the ``operator_queue_depth`` gauge event when depth exceeds threshold.
+def _maybe_emit_operator_queue_impact(self) -> None:
+    """Emit an edge-triggered ``operator_queue_impact`` signal (issue #1768).
 
-    Issue #1314 item 3. The operator-queue depth gauge makes a silently
-    growing queue of mechanical escalations visible in ``events.db``
-    rather than only via GitHub label queries. The gauge is checked
-    every loop pass (or on the dedicated
-    ``operator_queue_review_interval_minutes`` cadence if configured),
-    and the ``operator_queue_depth`` warning event is emitted only when
-    the depth exceeds the configured ``operator_queue_depth_threshold``
-    -- the same "checked every pass, emitted only when the condition
-    holds" pattern ``dispatch_stale`` uses.
+    Replaces the old level-triggered ``operator_queue_depth`` raw-count
+    gauge (issue #1314 item 3), which fired unconditionally on every pass
+    once any operator-queue item existed -- 16% of a live 2000-row event
+    ring, and a lone-root queue (the "fresh-eyes" shape: 1 root
+    transitively blocking 17 of 21 open issues) never crossed a raw-count
+    threshold at all, so the highest-blast-radius scenario in the fleet
+    was exactly the one this gauge could never alarm on.
 
-    The consumer is ``heartbeat_check.py``'s ``check_warning_events``,
-    which buckets the kind (registered in
-    ``EXPECTED_OPERATIONAL_KINDS``) into a summarized count so a
-    chronically deep queue does not drown out genuinely rare warnings.
-    That bucketing wiring lands in the same PR as the signal, per the
-    signal-without-a-consumer rule.
+    The sink (``sink_census``: issues parked ``agent:human-needed`` /
+    ``agent:operator-queue`` / reviewer-``blocked``) is measured every
+    pass (or on the dedicated ``operator_queue_review_interval_minutes``
+    cadence if configured, same as before), but the event now fires only
+    on a *material change* -- root-set membership change, an
+    impact-vs-threshold crossing, or an oldest-root age-bucket crossing
+    (``should_fire_operator_queue_impact``, mirroring the #817
+    ``_filter_fleet_health_transitions`` transition-filter shape) -- plus
+    a bounded low-rate reminder while the condition persists unchanged.
+    "Impact" is the transitive count of *automated-ready* open issues
+    blocked behind the sink roots (``compute_operator_queue_impact``,
+    reusing the same ``gh.issue_list(state="open")`` fetch
+    ``classify_backlog_reachability`` already makes each pass -- no new
+    GitHub call), not a plain tally of root issues.
+
+    On a genuine fire, the richer payload (root numbers, blocked-ready
+    count and issue numbers, oldest-root age) is both dual-written to
+    ``events.db`` (via ``self._record_event``) and delivered to the
+    desktop-toast pipeline via ``notify.AttentionDigest`` -- the same
+    channel worker-health transitions already use -- so the payload the
+    emitter computes actually reaches the operator instead of being
+    discarded after a heartbeat-line bucket count (AC2).
 
     Threshold 0 disables the alert entirely (no event emitted regardless
-    of depth), preserving the pre-feature silent-queue behavior for
-    fleets that have not yet opted in.
+    of impact), preserving the pre-feature silent-queue behavior for
+    fleets that have not yet opted in. The field is reused as-is
+    (``operator_queue_depth_threshold``, now interpreted in
+    blocked-ready-issue-count units rather than root-count units) rather
+    than introducing a new config key, since no fleet repo currently
+    overrides it.
 
-    ``dry_run`` short-circuits the entire gauge before any lock or state
-    read: the gauge emits a warning event and persists the
-    ``next_operator_queue_review_at`` arm timestamp via a raw
-    ``save_state`` (outside WriteGate), so running it under
-    ``dry_run=True`` would both leak an ``operator_queue_depth`` row into
-    ``events.db`` and mutate ``state.json`` -- violating the C1.2
-    "byte-identical to a pass that never ran" dry-run invariant
-    (``test_loop_wrapper_telemetry_is_the_only_delta_under_dry_run_true``
-    pins that invariant; its fixture has zero escalated issues, so it
-    only exercises the depth<=threshold early return and would not catch
-    a deep-queue dry-run leak on its own). The guard is at the top rather
-    than after the threshold check so a dry-run pass pays neither the
-    lock acquisition nor the state load.
+    ``dry_run`` short-circuits the entire check before any lock, state
+    read, or GitHub call: preserves the C1.2 "byte-identical to a pass
+    that never ran" dry-run invariant
+    (``test_loop_wrapper_telemetry_is_the_only_delta_under_dry_run_true``).
     """
     if self.dry_run:
         return
@@ -571,31 +580,117 @@ def _maybe_emit_operator_queue_depth(self) -> None:
 
     state_file = self.paths.state_file
     review_interval = self.config.deescalation.operator_queue_review_interval_minutes
+    fire_payload: dict[str, Any] | None = None
     with _wf.state_lock(state_file):
         state = _wf.load_state(state_file)
         if review_interval > 0 and not _wf.is_operator_queue_review_due(state):
             return
-        depth_set = _wf.operator_queue_depth(state)
-        depth = len(depth_set)
-        if depth <= threshold:
+
+        roots = _wf.sink_census(state)
+        if not roots:
+            # Empty queue: clear any stale baseline (if one exists) so a
+            # future arrival has nothing to compare against and fires
+            # unconditionally (a drain-then-refill is a fresh event, not a
+            # continuation). No baseline to clear -> no write at all, same
+            # as the pre-#1768 gauge's silent "nothing parked" pass.
+            cleared = _wf.clear_operator_queue_impact_baseline(state)
+            if cleared is not state:
+                _wf.save_state(state_file, cleared)
             return
-        next_review_at = (
-            (datetime.now(UTC) + timedelta(minutes=review_interval))
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z")
+
+        state_issues = state.get("issues", {})
+        root_ages = [
+            _wf.age_days_since(state_issues.get(str(root), {}).get("terminal_since"))
+            for root in roots
+            if isinstance(state_issues.get(str(root)), dict)
+        ]
+        known_ages = [age for age in root_ages if age is not None]
+        oldest_root_age_days = max(known_ages) if known_ages else None
+
+        impact = _wf.compute_operator_queue_impact(
+            self.gh,
+            self.config,
+            roots,
+            oldest_root_age_days=oldest_root_age_days,
         )
-        state = _wf.arm_operator_queue_review(state, next_review_at)
+        over_threshold = impact.blocked_ready_count > threshold
+        age_bucket = _wf.age_bucket_label(oldest_root_age_days)
+        current_signature = _wf.operator_queue_impact_signature(
+            root_issue_numbers=sorted(roots),
+            over_threshold=over_threshold,
+            age_bucket=age_bucket,
+        )
+        baseline = _wf.operator_queue_impact_baseline(state)
+        now = datetime.now(UTC)
+        if not _wf.should_fire_operator_queue_impact(baseline, current_signature, now=now):
+            # Materially unchanged (and not yet due for a low-rate
+            # reminder): mirrors the old gauge's "depth <= threshold"
+            # early return -- no state write, no event, most passes take
+            # this path.
+            return
+
+        # Fire path only from here -- the cadence re-arm and the baseline
+        # write both happen only when something actually changed, matching
+        # the pre-#1768 gauge's structure (it too only ever armed
+        # ``next_operator_queue_review_at`` on its own emit path).
+        if review_interval > 0:
+            next_review_at = (
+                (now + timedelta(minutes=review_interval))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            state = _wf.arm_operator_queue_review(state, next_review_at)
+        alerted_at = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        state = _wf.record_operator_queue_impact_signature(
+            state,
+            root_issue_numbers=sorted(roots),
+            over_threshold=over_threshold,
+            age_bucket=age_bucket,
+            alerted_at=alerted_at,
+        )
         state = self._record_event(
             state,
-            "operator_queue_depth",
+            "operator_queue_impact",
             {
-                "depth": depth,
+                "root_issue_numbers": sorted(roots),
+                "blocked_ready_count": impact.blocked_ready_count,
+                "blocked_ready_issue_numbers": list(impact.blocked_ready_issue_numbers),
+                "oldest_root_age_days": oldest_root_age_days,
                 "threshold": threshold,
-                "issue_numbers": sorted(depth_set),
             },
         )
+        fire_payload = {
+            "root_issue_numbers": sorted(roots),
+            "blocked_ready_count": impact.blocked_ready_count,
+            "oldest_root_age_days": oldest_root_age_days,
+        }
         _wf.save_state(state_file, state)
+
+    if fire_payload is not None and self.config.notify.enabled:
+        _wf.emit_digest(
+            self._layout.notify,
+            _wf.AttentionDigest(
+                generated_at=_wf.utc_now(),
+                repo=self.repo_root.name,
+                transitions=(
+                    _wf.AttentionEntry(
+                        issue_number=0,
+                        adapter_kind="operator_queue",
+                        health="OPERATOR_QUEUE_IMPACT",
+                        previous_health=None,
+                        last_log_line=(
+                            f"blocked_ready={fire_payload['blocked_ready_count']} "
+                            f"roots={fire_payload['root_issue_numbers']} "
+                            f"oldest_age_days={fire_payload['oldest_root_age_days']}"
+                        ),
+                        pid=None,
+                        terminal_tool=None,
+                        terminal_reason="operator-queue impact changed materially",
+                    ),
+                ),
+            ),
+        )
 
 
 def _is_dispatchable(

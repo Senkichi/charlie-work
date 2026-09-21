@@ -366,6 +366,26 @@ def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def age_days_since(timestamp: str | None, *, now: datetime | None = None) -> float | None:
+    """Days elapsed since an ISO-8601 ``terminal_since``-shaped timestamp.
+
+    Shared helper for the ``terminal_since`` -> ``age_days`` arithmetic that
+    previously existed only inline in
+    ``orchestration.github_ops_operator_queue.operator_queue`` (issue #1768
+    step 3). Returns ``None`` for a missing, malformed, or non-string
+    timestamp rather than raising -- both callers treat "age unknown" as a
+    valid, displayable state, not an error.
+    """
+    if not timestamp:
+        return None
+    try:
+        since_dt = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    resolved_now = now if now is not None else datetime.now(UTC)
+    return round((resolved_now - since_dt).total_seconds() / 86400.0, 2)
+
+
 def without_review_dispatch_claim(pr_state: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of a PR state entry with all review-dispatch claim fields cleared.
 
@@ -1284,6 +1304,62 @@ def arm_operator_queue_review(
     """
     section = _deescalation_pass(data)
     section["next_operator_queue_review_at"] = next_operator_queue_review_at
+    return {**data, "deescalation_pass": section}
+
+
+def operator_queue_impact_baseline(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the last-recorded operator-queue-impact edge-detection signature.
+
+    Issue #1768. ``None`` when no signature has ever been recorded (a fresh
+    deploy, or a queue that was empty last time it was checked and got its
+    baseline cleared by ``clear_operator_queue_impact_baseline``) --
+    ``operator_queue_impact.should_fire_operator_queue_impact`` treats that
+    as "fire", so a brand-new occurrence is never silently swallowed.
+    """
+    section = _deescalation_pass(data)
+    baseline = section.get("operator_queue_impact_signature")
+    return dict(baseline) if isinstance(baseline, dict) else None
+
+
+def record_operator_queue_impact_signature(
+    data: dict[str, Any],
+    *,
+    root_issue_numbers: list[int],
+    over_threshold: bool,
+    age_bucket: str,
+    alerted_at: str,
+) -> dict[str, Any]:
+    """Persist the operator-queue-impact signature that just fired.
+
+    Returns a new state dict; does not mutate ``data``. Read back by
+    ``operator_queue_impact_baseline`` on the next pass so the emitter can
+    detect a materially unchanged condition and skip re-firing (issue
+    #1768's edge-triggering rewrite of the old level-triggered gauge).
+    """
+    section = _deescalation_pass(data)
+    section["operator_queue_impact_signature"] = {
+        "root_issue_numbers": sorted(root_issue_numbers),
+        "over_threshold": over_threshold,
+        "age_bucket": age_bucket,
+        "alerted_at": alerted_at,
+    }
+    return {**data, "deescalation_pass": section}
+
+
+def clear_operator_queue_impact_baseline(data: dict[str, Any]) -> dict[str, Any]:
+    """Drop the recorded signature once the queue drains to empty (issue #1768).
+
+    A future arrival then finds no baseline and fires unconditionally
+    (mirrors ``should_fire_operator_queue_impact``'s ``baseline is None``
+    branch) -- a queue that fully drains and later re-fills is a fresh
+    event, not a continuation of the old one. Returns ``data`` unchanged
+    (same object) when there was nothing to clear, so a no-op call never
+    forces a spurious ``state.json`` write.
+    """
+    section = _deescalation_pass(data)
+    if "operator_queue_impact_signature" not in section:
+        return data
+    section.pop("operator_queue_impact_signature", None)
     return {**data, "deescalation_pass": section}
 
 

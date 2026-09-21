@@ -719,14 +719,14 @@ def _loop_impl(
                     "last_escalation": None,
                     "last_pass_cid": None,
                 }
-        # Issue #1314 item 3: operator-queue depth gauge. Emitted after
-        # ``_loop_body`` so the gauge reflects post-pass state (the
+        # Issue #1768 (formerly #1314 item 3): operator-queue impact signal.
+        # Emitted after ``_loop_body`` so it reflects post-pass state (the
         # de-escalation sweep inside ``_loop_body`` may have cleared some
-        # issues), and before ``loop_completed`` so the gauge event is
-        # not self-counted by any post-pass event query. Shares this
-        # pass's correlation ID so the depth reading is attributable to
-        # the same pass as the sink census above.
-        self._maybe_emit_operator_queue_depth()
+        # issues), and before ``loop_completed`` so the event is not
+        # self-counted by any post-pass event query. Shares this pass's
+        # correlation ID so a fire is attributable to the same pass as the
+        # sink census above. Edge-triggered: most passes emit nothing.
+        self._maybe_emit_operator_queue_impact()
         log_event(
             self.paths.state_file,
             "loop_completed",

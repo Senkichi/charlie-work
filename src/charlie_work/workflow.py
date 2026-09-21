@@ -123,10 +123,12 @@ from .merge_finalize import _merged_issue_fields  # noqa: F401  (deliberate re-e
 from .state import (
     PASSIVE_OPEN_STATUS,
     StateLockBusy,
+    age_days_since,  # noqa: F401  (deliberate re-export; used by moved orchestration delegates via _wf.)
     append_event,
     arm_operator_queue_review,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     arm_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     arm_reconcile_pass,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
+    clear_operator_queue_impact_baseline,  # noqa: F401  (deliberate re-export; issue #1768, used by moved L01 b3 delegates via _wf.)
     clear_quota_throttles,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     clear_reviewer_quota,
     defer_reviewer_probe_after,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
@@ -147,6 +149,8 @@ from .state import (
     load_state_locked,
     mark_reviewer_quota_alerted,
     operator_claimed_issues,
+    operator_queue_impact_baseline,  # noqa: F401  (deliberate re-export; issue #1768, used by moved L01 b3 delegates via _wf.)
+    record_operator_queue_impact_signature,  # noqa: F401  (deliberate re-export; issue #1768, used by moved L01 b3 delegates via _wf.)
     release_operator_claimed,  # noqa: F401  (deliberate re-export; used by moved L01 b4 delegates via _wf.)
     save_state,
     schedule_worktree_reclamation,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
@@ -357,6 +361,20 @@ from .backlog_reachability import (  # noqa: F401  (deliberate re-export)
     fetch_merged_prs_fail_open,
     resolve_dispatch_mention_coverage,
     scan_merged_pr_references,
+)
+
+# Issue #1768: operator-queue impact measurement + edge-detection, extracted
+# to its own module for the same reason ``backlog_reachability`` is (a
+# standalone free-function family, disconnected from the other extracted
+# families). Re-exported here so ``state_maintenance``'s ``_wf.`` access
+# pattern and any monkeypatch targets keep working unchanged.
+from .operator_queue_impact import (  # noqa: F401  (deliberate re-export)
+    LOW_RATE_REMINDER_HOURS,
+    OperatorQueueImpact,
+    age_bucket_label,
+    compute_operator_queue_impact,
+    operator_queue_impact_signature,
+    should_fire_operator_queue_impact,
 )
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`

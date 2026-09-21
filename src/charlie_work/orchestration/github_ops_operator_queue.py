@@ -21,6 +21,7 @@ from charlie_work.instrumentation import query_events
 from charlie_work.state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     ESCALATION_REASON_CLASS_BY_EVENT_KIND,
+    age_days_since,
 )
 
 
@@ -100,13 +101,7 @@ def operator_queue(self) -> _wf.CommandResult:
         gh_issue = issues_by_number.get(issue_number, {})
 
         terminal_since = tracked_entry.get("terminal_since")
-        age_days: float | None = None
-        if terminal_since:
-            try:
-                since_dt = datetime.fromisoformat(str(terminal_since).replace("Z", "+00:00"))
-                age_days = round((now - since_dt).total_seconds() / 86400.0, 2)
-            except (ValueError, TypeError):
-                age_days = None
+        age_days = age_days_since(terminal_since, now=now)
 
         # Query events.db for the last escalation-transition event.
         last_escalation_event: dict[str, Any] | None = None
