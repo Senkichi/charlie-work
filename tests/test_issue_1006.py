@@ -162,6 +162,14 @@ def test_orphan_salvage_repo_root_guard(
         if e.get("kind") == "pr_create_failed_branch_stranded"
         and e.get("payload", {}).get("reason") == "dead_worker_branch_pushed_pr_create_failed"
     ]
+    # cw#1771 steps 4-6: this scenario's worker_outcome confirms
+    # push_succeeded=True/pr_created=False, so a successful open now emits the
+    # honestly-named additive ``worker_handoff_pr_opened`` kind rather than
+    # the anomaly-path ``orphaned_worker_opened_pr`` (which stays reserved for
+    # the no-outcome-file, ahead-count-only case).
+    handoff_events = [
+        e for e in state.get("events", []) if e.get("kind") == "worker_handoff_pr_opened"
+    ]
     opened_events = [
         e for e in state.get("events", []) if e.get("kind") == "orphaned_worker_opened_pr"
     ]
@@ -171,15 +179,18 @@ def test_orphan_salvage_repo_root_guard(
 
     if is_valid_path:
         assert calls == [tmp_path]
-        assert len(opened_events) == 1
-        assert opened_events[0]["payload"]["pr_number"] == 101
-        assert opened_events[0]["payload"]["issue_number"] == issue_number
+        assert len(handoff_events) == 1
+        assert handoff_events[0]["payload"]["pr_number"] == 101
+        assert handoff_events[0]["payload"]["issue_number"] == issue_number
+        assert handoff_events[0]["payload"]["reason"] == "worker_handoff_clean_exit"
+        assert len(opened_events) == 0
         assert len(drift_events) == 0
         assert len(relabel_events) == 0
         assert issue_state["status"] == PASSIVE_OPEN_STATUS
         assert issue_state["pr_number"] == 101
     else:
         assert calls == [None]
+        assert len(handoff_events) == 0
         assert len(opened_events) == 0
         assert len(relabel_events) == 0
         assert len(drift_events) == 1

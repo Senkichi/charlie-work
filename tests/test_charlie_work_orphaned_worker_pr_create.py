@@ -156,6 +156,11 @@ def test_orphaned_worker_pushed_branch_opens_pr(tmp_path: Path) -> None:
     assert open_pr_events[0]["payload"]["reason"] == "dead_worker_branch_pushed_no_pr"
     assert open_pr_events[0]["payload"]["pr_number"] == 9001
     assert open_pr_events[0]["payload"]["branch_name"] == branch
+    # cw#1771 steps 4-6: no outcome file exists here -- the branch is only
+    # inferred pushed via ahead_count -- so this stays the anomaly-path kind,
+    # never the additive honest-handoff kind.
+    assert open_pr_events[0]["payload"]["worker_reported"] is False
+    assert [e for e in events if e.get("kind") == "worker_handoff_pr_opened"] == []
 
     assert len(fake_gh.prs_created) == 1
     assert fake_gh.prs_created[0]["head"] == branch
@@ -170,6 +175,13 @@ def test_orphaned_worker_pushed_branch_uses_worker_drafted_pr_content(tmp_path: 
     for #N" synthesis -- proving the end-to-end wiring from
     ``_detect_and_handle_orphaned_workers``'s pre-computed ``worker_outcomes``
     through to ``_open_pr_for_orphaned_branch`` -> ``_open_salvage_pr``.
+
+    cw#1771 steps 4-6 (honest naming): this scenario -- ``push_succeeded=True``,
+    a valid outcome file -- is the successful-handoff case, so it must emit the
+    additive ``worker_handoff_pr_opened`` info kind, NOT the anomaly-path
+    ``orphaned_worker_opened_pr`` kind that
+    ``test_orphaned_worker_pushed_branch_opens_pr`` (no outcome file, pushed
+    branch inferred only from ``ahead_count``) still emits unchanged.
     """
     import subprocess
     from unittest.mock import patch
@@ -335,6 +347,26 @@ def test_orphaned_worker_pushed_branch_uses_worker_drafted_pr_content(tmp_path: 
     assert "Salvaged by the orchestrator" not in created["body"]
     assert (935, in_progress) in fake_gh.labels_removed
     assert (935, pr_open) in fake_gh.labels_added
+
+    # cw#1771 steps 4-6: confirmed handoff (worker declared push_succeeded via
+    # a valid outcome file) gets the honestly-named additive kind, not the
+    # anomaly-path "orphaned_worker_opened_pr".
+    events = state.get("events", [])
+    handoff_events = [e for e in events if e.get("kind") == "worker_handoff_pr_opened"]
+    assert len(handoff_events) == 1
+    payload = handoff_events[0]["payload"]
+    assert payload["reason"] == "worker_handoff_clean_exit"
+    assert payload["worker_reported"] is True
+    assert payload["pr_number"] == 9001
+    assert [e for e in events if e.get("kind") == "orphaned_worker_opened_pr"] == []
+
+    # cw#1771 steps 4-6: a clean handoff must not be counted as a worker
+    # death, nor consume any redispatch-cap bookkeeping -- both belong to
+    # code paths this success branch `continue`s past entirely.
+    assert "worker_death_at" not in entry
+    assert "orphan_redispatch_at" not in entry
+    assert "orphan_redispatch_head_sha" not in entry
+    assert "orphan_redispatch_counted_dispatch" not in entry
 
 
 def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(

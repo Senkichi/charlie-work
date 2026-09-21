@@ -2187,23 +2187,32 @@ def _repo_state_dirs(
     repo_root: Path,
     state_dir: Path,
     config: OrchestratorConfig | None = None,
-) -> tuple[Path, Path]:
-    """Return the (sessions_dir, prs_dir) for a repo given its state dir.
+) -> tuple[Path, Path, Path]:
+    """Return the (sessions_dir, prs_dir, worktrees_dir) for a repo given its state dir.
 
-    Honors ``devin.sessions_dir`` when a resolved config is provided, falling
-    back to the layout default otherwise.
+    Honors ``devin.sessions_dir`` / ``claude_code.worktrees_dir`` when a
+    resolved config is provided, falling back to the layout defaults
+    otherwise -- mirroring ``paths.resolved_layout``'s sentinel-override
+    handling for the same two fields.
     """
     default_sessions_dir = layout.sessions_dir_default(state_dir)
+    default_worktrees_dir = layout.worktrees_dir(state_dir)
     if config is not None:
         sessions_dir = layout.resolve_state_child(
             config.devin.sessions_dir,
             repo_root=repo_root,
             default=default_sessions_dir,
         )
+        worktrees_dir = layout.resolve_state_child(
+            config.claude_code.worktrees_dir or "",
+            repo_root=repo_root,
+            default=default_worktrees_dir,
+        )
     else:
         sessions_dir = default_sessions_dir
+        worktrees_dir = default_worktrees_dir
     prs_dir = state_dir / "prs"
-    return sessions_dir, prs_dir
+    return sessions_dir, prs_dir, worktrees_dir
 
 
 def _take_fleet_snapshot(
@@ -2235,8 +2244,8 @@ def _take_fleet_snapshot(
                 )
             except Exception:  # noqa: BLE001 - match count_fleet_live_sessions containment
                 config = None
-        sessions_dir, prs_dir = _repo_state_dirs(repo_root, state_dir, config)
-        repo_snapshots.add((repo_key, take_snapshot(sessions_dir, prs_dir)))
+        sessions_dir, prs_dir, worktrees_dir = _repo_state_dirs(repo_root, state_dir, config)
+        repo_snapshots.add((repo_key, take_snapshot(sessions_dir, prs_dir, worktrees_dir)))
 
     return FleetLocalSnapshot(frozenset(repo_snapshots))
 

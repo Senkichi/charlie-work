@@ -2543,9 +2543,32 @@ def _detect_and_handle_orphaned_workers(
                     if pr_number is not None:
                         entry["status"] = PASSIVE_OPEN_STATUS
                         entry["pr_number"] = pr_number
+                        # cw#1771 steps 4-6 (honest naming): a worker that
+                        # pushed AND wrote a valid `.worker-outcome.json`
+                        # confirming push_succeeded/pr_created=False completed
+                        # the handoff contract exactly as designed (workers
+                        # never carry a `gh` credential and cannot open the PR
+                        # themselves by design -- see `read_worker_outcome`).
+                        # That is not an anomaly, so it is named and counted
+                        # separately from the true-anomaly case: a pushed
+                        # branch inferred ONLY from `ahead_count` with no
+                        # confirming outcome file (worker died before writing
+                        # one, or wrote one that didn't confirm the push).
+                        # This is additive -- the anomaly case keeps emitting
+                        # the original `orphaned_worker_opened_pr` kind
+                        # unchanged, at its existing info level, so every
+                        # existing consumer/dashboard/memory-documented query
+                        # filtering on it keeps matching exactly what it
+                        # always matched.
+                        if candidate["reported_push"]:
+                            kind = "worker_handoff_pr_opened"
+                            reason = "worker_handoff_clean_exit"
+                        else:
+                            kind = "orphaned_worker_opened_pr"
+                            reason = "dead_worker_branch_pushed_no_pr"
                         sweep_events.append(
                             (
-                                "orphaned_worker_opened_pr",
+                                kind,
                                 {
                                     "issue_number": issue_number,
                                     "pr_number": pr_number,
@@ -2553,7 +2576,7 @@ def _detect_and_handle_orphaned_workers(
                                     "worker_reported": candidate["reported_push"],
                                     "ahead_count": candidate["ahead_count"],
                                     "previous_status": "dispatched",
-                                    "reason": "dead_worker_branch_pushed_no_pr",
+                                    "reason": reason,
                                     "label_write_ok": pr_error is None,
                                     "pr_error": pr_error,
                                 },
