@@ -12,15 +12,20 @@
     "src/charlie_work/cli.py": 2,
     "src/charlie_work/cross_repo_gate.py": 4,
     "src/charlie_work/fleet_dispatch.py": 2,
+    "src/charlie_work/no_op_checkpoint.py": 1,
+    "src/charlie_work/orchestration/state_record_review.py": 1,
     "src/charlie_work/pr_unlinked_visibility.py": 1,
     "src/charlie_work/venv_anchor.py": 1,
+    "src/charlie_work/workflow.py": 1,
     "src/charlie_work/worktree.py": 3,
     "tests/_dispatch_fixtures.py": 1,
     "tests/_reconcile_fixtures.py": 1,
     "tests/test_backfill_stale_rework_briefs.py": 2,
     "tests/test_capacity_starvation_escalation.py": 2,
+    "tests/test_charlie_work_dispatch_rework_caps.py": 1,
     "tests/test_charlie_work_orphaned_worker_reclaim.py": 1,
     "tests/test_charlie_work_orphaned_worker_sweep.py": 1,
+    "tests/test_charlie_work_record_review.py": 3,
     "tests/test_charlie_work_review_dispatch.py": 1,
     "tests/test_charlie_work_session_lifecycle_reap.py": 1,
     "tests/test_charlie_work_stalled_reviews.py": 1,
@@ -63,5 +68,5 @@
     "tests/test_worker_declared_blocked.py": 2,
     "tests/test_worktree.py": 11
   },
-  "total": 208
+  "total": 215
 }
