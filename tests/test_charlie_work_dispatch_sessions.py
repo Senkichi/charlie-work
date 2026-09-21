@@ -634,6 +634,43 @@ def test_dispatch_pass_backfills_baseline_from_events_db_history(tmp_path: Path)
     assert len(stale_events) == 1, stale_events
 
 
+def test_empty_issue_numbers_dispatch_events_are_ignored(tmp_path: Path) -> None:
+    """A pass that dispatches nothing must never touch the durable baseline.
+
+    Pre-#1769 this was a ``check_dispatch_staleness`` unit test: an
+    empty-payload ``dispatch`` row written to events.db *after* a real one
+    had to be skipped by the scan. The durable-marker design (issue #1769)
+    moves that guarantee to the call site instead -- ``dispatch_state.py``
+    only calls ``record_non_empty_dispatch`` ``if successful_issue_numbers``
+    -- so the honest restatement of this test is a real ``app.dispatch()``
+    pass that selects nothing and must leave an existing baseline marker
+    completely unchanged (same timestamp, same issue numbers), never
+    overwritten with "now" or cleared."""
+    config = OrchestratorConfig(dispatch=DispatchConfig(dispatch_staleness_minutes=240))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Issue 123 has an open tracked PR (default fixture) so this pass
+    # dispatches nothing (selected_count == 0) -- the empty-payload case.
+    assert app.gh.prs[0]["state"] == "OPEN"
+    old_ts = (
+        (datetime.now(UTC) - timedelta(minutes=30))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    _seed_backdated_dispatch_event(paths.state_file, old_ts, [1])
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    state = load_state(paths.state_file)
+    assert state["dispatch_cadence"]["last_non_empty_dispatch_at"] == old_ts
+    assert state["dispatch_cadence"]["last_non_empty_dispatch_issue_numbers"] == [1]
+
+
 def test_dispatch_isolates_label_write_failure(tmp_path: Path, monkeypatch) -> None:
     """Issue #135: PARTIAL_FAILURE during dispatch label transition must be recorded."""
     from charlie_work import devin_shell
