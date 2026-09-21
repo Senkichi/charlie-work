@@ -460,11 +460,27 @@ def unescalate(
     # before anything is actually voided, so a verdict that changed
     # underneath this call (e.g. a concurrent ``record_review``) is left
     # alone rather than clobbered with a stale "pending" stub.
+    #
+    # A still-valid "approved" verdict is deliberately excluded from voiding
+    # here (unlike ``review_verdict_guard``, which must protect all three
+    # decision values from a destructive manual re-review). "blocked"/
+    # "request_changes" are terminal NEGATIVE outcomes -- the verdict itself
+    # is why review_queue() has nothing to do, so it must be voided to make
+    # the PR reachable again. "approved" means review has nothing left to
+    # do BY DESIGN; when an approved PR is stuck it is stuck for an
+    # unrelated reason (e.g. a conflict-rework-attempts cap), and
+    # merge_ready()'s own conflict-detection/rework-dispatch lane requires
+    # ``approved`` to be true to run at all. Voiding it here would silently
+    # disable that lane on every subsequent merge_ready() pass until a full
+    # fresh review completes -- the conflict-cap re-arm this command exists
+    # to restore (issue #776 follow-up) would be dead on arrival.
     still_valid_verdict = (
         self._still_valid_recorded_verdict(pr_number, live_pr.get("headRefOid"))
         if pr_status_target == PASSIVE_OPEN_STATUS
         else None
     )
+    if still_valid_verdict is not None and still_valid_verdict[0].get("decision") == "approved":
+        still_valid_verdict = None
 
     def _apply_pr_reset(entry: dict[str, Any]) -> dict[str, Any]:
         updated = dict(entry)
