@@ -86,6 +86,18 @@ SESSION_RESULTS_FILENAME = "session-results.json"
 #: ``runtime.state_dir``, and must stay that way — see :func:`gh_config_dir`.
 GH_CONFIG_DIRNAME = "gh-config"
 
+#: Per-worktree isolated temp-directory name (issue #1767).
+#:
+#: Concurrent worker sessions on the same host previously shared the host's
+#: ambient TMP/TEMP (or, on Windows-with-Git-Bash, a literal ``/tmp``),
+#: letting one session silently read back another's scratch file (observed:
+#: a worker fetched a PR body to ``/tmp/pr-body.md`` and read back a
+#: different session's body). Deliberately keyed on the *worktree* path, like
+#: :data:`GH_CONFIG_DIRNAME` above, not on ``runtime.state_dir`` — each
+#: worktree is already unique per active session, so this needs no separate
+#: session-id parameter to be collision-free. See :func:`worker_tmp_dir`.
+WORKER_TMP_DIRNAME = "worker-tmp"
+
 _VAR_DIRNAME = ".var"
 
 #: Directory names whose *re-spelling* is a real divergence hazard, and which
@@ -107,6 +119,7 @@ _ENFORCED_DIRNAMES = (
     WORKTREES_DIRNAME,
     SESSIONS_DIRNAME,
     GH_CONFIG_DIRNAME,
+    WORKER_TMP_DIRNAME,
     _VAR_DIRNAME,
 )
 
@@ -290,6 +303,28 @@ def gh_config_dir(target_path: Path) -> Path:
     centralised here for discoverability, not to make it configurable.
     """
     return target_path / _VAR_DIRNAME / GH_CONFIG_DIRNAME
+
+
+def worker_tmp_dir(target_path: Path) -> Path:
+    """Return the worktree-local, session-scoped temp dir for ``target_path``
+    (issue #1767).
+
+    Mirrors :func:`gh_config_dir`: keyed on the *worktree* path rather than a
+    separate session id, because each worktree is already the unique per-session
+    identity every other worker-isolation mechanism in this module relies on.
+    Consumed by ``env_sanitize.sanitize_env``, which points TMP/TEMP/TMPDIR at
+    this directory so two concurrent worker subprocesses on the same host
+    cannot collide on a predictable shared temp path.
+
+    Note for future debugging: this nests under ``target_path``, so a deeply
+    nested worktree root (e.g. a long repo path combined with a long branch
+    name under ``.claude/worktrees/``) plus whatever a tool writes beneath
+    ``TMP`` could in principle approach Windows' legacy ~260-char ``MAX_PATH``
+    limit sooner than the old host-wide temp dir did. No case of this has been
+    observed; if a worker ever fails with a Windows path-length error, check
+    the resolved length of this path first.
+    """
+    return target_path / _VAR_DIRNAME / WORKER_TMP_DIRNAME
 
 
 # --- fleet-dir layout ------------------------------------------------------

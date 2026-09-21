@@ -136,6 +136,33 @@ def test_gh_config_dir_matches_historical_literal(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_worker_tmp_dir_matches_historical_literal(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    assert layout.worker_tmp_dir(worktree) == worktree / ".var" / "worker-tmp"
+
+
+def test_worker_tmp_dir_is_keyed_on_worktree_not_state_dir(tmp_path: Path) -> None:
+    """Mirrors gh_config_dir: each worktree is already unique per active
+    session, so worker_tmp_dir must not route through charlie-work's shared
+    state dir (issue #1767) -- that would defeat the isolation.
+
+    Asserts the positive property directly rather than the mere absence of
+    one literal substring: the result must be inside the worktree itself,
+    and must not be (or be inside) the shared per-repo state root that
+    ``default_state_root`` computes -- a stub that returned the worktree path
+    unchanged, or the host temp dir, or the shared state root under a
+    differently-named repo, would all wrongly pass a substring-only check
+    but fail these.
+    """
+    worktree = tmp_path / "some-worktree"
+    result = layout.worker_tmp_dir(worktree)
+    assert result.is_relative_to(worktree)
+    assert result != worktree
+    shared_state_root = layout.default_state_root(worktree)
+    assert result != shared_state_root
+    assert not result.is_relative_to(shared_state_root)
+
+
 def test_gh_config_dir_is_keyed_on_worktree_not_state_dir(tmp_path: Path) -> None:
     """``gh_config_dir`` must never route through ``charlie-work``'s state dir.
 
