@@ -64,7 +64,12 @@ _PRE_CAMPAIGN_MEMBER_SURFACE = 133
 # - ``review_verdict_guard`` (issue #1695): the why-charlie-hate CLI guard
 #   that refuses to regenerate a review packet when the recorded verdict is
 #   still valid.
-_POST_CAMPAIGN_SURFACE_ADDITIONS = frozenset({"review_verdict_guard"})
+# - ``_still_valid_recorded_verdict`` (issue #1765): the shared predicate
+#   factored out of ``review_verdict_guard`` so ``unescalate`` can also
+#   detect (and void) a still-valid terminal verdict before re-arming a PR.
+_POST_CAMPAIGN_SURFACE_ADDITIONS = frozenset(
+    {"review_verdict_guard", "_still_valid_recorded_verdict"}
+)
 
 
 def _apc_orchestratorapp_member_count() -> int:
