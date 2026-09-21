@@ -873,6 +873,25 @@ class ConcurrencyGovernorResult:
     # rework/recovery/loop paths, which are exempt from this clamp.
     open_pr_count: int = 0
     open_pr_max: int = 0
+    # Issue #1770: CI-capacity headroom fields. ``ci_headroom_ratio`` mirrors
+    # ``open_pr_max``'s exemption -- populated only for the same
+    # ``apply_open_pr_backpressure=True`` (fresh-issue) call, 0.0 for
+    # rework/recovery/loop paths regardless of the configured ratio.
+    # ``ci_headroom`` is the ``ci_headroom_available()`` reading: ``None``
+    # when the ratio is 0 (clamp off) or the data could not be trusted this
+    # pass (fail-open -- see ``orchestration.ci_headroom``'s docstring), an
+    # int otherwise.
+    ci_headroom: int | None = None
+    ci_headroom_ratio: float = 0.0
+    # Which term actually bound ``dispatch_limit`` this call, e.g.
+    # "ci_headroom", "open_pr_max", "fleet_max", "max_concurrent", or
+    # ``None`` when nothing clamped. The terms apply in sequence, each only
+    # tightening (never loosening) the running limit, so whichever term last
+    # reduced it is the true binding constraint -- this is what makes a
+    # "0 dispatched" pass explainable from the event alone instead of
+    # requiring a reader to redo the min() by hand (zero-dispatch-is-a-
+    # capacity-question-first).
+    clamped_by: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -889,9 +908,14 @@ class ConcurrencyGovernorResult:
         """Return True if the open-PR backpressure clamp is enabled (open_pr_max > 0)."""
         return self.open_pr_max > 0
 
-    def report_fields(self) -> dict[str, int]:
+    @property
+    def ci_headroom_enabled(self) -> bool:
+        """Return True if the CI-headroom clamp is enabled (ci_headroom_ratio > 0)."""
+        return self.ci_headroom_ratio > 0
+
+    def report_fields(self) -> dict[str, Any]:
         """Return the fields to include in CommandResult.data when clamped."""
-        fields = {
+        fields: dict[str, Any] = {
             "concurrency_limit": self.max_concurrent,
             "live_session_count": self.live_count,
             "available_slots": self.available_slots,
@@ -902,6 +926,11 @@ class ConcurrencyGovernorResult:
         if self.open_pr_enabled:
             fields["open_pr_count"] = self.open_pr_count
             fields["open_pr_max"] = self.open_pr_max
+        if self.ci_headroom_enabled:
+            fields["ci_headroom"] = self.ci_headroom
+            fields["ci_headroom_ratio"] = self.ci_headroom_ratio
+        if self.clamped_by is not None:
+            fields["clamped_by"] = self.clamped_by
         return fields
 
 
