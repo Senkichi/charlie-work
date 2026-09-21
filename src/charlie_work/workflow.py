@@ -2560,28 +2560,51 @@ def _detect_and_handle_orphaned_workers(
                         # existing consumer/dashboard/memory-documented query
                         # filtering on it keeps matching exactly what it
                         # always matched.
+                        # Two separate literal append sites (rather than a
+                        # `kind`/`reason` variable chosen above and passed
+                        # through) so the AST-based sweep-append scanner
+                        # (`_scan_sweep_append_kinds`, which resolves only the
+                        # literal at the `sweep_events.append((...))` call
+                        # site itself -- it does not trace local variable
+                        # assignments the way the main event-kind scanner
+                        # does) can prove each kind is registered. Matches
+                        # the literal-at-call-site convention used by every
+                        # other `sweep_events.append(...)` site in this repo
+                        # (see stalled_review_reap.py).
                         if candidate["reported_push"]:
-                            kind = "worker_handoff_pr_opened"
-                            reason = "worker_handoff_clean_exit"
-                        else:
-                            kind = "orphaned_worker_opened_pr"
-                            reason = "dead_worker_branch_pushed_no_pr"
-                        sweep_events.append(
-                            (
-                                kind,
-                                {
-                                    "issue_number": issue_number,
-                                    "pr_number": pr_number,
-                                    "branch_name": candidate["branch"],
-                                    "worker_reported": candidate["reported_push"],
-                                    "ahead_count": candidate["ahead_count"],
-                                    "previous_status": "dispatched",
-                                    "reason": reason,
-                                    "label_write_ok": pr_error is None,
-                                    "pr_error": pr_error,
-                                },
+                            sweep_events.append(
+                                (
+                                    "worker_handoff_pr_opened",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "branch_name": candidate["branch"],
+                                        "worker_reported": candidate["reported_push"],
+                                        "ahead_count": candidate["ahead_count"],
+                                        "previous_status": "dispatched",
+                                        "reason": "worker_handoff_clean_exit",
+                                        "label_write_ok": pr_error is None,
+                                        "pr_error": pr_error,
+                                    },
+                                )
                             )
-                        )
+                        else:
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_opened_pr",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "branch_name": candidate["branch"],
+                                        "worker_reported": candidate["reported_push"],
+                                        "ahead_count": candidate["ahead_count"],
+                                        "previous_status": "dispatched",
+                                        "reason": "dead_worker_branch_pushed_no_pr",
+                                        "label_write_ok": pr_error is None,
+                                        "pr_error": pr_error,
+                                    },
+                                )
+                            )
                         state["issues"][str(issue_number)] = entry
                         continue
 
