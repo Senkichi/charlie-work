@@ -18,6 +18,7 @@ from _fakes_github import FakeGitHub
 from _helpers import _init_git_repo
 from _rework_dispatch_fixtures import (
     _init_repo_with_remote_inline,
+    _wg,
 )
 from charlie_work.config import (
     DevinConfig,
@@ -27,6 +28,7 @@ from charlie_work.config import (
 )
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
+    PASSIVE_OPEN_STATUS,
     load_state,
     save_state,
     state_lock,
@@ -785,3 +787,242 @@ def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
     assert third.data["rework_path"] is None
     # Issue #1266: max_rework_cycles_exceeded is a mechanical escalation.
     assert (123, config.labels.operator_queue) in fake_gh.labels_added
+
+
+def test_dispatch_rework_jc1320_timeline_no_op_reset_avoids_false_escalation(
+    tmp_path: Path,
+) -> None:
+    """Job-cannon #1320 / PR #2148: reproduces the reported false-escalation
+    timeline end to end through the real production entry points --
+    ``record_review`` and the orphan-worker sweep -- rather than hand-
+    setting the final counters.
+
+    Three redispatch attempts occur for the same issue: the first ends in a
+    worker death with the PR never yet reviewed (credited via the orphan
+    sweep's previously-uncredited pr-open lane -- see
+    ``test_orphaned_worker_unreviewed_open_pr_credits_worker_death``), and
+    the next two each push genuinely new content and are followed by a
+    request_changes verdict against the newly-advanced head (each of which
+    resets the issue-level no-op counters -- see
+    ``test_record_review_request_changes_resets_no_op_counters_on_head_advance``).
+
+    Without either fix this accumulates to ``redispatch_at`` holding all
+    three timestamps and ``worker_death_at`` staying empty (the death was
+    never credited), giving ``no_op_count = 3 - 0 = 3 >= max_auto_redispatch
+    (2)`` -- exactly the false escalation reported. With both fixes, the
+    two genuine-progress resets clear the history before the third
+    redispatch is even considered, so only that single attempt survives to
+    the final no-op check below and the issue is not escalated.
+    """
+    from datetime import UTC, datetime
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
+        watchdog=WatchdogConfig(
+            enabled=True,
+            max_auto_redispatch=2,
+            redispatch_window_minutes=240,
+            stall_minutes=20,
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    def ts() -> str:
+        return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+
+    # --- Redispatch #1: a worker is dispatched and dies before pushing
+    # anything; PR 456 (the issue's PR) has never been reviewed.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "dispatched_at": ts(),
+            "redispatch_at": [ts()],
+            "branch_name": "agent/issue-123-fix-search",
+        }
+        state["prs"]["456"] = {"reviewed_head_sha": None}
+        save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == PASSIVE_OPEN_STATUS
+    assert len(state["issues"]["123"].get("worker_death_at", [])) == 1
+
+    # --- Review round 1: the reviewer finds real, new content and requests
+    # further changes. head_advanced=True (no prior reviewed_head_sha)
+    # resets both counters -- the credited death and redispatch #1 no
+    # longer describe the issue's state going forward.
+    fake_gh.pr_head_shas[456] = "sha-1"
+    fake_gh.prs[0]["headRefOid"] = "sha-1"
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="round 1: progress, more needed",
+        verdict_provenance="fresh_llm_review",
+    )
+    assert result.ok is True
+    assert result.data["escalated"] is False
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["issues"]["123"]["redispatch_at"] == []
+    assert state["issues"]["123"]["worker_death_at"] == []
+
+    # --- Redispatch #2: dispatched again, pushes more genuinely new content.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"]["redispatch_at"] = [ts()]
+        save_state(paths.state_file, state)
+
+    fake_gh.pr_head_shas[456] = "sha-2"
+    fake_gh.prs[0]["headRefOid"] = "sha-2"
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="round 2: almost done",
+        verdict_provenance="fresh_llm_review",
+    )
+    assert result.ok is True
+    assert result.data["escalated"] is False
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["redispatch_at"] == []
+    assert state["issues"]["123"]["worker_death_at"] == []
+
+    # --- Redispatch #3: one more attempt is recorded. The head has not
+    # moved since round 2's review, so a dispatch_rework pass evaluating
+    # whether to launch a 4th attempt runs the pre-launch no-op check
+    # against exactly this one surviving redispatch.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"]["redispatch_at"] = [ts()]
+        save_state(paths.state_file, state)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "rework-prompt.md").write_text("Fix the issues", encoding="utf-8")
+
+    from charlie_work.adapters import SessionDispatchResult
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=True,
+                pid=99999,
+                process_start_time=datetime.now(UTC).isoformat(),
+            )
+            for request in requests
+        ]
+
+    import charlie_work.workflow as workflow_module
+
+    original = workflow_module.dispatch_sessions
+    workflow_module.dispatch_sessions = fake_dispatch_sessions
+    try:
+        result = app.dispatch_rework()
+    finally:
+        workflow_module.dispatch_sessions = original
+
+    # Despite three total redispatch attempts across the timeline, the two
+    # genuine-progress resets mean only the third survives at this check --
+    # no_op_count = 1 (one redispatch, zero deaths), well under the cap of
+    # 2. Must NOT escalate.
+    assert 123 not in result.data.get("no_op_rework_escalated", [])
+    assert 123 not in result.data.get("worker_death_escalated", [])
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] != "escalated"
+
+
+def test_dispatch_rework_no_op_reset_does_not_mask_genuine_stagnation(
+    tmp_path: Path,
+) -> None:
+    """Companion regression guard for the job-cannon #1320 fix: when a
+    request_changes verdict is recorded against the SAME (unchanged) head
+    repeatedly, the reset must not fire -- otherwise a reviewer who merely
+    re-affirms a stalled PR would erase the no-op evidence and the cap
+    could never escalate a genuinely stuck issue.
+    """
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
+        worker=WorkerRoleConfig(harness="command"),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # First request_changes verdict pins reviewed_head_sha to the only head
+    # seen so far (FakeGitHub's default "sha-abc123").
+    result = app.record_review(
+        456, "request_changes", summary="needs work", verdict_provenance="fresh_llm_review"
+    )
+    assert result.ok is True
+
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    # Two redispatch attempts happen, but the worker never pushes anything
+    # new -- the head stays at "sha-abc123" both times.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"]["redispatch_at"] = [now_iso, now_iso]
+        save_state(paths.state_file, state)
+
+    # A reviewer re-affirms the SAME (unchanged) head -- head_advanced is
+    # False, so the counters must survive untouched.
+    result = app.record_review(
+        456, "request_changes", summary="still not fixed", verdict_provenance="fresh_llm_review"
+    )
+    assert result.ok is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["redispatch_at"] == [now_iso, now_iso]
+
+    # dispatch_rework must see the un-reset counters and escalate -- the
+    # live head is unchanged from the just-reviewed head, so the pre-launch
+    # no-op check fires.
+    result = app.dispatch_rework()
+    assert result.ok is True
+    assert 123 in result.data.get("no_op_rework_escalated", [])
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"

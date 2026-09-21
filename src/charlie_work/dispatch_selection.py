@@ -412,6 +412,36 @@ def _windowed_worker_death_at(
     return result
 
 
+def _credit_worker_death(
+    entry: dict[str, Any],
+    *,
+    window_minutes: int,
+    at: str | None = None,
+) -> list[str]:
+    """Return ``entry``'s ``worker_death_at`` timestamps with one death appended.
+
+    Single point of enforcement for crediting a dead-worker redispatch: every
+    code path that resets an issue to ``rework_requested`` (or an equivalent
+    passive-open state) because its worker died must call this instead of
+    reimplementing the append, so ``_windowed_worker_death_at`` — and
+    therefore the no-op-rework cap's ``no_op_count = redispatch_at -
+    worker_death_at`` subtraction (``_dispatch_rework_impl``) — sees every
+    death, not just the ones a given call site remembered to record.
+
+    Before this helper existed, the orphan-worker sweep's "dead worker, PR
+    still unreviewed" branch (``orphaned_worker_advanced_to_pr_open`` in
+    ``workflow.py``) transitioned the issue without ever touching
+    ``worker_death_at`` — a death that happened there was silently
+    indistinguishable from a genuine no-op redispatch, understating
+    ``worker_death_at`` and overstating ``no_op_count`` for every later pass.
+    Windows the existing timestamps the same way ``_windowed_worker_death_at``
+    does before appending, so the persisted list itself never grows past the
+    window regardless of which call site last wrote it.
+    """
+    timestamp = at if at is not None else datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return _windowed_worker_death_at(entry, window_minutes=window_minutes) + [timestamp]
+
+
 def _windowed_orphan_redispatch_at(
     entry: dict[str, Any],
     *,

@@ -199,6 +199,7 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
     _apply_local_review_cap,
     _windowed_redispatch_at,
     _windowed_worker_death_at,
+    _credit_worker_death,
     _windowed_orphan_redispatch_at,
     _windowed_blocked_environment_at,
     _windowed_foreign_writer_reaps,
@@ -2248,10 +2249,11 @@ def _detect_and_handle_orphaned_workers(
                             # (worker_death_loop) lets the operator triage
                             # "check the worktree" vs. "worker is spinning."
                             death_ts = utc_now()
-                            prior_deaths = entry.get("worker_death_at")
-                            if not isinstance(prior_deaths, list):
-                                prior_deaths = []
-                            entry["worker_death_at"] = prior_deaths + [death_ts]
+                            entry["worker_death_at"] = _credit_worker_death(
+                                entry,
+                                window_minutes=config.watchdog.redispatch_window_minutes,
+                                at=death_ts,
+                            )
                             sweep_events.append(
                                 (
                                     "orphaned_worker_recovered",
@@ -2400,10 +2402,11 @@ def _detect_and_handle_orphaned_workers(
                             entry["status"] = "rework_requested"
                             entry["dispatched_at"] = None
                             death_ts = utc_now()
-                            prior_deaths = entry.get("worker_death_at")
-                            if not isinstance(prior_deaths, list):
-                                prior_deaths = []
-                            entry["worker_death_at"] = prior_deaths + [death_ts]
+                            entry["worker_death_at"] = _credit_worker_death(
+                                entry,
+                                window_minutes=config.watchdog.redispatch_window_minutes,
+                                at=death_ts,
+                            )
                             sweep_events.append(
                                 (
                                     "orphaned_worker_recovered",
@@ -2458,6 +2461,25 @@ def _detect_and_handle_orphaned_workers(
                                     # later regression on this issue re-surfaces.
                                     entry["orphan_drift_fingerprint"] = None
                                     entry["orphan_drift_at"] = None
+                                    # Issue #1134's death-crediting invariant
+                                    # applies here too: this worker died just
+                                    # as much as the request_changes/approved
+                                    # branches above, and its issue can still
+                                    # return to ``rework_requested`` once the
+                                    # PR is eventually reviewed (a salvage-
+                                    # opened PR with no verdict yet is exactly
+                                    # this case). Before this fix, this was
+                                    # the one dead-worker branch that never
+                                    # touched ``worker_death_at`` -- a
+                                    # redispatch caused by THIS death read
+                                    # back as an uncredited no-op on every
+                                    # later no-op-rework-cap check.
+                                    death_ts = utc_now()
+                                    entry["worker_death_at"] = _credit_worker_death(
+                                        entry,
+                                        window_minutes=config.watchdog.redispatch_window_minutes,
+                                        at=death_ts,
+                                    )
                                     sweep_events.append(
                                         (
                                             "orphaned_worker_advanced_to_pr_open",
@@ -2472,6 +2494,7 @@ def _detect_and_handle_orphaned_workers(
                                                 "exit_code": terminal_exit_code,
                                                 "duration_seconds": terminal_duration_seconds,
                                                 "label_write_ok": True,
+                                                "worker_death_at": death_ts,
                                             },
                                         )
                                     )

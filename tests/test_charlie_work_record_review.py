@@ -308,6 +308,113 @@ def test_record_review_request_changes_updates_issue_status_to_rework_requested(
     assert state["issues"]["123"]["status"] == "rework_requested"
 
 
+def test_record_review_request_changes_resets_no_op_counters_on_head_advance(
+    tmp_path: Path,
+) -> None:
+    """Job-cannon #1320: a request_changes verdict against a head that has
+    genuinely moved since the last review is conclusive proof every
+    redispatch counted so far produced real content -- dispatch_rework's
+    own pre-routing check and the janitor gate's no-op detector both refuse
+    to route an unchanged (or sync-merge-only) head to a fresh review, so
+    reaching this branch with an advanced head means content was actually
+    reviewed. state_dispatch_rework's no-op cap sums ``redispatch_at`` over
+    a rolling time window with no notion of "already confirmed productive
+    by a review in between", so record_review is the single point that
+    resets those issue-level counters once a review clears them. Without
+    this reset, stale pre-checkpoint redispatch/death timestamps survive
+    indefinitely and can false-escalate an issue that is actually making
+    progress (the reported false escalation of job-cannon issue #1320).
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    stale_ts = "2026-01-01T00:00:00Z"
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [stale_ts, stale_ts],
+            "worker_death_at": [stale_ts],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "reviewed_head_sha": "sha-old",
+        }
+        save_state(paths.state_file, state)
+
+    # A worker pushed genuinely new content -- the live head has moved past
+    # what was last reviewed ("sha-old").
+    fake_gh.pr_head_shas[456] = "sha-abc123"
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="still needs work",
+        verdict_provenance="fresh_llm_review",
+    )
+    assert result.ok is True
+    assert result.data["escalated"] is False
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry["redispatch_at"] == []
+    assert entry["worker_death_at"] == []
+
+
+def test_record_review_request_changes_keeps_no_op_counters_when_head_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Companion guard for the job-cannon #1320 fix: when the live head has
+    NOT moved since the last review, a request_changes verdict must NOT
+    reset the no-op counters. Resetting here would let a reviewer who
+    merely re-affirms the same stalled head erase genuine no-op evidence,
+    permanently defeating the cap for real stagnation.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    stale_ts = "2026-01-01T00:00:00Z"
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [stale_ts, stale_ts],
+            "worker_death_at": [stale_ts],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            # Same as the live head (FakeGitHub's default "sha-abc123")
+            # below -- no genuine progress to attest to.
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="still broken",
+        verdict_provenance="fresh_llm_review",
+    )
+    assert result.ok is True
+    assert result.data["escalated"] is False
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry["redispatch_at"] == [stale_ts, stale_ts]
+    assert entry["worker_death_at"] == [stale_ts]
+
+
 def test_record_review_persists_escalated_in_decision_file(tmp_path: Path) -> None:
     """Issue #407: review-decision.json must include the correct escalated value.
 

@@ -676,6 +676,30 @@ def record_review(
                     }
                     _wf.clear_escalation(issue_entry)
                     _wf.clear_escalation_on_issue_prs(state, issue_number)
+                    if head_advanced:
+                        # ONE definition of no-op rework: this verdict is
+                        # reached only when the reviewer actually re-read a
+                        # genuinely different, patch-id-verified diff --
+                        # dispatch_rework's own pre-routing check
+                        # (_calculate_patch_id against reviewed_patch_id)
+                        # and the janitor gate's _check_no_op_rework both
+                        # refuse to route a literally-unchanged or
+                        # sync-merge-only head here, so record_review only
+                        # ever reaches this branch with head_advanced=True
+                        # on content that was actually reviewed. That is
+                        # conclusive proof every redispatch counted so far
+                        # was NOT a no-op, so reset the issue-level no-op
+                        # counters here: state_dispatch_rework's no-op-cap
+                        # check otherwise keeps summing raw launch counts
+                        # across a rolling time window regardless of how
+                        # many of those launches were already confirmed
+                        # productive by a review in between, which is
+                        # exactly the false-escalation defect this reset
+                        # closes (job-cannon #1320). Redispatches and deaths
+                        # from BEFORE this checkpoint no longer describe
+                        # whether the issue is stalled AFTER it.
+                        issue_entry["redispatch_at"] = []
+                        issue_entry["worker_death_at"] = []
                     state["issues"][str(issue_number)] = issue_entry
                 else:
                     # Clear rework_requested status when escalated to prevent selection

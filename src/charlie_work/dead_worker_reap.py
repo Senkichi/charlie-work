@@ -104,7 +104,11 @@ from .config import (
     OrchestratorConfig,
 )
 from .cross_repo_gate import cross_repo_scope_gate
-from .dispatch_selection import _windowed_redispatch_at, _windowed_worker_death_at
+from .dispatch_selection import (
+    _credit_worker_death,
+    _windowed_redispatch_at,
+    _windowed_worker_death_at,
+)
 from .escalation import _escalate_issue, _escalation_edge
 from .fleet_registry import managed_repo_names
 from .github import (
@@ -1332,18 +1336,21 @@ def _reap_restore_rework_requested(
         # Issue #1134: a worker that died before pushing leaves the PR head
         # unchanged, but that is NOT a no-op — the worker may have completed
         # its work and died mid-push with salvageable stranded commits.
-        # Record this death in worker_death_at (parallel to the orphan sweep
-        # at ~line 4245), and separate the death count from the no-op count
-        # in the cap check below.  A death-loop escalates with
-        # worker_death_loop (triage: "check the worktree for stranded work")
-        # instead of redispatch_cap_exceeded (triage: "worker is spinning").
-        worker_death_at = _windowed_worker_death_at(
-            entry, window_minutes=config.watchdog.redispatch_window_minutes
-        )
+        # Record this death in worker_death_at through the same
+        # ``_credit_worker_death`` helper the orphan sweep uses (single
+        # point of enforcement for the append), and separate the death
+        # count from the no-op count in the cap check below.  A death-loop
+        # escalates with worker_death_loop (triage: "check the worktree for
+        # stranded work") instead of redispatch_cap_exceeded (triage:
+        # "worker is spinning").
         if not immediate_escalation and not provider_throttled:
-            worker_death_at = worker_death_at + [
-                datetime.now(UTC).isoformat().replace("+00:00", "Z")
-            ]
+            worker_death_at = _credit_worker_death(
+                entry, window_minutes=config.watchdog.redispatch_window_minutes
+            )
+        else:
+            worker_death_at = _windowed_worker_death_at(
+                entry, window_minutes=config.watchdog.redispatch_window_minutes
+            )
 
         no_op_count = max(0, len(redispatch_at) - len(worker_death_at))
         death_count = len(worker_death_at)
