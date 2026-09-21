@@ -136,6 +136,21 @@ def test_gh_config_dir_matches_historical_literal(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_worker_tmp_dir_matches_historical_literal(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    assert layout.worker_tmp_dir(worktree) == worktree / ".var" / "worker-tmp"
+
+
+def test_worker_tmp_dir_is_keyed_on_worktree_not_state_dir(tmp_path: Path) -> None:
+    """Mirrors gh_config_dir: each worktree is already unique per active
+    session, so worker_tmp_dir must not route through charlie-work's shared
+    state dir (issue #1767) -- that would defeat the isolation.
+    """
+    worktree = tmp_path / "some-worktree"
+    result = layout.worker_tmp_dir(worktree)
+    assert "charlie-work" not in result.parts
+
+
 def test_gh_config_dir_is_keyed_on_worktree_not_state_dir(tmp_path: Path) -> None:
     """``gh_config_dir`` must never route through ``charlie-work``'s state dir.
 

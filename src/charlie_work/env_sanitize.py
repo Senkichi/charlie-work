@@ -26,6 +26,22 @@ an operator override supplied via ``worker_env``, always wins over the default.
 See ``resolve_pytest_cap``/``resolve_uv_no_sync`` for the precedence helper used
 by callers that need to log which layer supplied the final value.
 
+Session-scoped temp isolation (issue #1767): ``sanitize_env`` points
+TMP/TEMP/TMPDIR at a worktree-local directory (``layout.worker_tmp_dir``) so
+two concurrent worker sessions on this host cannot collide on a predictable
+shared temp path -- the observed incident was a worker fetching a PR body to
+a literal ``/tmp/pr-body.md`` and reading back a different session's body.
+This covers every consumer that resolves a temp directory through the
+environment (``tempfile.gettempdir()``, Node's ``os.tmpdir()``, .NET's
+``Path.GetTempPath()``, ``cmd.exe``/PowerShell's ``%TEMP%``, ``mktemp``, ...).
+It does NOT retarget a literal ``/tmp/...`` path written from a process
+spawned by Git Bash on this host: MSYS caches its ``/tmp`` ("usertemp") mount
+in a shared, install-wide table seeded once while any ``bash.exe`` from that
+Git install is alive, and does not recompute it from a new process's own
+TMP/TEMP -- verified by launching a standalone ``bash.exe`` with TMP/TEMP
+overridden and observing ``cygpath -w /tmp`` still resolve to the pre-existing
+shared temp dir, unchanged. See issue #1767 for the full probe.
+
 Shared-venv confinement (issue #649): ``sanitize_env`` does not rely on a
 ``UV_PROJECT_ENVIRONMENT`` pin to protect a junctioned shared venv. Once the
 orchestrator's value is popped, pinning the variable to ``.venv`` is a no-op
@@ -186,6 +202,21 @@ def sanitize_env(target_path: Path) -> dict[str, str]:
     gh_config_dir = layout.gh_config_dir(target_path)
     gh_config_dir.mkdir(parents=True, exist_ok=True)
     env["GH_CONFIG_DIR"] = str(gh_config_dir)
+
+    # Issue #1767: give every worker subprocess a session-scoped TMP/TEMP/
+    # TMPDIR so two concurrent sessions on this host cannot collide on a
+    # predictable shared temp path. Keyed on target_path like GH_CONFIG_DIR
+    # above -- each worktree is already unique per active session. Directory
+    # creation can fail (permissions, disk full, path length); this raises
+    # OSError rather than swallowing it, exactly like GH_CONFIG_DIR's mkdir
+    # above, so callers report a real launch failure instead of silently
+    # handing a worker an unusable/shared temp path. See the module docstring
+    # for the verified Git-Bash/MSYS caveat this does NOT cover.
+    tmp_dir = layout.worker_tmp_dir(target_path)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    env["TMP"] = str(tmp_dir)
+    env["TEMP"] = str(tmp_dir)
+    env["TMPDIR"] = str(tmp_dir)
 
     # Issue #646: cap xdist worker fan-out and guard a real local .venv from a
     # concurrent uv sync. setdefault() so an already-exported ambient value

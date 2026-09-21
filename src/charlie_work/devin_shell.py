@@ -661,9 +661,27 @@ def launch_devin_session(
     # then merge user-provided worker_env overrides on top (e.g. PYTEST_XDIST_AUTO_NUM_WORKERS).
     # sanitize_env drops GH_TOKEN/GITHUB_TOKEN and forces GH_CONFIG_DIR to a
     # worktree-local empty directory so workers do not inherit the orchestrator's
-    # admin token or stored gh auth state (issue #502). To give workers a scoped
+    # admin token or stored gh auth state (issue #502), and points TMP/TEMP/TMPDIR
+    # at a worktree-local directory so a concurrent session on this host cannot
+    # collide on a shared temp path (issue #1767). To give workers a scoped
     # GitHub token, set worker_env={"GH_TOKEN": "<scoped-PAT>"} in the adapter config.
-    sanitized_env = sanitize_env(worktree.path)
+    try:
+        sanitized_env = sanitize_env(worktree.path)
+    except OSError as exc:
+        _teardown_worktree()
+        record = SessionRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree.path),
+            prompt_path=str(prompt_path),
+            command=command_template,
+            pid=None,
+            started_at=utc_now(),
+            log_path=str(log_path),
+            error=f"failed to prepare worker environment: {exc}",
+        )
+        _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
+        return record
     worker_env_dict = {
         **sanitized_env,
         **{str(k): str(v) for k, v in (worker_env or {}).items()},

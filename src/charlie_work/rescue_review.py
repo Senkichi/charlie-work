@@ -261,8 +261,12 @@ def run_cross_family_review(
     prompt_path.write_text(prompt_text, encoding="utf-8")
 
     rendered = render_command(command, {"model": model, "prompt_path": str(prompt_path)})
-    # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator
-    env = sanitize_env(repo_root)
+    # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator,
+    # and to give this call its own TMP/TEMP/TMPDIR (issue #1767).
+    try:
+        env = sanitize_env(repo_root)
+    except OSError as exc:
+        return _fail(report_path, model, f"failed to prepare review environment: {exc}")
     stdout = ""
     for attempt in range(2):
         try:

@@ -265,6 +265,40 @@ def test_run_cross_family_sanitizes_environment_at_spawn(
     )
 
 
+def test_run_cross_family_review_tmp_dir_creation_failure_returns_stub_not_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the session-scoped temp dir cannot be created, run_cross_family_review
+    must return a not-ok result (issue #1767) -- it must never raise, per this
+    module's documented hard contract."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    report_path = tmp_path / "report.md"
+    prompt_path = tmp_path / "prompt.md"
+
+    original_mkdir = Path.mkdir
+
+    def failing_mkdir(self, mode=0o777, parents=False, exist_ok=False):
+        if self.name == "worker-tmp":
+            raise OSError("Mock tmp dir creation failure")
+        return original_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", failing_mkdir)
+
+    result = run_cross_family_review(
+        model="codex",
+        command=("echo", "test"),
+        repo_root=repo_root,
+        prompt_text="test prompt",
+        prompt_path=prompt_path,
+        report_path=report_path,
+        timeout_seconds=5,
+    )
+
+    assert result.ok is False
+    assert "failed to prepare review environment" in (result.error or "")
+
+
 def test_cross_family_verdict_post_init_rejects_content_free_request_changes() -> None:
     """Issue #784 AC-6: the invalid state -- request_changes with neither
     itemized required_changes nor a real summary -- must be unrepresentable

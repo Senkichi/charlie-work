@@ -240,6 +240,46 @@ def test_launch_sanitizes_environment(tmp_path: Path, monkeypatch: pytest.Monkey
     )
 
 
+def test_launch_devin_session_tmp_dir_creation_failure_returns_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the session-scoped temp dir cannot be created, launch_devin_session
+    must return an error record, never raise (issue #1767)."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    # Fail only the new session-tmp-dir mkdir -- a mutation gate: if
+    # sanitize_env's new mkdir call is ever swallowed instead of left to
+    # raise, this test fails because the launch would "succeed" with no
+    # worker environment isolation.
+    original_mkdir = Path.mkdir
+
+    def failing_mkdir(self, mode=0o777, parents=False, exist_ok=False):
+        if self.name == "worker-tmp":
+            raise OSError("Mock tmp dir creation failure")
+        return original_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", failing_mkdir)
+
+    record = launch_devin_session(
+        57,
+        "agent/issue-57-tmp-fail",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, "-c", "print('should not run')"),
+    )
+
+    assert record.error is not None
+    assert "failed to prepare worker environment" in record.error
+    assert record.pid is None
+
+
 def test_launch_passes_operator_scoped_gh_token_through(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

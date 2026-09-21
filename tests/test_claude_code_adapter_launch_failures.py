@@ -390,6 +390,57 @@ def test_launch_claude_worker_prompt_write_failure_tears_down_worktree(
     assert len(worktree_removed) == 1
 
 
+def test_launch_claude_worker_tmp_dir_creation_failure_tears_down_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the session-scoped temp dir cannot be created, launch_claude_worker
+    must return an error record and tear down the worktree, never raise
+    (issue #1767)."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    worktree_removed = []
+
+    def tracking_remove_worktree(repo_root, worktree_path, *, force=False, branch=None):
+        worktree_removed.append(worktree_path)
+        return True
+
+    monkeypatch.setattr(
+        claude_code,
+        "create_worktree",
+        lambda *args, **kwargs: _fake_worktree(tmp_path, "agent/issue-1767"),
+    )
+    monkeypatch.setattr(claude_code, "remove_worktree", tracking_remove_worktree)
+
+    # Fail only the new session-tmp-dir mkdir -- this is a mutation gate: if
+    # sanitize_env's new mkdir call is ever wrapped in a swallowing
+    # try/except instead of letting it raise, this test fails because the
+    # launch would then "succeed" with no worker environment isolation.
+    original_mkdir = Path.mkdir
+
+    def failing_mkdir(self, mode=0o777, parents=False, exist_ok=False):
+        if self.name == "worker-tmp":
+            raise OSError("Mock tmp dir creation failure")
+        return original_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", failing_mkdir)
+
+    record = launch_claude_worker(
+        1767,
+        "agent/issue-1767",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+    )
+
+    assert not record.ok
+    assert record.error is not None
+    assert "failed to prepare worker environment" in record.error
+    assert record.pid is None
+    assert len(worktree_removed) == 1
+
+
 # ---------------------------------------------------------------------------
 # Real-git integration tests: branch delete/preserve semantics
 # ---------------------------------------------------------------------------
