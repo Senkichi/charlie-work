@@ -18,12 +18,15 @@ from typing import Any
 
 import pytest
 
+import charlie_work.main_ci_reclaim as main_ci_reclaim_module
+from charlie_work.git_retry import RetryOutcome
 from charlie_work.github import GitHubRunResult
 from charlie_work.main_ci_reclaim import (
     _is_strict_ancestor,
     _object_exists,
     reclaim_superseded_main_ci_runs,
 )
+from charlie_work.subprocess_runner import run_captured
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -315,6 +318,58 @@ def test_reclaim_fails_safe_when_fetch_fails(tmp_path: Path) -> None:
     assert result.error is not None and "fetch" in result.error
     assert gh.list_calls == 0
     assert gh.cancel_calls == []
+    # No remote at all fails on the very first attempt (not a classified-
+    # transient error), so run_git_with_retry never retries it.
+    assert result.fetch_attempts == 1
+
+
+def test_reclaim_fetch_attempts_defaults_to_one_without_retry(
+    repo_with_history: tuple[Path, str, str, str, str],
+) -> None:
+    repo_root, _c1, _c2, c3, _d1 = repo_with_history
+    gh = FakeGh(tip_commits={"main": {"sha": c3}})
+    result = reclaim_superseded_main_ci_runs(gh, repo_root)
+    assert result.ok is True
+    assert result.fetch_attempts == 1
+
+
+def test_reclaim_wires_fetch_through_run_git_with_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    repo_with_history: tuple[Path, str, str, str, str],
+) -> None:
+    """Proves the leading fetch actually goes through
+    ``git_retry.run_git_with_retry`` -- not a bare ``run_captured`` call --
+    and that a retry surfaces via ``fetch_attempts``. If this wiring were
+    reverted to a bare ``run_captured`` call, this test fails even though
+    every other test in this file (none of which simulate a fetch failure)
+    would still pass.
+
+    The fake still runs the real ``git fetch`` via ``run_captured`` (this
+    file's own convention: shell out to a real temporary repo, never mock git
+    itself) -- it only stands in for the retry *loop*, whose own internals
+    are already covered by ``test_git_retry.py``.
+    """
+    repo_root, _c1, _c2, c3, _d1 = repo_with_history
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_git_with_retry(
+        command: list[str], *, cwd: Path, timeout_seconds: int, on_retry=None, **_kwargs: Any
+    ):
+        calls.append({"command": command, "cwd": cwd, "timeout_seconds": timeout_seconds})
+        result = run_captured(command, cwd=cwd, timeout_seconds=timeout_seconds)
+        if on_retry is not None:
+            on_retry(RetryOutcome(attempts=2, ok=result.ok, error=result.error))
+        return result
+
+    monkeypatch.setattr(main_ci_reclaim_module, "run_git_with_retry", fake_run_git_with_retry)
+    gh = FakeGh(tip_commits={"main": {"sha": c3}})
+    result = reclaim_superseded_main_ci_runs(gh, repo_root)
+
+    assert len(calls) == 1
+    assert calls[0]["command"] == ["git", "fetch", "origin", "main"]
+    assert calls[0]["cwd"] == repo_root
+    assert result.ok is True
+    assert result.fetch_attempts == 2
 
 
 def test_reclaim_fails_safe_when_tip_resolution_fails(

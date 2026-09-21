@@ -242,6 +242,68 @@ def test_pull_ci_fleet_sibling_declared_root_raises_is_caught(
     assert calls == []
 
 
+def test_pull_ci_fleet_sibling_retries_transient_failure_then_succeeds(
+    tmp_path: Path,
+    monkeypatch: Any,
+    captured_log_events: list[tuple[Path, str, dict[str, Any]]],
+) -> None:
+    """A transient blip on the sibling pull is retried in place; the retry
+    itself is recorded via a dedicated ``git_network_retry`` event, separate
+    from (and in addition to) the ``self_deploy_ci_fleet_pull`` outcome
+    event -- one event per retried call, never one per attempt.
+
+    ``git_retry``'s own ``time.sleep`` is monkeypatched out (issue #1777
+    finding 8) so the real ~0.75-1.25s backoff does not run for real on
+    every pass of this test.
+    """
+    import charlie_work.git_retry as git_retry_module
+
+    monkeypatch.setattr(git_retry_module.time, "sleep", lambda _seconds: None)
+
+    sibling = tmp_path / "ci-fleet"
+    _fake_declared_root(monkeypatch, sibling)
+
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "main\n", ""),  # branch
+            RunResult(0, "", ""),  # status --porcelain (clean)
+            RunResult(0, "abc123\n", ""),  # before HEAD
+            RunResult(
+                returncode=128,
+                stdout="",
+                stderr=(
+                    "fatal: unable to access 'https://github.com/x/y.git/': Failed to "
+                    "connect to github.com port 443 after 2093 ms: Couldn't connect to "
+                    "server"
+                ),
+            ),  # pull attempt 1: transient (real curl/schannel shape -- issue
+            # #1777 finding 2, not the `connectex` hybrid no tool emits)
+            RunResult(0, "", ""),  # pull attempt 2 (retry): ok
+            RunResult(0, "def456\n", ""),  # after HEAD
+        ]
+    )
+
+    outcome = _pull_ci_fleet_sibling(tmp_path, run_command=runner, timeout=60)
+
+    assert outcome is None
+    assert len(calls) == 6
+    kinds = [kind for _, kind, _ in captured_log_events]
+    assert kinds.count("git_network_retry") == 1
+    assert kinds.count("self_deploy_ci_fleet_pull") == 1
+    retry_payload = next(p for _, k, p in captured_log_events if k == "git_network_retry")
+    # site/cwd are call-site-specific (issue #1777 finding 4): the sibling
+    # pull is neither "self_deploy" nor the orchestrator's own checkout.
+    assert retry_payload["site"] == "ci_fleet_sibling_pull"
+    assert retry_payload["cwd"] == str(sibling)
+    assert retry_payload["attempts"] == 2
+    assert retry_payload["ok"] is True
+    outcome_payload = next(
+        p for _, k, p in captured_log_events if k == "self_deploy_ci_fleet_pull"
+    )
+    assert outcome_payload["ok"] is True
+    assert outcome_payload["changed"] is True
+
+
 def test_self_deploy_does_not_pull_ci_fleet_sibling_by_default(
     tmp_path: Path, monkeypatch: Any, no_fleet_live_sessions: None
 ) -> None:

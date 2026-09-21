@@ -315,6 +315,67 @@ def test_maybe_reclaim_superseded_main_ci_no_event_when_nothing_to_reclaim(
     assert not [e for e in events if str(e.get("kind", "")).startswith("main_ci_reclaim")]
 
 
+def test_maybe_reclaim_superseded_main_ci_records_retry_event_when_fetch_retried(
+    tmp_path: Path,
+) -> None:
+    """``fetch_attempts > 1`` on an otherwise-empty, successful pass still
+    gets a durable ``git_network_retry`` event -- the retry is a fact about
+    the fetch, independent of whether the rest of the pass found anything to
+    reclaim (see the method's docstring). This is distinct from the
+    no-event-on-empty-pass policy covered above: that policy is about
+    ``main_ci_reclaim_completed`` noise, not about suppressing retry
+    observability."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.main_ci_reclaim import MainCiReclaimResult
+
+    app = _main_ci_reclaim_app(tmp_path)
+    canned = MainCiReclaimResult(
+        ok=True, tip_sha="tip-sha", candidates_checked=0, cancelled=(), fetch_attempts=2
+    )
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "reclaim_superseded_main_ci_runs", lambda *a, **k: canned)
+    try:
+        app._maybe_reclaim_superseded_main_ci()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    events = state.get("events", [])
+    retry_events = [e for e in events if e.get("kind") == "git_network_retry"]
+    assert len(retry_events) == 1
+    payload = retry_events[0]["payload"]
+    assert payload["site"] == "main_ci_reclaim"
+    assert payload["command"] == "git fetch"
+    assert payload["attempts"] == 2
+    assert payload["ok"] is True
+    # No candidates found, so the completed-pass noise policy still holds.
+    assert not [e for e in events if e.get("kind") == "main_ci_reclaim_cancelled"]
+
+
+def test_maybe_reclaim_superseded_main_ci_no_retry_event_when_fetch_attempts_is_one(
+    tmp_path: Path,
+) -> None:
+    """The default, common case -- no retry needed -- must not write a
+    ``git_network_retry`` event at all."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.main_ci_reclaim import MainCiReclaimResult
+
+    app = _main_ci_reclaim_app(tmp_path)
+    canned = MainCiReclaimResult(ok=True, tip_sha="tip-sha", candidates_checked=0, cancelled=())
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "reclaim_superseded_main_ci_runs", lambda *a, **k: canned)
+    try:
+        app._maybe_reclaim_superseded_main_ci()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    events = state.get("events", [])
+    assert not [e for e in events if e.get("kind") == "git_network_retry"]
+
+
 def test_maybe_reclaim_superseded_main_ci_records_failed_event_on_pass_failure(
     tmp_path: Path,
 ) -> None:
