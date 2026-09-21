@@ -44,6 +44,9 @@ def _label_descriptions(self) -> dict[str, str]:
         labels.operator_queue: "A mechanical failure exhausted its automated retries; needs operator triage.",
         labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
         labels.merge_hold: "Approved PR is held out of the merge queue by operator request.",
+        labels.cross_repo_override: (
+            "Operator override: skip both cross-repo pre-flight gates and dispatch normally."
+        ),
     }
 
 

@@ -2447,7 +2447,24 @@ def _dispatching_repo_name(gh: GitHubLike, repo_root: Path) -> str:
     directory name) when the GitHub lookup fails (offline, gh missing) —
     the directory name is usually the same as the GitHub repo name, and a
     mismatch only means the scope gate cannot attribute the issue, which
-    is the safe direction (pass, not block).
+    is the safe direction (pass, not block) *for that gate*.
+
+    That "safe direction" reasoning does not carry over unchanged to this
+    return value's second, opposite-polarity consumer:
+    ``cross_repo_gate.py``'s :func:`~charlie_work.cross_repo_gate._find_owning_repo`
+    (added by the #1756-#1758 positive-evidence redesign) uses this same
+    name to *exclude* the dispatching repo's own registered entry from the
+    sibling-repo search. There, a mismatch (this fallback returning a
+    deployment directory name like ``charlie-work-daemon`` that does not
+    match the registry's ``charlie-work`` key) would let the dispatching
+    repo's own entry be searched as a "sibling" and escalate the repo
+    against itself — a *block*, not a pass. ``_find_owning_repo`` guards
+    against exactly this by also excluding a managed-roots entry whose
+    resolved root is (or contains) the dispatching repo's actual
+    ``repo_root``, independent of whatever name this function returns
+    (review finding 3) — so a caller adding a third name-keyed consumer of
+    this value should not assume a mismatch is automatically safe there
+    too; check which direction that consumer's decision points first.
     """
     try:
         nwo = gh.name_with_owner()
