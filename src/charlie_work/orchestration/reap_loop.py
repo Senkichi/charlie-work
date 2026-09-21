@@ -299,6 +299,11 @@ def _loop_body(
     fir_confirm_passes = self.config.review.foreign_issue_ref_confirm_passes
     fir_reprobe_hours = self.config.review.foreign_issue_ref_reprobe_hours
     loop_now = now or datetime.now(UTC)
+    # Issue #1766: collected here and recorded once, after this loop, via
+    # `_record_unlinked_pr_skips` -- see that method's docstring for why a
+    # per-PR call site at the point of `continue` below could abort every
+    # other PR's review/merge work in the same pass on lock contention.
+    unlinked_pr_entries: list[tuple[dict[str, Any], int]] = []
     for pr in prs:
         issue_number = _wf.linked_issue_number(
             pr,
@@ -313,8 +318,8 @@ def _loop_body(
             # unreviewed indefinitely with nothing in events.db to show for
             # it. Edge-triggered: fires once on first sight and again only
             # when the PR's material state changes -- see
-            # `_record_unlinked_pr_skip`'s docstring.
-            self._record_unlinked_pr_skip(pr, int(pr["number"]), now=loop_now)
+            # `_record_unlinked_pr_skips`'s docstring.
+            unlinked_pr_entries.append((pr, int(pr["number"])))
             continue
         pr_number = int(pr["number"])
         parked = (state_snapshot["prs"].get(str(pr_number)) or {}).get("foreign_issue_ref") or {}
@@ -630,6 +635,11 @@ def _loop_body(
                 repo=self.repo_root.name,
             )
             errors.append({"pr": pr_number, "error": str(exc)})
+    # Issue #1766: recorded once for the whole batch, after every PR above
+    # has already had its real review/merge work attempted -- see
+    # `_record_unlinked_pr_skips`'s docstring for why a per-PR call site
+    # ahead of this loop could abort that work on lock contention.
+    self._record_unlinked_pr_skips(unlinked_pr_entries, now=loop_now)
     warnings: list[str] = []
     merge_alert_transitions: dict[int, dict[str, Any]] = {}
     for merge_entry in merges:

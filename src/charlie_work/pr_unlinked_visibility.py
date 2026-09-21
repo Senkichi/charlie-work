@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from .issue_linking import linked_issue_number
 
@@ -98,7 +98,7 @@ def unlinked_pr_author(pr: dict[str, Any]) -> tuple[str | None, bool]:
     return (str(login) if login else None), bool(is_bot)
 
 
-def _age_days_since(first_seen_at: Any, now: datetime) -> float | None:
+def _observed_days_since(first_seen_at: Any, now: datetime) -> float | None:
     """Days between ``first_seen_at`` (an ISO timestamp) and ``now``, or ``None``."""
     if not isinstance(first_seen_at, str):
         return None
@@ -107,6 +107,47 @@ def _age_days_since(first_seen_at: Any, now: datetime) -> float | None:
     except ValueError:
         return None
     return round((now - first_seen_dt).total_seconds() / 86400.0, 2)
+
+
+def _is_unsettled(value: str | None) -> bool:
+    """True while GitHub has not finished computing mergeability yet.
+
+    ``pr_list()`` reports ``"UNKNOWN"`` for both ``mergeable`` and
+    ``mergeStateStatus`` for a window after any base- or head-branch push,
+    while GitHub recomputes the real verdict -- the identical window
+    ``orchestration/state_stale_checks.py`` defers on (issue #1451) and
+    ``orchestration/helpers_rework.py`` re-probes rather than trusting.
+    ``None`` (the field absent from the payload) is treated the same way:
+    neither is a settled verdict an operator should compare against.
+    """
+    return value is None or str(value).upper() == "UNKNOWN"
+
+
+def _settle_fingerprint(
+    previous: dict[str, Any] | None, fingerprint: UnlinkedPrFingerprint
+) -> dict[str, str | None]:
+    """Carry forward ``mergeable``/``merge_state_status`` while they are unsettled.
+
+    Without this, a PR that flaps ``MERGEABLE -> UNKNOWN -> MERGEABLE`` every
+    pass (any push anywhere in the repo can re-trigger GitHub's async
+    mergeability computation, not just a push to this PR's own branches)
+    would report a fresh "transition" -- and a fresh events.db write -- on
+    every single occurrence, even though nothing an operator cares about
+    changed. When the current value is unsettled and a previous fingerprint
+    exists, this substitutes the previous value so the comparison in
+    ``compute_unlinked_pr_transition`` sees no change. ``head_sha`` is never
+    carried forward: a new commit is always a real transition regardless of
+    mergeability. On first sight (no previous fingerprint) there is nothing
+    to carry forward, so the raw, possibly-unsettled value is used as-is --
+    it becomes the first-seen baseline, and later passes settle against it.
+    """
+    current = fingerprint.as_dict()
+    if not isinstance(previous, dict):
+        return current
+    for key in ("mergeable", "merge_state_status"):
+        if _is_unsettled(current.get(key)):
+            current[key] = previous.get(key)
+    return current
 
 
 def compute_unlinked_pr_transition(
@@ -121,21 +162,23 @@ def compute_unlinked_pr_transition(
     per-entry decision, applied to one PR's persisted marker instead of a
     fleet-wide baseline map. Returns ``(new_marker, event_extra)``:
 
-    - ``event_extra`` is ``None`` when ``fingerprint`` equals the marker's
-      last-emitted fingerprint -- nothing materially changed, so the caller
-      must neither emit an event nor rewrite ``state.json`` (a standing,
-      unresolved PR costs a single read per pass, not a write).
-    - Otherwise ``event_extra`` carries ``age_days`` (days since this PR was
-      first observed, tracked in ``first_seen_at`` -- there is no GitHub
-      "created at" field in hand without a new API call, so age is measured
-      from first observation, not true PR age) and ``previous_state`` (the
+    - ``event_extra`` is ``None`` when ``fingerprint`` (after settling any
+      unsettled ``mergeable``/``merge_state_status`` value via
+      ``_settle_fingerprint``) equals the marker's last-emitted fingerprint
+      -- nothing materially changed, so the caller must neither emit an
+      event nor rewrite ``state.json`` (a standing, unresolved PR costs a
+      single read per pass, not a write).
+    - Otherwise ``event_extra`` carries ``observed_days`` (days since this PR
+      was first observed, tracked in ``first_seen_at`` -- there is no GitHub
+      "created at" field in hand without a new API call, so this is time
+      since first observation, not true PR age) and ``previous_state`` (the
       prior fingerprint dict, or ``None`` on first sight) for the caller to
       fold into the emitted event's payload. ``new_marker`` is always the
       value the caller must persist.
     """
     marker = marker or {}
     previous_fingerprint = marker.get("last_fingerprint")
-    current_fingerprint = fingerprint.as_dict()
+    current_fingerprint = _settle_fingerprint(previous_fingerprint, fingerprint)
     if previous_fingerprint == current_fingerprint:
         return marker, None
     first_seen_raw = marker.get("first_seen_at")
@@ -146,7 +189,7 @@ def compute_unlinked_pr_transition(
         "last_emitted_at": now.isoformat(),
     }
     event_extra = {
-        "age_days": _age_days_since(first_seen_at, now),
+        "observed_days": _observed_days_since(first_seen_at, now),
         "previous_state": previous_fingerprint,
     }
     return new_marker, event_extra
@@ -158,6 +201,7 @@ def summarize_unlinked_prs(
     *,
     branch_prefix: str,
     now: datetime,
+    branch_issue_validator: Callable[[int], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the operator-facing "current set" of open, issue-less PRs.
 
@@ -168,10 +212,15 @@ def summarize_unlinked_prs(
     fetched) and ``state_prs`` (``state["prs"]``, for each PR's persisted
     ``first_seen_at`` marker) -- no GitHub calls of its own.
 
-    Uses the same ``linked_issue_number`` call ``status()`` already makes for
-    its own ``linked_prs`` list (no ``branch_issue_validator``, matching that
-    existing call's precedent) so a PR appears in exactly one of the two
-    lists.
+    ``branch_issue_validator``, when supplied, must be the SAME validator
+    instance the caller's ``linked_prs`` list resolves its own PRs with
+    (issue #1229: a stale ``agent/issue-709-...`` branch left over from a
+    merged PR must not bind to a closed/nonexistent issue). Both surfaces
+    have to agree on one resolution rule -- passing ``None`` here while
+    ``linked_prs`` validates (or vice versa) would let a stale-branch PR
+    resolve differently on each side and either double-count it (appearing
+    in both lists) or drop it (appearing in neither), instead of the "exactly
+    one of the two lists" invariant this module promises.
     """
     summary: list[dict[str, Any]] = []
     for pr in prs:
@@ -179,6 +228,7 @@ def summarize_unlinked_prs(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=branch_prefix,
+            branch_issue_validator=branch_issue_validator,
         )
         if issue_number is not None:
             continue
@@ -193,7 +243,7 @@ def summarize_unlinked_prs(
                 "url": pr.get("url"),
                 "author": author,
                 "is_bot": is_bot,
-                "age_days": _age_days_since(first_seen_at, now),
+                "observed_days": _observed_days_since(first_seen_at, now),
                 "mergeable": pr.get("mergeable"),
                 "merge_state_status": pr.get("mergeStateStatus"),
                 "first_seen_at": first_seen_at,

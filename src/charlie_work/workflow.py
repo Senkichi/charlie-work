@@ -4115,6 +4115,13 @@ class OrchestratorApp:
                 # Don't fail status() if runner observation fails
                 runners_data = None
 
+        # Issue #1766 review: `linked_prs` and `unlinked_prs` must resolve a
+        # PR's issue with the SAME validator the merge lane itself uses
+        # (`reap_loop._loop_body`'s `branch_validator`), or a stale
+        # `agent/issue-709-...` branch (#1229) can resolve differently on
+        # each side -- appearing in both lists, or in neither, instead of
+        # exactly one.
+        branch_validator = self._make_branch_issue_validator()
         linked_prs = [
             self._summarize_pr(pr)
             for pr in prs
@@ -4122,6 +4129,7 @@ class OrchestratorApp:
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
+                branch_issue_validator=branch_validator,
             )
             is not None
         ]
@@ -4137,6 +4145,7 @@ class OrchestratorApp:
             state.get("prs", {}),
             branch_prefix=self.config.dispatch.branch_prefix,
             now=now,
+            branch_issue_validator=branch_validator,
         )
         data = {
             "ready_issue_count": len(issues),
