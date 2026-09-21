@@ -180,9 +180,25 @@ class RepoMeta(CapabilityCollaborator):
         Uses `gh repo view --json nameWithOwner`. Raises GitHubError on failure
         (offline, not a GitHub repo, gh missing, etc.).
 
+        Cached per orchestrator pass in ``_list_cache`` (issue #1770 review
+        finding 7), mirroring ``_repo_owner_name``/``branch_protection``'s
+        precedent: the repo's identity is static for the process lifetime, so
+        a caller on a per-pass hot path (``_apply_concurrency_governor``'s
+        CI-headroom clamp) does not pay a fresh ``gh`` subprocess every call.
+        Only a successful lookup is cached -- a transient failure is retried
+        on the next call within the same pass rather than being remembered as
+        a permanent "?" for the rest of the process (unlike
+        ``branch_protection``, whose failure IS a meaningful, cacheable
+        answer -- "no protection configured" -- rather than a transient one).
+
         Returns:
             The repository's nameWithOwner string.
         """
+        cache_key = ("name_with_owner",)
+        cached = self._list_cache.get(cache_key)
+        if isinstance(cached, str):
+            return cached
+
         result = self.run(
             ["repo", "view", "--json", REPO_NAME_WITH_OWNER_FIELDS], json_output=True
         )
@@ -191,4 +207,5 @@ class RepoMeta(CapabilityCollaborator):
         name_with_owner = result.get("nameWithOwner")
         if not isinstance(name_with_owner, str):
             raise GitHubError("Expected nameWithOwner string in gh repo view output")
+        self._list_cache[cache_key] = name_with_owner
         return name_with_owner

@@ -248,6 +248,16 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # see that launches are being held by the budget, not silently dropped.
         "api_budget_refused": "warning",
         "ci_fleet_worktree_dirty": "warning",
+        # Issue #1770: ci_headroom_available (ci_headroom.py)
+        # could not compute a repo's CI dispatch headroom from the freshest
+        # runner_allocation event (missing, stale, unconfigured repo, a
+        # pinned/unmeasurable demand reading, or a malformed payload).
+        # Warning, not error: the caller fails OPEN on this (no clamp
+        # applied) precisely so a CI-observability outage never becomes a
+        # dispatch outage -- but a live fleet should be writing a fresh
+        # runner_allocation event every pass, so a repeating burst here means
+        # that channel itself needs attention.
+        "ci_headroom_unavailable": "warning",
         # Issue #1260: the diff-coverage static probe (W3) flagged one or more
         # non-test files whose added branch logic outran the diff's added
         # tests. Warning, not error: the probe is advisory-only and never

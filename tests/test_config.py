@@ -1941,6 +1941,36 @@ def test_build_config_from_data_require_worker_github_token_rejects_non_bool() -
         build_config_from_data({"dispatch": {"require_worker_github_token": "true"}})
 
 
+def test_build_config_from_data_ci_capacity_headroom_ratio_rejects_non_number() -> None:
+    """Issue #1770: dispatch.ci_capacity_headroom_ratio must be a number."""
+    with pytest.raises(ConfigError, match="ci_capacity_headroom_ratio.*must be a number"):
+        build_config_from_data({"dispatch": {"ci_capacity_headroom_ratio": "1.5"}})
+
+
+def test_build_config_from_data_ci_capacity_headroom_ratio_rejects_bool() -> None:
+    """Issue #1770: bool is an int subclass -- must be rejected explicitly."""
+    with pytest.raises(ConfigError, match="ci_capacity_headroom_ratio.*must be a number"):
+        build_config_from_data({"dispatch": {"ci_capacity_headroom_ratio": True}})
+
+
+def test_build_config_from_data_ci_capacity_headroom_ratio_rejects_negative() -> None:
+    """Issue #1770: dispatch.ci_capacity_headroom_ratio must be >= 0."""
+    with pytest.raises(ConfigError, match="ci_capacity_headroom_ratio.*must be >= 0"):
+        build_config_from_data({"dispatch": {"ci_capacity_headroom_ratio": -0.5}})
+
+
+def test_build_config_from_data_ci_capacity_headroom_ratio_defaults_to_off() -> None:
+    """Issue #1770: unset ci_capacity_headroom_ratio preserves current behavior (0 = off)."""
+    config = build_config_from_data({})
+    assert config.dispatch.ci_capacity_headroom_ratio == 0.0
+
+
+def test_build_config_from_data_ci_capacity_headroom_ratio_accepts_float() -> None:
+    """Issue #1770: a configured ratio round-trips through build_config_from_data."""
+    config = build_config_from_data({"dispatch": {"ci_capacity_headroom_ratio": 1.5}})
+    assert config.dispatch.ci_capacity_headroom_ratio == 1.5
+
+
 # ---------------------------------------------------------------------------
 # Issue #1383: auto_merge.infra_blocked validation error paths.
 #

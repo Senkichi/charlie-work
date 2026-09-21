@@ -352,6 +352,39 @@ class DispatchConfig:
     # they reduce verification debt rather than adding to it. 0 = off,
     # preserving current behavior.
     max_open_agent_prs: int = 0
+    # Issue #1770: CI-capacity headroom for fresh-issue dispatch. When > 0,
+    # fresh dispatch additionally clamps to ci_headroom_available()'s reading
+    # for this repo -- floor(registered_runner_capacity * ratio) minus live
+    # queued+in_progress CI *job* demand, both already measured by ci_fleet's
+    # runner_allocation pass (see ci_headroom.py; no new
+    # GitHub calls). Paces fresh PR creation to the repo's actual CI
+    # throughput instead of only to worker concurrency, so the in-flight-PR
+    # queue stops outrunning what CI can drain (runner-starvation.md
+    # Option C).
+    #
+    # This is a runner-SLOT headroom, not a PR count: one PR can fan out to
+    # several CI jobs (a matrix workflow), and that fan-out factor is
+    # repo-specific and not represented in the ratio. A ratio of 1.0 means
+    # "stop dispatching once every runner is busy", which halts fresh
+    # dispatch on a repo whose runners are simply keeping up with healthy
+    # load (demand == capacity, zero queue is NOT saturation) -- pick a
+    # ratio meaningfully above 1.0 for a repo with multi-job PRs, and expect
+    # to tune it per repo rather than reusing one value fleet-wide. See
+    # ci_headroom.py's module docstring for the full rationale.
+    #
+    # Repos with no self-hosted runner_allocation entry (e.g. public
+    # charlie-work's hosted-runner repos) have no reading to clamp against,
+    # so dispatch itself is unaffected -- ci_headroom_available() returns
+    # None (fail-open, never a hard 0) for them, derived from whether
+    # ci_fleet's plan carries the repo at all, never a repo-name list. This
+    # is NOT silent, though: an unclamped repo still gets a rate-limited
+    # ci_headroom_unavailable diagnostic event in its own events.db (at most
+    # once per reason per max_data_age_minutes) so the fail-open condition
+    # stays visible without flooding the store.
+    # Rework, conflict-rework, recovery, and review dispatch are NOT gated,
+    # same rationale as max_open_agent_prs -- they reduce WIP rather than
+    # adding to it. 0 = off, preserving current behavior.
+    ci_capacity_headroom_ratio: float = 0.0
     # Repo-root-relative paths copied into each worktree after creation
     # (e.g. [".devin"]). Copy-not-link (workers may write marker files);
     # skip-if-tracked (tracked paths are already present). Errors surface as
@@ -2377,6 +2410,19 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         if _mop < 0:
             raise ConfigError(
                 f"config section 'dispatch' key 'max_open_agent_prs' must be >= 0, got {_mop}"
+            )
+    # Issue #1770: numeric validation for ci_capacity_headroom_ratio.
+    _cchr = dispatch_data.get("ci_capacity_headroom_ratio")
+    if _cchr is not None:
+        if isinstance(_cchr, bool) or not isinstance(_cchr, (int, float)):
+            raise ConfigError(
+                "config section 'dispatch' key 'ci_capacity_headroom_ratio' must be a number, "
+                f"got {type(_cchr).__name__}"
+            )
+        if _cchr < 0:
+            raise ConfigError(
+                "config section 'dispatch' key 'ci_capacity_headroom_ratio' must be >= 0, "
+                f"got {_cchr}"
             )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review_data = _section(data, "review")

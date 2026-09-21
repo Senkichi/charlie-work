@@ -877,6 +877,25 @@ class ConcurrencyGovernorResult:
     # rework/recovery/loop paths, which are exempt from this clamp.
     open_pr_count: int = 0
     open_pr_max: int = 0
+    # Issue #1770: CI-capacity headroom fields. ``ci_headroom_ratio`` mirrors
+    # ``open_pr_max``'s exemption -- populated only for the same
+    # ``apply_open_pr_backpressure=True`` (fresh-issue) call, 0.0 for
+    # rework/recovery/loop paths regardless of the configured ratio.
+    # ``ci_headroom`` is the ``ci_headroom_available()`` reading: ``None``
+    # when the ratio is 0 (clamp off) or the data could not be trusted this
+    # pass (fail-open -- see ``ci_headroom``'s docstring), an
+    # int otherwise.
+    ci_headroom: int | None = None
+    ci_headroom_ratio: float = 0.0
+    # Which term actually bound ``dispatch_limit`` this call, e.g.
+    # "ci_headroom", "open_pr_max", "fleet_max", "max_concurrent", or
+    # ``None`` when nothing clamped. The terms apply in sequence, each only
+    # tightening (never loosening) the running limit, so whichever term last
+    # reduced it is the true binding constraint -- this is what makes a
+    # "0 dispatched" pass explainable from the event alone instead of
+    # requiring a reader to redo the min() by hand (zero-dispatch-is-a-
+    # capacity-question-first).
+    clamped_by: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -893,9 +912,37 @@ class ConcurrencyGovernorResult:
         """Return True if the open-PR backpressure clamp is enabled (open_pr_max > 0)."""
         return self.open_pr_max > 0
 
-    def report_fields(self) -> dict[str, int]:
+    @property
+    def ci_headroom_enabled(self) -> bool:
+        """Return True if the CI-headroom clamp is enabled (ci_headroom_ratio > 0)."""
+        return self.ci_headroom_ratio > 0
+
+    @property
+    def any_term_enabled(self) -> bool:
+        """Return True if any governor term is enabled.
+
+        Single point of enforcement (issue #1770 review finding 1): every
+        call site that decides whether to splat ``report_fields()`` into a
+        ``CommandResult.data`` dict must gate on this property, never on a
+        hand-written ``or``-chain of the individual ``*_enabled`` flags. A
+        hand-written chain silently stops covering new terms the moment one
+        is added -- exactly what happened when ``ci_headroom_enabled`` shipped
+        without being added to the ten pre-existing
+        ``gov.enabled or gov.fleet_enabled or gov.open_pr_enabled`` sites, so
+        a repo that opted into *only* the CI-headroom clamp (the other three
+        left at 0, precisely the "opt into just the new clamp" rollout the
+        config comment advertises) got its ``dispatch_limit`` clamped to 0
+        with no ``ci_headroom``/``clamped_by`` field in the result to explain
+        why. Deriving this from the flags themselves means the next new term
+        cannot repeat that gap.
+        """
+        return (
+            self.enabled or self.fleet_enabled or self.open_pr_enabled or self.ci_headroom_enabled
+        )
+
+    def report_fields(self) -> dict[str, Any]:
         """Return the fields to include in CommandResult.data when clamped."""
-        fields = {
+        fields: dict[str, Any] = {
             "concurrency_limit": self.max_concurrent,
             "live_session_count": self.live_count,
             "available_slots": self.available_slots,
@@ -906,6 +953,11 @@ class ConcurrencyGovernorResult:
         if self.open_pr_enabled:
             fields["open_pr_count"] = self.open_pr_count
             fields["open_pr_max"] = self.open_pr_max
+        if self.ci_headroom_enabled:
+            fields["ci_headroom"] = self.ci_headroom
+            fields["ci_headroom_ratio"] = self.ci_headroom_ratio
+        if self.clamped_by is not None:
+            fields["clamped_by"] = self.clamped_by
         return fields
 
 

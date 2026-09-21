@@ -260,6 +260,7 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
         "concurrency_limit": 2,
         "live_session_count": 0,
         "available_slots": 2,
+        "clamped_by": "max_concurrent",
     }
 
     # --- Scenario 4: --issues path, 7 deferred (full-vs-truncated pin) -----
@@ -409,6 +410,7 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
         "concurrency_limit": 1,
         "live_session_count": 1,
         "available_slots": 0,
+        "clamped_by": "max_concurrent",
     }
 
     # --- Scenario 2: same clamped config, genuinely empty backlog ---------
@@ -478,6 +480,7 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
         "available_slots": 1,
         "fleet_concurrency_limit": 3,
         "fleet_live_session_count": 3,
+        "clamped_by": "fleet_max",
     }
 
     # --- Scenario 4: --issues path, >5 deferred (review regression pin) ---

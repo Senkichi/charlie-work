@@ -1066,7 +1066,25 @@ _RATCHET_BASELINE: dict[str, int] = {
     "workflow.py": 55,
     "orchestration/dispatch_state.py": 30,
     "orchestration/reap_loop.py": 5,
-    "orchestration/reap_dispatch.py": 1,
+    # Issue #1770: +1 raw log_event call in _apply_concurrency_governor's new
+    # CI-headroom clamp branch (the dispatch_backpressure event recorded when
+    # ci_headroom_available()'s reading clamps fresh dispatch, mirroring the
+    # pre-existing open_pr_max clamp's own raw log_event call in the same
+    # function). Same out-of-wave class as that pre-existing site -- the
+    # ratchet holds at the new count (1 -> 2).
+    "orchestration/reap_dispatch.py": 2,
+    # Issue #1770: +1 raw log_event call in ci_headroom_available's
+    # _log_unavailable helper (the ci_headroom_unavailable diagnostic event).
+    # A standalone function in a new module, not an OrchestratorApp method,
+    # so it has no self.write_gate receiver -- same out-of-wave pattern as
+    # capacity_starvation_escalation.py below. Lives at top-level
+    # charlie_work/ci_headroom.py (not under orchestration/): that package is
+    # reserved for the Track 2 Phase B delegation installer's destination
+    # modules (every top-level def in a flat orchestration/ submodule is
+    # auto-installed onto OrchestratorApp -- see workflow_delegation.py), and
+    # this module's functions are plain standalone helpers with no ``self``,
+    # never meant to become OrchestratorApp members.
+    "ci_headroom.py": 1,
     "orchestration/instrumentation_ops.py": 11,
     "orchestration/state_rework_routing.py": 8,
     "orchestration/state_stale_checks.py": 9,

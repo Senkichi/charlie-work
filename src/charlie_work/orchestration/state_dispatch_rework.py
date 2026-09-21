@@ -190,7 +190,7 @@ def _dispatch_rework_impl(
                 "deferred_reason": "provider_throttled",
                 "throttled_until": throttled_until,
             }
-            if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
+            if gov.any_term_enabled:
                 data.update(gov.report_fields())
             return _wf.CommandResult(
                 False,
@@ -374,7 +374,7 @@ def _dispatch_rework_impl(
             "blocked_environment_escalated": sorted(dry_blocked_environment_escalated),
             "rescue_issue_numbers": sorted(dry_rescue_issue_numbers),
         }
-        if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
+        if gov.any_term_enabled:
             data.update(gov.report_fields())
         return _wf.CommandResult(
             True,
@@ -878,7 +878,7 @@ def _dispatch_rework_impl(
             "salvaged_to_review": sorted(salvaged_to_review),
             "blocked_environment_escalated": sorted(blocked_environment_escalated),
         }
-        if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
+        if gov.any_term_enabled:
             data.update(gov.report_fields())
         return _wf.CommandResult(
             True,
@@ -943,7 +943,7 @@ def _dispatch_rework_impl(
             "salvaged_to_review": sorted(salvaged_to_review),
             "blocked_environment_escalated": sorted(blocked_environment_escalated),
         }
-        if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
+        if gov.any_term_enabled:
             data.update(gov.report_fields())
         return _wf.CommandResult(
             True,
@@ -1177,7 +1177,7 @@ def _dispatch_rework_impl(
             "salvaged_to_review": sorted(salvaged_to_review),
             "blocked_environment_escalated": sorted(blocked_environment_escalated),
         }
-        if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
+        if gov.any_term_enabled:
             data.update(gov.report_fields())
         return _wf.CommandResult(
             True,
@@ -1636,7 +1636,7 @@ def _dispatch_rework_impl(
         "salvaged_to_review": sorted(salvaged_to_review),
         "blocked_environment_escalated": sorted(blocked_environment_escalated),
     }
-    if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
+    if gov.any_term_enabled:
         data.update(gov.report_fields())
 
     # Emit notification digest if there are health transitions (stalled sessions)
