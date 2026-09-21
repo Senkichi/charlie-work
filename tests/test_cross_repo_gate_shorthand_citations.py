@@ -130,42 +130,46 @@ def test_shorthand_items_still_extract_then_classify() -> None:
 
 def test_standalone_leading_slash_path_still_escalates(tmp_path: Path) -> None:
     """A leading-``/`` candidate NOT continuing a backtick-span run is a
-    genuine absolute path, not shorthand — a missing one still escalates
-    exactly as before (no weakening of cross-repo detection)."""
+    genuine absolute path, not shorthand — a missing one still survives
+    classification as referenced/missing exactly as before (no weakening of
+    cross-repo detection). Without a fleet registry the gate abstains on it
+    rather than escalating (positive-evidence redesign, #1756-#1758)."""
     repo = _init_git_repo_with_logs_gitignore(tmp_path / "repo")
     body = "The file is at `/sessions/30392.json` on the runner."
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert result.referenced_paths == ("/sessions/30392.json",)
     assert result.missing_paths == ("/sessions/30392.json",)
     assert result.neutral_paths == ()
-    assert "cross_repo_target" in result.reason
+    assert "abstaining" in result.reason
 
 
 def test_absolute_path_continuation_with_missing_resolved_still_escalates(
     tmp_path: Path,
 ) -> None:
     """A leading-``/`` continuation whose resolved form is genuinely missing
-    still escalates: `` `src/a.py`, `/home/operator/other-repo/x.py` ``
+    still survives classification: `` `src/a.py`, `/home/operator/other-repo/x.py` ``
     resolves to ``src/home/operator/other-repo/x.py`` (absent), so the raw
     candidate survives and reports missing. This is the guard that the run
     detection does not blanket-neutralize every ``/``-starting path that
-    happens to follow a backtick span."""
+    happens to follow a backtick span. Without a fleet registry the gate
+    abstains on it rather than escalating (positive-evidence redesign,
+    #1756-#1758)."""
     repo = _init_git_repo_with_logs_gitignore(tmp_path / "repo")
     (repo / "src").mkdir()
     body = "Fix `src/missing_a.py` and `/home/operator/other-repo/missing_b.py`."
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert set(result.missing_paths) == {
         "src/missing_a.py",
         "/home/operator/other-repo/missing_b.py",
     }
     assert result.neutral_paths == ()
-    assert "cross_repo_target" in result.reason
+    assert "abstaining" in result.reason
 
 
 def test_shorthand_resolving_to_existing_file_counts_as_evidence(
@@ -193,14 +197,16 @@ def test_shorthand_resolving_to_missing_repo_shaped_path_still_escalates(
 ) -> None:
     """`` `src/a.py`, `/b.py` `` with both resolved files missing: the
     shorthand item behaves as the spelled-out ``src/b.py`` would — missing
-    and repo-shaped — so the gate escalates rather than hiding it."""
+    and repo-shaped — so it is not hidden from ``missing_paths``. Without a
+    fleet registry the gate abstains rather than escalating on it
+    (positive-evidence redesign, #1756-#1758)."""
     repo = _init_git_repo_with_logs_gitignore(tmp_path / "repo")
     (repo / "src").mkdir()
     body = "The change touches `src/missing_a.py`, `/missing_b.py`."
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert set(result.missing_paths) == {"src/missing_a.py", "/missing_b.py"}
     assert result.neutral_paths == ()
 
@@ -208,10 +214,12 @@ def test_shorthand_resolving_to_missing_repo_shaped_path_still_escalates(
 def test_shorthand_run_with_real_missing_path_still_escalates(
     tmp_path: Path,
 ) -> None:
-    """A genuine missing dispatch target in the same body still escalates:
-    the shorthand item bins neutral (resolved under gitignored ``logs/``)
-    and the fully-qualified ``src/missing.py`` survives — the fix narrows
-    ``missing_paths`` to exactly the real target."""
+    """A genuine missing dispatch target in the same body still survives
+    classification: the shorthand item bins neutral (resolved under
+    gitignored ``logs/``) and the fully-qualified ``src/missing.py``
+    survives — the fix narrows ``missing_paths`` to exactly the real target.
+    Without a fleet registry the gate abstains on it rather than escalating
+    (positive-evidence redesign, #1756-#1758)."""
     repo = _init_git_repo_with_logs_gitignore(tmp_path / "repo")
     (repo / "src").mkdir()
     body = (
@@ -220,10 +228,10 @@ def test_shorthand_run_with_real_missing_path_still_escalates(
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert result.missing_paths == ("src/missing.py",)
     assert "/b.json" in result.neutral_paths
-    assert "cross_repo_target" in result.reason
+    assert "abstaining" in result.reason
 
 
 def test_newline_separated_run_also_resolves(tmp_path: Path) -> None:
@@ -255,13 +263,15 @@ def test_ellipsis_shorthand_standalone_is_neutral(tmp_path: Path) -> None:
 def test_prose_separated_slash_path_is_not_a_continuation(tmp_path: Path) -> None:
     """Words between backtick spans end the run: `` `a/b.json`. Later,
     `/etc/x.py` `` cites ``/etc/x.py`` on its own terms — a genuine absolute
-    path that still escalates when missing."""
+    path that survives classification as missing when it is. Without a
+    fleet registry the gate abstains on it rather than escalating
+    (positive-evidence redesign, #1756-#1758)."""
     repo = _init_git_repo_with_logs_gitignore(tmp_path / "repo")
     body = "`logs/run/a.json`. Later, `/etc/x.py` was implicated."
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert result.missing_paths == ("/etc/x.py",)
     assert result.neutral_paths == ("logs/run/a.json",)
 
@@ -270,42 +280,52 @@ def test_parent_relative_sibling_repo_run_still_escalates(
     tmp_path: Path,
 ) -> None:
     """``..`` is the real parent-directory segment, not a shorthand marker:
-    a comma-separated run of ``../sibling-repo/`` citations still escalates
-    as ``cross_repo_target``, exactly as it did before the shorthand
-    machinery existed (round-2 review regression — a ``\\.{2,}``
-    threshold would neutralize these and dispatch into the wrong repo)."""
+    a comma-separated run of ``../sibling-repo/`` citations survives
+    classification as referenced/missing, exactly as it did before the
+    shorthand machinery existed (round-2 review regression — a ``\\.{2,}``
+    threshold would neutralize these instead). Without a fleet registry
+    supplied here, ``_find_owning_repo`` is never consulted (no siblings to
+    check), so the gate abstains rather than escalating — but critically,
+    the ``..`` candidates are never treated as shorthand and never appear in
+    ``neutral_paths``. See ``test_missing_path_found_in_sibling_repo_blocks``
+    in ``test_cross_repo_gate.py`` for the WITH-fleet-registry escalation
+    shape, and note the traversal containment guard (``_resolve_within_root``
+    + ``contains()``) still applies there before any ``exists()`` check."""
     repo = _init_git_repo_with_logs_gitignore(tmp_path / "repo")
     body = "Edit `../other-repo/a.py`, `../other-repo/b.py`."
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert set(result.missing_paths) == {
         "../other-repo/a.py",
         "../other-repo/b.py",
     }
     assert result.neutral_paths == ()
-    assert "cross_repo_target" in result.reason
+    assert "abstaining" in result.reason
 
 
 def test_parent_relative_citations_prose_separated_still_escalate(
     tmp_path: Path,
 ) -> None:
     """Same guard outside list context: two ``../sibling-repo/`` citations
-    separated by prose still escalate — ``..`` neutrality must not depend
-    on run shape either."""
+    separated by prose survive classification as referenced/missing — ``..``
+    neutrality must not depend on run shape either. Without a fleet
+    registry the gate abstains rather than escalating on them
+    (positive-evidence redesign, #1756-#1758), but they are never
+    misclassified as shorthand (``neutral_paths`` stays empty)."""
     repo = _init_git_repo_with_logs_gitignore(tmp_path / "repo")
     body = "Edit `../other-repo/a.py`. The helper it calls lives in `../other-repo/b.py`."
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert set(result.missing_paths) == {
         "../other-repo/a.py",
         "../other-repo/b.py",
     }
     assert result.neutral_paths == ()
-    assert "cross_repo_target" in result.reason
+    assert "abstaining" in result.reason
 
 
 def test_parent_relative_continuation_after_repo_anchor_still_escalates(
@@ -314,18 +334,20 @@ def test_parent_relative_continuation_after_repo_anchor_still_escalates(
     """Pins the kept ``..`` behavior: ``..`` is NEVER shorthand, even when
     the candidate directly continues a comma-separated backtick-span run
     anchored by a non-shorthand span — `` `src/x.py`, `../sibling/y.py` ``
-    keeps ``../sibling/y.py`` a real missing candidate, so the sibling-repo
-    target still escalates instead of being silently neutralized."""
+    keeps ``../sibling/y.py`` a real missing candidate (never silently
+    neutralized into ``neutral_paths``). Without a fleet registry the gate
+    abstains on it rather than escalating (positive-evidence redesign,
+    #1756-#1758)."""
     repo = _init_git_repo_with_logs_gitignore(tmp_path / "repo")
     (repo / "src").mkdir()
     body = "Fix `src/missing_a.py`, `../sibling-repo/missing_b.py`."
 
     result = cross_repo_gate(body, repo)
 
-    assert result.passed is False
+    assert result.passed is True
     assert set(result.missing_paths) == {
         "src/missing_a.py",
         "../sibling-repo/missing_b.py",
     }
     assert result.neutral_paths == ()
-    assert "cross_repo_target" in result.reason
+    assert "abstaining" in result.reason

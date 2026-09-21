@@ -40,10 +40,15 @@ def test_referenced_path_exists_in_repo_passes(tmp_path: Path) -> None:
 
 
 def test_all_referenced_paths_missing_blocks(tmp_path: Path) -> None:
-    """When every referenced path is absent from the repo, the gate blocks.
+    """When every referenced path is absent from this repo AND no fleet
+    registry was supplied, the gate abstains rather than blocks.
 
-    This is the core scenario from issue #1010: the issue references
-    ``suite_coverage.py`` which lives in a sibling repo, not this one.
+    This is the core scenario from issue #1010 (the issue references
+    ``suite_coverage.py`` which lives in a sibling repo, not this one), but
+    the positive-evidence redesign (issues #1756-#1758) means bare absence
+    is no longer sufficient to escalate — see
+    ``test_missing_path_found_in_sibling_repo_blocks`` below for the same
+    scenario WITH a registered sibling repo, which does escalate.
     """
     body = (
         "`suite_coverage.py` is at "
@@ -51,9 +56,33 @@ def test_all_referenced_paths_missing_blocks(tmp_path: Path) -> None:
         "there is no `src/charlie_work/suite_coverage.py`."
     )
     result = cross_repo_gate(body, tmp_path)
-    assert not result.passed
+    assert result.passed
     assert len(result.referenced_paths) >= 1
     assert result.missing_paths == result.referenced_paths
+    assert "abstaining" in result.reason
+
+
+def test_missing_path_found_in_sibling_repo_blocks(tmp_path: Path) -> None:
+    """The #1010 scenario WITH a registered fleet sibling: the referenced
+    path is positively found under exactly one other managed repo's root,
+    so the gate escalates and records ``found_in_repo``."""
+    this_repo = tmp_path / "charlie-work"
+    this_repo.mkdir()
+    sibling_repo = tmp_path / "ci_runners"
+    (sibling_repo / "src" / "ci_fleet").mkdir(parents=True)
+    (sibling_repo / "src" / "ci_fleet" / "suite_coverage.py").write_text(
+        "# suite_coverage", encoding="utf-8"
+    )
+    body = "`suite_coverage.py` is at `src/ci_fleet/suite_coverage.py`."
+
+    result = cross_repo_gate(
+        body,
+        this_repo,
+        {"charlie-work": this_repo, "ci_runners": sibling_repo},
+        "charlie-work",
+    )
+    assert not result.passed
+    assert result.found_in_repo == "ci_runners"
     assert "cross_repo_target" in result.reason
 
 
@@ -83,24 +112,38 @@ def test_absolute_path_inside_repo_passes(tmp_path: Path) -> None:
 
 
 def test_absolute_path_outside_repo_blocks(tmp_path: Path) -> None:
-    """An absolute path to a different repo blocks the gate."""
+    """An absolute path to a different repo now abstains rather than blocks
+    when no fleet registry is supplied — positive sibling-repo evidence is
+    required to escalate (issues #1756-#1758), so an unregistered absolute
+    path is "not found anywhere in the fleet" rather than automatic
+    cross-repo evidence. (Name kept for history; see
+    ``test_missing_path_found_in_sibling_repo_blocks`` for the escalating
+    case with a registered sibling.)"""
     body = "The file is at `C:/Users/operator/repos/ci_runners/src/ci_fleet/suite_coverage.py`."
     result = cross_repo_gate(body, tmp_path)
-    assert not result.passed
+    assert result.passed
+    assert "abstaining" in result.reason
 
 
 def test_posix_style_absolute_path_outside_repo_blocks(tmp_path: Path) -> None:
-    """A POSIX-style absolute path (no drive letter) also keeps escalating.
+    """A POSIX-style absolute path (no drive letter) also now abstains
+    without a fleet registry, rather than blocking.
 
     ``Path(candidate).is_absolute()`` is platform-dependent: on Windows a
     POSIX-style absolute path like ``/home/user/other-repo/foo.py`` reports
-    ``is_absolute() is False`` (no drive letter), which would otherwise let
-    it fall through to the single-ambiguous-candidate abstain path instead
-    of escalating. This is a regression test for that specific misfire.
+    ``is_absolute() is False`` (no drive letter). The single-ambiguous-
+    candidate branch this test originally guarded no longer exists — the
+    positive-evidence redesign (issues #1756-#1758) removed it entirely in
+    favor of the sibling-repo check — but ``_is_absolute_path`` is still
+    load-bearing inside ``_find_owning_repo``/``_resolve_within_root``, so
+    this pins that a POSIX-style absolute candidate is still correctly
+    recognized as absolute (not silently mis-joined onto a repo root) even
+    though the outcome here, with no registry supplied, is abstain.
     """
     body = "The bug is in /home/operator/other-repo/foo.py."
     result = cross_repo_gate(body, tmp_path)
-    assert not result.passed
+    assert result.passed
+    assert "abstaining" in result.reason
 
 
 def test_urls_are_not_treated_as_file_paths(tmp_path: Path) -> None:
@@ -172,9 +215,12 @@ def test_jc_1688_domain_shaped_table_cell_extracts_nothing_and_passes(
 
 def test_cw_1062_single_non_repo_shaped_candidate_abstains(tmp_path: Path) -> None:
     """cw#1062 misfire: the sole extracted candidate is ``Scripts/charlie.exe``
-    — a venv-relative path, not a reference to this repo's code (``Scripts``
-    is not a real top-level directory here). Isolates fix 2: the fragment is
-    not domain-shaped, so this exercises only the decision-layer rule."""
+    — a venv-relative path, not a reference to this repo's code. Isolates
+    fix 2: the fragment is not domain-shaped, so this exercises only the
+    decision layer. Post-positive-evidence-redesign (#1756-#1758), no fleet
+    registry is supplied here, so the candidate abstains as "not found
+    anywhere in the fleet" rather than via the old repo-shape heuristic —
+    same outcome, different (now structural) reason."""
     body = (
         "Both hits are `self_deploy_failed` on `uv sync` failing to remove "
         "Scripts/charlie.exe (the known #854 condition)."
@@ -194,8 +240,9 @@ def test_domain_token_excluded_leaves_real_missing_path_to_escalate(
     """Isolates fix 1: two candidates in the body, one domain-shaped (must be
     excluded by the regex fix) and one real repo-shaped missing path. The
     domain token is dropped during extraction; the surviving candidate is a
-    single repo-shaped missing path, which still escalates — proving the
-    regex fix does not depend on the decision-layer fix's abstain behavior.
+    single repo-shaped missing path. With no fleet registry supplied, it
+    abstains (positive-evidence redesign, #1756-#1758) — proving the regex
+    fix's extraction result is unaffected by the decision-layer rule.
     """
     (tmp_path / "src" / "charlie_work").mkdir(parents=True)
 
@@ -207,28 +254,34 @@ def test_domain_token_excluded_leaves_real_missing_path_to_escalate(
     assert paths == ["src/charlie_work/nonexistent.py"]
 
     result = cross_repo_gate(body, tmp_path)
-    assert not result.passed
+    assert result.passed
     assert result.referenced_paths == ("src/charlie_work/nonexistent.py",)
-    assert "cross_repo_target" in result.reason
+    assert "abstaining" in result.reason
 
 
 def test_single_repo_shaped_relative_candidate_still_escalates(tmp_path: Path) -> None:
     """A single missing relative candidate whose first segment IS a real
-    repo_root directory (``src``) still escalates — the decision-layer
-    exception only abstains for non-repo-shaped candidates."""
+    repo_root directory (``src``) now abstains without a fleet registry —
+    the old repo-shape exception this test guarded no longer exists
+    (positive-evidence redesign, #1756-#1758): the decision no longer
+    depends on whether a candidate merely *looks* like it belongs to this
+    repo, only on whether it is positively found under a sibling."""
     (tmp_path / "src" / "charlie_work").mkdir(parents=True)
 
     body = "The bug is in `src/charlie_work/nonexistent.py`."
     result = cross_repo_gate(body, tmp_path)
-    assert not result.passed
+    assert result.passed
     assert result.referenced_paths == ("src/charlie_work/nonexistent.py",)
-    assert "cross_repo_target" in result.reason
+    assert "abstaining" in result.reason
 
 
 def test_issue_953_scenario_blocks(tmp_path: Path) -> None:
     """The exact scenario from issue #1010/#953: issue body references
     ``suite_coverage.py`` at a path in a sibling repo, with no matching file
-    in the target repo."""
+    in the target repo, and no fleet registry supplied — abstains rather
+    than blocks (positive-evidence redesign, #1756-#1758). See
+    ``test_missing_path_found_in_sibling_repo_blocks`` for the same body
+    shape WITH a registered sibling repo, which escalates."""
     body = (
         "But **#953's code does not live in this repo.** `suite_coverage.py` is at "
         "`C:/Users/operator/repos/ci_runners/src/ci_fleet/suite_coverage.py`; there is no "
@@ -237,8 +290,8 @@ def test_issue_953_scenario_blocks(tmp_path: Path) -> None:
         "`C:\\Users\\operator\\repos\\ci_runners` — the **shared main checkout** — and worked there."
     )
     result = cross_repo_gate(body, tmp_path)
-    assert not result.passed
-    assert "cross_repo_target" in result.reason
+    assert result.passed
+    assert "abstaining" in result.reason
 
 
 def test_domain_token_adjacent_to_real_path_does_not_swallow_it(
@@ -246,15 +299,16 @@ def test_domain_token_adjacent_to_real_path_does_not_swallow_it(
 ) -> None:
     """A domain-shaped token packed tightly against a repo-shaped path in a
     compact markdown table cell must not swallow its neighbor: the domain
-    token is stripped, the real (missing) repo-shaped candidate survives,
-    and the gate still escalates on it."""
+    token is stripped and the real (missing) repo-shaped candidate survives
+    classification — it just abstains rather than escalates without a fleet
+    registry (positive-evidence redesign, #1756-#1758)."""
     (tmp_path / "src" / "charlie_work").mkdir(parents=True)
 
     body = "| Pulte | pultegroupinc.com/careers/default.aspx|src/charlie_work/real.py |"
     result = cross_repo_gate(body, tmp_path)
     assert result.referenced_paths == ("src/charlie_work/real.py",)
-    assert not result.passed
-    assert "cross_repo_target" in result.reason
+    assert result.passed
+    assert "abstaining" in result.reason
 
 
 # --- issue #1343: templated runtime-state example paths ---------------------
@@ -331,31 +385,34 @@ def test_issue_1343_gitignored_top_level_dir_not_repo_shaped(tmp_path: Path) -> 
 def test_issue_1343_tracked_top_level_dir_still_repo_shaped_with_gitignore(
     tmp_path: Path,
 ) -> None:
-    """A gitignore that ignores ``.var/`` must not weaken escalation on a
-    genuine tracked-dir reference: ``src/charlie_work/nonexistent.py`` (``src``
-    is a real, non-ignored top-level dir) still escalates."""
+    """A gitignore that ignores ``.var/`` must not affect a genuine
+    tracked-dir reference: ``src/charlie_work/nonexistent.py`` (``src`` is a
+    real, non-ignored top-level dir) still survives classification as
+    missing — it just abstains rather than escalates without a fleet
+    registry (positive-evidence redesign, #1756-#1758)."""
     (tmp_path / "src" / "charlie_work").mkdir(parents=True)
     (tmp_path / ".gitignore").write_text(".var/\n.venv/\n", encoding="utf-8")
 
     body = "The bug is in `src/charlie_work/nonexistent.py`."
     result = cross_repo_gate(body, tmp_path)
-    assert not result.passed
+    assert result.passed
     assert result.referenced_paths == ("src/charlie_work/nonexistent.py",)
-    assert "cross_repo_target" in result.reason
+    assert "abstaining" in result.reason
 
 
 def test_issue_1343_no_gitignore_keeps_existing_repo_shape_behavior(
     tmp_path: Path,
 ) -> None:
     """Without a ``.gitignore`` the gitignore-derived exclusion is a no-op:
-    a single repo-shaped missing candidate still escalates, preserving the
-    pre-#1343 positive behavior."""
+    a single repo-shaped missing candidate abstains without a fleet registry
+    (positive-evidence redesign, #1756-#1758) rather than escalating on
+    shape alone."""
     (tmp_path / "src" / "charlie_work").mkdir(parents=True)
 
     body = "The bug is in `src/charlie_work/nonexistent.py`."
     result = cross_repo_gate(body, tmp_path)
-    assert not result.passed
-    assert "cross_repo_target" in result.reason
+    assert result.passed
+    assert "abstaining" in result.reason
 
 
 # --- issue #1391: glob metacharacters and launcher-owned worktree paths -------
@@ -435,8 +492,9 @@ def test_issue_1391_devin_alongside_real_missing_path_keeps_real_path(
     tmp_path: Path,
 ) -> None:
     """A ``.devin/`` candidate is dropped but a real missing repo-shaped path
-    in the same body survives and still escalates — the launcher-owned filter
-    does not suppress genuine cross-repo evidence."""
+    in the same body survives classification — the launcher-owned filter does
+    not suppress genuine evidence. Without a fleet registry it abstains
+    (positive-evidence redesign, #1756-#1758) rather than escalating."""
     (tmp_path / "src" / "charlie_work").mkdir(parents=True)
 
     body = (
@@ -446,5 +504,5 @@ def test_issue_1391_devin_alongside_real_missing_path_keeps_real_path(
     assert paths == ["src/charlie_work/nonexistent.py"]
 
     result = cross_repo_gate(body, tmp_path)
-    assert not result.passed
-    assert "cross_repo_target" in result.reason
+    assert result.passed
+    assert "abstaining" in result.reason

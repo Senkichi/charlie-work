@@ -20,14 +20,13 @@ The gate is conservative by design:
   cross-repo target).
 - An issue where **at least one** referenced path exists in the repo passes
   (the worker has something to work on here).
-- An issue with **exactly one** referenced path, that path missing, and the
-  path not shaped like a reference to this repo (not a relative path whose
-  first segment names a real top-level directory here) also passes — a
-  single ambiguous fragment pulled out of prose is weak evidence on its own,
-  and escalating on it wastes a human triage action for no reason.
-- Otherwise — every referenced path is missing, and either there are
-  multiple such paths or the sole path is repo-shaped-but-missing — the
-  issue is blocked.
+- Otherwise — every referenced path is missing from this repo — the gate
+  requires *positive* evidence of a sibling repo before escalating (see
+  "Positive-evidence redesign" below) rather than treating bare absence as
+  proof of a cross-repo target: found under exactly one *other* managed
+  fleet repo's root -> escalate; found under zero or 2+ sibling repos ->
+  abstain, the same "no evidence either way" outcome as an issue with no
+  referenced paths at all.
 
 Escalating to ``human-needed`` is a safe failure mode: a human can re-label
 the issue after confirming the target repo, so a false positive costs one
@@ -90,6 +89,50 @@ production:
   leading-``/`` candidate cited standalone (or one whose resolved form is
   genuinely missing) still escalates as before.
 
+Positive-evidence redesign (issues #1756, #1757, #1758; design doc
+"cross_repo_gate: root cause, precision audit, and redesign
+recommendation", Option B): a 2026-09-21 precision audit found 0 confirmed
+true positives across 29 firings (24 unique issues, all 5 managed repos,
+all-time) — every measured escalation was a false positive, each one a
+plain-absence misfire (a newline-corrupted candidate, a module-relative
+citation missing only a path prefix, or a citation of a file the issue
+itself is about to create). The root defect: "this repo's filesystem
+doesn't recognize a candidate" was being read as "the candidate belongs to
+a different repo," but absence here is not by itself evidence of presence
+*anywhere in particular* — it is equally consistent with a corrupted
+string, a not-yet-created file, or a citation this repo's tree simply
+doesn't have.
+
+Escalation now requires positive sibling-repo evidence instead of bare
+absence: once every survivor is missing from this repo, each missing
+survivor is checked against every *other* managed fleet repo's root
+(:func:`charlie_work.fleet_registry.managed_repo_roots` — never a
+hardcoded repo list) via :func:`_find_owning_repo`. Found under exactly
+one sibling repo escalates, with that repo's name recorded on
+``CrossRepoGateResult.found_in_repo``. Found under zero or 2+ sibling
+repos abstains — which subsumes the corrupted-candidate (#1756) and
+issue-authored-new-file (#1758) cases for free: both degrade to "not
+found anywhere in the fleet" without any new prose-parsing heuristic,
+exactly the way this module already collapses distinguishable-in-theory
+cases into one bucket wherever the distinction carries no decision-layer
+weight. (#1757's own module-relative *same-repo* fallback for
+``_path_exists_in_repo`` — resolving ``schemas/coach.py`` against the real,
+more deeply nested ``server/src/swole/schemas/coach.py`` in the *same*
+repo — is a related but separate fix tracked on that issue and not
+implemented here; this module's contribution toward it is the shared
+segment-boundary suffix-match helper, :func:`_segment_boundary_suffix_match`,
+used today by :func:`_find_owning_repo` and written so #1757's fix can
+reuse it rather than duplicate the segment-boundary logic.)
+
+Also added as cheap defense-in-depth: a candidate containing *any* embedded
+whitespace (not just runs of 2+, issue #1756's own narrower proposal) is
+dropped at extraction, alongside the existing glob/placeholder/launcher-owned
+filters. This closes #1756's newline-corrupted-candidate shape and a
+related single-space multi-path-in-one-backtick-span shape found live in cw
+issue #1518's body (`` `tests/a.py tests/b.py` `` extracting as one
+corrupted candidate containing an embedded space, which a "2+ whitespace"
+filter alone would not catch).
+
 All of these shapes are classified **neutral**: excluded from the pass/escalate
 decision and reported separately (``CrossRepoGateResult.neutral_paths``)
 rather than folded into ``referenced_paths``/``missing_paths``. When every
@@ -102,7 +145,9 @@ existing pass/escalate rule above applies to the survivors unchanged.
 
 from __future__ import annotations
 
+import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -169,6 +214,16 @@ _DOMAIN_PATH = r"\b(?:[\w-]+\.)+[a-zA-Z]{2,24}/[^\s|`)\]]*"
 #     letters, a dash, then a literal capital ``N`` standing in for an
 #     unknown number.
 _PLACEHOLDER_SEGMENT = re.compile(r"^(?:[A-Za-z]+-N|.*[<>].*)$")
+
+# Embedded whitespace of any width (issue #1756, and the single-space
+# shape found live in cw #1518, ``_TICK_PATH`` capturing
+# `` `tests/a.py tests/b.py` `` as one corrupted candidate): no real
+# relative or absolute file path contains a space, tab, or line break. This
+# is deliberately wider than #1756's own proposed "\r, \n, or 2+ whitespace"
+# filter — a single embedded space is not "2+ whitespace" and would slip
+# that narrower version, but is exactly the same class of corrupted,
+# can-never-exist candidate.
+_EMBEDDED_WHITESPACE_RE = re.compile(r"\s")
 
 # Glob metacharacters: ``*``, ``?``, ``[``, ``]``. A candidate containing any
 # of these is a glob pattern, not a literal file path — no file literally
@@ -432,6 +487,13 @@ class CrossRepoGateResult:
             and from the pass/escalate decision entirely. Reported
             separately for observability, not because it drives any
             downstream behavior today.
+        found_in_repo: when ``passed`` is ``False``, the name of the single
+            other managed fleet repo under whose root a missing survivor was
+            positively found (issues #1756, #1757, #1758 -- the
+            positive-evidence redesign; see the module docstring). ``None``
+            when the gate passed, or when it was constructed by
+            :func:`cross_repo_scope_gate` (which has no notion of a missing
+            path's owning repo).
     """
 
     passed: bool
@@ -439,6 +501,7 @@ class CrossRepoGateResult:
     missing_paths: tuple[str, ...]
     reason: str
     neutral_paths: tuple[str, ...] = ()
+    found_in_repo: str | None = None
 
 
 def extract_referenced_paths(issue_body: str) -> list[str]:
@@ -458,6 +521,12 @@ def extract_referenced_paths(issue_body: str) -> list[str]:
     ``pr-N``, ``issue-N``, ``<...>``) are dropped — a template stand-in can
     never name a real file, so a templated documentation path in an issue
     body cannot fire the gate (issue #1343).
+
+    Candidates containing embedded whitespace of any width (a space, tab, or
+    line break) are dropped — no real file path contains one, so a
+    whitespace-corrupted candidate (a hard-wrapped backtick-quoted path, or
+    two paths cited together in one backtick span separated by a single
+    space) can never exist and would false-positive the gate (issue #1756).
 
     Candidates containing glob metacharacters (``*``, ``?``, ``[``, ``]``)
     are dropped — a glob pattern is not a literal file path, and no file
@@ -503,6 +572,14 @@ def _iter_candidate_matches(issue_body: str) -> tuple[list[tuple[str, int, int]]
         # The regex has four alternation groups; pick the one that matched.
         raw = next((g for g in match.groups() if g is not None), "")
         if not raw:
+            continue
+        # Drop whitespace-corrupted candidates: a real path never contains a
+        # space, tab, or line break. Catches both a hard-wrapped
+        # backtick-quoted path (embedded \r\n, issue #1756) and a
+        # single-space multi-path span in one backtick pair (cw #1518) —
+        # deliberately wider than a "2+ whitespace" filter, which the
+        # single-space shape would slip.
+        if _EMBEDDED_WHITESPACE_RE.search(raw):
             continue
         # Drop templated/placeholder paths: a segment like ``pr-N`` or
         # ``<state-dir>`` is documentation template text, not a real file
@@ -573,60 +650,6 @@ def _path_exists_in_repo(path_str: str, repo_root: Path) -> bool:
         return False
 
 
-def _top_level_dirs(repo_root: Path) -> set[str]:
-    """Return the names of ``repo_root``'s immediate subdirectories.
-
-    Derived dynamically from the live filesystem — never a hardcoded list —
-    so the "is this a real repo-relative path" check tracks the repo's
-    actual structure.
-    """
-    try:
-        return {entry.name for entry in repo_root.iterdir() if entry.is_dir()}
-    except OSError:
-        return set()
-
-
-def _gitignored_top_level_names(repo_root: Path) -> set[str]:
-    """Return top-level names ignored by the repo's ``.gitignore``.
-
-    Derived from the repo's ``.gitignore`` — never a hardcoded name list —
-    so the "repo-shaped" exclusion tracks the repo's actual ignore policy
-    rather than a brittle hand-maintained set.  Issue #1343: the runtime
-    state dir (``.var``) is a real top-level directory in the checkout but
-    is gitignored; a templated documentation path keyed on its name must
-    not count as "repo-shaped" evidence.
-
-    Only simple literal patterns are collected — a bare ``name`` or
-    ``name/`` line with no nested slash, no wildcard, and no negation.
-    Complex patterns (globs, negations, nested paths) are left to git
-    itself and do not participate in this exclusion; they cannot name a
-    single top-level directory unambiguously, and over-collecting them
-    would risk excluding a real tracked directory.
-    """
-    gitignore = repo_root / ".gitignore"
-    if not gitignore.is_file():
-        return set()
-    ignored: set[str] = set()
-    try:
-        text = gitignore.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return set()
-    for line in text.splitlines():
-        pattern = line.strip()
-        if not pattern or pattern.startswith("#") or pattern.startswith("!"):
-            continue
-        # Drop a trailing slash (directory marker); the bare name is what
-        # would appear as the first segment of a relative path.
-        name = pattern.rstrip("/")
-        # Only collect simple literal top-level names: no slash (nested
-        # patterns do not name a top-level dir), no wildcard/bracket sets
-        # (they cannot name a single directory unambiguously).
-        if "/" in name or "*" in name or "?" in name or "[" in name:
-            continue
-        ignored.add(name)
-    return ignored
-
-
 def _is_absolute_path(candidate: str) -> bool:
     """Return ``True`` when ``candidate`` is absolute, on any host platform.
 
@@ -635,48 +658,132 @@ def _is_absolute_path(candidate: str) -> bool:
     absolute when it carries a drive letter, so a POSIX-style absolute path
     like ``/home/user/other-repo/foo.py`` reports ``is_absolute() is False``.
     Left unguarded, that misclassifies a genuinely absolute (and genuinely
-    outside-the-repo) candidate as "relative", which would let it reach the
-    repo-shape check, fail it (its "first segment" is the empty string
-    before the leading slash), and incorrectly abstain instead of escalate.
-    A leading path separator is unambiguously absolute regardless of host
-    platform, so it is treated as absolute here even where ``Path.is_absolute``
-    disagrees.
+    outside-the-repo) candidate as "relative", which would let
+    :func:`_resolve_within_root` join it onto a repo root instead of
+    containment-checking it directly. A leading path separator is
+    unambiguously absolute regardless of host platform, so it is treated as
+    absolute here even where ``Path.is_absolute`` disagrees.
     """
     return Path(candidate).is_absolute() or bool(re.match(r"[\\/]", candidate))
 
 
-def _is_repo_shaped_relative_candidate(candidate: str, repo_root: Path) -> bool:
-    """Return ``True`` when ``candidate`` is a *relative* path whose first
-    path segment names a directory that actually exists in ``repo_root`` and
-    is not gitignored.
+def _resolve_within_root(root: Path, path_str: str) -> Path | None:
+    """Return ``path_str`` resolved against ``root``, or ``None`` when it
+    would not resolve to a path inside ``root``.
 
-    Absolute candidates are never repo-shaped by this definition — callers
-    that need to keep escalating on a missing absolute path must check
-    ``_is_absolute_path(candidate)`` themselves before consulting this
-    function (see the single-candidate exception in :func:`cross_repo_gate`).
-
-    This is the shape test that distinguishes a genuine (but missing)
-    repo-relative reference like ``src/charlie_work/nonexistent.py`` (first
-    segment ``src`` is a real top-level directory) from an unrelated
-    relative-looking token like ``Scripts/charlie.exe`` (first segment
-    ``Scripts`` names no directory in this repo — it is a venv path, not a
-    reference to this repo's code).
-
-    A real top-level directory that is *gitignored* (the runtime state dir,
-    a venv, build artifacts) does not count as repo-shaped evidence: a path
-    keyed on such a name is typically a templated documentation path (e.g. a
-    runtime-state example), not a reference to this repo's tracked code
-    (issue #1343).  The exclusion is derived from the repo's ``.gitignore``,
-    not a hardcoded name list, so it tracks the repo's actual ignore policy.
+    Handles both relative candidates (joined onto ``root``, then
+    containment-checked so a ``..`` segment walking out of ``root`` is
+    caught) and absolute candidates (containment-checked directly, never
+    joined — joining an absolute-looking string onto a base path is
+    unreliable across platforms). Resolution and containment happen before
+    any ``exists()`` check, so a traversal or absolute candidate can never
+    be reported as "owned" by a root it does not actually resolve into,
+    even if the resolved location happens to exist somewhere else on disk
+    (:func:`charlie_work.safe_path.contains` resolves both sides, catching
+    a lexically-contained-looking path that a symlink/junction or a ``..``
+    collapse actually escapes).
     """
-    if _is_absolute_path(candidate):
-        return False
-    first_segment = re.split(r"[\\/]+", candidate, maxsplit=1)[0]
-    if first_segment not in _top_level_dirs(repo_root):
-        return False
-    if first_segment in _gitignored_top_level_names(repo_root):
-        return False
-    return True
+    path = Path(path_str)
+    if _is_absolute_path(path_str):
+        candidate = path
+    else:
+        candidate = root / path
+    try:
+        if contains(root, candidate):
+            return candidate
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _all_repo_files(repo_root: Path) -> list[str]:
+    """Return every file under ``repo_root``, POSIX-separated and relative.
+
+    Derived fresh from the live filesystem — never cached across calls —
+    mirroring the rest of this module's "ask the filesystem, don't
+    hand-maintain a list" convention. ``.git`` is pruned during the walk
+    (not filtered afterward) so a large history does not slow down every
+    lookup; a real source file is never inside ``.git``. Best-effort: an
+    ``OSError`` mid-walk (a repo root that vanishes concurrently) returns
+    whatever was collected so far rather than raising, matching
+    ``_top_level_dirs``'s historical "empty/partial on error" contract.
+    """
+    files: list[str] = []
+    try:
+        for dirpath, dirnames, filenames in os.walk(repo_root):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
+            for filename in filenames:
+                rel = Path(dirpath, filename).relative_to(repo_root).as_posix()
+                files.append(rel)
+    except OSError:
+        return files
+    return files
+
+
+def _segment_boundary_suffix_match(candidate: str, files: list[str]) -> str | None:
+    """Return the single file in ``files`` whose path ends with ``candidate``
+    on a path-segment boundary, or ``None`` when zero or 2+ files match.
+
+    ``files`` are ``repo_root``-relative, POSIX-separated paths (see
+    :func:`_all_repo_files`). A segment-boundary suffix match requires the
+    match to start either at the beginning of the file's path or
+    immediately after a ``/`` — a raw string suffix would wrongly match
+    ``"ngs/coach.py"`` inside ``".../settings/coach.py"`` (issue #1757).
+    Ambiguous suffixes (2+ files share one) are treated the same as no
+    match at all: this module's existing conservative default for anything
+    ambiguous (see the shorthand and evidence-marker classifiers) is to
+    fall back to "not resolved" rather than silently pick one.
+
+    Standalone — takes no ``repo_root`` and does no filesystem I/O itself —
+    so it is shared as-is between :func:`_find_owning_repo`'s cross-repo
+    check here and issue #1757's own planned same-repo nested-module
+    fallback for :func:`_path_exists_in_repo`, rather than each
+    reimplementing the segment-boundary comparison.
+    """
+    candidate_posix = candidate.replace("\\", "/").lstrip("/")
+    if not candidate_posix:
+        return None
+    matches = {f for f in files if f == candidate_posix or f.endswith("/" + candidate_posix)}
+    if len(matches) == 1:
+        return next(iter(matches))
+    return None
+
+
+def _find_owning_repo(
+    path_str: str, managed_roots: Mapping[str, Path], exclude: str
+) -> str | None:
+    """Return the name of the single *other* managed repo that owns ``path_str``.
+
+    Checks ``path_str`` against every repo in ``managed_roots`` except
+    ``exclude`` (the dispatching repo itself), both as a literal
+    repo-root-relative/absolute path (via :func:`_resolve_within_root`,
+    which containment-checks before any ``exists()`` call — a ``..``
+    traversal or an absolute path can never be reported as resolving into a
+    root it does not actually resolve into) and, when that misses, via
+    :func:`_segment_boundary_suffix_match` against that repo's full file
+    listing — the module-relative-citation shape from issues #1757/#1758
+    (``shared/.../SettingsRepository.kt`` citing the real, more deeply
+    nested ``swole/app/mobile/.../SettingsRepository.kt``).
+
+    Returns the owning repo's name when exactly one *other* managed repo
+    matches; ``None`` when zero or 2+ repos match. Ambiguous ownership is
+    not escalation evidence — the same conservative "abstain rather than
+    guess" default this module already uses for ambiguous suffix and
+    shorthand resolutions.
+    """
+    owners: set[str] = set()
+    for repo_name, root in managed_roots.items():
+        if repo_name == exclude:
+            continue
+        resolved = _resolve_within_root(root, path_str)
+        if resolved is not None and resolved.exists():
+            owners.add(repo_name)
+            continue
+        if _segment_boundary_suffix_match(path_str, _all_repo_files(root)) is not None:
+            owners.add(repo_name)
+    if len(owners) == 1:
+        return next(iter(owners))
+    return None
 
 
 def _paragraph_span(text: str, start: int, end: int) -> tuple[str, str]:
@@ -777,14 +884,23 @@ def _split_survivors_and_neutral(
     return survivors, neutral
 
 
-def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
+def cross_repo_gate(
+    issue_body: str,
+    repo_root: Path,
+    managed_repo_roots: Mapping[str, Path] | None = None,
+    dispatching_repo_name: str = "",
+) -> CrossRepoGateResult:
     """Decide whether an issue should be dispatched or escalated as cross-repo.
 
     Returns a :class:`CrossRepoGateResult` with ``passed=True`` when the issue
-    is safe to dispatch (it references no file paths, or at least one
-    referenced path exists in ``repo_root``), and ``passed=False`` when every
-    referenced path is missing from ``repo_root`` — the signal that the
-    issue's subject code lives in a different repo.
+    is safe to dispatch (it references no file paths, at least one referenced
+    path exists in ``repo_root``, or no missing path is positively found
+    under exactly one other managed repo), and ``passed=False`` when every
+    referenced path is missing from ``repo_root`` *and* at least one of them
+    is found under exactly one other managed fleet repo — positive evidence
+    that the issue's subject code lives there instead (see the module
+    docstring's "Positive-evidence redesign" section, issues #1756, #1757,
+    #1758).
 
     Before the pass/escalate decision runs, extracted candidates are split
     into survivors and neutral candidates (see the module docstring and
@@ -794,16 +910,18 @@ def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
     abstains the same way it would for an issue with no candidates at all.
     The rules below then apply to the survivors.
 
-    A single-candidate exception applies: when exactly one survivor remains
-    and it is missing, the gate abstains (``passed=True``) unless that
-    candidate is a relative path whose first segment names a directory that
-    actually exists in ``repo_root`` (see
-    :func:`_is_repo_shaped_relative_candidate`). One ambiguous fragment
-    pulled out of prose (a venv-relative path, a config key, anything that
-    merely *looks* path-shaped) is weak evidence of a cross-repo target on
-    its own — escalating on it wastes a human triage action for no reason.
-    An absolute path resolving outside the repo is not ambiguous in the same
-    way and keeps escalating regardless of this exception.
+    ``managed_repo_roots`` (repo name -> repo root, from
+    :func:`charlie_work.fleet_registry.managed_repo_roots`) and
+    ``dispatching_repo_name`` (this repo's own name, excluded from the
+    search) default to an empty mapping and the empty string — "no fleet
+    information available" — which can only ever *abstain* on the
+    every-survivor-missing branch, never escalate: escalation requires
+    positive sibling-repo evidence that only a real registry lookup can
+    provide, so a caller that has not been wired to pass these two
+    (tracked separately: this gate's own decision rule vs. threading the
+    fleet registry through each call site) gets the strictly safer
+    "abstain when we don't know" behavior rather than a crash or the old,
+    imprecise "escalate on bare absence" rule.
     """
     referenced = extract_referenced_paths(issue_body)
     if not referenced:
@@ -831,12 +949,14 @@ def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
             ),
             neutral_paths=tuple(neutral),
         )
-    missing = tuple(
-        raw for raw, effective in survivors if not _path_exists_in_repo(effective, repo_root)
-    )
-    # Block only when EVERY surviving path is absent — the issue's subject
-    # code is not in this repo at all.  If even one survivor exists, the
-    # worker has something to work on here and the gate passes.
+    missing_pairs = [
+        (raw, effective)
+        for raw, effective in survivors
+        if not _path_exists_in_repo(effective, repo_root)
+    ]
+    missing = tuple(raw for raw, _ in missing_pairs)
+    # Pass when at least one survivor exists here — the worker has something
+    # to work on in this repo regardless of what else is missing.
     if len(missing) < len(survivors):
         return CrossRepoGateResult(
             passed=True,
@@ -845,39 +965,44 @@ def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
             reason="at least one referenced path exists in the target repo",
             neutral_paths=tuple(neutral),
         )
-    # NOTE: absoluteness is checked via ``_is_absolute_path``, not a bare
-    # ``Path(...).is_absolute()`` — the latter is platform-dependent (a
-    # POSIX-style absolute path is not "absolute" under Windows' drive-letter
-    # rule) and would let a genuinely-absolute, outside-the-repo candidate
-    # slip through as "relative" and incorrectly abstain. See
-    # ``_is_absolute_path`` for the full rationale.
-    if (
-        len(survivors) == 1
-        and not _is_absolute_path(survivors[0][1])
-        and not _is_repo_shaped_relative_candidate(survivors[0][1], repo_root)
-    ):
+    # Every surviving path is missing from THIS repo. That alone is not
+    # evidence of a cross-repo target (see "Positive-evidence redesign" in
+    # the module docstring) — it is equally consistent with a corrupted
+    # candidate, a citation of a file this issue is about to create, or a
+    # citation this fleet has never seen anywhere. Escalate only when a
+    # missing survivor is positively found under exactly one *other*
+    # managed repo's root.
+    found_in_repo: str | None = None
+    if managed_repo_roots:
+        for raw, effective in missing_pairs:
+            owner = _find_owning_repo(effective, managed_repo_roots, dispatching_repo_name)
+            if owner is not None:
+                found_in_repo = owner
+                break
+    if found_in_repo is None:
         return CrossRepoGateResult(
             passed=True,
-            referenced_paths=(survivors[0][0],),
+            referenced_paths=tuple(raw for raw, _ in survivors),
             missing_paths=missing,
             reason=(
-                "single ambiguous candidate "
-                f"({survivors[0][0]!r}) is not a repo-shaped relative path — "
-                "abstaining rather than escalating on weak evidence"
+                f"abstaining: {len(missing)} referenced file path(s) are "
+                "absent from this repo and were not found under exactly one "
+                "other managed fleet repo — not positive evidence of a "
+                "cross-repo target"
             ),
             neutral_paths=tuple(neutral),
         )
-    # Every surviving path is missing — the issue's subject code is not in
-    # this repo.  Escalate instead of dispatching a worker that will wander.
     return CrossRepoGateResult(
         passed=False,
         referenced_paths=tuple(raw for raw, _ in survivors),
         missing_paths=missing,
         reason=(
-            f"cross_repo_target: all {len(missing)} referenced file path(s) "
-            f"are absent from the target repo ({repo_root})"
+            f"cross_repo_target: a referenced file path is absent from the "
+            f"target repo ({repo_root}) but found under exactly one other "
+            f"managed fleet repo ({found_in_repo!r})"
         ),
         neutral_paths=tuple(neutral),
+        found_in_repo=found_in_repo,
     )
 
 

@@ -529,6 +529,17 @@ def count_fleet_runners(
     return total_runners, total_busy_runners, skipped_repos
 
 
+def _repo_name_segment(name_with_owner: str) -> str:
+    """Return the repo-name segment of an ``owner/repo`` registry key.
+
+    Shared by :func:`managed_repo_names` and :func:`managed_repo_roots` so
+    the two functions extract a repo's name identically by construction —
+    a repo present in one is keyed the same way in the other.
+    """
+    parts = str(name_with_owner).rsplit("/", 1)
+    return parts[1] if len(parts) == 2 else str(name_with_owner)
+
+
 def managed_repo_names(fleet_dir_override: str | None) -> frozenset[str]:
     """Return the set of repo names managed by the fleet.
 
@@ -547,12 +558,33 @@ def managed_repo_names(fleet_dir_override: str | None) -> frozenset[str]:
     fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     data = _load_registry(fleet_json_path)
     repos = data.get("repos", {})
-    names: set[str] = set()
-    for name_with_owner in repos:
-        # name_with_owner is "owner/repo" — extract the repo name segment.
-        parts = str(name_with_owner).rsplit("/", 1)
-        if len(parts) == 2:
-            names.add(parts[1])
-        else:
-            names.add(str(name_with_owner))
-    return frozenset(names)
+    return frozenset(_repo_name_segment(name) for name in repos)
+
+
+def managed_repo_roots(fleet_dir_override: str | None) -> dict[str, Path]:
+    """Return ``{repo_name: repo_root}`` for every repo managed by the fleet.
+
+    Mirrors :func:`managed_repo_names`'s name extraction (the shared
+    ``_repo_name_segment`` helper) but keeps each entry's ``repo_root``
+    alongside its name — the cross-repo gate's positive-evidence check
+    (issues #1757, #1758) needs to check a missing path's existence under a
+    *sibling* repo's actual filesystem root, not just know that the
+    sibling's name is managed.
+
+    Derived from the fleet registry on disk — never a hardcoded list — so
+    it tracks the fleet's actual managed repos exactly like
+    ``managed_repo_names`` does. An entry with no recorded ``repo_root``
+    (should not happen in practice — ``touch_repo`` always writes one) is
+    skipped rather than mapping the name to a placeholder path that could
+    spuriously "contain" every relative candidate.
+    """
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
+    data = _load_registry(fleet_json_path)
+    repos = data.get("repos", {})
+    roots: dict[str, Path] = {}
+    for name_with_owner, entry in repos.items():
+        repo_root_str = entry.get("repo_root")
+        if not repo_root_str:
+            continue
+        roots[_repo_name_segment(name_with_owner)] = Path(repo_root_str)
+    return roots
