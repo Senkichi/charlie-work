@@ -67,8 +67,11 @@ _PRE_CAMPAIGN_MEMBER_SURFACE = 133
 # - ``_still_valid_recorded_verdict`` (issue #1765): the shared predicate
 #   factored out of ``review_verdict_guard`` so ``unescalate`` can also
 #   detect (and void) a still-valid terminal verdict before re-arming a PR.
+# - ``_record_unlinked_pr_skips`` (issue #1766): batches the edge-triggered
+#   ``pr_unlinked_skipped`` notice for issue-less PRs the merge lane skips,
+#   installed from the new ``orchestration/github_ops_unlinked_prs.py`` leaf.
 _POST_CAMPAIGN_SURFACE_ADDITIONS = frozenset(
-    {"review_verdict_guard", "_still_valid_recorded_verdict"}
+    {"review_verdict_guard", "_still_valid_recorded_verdict", "_record_unlinked_pr_skips"}
 )
 
 
