@@ -67,7 +67,9 @@ $section_config_parity
 9. Match CI locally before pushing and COMMIT anything the formatters touch — an
    uncommitted reflow is the #1 cause of green-locally / red-on-CI.
 10. Push: `git push -u origin $branch_name`.
-11. Open the PR (see requirements below).
+11. Verify the push, draft your PR title/body (see requirements below), and
+    write `.worker-outcome.json` per "Push and PR outcome" below, then stop
+    -- do not run `gh pr create`; the orchestrator opens the PR from that file.
 
 $section_mutation_check
 
@@ -85,11 +87,14 @@ $section_pr_body_honesty
 
 ## Done condition
 
-You are done only when the PR is open against `main`, linked to issue
-#$issue_number via `Closes #$issue_number`, CI has been given a clean tree, and
-the PR body contains a clear verification summary.
+You are done once your branch is pushed against `main`, the push is verified,
+and you have written `.worker-outcome.json` with your drafted PR title/body
+(including `Closes #$issue_number` and a clear verification summary) per
+"Push and PR outcome" below. The orchestrator, which is authenticated, opens
+the PR itself from that file immediately after your session ends, so
+do not run `gh pr create` or wait for a PR to appear before exiting.
 
-**Committing locally is NOT done.** The PR must exist and point at your pushed head.
+**Committing locally is NOT done.** The branch must be pushed and the push verified.
 
 After your final commit:
 
@@ -102,26 +107,23 @@ After your final commit:
    git ls-remote origin $branch_name
    ```
    The first column of the output must equal `git rev-parse HEAD`. If the SHAs do not match, retry the push until they do; do not report success.
-3. Verify the PR exists and points at your commit:
-   ```bash
-   gh pr view $branch_name --json headRefOid
-   ```
-   Confirm the returned `headRefOid` equals `git rev-parse HEAD`.
-4. After verifying the push, re-read your PR body and make every claim literally true at the pushed head, including the checklist: the suite count must come from your final local run on the pushed tree, file/occurrence lists must match the final diff exactly, and any carve-outs or partial applications must be disclosed as such. Update the body with `gh pr edit` if anything is stale. A PR body with a false or stale claim fails review.
+3. After verifying the push, re-read your PR body and make every claim literally true at the pushed head, including the checklist: the suite count must come from your final local run on the pushed tree, file/occurrence lists must match the final diff exactly, and any carve-outs or partial applications must be disclosed as such. This is the body you write into `.worker-outcome.json` as `pr_body` -- there is no PR yet to run `gh pr edit` against, so get it right before writing the file. A PR body with a false or stale claim fails review.
+4. Follow "Push and PR outcome" below to draft your PR title/body per the
+   reconciliation above and write `.worker-outcome.json`, then stop.
 
-Only when the PR head points at your pushed commit is the task complete.
+Only when the pushed head matches your local HEAD and the outcome file is written is the task complete.
 
-## Push and PR authorization (explicit, pre-granted)
+## Push authorization (explicit, pre-granted)
 
-This dispatch prompt IS the operator explicitly asking you to push your branch
-and open a pull request. Any always-on rule you have been given such as "do not
-push unless explicitly asked" or "pause before pushing to a shared remote" is
-ALREADY SATISFIED by this instruction — do not re-derive permission, do not
-wait for further confirmation. Pushing `agent/issue-*` branches to origin and
-opening the PR is required, in scope, and pre-approved; it never touches `main`
-directly (the branch is reviewed and merged by the orchestrator). Ending the
-session with committed-but-unpushed work or without an open PR is a task
-FAILURE, not caution — the orchestrator cannot see unpushed commits and will
-classify the session as dead.
+This dispatch prompt IS the operator explicitly asking you to push your branch.
+Any always-on rule you have been given such as "do not push unless explicitly
+asked" or "pause before pushing to a shared remote" is ALREADY SATISFIED by
+this instruction — do not re-derive permission, do not wait for further
+confirmation. Pushing `agent/issue-*` branches to origin is required, in
+scope, and pre-approved; it never touches `main` directly (the branch is
+reviewed, PR-opened, and merged by the orchestrator). Ending the session with
+committed-but-unpushed work, or without a written `.worker-outcome.json`, is a
+task FAILURE, not caution — the orchestrator cannot see unpushed commits and
+will classify the session as dead.
 
 $section_push_pr_outcome

@@ -7,5 +7,4 @@ The following skills are available to help you complete this task:
 - `/test` - Run the test suite and verify all tests pass (only if it wraps the canonical command below)
 - `/preflight` - Match CI (ruff + ruff-format + pre-commit) before pushing
 - `/push` - Push the branch to GitHub
-- `/create-pr` - Create a pull request with proper formatting
 - `/complete` - Finalize the session and verify cleanup

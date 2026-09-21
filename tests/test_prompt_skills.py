@@ -80,16 +80,20 @@ def _override_declaration(root: Path, body: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_declared_skills_are_the_seven_loop_skills_in_order() -> None:
+def test_declared_skills_are_the_six_loop_skills_in_order() -> None:
     """Positive control: the bullet parser finds exactly what the overlay lists, so an
-    empty tuple elsewhere is a verdict on the repo and not on a broken parser."""
+    empty tuple elsewhere is a verdict on the repo and not on a broken parser.
+
+    cw#1771: ``create-pr`` was dropped from the declaration -- workers never open
+    the PR themselves (see ``push_pr_outcome.md``), so a skill for it is never
+    provisioned or needed.
+    """
     assert declared_skills() == (
         "create-branch",
         "commit",
         "test",
         "preflight",
         "push",
-        "create-pr",
         "complete",
     )
 
@@ -260,7 +264,7 @@ def test_declaration_is_derived_so_a_repo_local_one_changes_the_requirement(
     _ship(repo, ".devin/skills", ("only-one",))
 
     assert active_prompt_variants(DEVIN, repo, (prompt_dir,)) == (SKILLS_VARIANT,)
-    # The same repo does not satisfy the package's seven-skill declaration.
+    # The same repo does not satisfy the package's own (six-skill) declaration.
     assert active_prompt_variants(DEVIN, repo) == ()
 
 

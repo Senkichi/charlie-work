@@ -5,6 +5,9 @@
    they fix — an uncommitted reflow or an un-normalized fixture is the #1 cause of a
    green-locally / red-on-CI PR, and the push/PR gate will block you on it.
 10. Push your branch: `git push -u origin $branch_name`.
-11. Open the pull request with `gh pr create` (see PR requirements below).
+11. Verify the push, draft your PR title/body (see PR requirements below), and write
+    `.worker-outcome.json` per "Push and PR outcome" below -- do not run `gh pr create`;
+    the orchestrator opens the PR from that file.
 12. Finalize: confirm the working tree is clean (`git status --short`), the branch is
-    pushed (`git branch -vv`), and the PR exists (`gh pr list --head $branch_name`).
+    pushed (`git branch -vv`), and `.worker-outcome.json` exists. Then stop -- do not
+    wait for a PR to appear.

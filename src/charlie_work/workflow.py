@@ -2535,6 +2535,10 @@ def _detect_and_handle_orphaned_workers(
                         issue_labels=details.get("issue_labels", set()),
                         issue_title=(details.get("issue") or {}).get("title"),
                         state_file=state_file,
+                        # cw#1771: prefer the worker's own drafted PR title/body
+                        # (pre-computed above alongside this candidate) over the
+                        # orchestrator's "Salvaged work for #N" synthesis.
+                        worker_outcome=candidate.get("worker_outcome"),
                     )
                     if pr_number is not None:
                         entry["status"] = PASSIVE_OPEN_STATUS

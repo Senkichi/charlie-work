@@ -162,7 +162,12 @@ def test_extra_style_rework_names_preflight(tmp_path: Path) -> None:
 
 
 def test_skills_loop_step_text_is_intact_for_a_skills_consumer(tmp_path: Path) -> None:
-    """Steps 1 and 8-12 read exactly as they did before the loop became conditional."""
+    """Steps 1 and 8-12 read exactly as they did before the loop became conditional.
+
+    cw#1771: step 11 no longer calls a PR-creation skill -- workers draft
+    their PR content into `.worker-outcome.json` and stop; the orchestrator
+    opens the PR. See ``push_pr_outcome.md``'s DEFAULT contract.
+    """
     worker = _render(tmp_path, _shape("extra-style")).worker
 
     assert "8. Use `/commit` to commit your changes with conventional format.\n" in worker
@@ -171,9 +176,12 @@ def test_skills_loop_step_text_is_intact_for_a_skills_consumer(tmp_path: Path) -
         "   fixes — an uncommitted reflow or an un-normalized fixture is the #1 cause of a\n"
         "   green-locally / red-on-CI PR, and the push/PR gate will block you on it.\n"
         "10. Use `/push` to push your branch to GitHub.\n"
-        "11. Use `/create-pr` to create a pull request with proper formatting.\n"
+        "11. Verify the push, draft your PR title/body (see PR requirements below), and write\n"
+        '    `.worker-outcome.json` per "Push and PR outcome" below -- do not create a pull\n'
+        "    request yourself; the orchestrator opens it from that file.\n"
         "12. Use `/complete` to finalize the session.\n"
     ) in worker
+    assert "/create-pr" not in worker
 
 
 def test_extra_style_keeps_the_dev_extra_command(tmp_path: Path) -> None:
@@ -206,13 +214,20 @@ def test_group_style_prompts_name_no_slash_skill(tmp_path: Path) -> None:
 
 
 def test_group_style_worker_carries_the_plain_git_gh_loop(tmp_path: Path) -> None:
+    """cw#1771: `gh pr create` survives only inside the "do not run" instruction.
+
+    This shape has no skills, so it renders `worker.md` plus the shared
+    (non-skills) `loop_finish_steps.md` and `push_pr_outcome.md` partials --
+    none of which tell the worker to actually invoke `gh pr create` anymore.
+    """
     worker = _render(tmp_path, _shape("group-style")).worker
 
     assert "git switch -c agent/issue-7-fix-x origin/main" in worker
     assert "git push -u origin agent/issue-7-fix-x" in worker
-    assert "gh pr create" in worker
+    assert "do not run `gh pr create`" in worker
     assert "git status --short" in worker
     assert "8. Commit your changes with a Conventional-Commits message" in worker
+    assert ".worker-outcome.json" in worker
 
 
 def test_group_style_rework_carries_the_plain_preflight(tmp_path: Path) -> None:

@@ -473,10 +473,21 @@ def _write_json_atomic(path: Path, value: Any) -> None:
 def read_worker_outcome(worktree_path: Path) -> dict[str, Any] | None:
     """Read a worker's structured outcome file if present and well-formed.
 
-    Workers write this file (per ``$section_push_pr_outcome``) when they
-    successfully push a branch but cannot open a PR because ``gh`` is
-    unauthenticated. The orchestrator reads it both from the worktree and,
-    when the terminal-status watcher copies it, from durable terminal status.
+    Workers write this file (per ``$section_push_pr_outcome``) once they have
+    pushed a branch and verified the push -- they never attempt ``gh pr
+    create`` themselves (issue #1771: it always fails, workers carry no
+    ``gh`` credential by design). The orchestrator reads it both from the
+    worktree and, when the terminal-status watcher copies it, from durable
+    terminal status.
+
+    In addition to ``push_succeeded``/``pr_created``/``error``, the dict may
+    carry the worker's own drafted ``pr_title``/``pr_body`` (issue #1771,
+    cw#1771's Option C step 1) -- the PR content the worker would have used
+    for ``gh pr create``. Both are optional strings; no parsing here treats
+    them specially, this function returns the whole dict unchanged. Callers
+    that open a PR from this outcome (``dead_worker_reap._open_salvage_pr``)
+    prefer these fields verbatim over their own synthesized title/body when
+    both are present and non-empty.
     """
     path = worktree_path / WORKER_OUTCOME_FILENAME
     if not path.is_file():

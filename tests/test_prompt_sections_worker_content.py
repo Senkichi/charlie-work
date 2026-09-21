@@ -175,33 +175,65 @@ def test_rework_prompt_includes_push_then_verify_final_step() -> None:
 
 
 def test_worker_prompt_includes_push_then_verify() -> None:
-    """Verify that the worker.md prompt includes push-then-verify in the Done condition."""
+    """Verify that the worker.md prompt includes push-then-verify in the Done condition.
+
+    cw#1771: the worker's done condition is push + verify + write the outcome
+    file -- it never runs ``gh pr view``/``gh pr create`` itself (issue #502:
+    workers carry no ``gh`` credential, so both always fail on auth). The
+    orchestrator opens the PR from ``.worker-outcome.json`` after the session
+    ends.
+    """
     prompt = _render_worker_with_sections("worker.md")
 
     # Verify the key instruction about local commits not being done
     assert "Committing locally is NOT done" in prompt
     # Verify the push instruction with resolved branch name
     assert "git push origin agent/issue-123-fix-search" in prompt
-    # Verify the PR head verification
-    assert "gh pr view agent/issue-123-fix-search --json headRefOid" in prompt
-    # Verify the comparison instruction
-    assert "headRefOid" in prompt
+    # Verify the push-verification instruction (ls-remote, not a PR-existence probe)
+    assert "git ls-remote origin agent/issue-123-fix-search" in prompt
     assert "git rev-parse HEAD" in prompt
+    # The done condition routes to the outcome-file contract instead of
+    # asking the worker to confirm a PR it never opens.
+    assert ".worker-outcome.json" in prompt
+    assert "gh pr view agent/issue-123-fix-search --json headRefOid" not in prompt
 
 
 def test_claude_code_worker_prompt_includes_push_then_verify() -> None:
-    """Verify that the worker_claude_code.md prompt includes push-then-verify in the Done condition."""
+    """Verify that the worker_claude_code.md prompt includes push-then-verify in the Done condition.
+
+    cw#1771: same contract as ``worker.md`` -- see that test's docstring.
+    """
     prompt = _render_worker_with_sections("worker_claude_code.md")
 
     # Verify the key instruction about local commits not being done
     assert "Committing locally is NOT done" in prompt
     # Verify the push instruction with resolved branch name
     assert "git push -u origin agent/issue-123-fix-search" in prompt
-    # Verify the PR head verification
-    assert "gh pr view agent/issue-123-fix-search --json headRefOid" in prompt
-    # Verify the comparison instruction
-    assert "headRefOid" in prompt
+    # Verify the push-verification instruction (ls-remote, not a PR-existence probe)
+    assert "git ls-remote origin agent/issue-123-fix-search" in prompt
     assert "git rev-parse HEAD" in prompt
+    assert ".worker-outcome.json" in prompt
+    assert "gh pr view agent/issue-123-fix-search --json headRefOid" not in prompt
+
+
+def test_worker_prompts_never_instruct_gh_pr_create() -> None:
+    """cw#1771: the DEFAULT worker contract is commit/push/verify/write-outcome-file/stop.
+
+    Workers carry no ``gh`` credential (issue #502), so ``gh pr create`` always
+    fails on auth; the old instruction to run it burned 2-4 wasted tool calls
+    on every single dispatch (measured 8/8 in the issue's session-log sample).
+    This must fail against the pre-fix templates, which told the worker to
+    "Open the pull request with `gh pr create`" as the very last loop step --
+    the rendered prompt only ever mentions `gh pr create` now inside the
+    explicit "do not run" instruction, never as something to do.
+    """
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "Open the pull request with `gh pr create`" not in prompt
+        assert "Open the PR (see requirements below)" not in prompt
+        assert "do not run `gh pr create`" in prompt
+        assert "pr_title" in prompt
+        assert "pr_body" in prompt
 
 
 def test_worker_and_rework_templates_contain_identical_canonical_test_command() -> None:
