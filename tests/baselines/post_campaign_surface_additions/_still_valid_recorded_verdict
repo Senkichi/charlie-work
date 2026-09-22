@@ -1,0 +1,4 @@
+issue #1765: the shared predicate factored out of ``review_verdict_guard``
+so ``unescalate`` can also detect (and void) a still-valid terminal verdict
+before re-arming a PR. Net-new OrchestratorApp member added after the Track 2
+Phase B surface baseline was pinned.

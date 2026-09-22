@@ -12,7 +12,6 @@ mention the real private slugs and is not counted in the baseline.
 from __future__ import annotations
 
 import argparse
-import json
 
 import pytest
 
@@ -226,6 +225,17 @@ def test_exclude_paths_skips_file() -> None:
     assert delta.removed == []
 
 
+def test_exclude_paths_skips_directory_prefix() -> None:
+    # A trailing-slash entry excludes every path beneath it (issue #1802 --
+    # the baseline is now a directory of per-entry files).
+    diff = _make_diff(".private-slug-baseline/README.md", ["# slugs: secret-repo"])
+    delta = find_slug_mentions_in_diff(
+        diff, _SLUGS, exclude_paths=frozenset({".private-slug-baseline/"})
+    )
+    assert delta.added == []
+    assert delta.removed == []
+
+
 def test_empty_diff_has_no_findings() -> None:
     assert find_slug_mentions_in_diff("", _SLUGS).added == []
 
@@ -352,22 +362,37 @@ def _mock_git_diff(stdout: str, ok: bool = True) -> RunResult:
     return RunResult(returncode=1, stdout="", stderr="boom", error="git diff failed")
 
 
-def _mock_git_show(stdout: str, ok: bool = True) -> RunResult:
-    if ok:
-        return RunResult(returncode=0, stdout=stdout, stderr="", error=None)
-    return RunResult(returncode=1, stdout="", stderr="not found", error="no such file")
+_BASELINE_DIR = ".private-slug-baseline"
 
 
-def _write_baseline(tmp_path, *, slugs=None, total=0, files=None) -> None:
-    """Write a baseline file for testing."""
-    baseline_path = tmp_path / ".private-slug-baseline.json"
-    baseline = {
-        "version": 1,
-        "slugs": _SLUGS if slugs is None else slugs,
-        "files": files or {},
-        "total": total,
-    }
-    baseline_path.write_text(json.dumps(baseline, indent=2) + "\n", encoding="utf-8")
+def _write_baseline(tmp_path, *, slugs=None, files=None) -> None:
+    """Write a per-entry baseline directory (issue #1802) for testing."""
+    slugs_dir = tmp_path / _BASELINE_DIR / "slugs"
+    slugs_dir.mkdir(parents=True, exist_ok=True)
+    for slug in _SLUGS if slugs is None else slugs:
+        (slugs_dir / slug).write_text("", encoding="utf-8")
+    for path, count in (files or {}).items():
+        entry = tmp_path / _BASELINE_DIR / "files" / (path + ".count")
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text(f"{count}\n", encoding="utf-8")
+
+
+def _count_entry_diff(key: str, *, removed: str | None = None, added: str | None = None) -> str:
+    """Build a diff hunk modifying ``files/<key>.count`` under the baseline dir.
+
+    The gate derives the baseline increase from the diff itself (issue #1802),
+    so tests express a "bump" as a change to a ``.count`` entry rather than a
+    stored total read via ``git show``.
+    """
+    path = f"{_BASELINE_DIR}/files/{key}.count"
+    old_side = f"--- a/{path}\n" if removed is not None else "--- /dev/null\n"
+    new_side = f"+++ b/{path}\n" if added is not None else "+++ /dev/null\n"
+    hunk = f"diff --git a/{path} b/{path}\n{old_side}{new_side}@@ -1 +1 @@\n"
+    if removed is not None:
+        hunk += f"-{removed}\n"
+    if added is not None:
+        hunk += f"+{added}\n"
+    return hunk
 
 
 def _setup_cli_mocks(
@@ -376,21 +401,12 @@ def _setup_cli_mocks(
     *,
     diff_stdout="",
     diff_ok=True,
-    base_baseline_total=0,
-    base_baseline_exists=True,
 ) -> None:
     """Wire up the common CLI mocks for private-slug-check tests."""
     monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
 
     def fake_run_captured(command, **kwargs):
-        if command[:2] == ["git", "show"]:
-            if base_baseline_exists:
-                baseline = json.dumps(
-                    {"version": 1, "slugs": _SLUGS, "total": base_baseline_total}
-                )
-                return _mock_git_show(baseline)
-            return _mock_git_show("", ok=False)
         if command[:2] == ["git", "diff"]:
             return _mock_git_diff(diff_stdout, ok=diff_ok)
         if command[:2] == ["git", "ls-files"]:
@@ -401,9 +417,9 @@ def _setup_cli_mocks(
 
 
 def test_cli_check_fails_on_new_mention_without_baseline_bump(monkeypatch, tmp_path) -> None:
-    _write_baseline(tmp_path, total=10)
+    _write_baseline(tmp_path, files={"src/old.py": 10})
     diff = _make_diff("src/new.py", ["# ref secret-repo here"])
-    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff, base_baseline_total=10)
+    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff)
 
     result = cli_module.run_private_slug_check_command(_cli_args("abc123"))
 
@@ -415,11 +431,12 @@ def test_cli_check_fails_on_new_mention_without_baseline_bump(monkeypatch, tmp_p
 
 
 def test_cli_check_passes_when_baseline_bumped(monkeypatch, tmp_path) -> None:
-    # Baseline at HEAD has total=11, at base has total=10 -> increase=1.
-    # Diff adds 1 net-new mention.  1 >= 1 -> pass (tamper-evident bump).
-    _write_baseline(tmp_path, total=11)
+    # Diff raises src/new.py's .count entry by 1 and adds 1 net-new mention.
+    # 1 >= 1 -> pass (tamper-evident bump derived from the diff itself).
+    _write_baseline(tmp_path, files={"src/old.py": 10, "src/new.py": 1})
     diff = _make_diff("src/new.py", ["# ref secret-repo here"])
-    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff, base_baseline_total=10)
+    diff += _count_entry_diff("src/new.py", removed="0", added="1")
+    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff)
 
     result = cli_module.run_private_slug_check_command(_cli_args("abc123"))
 
@@ -429,9 +446,9 @@ def test_cli_check_passes_when_baseline_bumped(monkeypatch, tmp_path) -> None:
 
 
 def test_cli_check_passes_on_clean_diff(monkeypatch, tmp_path) -> None:
-    _write_baseline(tmp_path, total=10)
+    _write_baseline(tmp_path, files={"src/old.py": 10})
     diff = _make_diff("src/example.py", ["# no slugs here"])
-    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff, base_baseline_total=10)
+    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff)
 
     result = cli_module.run_private_slug_check_command(_cli_args())
 
@@ -442,13 +459,13 @@ def test_cli_check_passes_on_clean_diff(monkeypatch, tmp_path) -> None:
 
 def test_cli_check_passes_on_move(monkeypatch, tmp_path) -> None:
     # A move: 1 added, 1 removed -> net_new=0 -> pass regardless of baseline.
-    _write_baseline(tmp_path, total=10)
+    _write_baseline(tmp_path, files={"src/old.py": 10})
     diff = _make_diff(
         "src/example.py",
         added_lines=["# moved ref secret-repo"],
         removed_lines=["# old ref secret-repo"],
     )
-    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff, base_baseline_total=10)
+    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff)
 
     result = cli_module.run_private_slug_check_command(_cli_args())
 
@@ -460,9 +477,9 @@ def test_cli_check_passes_on_move(monkeypatch, tmp_path) -> None:
 
 def test_cli_check_passes_on_removal(monkeypatch, tmp_path) -> None:
     # Removing a mention: net_new=-1 -> pass (ratchet tightens).
-    _write_baseline(tmp_path, total=10)
+    _write_baseline(tmp_path, files={"src/old.py": 10})
     diff = _make_diff("src/example.py", added_lines=[], removed_lines=["# ref secret-repo"])
-    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff, base_baseline_total=10)
+    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff)
 
     result = cli_module.run_private_slug_check_command(_cli_args())
 
@@ -471,10 +488,11 @@ def test_cli_check_passes_on_removal(monkeypatch, tmp_path) -> None:
 
 
 def test_cli_check_fails_when_baseline_bump_insufficient(monkeypatch, tmp_path) -> None:
-    # 2 net-new mentions but baseline only bumped by 1 -> fail.
-    _write_baseline(tmp_path, total=11)
+    # 2 net-new mentions but baseline entries only bumped by 1 -> fail.
+    _write_baseline(tmp_path, files={"src/old.py": 10, "src/new.py": 1})
     diff = _make_diff("src/new.py", ["# ref secret-repo", "# ref hidden-project"])
-    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff, base_baseline_total=10)
+    diff += _count_entry_diff("src/new.py", removed="0", added="1")
+    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff)
 
     result = cli_module.run_private_slug_check_command(_cli_args("abc123"))
 
@@ -484,13 +502,15 @@ def test_cli_check_fails_when_baseline_bump_insufficient(monkeypatch, tmp_path) 
 
 
 def test_cli_check_passes_when_baseline_file_new_at_head(monkeypatch, tmp_path) -> None:
-    # First PR: baseline file doesn't exist at base (base_total=0).
-    # Baseline at HEAD has total=5, diff adds 3 net-new, bump=5 >= 3 -> pass.
-    _write_baseline(tmp_path, total=5)
+    # First PR: baseline dir doesn't exist at base, so its .count entries
+    # show up as new files in the diff. Head entries total 5, diff adds 3
+    # net-new, bump=5 >= 3 -> pass.
+    _write_baseline(tmp_path, files={"src/new.py": 5})
     diff = _make_diff(
         "src/new.py", ["# ref secret-repo", "# ref hidden-project", "# ref secret-repo again"]
     )
-    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff, base_baseline_exists=False)
+    diff += _count_entry_diff("src/new.py", added="5")
+    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff)
 
     result = cli_module.run_private_slug_check_command(_cli_args("abc123"))
 
@@ -500,11 +520,11 @@ def test_cli_check_passes_when_baseline_file_new_at_head(monkeypatch, tmp_path) 
 
 
 def test_cli_check_fails_when_baseline_file_new_but_no_bump(monkeypatch, tmp_path) -> None:
-    # First PR: baseline at HEAD has total=0, diff adds 1 net-new -> fail.
-    # (This would mean the PR adds mentions but the baseline total is 0.)
-    _write_baseline(tmp_path, total=0)
+    # First PR: no baseline entries at HEAD and the diff adds 1 net-new
+    # mention -> baseline_increase=0 -> fail.
+    _write_baseline(tmp_path)
     diff = _make_diff("src/new.py", ["# ref secret-repo"])
-    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff, base_baseline_exists=False)
+    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff)
 
     result = cli_module.run_private_slug_check_command(_cli_args("abc123"))
 
@@ -514,7 +534,7 @@ def test_cli_check_fails_when_baseline_file_new_but_no_bump(monkeypatch, tmp_pat
 
 
 def test_cli_check_reports_git_diff_failure(monkeypatch, tmp_path) -> None:
-    _write_baseline(tmp_path, total=10)
+    _write_baseline(tmp_path, files={"src/old.py": 10})
     _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout="", diff_ok=False)
 
     result = cli_module.run_private_slug_check_command(_cli_args("bad-ref"))
@@ -525,12 +545,10 @@ def test_cli_check_reports_git_diff_failure(monkeypatch, tmp_path) -> None:
 
 
 def test_cli_check_uses_two_dot_diff(monkeypatch, tmp_path) -> None:
-    _write_baseline(tmp_path, total=10)
+    _write_baseline(tmp_path, files={"src/old.py": 10})
     captured: list[list[str]] = []
 
     def fake_run_captured(command, **kwargs):
-        if command[:2] == ["git", "show"]:
-            return _mock_git_show(json.dumps({"total": 10}))
         if command[:2] == ["git", "diff"]:
             captured.append(command)
             return _mock_git_diff("")
@@ -549,29 +567,22 @@ def test_cli_check_uses_two_dot_diff(monkeypatch, tmp_path) -> None:
 
 
 def test_cli_check_excludes_baseline_file_from_scan(monkeypatch, tmp_path) -> None:
-    # The baseline file itself is excluded from the diff scan -- it lists
-    # slugs as config, not as mentions of the private repos.
-    _write_baseline(tmp_path, total=10)
-    # Diff includes a change to the baseline file (adding a slug to the list)
-    # AND a clean change to a source file.  The baseline file's slug strings
-    # should NOT be counted as mentions.
+    # The baseline directory itself is excluded from the diff scan -- it
+    # lists slugs as config, not as mentions of the private repos. A slug
+    # name inside a baseline-dir file (e.g. README rationale) must not be
+    # counted; the .count entry bump still feeds the ratchet.
+    _write_baseline(tmp_path, files={"src/x.py": 10})
     diff = (
-        "diff --git a/.private-slug-baseline.json b/.private-slug-baseline.json\n"
-        "--- a/.private-slug-baseline.json\n"
-        "+++ b/.private-slug-baseline.json\n"
-        "@@ -1,3 +1,3 @@\n"
-        " {\n"
-        '-  "total": 10,\n'
-        '+  "total": 11,\n'
-        '   "slugs": ["secret-repo"]\n'
-        "diff --git a/src/clean.py b/src/clean.py\n"
-        "--- a/src/clean.py\n"
-        "+++ b/src/clean.py\n"
+        "diff --git a/.private-slug-baseline/README.md b/.private-slug-baseline/README.md\n"
+        "--- a/.private-slug-baseline/README.md\n"
+        "+++ b/.private-slug-baseline/README.md\n"
         "@@ -1,1 +1,2 @@\n"
-        " # ctx\n"
-        "+# no slugs here\n"
+        " # header\n"
+        "+# gated slug: secret-repo\n"
     )
-    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff, base_baseline_total=10)
+    diff += _count_entry_diff("src/x.py", removed="10", added="10")
+    diff += _make_diff("src/clean.py", ["# no slugs here"])
+    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout=diff)
 
     result = cli_module.run_private_slug_check_command(_cli_args("abc123"))
 
@@ -581,33 +592,61 @@ def test_cli_check_excludes_baseline_file_from_scan(monkeypatch, tmp_path) -> No
 
 
 def test_cli_check_fails_on_missing_baseline_file(monkeypatch, tmp_path) -> None:
-    # No baseline file at all -> ConfigError, caught by top-level handler.
-    # The command itself raises ConfigError; the test verifies it propagates.
+    # No baseline directory at all -> ConfigError, caught by top-level
+    # handler. The command itself raises ConfigError; the test verifies it
+    # propagates.
     from charlie_work.config import ConfigError
 
     monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
 
-    with pytest.raises(ConfigError, match="baseline file not found"):
+    with pytest.raises(ConfigError, match="baseline directory not found"):
         cli_module.run_private_slug_check_command(_cli_args())
 
 
 def test_cli_check_fails_on_empty_slugs_list(monkeypatch, tmp_path) -> None:
-    _write_baseline(tmp_path, slugs=[], total=0)
+    _write_baseline(tmp_path, slugs=[])
     _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout="")
 
     result = cli_module.run_private_slug_check_command(_cli_args())
 
     assert result.ok is False
-    assert "empty 'slugs'" in result.message
+    assert "empty slugs/" in result.message
+
+
+def test_cli_check_fails_on_malformed_count_entry(monkeypatch, tmp_path) -> None:
+    # A malformed .count entry must fail closed (ConfigError), never
+    # silently parse as zero (issue #1802 fail-closed requirement).
+    from charlie_work.config import ConfigError
+
+    _write_baseline(tmp_path, files={"src/old.py": 10})
+    bad = tmp_path / _BASELINE_DIR / "files" / "src" / "old.py.count"
+    bad.write_text("not-an-integer\n", encoding="utf-8")
+    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout="")
+
+    with pytest.raises(ConfigError, match="malformed count entry"):
+        cli_module.run_private_slug_check_command(_cli_args())
+
+
+def test_cli_check_fails_on_stray_file_in_files_dir(monkeypatch, tmp_path) -> None:
+    # A non-.count file under files/ fails closed too.
+    from charlie_work.config import ConfigError
+
+    _write_baseline(tmp_path, files={"src/old.py": 10})
+    (tmp_path / _BASELINE_DIR / "files" / "stray.txt").write_text("x\n", encoding="utf-8")
+    _setup_cli_mocks(monkeypatch, tmp_path, diff_stdout="")
+
+    with pytest.raises(ConfigError, match="unexpected file"):
+        cli_module.run_private_slug_check_command(_cli_args())
 
 
 # --- CLI: --regenerate mode ---
 
 
 def test_cli_regenerate_with_existing_baseline(monkeypatch, tmp_path) -> None:
-    _write_baseline(tmp_path, total=10)
-    # Simulate git ls-files returning a few files, one of which mentions a slug.
+    _write_baseline(tmp_path, files={"src/stale.py": 10})
+    # Simulate git ls-files returning a few files, one of which mentions a
+    # slug, plus baseline-dir entries that must be skipped by the scan.
     monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
     monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
 
@@ -615,7 +654,11 @@ def test_cli_regenerate_with_existing_baseline(monkeypatch, tmp_path) -> None:
         if command[:2] == ["git", "ls-files"]:
             return RunResult(
                 returncode=0,
-                stdout="src/a.py\nsrc/b.py\n.private-slug-baseline.json\n",
+                stdout=(
+                    "src/a.py\nsrc/b.py\n"
+                    ".private-slug-baseline/files/src/stale.py.count\n"
+                    ".private-slug-baseline/slugs/secret-repo\n"
+                ),
                 stderr="",
                 error=None,
             )
@@ -634,11 +677,13 @@ def test_cli_regenerate_with_existing_baseline(monkeypatch, tmp_path) -> None:
     assert result.data["total"] == 1
     assert result.data["files"] == {"src/a.py": 1}
 
-    # Verify the baseline file was written atomically.
-    written = json.loads((tmp_path / ".private-slug-baseline.json").read_text(encoding="utf-8"))
-    assert written["total"] == 1
-    assert written["files"] == {"src/a.py": 1}
-    assert written["slugs"] == _SLUGS
+    # Verify the baseline directory was rewritten: new entry present, stale
+    # entry removed, slug markers match the existing slugs/ set.
+    files_dir = tmp_path / _BASELINE_DIR / "files"
+    assert (files_dir / "src" / "a.py.count").read_text(encoding="utf-8").splitlines()[0] == "1"
+    assert not (files_dir / "src" / "stale.py.count").exists()
+    slugs_dir = tmp_path / _BASELINE_DIR / "slugs"
+    assert sorted(p.name for p in slugs_dir.iterdir()) == sorted(_SLUGS)
 
 
 def test_cli_regenerate_with_slugs_arg_when_no_baseline(monkeypatch, tmp_path) -> None:
@@ -662,6 +707,8 @@ def test_cli_regenerate_with_slugs_arg_when_no_baseline(monkeypatch, tmp_path) -
     assert result.ok is True
     assert result.data["total"] == 1
     assert result.data["slugs"] == _SLUGS
+    slugs_dir = tmp_path / _BASELINE_DIR / "slugs"
+    assert sorted(p.name for p in slugs_dir.iterdir()) == sorted(_SLUGS)
 
 
 def test_cli_regenerate_without_slugs_and_no_baseline_fails(monkeypatch, tmp_path) -> None:
@@ -692,7 +739,7 @@ def test_cli_check_passes_no_redirect_to_bootstrap(monkeypatch, tmp_path) -> Non
     (always an empty diff) and reports a false clean -- the failure mode that
     let net-new slug mentions reach CI green locally on PR #1806.
     """
-    _write_baseline(tmp_path, total=10)
+    _write_baseline(tmp_path, files={"src/old.py": 10})
     captured: dict[str, object] = {}
 
     def mock_bootstrap(args, **kwargs):
@@ -707,15 +754,8 @@ def test_cli_check_passes_no_redirect_to_bootstrap(monkeypatch, tmp_path) -> Non
             gh=GitHub(repo_root=tmp_path, runtime=None, dry_run=True),
         )
 
-    def mock_run_captured(cmd, cwd=None, timeout_seconds=60, **kw):
-        if cmd[:2] == ["git", "show"]:
-            return _mock_git_show(json.dumps({"version": 1, "slugs": _SLUGS, "total": 10}))
-        if cmd[:2] == ["git", "diff"]:
-            return _mock_git_diff("")
-        return RunResult(returncode=0, stdout="", stderr="", error=None)
-
     monkeypatch.setattr(cli_module, "bootstrap_command", mock_bootstrap)
-    monkeypatch.setattr(cli_module, "run_captured", mock_run_captured)
+    monkeypatch.setattr(cli_module, "run_captured", lambda *a, **k: _mock_git_diff(""))
 
     result = cli_module.run_private_slug_check_command(_cli_args())
 

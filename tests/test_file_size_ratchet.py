@@ -11,11 +11,13 @@ binds the monolith itself. Extraction (#1317) cannot converge while regrowth
 outpaces it.
 
 This ratchet closes that gap. For every tracked ``*.py`` file over the
-800-line cap, a high-water mark is recorded in the checked-in baseline file
-``file_size_ratchet_baseline.json`` (repo root). CI fails any PR whose tree
-leaves an over-cap file with MORE physical lines than its recorded mark. The
-mark may only be lowered -- never raised except via an explicit reviewed edit
-to the baseline file.
+800-line cap, a high-water mark is recorded in the checked-in baseline
+directory ``file_size_ratchet_baseline/`` (repo root) -- one ``.count`` file
+per covered path (issue #1802: the single JSON document was a shared append
+point that serialized concurrent PRs into merge conflicts). CI fails any PR
+whose tree leaves an over-cap file with MORE physical lines than its recorded
+mark. The mark may only be lowered -- never raised except via an explicit
+reviewed edit to the baseline entry.
 
 ## Quantized marks (MARK_QUANTUM)
 
@@ -25,11 +27,14 @@ Marks are multiples of ``MARK_QUANTUM`` (200), derived as
 the repo's hottest merge-conflict site: any two concurrent PRs changing a
 monolith's line count wrote different values on the same JSON line, and the
 flat one-key-per-line layout put even different keys within diff3's context
-window. Quantized marks mean growth within a bucket needs no baseline edit at
-all, and two PRs bumping the same file into the same bucket write the
-identical line (clean merge). A reviewed hand-raise must follow the same
-rule -- next multiple of 200, never the exact line count. If a baseline line
-still conflicts on merge, take the larger value.
+window. Issue #1802 moved the baseline to per-entry ``.count`` files (see
+``charlie_work.ratchet_baseline``), which removes the shared-append-point
+half of that conflict surface entirely; quantization still matters because
+growth within a bucket needs no baseline edit at all, and two PRs bumping the
+same file into the same bucket write the identical value (clean merge). A
+reviewed hand-raise must follow the same rule -- next multiple of 200, never
+the exact line count. If a baseline entry still conflicts on merge, take the
+larger value.
 
 The cost is bounded slack: a mark can sit up to 199 lines above the live
 count. The stale-low guard below is unaffected (quantizing rounds UP), and
@@ -38,10 +43,10 @@ count. The stale-low guard below is unaffected (quantizing rounds UP), and
 
 ## Derivation, not enumeration (issue #1375)
 
-The covered file set is derived from the baseline file's own keys UNION a live
-scan of tracked ``*.py`` files over the cap (``git ls-files`` + line count),
-never a hardcoded list. This is the derive-what-is-covered / fail-closed
-direction:
+The covered file set is derived from the baseline directory's own entries
+UNION a live scan of tracked ``*.py`` files over the cap (``git ls-files`` +
+line count), never a hardcoded list. This is the derive-what-is-covered /
+fail-closed direction:
 
 * A file over the cap that is NOT in the baseline is compared against an
   implicit mark of 0 -- any non-empty over-cap file with no baseline entry
@@ -86,12 +91,13 @@ redirect, not just a red X. See ``_EXTRACTION_REMEDY`` below.
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from charlie_work.ratchet_baseline import BaselineFormatError, load_count_baseline
 
 # Marks in the baseline are multiples of this quantum (rounded UP from the
 # live count) -- see "Quantized marks" in the module docstring. Authoritative
@@ -100,7 +106,7 @@ import pytest
 from _ratchet_constants import MARK_QUANTUM as MARK_QUANTUM
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_BASELINE_PATH = _REPO_ROOT / "file_size_ratchet_baseline.json"
+_BASELINE_PATH = _REPO_ROOT / "file_size_ratchet_baseline"
 
 # The repo's normal per-module line cap. Over-cap files (lines > CAP) are the
 # ratchet's covered set. Same value the extraction lineage records cap-exemption
@@ -121,16 +127,16 @@ _EXTRACTION_REMEDY = (
     "byte-identical extraction shrinks the source file and passes this ratchet "
     "trivially. After the extraction, run "
     "`python scripts/refresh_file_size_ratchet.py` and commit the resulting "
-    "`file_size_ratchet_baseline.json` tightening in this PR -- the script's "
+    "`file_size_ratchet_baseline/` entry tightening in this PR -- the script's "
     "default mode is lower-only (never raises a mark), so it is safe to run "
     "mid-PR: same-bucket shrinks produce no diff, and cross-bucket shrinks "
     "write the deterministic quantized value, so concurrent shrink PRs "
     "converge byte-identically (#1495). To record a deliberate, reviewed exception (e.g. a new "
-    "extraction that is itself over the cap), edit "
-    "file_size_ratchet_baseline.json directly as a reviewed change in the PR. "
+    "extraction that is itself over the cap), edit the file's entry under "
+    "file_size_ratchet_baseline/ directly as a reviewed change in the PR. "
     "When raising a mark, raise it to the NEXT MULTIPLE OF 200 (MARK_QUANTUM) "
     "above the new line count -- never the exact count -- so concurrent PRs "
-    "bumping the same file write the identical value. If the baseline line "
+    "bumping the same file write the identical value. If a baseline entry "
     "still conflicts on merge, take the larger value."
 )
 
@@ -283,13 +289,15 @@ def test_synthetic_plus_one_line_to_at_mark_file_trips_check() -> None:
 
 
 def _load_baseline() -> dict[str, int]:
-    if not _BASELINE_PATH.exists():
+    if not _BASELINE_PATH.is_dir():
         pytest.fail(
-            f"file_size_ratchet_baseline.json not found at {_BASELINE_PATH}. "
+            f"file_size_ratchet_baseline/ not found at {_BASELINE_PATH}. "
             "Run `python scripts/refresh_file_size_ratchet.py --init` to create it."
         )
-    data = json.loads(_BASELINE_PATH.read_text(encoding="utf-8"))
-    return {k: int(v) for k, v in data.items()}
+    try:
+        return load_count_baseline(_BASELINE_PATH)
+    except BaselineFormatError as exc:
+        pytest.fail(f"file_size_ratchet_baseline/ is malformed (fail closed): {exc}")
 
 
 def test_baseline_includes_the_two_named_monoliths() -> None:
@@ -330,7 +338,7 @@ def test_baseline_marks_are_at_or_above_the_live_tree() -> None:
         if live.get(path, 0) > mark
     ]
     assert not stale_low, (
-        "file_size_ratchet_baseline.json has mark(s) BELOW the live line count "
+        "file_size_ratchet_baseline/ has mark(s) BELOW the live line count "
         "-- a stale-low baseline that false-trips the ratchet. Either the file "
         "grew past its mark (the keystone reports that separately) or the mark "
         "was lowered without the file shrinking; re-run "
@@ -378,17 +386,19 @@ def test_keystone_never_writes_the_baseline(
 ) -> None:
     """Regression guard for the conflict-storm mechanism: running the keystone
     against a tree whose files SHRANK below their marks must leave the
-    baseline file byte-identical (and leave no temp file behind). The old
+    baseline entries byte-identical (and leave no temp file behind). The old
     write-on-shrink side effect dirtied the baseline on every local pytest
     run; workers committed the dirt per the preflight guidance, and those
     exact-count edits collided in merge after merge."""
     mod = sys.modules[__name__]
 
-    baseline_file = tmp_path / "file_size_ratchet_baseline.json"
-    original = json.dumps({"src/charlie_work/big.py": 1000}, indent=2) + "\n"
-    baseline_file.write_text(original, encoding="utf-8")
+    baseline_dir = tmp_path / "file_size_ratchet_baseline"
+    entry = baseline_dir / "src" / "charlie_work" / "big.py.count"
+    entry.parent.mkdir(parents=True)
+    original = "1000\n"
+    entry.write_text(original, encoding="utf-8")
 
-    monkeypatch.setattr(mod, "_BASELINE_PATH", baseline_file)
+    monkeypatch.setattr(mod, "_BASELINE_PATH", baseline_dir)
     monkeypatch.setattr(
         mod,
         "_tracked_py_line_counts",
@@ -397,11 +407,11 @@ def test_keystone_never_writes_the_baseline(
 
     mod.test_over_cap_files_do_not_exceed_high_water_mark()
 
-    assert baseline_file.read_text(encoding="utf-8") == original, (
+    assert entry.read_text(encoding="utf-8") == original, (
         "the keystone wrote the baseline on shrink -- the test suite must be a "
         "pure assertion; only scripts/refresh_file_size_ratchet.py writes"
     )
-    leftovers = [p.name for p in tmp_path.iterdir() if p != baseline_file]
+    leftovers = [p for p in baseline_dir.rglob("*") if p.is_file() and p != entry]
     assert not leftovers, f"keystone left stray file(s) behind: {leftovers}"
 
 
@@ -444,7 +454,7 @@ def test_extraction_remedy_names_refresh_script() -> None:
         "the extraction remedy text must name scripts/refresh_file_size_ratchet.py "
         "so a worker fixing a growth violation tightens the baseline in the same PR"
     )
-    assert "file_size_ratchet_baseline.json" in _EXTRACTION_REMEDY
+    assert "file_size_ratchet_baseline" in _EXTRACTION_REMEDY
     assert "lower-only" in _EXTRACTION_REMEDY, (
         "the safety rationale (lower-only, never raises) must travel with the "
         "instruction so it is not stripped as a risky mid-PR side effect"
@@ -521,7 +531,7 @@ def test_baseline_is_a_fixed_point_of_the_lower_only_refresh() -> None:
         timeout=60,
     )
     assert proc.returncode == 0, (
-        "file_size_ratchet_baseline.json is not a fixed point of the lower-only "
+        "file_size_ratchet_baseline/ is not a fixed point of the lower-only "
         "refresh (issue #1675): an over-cap file shrank or was deleted without "
         "its mark being lowered/dropped in the same PR. Run "
         "`python scripts/refresh_file_size_ratchet.py` and commit the updated "

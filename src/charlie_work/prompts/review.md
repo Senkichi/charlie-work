@@ -93,7 +93,7 @@ domain module per the established facade pattern (re-export block in the
 monolith, implementation in the module), matching the #1283-era extractions.
 After the extraction (or any shrink that lowers an over-cap file's line
 count), run `python scripts/refresh_file_size_ratchet.py` and commit the
-resulting `file_size_ratchet_baseline.json` tightening in the same PR -- the
+resulting `file_size_ratchet_baseline/` entry tightening in the same PR -- the
 script's default mode is lower-only (it never raises a mark), so it is safe
 to run mid-PR: same-bucket shrinks produce no diff, and cross-bucket shrinks
 write the deterministic quantized value, so concurrent shrink PRs converge
