@@ -333,6 +333,7 @@ GLOBAL_CONFIG_FILENAME = "config.yaml"
 FLEET_REGISTRY_FILENAME = "fleet.json"
 FLEET_LOCK_FILENAME = "fleet.lock"
 FLEET_SUPERVISOR_LOCK_FILENAME = "fleet-supervisor.lock"
+FLEET_STOP_REQUEST_FILENAME = "fleet-stop-request.json"
 NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
 CAPACITY_STARVATION_STATE_FILENAME = "capacity_starvation_state.json"
 
@@ -400,6 +401,17 @@ def fleet_supervisor_lock_path(override: str | None = None) -> Path:
     See :func:`supervisor_lock_path` for the per-repo counterpart.
     """
     return fleet_dir(override=override) / FLEET_SUPERVISOR_LOCK_FILENAME
+
+
+def fleet_stop_request_path(override: str | None = None) -> Path:
+    """Return the operator stop/drain request marker path in the fleet dir.
+
+    ``charlie fleet stop [--drain]`` writes this file; ``fleet supervise``
+    checks it between passes and ``fleet supervise-loop`` checks it before
+    relaunching a child that asked to be replaced. Centralised here so the
+    writer and both readers agree on the name (issue #1716).
+    """
+    return fleet_dir(override=override) / FLEET_STOP_REQUEST_FILENAME
 
 
 def notify_health_state_path(override: str | None = None) -> Path:
