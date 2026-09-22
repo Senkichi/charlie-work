@@ -20,7 +20,7 @@ events.db backfill, the MAJOR-required resolved-reason gating on
 ``clear_dispatch_stale_alert``) grew this cluster past the point where
 ``state.py`` -- already an over-cap monolith tracked by the file-size
 ratchet, issue #1442 -- could absorb it without breaching its recorded
-high-water mark (``file_size_ratchet_baseline.json``). A byte-identical
+high-water mark (``file_size_ratchet_baseline/``). A byte-identical
 extraction shrinks ``state.py`` back under its mark and passes the ratchet
 trivially, the same remedy ``tests/test_file_size_ratchet.py`` names for any
 over-cap-monolith growth.

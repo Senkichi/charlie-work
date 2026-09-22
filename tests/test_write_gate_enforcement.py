@@ -73,10 +73,10 @@ reintroduces the 285-site problem):
 For everything OUTSIDE the predicate (a function that never directly calls
 ``write_gate`` at all), the keystone additionally asserts a **per-module
 shrink-only count ratchet** on raw primitive calls: counts recorded per
-module at this PR's base (``_RATCHET_BASELINE`` below, re-derived live
-against the actual post-PR3 tree, not merely copied from the prototype's
-pre-PR3 numbers) may only decrease or hold; any increase fails, naming the
-module. This is issue #619's ratchet concept, narrowed to counts so it
+module at this PR's base (``tests/baselines/write_gate/<module>.count``
+per-entry files, issue #1802; originally derived live against the actual
+post-PR3 tree, not merely copied from the prototype's pre-PR3 numbers) may
+only decrease or hold; any increase fails, naming the module. This is issue #619's ratchet concept, narrowed to counts so it
 never needs a site-by-site allow-list for the ~300 out-of-wave sites and
 only trips when someone adds a NEW raw write to unconverted territory --
 exactly the event it exists to catch. The full site inventory (workflow.py's
@@ -196,6 +196,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+from charlie_work.ratchet_baseline import BaselineFormatError, load_count_baseline
 
 _SRC_ROOT = Path(__file__).parents[1] / "src" / "charlie_work"
 
@@ -827,346 +829,40 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
 # exemption by centralizing it onto WriteGate; reconcile.py and
 # fleet_registry.py are pre-existing, out-of-wave raw sites with no #1264
 # sub-issue yet).
+#
+# Issue #1802 moved the baseline out of this file (where it was a shared
+# append point for concurrent PRs) into per-module ``.count`` entries under
+# ``tests/baselines/write_gate/``; each entry's first line is the count and
+# the remaining ``#`` lines carry the audit trail the inline dict held as
+# comments.
 # ---------------------------------------------------------------------------
-_RATCHET_BASELINE: dict[str, int] = {
-    # Issue #1372: +3 log_event calls in fleet_loop's stale-entry handling
-    # (stale detection warning, prune warning, and the existing lane-completed
-    # events). These are out-of-wave raw sites in unconverted territory, same
-    # class as the pre-existing 8 — the ratchet holds at the new count.
-    "fleet_dispatch.py": 11,
-    "fleet_registry.py": 1,
-    # Issue #1241: +1 raw log_event call in the reconcile salvage lane's new
-    # pre-open supersession check (the salvage_skipped_* event emitted when the
-    # shared check_salvage_superseded finds the work already landed). This is
-    # out-of-wave raw territory -- the salvage lane has not been converted to
-    # WriteGate (it predates #1264's wave and uses log_event directly, matching
-    # the existing pr_closing_ref_rewritten / pr_closing_ref_unlinked calls in
-    # the same block). The ratchet holds at the new count.
-    "reconcile.py": 6,
-    "state_migration.py": 1,
-    # Issue #1777: +1 raw log_event call in _log_self_deploy_git_retry, the
-    # on_retry hook wired into every self-deploy/ci-fleet-sibling
-    # run_git_with_retry call site. Out-of-wave raw territory, same class as
-    # the pre-existing 11 -- self-deploy's own log_event calls are not routed
-    # through WriteGate (CLAUDE.md's "outside state-lock contexts, call
-    # log_event() directly" convention). The ratchet holds at the new count.
-    "supervise.py": 12,
-    "supervisor_lifecycle.py": 3,
-    # Issue #1131: +2 raw primitives in record_review's rework-label-skip
-    # guard (_record_event + save_state for rework_label_skipped_issue_closed).
-    # These match the existing raw pattern in record_review (which has not
-    # yet been converted to WriteGate -- see #1264/#1324), so routing them
-    # through self.write_gate would trigger R9's exclusive-use predicate on
-    # the whole function and flag every pre-existing raw call. The ratchet
-    # holds at the new count until record_review's full conversion.
-    # Issue #1393: +11 raw calls for the blocked-environment dispatch path
-    # (separate blocked_environment_at counter, distinct escalation reason,
-    # candidate-filtering safety net, and stranded .json.tmp cleanup). These
-    # are out-of-wave raw sites in unconverted territory, same class as the
-    # pre-existing 270 — the ratchet holds at the new count.
-    # Issue #1314: +2 raw calls for the operator-queue depth gauge
-    # (_maybe_emit_operator_queue_depth: one save_state + one _record_event
-    # -> append_event). Same out-of-wave raw-site class as the pre-existing
-    # 281 — the ratchet holds at the new count.
-    # Combined baseline after merging #1131 (+2), #1393 (+11), and #1314 (+2)
-    # onto the pre-existing 270: 285.
-    # Issue #1324: _record_event centralized onto WriteGate (its body now
-    # calls self.write_gate.record_event instead of a bare append_event), so
-    # _record_event is no longer a gated primitive name in this scanner's
-    # vocabulary -- all ~70 self._record_event(...) call sites are
-    # gate-covered by construction and no longer tracked as raw sites.
-    # Additionally, the paired save_state calls in _maybe_reconcile_drift (2)
-    # and _maybe_reclaim_superseded_main_ci (3) were routed through
-    # self.write_gate.save_state, moving both functions into the R9
-    # in-predicate bucket. Net decrease: 285 -> 196.
-    #
-    # Issue #1317 (merged on main after this PR's original base): verbatim
-    # extraction of the dead-worker/session-reap family out of workflow.py
-    # into dead_worker_reap.py (byte-identical move, no write-path changes).
-    # The 11 raw sites in that family relocated to the new module; they are
-    # not _record_event calls (the family uses write_gate.append_event
-    # directly for its gated writes, with log_event / _api_write_json_atomic
-    # as the raw primitives), so #1324's centralization does not change their
-    # raw count. workflow.py's actual count drops accordingly (196 -> 185
-    # after the extraction), which the shrink-only ratchet accepts without a
-    # further baseline edit; only the newly-introduced module needs its own
-    # entry.
-    #
-    # Issue #1132: +4 raw primitives for the foreign_issue_ref self-heal path
-    # (2 save_state calls in the module-level _clear_foreign_issue_ref_marker
-    # and _touch_foreign_issue_ref_marker helpers, and 2 log_event calls in
-    # _loop_body's reprobe/clear and transient-classification branches). These
-    # are out-of-wave raw sites in unconverted territory -- _loop_body already
-    # has ~190 raw calls and the helpers are module-level free functions with
-    # no self.write_gate receiver, matching the existing raw pattern in this
-    # area. The ratchet holds at the new count until _loop_body's full
-    # conversion wave.
-    # Issue #1632 (Track 2 Phase B leaf L01 batch 1): verbatim extraction of
-    # the rework-routing and stale-checks member families out of workflow.py
-    # into two new charlie_work.orchestration submodules (bodies moved, write
-    # paths unchanged apart from the #1627 ``_wf.`` namespace rebind). 16 raw
-    # sites relocated out of workflow.py -- 8 into state_rework_routing.py and
-    # 8 into state_stale_checks.py -- so workflow.py's entry drops by exactly
-    # that 16 (198 -> 182) and each new module gets its own entry equal to its
-    # relocated count. This is the same total-preserving redistribution #1317
-    # sanctioned above ("only the newly-introduced module needs its own entry")
-    # for a byte-identical move that carried raw sites into a fresh module; the
-    # baseline-dict sum is unchanged, so no ratchet ceiling is loosened.
-    #
-    # Issue #1645 (Track 2 Phase B leaf L01 batch 2): verbatim extraction of ten
-    # more OrchestratorApp members (review-recording, rework-dispatch,
-    # rework-to-review routing, rescue, mechanical de-escalation, unauthorized-
-    # merge baseline, and the stale-CI verdict-requeue emitter) into six new
-    # charlie_work.orchestration submodules plus an append to state_stale_checks.
-    # Bodies moved byte-identically apart from the #1627 ``_wf.`` namespace
-    # rebind. 47 raw sites relocated out of workflow.py -- 5 into
-    # state_record_review.py, 36 into state_dispatch_rework.py, 2 into
-    # state_rework_review.py, 2 into state_rescue.py, 1 into
-    # state_unauthorized_merge.py, and 1 appended to state_stale_checks.py (8 ->
-    # 9); state_mechanical.py carries zero raw sites so needs no entry. As in
-    # #1632/#1317, this is a total-preserving redistribution: workflow.py's entry
-    # drops by exactly that 47 (182 -> 135) and each destination gains its
-    # relocated count, so the baseline-dict sum is unchanged and no ratchet
-    # ceiling is loosened. (workflow.py's measured raw count at this PR's base is
-    # 177, i.e. 5 below the recorded 182; that pre-existing slack is carried
-    # forward here rather than tightened, keeping this a pure move commit's
-    # guard update.)
-    #
-    # Issue #1646 (Track 2 Phase B leaf L01 batch 3): verbatim extraction of ten
-    # more OrchestratorApp members (loop-tick maintenance singletons and the
-    # merge-train / externally-merged-finalization members) into two new
-    # charlie_work.orchestration submodules. Bodies moved byte-identically apart
-    # from the #1627 ``_wf.`` namespace rebind. 14 raw sites relocated out of
-    # workflow.py -- 8 into state_maintenance.py and 6 into state_merge_train.py.
-    # As in #1632/#1645/#1317, this is a total-preserving redistribution: the
-    # baseline-dict sum stays 247 and no ratchet ceiling is loosened. workflow.py's
-    # entry drops by exactly that 14 (135 -> 121) while its own slack is held at 5
-    # (measured raw count at this PR's base 70ebbf9e is 130, i.e. 5 below 135;
-    # after the move the live count is 116, so 121 = 116 + 5). Each destination
-    # module's entry is set exactly to its own relocated live count (slack 0):
-    # state_maintenance.py = 8, state_merge_train.py = 6.
-    #
-    # Issue #1647 (Track 2 Phase B leaf L01 batch 4, the last L01 batch): verbatim
-    # extraction of the final nine OrchestratorApp members -- the four public
-    # operator commands (claim, merge_authorize, unescalate, ack_unauthorized_merge)
-    # into state_operator_commands.py and the five approval-head / unauthorized-
-    # merge-announcement members (_update_approval_head, _refresh_pr_decision_cache,
-    # _stamp_mention_rearm, _record_unauthorized_merge_skip,
-    # _announce_unauthorized_merges) into state_approval.py. Bodies moved
-    # byte-identically apart from the #1627 ``_wf.`` namespace rebind. 10 raw
-    # sites relocated out of workflow.py -- 6 into state_operator_commands.py and
-    # 4 into state_approval.py. As in #1632/#1645/#1646/#1317, this is a total-
-    # preserving redistribution: the baseline-dict sum stays 247 and no ratchet
-    # ceiling is loosened. workflow.py's entry drops by exactly that 10 (121 -> 111)
-    # while its own slack is held at 5 (measured raw count at this PR's base
-    # bb030300 is 116, so 121 = 116 + 5; after the move the live count is 106, so
-    # 111 = 106 + 5). Each destination module's entry is set exactly to its own
-    # relocated live count (slack 0): state_operator_commands.py = 6,
-    # state_approval.py = 4. (_stamp_mention_rearm and _refresh_pr_decision_cache
-    # carry zero gated-primitive raw sites -- both route their writes through
-    # self.write_gate -- so they contribute nothing to state_approval.py's count.)
-    #
-    # Issue #1652 (Track 2 Phase B leaf L02 batch 1): verbatim extraction of
-    # nine more OrchestratorApp members (the seven base-currency / merge-readiness
-    # gating helpers into helpers_merge_gate.py, and the worker-summary /
-    # branch-naming helpers into helpers_worker.py). Bodies moved byte-identically
-    # apart from the #1627 ``_wf.`` namespace rebind. Zero raw gated-primitive
-    # sites relocated -- every moved body is read-only gating or summarization
-    # (the only call in _is_base_freshness_required is logging.getLogger, not a
-    # gated primitive; _summarize_worker writes nothing) -- so workflow.py's live
-    # raw count is unchanged (107) and its baseline (111) holds with slack 4.
-    # Neither destination module needs a baseline entry (both at implicit 0).
-    # As in #1632/#1645/#1646/#1647, the baseline-dict sum stays 247 and no
-    # ratchet ceiling is loosened; this comment is the sole ratchet-side update,
-    # recording the move's zero-raw-site status for the audit trail.
-    #
-    # Issue #1653 (Track 2 Phase B leaf L02 batch 2): verbatim extraction of
-    # seven more OrchestratorApp members -- the rework-packet / PR-comment I/O
-    # helpers (_read_advisories_from_pr_comment, _read_packet_head_oid,
-    # _read_packet_turn_cap_multiplier, _read_packet_template_sha,
-    # _packet_template_current, _read_packet_diff, _comment_pr) into
-    # helpers_packet.py. Bodies moved byte-identically apart from the #1627
-    # ``_wf.`` namespace rebind (_gh_api_list, ORCHESTRATOR_COMMENT_MARKER).
-    # Zero raw gated-primitive sites relocated -- every moved body is read-only
-    # packet/comment I/O (json reads, diff.patch reads, and _comment_pr's
-    # write_text + self.gh.pr_comment, none of which are gated primitives) --
-    # so workflow.py's live raw count is unchanged (107) and its baseline (111)
-    # holds with slack 4. The destination module needs no baseline entry (at
-    # implicit 0). As in #1632/#1645/#1646/#1647/#1652, the baseline-dict sum
-    # stays 247 and no ratchet ceiling is loosened; this comment is the sole
-    # ratchet-side update, recording the move's zero-raw-site status.
-    #
-    # Issue #1654 (Track 2 Phase B leaf L02 batch 3): verbatim extraction of
-    # eight more OrchestratorApp members -- the merge preflight / outcome
-    # recording helpers (merge_check, _record_merge_or_error,
-    # _record_review_or_error, _record_event, _resolve) into
-    # helpers_merge_outcomes.py, and the rework request / conflict helpers
-    # (_request_cross_pr_revert_rework, _request_no_op_rework_repair,
-    # _rework_candidate_conflict_blocked) into helpers_rework.py. Bodies moved
-    # byte-identically apart from the #1627 ``_wf.`` namespace rebind
-    # (CommandResult, _authorized_override_matches). Zero raw gated-primitive
-    # sites relocated -- _record_event's own body calls
-    # self.write_gate.record_event (Convention A, gate-covered by construction,
-    # not a raw primitive) and the other seven bodies contain no gated
-    # primitive calls -- so workflow.py's live raw count is unchanged (107) and
-    # its baseline (111) holds with slack 4. Both destination modules need no
-    # baseline entry (at implicit 0). As in #1632/#1645/#1646/#1647/#1652/#1653,
-    # the baseline-dict sum stays 247 and no ratchet ceiling is loosened; this
-    # comment is the sole ratchet-side update, recording the move's
-    # zero-raw-site status.
-    #
-    # Issue #1655 (Track 2 Phase B leaf L02 batch 4, last): the final eight
-    # OrchestratorApp members move to helpers_dispatch.py (the four dispatch
-    # sort/filter helpers) and helpers_labels.py (_label_color,
-    # _label_descriptions, _ensure_labels_core, bootstrap_labels). None calls
-    # a gated primitive; both modules measured 0 out-of-predicate raw sites,
-    # workflow.py holds at 111 (live 107) and the baseline-dict sum stays 247.
-    #
-    # Issue #1660 (Track 2 Phase B leaf L03 batch 3, last): verbatim extraction of
-    # seven more OrchestratorApp members -- worker-dispatch/worktree-safety into
-    # misc_worker_dispatch.py, review-verdict reaping into misc_review_verdicts.py,
-    # the reconcile loop into misc_reconcile.py, and escalated-label repair into
-    # misc_escalation.py. Bodies moved byte-identically apart from the #1627 ``_wf.``
-    # namespace rebind. 11 raw sites relocated out of workflow.py -- 4 into
-    # misc_review_verdicts.py (_reap_review_verdicts: append_event x2, save_state x2),
-    # 4 into misc_reconcile.py (_reconcile_locked: append_event x1, save_state x3), and
-    # 3 into misc_escalation.py (_repair_escalated_labels: transition, append_event,
-    # save_state); misc_worker_dispatch.py carries zero raw sites. As in the L01/L02
-    # batches, this is a total-preserving redistribution: workflow.py's entry drops by
-    # exactly that 11 (111 -> 100) while its own slack is held (measured out-of-predicate
-    # raw count at this PR's base 5e3bebea is 106, so 111 = 106 + 5; after the move the
-    # live count is 95, so 100 = 95 + 5). Each destination entry equals its own relocated
-    # live count (slack 0). The baseline-dict sum stays 247 and no ratchet ceiling loosens.
-    #
-    # Issue #1636 (Track 2 Phase B leaf L05, single PR): verbatim extraction of eight
-    # more OrchestratorApp members -- the instrumentation / loop-orchestration family
-    # (_backfill_missing_reason_classes, _build_module_map_value,
-    # _build_attachment_budget_value, _queue_sync_merge_covered,
-    # _reconcile_stranded_verdicts, ensure_labels, tripwire_status, _loop_impl) into
-    # one new charlie_work.orchestration submodule, instrumentation_ops.py. Bodies moved
-    # byte-identically apart from the #1627 ``_wf.`` namespace rebind. 12 raw log_event
-    # sites relocated out of workflow.py -- 11 ratchet-relevant (_build_module_map_value 1,
-    # _build_attachment_budget_value 1, _queue_sync_merge_covered 1,
-    # _reconcile_stranded_verdicts 2, ensure_labels 4, _loop_impl 2) plus the 1 by-design
-    # allow-listed _loop_impl preflight-warning site (repointed in
-    # _ALLOWED_RAW_PRIMITIVE_SITES above, so it never counted toward the ratchet at
-    # either location). As in the L01/L03 batches, this is a total-preserving
-    # redistribution: workflow.py's entry drops by exactly the 11 ratchet-relevant sites
-    # (100 -> 89) while its own slack is held at 5 (measured out-of-predicate raw count at
-    # this PR's base 5082a479 after the move is 84, so 89 = 84 + 5), and the new module's
-    # entry equals its own relocated live count exactly (slack 0):
-    # instrumentation_ops.py = 11. The baseline-dict sum stays 247 and no ratchet ceiling
-    # loosens.
-    #
-    # Issue #1637 (Track 2 Phase B leaf L06, single PR): verbatim extraction of four
-    # more OrchestratorApp members -- the dead-worker-reap family (_loop_body into
-    # orchestration/reap_loop.py; _detect_ci_run_never_created,
-    # _apply_concurrency_governor, and dispatch into orchestration/reap_dispatch.py).
-    # Bodies moved verbatim apart from the #1627 ``_wf.`` namespace rebind. 6 raw
-    # log_event sites relocated out of workflow.py -- 5 from _loop_body, 1 from
-    # _apply_concurrency_governor; none allow-listed. As in L05, this is a
-    # total-preserving redistribution: workflow.py's entry drops by exactly those 6
-    # sites (89 -> 83) while its own slack is held at 5 (measured out-of-predicate raw
-    # count at this PR's base 4b7ccf7e after the move is 78, so 83 = 78 + 5), and each
-    # new module's entry equals its own relocated live count exactly (slack 0):
-    # reap_loop.py = 5, reap_dispatch.py = 1. The baseline-dict sum stays 247 and no
-    # ratchet ceiling loosens.
-    # L08 (#1639): _dispatch_impl moved verbatim to orchestration/dispatch_state.py
-    # (bodies unchanged apart from the #1627 ``_wf.`` rebind; the scanner is
-    # receiver-agnostic, so ``_wf.save_state(...)`` counts identically to a bare
-    # call). 28 out-of-predicate raw sites (16 save_state + 7 append_event + 5
-    # transition) relocate with it; none allow-listed. Same total-preserving
-    # redistribution: workflow.py drops by exactly those 28 (83 -> 55) with its
-    # slack held at 5 (measured out-of-predicate raw count after the move is 50, so
-    # 55 = 50 + 5), and dispatch_state.py's entry equals its relocated live count
-    # exactly (28, slack 0). The baseline-dict sum stays 247 and no ceiling loosens.
-    # PR #1792 (issue #1758): the cross-repo-gate override-label valve adds one
-    # new out-of-predicate save_state+append_event pair directly in
-    # orchestration/dispatch_state.py (not relocated from elsewhere), raising
-    # its entry from 28 to 30. This is a genuine new raw site, reviewed and
-    # accepted here rather than routed through WriteGate, because it sits in
-    # the same dispatch-transition code path as the other 28 already-accepted
-    # raw sites in this module.
-    "workflow.py": 55,
-    "orchestration/dispatch_state.py": 30,
-    "orchestration/reap_loop.py": 5,
-    # Issue #1770: +1 raw log_event call in _apply_concurrency_governor's new
-    # CI-headroom clamp branch (the dispatch_backpressure event recorded when
-    # ci_headroom_available()'s reading clamps fresh dispatch, mirroring the
-    # pre-existing open_pr_max clamp's own raw log_event call in the same
-    # function). Same out-of-wave class as that pre-existing site -- the
-    # ratchet holds at the new count (1 -> 2).
-    "orchestration/reap_dispatch.py": 2,
-    # Issue #1770: +1 raw log_event call in ci_headroom_available's
-    # _log_unavailable helper (the ci_headroom_unavailable diagnostic event).
-    # A standalone function in a new module, not an OrchestratorApp method,
-    # so it has no self.write_gate receiver -- same out-of-wave pattern as
-    # capacity_starvation_escalation.py below. Lives at top-level
-    # charlie_work/ci_headroom.py (not under orchestration/): that package is
-    # reserved for the Track 2 Phase B delegation installer's destination
-    # modules (every top-level def in a flat orchestration/ submodule is
-    # auto-installed onto OrchestratorApp -- see workflow_delegation.py), and
-    # this module's functions are plain standalone helpers with no ``self``,
-    # never meant to become OrchestratorApp members.
-    "ci_headroom.py": 1,
-    "orchestration/instrumentation_ops.py": 11,
-    "orchestration/state_rework_routing.py": 8,
-    "orchestration/state_stale_checks.py": 9,
-    "orchestration/state_record_review.py": 5,
-    "orchestration/state_dispatch_rework.py": 36,
-    "orchestration/state_rework_review.py": 2,
-    "orchestration/state_rescue.py": 2,
-    "orchestration/state_unauthorized_merge.py": 1,
-    # Issue #1768: +1 raw save_state call in the rewritten
-    # _maybe_emit_operator_queue_impact (formerly _maybe_emit_operator_queue_depth).
-    # The edge-triggered rewrite added a second, distinct raw-save path: when
-    # the sink drains to empty, a stale baseline signature is cleared with its
-    # own save_state (so a later refill fires fresh rather than being silently
-    # suppressed by stale state) -- separate from the pre-existing raw
-    # save_state on the fire path (arming the review cadence + recording the
-    # new baseline). Same out-of-wave raw-site class as this function's
-    # existing #1314 raw call. The ratchet holds at the new count.
-    "orchestration/state_maintenance.py": 9,
-    "orchestration/state_merge_train.py": 6,
-    "orchestration/state_operator_commands.py": 6,
-    "orchestration/state_approval.py": 4,
-    "orchestration/misc_review_verdicts.py": 4,
-    "orchestration/misc_reconcile.py": 4,
-    "orchestration/misc_escalation.py": 3,
-    "dead_worker_reap.py": 11,
-    # Issue #1423: +2 raw primitives in _reap_idle_foreign_writer (log_event
-    # for the foreign_writer_reaped instrumentation event, and kill_orphan_pid
-    # for sweeping the reaped writer's orphan processes). This is a standalone
-    # function in worktree.py, not an OrchestratorApp method, so it has no
-    # self.write_gate receiver and cannot use Convention A without a
-    # write_gate parameter threaded through every caller — the same
-    # out-of-wave pattern as the #1393 blocked-environment sites. The
-    # log_event call is best-effort (wrapped in try/except), and
-    # kill_orphan_pid is a process-kill primitive, not a state write. The
-    # ratchet holds at the new count until worktree.py's conversion wave.
-    "worktree.py": 3,
-    # Issue #763: +1 raw log_event call in detect_capacity_starvation_escalation
-    # (the sustained-window capacity-starvation escalation event). This is a
-    # standalone function in capacity_starvation_escalation.py, not an
-    # OrchestratorApp method, so it has no self.write_gate receiver and cannot
-    # use Convention A without a write_gate parameter threaded through every
-    # caller — the same out-of-wave pattern as the #1423 worktree.py sites.
-    # The ratchet holds at the new count until this module's conversion wave.
-    "capacity_starvation_escalation.py": 1,
-    # Issue #1514: +1 raw log_event call in launch_api_worker's budget-preflight
-    # refusal (the api_budget_refused event emitted when the daily/lifetime cap
-    # is exhausted, so the operator can see launches are being held by the
-    # budget). launch_api_worker is a standalone module-level function in
-    # api_worker.py, not an OrchestratorApp method, so it has no
-    # self.write_gate receiver and cannot use Convention A without a write_gate
-    # parameter threaded through every caller — the same out-of-wave pattern as
-    # the #763 capacity_starvation_escalation.py site. The log_event call is
-    # best-effort (instrumentation.log_event catches any I/O error internally,
-    # never breaking the launch path), and the refusal itself is returned as a
-    # ClaudeWorkerRecord value regardless of whether the event lands. The
-    # ratchet holds at the new count until api_worker.py's conversion wave.
-    "api_worker.py": 1,
-}
+_RATCHET_BASELINE_DIR = Path(__file__).parent / "baselines" / "write_gate"
+
+
+def _load_ratchet_baseline() -> dict[str, int]:
+    """Load the per-module raw-call baseline (issue #1802).
+
+    The baseline is a directory of ``<module-path>.count`` files under
+    ``tests/baselines/write_gate/`` -- one file per module, each carrying its
+    count on line 1 and the issue-by-issue audit trail the old inline dict
+    held as comments (``#`` lines after the first). The single shared dict
+    was a shared append point: concurrent PRs raising different modules'
+    counts conflicted on the same source lines. Per-entry files make
+    distinct-module bumps merge cleanly; same-module bumps still conflict on
+    the entry file (the required control direction).
+
+    Fail closed: a missing directory or a malformed/stray entry raises
+    ``BaselineFormatError``, which fails the test rather than silently
+    treating the module as baseline-0 (a missing entry would mask a module's
+    whole raw-call count).
+    """
+    try:
+        return load_count_baseline(_RATCHET_BASELINE_DIR)
+    except BaselineFormatError as exc:
+        pytest.fail(
+            f"write-gate ratchet baseline is missing or malformed at "
+            f"{_RATCHET_BASELINE_DIR} (fail closed): {exc}"
+        )
 
 
 def _format_inventory(sites: list[_RawPrimitiveSite]) -> str:
@@ -1890,7 +1586,7 @@ def test_ratchet_treats_a_brand_new_module_as_baseline_zero() -> None:
 #   1. Every IN-PREDICATE site (its enclosing function uses WriteGate) must
 #      be gate-routed or on the R4 allow-list -- zero tolerance, no ratchet.
 #   2. Every OUT-OF-PREDICATE module's raw-call count must not exceed its
-#      recorded _RATCHET_BASELINE -- shrink or hold only.
+#      recorded tests/baselines/write_gate/ entry -- shrink or hold only.
 # ---------------------------------------------------------------------------
 def test_write_gate_no_unaccounted_raw_primitive_calls() -> None:
     """The PR4 keystone. Fails loudly, naming every offending site or
@@ -1916,7 +1612,8 @@ def test_write_gate_no_unaccounted_raw_primitive_calls() -> None:
             continue
         out_of_predicate_counts[site.path] = out_of_predicate_counts.get(site.path, 0) + 1
 
-    regressed = _ratchet_violations(out_of_predicate_counts, _RATCHET_BASELINE)
+    ratchet_baseline = _load_ratchet_baseline()
+    regressed = _ratchet_violations(out_of_predicate_counts, ratchet_baseline)
     assert not regressed, (
         "Raw primitive call count increased in module(s) outside issue #1264's wave scope "
         "(R9's per-module shrink-only ratchet). A NEW raw write appeared in territory this "
@@ -1924,7 +1621,7 @@ def test_write_gate_no_unaccounted_raw_primitive_calls() -> None:
         "out of scope, this ratchet is the wrong place to relax; file/expand the owning "
         "follow-up issue instead:\n"
         + "\n".join(
-            f"  {module}: baseline={_RATCHET_BASELINE.get(module, 0)} "
+            f"  {module}: baseline={ratchet_baseline.get(module, 0)} "
             f"actual={out_of_predicate_counts[module]}"
             for module in regressed
         )

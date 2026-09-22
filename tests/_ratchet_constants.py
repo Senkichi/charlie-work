@@ -1,8 +1,9 @@
 """Shared test-side constant for the file-size ratchet surface.
 
 ``MARK_QUANTUM`` is authoritatively declared in
-``scripts/refresh_file_size_ratchet.py`` (the SOLE writer of
-``file_size_ratchet_baseline.json``). The test side needs the same value --
+``scripts/refresh_file_size_ratchet.py`` (the SOLE writer of the
+``file_size_ratchet_baseline/`` per-entry directory, issue #1802). The test
+side needs the same value --
 ``tests/test_file_size_ratchet.py`` uses it in the keystone's remedy text and
 mutation checks -- but test modules may not import each other
 (``tests/test_zero_cross_test_import_guard.py``), and the script is only

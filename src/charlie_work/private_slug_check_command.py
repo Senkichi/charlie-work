@@ -4,10 +4,21 @@ This module is the command wrapper extracted from the ``cli.py`` monolith so
 that new code does not land in an over-cap file (the file-size high-water-mark
 ratchet, issue #1442, forbids growing ``cli.py`` past its recorded mark).  The
 pure scanning logic lives in :mod:`charlie_work.private_slug_gate`; this module
-owns the argparse subparser registration, the baseline-file I/O, the
-``git diff``/``git show``/``git ls-files`` subprocess calls, and the
+owns the argparse subparser registration, the baseline-directory I/O, the
+``git diff``/``git ls-files`` subprocess calls, and the
 exit-code decision -- the same split ``cli.py``'s ``run_mojibake_check_command``
 uses with :mod:`charlie_work.mojibake_gate`.
+
+The baseline is the ``.private-slug-baseline/`` directory (issue #1802):
+
+* ``slugs/<slug>`` -- one empty marker file per gated slug (the config).
+* ``files/<repo-relative-path>.count`` -- recorded mention count per file;
+  first line is a non-negative integer, remaining lines are ``#`` comments.
+
+The check-mode baseline *increase* is derived from the diff itself
+(:func:`charlie_work.ratchet_baseline.count_delta_in_diff`), so no
+``git show <base>:...`` round-trip and no stored ``total`` that two
+concurrent PRs would conflict on.
 
 ``cli`` is imported lazily *inside* the functions that need it
 (``cli.bootstrap_command``, ``cli.run_captured``), never at module top level.
@@ -37,15 +48,24 @@ call time.
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from typing import Any
 
 from .config import ConfigError
 from .private_slug_gate import count_slug_mentions_in_text, find_slug_mentions_in_diff
+from .ratchet_baseline import (
+    BaselineFormatError,
+    count_delta_in_diff,
+    load_count_baseline,
+    load_set_baseline,
+    write_count_baseline,
+    write_set_baseline,
+)
 from .workflow import CommandResult
 
-PRIVATE_SLUG_BASELINE_FILENAME = ".private-slug-baseline.json"
+PRIVATE_SLUG_BASELINE_DIRNAME = ".private-slug-baseline"
+_SLUGS_DIRNAME = "slugs"
+_FILES_DIRNAME = "files"
 
 
 def register_private_slug_check_subparser(subparsers: argparse._SubParsersAction) -> None:
@@ -59,10 +79,11 @@ def register_private_slug_check_subparser(subparsers: argparse._SubParsersAction
         help=(
             "CI gate (issue #1502): fail if the diff adds net-new mentions "
             "of configured private sibling-repo slugs in tracked files. "
-            "Ratchet-style against .private-slug-baseline.json: a PR that "
-            "adds net-new mentions must bump the baseline total by at least "
-            "the net-new count (tamper-evident in diff review). Moves "
-            "(remove + add) produce zero net-new and do not trigger the gate."
+            "Ratchet-style against .private-slug-baseline/: a PR that "
+            "adds net-new mentions must raise the matching files/*.count "
+            "entries by at least the net-new count (tamper-evident in diff "
+            "review). Moves (remove + add) produce zero net-new and do not "
+            "trigger the gate."
         ),
     )
     private_slug_check.add_argument(
@@ -76,44 +97,56 @@ def register_private_slug_check_subparser(subparsers: argparse._SubParsersAction
         "--regenerate",
         action="store_true",
         help="Instead of checking, scan the working tree and rewrite "
-        ".private-slug-baseline.json with current per-file mention counts. "
-        "The slug list is read from the existing baseline file (or from "
-        "--slugs when the file does not exist yet). Run this after removing "
-        "mentions to tighten the ratchet, or after intentionally adding "
-        "mentions to update the baseline.",
+        ".private-slug-baseline/files/ with current per-file mention counts. "
+        "The slug list is read from the existing baseline directory's slugs/ "
+        "entries (or from --slugs when the directory does not exist yet). Run "
+        "this after removing mentions to tighten the ratchet, or after "
+        "intentionally adding mentions to update the baseline.",
     )
     private_slug_check.add_argument(
         "--slugs",
         default=None,
         help="Comma-separated slug list for --regenerate when the baseline "
-        "file does not exist yet (e.g. --slugs slug-one,slug-two). Ignored "
-        "in check mode (slugs come from the baseline file).",
+        "directory does not exist yet (e.g. --slugs slug-one,slug-two). Ignored "
+        "in check mode (slugs come from the baseline directory).",
     )
 
 
-def _load_baseline_file(path: Path) -> dict[str, Any]:
-    """Load and parse the private-slug baseline JSON file.
+def _load_slugs(baseline_dir: Path) -> list[str]:
+    """Load the configured slug list from ``<baseline_dir>/slugs/``.
 
-    Returns the parsed dict.  Raises ``ConfigError`` (caught by the CLI's
-    top-level handler) if the file is missing or malformed -- fail closed,
+    Raises ``ConfigError`` (caught by the CLI's top-level handler) when the
+    baseline directory or the slugs subdirectory is missing -- fail closed,
     matching the heartbeat-suppressions.yaml philosophy: a bad config can
     only ever add friction, never silently pass.
     """
-    if not path.exists():
-        raise ConfigError(
-            f"private-slug-check: baseline file not found: {path}. "
-            f"Create it with 'charlie private-slug-check --regenerate --slugs <list>'."
-        )
+    slugs_dir = baseline_dir / _SLUGS_DIRNAME
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        raise ConfigError(f"private-slug-check: malformed baseline file {path}: {exc}") from exc
+        return sorted(load_set_baseline(slugs_dir))
+    except BaselineFormatError as exc:
+        raise ConfigError(f"private-slug-check: {exc}") from exc
+
+
+def _load_head_counts(baseline_dir: Path) -> dict[str, int]:
+    """Load per-file mention counts from ``<baseline_dir>/files/``.
+
+    A missing ``files/`` directory is a legitimate zero-mention baseline
+    (the ratchet's ideal end state); a present-but-malformed one fails
+    closed.
+    """
+    files_dir = baseline_dir / _FILES_DIRNAME
+    if not files_dir.is_dir():
+        return {}
+    try:
+        return load_count_baseline(files_dir)
+    except BaselineFormatError as exc:
+        raise ConfigError(f"private-slug-check: {exc}") from exc
 
 
 def _regenerate_private_slug_baseline(
-    repo_root: Path, slugs: list[str], baseline_path: Path
+    repo_root: Path, slugs: list[str], baseline_dir: Path
 ) -> CommandResult:
-    """Scan tracked files and rewrite the baseline file with current counts."""
+    """Scan tracked files and rewrite the baseline directory's entries."""
     from . import cli  # deferred: see module docstring (circular-import / -m guard)
 
     ls_result = cli.run_captured(
@@ -129,8 +162,11 @@ def _regenerate_private_slug_baseline(
             {"slugs": slugs},
         )
 
+    baseline_prefix = PRIVATE_SLUG_BASELINE_DIRNAME + "/"
     tracked_files = [
-        f for f in ls_result.stdout.splitlines() if f and f != PRIVATE_SLUG_BASELINE_FILENAME
+        f
+        for f in ls_result.stdout.splitlines()
+        if f and not f.startswith(baseline_prefix) and f != ".private-slug-baseline.json"
     ]
 
     files: dict[str, int] = {}
@@ -146,17 +182,11 @@ def _regenerate_private_slug_baseline(
             files[rel_path] = count
             total += count
 
-    baseline = {
-        "version": 1,
-        "slugs": slugs,
-        "files": dict(sorted(files.items())),
-        "total": total,
-    }
-
-    # Atomic write (temp-file + replace), per CLAUDE.md invariant.
-    tmp = baseline_path.with_suffix(baseline_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(baseline, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(baseline_path)
+    # Per-entry writes (temp-file + replace inside write_count_baseline),
+    # per CLAUDE.md's atomic state-write invariant. Stale entries are
+    # removed so the directory tracks the live tree exactly.
+    write_count_baseline(baseline_dir / _FILES_DIRNAME, files)
+    write_set_baseline(baseline_dir / _SLUGS_DIRNAME, slugs)
 
     return CommandResult(
         True,
@@ -169,29 +199,34 @@ def _regenerate_private_slug_baseline(
 def run_private_slug_check_command(args: argparse.Namespace) -> CommandResult:
     """CI gate (issue #1502): fail if the diff adds net-new private-slug mentions.
 
-    Loads the slug list and baseline total from ``.private-slug-baseline.json``
-    at the repo root, runs ``git diff <base>..HEAD``, and scans every added
+    Loads the slug list from ``.private-slug-baseline/slugs/`` and the
+    per-file mention counts from ``.private-slug-baseline/files/`` at the
+    repo root, runs ``git diff <base>..HEAD``, and scans every added
     and removed line for mentions of the configured slugs.  The gate fails
-    when ``net_new = added - removed > 0`` AND the baseline ``total`` did not
-    increase by at least ``net_new`` between *base* and HEAD -- i.e. a PR
+    when ``net_new = added - removed > 0`` AND the baseline entries' net
+    increase in the same diff is smaller than ``net_new`` -- i.e. a PR
     that adds new mentions must also bump the baseline, and that bump is
-    tamper-evident in the diff.
+    tamper-evident in the diff.  The baseline increase is derived from the
+    diff's own ``.count`` entry changes
+    (:func:`charlie_work.ratchet_baseline.count_delta_in_diff`), so there is
+    no stored ``total`` for two PRs to conflict over and no second git
+    call.
 
     Moves (remove from one location, add to another) produce zero net-new
     and pass regardless of the baseline, which is why the gate counts
-    net-new rather than scanning added lines alone.  The baseline file
+    net-new rather than scanning added lines alone.  The baseline directory
     itself is excluded from the scan because it *lists* slugs as config.
 
     Uses a two-dot diff (``base..HEAD``) for the same shallow-clone reason
-    as the mojibake gate.  The baseline total at *base* is read via
-    ``git show <base>:.private-slug-baseline.json``; if the file does not
-    exist at *base* (first PR introducing the gate), the base total is 0
-    and any net-new mentions require a matching baseline bump.
+    as the mojibake gate.  If the baseline directory does not exist at the
+    base ref (first PR introducing the gate), its entries show up as new
+    files in the diff, so the whole directory counts as the increase --
+    the same ``base_total = 0`` semantics the JSON baseline had.
 
     With ``--regenerate``, the command instead scans the working tree and
-    rewrites the baseline file with current per-file mention counts.  The
-    slug list is read from the existing baseline (or from ``--slugs`` when
-    the file does not exist yet).
+    rewrites the baseline directory with current per-file mention counts.
+    The slug list is read from the existing ``slugs/`` entries (or from
+    ``--slugs`` when the directory does not exist yet).
 
     Errors as values (per CLAUDE.md): git failures come back as
     ``CommandResult(ok=False)`` -- never raised -- so the CI step exits
@@ -200,54 +235,42 @@ def run_private_slug_check_command(args: argparse.Namespace) -> CommandResult:
     from . import cli  # deferred: see module docstring (circular-import / -m guard)
 
     ctx = cli.bootstrap_command(args)
-    baseline_path = ctx.repo_root / PRIVATE_SLUG_BASELINE_FILENAME
+    baseline_dir = ctx.repo_root / PRIVATE_SLUG_BASELINE_DIRNAME
 
-    # --- --regenerate mode: scan tree, rewrite baseline ---
+    # --- --regenerate mode: scan tree, rewrite baseline entries ---
     if getattr(args, "regenerate", False):
-        if baseline_path.exists():
-            existing = _load_baseline_file(baseline_path)
-            slugs = existing.get("slugs", [])
+        if baseline_dir.is_dir():
+            slugs = _load_slugs(baseline_dir)
         else:
             raw = getattr(args, "slugs", None)
             if not raw:
                 return CommandResult(
                     False,
                     "private-slug-check: --regenerate requires --slugs when "
-                    "the baseline file does not exist yet.",
+                    "the baseline directory does not exist yet.",
                     {},
                 )
             slugs = [s.strip() for s in raw.split(",") if s.strip()]
-        return _regenerate_private_slug_baseline(ctx.repo_root, slugs, baseline_path)
+        return _regenerate_private_slug_baseline(ctx.repo_root, slugs, baseline_dir)
 
     # --- check mode: diff-based ratchet gate ---
-    baseline = _load_baseline_file(baseline_path)
-    slugs = baseline.get("slugs", [])
+    if not baseline_dir.is_dir():
+        raise ConfigError(
+            f"private-slug-check: baseline directory not found: {baseline_dir}. "
+            f"Create it with 'charlie private-slug-check --regenerate --slugs <list>'."
+        )
+    slugs = _load_slugs(baseline_dir)
     if not slugs:
         return CommandResult(
             False,
-            "private-slug-check: baseline file has empty 'slugs' list -- "
+            "private-slug-check: baseline directory has an empty slugs/ set -- "
             "nothing to check. Populate it or remove the gate.",
             {"slugs": slugs},
         )
 
-    head_total = baseline.get("total", 0)
+    head_counts = _load_head_counts(baseline_dir)
+    head_total = sum(head_counts.values())
     base = getattr(args, "base", "origin/main")
-
-    # Read the baseline total at the base ref to compute the bump.
-    base_show = cli.run_captured(
-        ["git", "show", f"{base}:{PRIVATE_SLUG_BASELINE_FILENAME}"],
-        cwd=ctx.repo_root,
-        timeout_seconds=30,
-    )
-    if base_show.ok:
-        try:
-            base_baseline = json.loads(base_show.stdout)
-            base_total = base_baseline.get("total", 0)
-        except json.JSONDecodeError:
-            base_total = 0
-    else:
-        # File did not exist at base (first PR introducing the gate).
-        base_total = 0
 
     diff_result = cli.run_captured(
         ["git", "diff", f"{base}..HEAD"],
@@ -265,10 +288,15 @@ def run_private_slug_check_command(args: argparse.Namespace) -> CommandResult:
     delta = find_slug_mentions_in_diff(
         diff_result.stdout,
         slugs,
-        exclude_paths=frozenset({PRIVATE_SLUG_BASELINE_FILENAME}),
+        exclude_paths=frozenset(
+            {".private-slug-baseline.json", PRIVATE_SLUG_BASELINE_DIRNAME + "/"}
+        ),
     )
 
-    baseline_increase = head_total - base_total
+    baseline_increase = count_delta_in_diff(
+        diff_result.stdout,
+        f"{PRIVATE_SLUG_BASELINE_DIRNAME}/{_FILES_DIRNAME}",
+    )
 
     data: dict[str, Any] = {
         "base": base,
@@ -290,10 +318,12 @@ def run_private_slug_check_command(args: argparse.Namespace) -> CommandResult:
             f"private-slug-check: {delta.net_new} net-new private-slug mention(s) "
             f"in diff against {base}\n"
             + "\n".join(lines)
-            + f"\nBaseline total increased by {baseline_increase} but {delta.net_new} "
-            f"net-new mention(s) were added. Bump the 'total' (and per-file counts) "
-            f"in {PRIVATE_SLUG_BASELINE_FILENAME} to acknowledge the new mentions, "
-            f"or remove the mentions. The baseline bump is tamper-evident in diff review."
+            + f"\nBaseline entries increased by {baseline_increase} but "
+            f"{delta.net_new} net-new mention(s) were added. Raise the matching "
+            f"{PRIVATE_SLUG_BASELINE_DIRNAME}/{_FILES_DIRNAME}/<path>.count "
+            f"entries (or add new ones) to acknowledge the new mentions, "
+            f"or remove the mentions. The baseline bump is tamper-evident in "
+            f"diff review."
         )
         return CommandResult(False, message, data)
 

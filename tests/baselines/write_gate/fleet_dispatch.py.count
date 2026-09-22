@@ -1,0 +1,5 @@
+11
+# Issue #1372: +3 log_event calls in fleet_loop's stale-entry handling
+# (stale detection warning, prune warning, and the existing lane-completed
+# events). These are out-of-wave raw sites in unconverted territory, same
+# class as the pre-existing 8 — the ratchet holds at the new count.
