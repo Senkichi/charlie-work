@@ -268,6 +268,9 @@ def _init_repo(repo: Path) -> None:
     _git(repo, "config", "user.name", "test")
     _git(repo, "config", "user.email", "test@example.com")
     _git(repo, "config", "commit.gpgsign", "false")
+    # git-for-windows fails to write objects/index entries past MAX_PATH when
+    # the pytest tmpdir sits under a deep worktree path; harmless elsewhere.
+    _git(repo, "config", "core.longpaths", "true")
 
 
 def _commit_entry(repo: Path, key: str, value: int, branch: str, message: str) -> None:
