@@ -527,6 +527,15 @@ def test_ci_findings_header_ratio_still_matches_the_bands_own_justification() ->
     and the total to 680. No unit was added or removed -- this is docstring
     and import-line growth within existing units, still comfortably inside
     the same [50, 80]-line judgment call the #1686 update reconfirmed.
+
+    Re-measured a third time at issue #1682: ``check_dispatch_staleness``
+    gained the progress-bounded #1110 exemption arm (the
+    ``dependency_root_blocker_idle`` reason) plus its docstring paragraph,
+    and one import line was added for
+    ``.dispatch_cadence._dependency_root_blocker_progress`` -- the helper
+    pair itself lives in ``dispatch_cadence.py`` because this module was at
+    the file-size ratchet cap, so no unit was added or removed here either.
+    Header is now 56 lines, total 732.
     """
     ci_findings_source = _CI_FINDINGS_PATH.read_text(encoding="utf-8")
     ci_findings_lines = ci_findings_source.splitlines()
@@ -541,14 +550,14 @@ def test_ci_findings_header_ratio_still_matches_the_bands_own_justification() ->
     # the exact arithmetic (which involved manual line-classification at
     # Preflight time, e.g. deciding a bare `)` closing a multi-line import
     # counts toward "import block" but not toward "docstring").
-    assert header_length == 55, (
-        f"ci_findings.py's header length is now {header_length} lines, expected 55 -- "
+    assert header_length == 56, (
+        f"ci_findings.py's header length is now {header_length} lines, expected 56 -- "
         "the cap-exemption band this file asserts was derived from that figure; if "
         "ci_findings.py has genuinely changed shape, the band needs re-deriving, not "
         "this guard silently loosened"
     )
-    assert len(ci_findings_lines) == 680, (
-        f"ci_findings.py is now {len(ci_findings_lines)} lines total, expected 680 -- "
+    assert len(ci_findings_lines) == 732, (
+        f"ci_findings.py is now {len(ci_findings_lines)} lines total, expected 732 -- "
         "same drift-guard rationale as the header-length assertion above"
     )
 
