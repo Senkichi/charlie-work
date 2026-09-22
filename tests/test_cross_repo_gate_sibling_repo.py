@@ -250,9 +250,16 @@ def test_traversal_candidate_escaping_dispatching_root_is_missing(tmp_path: Path
     "at least one referenced path exists in the target repo" pass branch.
     The fix routes both branches through :func:`_resolve_within_root`
     (``safe_path.contains``), so the candidate is missing and — with no
-    fleet registry supplied — the gate abstains."""
+    fleet registry supplied — the gate abstains.
+
+    ``this_repo`` is a real ``git init``-ed repo so ``_is_gitignored``'s
+    ``git check-ignore`` consults this repo's own rules — the production
+    shape — rather than silently inheriting the ignore rules of whatever
+    worktree happens to enclose ``tmp_path`` (which neutralizes the
+    candidate before the gate logic under test is ever reached)."""
     this_repo = tmp_path / "charlie-work"
     this_repo.mkdir()
+    _git(this_repo, "init", "-q")
     # Sibling of `this_repo`, one level up -- reachable from inside
     # `this_repo` via `../outside/secret.py`, but NOT a descendant of
     # `this_repo`'s own root.
