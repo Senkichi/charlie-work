@@ -234,7 +234,16 @@ def run_private_slug_check_command(args: argparse.Namespace) -> CommandResult:
     """
     from . import cli  # deferred: see module docstring (circular-import / -m guard)
 
-    ctx = cli.bootstrap_command(args)
+    # Same opt-out as ast-equivalence-check (issue #1600): this command only
+    # ever inspects or regenerates against the checkout it was invoked from
+    # -- it mutates no orchestrator state.  bootstrap_command defaults to
+    # redirecting a linked-worktree cwd to the shared main worktree root
+    # (issue #648 state-safety), but that redirect makes check mode scan the
+    # main worktree's ``base..HEAD`` diff instead of the invoking
+    # worktree's -- in a linked worktree that diff is always empty, so the
+    # gate reports a false clean -- and makes --regenerate scan the wrong
+    # tree's files.
+    ctx = cli.bootstrap_command(args, redirect_to_main_worktree=False)
     baseline_dir = ctx.repo_root / PRIVATE_SLUG_BASELINE_DIRNAME
 
     # --- --regenerate mode: scan tree, rewrite baseline entries ---

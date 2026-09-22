@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from charlie_work.paths import runtime_paths
+from charlie_work.paths import find_repo_root, runtime_paths
 
 
 def test_runtime_paths_are_repo_relative(tmp_path: Path) -> None:
@@ -146,3 +146,21 @@ def test_runtime_paths_silent_when_state_json_exists(tmp_path: Path, caplog: Any
         runtime_paths(tmp_path, ".var/charlie-work")
 
     assert not caplog.records
+
+
+def test_find_repo_root_explicit_marker_git_dir_returns_self(tmp_path: Path) -> None:
+    """An explicit ``--repo`` naming a directory that contains a ``.git``
+    *directory* must be honored as the root even when the ``.git`` dir is
+    not a readable gitdir. Git discovery treats an empty ``.git`` as
+    non-repository and walks past it into an enclosing repo — under a
+    basetemp nested inside a checkout (worker-sandbox TMPDIR) that
+    silently retargets ``--repo`` at the *enclosing* repo's state, the
+    same misroute class issues #648/#895 close down. Test-fake repos
+    (``_cli_fixtures._make_repo``) rely on the marker form — this test
+    exercises exactly that shape, and in a repo-nested basetemp it
+    distinguishes the fix from the absorption the git-discovery path
+    used to produce."""
+    marker_repo = tmp_path / "fake-repo"
+    (marker_repo / ".git").mkdir(parents=True)
+
+    assert find_repo_root(marker_repo, explicit=True) == marker_repo.resolve()

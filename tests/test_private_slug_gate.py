@@ -724,3 +724,40 @@ def test_cli_regenerate_without_slugs_and_no_baseline_fails(monkeypatch, tmp_pat
 
     assert result.ok is False
     assert "--slugs" in result.message
+
+
+# --- CLI: linked-worktree redirect opt-out ---
+
+
+def test_cli_check_passes_no_redirect_to_bootstrap(monkeypatch, tmp_path) -> None:
+    """``private-slug-check`` is a read-only diagnostic (check mode) / local
+    regeneration tool (--regenerate).  It must call ``bootstrap_command`` with
+    ``redirect_to_main_worktree=False`` so it inspects the worktree it was
+    invoked from, not the shared main worktree -- the same opt-out
+    ``ast-equivalence-check`` took in issue #1600.  Without it, running the
+    gate from a linked worktree diffs ``base..HEAD`` in the main checkout
+    (always an empty diff) and reports a false clean -- the failure mode that
+    let net-new slug mentions reach CI green locally on PR #1806.
+    """
+    _write_baseline(tmp_path, files={"src/old.py": 10})
+    captured: dict[str, object] = {}
+
+    def mock_bootstrap(args, **kwargs):
+        captured["kwargs"] = kwargs
+        from charlie_work.github import GitHub
+        from charlie_work.paths import RuntimePaths
+
+        return cli_module.CommandContext(
+            repo_root=tmp_path,
+            config=OrchestratorConfig(),
+            paths=RuntimePaths.__new__(RuntimePaths),
+            gh=GitHub(repo_root=tmp_path, runtime=None, dry_run=True),
+        )
+
+    monkeypatch.setattr(cli_module, "bootstrap_command", mock_bootstrap)
+    monkeypatch.setattr(cli_module, "run_captured", lambda *a, **k: _mock_git_diff(""))
+
+    result = cli_module.run_private_slug_check_command(_cli_args())
+
+    assert result.ok is True
+    assert captured["kwargs"] == {"redirect_to_main_worktree": False}

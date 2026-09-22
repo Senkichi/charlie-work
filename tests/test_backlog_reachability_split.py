@@ -57,6 +57,10 @@ _MOVED_NAMES = (
     "fetch_merged_prs_fail_open",
     "resolve_dispatch_mention_coverage",
     "scan_merged_pr_references",
+    # Issue #1803: added with the mention-gate redesign, not part of the
+    # original move -- the module's namespace is still the contract, so
+    # new units land here (and in the facade) rather than bypassing it.
+    "mention_scan_repo_context",
 )
 
 
@@ -227,7 +231,9 @@ def test_all_backlog_reachability_names_are_reexported_by_identity() -> None:
 
     names = _module_level_defined_names(_BACKLOG_REACHABILITY_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 6, f"expected 6 moved units, found {len(names)}: {sorted(names)}"
+    assert len(names) == len(_MOVED_NAMES), (
+        f"expected {len(_MOVED_NAMES)} module-level units, found {len(names)}: {sorted(names)}"
+    )
     assert set(names) == set(_MOVED_NAMES), (
         f"AST-derived names {sorted(names)} do not match the expected moved set "
         f"{sorted(_MOVED_NAMES)}"

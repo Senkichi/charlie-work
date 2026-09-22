@@ -114,16 +114,20 @@ PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,a
 # Consumers: workflow._merged_pr_referenced_issue_numbers() (via
 # linked_issue_number()/issue_numbers_mentioned_by_pr()) reads the identity and
 # branch fields; post-merge audit paths additionally need `headRefOid` to tell
-# *which commit* was merged, not merely that a merge happened.
+# *which commit* was merged, not merely that a merge happened; and issue
+# #1803's mention-gate temporal rule needs `mergedAt` to prove a merged PR
+# did not predate the issue it textually mentions (a PR merged before the
+# issue existed cannot have addressed it).
 #
 # Deliberately narrower than PR_LIST_FIELDS: merged PRs don't need current
 # CI/review/label state, and `statusCheckRollup` in particular forces gh's
 # GraphQL query to walk each PR's check-run connection -- expensive across up
 # to 500 merged PRs and the cause of intermittent gateway 502s on this query
-# (issue #361). `headRefOid` carries no such cost: it is a scalar on the PR
-# object, and on the REST path it is already present in the payload as
-# head.sha, so adding it costs neither an extra request nor a graph walk.
-MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,headRefOid"
+# (issue #361). `headRefOid`/`mergedAt` carry no such cost: they are scalars
+# on the PR object, and on the REST path they are already present in the
+# payload as head.sha/merged_at, so adding them costs neither an extra
+# request nor a graph walk.
+MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,headRefOid,mergedAt"
 
 
 # Moved from ``github.py`` verbatim alongside ``merged_prs_for_issue`` (Track

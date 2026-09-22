@@ -15,10 +15,11 @@ not grow past its file-size ratchet high-water mark:
 verbatim from ``_merged_pr_referenced_issue_numbers``), the mention-coverage
 map builder ``compute_mention_coverage_map``, the fail-open merged-PR fetch
 ``fetch_merged_prs_fail_open``, and the dispatch-side fetch/reuse resolver
-``resolve_dispatch_mention_coverage``. The classifier's mention-coverage arm
-and the dispatch-side exclusion both call ``scan_merged_pr_references`` (via
-the app's thin wrapper), so the exclusion semantics cannot drift between the
-two paths.
+``resolve_dispatch_mention_coverage``. The classifier's mention-coverage arm,
+the dispatch-side exclusion, and ``state_merge_train``'s
+externally-merged finalization mention scan (issue #1803 rework) all call
+``scan_merged_pr_references`` (via the app's thin wrapper), so the exclusion
+semantics cannot drift between the paths.
 
 ``workflow.py`` re-exports all symbols via a facade import block (mirroring
 ``config.py``'s ``RunnerAllocationConfig`` re-export pattern and this
@@ -30,9 +31,13 @@ paths and monkeypatch targets keep working unchanged.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
+from .ci_findings import _parse_iso_ts
 from .config import OrchestratorConfig
+from .fleet_registry import managed_repo_names
 from .github import (
     GitHubError,
     GitHubLike,
@@ -304,20 +309,66 @@ def classify_backlog_reachability(
 # ---------------------------------------------------------------------------
 
 
+def mention_scan_repo_context(
+    gh: GitHubLike,
+    repo_root: Path,
+    fleet_dir_override: str | None,
+) -> tuple[str | None, frozenset[str]]:
+    """Issue #1803: resolve the repo identity the mention-qualifier check needs.
+
+    Returns ``(current_repo, other_repo_names)``:
+
+    * ``current_repo`` -- the dispatching repo's ``owner/repo`` slug from
+      ``gh.name_with_owner()``, or ``None`` when the lookup fails (offline,
+      gh missing). A slug-shaped mention qualifier (``owner/repo issue
+      #N``, ``issue owner/repo#N``) counts as foreign when the slug cannot
+      be resolved; the repo-name fallback below does not change that —
+      see ``github._mention_qualifier_is_foreign``.
+    * ``other_repo_names`` -- the fleet's managed repo-name segments minus
+      the dispatching repo's own name, derived from the fleet registry on
+      disk (never a hardcoded list — the same source
+      ``cross_repo_scope_gate`` uses). Falls back to ``repo_root.name``
+      for the self-name when the slug lookup fails.
+    """
+    try:
+        current_repo = gh.name_with_owner() or None
+    except Exception:
+        # Same fail-open posture as ``_dispatching_repo_name``: the mention
+        # gate is advisory, so an unresolvable slug must not crash the scan.
+        current_repo = None
+    dispatching_name = current_repo.rsplit("/", 1)[-1] if current_repo else repo_root.name
+    other_repo_names = frozenset(
+        name
+        for name in managed_repo_names(fleet_dir_override)
+        if name.lower() != dispatching_name.lower()
+    )
+    return current_repo, other_repo_names
+
+
 def scan_merged_pr_references(
     issues: list[dict[str, Any]],
     merged_prs: list[dict[str, Any]],
     branch_prefix: str,
-) -> tuple[set[int], set[int], set[int], dict[int, list[int]]]:
+    *,
+    current_repo: str | None = None,
+    other_repo_names: Iterable[str] = (),
+) -> tuple[
+    set[int],
+    set[int],
+    set[int],
+    dict[int, list[int]],
+    dict[int, list[dict[str, Any]]],
+]:
     """Return ready issues already covered by a merged PR, split by trust level.
 
     Extracted verbatim from ``workflow.py``'s ``_merged_pr_referenced_issue_numbers``
     method (issue #1337 moved it here so the mention-PR tracking it added does
     not grow the monolith past its ratchet high-water mark). The thin wrapper
-    on ``OrchestratorApp`` passes ``self.config.dispatch.branch_prefix``.
+    on ``OrchestratorApp`` passes ``self.config.dispatch.branch_prefix`` plus
+    the ``mention_scan_repo_context`` values (issue #1803).
 
     Returns a ``(bound, mention_only, bound_pr_numbers,
-    mention_pr_numbers_by_issue)`` 4-tuple:
+    mention_pr_numbers_by_issue, mention_pr_details_by_issue)`` 5-tuple:
 
     * ``bound`` -- ``linked_issue_number`` binds the PR to the issue by a
       hijack-safe signal (same-repo branch-prefix or closing-action verb).
@@ -345,13 +396,46 @@ def scan_merged_pr_references(
       map too). Consumed by the backlog-reachability classifier to name
       the mentioning PR(s) in its ``mention_covered_awaiting_operator``
       reason.
+    * ``mention_pr_details_by_issue`` -- issue_number -> per-mentioning-PR
+      detail dicts ``{"number", "merged_at", "merged_at_unknown"}``
+      (issue #1803). ``merged_at`` is the PR's raw timestamp (``mergedAt``
+      GraphQL spelling preferred, ``merged_at`` REST spelling accepted);
+      ``merged_at_unknown`` is True when the temporal check below could
+      not run because either side's timestamp was missing or unparseable
+      — the mention counted under the fail-safe, and the flag event
+      reports this so the case is countable rather than invisible.
 
     The bound/mention sets are intersected with the supplied issue set so a
     stray mention of an issue not in the dispatch queue does not get
     actioned. ``bound`` takes precedence: an issue bound by one merged PR
     but only mentioned by another is reported solely in ``bound``.
+
+    Issue #1803 narrows ``mention_only`` two ways, both inside this scan so
+    dispatch exclusion and the reachability classifier cannot drift:
+
+    * A mention whose immediate qualifier names another repo
+      (``private issue #N``, ``owner/repo issue #N``,
+      ``issue owner/repo#N``, or another managed repo's name) is dropped
+      inside ``issue_numbers_mentioned_by_pr`` — qualified mentions are
+      explicit about which tracker the number belongs to.
+    * A merged PR whose ``mergedAt``/``merged_at`` is *earlier* than the
+      issue's ``createdAt`` cannot have addressed the issue — the
+      reference predates it (the jobcannon incident: PR #43 merged
+      2026-08-13, issues #377/#391 filed 2026-09-04). Missing or
+      unparseable timestamps on EITHER side fail toward the previous
+      behaviour: the mention still counts, marked ``merged_at_unknown``
+      in the detail map.
     """
     ready_issue_numbers = {int(issue["number"]) for issue in issues}
+    # Issue #1803: keep only str timestamps -- ``_parse_iso_ts``'s contract
+    # takes str, and a non-str field value (corrupt payload, non-JSON test
+    # fixture) must read as "timestamp unknown", not crash on ``.replace``.
+    created_at_by_number = {
+        int(issue["number"]): created
+        for issue in issues
+        if issue.get("number") is not None
+        and isinstance((created := issue.get("createdAt") or issue.get("created_at")), str)
+    }
     bound: set[int] = set()
     bound_pr_numbers: set[int] = set()
     mention_only: set[int] = set()
@@ -361,6 +445,10 @@ def scan_merged_pr_references(
     # issue_number -> list of PR numbers (accumulated across PRs; a
     # single issue can be mentioned by multiple merged PRs).
     mention_prs: dict[int, list[int]] = {}
+    # Issue #1803: per-issue mention detail (PR number, merged_at,
+    # merged_at_unknown) accumulated in the same loop for the flag
+    # event's observability payload.
+    mention_details: dict[int, list[dict[str, Any]]] = {}
     for pr in merged_prs:
         if str(pr.get("state") or "").upper() != "MERGED":
             continue
@@ -388,20 +476,57 @@ def scan_merged_pr_references(
         # It cannot fully guard a cross-repo mention collision, but it does
         # guard the common case of a fork PR's text being trusted at all.
         if pr.get("isCrossRepository") is False:
-            for mentioned in issue_numbers_mentioned_by_pr(pr):
-                if mentioned in ready_issue_numbers:
-                    mention_only.add(mentioned)
-                    mention_prs.setdefault(mentioned, []).append(pr_number)
+            pr_merged_at_raw = pr.get("mergedAt") or pr.get("merged_at")
+            for mentioned in issue_numbers_mentioned_by_pr(
+                pr,
+                current_repo=current_repo,
+                other_repo_names=other_repo_names,
+            ):
+                if mentioned not in ready_issue_numbers:
+                    continue
+                # Issue #1803 temporal hard rule: a PR merged before the
+                # issue existed cannot have addressed it. The exclusion
+                # applies ONLY when both timestamps parse — a missing or
+                # unparseable value on either side keeps the mention
+                # (fail toward the previous flagging behaviour) and is
+                # marked merged_at_unknown so the flag event can count it.
+                issue_created = _parse_iso_ts(created_at_by_number.get(mentioned) or "")
+                pr_merged = (
+                    _parse_iso_ts(pr_merged_at_raw) if isinstance(pr_merged_at_raw, str) else None
+                )
+                timestamp_unknown = issue_created is None or pr_merged is None
+                if not timestamp_unknown and pr_merged < issue_created:
+                    continue
+                mention_only.add(mentioned)
+                mention_prs.setdefault(mentioned, []).append(pr_number)
+                mention_details.setdefault(mentioned, []).append(
+                    {
+                        "number": pr_number,
+                        "merged_at": pr_merged_at_raw,
+                        "merged_at_unknown": timestamp_unknown,
+                    }
+                )
     mention_only -= bound
-    # Drop bound issues from the mention-PR map: ``bound`` takes
+    # Drop bound issues from the mention-PR maps: ``bound`` takes
     # precedence, so a bound issue is never reported as mention-only.
     for bound_issue in bound:
         mention_prs.pop(bound_issue, None)
+        mention_details.pop(bound_issue, None)
     mention_pr_numbers_by_issue = {
         issue_number: sorted(pr_numbers)
         for issue_number, pr_numbers in sorted(mention_prs.items())
     }
-    return bound, mention_only, bound_pr_numbers, mention_pr_numbers_by_issue
+    mention_pr_details_by_issue = {
+        issue_number: sorted(details, key=lambda d: d["number"])
+        for issue_number, details in sorted(mention_details.items())
+    }
+    return (
+        bound,
+        mention_only,
+        bound_pr_numbers,
+        mention_pr_numbers_by_issue,
+        mention_pr_details_by_issue,
+    )
 
 
 def compute_mention_coverage_map(
@@ -440,7 +565,7 @@ def compute_mention_coverage_map(
     """
     if not issues or not resolved_merged_prs:
         return {}
-    _bound, mention_only, _bound_pr_numbers, mention_pr_numbers_by_issue = (
+    _bound, mention_only, _bound_pr_numbers, mention_pr_numbers_by_issue, _details = (
         app._merged_pr_referenced_issue_numbers(issues, resolved_merged_prs)
     )
     if not mention_only:
