@@ -49,10 +49,21 @@ from .subprocess_runner import no_console_window_kwargs
 # malformed or adversarial in some other way, so the walk can never spin.
 _MAX_CHAIN_DEPTH = 4096
 
-# Timeout for the PowerShell process-snapshot query. Generous relative to
+# Timeout for one PowerShell process-snapshot attempt. Generous relative to
 # `process_utils.sweep_orphan_processes`'s 10s because this queries every
-# process on the host, not a CommandLine-filtered subset.
-_LIST_PROCESSES_TIMEOUT_SECONDS = 15
+# process on the host, not a CommandLine-filtered subset. The original 15s
+# budget was empirically too tight: the hosted-CI Tests job on PR #1805
+# timed out under pytest-xdist load. 60s matches `_DEFAULT_TIMEOUT_SECONDS`
+# in worktree.py for local subprocess work.
+_LIST_PROCESSES_TIMEOUT_SECONDS = 60
+
+# A loaded host can stall a single full-CIM enumeration without anything
+# being wrong, so a timeout is retried once -- the same convention as
+# `worktree._run_remote_captured`. Any other failure mode (non-zero exit,
+# unparseable output) is deterministic and is not retried. Worst case the
+# gate blocks for 2 * _LIST_PROCESSES_TIMEOUT_SECONDS before failing
+# closed.
+_LIST_PROCESSES_ATTEMPTS = 2
 
 
 @dataclass(frozen=True)
@@ -288,29 +299,40 @@ def list_processes() -> tuple[Sequence[ProcessInfo], str | None]:
     if not shutil.which("powershell"):
         return (), "powershell executable not found on PATH"
 
-    try:
-        result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                # No `-AsArray`: that switch is PowerShell 6+. Windows PowerShell
-                # 5.1 -- the edition this host ships -- fails the whole command
-                # with a ParameterBindingException, which made every quiescence
-                # check on 5.1 fail closed and report "not quiescent" regardless
-                # of what was actually running. The single-result normalization
-                # below is what makes dropping it safe.
-                "Get-CimInstance Win32_Process | "
-                "Select-Object ProcessId, ParentProcessId, Name, CommandLine | "
-                "ConvertTo-Json",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_LIST_PROCESSES_TIMEOUT_SECONDS,
-            **no_console_window_kwargs(),
-        )
-    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError) as exc:
-        return (), f"powershell invocation failed: {exc}"
+    last_timeout_error: str | None = None
+    result: subprocess.CompletedProcess[str] | None = None
+    for _ in range(_LIST_PROCESSES_ATTEMPTS):
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    # No `-AsArray`: that switch is PowerShell 6+. Windows
+                    # PowerShell 5.1 -- the edition this host ships -- fails
+                    # the whole command with a ParameterBindingException,
+                    # which made every quiescence check on 5.1 fail closed
+                    # and report "not quiescent" regardless of what was
+                    # actually running. The single-result normalization
+                    # below is what makes dropping it safe.
+                    "Get-CimInstance Win32_Process | "
+                    "Select-Object ProcessId, ParentProcessId, Name, CommandLine | "
+                    "ConvertTo-Json",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_LIST_PROCESSES_TIMEOUT_SECONDS,
+                **no_console_window_kwargs(),
+            )
+            break
+        except subprocess.TimeoutExpired as exc:
+            last_timeout_error = f"powershell invocation failed: {exc}"
+        except (subprocess.SubprocessError, OSError) as exc:
+            return (), f"powershell invocation failed: {exc}"
+    if result is None:
+        # Reached only when every attempt raised TimeoutExpired -- all other
+        # failure modes return inside the loop.
+        return (), last_timeout_error or "powershell invocation failed"
 
     if result.returncode != 0:
         stderr = (result.stderr or "").strip()
