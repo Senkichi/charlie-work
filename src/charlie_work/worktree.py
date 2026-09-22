@@ -35,7 +35,7 @@ from .config import (
     WRITER_MARKER_FILENAME,
 )
 from . import git_pull_blockers
-from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS
+from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS, WORKTREE_PR_HEAD_FIELDS
 from .issue_linking import linked_issue_number
 from .janitor import _calculate_patch_id
 from . import layout
@@ -5154,8 +5154,11 @@ class WorktreeCleanResult:
 class WorktreeCleanGH(Protocol):
     """Slice of :class:`GitHub` that ``clean_worktrees`` depends on.
 
-    The cleanup lane only reads PR merge state via a single ``gh pr view``
-    call, so it needs just ``run`` -- the rest of ``GitHub`` (list caches,
+    The cleanup lane only reads: PR merge state via ``gh pr view``, and --
+    only when state.json carries no linked PR for the worktree's issue -- a
+    ``gh pr list --head <branch> --state all`` fallback that discovers the
+    PR by head branch (issue #1713). It needs just ``run`` -- the rest of
+    ``GitHub`` (list caches,
     mutating ops, retry config) is irrelevant here. Narrowing the parameter
     type to this protocol lets test doubles satisfy the contract structurally
     without subclassing the frozen ``GitHub`` dataclass, and documents exactly
@@ -5165,6 +5168,47 @@ class WorktreeCleanGH(Protocol):
     def run(
         self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
     ) -> Any: ...
+
+
+def _pr_number_for_head_branch(gh: WorktreeCleanGH, branch: str) -> tuple[int | None, str | None]:
+    """Fallback PR resolution for ``clean_worktrees`` (issue #1713).
+
+    When ``state.json`` carries no linked PR for a worktree's issue -- the
+    state entry was pruned, or the worktree was created outside the normal
+    dispatch path -- resolve the PR by head branch instead, via a live
+    ``gh pr list --head <branch> --state all``. Exactly one matching PR is
+    an unambiguous link; its number is returned so the caller's unchanged
+    ``gh pr view`` + merged/contained/dirty gates still decide eligibility.
+    Zero matches, more than one match, a malformed payload, or an erroring
+    ``gh`` call return ``None`` -- the caller keeps the fail-closed skip.
+
+    Returns ``(pr_number, detail)``: ``detail`` is ``None`` on a successful
+    single match and otherwise describes the lookup outcome for the skip
+    reason, so the skip classes stay distinguishable in durable output.
+    """
+    result = gh.run(
+        ["pr", "list", "--head", branch, "--state", "all", "--json", WORKTREE_PR_HEAD_FIELDS],
+        json_output=True,
+        allow_failure=True,
+    )
+    if not (isinstance(result, GitHubRunResult) and result.ok):
+        error = result.error if isinstance(result, GitHubRunResult) else "unknown"
+        return None, f"head-branch PR lookup failed: {error}"
+    if not isinstance(result.value, list):
+        # e.g. gh exited 0 with empty stdout: cannot distinguish an empty
+        # result from an unreadable one (same ambiguity github.py's
+        # allow_failure=False path calls out) -- treat as lookup failure,
+        # never as "zero matches".
+        return None, "head-branch PR lookup returned no usable list"
+    entries = result.value
+    if not entries:
+        return None, "no PR found for head branch"
+    if len(entries) == 1:
+        number = entries[0].get("number") if isinstance(entries[0], dict) else None
+        if isinstance(number, int):
+            return number, None
+        return None, "the head-branch PR entry has no number field"
+    return None, f"{len(entries)} PRs share head branch; cannot pick one"
 
 
 def clean_worktrees(
@@ -5179,7 +5223,10 @@ def clean_worktrees(
     """Junction-safe cleanup of worker worktrees for merged or closed-unmerged PRs.
 
     Enumerates worktrees under ``worktrees_dir`` whose linked issue/PR resolves
-    to a PR number in ``state.json``, then applies one of two eligibility
+    to a PR number in ``state.json`` -- or, when state.json has no link, via a
+    ``gh pr list --head <branch> --state all`` fallback that adopts the PR only
+    when exactly one matches the branch (issue #1713; see
+    ``_pr_number_for_head_branch``) -- then applies one of two eligibility
     checks per worktree, chosen by the PR's *terminal* state:
 
     **Merged path** (PR state ``MERGED``):
@@ -5302,15 +5349,27 @@ def clean_worktrees(
         issue_state = state_issues.get(str(issue_number), {})
         pr_number = _find_linked_pr_number(issue_number, issue_state, state_prs)
         if not pr_number:
-            skipped.append(
-                {
-                    "worktree": str(wt_path),
-                    "branch": branch,
-                    "issue_number": issue_number,
-                    "reason": "no linked PR in state.json",
-                }
-            )
-            continue
+            # Issue #1713: a worktree whose state entry was pruned, or that
+            # was created outside the normal dispatch path, has no state.json
+            # link, so the state-only lookup above can never resolve it and
+            # the worktree would sit skipped forever. Widen PR *discovery* to
+            # a live `gh pr list --head <branch> --state all`: exactly one
+            # matching PR is unambiguous and flows into the unchanged
+            # merged/closed-unmerged + containment + dirty-tree gates below
+            # (each still fail-closed on a live `gh pr view`). Zero matches,
+            # multiple matches, or an erroring lookup keep today's skip --
+            # only discovery widens, never eligibility.
+            pr_number, lookup_detail = _pr_number_for_head_branch(gh, branch)
+            if not pr_number:
+                skipped.append(
+                    {
+                        "worktree": str(wt_path),
+                        "branch": branch,
+                        "issue_number": issue_number,
+                        "reason": f"no linked PR in state.json; {lookup_detail}",
+                    }
+                )
+                continue
         pr_state = state_prs.get(str(pr_number), {})
         state_merged = bool(pr_state.get("status") == "merged" or pr_state.get("merged") is True)
 

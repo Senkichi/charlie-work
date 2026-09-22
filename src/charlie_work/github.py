@@ -117,6 +117,13 @@ _JITTER_FRACTION = 0.25
 # These are the single source of truth for all JSON field queries to GitHub.
 # All call sites must use these constants — no inline field-list literals.
 PR_VIEW_MERGED_FIELDS = "state,mergedAt,headRefOid"
+# Field list for the worktree-GC fallback PR lookup (issue #1713): when
+# state.json carries no linked PR for a dispatch-prefixed worktree branch,
+# ``clean_worktrees`` runs ``gh pr list --head <branch> --state all`` and
+# needs only the PR number -- the resolved number feeds the existing live
+# ``gh pr view`` confirmation above, which re-fetches merge state rather
+# than trusting the list row.
+WORKTREE_PR_HEAD_FIELDS = "number"
 # MERGED_PR_LIST_FIELDS (the field contract for every merged-PR listing) moved
 # to github_capabilities/pull_requests.py (Track 2, issue #1613; design doc
 # Section 5, L06b), imported above -- it is a bare global in both

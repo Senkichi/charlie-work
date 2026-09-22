@@ -5611,6 +5611,12 @@ class _FakeGH(WorktreeCleanGH):
     ``available=False`` simulates ``gh`` itself failing/being unreachable
     (``GitHubRunResult(ok=False, ...)``), distinct from ``gh`` succeeding but
     reporting a PR state other than ``MERGED``.
+
+    ``head_branch_prs`` maps a head-branch name to the PR numbers a
+    ``gh pr list --head <branch> --state all`` call should report -- the
+    issue-#1713 fallback lookup ``clean_worktrees`` makes when state.json
+    has no linked PR. Every invocation is recorded in ``calls`` so tests
+    can assert whether the fallback ran at all.
     """
 
     def __init__(
@@ -5621,16 +5627,39 @@ class _FakeGH(WorktreeCleanGH):
         *,
         available: bool = True,
         error: str = "gh: could not resolve to a PullRequest",
+        head_branch_prs: dict[str, list[int]] | None = None,
     ) -> None:
         self.pr_state = pr_state
         self.merged_at = merged_at
         self.head_sha = head_sha
         self.available = available
         self.error = error
+        self.head_branch_prs = head_branch_prs or {}
+        self.calls: list[list[str]] = []
 
     def run(
         self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
     ) -> GitHubRunResult:
+        self.calls.append(list(args))
+        if args[:2] == ["pr", "list"] and "--head" in args and json_output and allow_failure:
+            if not self.available:
+                return GitHubRunResult(
+                    ok=False,
+                    returncode=1,
+                    stdout="",
+                    stderr=self.error,
+                    value=None,
+                    error=self.error,
+                )
+            head = args[args.index("--head") + 1]
+            return GitHubRunResult(
+                ok=True,
+                returncode=0,
+                stdout="",
+                stderr="",
+                value=[{"number": number} for number in self.head_branch_prs.get(head, [])],
+                error=None,
+            )
         if args[:2] == ["pr", "view"] and json_output and allow_failure:
             if not self.available:
                 return GitHubRunResult(
