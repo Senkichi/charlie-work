@@ -29,6 +29,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from _unescalate_fixtures import _app, _events
 from charlie_work import cli
 from charlie_work.config import OrchestratorConfig
@@ -832,6 +834,15 @@ def test_unescalate_refuses_worktree_unsafe_when_worktree_still_dirty(
 
     app = _app(tmp_path)
     wt_path = worktree_path_for_branch(app.repo_root, branch, app._layout.worktrees)
+    # ``git worktree add`` builds the child worktree's ``.git`` path in a
+    # fixed-size internal buffer — a deeply nested basetemp (e.g. a worker
+    # sandbox whose TMPDIR sits under a long worktree checkout) overflows
+    # it deterministically: ``fatal: '$GIT_DIR' too big``, and even
+    # ``core.longpaths`` still fails the ``.git`` file creation. There is
+    # no test-side remedy, so skip when the target path is over git's
+    # practical ceiling rather than report a spurious failure.
+    if len(str(wt_path / ".git")) > 240:
+        pytest.skip(f"worktree target path too deep for git's internal buffers: {wt_path}")
     wt_path.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["git", "-C", str(tmp_path), "worktree", "add", str(wt_path), "-b", branch],
