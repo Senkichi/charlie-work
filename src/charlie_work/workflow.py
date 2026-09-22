@@ -363,6 +363,7 @@ from .backlog_reachability import (  # noqa: F401  (deliberate re-export)
     classify_backlog_reachability,
     compute_mention_coverage_map,
     fetch_merged_prs_fail_open,
+    mention_scan_repo_context,
     resolve_dispatch_mention_coverage,
     scan_merged_pr_references,
 )

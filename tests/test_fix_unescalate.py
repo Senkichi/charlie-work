@@ -1003,3 +1003,53 @@ def test_unescalate_closed_pr_leaves_non_escalated_issue(tmp_path: Path) -> None
     # Issue left as-is.
     assert state["issues"]["123"]["status"] == "reviewing"
     assert result.data["label_edge"] is None
+
+
+def test_unescalate_rearms_mention_flagged_issue(tmp_path: Path) -> None:
+    """Issue #1803: a merged-PR mention flag parks an issue in the
+    ``agent:human-needed`` sink WITHOUT setting a sink status --
+    ``unescalate --issue`` used to report "nothing to unescalate" on
+    exactly those records, leaving hand-edit the only recovery. The
+    re-arm must strip the human-needed label via ``unescalated_requeued``,
+    stamp the durable ``mention_rearmed_at`` marker, and emit the same
+    ``dispatch_merged_pr_mention_rearmed`` event shape the dispatch-side
+    label-removal detection emits."""
+    app = _app(tmp_path)
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "merged_pr_mention_flagged_at": "2026-09-04T12:00:00Z",
+            "reason_class": "judgment",
+        }
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(issue_number=123)
+
+    assert result.ok is True
+    assert result.data["changed"] is True
+    assert result.data["mention_rearmed"] is True
+    assert result.data["label_edge"] == "unescalated_requeued"
+
+    state = load_state(app.paths.state_file)
+    entry = state["issues"]["123"]
+    # The flag marker stays (the re-arm lift requires a prior flag); the
+    # durable re-arm marker is what lifts the exclusion.
+    assert entry.get("merged_pr_mention_flagged_at") is not None
+    assert entry.get("mention_rearmed_at") is not None
+
+    rearmed_events = _events(state, "dispatch_merged_pr_mention_rearmed")
+    assert len(rearmed_events) == 1
+    assert rearmed_events[0]["payload"]["issue_numbers"] == [123]
+
+    # The unescalated_requeued edge strips every workflow label incl.
+    # agent:human-needed.
+    assert (123, app.config.labels.human_needed) in app.gh.labels_removed
+
+    # Idempotent: a second unescalate is a no-op, no duplicate re-arm event.
+    result2 = app.unescalate(issue_number=123)
+    assert result2.ok is True
+    assert result2.data["changed"] is False
+    assert "nothing to unescalate" in result2.message
+    state = load_state(app.paths.state_file)
+    assert len(_events(state, "dispatch_merged_pr_mention_rearmed")) == 1

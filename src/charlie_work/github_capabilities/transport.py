@@ -230,6 +230,13 @@ class Transport(CapabilityCollaborator):
             # the merge everything the PR carried is main-reachable through
             # the merge commit itself.
             "mergeCommitOid": pr.get("merge_commit_sha"),
+            # Issue #1803: the merge timestamp, mapped to gh's GraphQL name.
+            # The mention gate's temporal rule compares this against the
+            # issue's createdAt -- a PR merged before the issue existed
+            # cannot have addressed it. REST spells it `merged_at`; the
+            # normalized shape must carry it forward or every REST-sourced
+            # merged PR reads as timestamp-unknown downstream.
+            "mergedAt": pr.get("merged_at"),
         }
 
     def _run_bool(self, args: list[str]) -> bool:

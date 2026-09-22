@@ -850,10 +850,16 @@ class _StubApp:
 
     def _merged_pr_referenced_issue_numbers(
         self, issues: list[dict[str, Any]], merged_prs: list[dict[str, Any]]
-    ) -> tuple[set[int], set[int], set[int], dict[int, list[int]]]:
-        # Return the stubbed mention_only set with PR numbers derived from
-        # the merged_prs list. bound is empty so mention_only is not
-        # reduced.
+    ) -> tuple[
+        set[int],
+        set[int],
+        set[int],
+        dict[int, list[int]],
+        dict[int, list[dict[str, Any]]],
+    ]:
+        # Stub mention_only with PR numbers derived from merged_prs; bound
+        # is empty so mention_only is not reduced. The fifth element
+        # (#1803's per-PR detail map) is unused by the coverage map.
         mention_pr_numbers_by_issue: dict[int, list[int]] = {}
         for pr in merged_prs:
             if str(pr.get("state") or "").upper() != "MERGED":
@@ -864,7 +870,7 @@ class _StubApp:
         mention_pr_numbers_by_issue = {
             k: sorted(v) for k, v in sorted(mention_pr_numbers_by_issue.items())
         }
-        return set(), set(self._mention_only), set(), mention_pr_numbers_by_issue
+        return set(), set(self._mention_only), set(), mention_pr_numbers_by_issue, {}
 
     def _mention_rearmed_issue_numbers(
         self,

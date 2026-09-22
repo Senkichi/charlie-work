@@ -377,6 +377,7 @@ def _dispatch_impl(
             merged_pr_mention_only_issue_numbers,
             _,
             _,
+            merged_pr_mention_details_by_issue,
         ) = self._merged_pr_referenced_issue_numbers(issues, resolved_merged_prs)
         merged_pr_issue_numbers = (
             merged_pr_bound_issue_numbers | merged_pr_mention_only_issue_numbers
@@ -576,6 +577,10 @@ def _dispatch_impl(
             "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
             "merged_pr_mention_only_issue_numbers": sorted(merged_pr_mention_only_issue_numbers),
             "merged_pr_mention_rearmed_issue_numbers": sorted(rearmed_mention_issues),
+            # Issue #1803: same per-PR mention evidence the real dispatch
+            # path reports -- dry-run callers get flag diagnostics without
+            # reading events.db.
+            "merged_pr_mention_details": merged_pr_mention_details_by_issue,
             "label_errors": [],
             "cross_repo_escalated_issue_numbers": sorted(dry_run_cross_repo_escalated),
             "cross_repo_override_issue_numbers": sorted(dry_run_cross_repo_overridden),
@@ -613,6 +618,7 @@ def _dispatch_impl(
         merged_pr_mention_only_issue_numbers,
         merged_pr_bound_pr_numbers,
         _,
+        merged_pr_mention_details_by_issue,
     ) = self._merged_pr_referenced_issue_numbers(issues, resolved_merged_prs)
     merged_pr_issue_numbers = merged_pr_bound_issue_numbers | merged_pr_mention_only_issue_numbers
 
@@ -833,10 +839,29 @@ def _dispatch_impl(
                 "reason_class": escalation_reason_class("judgment"),
             }
         if stamped_mention_issues:
+            # Issue #1803: carry the per-issue mention evidence (which
+            # merged PRs caused the flag, whether the temporal check ran).
+            # ``merged_at_unknown`` makes the fail-open share of flags
+            # countable from the event stream.
+            mentioning_prs = {
+                str(issue_number): merged_pr_mention_details_by_issue.get(issue_number, [])
+                for issue_number in stamped_mention_issues
+            }
             state = _wf.append_event(
                 state,
                 "dispatch_merged_pr_mention_flagged",
-                {"issue_numbers": stamped_mention_issues},
+                {
+                    "issue_numbers": stamped_mention_issues,
+                    "mentioning_prs": mentioning_prs,
+                    "merged_at_unknown": sorted(
+                        issue_number
+                        for issue_number in stamped_mention_issues
+                        if any(
+                            detail.get("merged_at_unknown")
+                            for detail in mentioning_prs[str(issue_number)]
+                        )
+                    ),
+                },
                 state_path=self.paths.state_file,
             )
             _wf.save_state(self.paths.state_file, state)
@@ -1911,6 +1936,12 @@ def _dispatch_impl(
         "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
         "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
         "merged_pr_mention_rearmed_issue_numbers": sorted(newly_rearmed_mention_issues),
+        # Issue #1803: issue_number -> per-mentioning-PR detail
+        # ({"number", "merged_at", "merged_at_unknown"}) — the same map the
+        # dispatch_merged_pr_mention_flagged event payload carries, kept
+        # here so dispatch callers get the flag evidence without querying
+        # events.db.
+        "merged_pr_mention_details": merged_pr_mention_details_by_issue,
         "label_errors": sorted(label_errors),
         "session_manifest": str(manifest_path),
         "session_results": str(results_path),

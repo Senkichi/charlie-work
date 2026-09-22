@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
+from charlie_work.backlog_reachability import mention_scan_repo_context
 from charlie_work.github import GitHubError
 import charlie_work.workflow as _wf
 
@@ -213,6 +214,16 @@ def _finalize_externally_merged_issues(
         merged_prs = []
     else:
         merged_pr_outcome = _wf._MergedPRListOutcome(merged_prs, called=True)
+    # Issue #1803: the mention scan drops references whose immediate
+    # qualifier names another repo, so a qualified mention must not
+    # protect a closed issue from the unmerged-label strip either — same
+    # repo context the dispatch-side scan resolves (skip the gh call
+    # when there is nothing to scan, matching the #361 fetch guard).
+    mention_repo_context: tuple[str | None, frozenset[str]] = (None, frozenset())
+    if merged_prs:
+        mention_repo_context = mention_scan_repo_context(
+            self.gh, self.repo_root, self.fleet_dir_override
+        )
     for pr in merged_prs:
         if str(pr.get("state") or "").upper() != "MERGED":
             continue
@@ -240,7 +251,11 @@ def _finalize_externally_merged_issues(
         # collision, but it does guard the common case of a fork PR's text
         # being trusted at all.
         if pr.get("isCrossRepository") is False:
-            for mentioned in _wf.issue_numbers_mentioned_by_pr(pr):
+            for mentioned in _wf.issue_numbers_mentioned_by_pr(
+                pr,
+                current_repo=mention_repo_context[0],
+                other_repo_names=mention_repo_context[1],
+            ):
                 mention_only_issue_numbers.add(mentioned)
 
     # Mention-only references are advisory; they are not a binding, but

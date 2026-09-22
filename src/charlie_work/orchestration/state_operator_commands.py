@@ -288,6 +288,15 @@ def unescalate(
     - Issue with no live PR: drop the issue back to the never-dispatched
       baseline and strip workflow labels (``unescalated_requeued``) so
       dispatch treats it as fresh.
+    - Issue carrying a merged-PR mention flag: the flag path
+      (``dispatch_merged_pr_mention_flagged``) deliberately leaves
+      ``status`` untouched, so a mention-flagged issue parks in the
+      ``agent:human-needed`` sink WITHOUT a sink status — invisible to
+      ``SINK_STATUSES`` and to this command's pre-#1803 stuck predicate.
+      A flag recorded in a prior pass and not yet re-armed counts as
+      stuck here; re-arming stamps ``mention_rearmed_at`` (the same
+      durable marker the dispatch-side label-removal detection writes)
+      so the mention-only dispatch exclusion lifts on the next pass.
 
     "Stuck" is derived from ``state.SINK_STATUSES`` (currently "escalated"
     and "blocked" -- both map to the same ``agent:human-needed`` label edge
@@ -331,12 +340,24 @@ def unescalate(
     pr_status = pr_state.get("status")
     pr_stuck = pr_status in SINK_STATUSES or pr_status == "janitor_blocked"
     issue_stuck = issue_state.get("status") in SINK_STATUSES
-    if not pr_stuck and not issue_stuck:
+    # Issue #1803: the merged-PR mention flag parks an issue in the same
+    # human sink (agent:human-needed) without writing a sink status, so
+    # SINK_STATUSES alone reports "nothing to unescalate" on exactly the
+    # records this command exists to re-arm (the operator-visible form of
+    # the jobcannon #377/#391 recovery path). Flagged in a prior pass and
+    # not already re-armed is the stuck condition; an issue already
+    # carrying mention_rearmed_at has nothing left to lift.
+    mention_flagged = (
+        isinstance(issue_state, dict)
+        and bool(issue_state.get("merged_pr_mention_flagged_at"))
+        and not issue_state.get("mention_rearmed_at")
+    )
+    if not pr_stuck and not issue_stuck and not mention_flagged:
         return _wf.CommandResult(
             True,
             f"nothing to unescalate (pr={pr_number} status="
             f"{pr_state.get('status')!r}, issue={issue_number} status="
-            f"{issue_state.get('status')!r})",
+            f"{issue_state.get('status')!r}, mention_flagged={mention_flagged})",
             {"pr": pr_number, "issue": issue_number, "changed": False},
         )
 
@@ -517,15 +538,21 @@ def unescalate(
             # take the no-live-PR path (issue #1391). When another open PR
             # exists, or the issue is not stuck, leave the issue to
             # finalization/reconcile as before.
-            if issue_stuck and not _wf._has_other_open_pr(state, issue_number, pr_number):
+            if (issue_stuck or mention_flagged) and not _wf._has_other_open_pr(
+                state, issue_number, pr_number
+            ):
                 issue_status_action = "drop"
                 label_edge = "unescalated_requeued"
             else:
                 label_edge = None
-        elif issue_stuck:
+        elif issue_stuck or mention_flagged:
             # No live PR at all — back to the never-dispatched baseline
             # (a status literal no dispatch selector reads would just
-            # recreate the orphan gap reconcile now repairs).
+            # recreate the orphan gap reconcile now repairs). For a
+            # mention-flagged issue "drop" is a no-op on ``status`` (the
+            # flag path never writes one); what matters is the
+            # ``unescalated_requeued`` edge stripping agent:human-needed
+            # and the mention_rearmed_at stamp below.
             issue_status_action = "drop"
             label_edge = "unescalated_requeued"
 
@@ -580,6 +607,7 @@ def unescalate(
                 "issue": issue_number,
                 "transitions": transitions,
                 "label_edge": label_edge,
+                "mention_rearmed": mention_flagged,
                 "blocked_environment_at_reset": prior_blocked_environment_count > 0,
                 "blocked_environment_at_prior_count": prior_blocked_environment_count,
                 "verdict_would_be_voided": still_valid_verdict is not None,
@@ -588,6 +616,7 @@ def unescalate(
         )
 
     verdict_voided = False
+    mention_rearmed = False
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
         if pr_number is not None and pr_stuck:
@@ -658,6 +687,26 @@ def unescalate(
                 **_apply_issue_reset(fresh_issue if isinstance(fresh_issue, dict) else {}),
                 "number": issue_number,
             }
+            # Issue #1803: a mention-flagged issue needs the durable
+            # re-arm marker, not just the label edge — the mention-only
+            # dispatch exclusion lifts on mention_rearmed_at (or on the
+            # human-needed removal the edge performs, but the stamp makes
+            # the re-arm observable and immune to a stale label snapshot).
+            # Re-checked on the fresh entry so a marker stamped between
+            # the pre-lock read and this write is left alone. Routed
+            # through _stamp_mention_rearm so the write goes through the
+            # write gate and emits the same
+            # dispatch_merged_pr_mention_rearmed event the dispatch-side
+            # detection emits — operators see one re-arm event shape
+            # regardless of which door performed it.
+            fresh_mention_flagged = (
+                isinstance(fresh_issue, dict)
+                and bool(fresh_issue.get("merged_pr_mention_flagged_at"))
+                and not fresh_issue.get("mention_rearmed_at")
+            )
+            if fresh_mention_flagged:
+                state = self._stamp_mention_rearm(state, [issue_number])
+                mention_rearmed = True
         state = self._record_event(
             state,
             "unescalate",
@@ -666,6 +715,7 @@ def unescalate(
                 "issue_number": issue_number,
                 "transitions": transitions,
                 "label_edge": label_edge,
+                "mention_rearmed": mention_rearmed,
                 "blocked_environment_at_reset": prior_blocked_environment_count > 0,
                 "blocked_environment_at_prior_count": prior_blocked_environment_count,
                 "verdict_voided": verdict_voided,
@@ -697,6 +747,8 @@ def unescalate(
     message = f"unescalated pr={pr_number} issue={issue_number}"
     if summary:
         message += f" ({summary})"
+    if mention_rearmed:
+        message += " (mention flag re-armed)"
     if label_error:
         message += f" (label update failed: {label_error['outcome']})"
     return _wf.CommandResult(
@@ -708,6 +760,7 @@ def unescalate(
             "transitions": transitions,
             "label_edge": label_edge,
             "label_error": label_error,
+            "mention_rearmed": mention_rearmed,
             "verdict_voided": verdict_voided,
             "changed": True,
         },

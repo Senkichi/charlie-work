@@ -658,12 +658,37 @@ def build_branch_issue_validator_from_issues(
 # (issue #1627), so the name is not reachable through
 # ``charlie_work.github``.
 
+# GitHub repository-visibility designators that qualify an ``issue #N``
+# mention as belonging to a different repo's tracker (issue #1803). The
+# observed false positive was a jobcannon docs PR that rewrote bare
+# ``issue #391`` references to ``private issue #391`` — "the private repo"
+# is jobcannon's private source checkout, not the dispatching repo, so the
+# qualified mention never referred to the flagged issue. ``internal`` is
+# the other non-public GraphQL ``RepositoryVisibility`` value and reads
+# the same way. ``public`` is deliberately absent: in a public repo "the
+# public issue" can refer to this tracker itself, so counting it fails
+# toward flagging — the safe direction for an advisory gate.
+_FOREIGN_REPO_VISIBILITY_QUALIFIERS = frozenset({"private", "internal"})
+
 # Explicit issue-reference pattern: the word "issue" or "issues" followed by
 # an optional space and then "#N".  This is deliberately narrower than a bare
 # ``#N`` so a merged PR that mentions a different PR (e.g. "PR #181") is not
 # mistaken for an issue reference.  Closing-keyword binding is handled by
 # ``linked_issue_number``.
-_ISSUE_MENTION_RE = re.compile(r"\b(?:issue|issues)\s*#(\d+)\b", flags=re.IGNORECASE)
+#
+# Issue #1803: the match also captures an *immediate qualifier* in either of
+# two positions so a mention explicitly scoped to another repo can be
+# suppressed:
+#
+# * a bare name or ``owner/repo`` slug directly before the word "issue"
+#   (``private issue #N``, ``job-cannon issue #N``, ``o/r issue #N``);
+# * an ``owner/repo`` slug between "issue" and the hash (``issue o/r#N``)
+#   — the same qualifier shape ``closing_reference._CLOSING_LINE_RE``
+#   accepts on ``Closes`` lines.
+_ISSUE_MENTION_RE = re.compile(
+    r"\b(?:([\w.-]+(?:/[\w.-]+)?)\s+)?issues?\s*(?:([\w.-]+/[\w.-]+))?#(\d+)\b",
+    flags=re.IGNORECASE,
+)
 # Stripped before matching to cut two concrete false-positive classes: a
 # fenced code sample that happens to contain the literal text, and quoted
 # reply text (e.g. an email-style ``> see issue #123`` blockquote).
@@ -671,7 +696,54 @@ _FENCED_CODE_BLOCK_RE = re.compile(r"```.*?```", flags=re.DOTALL)
 _BLOCKQUOTE_LINE_RE = re.compile(r"^[ \t]*>.*$", flags=re.MULTILINE)
 
 
-def issue_numbers_mentioned_by_pr(pr: dict[str, Any]) -> set[int]:
+def _mention_qualifier_is_foreign(
+    qualifier: str | None,
+    *,
+    current_repo: str | None,
+    other_repo_names: Iterable[str],
+) -> bool:
+    """True when an ``issue #N`` mention's immediate qualifier names another repo.
+
+    ``qualifier`` is whichever of ``_ISSUE_MENTION_RE``'s two qualifier
+    groups matched (``None`` for an unqualified mention, which is never
+    foreign — the pre-#1803 behaviour is preserved for plain ``issue #N``).
+
+    An ``owner/repo`` slug qualifier is GitHub's own cross-repo reference
+    syntax — the writer explicitly named which repo the number belongs to.
+    It is foreign unless it is exactly ``current_repo``; when our own slug
+    cannot be resolved (``current_repo is None``) we cannot confirm it is
+    ours, and a qualified reference failing toward *not* flagging is the
+    safe direction for this advisory gate (an unqualified mention still
+    flags).
+
+    A bare-word qualifier is foreign when it names another *managed* repo
+    (``other_repo_names``, derived from the fleet registry by the caller —
+    never a hardcoded list) or is a GitHub repo-visibility designator
+    (``private``/``internal`` — see
+    ``_FOREIGN_REPO_VISIBILITY_QUALIFIERS``). The dispatching repo's own
+    name is checked first so a self-named qualifier (``jobcannon issue
+    #N`` inside jobcannon, or a repo literally named "private") still
+    counts.
+    """
+    if not qualifier:
+        return False
+    q = qualifier.lower()
+    if "/" in qualifier:
+        return current_repo is None or q != current_repo.lower()
+    current_name = current_repo.rsplit("/", 1)[-1].lower() if current_repo else None
+    if current_name is not None and q == current_name:
+        return False
+    return q in _FOREIGN_REPO_VISIBILITY_QUALIFIERS or q in {
+        str(n).lower() for n in other_repo_names
+    }
+
+
+def issue_numbers_mentioned_by_pr(
+    pr: dict[str, Any],
+    *,
+    current_repo: str | None = None,
+    other_repo_names: Iterable[str] = (),
+) -> set[int]:
     """Return issue numbers loosely referenced by a PR's title/body — advisory only.
 
     Matches the literal phrase ``issue #N`` / ``issues #N`` (case-insensitive,
@@ -680,6 +752,16 @@ def issue_numbers_mentioned_by_pr(pr: dict[str, Any]) -> set[int]:
     GitHub's issue-reference syntax: it does not treat a bare ``#N`` (which
     could be a PR number) as an issue reference, and it does not treat
     closing keywords like ``Fixes #N`` as any more than a reference.
+
+    Issue #1803: a match whose *immediate qualifier* names another repo is
+    suppressed — ``private issue #N`` / ``internal issue #N`` (GitHub
+    repo-visibility designators), a qualifier naming another managed repo
+    (``other_repo_names``), or an ``owner/repo`` slug qualifier
+    (``owner/repo issue #N``, ``issue owner/repo#N``) that is not exactly
+    ``current_repo``. Qualified mentions are explicit about which tracker
+    the number belongs to; treating "not proven to be ours" as coverage
+    was the absence-of-disproof defect behind the jobcannon #377/#391
+    false escalations.
 
     This is looser than ``linked_issue_number``'s hijack-safety guarantee —
     phrases like "unlike issue #N", "follow-up to issue #N", or a collision
@@ -693,7 +775,22 @@ def issue_numbers_mentioned_by_pr(pr: dict[str, Any]) -> set[int]:
     text = f"{pr.get('title', '')}\n{pr.get('body', '')}"
     text = _FENCED_CODE_BLOCK_RE.sub("", text)
     text = _BLOCKQUOTE_LINE_RE.sub("", text)
-    return {int(m.group(1)) for m in _ISSUE_MENTION_RE.finditer(text)}
+    found: set[int] = set()
+    for match in _ISSUE_MENTION_RE.finditer(text):
+        # The post-"issue" slug (group 2) wins over a bare-word qualifier
+        # (group 1): it is GitHub's canonical ``owner/repo#N`` reference
+        # syntax and sits closest to the number, so in ``see issue
+        # owner/repo#7`` the scoping qualifier is ``owner/repo``, not the
+        # prose word "see".
+        qualifier = match.group(2) or match.group(1)
+        if _mention_qualifier_is_foreign(
+            qualifier,
+            current_repo=current_repo,
+            other_repo_names=other_repo_names,
+        ):
+            continue
+        found.add(int(match.group(3)))
+    return found
 
 
 def _is_not_found_gh_error(error: str) -> bool:
