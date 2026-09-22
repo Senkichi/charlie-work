@@ -35,7 +35,17 @@ session is about to stop, feeding it a JSON payload on stdin. It:
    of leaving the omission for CI to catch a round late. No hardcoded
    source-to-test mapping beyond this one explicit rule: the targeted set is
    otherwise derived entirely from the session's own changed files.
-5. Blocks the stop on any failure, bounded by a consecutive-block cap
+5. Anchors the *imported* tree to the gated tree before any test run
+   (issue #1793): targeted tests execute as ``sys.executable -m pytest``
+   with the gated toplevel's ``src/`` prepended to ``PYTHONPATH``, and an
+   import probe first asserts ``charlie_work.__file__`` resolves inside
+   that toplevel. The pre-#1793 ``uv run`` form made neither guarantee --
+   import resolution followed the resolved environment's editable install
+   (in a worktree, the MAIN checkout's ``src``: false reds *and* false
+   greens) -- and silently created a fresh ``.venv`` inside the worktree.
+   Invoking the gate's own interpreter directly -- never an installing
+   ``uv`` command -- removes both defects at once.
+6. Blocks the stop on any failure, bounded by a consecutive-block cap
    (``MAX_BLOCKS_PER_SESSION``) so a session that cannot converge still ends
    instead of looping forever; on cap exhaustion it allows the stop while
    printing the ``WORKER_STOP_GATE_EXHAUSTED`` marker. A pass -- or hitting
@@ -104,14 +114,16 @@ Stdlib-only (worker sessions are not guaranteed to have the ``dev`` extra
 installed -- see issue #1259's binding recon comment on
 ``scripts/merge_autonomy_ratio.py`` being the correct "stdlib-only scripts"
 citation, not ``scripts/heartbeat_check.py`` which imports ``psutil``/
-``yaml``). It shells out to ``ruff``/``pytest`` via ``uv run --no-sync``
-rather than importing them, so the script itself never needs third-party
-packages to run.
+``yaml``). It shells out to ``ruff``/``pytest`` as ``sys.executable -m
+<tool>`` -- the interpreter the hook command already pinned -- so the
+script itself never needs third-party packages, and never creates or
+syncs a virtualenv as a side effect (#1793: ``uv run`` did exactly that).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -160,6 +172,21 @@ _EMIT_SITE_RE = re.compile(r"\b(?:log_event|append_event|_record_event)\(")
 
 _SESSION_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9_-]")
 _FALLBACK_SESSION_ID = "unknown-session"
+
+#: Reason prefix for the import-anchor check (issue #1793). When the gated
+#: tree's ``charlie_work`` cannot be proven to resolve inside the gated
+#: toplevel, the gate blocks with this distinct wording -- never a wall of
+#: unrelated test failures from the wrong checkout.
+IMPORT_ANCHOR_FAILURE = "import-anchor check failed"
+
+#: One-liner for the import-anchor probe: print the resolved ``__file__`` of
+#: ``charlie_work`` under the gated tree's PYTHONPATH, or an empty line when
+#: the package has no ``__file__`` (a namespace package -- not an anchored
+#: checkout, treated as a failure, never a pass).
+_IMPORT_ANCHOR_PROBE = (
+    "import pathlib, charlie_work; "
+    "print(pathlib.Path(charlie_work.__file__).resolve() if charlie_work.__file__ else '')"
+)
 
 
 class GateError(Exception):
@@ -275,7 +302,13 @@ def _prune_stale_state_files(state_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _run(cmd: list[str], *, cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+def _run(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             cmd,
@@ -285,6 +318,7 @@ def _run(cmd: list[str], *, cwd: Path, timeout: int) -> subprocess.CompletedProc
             timeout=timeout,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise GateError(f"{' '.join(cmd)!r} failed to run: {exc}") from exc
@@ -507,11 +541,17 @@ def _run_ruff(repo_root: Path, py_files: tuple[str, ...]) -> GateResult:
     distinguish session-written debris from pre-existing debris). A caller
     with no ``.py`` files in its changed set should not call this at all;
     as a second line of defense it is also a no-op here.
+
+    Runs as ``sys.executable -m ruff`` -- the interpreter the hook command
+    already pinned -- rather than ``uv run`` (#1793: ``uv run`` ignores an
+    inherited ``VIRTUAL_ENV`` and silently creates a fresh ``.venv`` inside
+    a gated worktree; ruff lints file paths, so it needs no environment
+    resolution at all, only the interpreter's installed console module).
     """
     if not py_files:
         return GateResult(block=False)
     check = _run(
-        ["uv", "run", "--no-sync", "ruff", "check", "--force-exclude", *py_files],
+        [sys.executable, "-m", "ruff", "check", "--force-exclude", *py_files],
         cwd=repo_root,
         timeout=RUFF_TIMEOUT_SECONDS,
     )
@@ -520,7 +560,7 @@ def _run_ruff(repo_root: Path, py_files: tuple[str, ...]) -> GateResult:
             block=True, reason="ruff check failed:\n" + (check.stdout + check.stderr).strip()
         )
     fmt = _run(
-        ["uv", "run", "--no-sync", "ruff", "format", "--check", "--force-exclude", *py_files],
+        [sys.executable, "-m", "ruff", "format", "--check", "--force-exclude", *py_files],
         cwd=repo_root,
         timeout=RUFF_TIMEOUT_SECONDS,
     )
@@ -532,13 +572,104 @@ def _run_ruff(repo_root: Path, py_files: tuple[str, ...]) -> GateResult:
     return GateResult(block=False)
 
 
+# ---------------------------------------------------------------------------
+# Import anchoring (issue #1793): tests must import ``charlie_work`` from the
+# gated tree's ``src``, not the resolved environment's editable install (in
+# a worktree, the MAIN checkout -- false reds and false greens). PYTHONPATH
+# precedes site-packages on ``sys.path``, so prepending the gated ``src``
+# shadows the editable install; the probe then proves the shadow took.
+# ---------------------------------------------------------------------------
+
+
+def _gated_tree_env(repo_root: Path) -> dict[str, str]:
+    """Child environment that pins import resolution to the gated tree.
+
+    Prepends ``<repo_root>/src`` to ``PYTHONPATH`` (same recipe as
+    ``tests/test_cli_module_entrypoint.py`` and the mandated
+    ``ac1b_findings_actionability`` invocation) and drops
+    ``VIRTUAL_ENV``/``UV_PROJECT_ENVIRONMENT``: an inherited value names a
+    *different* checkout's environment and must not travel into the test
+    process as a lie about which environment is active.
+    """
+    env = dict(os.environ)
+    env.pop("VIRTUAL_ENV", None)
+    env.pop("UV_PROJECT_ENVIRONMENT", None)
+    src = str(repo_root / "src")
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{src}{os.pathsep}{existing}" if existing else src
+    return env
+
+
+def _path_within(child: Path, root: Path) -> bool:
+    """Resolved-path containment: ``realpath`` both sides (junctions must be
+    resolved *before* comparing), then ``normcase`` so Windows drive/case
+    differences cannot produce a false escape report.
+    """
+    resolved_child = Path(os.path.normcase(os.path.realpath(child)))
+    resolved_root = Path(os.path.normcase(os.path.realpath(root)))
+    return resolved_child.is_relative_to(resolved_root)
+
+
+def _assert_import_anchor(repo_root: Path) -> GateResult | None:
+    """Prove ``charlie_work`` resolves inside ``repo_root`` before pytest runs.
+
+    Runs the same interpreter pytest will use, under the same environment
+    (``_gated_tree_env``). Returns ``None`` when anchored; otherwise a
+    blocking ``GateResult`` whose reason is the distinct
+    ``IMPORT_ANCHOR_FAILURE`` wording, never a wall of wrong-tree test
+    failures (#1793).
+    """
+    src = repo_root / "src"
+    probe = _run(
+        [sys.executable, "-c", _IMPORT_ANCHOR_PROBE],
+        cwd=repo_root,
+        timeout=GIT_TIMEOUT_SECONDS,
+        env=_gated_tree_env(repo_root),
+    )
+    if probe.returncode != 0:
+        return GateResult(
+            block=True,
+            reason=(
+                f"{IMPORT_ANCHOR_FAILURE}: `import charlie_work` failed under "
+                f"PYTHONPATH={src} (exit {probe.returncode}):\n"
+                + (probe.stdout + probe.stderr).strip()
+            ),
+        )
+    reported = next((line.strip() for line in probe.stdout.splitlines() if line.strip()), "")
+    if not reported:
+        return GateResult(
+            block=True,
+            reason=(
+                f"{IMPORT_ANCHOR_FAILURE}: `import charlie_work` under "
+                f"PYTHONPATH={src} reported no __file__ location "
+                "(namespace package?) -- cannot anchor the gated tree"
+            ),
+        )
+    loaded = Path(reported)
+    if not _path_within(loaded, repo_root):
+        return GateResult(
+            block=True,
+            reason=(
+                f"{IMPORT_ANCHOR_FAILURE}: charlie_work.__file__ resolved to "
+                f"{loaded}, which is outside the gated tree {repo_root}. "
+                "Targeted tests would exercise a different checkout than the "
+                "one being gated -- refusing to trust that result (issue #1793)."
+            ),
+        )
+    return None
+
+
 def _run_targeted_tests(repo_root: Path, targets: tuple[str, ...]) -> GateResult:
     if not targets:
         return GateResult(block=False)
+    anchor_failure = _assert_import_anchor(repo_root)
+    if anchor_failure is not None:
+        return anchor_failure
     proc = _run(
-        ["uv", "run", "--no-sync", "pytest", "-q", "--tb=short", *targets],
+        [sys.executable, "-m", "pytest", "-q", "--tb=short", *targets],
         cwd=repo_root,
         timeout=PYTEST_TIMEOUT_SECONDS,
+        env=_gated_tree_env(repo_root),
     )
     if proc.returncode != 0:
         return GateResult(
