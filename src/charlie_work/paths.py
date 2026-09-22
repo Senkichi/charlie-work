@@ -120,6 +120,10 @@ def find_repo_root(
     user-facing ``--repo`` flag.  In that case the path must exist and must
     be inside a git work tree; a clear :class:`RepoNotFoundError` is raised
     otherwise so the operator sees the mistake instead of a silent phantom repo.
+    A ``.git`` directory at the explicit path is honored as the root
+    immediately — git discovery treats an unreadable ``.git`` dir as
+    non-repository and walks past it into an enclosing repo, which would
+    silently retarget the command's state.
 
     Regardless of *explicit*, the *shared* (main) worktree root is resolved
     via ``git rev-parse --git-dir`` / ``--git-common-dir`` before falling back
@@ -147,6 +151,16 @@ def find_repo_root(
             raise RepoNotFoundError(f"--repo path does not exist: {start}")
         if not start.is_dir():
             raise RepoNotFoundError(f"--repo path is not a directory: {start}")
+        # A ``.git`` *directory* at the explicit path marks a repo root —
+        # honor the operator's declaration instead of re-deriving through
+        # git discovery. Git does not consider an empty or otherwise
+        # unreadable ``.git`` dir a valid gitdir, so discovery would walk
+        # past it and silently resolve an *enclosing* repo — the same
+        # state-misroute class issues #648/#895 close down. A ``.git``
+        # *file* (linked worktree, ``--separate-git-dir``) still falls
+        # through to the main-worktree normalization below.
+        if (start / ".git").is_dir():
+            return start
     # Prefer the shared/main worktree root so that a cwd (or an explicit
     # --repo) inside a linked worktree does not resolve to that worktree's
     # own toplevel (which would point at a phantom state dir). Returns None

@@ -1,0 +1,7 @@
+12
+# Issue #1777: +1 raw log_event call in _log_self_deploy_git_retry, the
+# on_retry hook wired into every self-deploy/ci-fleet-sibling
+# run_git_with_retry call site. Out-of-wave raw territory, same class as
+# the pre-existing 11 -- self-deploy's own log_event calls are not routed
+# through WriteGate (CLAUDE.md's "outside state-lock contexts, call
+# log_event() directly" convention). The ratchet holds at the new count.

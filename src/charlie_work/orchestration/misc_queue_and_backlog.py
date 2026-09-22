@@ -21,6 +21,7 @@ from typing import Any
 import charlie_work.workflow as _wf
 from charlie_work.backlog_reachability import (
     _get_open_blockers_for_issue,
+    mention_scan_repo_context,
     scan_merged_pr_references,
 )
 
@@ -29,14 +30,46 @@ def _merged_pr_referenced_issue_numbers(
     self,
     issues: list[dict[str, Any]],
     merged_prs: list[dict[str, Any]],
-) -> tuple[set[int], set[int], set[int], dict[int, list[int]]]:
+) -> tuple[
+    set[int],
+    set[int],
+    set[int],
+    dict[int, list[int]],
+    dict[int, list[dict[str, Any]]],
+]:
     """Thin wrapper for ``scan_merged_pr_references`` (issue #1337 moved
     the implementation to ``backlog_reachability.py`` so the mention-PR
     tracking it added does not grow the monolith past its ratchet
     high-water mark). See ``scan_merged_pr_references``'s docstring for
     the return-tuple semantics.
+
+    Issue #1803: supplies the repo context the mention-qualifier check
+    needs (dispatching repo slug + other managed repo names). Skipped
+    when either input is empty — the scan's ready-set intersection makes
+    the result empty anyway, so resolving ``name_with_owner`` (a gh
+    call) would be pure waste, matching the issue #361 fetch guard.
+
+    Consumers: ``dispatch_state`` (dispatch exclusion + mention flagging),
+    ``compute_mention_coverage_map`` (the reachability classifier's
+    mention-coverage arm), and ``state_merge_train``'s
+    ``_finalize_externally_merged_issues`` (issue #1803 rework — the
+    externally-merged finalization scan routes here so the temporal
+    mergedAt-vs-createdAt check and the qualifier suppression cannot
+    drift between the dispatch and finalize paths).
     """
-    return scan_merged_pr_references(issues, merged_prs, self.config.dispatch.branch_prefix)
+    current_repo: str | None = None
+    other_repo_names: frozenset[str] = frozenset()
+    if issues and merged_prs:
+        current_repo, other_repo_names = mention_scan_repo_context(
+            self.gh, self.repo_root, self.fleet_dir_override
+        )
+    return scan_merged_pr_references(
+        issues,
+        merged_prs,
+        self.config.dispatch.branch_prefix,
+        current_repo=current_repo,
+        other_repo_names=other_repo_names,
+    )
 
 
 def _get_open_blockers(self, issue: dict[str, Any]) -> tuple[list[int], list[int]]:

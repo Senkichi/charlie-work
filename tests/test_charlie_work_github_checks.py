@@ -235,6 +235,7 @@ def test_validate_field_lists_passes_when_gh_lists_all_fields(monkeypatch, tmp_p
             "mergeStateStatus",
             "additions",
             "deletions",
+            "mergedAt",
         ]
         stderr = (
             'Unknown JSON field: "nonexistent"\nAvailable fields:\n  '

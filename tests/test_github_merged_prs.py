@@ -78,6 +78,7 @@ def test_merged_pr_list_uses_rest_pagination_and_filters_merged(
             "state": "MERGED",
             "headRefOid": "aaaa1111",
             "mergeCommitOid": None,
+            "mergedAt": "2026-07-21T20:00:00Z",
         }
     ]
     assert pull_call_count >= 1

@@ -338,6 +338,9 @@ def test_normalize_rest_pr_delegate_reachable(tmp_path: Path) -> None:
         "state": "MERGED",
         "headRefOid": "abc123",
         "mergeCommitOid": "def456",
+        # Issue #1803: REST `merged_at` is carried through as `mergedAt`
+        # (None here -- the fixture omits the field).
+        "mergedAt": None,
     }
 
 
