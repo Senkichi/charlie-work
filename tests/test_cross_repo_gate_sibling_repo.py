@@ -205,13 +205,13 @@ def test_traversal_candidate_escaping_sibling_root_never_treated_as_found(
     candidate that would resolve OUTSIDE a sibling repo's root must never
     be reported as "found" under that sibling, even when the resolved
     location happens to exist on disk. ``this_repo`` and ``sibling_repo``
-    sit at different depths so a naive (containment-unaware) relative join
-    against ``this_repo`` -- the pre-existing, out-of-scope gap in
-    ``_path_exists_in_repo`` -- does not coincidentally also reach the
-    outside file and mask what this test is isolating: the containment
-    check inside ``_find_owning_repo``/``_resolve_within_root``, which
-    resolves both sides via ``safe_path.contains`` before any ``exists()``
-    call."""
+    sit at different depths so the relative-candidate existence check
+    against ``this_repo`` (``_path_exists_in_repo``, containment-checked
+    via ``_resolve_within_root`` since issue #1772) does not
+    coincidentally also reach the outside file and mask what this test is
+    isolating: the containment check inside
+    ``_find_owning_repo``/``_resolve_within_root``, which resolves both
+    sides via ``safe_path.contains`` before any ``exists()`` call."""
     this_repo = tmp_path / "charlie-work"
     this_repo.mkdir()
     sibling_repo = tmp_path / "deep" / "ci_runners"
@@ -236,6 +236,55 @@ def test_traversal_candidate_escaping_sibling_root_never_treated_as_found(
     assert result.missing_paths == ("../outside/secret.py",)
     assert result.found_in_repo is None
     assert "abstaining" in result.reason
+
+
+def test_traversal_candidate_escaping_dispatching_root_is_missing(tmp_path: Path) -> None:
+    """Issue #1772: a ``..``-traversal relative candidate that escapes the
+    *dispatching* repo's own root must be classified missing, not "exists
+    in the target repo."
+
+    ``_path_exists_in_repo`` previously joined a relative candidate onto
+    ``repo_root`` and called ``exists()`` with no containment check — a
+    ``../outside/secret.py`` candidate whose escaped location happens to
+    exist on disk was wrongly classified "not missing," firing the gate's
+    "at least one referenced path exists in the target repo" pass branch.
+    The fix routes both branches through :func:`_resolve_within_root`
+    (``safe_path.contains``), so the candidate is missing and — with no
+    fleet registry supplied — the gate abstains."""
+    this_repo = tmp_path / "charlie-work"
+    this_repo.mkdir()
+    # Sibling of `this_repo`, one level up -- reachable from inside
+    # `this_repo` via `../outside/secret.py`, but NOT a descendant of
+    # `this_repo`'s own root.
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (outside_dir / "secret.py").write_text("# secret", encoding="utf-8")
+
+    body = "See `../outside/secret.py` for the fix."
+
+    result = cross_repo_gate(body, this_repo)
+
+    assert result.passed is True
+    assert result.missing_paths == ("../outside/secret.py",)
+    assert "abstaining" in result.reason
+
+
+def test_path_exists_in_repo_containment_checks_relative_candidates(
+    tmp_path: Path,
+) -> None:
+    """Issue #1772, function level: ``_path_exists_in_repo`` returns
+    ``False`` for a relative candidate whose ``..`` segment escapes
+    ``repo_root`` even when a file exists at the escaped location, while a
+    genuinely contained relative path still returns ``True``."""
+    this_repo = tmp_path / "charlie-work"
+    (this_repo / "src").mkdir(parents=True)
+    (this_repo / "src" / "real.py").write_text("# real", encoding="utf-8")
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (outside_dir / "secret.py").write_text("# secret", encoding="utf-8")
+
+    assert cross_repo_gate_module._path_exists_in_repo("../outside/secret.py", this_repo) is False
+    assert cross_repo_gate_module._path_exists_in_repo("src/real.py", this_repo) is True
 
 
 def test_segment_boundary_match_ignores_untracked_worktree_copies(tmp_path: Path) -> None:

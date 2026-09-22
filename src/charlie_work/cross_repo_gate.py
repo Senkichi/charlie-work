@@ -671,20 +671,25 @@ def _is_launcher_owned_path(candidate: str) -> bool:
 
 
 def _path_exists_in_repo(path_str: str, repo_root: Path) -> bool:
-    """Return ``True`` when ``path_str`` resolves to an existing file inside ``repo_root``."""
-    path = Path(path_str)
-    if path.is_absolute():
-        try:
-            if not path.exists():
-                return False
-            return contains(repo_root, path)
-        except (OSError, ValueError):
-            return False
-    # Relative path: resolve against the repo root.
-    resolved = repo_root / path
+    """Return ``True`` when ``path_str`` resolves to an existing file inside ``repo_root``.
+
+    Containment runs before the existence check on *both* branches, via
+    :func:`_resolve_within_root` (``safe_path.contains`` resolves both
+    sides): a relative candidate carrying a ``..`` segment can walk outside
+    ``repo_root`` entirely, and a bare ``(repo_root / path).exists()`` would
+    report a coincidental file at that escaped location as "in the target
+    repo" (issue #1772). Routing the absolute branch through the same helper
+    also recognizes POSIX-style absolute candidates that
+    ``Path.is_absolute()`` misclassifies as relative on Windows — those were
+    previously joined onto ``repo_root`` (collapsing to the drive root) and
+    existence-checked without any containment check at all.
+    """
+    resolved = _resolve_within_root(repo_root, path_str)
+    if resolved is None:
+        return False
     try:
         return resolved.exists()
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
