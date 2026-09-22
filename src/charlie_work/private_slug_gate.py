@@ -5,15 +5,20 @@ sibling repo slugs in tracked files (test fixtures, examples, a live
 heartbeat-suppressions entry) but rejected *unbounded growth*: without a gate,
 every future salvage PR can silently add new mentions.  This gate fails when
 a PR adds a net-new mention of a configured private slug in a tracked file,
-ratchet-style against a baseline file at the repo root.
+ratchet-style against a baseline directory at the repo root.
 
 The slug list (the "pattern source") is config, not hardcoded slugs in the
-check body: it lives in ``.private-slug-baseline.json`` alongside a ``total``
-count that forms the ratchet baseline.  A PR that adds a net-new mention MUST
-also bump the baseline ``total`` by at least the net-new count -- that bump is
-tamper-evident in diff review, the same way ``.attachment-budgets.json``
-bumps are.  Without the bump, the gate fails; with it, a reviewer sees both
-the new mention and the baseline increase in the same diff and can ask why.
+check body: it lives in ``.private-slug-baseline/slugs/`` (one marker file
+per slug) alongside per-file mention counts in
+``.private-slug-baseline/files/<repo-path>.count`` (issue #1802 -- the
+single shared JSON document was a shared append point that serialized
+concurrent PRs into merge conflicts).  There is no stored ``total``: the
+check derives it from the diff, and a PR that adds a net-new mention MUST
+raise the matching ``.count`` entries by at least the net-new count -- that
+bump is tamper-evident in diff review, the same way
+``.attachment-budgets.json`` bumps are.  Without the bump, the gate fails;
+with it, a reviewer sees both the new mention and the baseline increase in
+the same diff and can ask why.
 
 Moves during a refactor (remove from one place, add to another) produce zero
 net-new mentions and do not trigger the gate -- a pure added-lines scan
@@ -104,8 +109,10 @@ def find_slug_mentions_in_diff(
     ``net_new`` property is the count to check against the ratchet baseline.
 
     *exclude_paths* is a set of repo-relative paths to skip entirely (e.g.
-    the baseline file itself, which lists slugs as config -- those are not
-    "mentions" of the private repos).  Pass ``None`` for no exclusions.
+    the baseline directory itself, which lists slugs as config -- those are
+    not "mentions" of the private repos).  An entry ending in ``/`` is a
+    directory prefix: any path beneath it is excluded.  Pass ``None`` for
+    no exclusions.
 
     The diff is read as text (the caller decides encoding; ``git diff``
     output is UTF-8 in this repo).  Binary file diffs
@@ -204,10 +211,21 @@ def find_slug_mentions_in_diff(
 
 
 def _excluded(path: str, exclude_paths: frozenset[str] | None) -> bool:
-    """Return ``True`` if *path* is in *exclude_paths*."""
+    """Return ``True`` if *path* is in *exclude_paths*.
+
+    Entries ending in ``/`` are directory prefixes -- a path beneath one is
+    excluded even though it never equals the entry.  All other entries are
+    exact matches.
+    """
     if exclude_paths is None:
         return False
-    return path in exclude_paths
+    for entry in exclude_paths:
+        if entry.endswith("/"):
+            if path.startswith(entry):
+                return True
+        elif path == entry:
+            return True
+    return False
 
 
 def count_slug_mentions_in_text(text: str, slugs: list[str]) -> int:

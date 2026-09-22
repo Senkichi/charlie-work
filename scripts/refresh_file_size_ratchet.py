@@ -3,13 +3,24 @@
 The ratchet itself is enforced by ``tests/test_file_size_ratchet.py``, which
 runs in CI on every push and fails any PR that leaves an over-cap tracked
 ``*.py`` file with MORE physical lines than its recorded high-water mark. This
-script is the SOLE writer of the checked-in baseline file
-(``file_size_ratchet_baseline.json`` at the repo root): it can create the
+script is the SOLE writer of the checked-in baseline
+(``file_size_ratchet_baseline/`` at the repo root): it can create the
 baseline from the live tree (one-time ``--init``) and lower existing marks
 after a shrink (the default). The test suite never writes the baseline -- a
 pytest run must leave the tree clean, so a PR only ever changes the baseline
 as a deliberate, reviewed edit. This script NEVER raises a mark -- raising
-requires an explicit, reviewed edit to the baseline file, by design (#1442).
+requires an explicit, reviewed edit to the baseline entry, by design (#1442).
+
+## Per-entry baseline layout (issue #1802)
+
+The baseline is a directory of one ``.count`` file per covered path
+(``file_size_ratchet_baseline/src/charlie_work/workflow.py.count`` records
+the mark for ``src/charlie_work/workflow.py``), loaded and written via
+``charlie_work.ratchet_baseline``. The previous single JSON document was a
+shared append point: concurrent PRs editing different entries conflicted on
+the same file, and a CONFLICTING PR gets no pull_request CI run. With one
+file per entry, distinct-entry PRs merge cleanly; two PRs raising the SAME
+entry still conflict on that file, which is the required control direction.
 
 ## Quantized marks
 
@@ -20,14 +31,14 @@ script writes is ``ceil(lines / 200) * 200``. Two reasons:
   hottest conflict site: any two concurrent PRs changing a monolith's line
   count wrote different values on the same JSON line. With quantized marks,
   growth within a bucket needs no baseline edit at all, and two PRs bumping
-  the same file into the same bucket write the identical line (clean merge).
+  the same file into the same bucket write the identical value (clean merge).
 * **Deterministic convergence.** Every writer (this script, and a PR raising
   a mark by hand) uses the same rule -- next multiple of 200 -- so
   independent edits agree byte-for-byte.
 
-A hand-raise in a growth PR must follow the same rule: raise to the next
-multiple of 200, never to the exact line count. If a baseline line still
-conflicts on merge, take the larger value.
+A hand-raise in a growth PR must follow the same rule: raise the file's
+``.count`` entry to the next multiple of 200, never to the exact line count.
+If an entry still conflicts on merge, take the larger value.
 
 Usage::
 
@@ -62,10 +73,21 @@ normal per-module cap of 800 lines.
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import sys
 from pathlib import Path
+
+# Fallback so the script also runs under a bare interpreter without the
+# package installed (same pattern scripts/ac1b_findings_actionability.py uses).
+_FALLBACK_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_FALLBACK_SRC) not in sys.path:
+    sys.path.insert(0, str(_FALLBACK_SRC))
+
+from charlie_work.ratchet_baseline import (  # noqa: E402
+    BaselineFormatError,
+    load_count_baseline,
+    write_count_baseline,
+)
 
 # The repo's normal per-module line cap. Over-cap files (lines > CAP) are the
 # ratchet's covered set. This is the same cap the extraction lineage (#1283
@@ -80,7 +102,7 @@ FILE_SIZE_CAP = 800
 # side; tests/test_refresh_file_size_ratchet.py asserts the two stay equal.
 MARK_QUANTUM = 200
 
-_BASELINE_NAME = "file_size_ratchet_baseline.json"
+_BASELINE_NAME = "file_size_ratchet_baseline"
 
 
 def _quantize_mark(lines: int) -> int:
@@ -162,33 +184,52 @@ def _scan_over_cap(repo_root: Path) -> dict[str, int]:
 
 
 def _load_baseline(path: Path) -> dict[str, int]:
-    if not path.exists():
+    """Load the per-entry baseline directory (issue #1802).
+
+    A missing directory loads as an empty baseline (``--init``'s starting
+    state); a present-but-malformed directory raises
+    :class:`BaselineFormatError`, which ``main`` turns into a non-zero exit --
+    fail closed, never silently a zero baseline.
+    """
+    if not path.is_dir():
         return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return {k: int(v) for k, v in data.items()}
+    return load_count_baseline(path)
 
 
 def _write_baseline(path: Path, marks: dict[str, int]) -> None:
-    """Atomic write (temp-file + ``replace``) per the project's JSON-write
-    invariant (CLAUDE.md). Sorted keys for stable diffs."""
-    payload = json.dumps(dict(sorted(marks.items())), indent=2, ensure_ascii=False)
-    payload += "\n"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(path)
+    """Sync the baseline directory to exactly *marks*.
+
+    Each write is an atomic temp-file + ``replace`` inside
+    ``write_count_baseline`` (CLAUDE.md's state-write invariant); stale
+    entries are removed and emptied directories pruned.
+    """
+    write_count_baseline(path, marks)
+
+
+def _read_baseline_or_report(baseline_path: Path) -> dict[str, int] | None:
+    """``_load_baseline`` with the fail-closed boundary: a malformed directory
+    reports and returns ``None`` so callers exit 1 rather than traceback or
+    silently treat it as empty."""
+    try:
+        return _load_baseline(baseline_path)
+    except BaselineFormatError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return None
 
 
 def _init(repo_root: Path, baseline_path: Path, dry_run: bool) -> int:
     """One-time baseline generation: mark = current line count quantized up
     to a multiple of ``MARK_QUANTUM``, for every over-cap tracked ``*.py``
     file."""
-    existing = _load_baseline(baseline_path)
+    existing = _read_baseline_or_report(baseline_path)
+    if existing is None:
+        return 1
     if existing and not dry_run:
         print(
             f"ERROR: baseline already exists at {baseline_path} with "
             f"{len(existing)} entries. --init is a one-time setup; use the "
-            "default (lower-only) mode to maintain it, or delete the file "
-            "first to regenerate from scratch.",
+            "default (lower-only) mode to maintain it, or delete the "
+            "directory first to regenerate from scratch.",
             file=sys.stderr,
         )
         return 1
@@ -248,7 +289,9 @@ def _lower(repo_root: Path, baseline_path: Path, dry_run: bool) -> int:
     entries for files that fell under the cap or were deleted. Never adds new
     entries -- a new over-cap file requires an explicit reviewed baseline
     edit."""
-    baseline = _load_baseline(baseline_path)
+    baseline = _read_baseline_or_report(baseline_path)
+    if baseline is None:
+        return 1
     if not baseline:
         print(
             f"ERROR: no baseline at {baseline_path}. Run with --init first to "
@@ -285,7 +328,9 @@ def _check(repo_root: Path, baseline_path: Path) -> int:
     (``test_over_cap_files_do_not_exceed_high_water_mark`` in
     tests/test_file_size_ratchet.py) to report, not this gate's.
     """
-    baseline = _load_baseline(baseline_path)
+    baseline = _read_baseline_or_report(baseline_path)
+    if baseline is None:
+        return 1
     if not baseline:
         print(
             f"ERROR: no baseline at {baseline_path}. Run with --init first to "
@@ -304,7 +349,7 @@ def _check(repo_root: Path, baseline_path: Path) -> int:
     print(
         f"baseline at {baseline_path} is not a fixed point of the lower-only "
         "refresh; run `python scripts/refresh_file_size_ratchet.py` and commit "
-        "the updated file_size_ratchet_baseline.json in the same PR to apply:"
+        "the updated file_size_ratchet_baseline/ entries in the same PR to apply:"
     )
     for c in changes:
         print(c)

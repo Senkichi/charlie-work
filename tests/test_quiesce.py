@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -490,6 +491,93 @@ def test_list_processes_actually_runs_against_this_host() -> None:
     own = [p for p in processes if p.pid == os.getpid()]
     assert own, "the running interpreter did not appear in its own process snapshot"
     assert own[0].command_line, "own process reported an empty command line"
+
+
+# ---------------------------------------------------------------------------
+# list_processes() -- timeout retry. The full ``Win32_Process`` enumeration is
+# the heaviest CIM query this repo runs, and a single attempt can exceed its
+# budget on a loaded host without anything being wrong (hosted-CI Tests job on
+# PR #1805 timed out under pytest-xdist). A transient timeout is retried once;
+# every other failure mode is deterministic and must not be retried.
+# ---------------------------------------------------------------------------
+
+
+def _fake_completed(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        args=["powershell"], returncode=returncode, stdout=stdout, stderr=""
+    )
+
+
+def _win32_listing_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Get ``list_processes`` past its win32/PATH guards on any platform."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(shutil, "which", lambda name: name)
+
+
+def test_list_processes_retries_once_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A first-attempt timeout followed by a good snapshot must succeed.
+
+    This is the CI flake as a deterministic unit test: before the retry,
+    one stalled enumeration turned straight into an error and the gate
+    failed closed on a healthy host.
+    """
+    _win32_listing_env(monkeypatch)
+    calls: list[int] = []
+    payload = json.dumps(
+        [{"ProcessId": 1, "ParentProcessId": 0, "Name": "a.exe", "CommandLine": "a.exe"}]
+    )
+
+    def _flaky_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd="powershell", timeout=60)
+        return _fake_completed(payload)
+
+    monkeypatch.setattr(subprocess, "run", _flaky_run)
+
+    processes, error = list_processes()
+
+    assert error is None
+    assert [p.pid for p in processes] == [1]
+    assert len(calls) == 2
+
+
+def test_list_processes_fails_closed_after_repeated_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retry is bounded: persistent timeouts still return an error."""
+    _win32_listing_env(monkeypatch)
+    calls: list[int] = []
+
+    def _always_timeout(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        raise subprocess.TimeoutExpired(cmd="powershell", timeout=60)
+
+    monkeypatch.setattr(subprocess, "run", _always_timeout)
+
+    processes, error = list_processes()
+
+    assert processes == ()
+    assert error is not None and "timed out" in error
+    assert len(calls) == 2
+
+
+def test_list_processes_does_not_retry_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-zero exit is deterministic -- retrying it cannot succeed."""
+    _win32_listing_env(monkeypatch)
+    calls: list[int] = []
+
+    def _failing_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        return _fake_completed("", returncode=1)
+
+    monkeypatch.setattr(subprocess, "run", _failing_run)
+
+    processes, error = list_processes()
+
+    assert processes == ()
+    assert error is not None and "exited 1" in error
+    assert len(calls) == 1
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="list_processes is win32-only")

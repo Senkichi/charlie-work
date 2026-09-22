@@ -388,13 +388,16 @@ jobs:
         #
         # Fails when a PR adds net-new mentions of configured private
         # sibling-repo slugs in tracked files, ratchet-style against
-        # .private-slug-baseline.json. The slug list is config (in the
-        # baseline file), not hardcoded in the check body. Moves (remove +
-        # add) produce zero net-new and do not trigger the gate. A PR that
-        # intentionally adds new mentions must bump the baseline total by
-        # at least the net-new count -- that bump is tamper-evident in diff
-        # review. See src/charlie_work/private_slug_gate.py for the full
-        # rationale.
+        # .private-slug-baseline/ (issue #1802: per-entry .count files, so
+        # concurrent PRs touching different entries merge cleanly instead of
+        # conflicting on a shared JSON document). The slug list is config
+        # (marker files under .private-slug-baseline/slugs/), not hardcoded
+        # in the check body. Moves (remove + add) produce zero net-new and
+        # do not trigger the gate. A PR that intentionally adds new mentions
+        # must raise the matching files/*.count entries by at least the
+        # net-new count -- that bump is tamper-evident in diff review and
+        # derived from the diff itself (no stored total). See
+        # src/charlie_work/private_slug_gate.py for the full rationale.
         #
         # The base SHA is already fetched by the mojibake gate step above
         # (same job, same fetch). shell: bash with set -e for the same

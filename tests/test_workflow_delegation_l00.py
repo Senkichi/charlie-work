@@ -41,6 +41,7 @@ import pytest
 import charlie_work.orchestration as _orchestration
 import charlie_work.workflow_delegation as wd
 from charlie_work.attachment_contracts.archetypes import scan_source
+from charlie_work.ratchet_baseline import BaselineFormatError, load_set_baseline
 from charlie_work.workflow import OrchestratorApp
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -56,23 +57,30 @@ _PRE_CAMPAIGN_MEMBER_SURFACE = 133
 
 # Members legitimately ADDED to the OrchestratorApp surface after the campaign
 # baseline was pinned. The conservation invariant covers bodies MOVED out of
-# workflow.py; a net-new member is not a move, so it is declared here by name
-# and subtracted before the pre-campaign total is checked. Naming each addition
+# workflow.py; a net-new member is not a move, so it is declared by name and
+# subtracted before the pre-campaign total is checked. Naming each addition
 # (rather than a bare count) keeps the audit trail: a member that disappears or
 # is silently swapped still fails the subset assertion below.
 #
-# - ``review_verdict_guard`` (issue #1695): the why-charlie-hate CLI guard
-#   that refuses to regenerate a review packet when the recorded verdict is
-#   still valid.
-# - ``_still_valid_recorded_verdict`` (issue #1765): the shared predicate
-#   factored out of ``review_verdict_guard`` so ``unescalate`` can also
-#   detect (and void) a still-valid terminal verdict before re-arming a PR.
-# - ``_record_unlinked_pr_skips`` (issue #1766): batches the edge-triggered
-#   ``pr_unlinked_skipped`` notice for issue-less PRs the merge lane skips,
-#   installed from the new ``orchestration/github_ops_unlinked_prs.py`` leaf.
-_POST_CAMPAIGN_SURFACE_ADDITIONS = frozenset(
-    {"review_verdict_guard", "_still_valid_recorded_verdict", "_record_unlinked_pr_skips"}
+# Issue #1802: the declarations live as per-member marker files under
+# ``tests/baselines/post_campaign_surface_additions/<member>`` (file contents
+# are freeform rationale) rather than an inline frozenset -- the inline set
+# was a shared append point for concurrent PRs. The set of member names is
+# derived from the directory listing at check time.
+_POST_CAMPAIGN_SURFACE_ADDITIONS_DIR = (
+    Path(__file__).parent / "baselines" / "post_campaign_surface_additions"
 )
+
+
+def _post_campaign_surface_additions() -> frozenset[str]:
+    """Load the declared post-campaign member additions; fail closed."""
+    try:
+        return load_set_baseline(_POST_CAMPAIGN_SURFACE_ADDITIONS_DIR)
+    except BaselineFormatError as exc:
+        pytest.fail(
+            f"post-campaign surface-additions baseline is missing or malformed "
+            f"at {_POST_CAMPAIGN_SURFACE_ADDITIONS_DIR} (fail closed): {exc}"
+        )
 
 
 def _apc_orchestratorapp_member_count() -> int:
@@ -545,8 +553,8 @@ def test_orchestratorapp_member_surface_conserved_lexical_plus_installed() -> No
          the class body is re-attached by the installer, so nothing is lost
          or double-counted, and net-new members added after the baseline was
          pinned (issue #1695's ``review_verdict_guard``) are declared in
-         ``_POST_CAMPAIGN_SURFACE_ADDITIONS`` rather than silently growing
-         the conserved total;
+         ``tests/baselines/post_campaign_surface_additions/`` rather than
+         silently growing the conserved total;
       3. no installed delegate name is also a lexical def -- a name in both
          places is exactly the shadow the installer raises on, cross-checked
          here as two disjoint sets.
@@ -568,11 +576,12 @@ def test_orchestratorapp_member_surface_conserved_lexical_plus_installed() -> No
     # Post-campaign additions (e.g. issue #1695's review_verdict_guard) are
     # net-new members, not moved bodies -- every declared addition must be
     # installed, then the moved-only remainder conserves the baseline.
-    assert _POST_CAMPAIGN_SURFACE_ADDITIONS <= installed, (
+    additions = _post_campaign_surface_additions()
+    assert additions <= installed, (
         f"declared post-campaign addition(s) missing from installed delegates: "
-        f"{sorted(_POST_CAMPAIGN_SURFACE_ADDITIONS - installed)}"
+        f"{sorted(additions - installed)}"
     )
-    moved_delegates = installed - _POST_CAMPAIGN_SURFACE_ADDITIONS
+    moved_delegates = installed - additions
     assert lexical_defs + len(moved_delegates) == _PRE_CAMPAIGN_MEMBER_SURFACE
 
     shadowed = installed & lexical_names

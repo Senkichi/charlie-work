@@ -171,7 +171,7 @@ def test_render_over_cap_section_instructs_refresh_script() -> None:
     findings = (OverCapFileFinding("src/god_file.py", 102, 100, 2),)
     section = render_over_cap_section(findings)
     assert "refresh_file_size_ratchet.py" in section
-    assert "file_size_ratchet_baseline.json" in section
+    assert "file_size_ratchet_baseline" in section
     # The safety rationale must travel with the instruction so a reviewer
     # does not strip it as a risky side effect.
     assert "lower-only" in section

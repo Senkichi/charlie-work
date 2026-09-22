@@ -1,0 +1,4 @@
+issue #1766: batches the edge-triggered ``pr_unlinked_skipped`` notice for
+issue-less PRs the merge lane skips, installed from the new
+``orchestration/github_ops_unlinked_prs.py`` leaf. Net-new OrchestratorApp
+member added after the Track 2 Phase B surface baseline was pinned.

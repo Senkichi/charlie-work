@@ -1,0 +1,7 @@
+2
+# Issue #1770: +1 raw log_event call in _apply_concurrency_governor's new
+# CI-headroom clamp branch (the dispatch_backpressure event recorded when
+# ci_headroom_available()'s reading clamps fresh dispatch, mirroring the
+# pre-existing open_pr_max clamp's own raw log_event call in the same
+# function). Same out-of-wave class as that pre-existing site -- the
+# ratchet holds at the new count (1 -> 2).

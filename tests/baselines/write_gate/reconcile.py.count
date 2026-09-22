@@ -1,0 +1,8 @@
+6
+# Issue #1241: +1 raw log_event call in the reconcile salvage lane's new
+# pre-open supersession check (the salvage_skipped_* event emitted when the
+# shared check_salvage_superseded finds the work already landed). This is
+# out-of-wave raw territory -- the salvage lane has not been converted to
+# WriteGate (it predates #1264's wave and uses log_event directly, matching
+# the existing pr_closing_ref_rewritten / pr_closing_ref_unlinked calls in
+# the same block). The ratchet holds at the new count.
