@@ -42,9 +42,11 @@ self-hosted-runner ``sessions.db`` for the test PID).
 from __future__ import annotations
 
 import ast
+import atexit
 import importlib
 import importlib.util
 import inspect
+import os
 import pkgutil
 from pathlib import Path
 
@@ -1059,6 +1061,58 @@ def test_worktree_unsafe_local_commits_not_auto_deescalated(tmp_path: Path) -> N
 
 # --- Issue #849: worktree_unsafe de-escalation safety re-check ---
 
+# git-for-windows cannot ``worktree add`` a target whose path exceeds
+# MAX_PATH (~260 chars): the ``<wt>/.git`` file write fails, and
+# ``core.longpaths`` does not cover it.  The repo-side metadata path
+# ``<repo>/.git/worktrees/<basename>/`` has the same limit, so the staged
+# worktree must keep a SHORT basename, not the branch slug.  When pytest
+# runs inside a nested agent worktree (deep ``tmp_path``), both limits
+# trip; the real worktree is staged at a shallow path with a short name
+# and the layout-expected path is joined to it by a junction -- junctions
+# need no elevation and ``git -C`` probes resolve them transparently.
+# ``git worktree remove`` must then be given the RESOLVED path
+# (``wt_path.resolve()``): git registers the staging path and does not
+# resolve junctions itself.
+_MAX_PATH_WORKTREE_LIMIT = 230
+_staging_worktrees: list[Path] = []
+
+
+def _add_worktree_for_deescalation(repo: Path, wt_path: Path, branch: str) -> None:
+    """``git worktree add`` ``branch`` at ``wt_path``, staging shallow and
+    junctioning when ``wt_path`` would exceed MAX_PATH."""
+    import subprocess
+
+    target = wt_path
+    if os.name == "nt" and len(str(wt_path)) > _MAX_PATH_WORKTREE_LIMIT:
+        import tempfile
+
+        local = os.environ.get("LOCALAPPDATA")
+        staging_root = Path(local) / "Temp" if local else Path(tempfile.gettempdir())
+        staging_root.mkdir(parents=True, exist_ok=True)
+        # The mkdtemp dir itself is the worktree: its short basename keeps
+        # ``<repo>/.git/worktrees/<basename>/`` under MAX_PATH too.
+        target = Path(tempfile.mkdtemp(prefix="cw-wt-", dir=staging_root))
+        _staging_worktrees.append(target)
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", str(target), "-b", branch],
+        check=True,
+        capture_output=True,
+    )
+    if target is not wt_path:
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(wt_path))
+
+
+def _cleanup_staging_worktrees() -> None:
+    import shutil
+
+    for path in _staging_worktrees:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+atexit.register(_cleanup_staging_worktrees)
+
 
 def _init_repo_for_deescalation(tmp_path: Path, branch: str) -> Path:
     """Init a git repo at tmp_path, create a worktree at the layout-expected
@@ -1088,12 +1142,9 @@ def _init_repo_for_deescalation(tmp_path: Path, branch: str) -> Path:
     app = _app(tmp_path)
     wt_path = worktree_path_for_branch(app.repo_root, branch, app._layout.worktrees)
     wt_path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["git", "-C", str(tmp_path), "worktree", "add", str(wt_path), "-b", branch],
-        check=True,
-        capture_output=True,
-    )
-    # Make the worktree dirty.
+    _add_worktree_for_deescalation(tmp_path, wt_path, branch)
+    # Make the worktree dirty (writes through the junction land in the
+    # staging dir when the MAX_PATH fallback engaged).
     (wt_path / "worker_wip.txt").write_text("uncommitted work\n", encoding="utf-8")
     return wt_path
 
@@ -1156,11 +1207,14 @@ def test_deescalation_clears_worktree_unsafe_when_worktree_cleaned(
     app = _app(tmp_path)
     wt_path = worktree_path_for_branch(app.repo_root, branch, app._layout.worktrees)
 
-    # Remove the dirty worktree — the blocker is gone.
+    # Remove the dirty worktree — the blocker is gone. ``resolve()`` maps
+    # ``wt_path`` through the junction to the registered staging path when
+    # the MAX_PATH fallback engaged; it is a no-op otherwise (``git
+    # worktree remove`` does not resolve junctions itself).
     import subprocess
 
     subprocess.run(
-        ["git", "-C", str(tmp_path), "worktree", "remove", "--force", str(wt_path)],
+        ["git", "-C", str(tmp_path), "worktree", "remove", "--force", str(wt_path.resolve())],
         check=True,
         capture_output=True,
     )
