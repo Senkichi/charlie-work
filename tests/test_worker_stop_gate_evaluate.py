@@ -111,14 +111,18 @@ def test_evaluate_blocks_on_targeted_test_failure(gate, repo, monkeypatch):
         "def test_x():\n    assert False\n", encoding="utf-8"
     )
 
-    def _fake_run(cmd, *, cwd, timeout):
-        del cwd, timeout
+    def _fake_run(cmd, *, cwd, timeout, env=None):
+        del cwd, timeout, env
         if cmd[:2] == ["git", "symbolic-ref"]:
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
         if "status" in cmd:
             return subprocess.CompletedProcess(
                 cmd, 0, stdout="?? tests/test_something.py\n", stderr=""
             )
+        if "-c" in cmd:
+            # Import-anchor probe (#1793): report a location inside repo.
+            anchored = repo / "src" / "charlie_work" / "__init__.py"
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{anchored}\n", stderr="")
         if "ruff" in cmd:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if "pytest" in cmd:
@@ -306,12 +310,16 @@ def test_evaluate_still_targets_untracked_test_files(gate, repo, monkeypatch):
     )
     captured_pytest: list[list[str]] = []
 
-    def _fake_run(cmd, *, cwd, timeout):
-        del cwd, timeout
+    def _fake_run(cmd, *, cwd, timeout, env=None):
+        del cwd, timeout, env
         if cmd[:2] == ["git", "symbolic-ref"]:
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
         if "status" in cmd:
             return subprocess.CompletedProcess(cmd, 0, stdout="?? tests/test_new.py\n", stderr="")
+        if "-c" in cmd:
+            # Import-anchor probe (#1793): report a location inside repo.
+            anchored = repo / "src" / "charlie_work" / "__init__.py"
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{anchored}\n", stderr="")
         if "ruff" in cmd:
             raise AssertionError("ruff must not run on untracked test file (#1306)")
         if "pytest" in cmd:
@@ -347,8 +355,8 @@ def test_evaluate_untracked_src_with_emit_site_still_triggers_w4(gate, repo, mon
         "def f():\n    log_event(state_path, 'k', {})\n", encoding="utf-8"
     )
 
-    def _fake_run(cmd, *, cwd, timeout):
-        del cwd, timeout
+    def _fake_run(cmd, *, cwd, timeout, env=None):
+        del cwd, timeout, env
         if cmd[:2] == ["git", "symbolic-ref"]:
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
         if "status" in cmd:
@@ -358,6 +366,10 @@ def test_evaluate_untracked_src_with_emit_site_still_triggers_w4(gate, repo, mon
                 stdout="?? src/charlie_work/new_emit.py\n",
                 stderr="",
             )
+        if "-c" in cmd:
+            # Import-anchor probe (#1793): report a location inside repo.
+            anchored = repo / "src" / "charlie_work" / "__init__.py"
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{anchored}\n", stderr="")
         if "ruff" in cmd:
             raise AssertionError("ruff must not run on untracked src file (#1306)")
         if "pytest" in cmd:
