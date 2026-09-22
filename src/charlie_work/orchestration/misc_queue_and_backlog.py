@@ -48,6 +48,14 @@ def _merged_pr_referenced_issue_numbers(
     when either input is empty — the scan's ready-set intersection makes
     the result empty anyway, so resolving ``name_with_owner`` (a gh
     call) would be pure waste, matching the issue #361 fetch guard.
+
+    Consumers: ``dispatch_state`` (dispatch exclusion + mention flagging),
+    ``compute_mention_coverage_map`` (the reachability classifier's
+    mention-coverage arm), and ``state_merge_train``'s
+    ``_finalize_externally_merged_issues`` (issue #1803 rework — the
+    externally-merged finalization scan routes here so the temporal
+    mergedAt-vs-createdAt check and the qualifier suppression cannot
+    drift between the dispatch and finalize paths).
     """
     current_repo: str | None = None
     other_repo_names: frozenset[str] = frozenset()

@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
-from charlie_work.backlog_reachability import mention_scan_repo_context
 from charlie_work.github import GitHubError
 import charlie_work.workflow as _wf
 
@@ -204,8 +203,6 @@ def _finalize_externally_merged_issues(
 
     # Try the cheap 500-window binding first; if the GraphQL-budget guard
     # refuses the call, fall back to per-issue search for all candidates.
-    bound_issue_numbers: set[int] = set()
-    mention_only_issue_numbers: set[int] = set()
     merged_pr_outcome = _wf._MergedPRListOutcome()
     try:
         merged_prs = self.gh.merged_pr_list()
@@ -214,54 +211,41 @@ def _finalize_externally_merged_issues(
         merged_prs = []
     else:
         merged_pr_outcome = _wf._MergedPRListOutcome(merged_prs, called=True)
-    # Issue #1803: the mention scan drops references whose immediate
-    # qualifier names another repo, so a qualified mention must not
-    # protect a closed issue from the unmerged-label strip either — same
-    # repo context the dispatch-side scan resolves (skip the gh call
-    # when there is nothing to scan, matching the #361 fetch guard).
-    mention_repo_context: tuple[str | None, frozenset[str]] = (None, frozenset())
-    if merged_prs:
-        mention_repo_context = mention_scan_repo_context(
-            self.gh, self.repo_root, self.fleet_dir_override
-        )
-    for pr in merged_prs:
-        if str(pr.get("state") or "").upper() != "MERGED":
-            continue
-        # Issue #1229 scoping decision: this call site is deliberately NOT
-        # threaded through branch_issue_validator. ``bound_issue_numbers``
-        # only gates which CLOSED ready issues have a merged PR binding
-        # them (so they are not stripped as closed-unmerged); no
-        # issue-label transition or state escalation keys off it. A stale
-        # branch-name binding can at worst add a wrong number to
-        # ``bound_issue_numbers``, causing a missed label-strip on an
-        # already-CLOSED (terminal) issue that the next pass recovers --
-        # not the "escalate the wrong issue" failure class the validator
-        # exists to prevent. (Contrast ``detect_mergequeue_wedged``, whose
-        # ``issue_number`` DOES drive ``_escalate_issue`` and is
-        # validator-threaded.)
-        bound = _wf.linked_issue_number(
-            pr,
-            is_cross_repository=pr.get("isCrossRepository"),
-            branch_prefix=self.config.dispatch.branch_prefix,
-        )
-        if bound is not None:
-            bound_issue_numbers.add(bound)
-        # isCrossRepository describes the PR's own head-branch provenance
-        # (fork vs. same-repo). It cannot fully guard a cross-repo mention
-        # collision, but it does guard the common case of a fork PR's text
-        # being trusted at all.
-        if pr.get("isCrossRepository") is False:
-            for mentioned in _wf.issue_numbers_mentioned_by_pr(
-                pr,
-                current_repo=mention_repo_context[0],
-                other_repo_names=mention_repo_context[1],
-            ):
-                mention_only_issue_numbers.add(mentioned)
-
-    # Mention-only references are advisory; they are not a binding, but
-    # they also must not be stripped as "unmerged" — dispatch() will flag
-    # them for a human decision.
-    mention_only_issue_numbers -= bound_issue_numbers
+    # Issue #1803 rework: the bound/mention scan goes through the same
+    # ``_merged_pr_referenced_issue_numbers`` wrapper dispatch uses, so
+    # this call site applies BOTH #1803 narrowings instead of only the
+    # repo-qualifier suppression it originally got. A temporally-invalid
+    # mention — a PR whose ``mergedAt`` predates the issue's ``createdAt``
+    # cannot have addressed it (the jobcannon absence-of-disproof defect)
+    # — must not protect a closed issue from the unmerged-label strip any
+    # more than a foreign-qualified one does. Scanning against
+    # ``closed_ready`` keeps the intersection identical: only closed-ready
+    # issues can be strip candidates, so bound/mention numbers outside
+    # that set were already dead weight. The wrapper resolves the mention
+    # repo context itself and skips the ``name_with_owner`` gh call when
+    # there is nothing to scan (the #361 fetch guard), and the scan's own
+    # bound-before-mention precedence replaces the manual subtraction.
+    #
+    # Issue #1229 scoping decision: the scan is deliberately NOT threaded
+    # through branch_issue_validator — the same decision the dispatch-side
+    # call site documents inside ``scan_merged_pr_references``.
+    # ``bound_issue_numbers`` only gates which CLOSED ready issues have a
+    # merged PR binding them (so they are not stripped as
+    # closed-unmerged); no issue-label transition or state escalation keys
+    # off it. A stale branch-name binding can at worst add a wrong number
+    # to ``bound_issue_numbers``, causing a missed label-strip on an
+    # already-CLOSED (terminal) issue that the next pass recovers -- not
+    # the "escalate the wrong issue" failure class the validator exists to
+    # prevent. (Contrast ``detect_mergequeue_wedged``, whose
+    # ``issue_number`` DOES drive ``_escalate_issue`` and is
+    # validator-threaded.)
+    (
+        bound_issue_numbers,
+        mention_only_issue_numbers,
+        _bound_pr_numbers,
+        _mention_pr_numbers_by_issue,
+        _mention_pr_details_by_issue,
+    ) = self._merged_pr_referenced_issue_numbers(closed_ready, merged_prs)
 
     # Only unbound closed issues are candidates for per-issue search or strip.
     unbound_issues = [

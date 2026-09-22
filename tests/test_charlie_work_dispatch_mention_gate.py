@@ -12,6 +12,7 @@ payload (``mentioning_prs`` / ``merged_at_unknown``).
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from _fakes_github import FakeGitHub
@@ -170,6 +171,86 @@ def test_dispatch_merged_pr_mention_ignores_private_issue_qualifier(
     assert result.data["merged_pr_referenced_issue_numbers"] == []
     assert result.data["selected_count"] == 1
     assert (123, "agent:human-needed") not in fake_gh.labels_added
+
+
+def test_finalize_strips_closed_ready_issue_when_mention_predates_issue_creation(
+    tmp_path: Path,
+) -> None:
+    """Issue #1803 rework (round-2 finding): the finalize path ran its own
+    mention scan through ``issue_numbers_mentioned_by_pr`` directly, so it
+    got the qualifier suppression but NOT the mergedAt-vs-createdAt
+    temporal check -- a temporally-invalid mention permanently blocked the
+    stale-ready-label strip. Now that the scan routes through the same
+    ``_merged_pr_referenced_issue_numbers`` wrapper dispatch uses, the
+    jobcannon ordering (PR merged before the issue was filed) cannot
+    protect the closed issue either."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    now = datetime.now(timezone.utc)
+    fake_gh.issues[0]["state"] = "CLOSED"
+    fake_gh.issues[0]["createdAt"] = (now - timedelta(days=2)).isoformat()
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+    fake_gh.prs[0]["mergedAt"] = (now - timedelta(days=30)).isoformat()
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    # The temporally-invalid mention must not protect the closed issue
+    # from the stale-ready-label strip.
+    assert (123, config.labels.ready) in fake_gh.labels_removed
+    assert result.data["merged_pr_flagged_issue_numbers"] == []
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "closed"
+    stripped = [
+        e
+        for e in state.get("events", [])
+        if e.get("kind") == "dispatch_closed_unmerged_ready_stripped"
+    ]
+    assert len(stripped) == 1
+    assert stripped[0]["payload"]["issue_numbers"] == [123]
+
+
+def test_finalize_temporally_valid_mention_still_protects_from_strip(
+    tmp_path: Path,
+) -> None:
+    """Positive control for the finalize-path temporal check: the SAME
+    mention shape on a PR merged AFTER the issue was created still
+    protects the closed issue from the unmerged-label strip and is
+    flagged for a human -- the check narrows on a proven ordering, it
+    does not gut the mention guard."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    now = datetime.now(timezone.utc)
+    fake_gh.issues[0]["state"] = "CLOSED"
+    fake_gh.issues[0]["createdAt"] = (now - timedelta(days=2)).isoformat()
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+    fake_gh.prs[0]["mergedAt"] = (now - timedelta(hours=1)).isoformat()
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert (123, config.labels.ready) not in fake_gh.labels_removed
+    assert result.data["merged_pr_flagged_issue_numbers"] == [123]
+    assert (123, "agent:human-needed") in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    stripped = [
+        e
+        for e in state.get("events", [])
+        if e.get("kind") == "dispatch_closed_unmerged_ready_stripped"
+    ]
+    assert stripped == []
 
 
 def test_dispatch_merged_pr_mention_slug_qualifier_foreign_vs_self(

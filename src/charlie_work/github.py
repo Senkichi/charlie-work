@@ -685,8 +685,24 @@ _FOREIGN_REPO_VISIBILITY_QUALIFIERS = frozenset({"private", "internal"})
 # * an ``owner/repo`` slug between "issue" and the hash (``issue o/r#N``)
 #   — the same qualifier shape ``closing_reference._CLOSING_LINE_RE``
 #   accepts on ``Closes`` lines.
+#
+# Group 1 captures an optional determiner immediately before the bare-word
+# qualifier (``a private issue #N``, ``the internal issue #N``, ``this
+# sibling-repo issue #N``). A determiner marks the word as an ordinary
+# adjective in a noun phrase about THIS tracker — English determiners are a
+# closed grammatical class, so a literal alternation is correct here, not a
+# fleet-managed list. ``issue_numbers_mentioned_by_pr`` de-qualifies a
+# bare-word qualifier under a determiner so organic prose that
+# coincidentally names a managed repo or visibility designator cannot
+# silently suppress a genuine same-repo mention. ``owner/repo`` slug
+# qualifiers are canonical cross-repo syntax in any construction and are
+# never de-qualified.
+_ISSUE_MENTION_DETERMINERS_RE = (
+    r"(an|a|the|this|that|these|those|our|my|its|their|your|any|each|every|another|no|such)"
+)
 _ISSUE_MENTION_RE = re.compile(
-    r"\b(?:([\w.-]+(?:/[\w.-]+)?)\s+)?issues?\s*(?:([\w.-]+/[\w.-]+))?#(\d+)\b",
+    rf"\b(?:{_ISSUE_MENTION_DETERMINERS_RE}\s+)?"
+    r"(?:([\w.-]+(?:/[\w.-]+)?)\s+)?issues?\s*(?:([\w.-]+/[\w.-]+))?#(\d+)\b",
     flags=re.IGNORECASE,
 )
 # Stripped before matching to cut two concrete false-positive classes: a
@@ -707,6 +723,11 @@ def _mention_qualifier_is_foreign(
     ``qualifier`` is whichever of ``_ISSUE_MENTION_RE``'s two qualifier
     groups matched (``None`` for an unqualified mention, which is never
     foreign — the pre-#1803 behaviour is preserved for plain ``issue #N``).
+    The caller de-qualifies a bare-word qualifier sitting under a
+    determiner (``a private issue`` reads as prose, not repo scoping) to
+    ``None`` before calling, so this function never sees the determiner —
+    by the time a bare word reaches here it is already in qualifier
+    position.
 
     An ``owner/repo`` slug qualifier is GitHub's own cross-repo reference
     syntax — the writer explicitly named which repo the number belongs to.
@@ -777,19 +798,31 @@ def issue_numbers_mentioned_by_pr(
     text = _BLOCKQUOTE_LINE_RE.sub("", text)
     found: set[int] = set()
     for match in _ISSUE_MENTION_RE.finditer(text):
-        # The post-"issue" slug (group 2) wins over a bare-word qualifier
-        # (group 1): it is GitHub's canonical ``owner/repo#N`` reference
+        # The post-"issue" slug (group 3) wins over a bare-word qualifier
+        # (group 2): it is GitHub's canonical ``owner/repo#N`` reference
         # syntax and sits closest to the number, so in ``see issue
         # owner/repo#7`` the scoping qualifier is ``owner/repo``, not the
         # prose word "see".
-        qualifier = match.group(2) or match.group(1)
+        qualifier = match.group(3) or match.group(2)
+        # A bare-word qualifier under a determiner (group 1) reads as an
+        # ordinary adjective phrase about THIS tracker — "a private
+        # issue", "the internal issue", "this sibling-repo issue" — not a
+        # repo-scoping noun adjunct. De-qualify it so an ordinary word
+        # that coincidentally equals a managed repo name or visibility
+        # designator cannot silently suppress a genuine same-repo mention.
+        # ``owner/repo`` slug qualifiers are canonical cross-repo syntax
+        # in any construction and are never de-qualified; a suppressed
+        # mention fails toward flagging, the safe direction for this
+        # advisory gate, so the boundary is drawn at the determiner.
+        if match.group(1) is not None and qualifier and "/" not in qualifier:
+            qualifier = None
         if _mention_qualifier_is_foreign(
             qualifier,
             current_repo=current_repo,
             other_repo_names=other_repo_names,
         ):
             continue
-        found.add(int(match.group(3)))
+        found.add(int(match.group(4)))
     return found
 
 

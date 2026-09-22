@@ -99,6 +99,46 @@ def test_issue_numbers_mentioned_by_pr_unqualified_and_generic_qualifiers_still_
     assert issue_numbers_mentioned_by_pr(pr) == {113, 114, 115}
 
 
+def test_issue_numbers_mentioned_by_pr_determiner_prose_qualifiers_still_match() -> None:
+    """Issue #1803 rework: a bare-word qualifier sitting under a determiner
+    is an ordinary adjective phrase about THIS tracker, not repo scoping.
+    Organic prose like "a private issue" (a confidential ticket here),
+    "an internal issue", or "this sibling-repo issue" must still count --
+    a word that coincidentally equals a managed repo name or visibility
+    designator cannot silently suppress a genuine same-repo mention."""
+    pr = {
+        "title": "chore: close out the quarter's stragglers",
+        "body": (
+            "Filed a private issue #42 for the credential rotation, "
+            "an internal issue #43 covers the staging rollout, and "
+            "this sibling-repo issue #44 tracks the shared-client work."
+        ),
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr, other_repo_names={"sibling-repo"}) == {
+        42,
+        43,
+        44,
+    }
+
+
+def test_issue_numbers_mentioned_by_pr_qualifier_position_still_suppresses() -> None:
+    """Boundary pin: the SAME qualifier words keep suppressing when they
+    sit in qualifier position (no determiner) -- the guard narrows the
+    match, it does not gut the #1803 suppression. An ``owner/repo`` slug
+    stays qualified under a determiner too: it is canonical cross-repo
+    syntax, never an adjective."""
+    pr = {
+        "title": "",
+        "body": (
+            "tracked as private issue #42, moved to sibling-repo issue #44, "
+            "and the owner/repo issue #8"
+        ),
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr, other_repo_names={"sibling-repo"}) == set()
+
+
 def test_defang_closing_keywords_strips_live_keyword_but_keeps_number_legible() -> None:
     # Issue #781 AC3: defang_closing_keywords rewrites `<keyword> #N` to
     # `<keyword> issue N` -- the rewritten text no longer matches the

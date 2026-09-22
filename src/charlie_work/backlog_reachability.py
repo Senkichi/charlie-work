@@ -15,10 +15,11 @@ not grow past its file-size ratchet high-water mark:
 verbatim from ``_merged_pr_referenced_issue_numbers``), the mention-coverage
 map builder ``compute_mention_coverage_map``, the fail-open merged-PR fetch
 ``fetch_merged_prs_fail_open``, and the dispatch-side fetch/reuse resolver
-``resolve_dispatch_mention_coverage``. The classifier's mention-coverage arm
-and the dispatch-side exclusion both call ``scan_merged_pr_references`` (via
-the app's thin wrapper), so the exclusion semantics cannot drift between the
-two paths.
+``resolve_dispatch_mention_coverage``. The classifier's mention-coverage arm,
+the dispatch-side exclusion, and ``state_merge_train``'s
+externally-merged finalization mention scan (issue #1803 rework) all call
+``scan_merged_pr_references`` (via the app's thin wrapper), so the exclusion
+semantics cannot drift between the paths.
 
 ``workflow.py`` re-exports all symbols via a facade import block (mirroring
 ``config.py``'s ``RunnerAllocationConfig`` re-export pattern and this
