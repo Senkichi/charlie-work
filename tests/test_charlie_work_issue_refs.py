@@ -78,12 +78,12 @@ def test_issue_numbers_mentioned_by_pr_suppresses_managed_repo_qualifier() -> No
     """Issue #1803: a bare-word qualifier naming another *managed* repo
     (``other_repo_names``, fleet-registry derived) is foreign; the
     dispatching repo's own name is not."""
-    pr = {"title": "", "body": "tracked as job-cannon issue #10"}
+    pr = {"title": "", "body": "tracked as sibling-repo issue #10"}
 
-    assert issue_numbers_mentioned_by_pr(pr, other_repo_names={"job-cannon"}) == set()
+    assert issue_numbers_mentioned_by_pr(pr, other_repo_names={"sibling-repo"}) == set()
     # Self-name beats the foreign set when both are supplied.
     assert issue_numbers_mentioned_by_pr(
-        pr, current_repo="Senkichi/job-cannon", other_repo_names={"job-cannon"}
+        pr, current_repo="me/sibling-repo", other_repo_names={"sibling-repo"}
     ) == {10}
 
 

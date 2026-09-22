@@ -681,7 +681,7 @@ _FOREIGN_REPO_VISIBILITY_QUALIFIERS = frozenset({"private", "internal"})
 # suppressed:
 #
 # * a bare name or ``owner/repo`` slug directly before the word "issue"
-#   (``private issue #N``, ``job-cannon issue #N``, ``o/r issue #N``);
+#   (``private issue #N``, ``sibling-repo issue #N``, ``o/r issue #N``);
 # * an ``owner/repo`` slug between "issue" and the hash (``issue o/r#N``)
 #   — the same qualifier shape ``closing_reference._CLOSING_LINE_RE``
 #   accepts on ``Closes`` lines.
