@@ -204,4 +204,31 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[str, tuple[str, ...]]]
             "conflict_rework_attempts_stall_head",
         ),
     ),
+    # Issue #1683: the review-dispatch lanes were missing from this map
+    # entirely, so every automated clear of either reason was inert -- the
+    # gating counter stayed at cap, the next dispatch pass re-escalated
+    # without a single new ``review_dispatch_claim``, and the inert clears
+    # burned ``auto_deescalation_count`` until ``deescalation_cap_exhausted``
+    # parked the issue (PR #1623 / issue #1614).
+    #
+    # Both review counters are same-head-sensitive: ``review()``'s packet
+    # write preserves ``review_dispatch_attempt_count`` and
+    # ``review_turn_limit_miss_streak`` while
+    # ``review_dispatch_attempt_last_head`` matches the packet head, and
+    # resets them only on a fresh dispatch cycle.  ``review_dispatch_
+    # attempt_last_head`` is therefore a companion of BOTH lanes: popping
+    # it forces the next packet write down the fresh-cycle path, which
+    # re-baselines the whole dispatch epoch.  That matters most for the
+    # streak lane -- every turn-limit miss also consumed a dispatch
+    # attempt, so ``review_dispatch_attempt_count`` is typically at cap
+    # too and would re-escalate under the OTHER reason before any new
+    # claim if the stale baseline survived.
+    "max_review_dispatch_attempts_exceeded": (
+        "review_dispatch_attempt_count",
+        ("review_dispatch_attempt_last_head",),
+    ),
+    "max_consecutive_turn_limit_misses_exceeded": (
+        "review_turn_limit_miss_streak",
+        ("review_dispatch_attempt_last_head",),
+    ),
 }

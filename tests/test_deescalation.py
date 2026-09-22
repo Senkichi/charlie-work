@@ -1357,6 +1357,10 @@ def test_sweep_does_not_re_reset_rework_counter_in_same_episode(
     assert "escalation_reason" not in pr_456
     cleared = _events(state, "deescalation_cleared")
     assert cleared[0]["payload"]["rework_budget_reset"] is False
+    # Issue #1683: distinguishable from the no-map-entry case -- here the
+    # per-episode reset window was NOT consumed (already spent), whereas a
+    # no-counter reason reports ``rework_budget_reset_needed is True``.
+    assert cleared[0]["payload"]["rework_budget_reset_needed"] is False
 
 
 def test_sweep_resets_rework_counter_again_after_re_escalation(
@@ -1581,7 +1585,13 @@ def test_sweep_does_not_reset_rework_counter_for_non_rework_reason(
     assert "escalation_reason" not in pr_456
     assert "escalation_reason" not in state["issues"]["123"]
     cleared = _events(state, "deescalation_cleared")
-    assert cleared[0]["payload"]["rework_budget_reset"] is True
+    # Issue #1683: ``rework_budget_reset`` reports whether a counter was
+    # actually zeroed -- for a no-map-entry reason that is False even
+    # though the per-episode reset window WAS consumed (the marker is
+    # still stamped, so the field must distinguish "reset attempted, no
+    # counter" from "counter reset").
+    assert cleared[0]["payload"]["rework_budget_reset"] is False
+    assert cleared[0]["payload"]["rework_budget_reset_needed"] is True
 
 
 # --- issue #1327: dry-run state/label divergence ---
