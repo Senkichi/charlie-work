@@ -334,6 +334,7 @@ def _emit_fallback_event(state_path: Path, *, command: list[str], reason: str) -
     matching.
     """
     payload = {"command": " ".join(command), "reason": reason}
+    # write-gate-exempt(issue=1834): GitHub client layer has no WriteGate; transport fallback bookkeeping is lock-free
     log_event(state_path, "github_transport_fallback", payload)
 
 

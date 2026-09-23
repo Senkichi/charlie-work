@@ -298,15 +298,24 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
         # detection.  See ``_REWORK_BUDGET_RESET_BY_ESCALATION_REASON``.
         _wf.clear_escalation_on_issue_prs(fresh_state, issue_number)
         _wf._reset_linked_pr_status_to_passive_open(fresh_state, pr_number)
+        # Issue #1683: report whether a counter was actually zeroed, not
+        # merely whether the per-episode reset window was consumed --
+        # ``budget_reset_needed`` is also true for cleared reasons with no
+        # map entry (nothing to reset), and reporting those as a reset
+        # made inert clears indistinguishable from real ones in
+        # events.db.
+        counter_reset = False
         if budget_reset_needed:
             fresh_pr = fresh_state["prs"].get(str(pr_number))
             if isinstance(fresh_pr, dict):
                 reset_spec = self._REWORK_BUDGET_RESET_BY_ESCALATION_REASON.get(cleared_condition)
                 if reset_spec is not None:
-                    counter_field, companion_fields = reset_spec
-                    fresh_pr[counter_field] = 0
+                    counter_fields, companion_fields = reset_spec
+                    for _counter_field in counter_fields:
+                        fresh_pr[_counter_field] = 0
                     for _field in companion_fields:
                         fresh_pr.pop(_field, None)
+                    counter_reset = True
         fresh_state = self.write_gate.record_event(
             fresh_state,
             "deescalation_cleared",
@@ -318,7 +327,8 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
                 "pr_mergeable": mergeable,
                 "janitor_ok": janitor_verdict.ok,
                 "auto_deescalation_count": cleared_auto_count,
-                "rework_budget_reset": budget_reset_needed,
+                "rework_budget_reset": counter_reset,
+                "rework_budget_reset_needed": budget_reset_needed,
             },
         )
         self.write_gate.save_state(fresh_state)
