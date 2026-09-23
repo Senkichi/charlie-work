@@ -22,6 +22,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from charlie_work.config import (
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
     DevinConfig,
@@ -37,7 +39,7 @@ from charlie_work.devin_shell import SessionRecord
 from charlie_work.fleet_registry import managed_repo_names
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
-from charlie_work.worktree import create_worktree
+from charlie_work.worktree import create_worktree, worktree_path_for_branch
 from charlie_work.write_gate import WriteGate
 
 from _fakes_github import FakeGitHub
@@ -233,6 +235,11 @@ def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
     remote = tmp_path / "remote"
     remote.mkdir(parents=True, exist_ok=True)
     _git(remote, "init", "--bare", "--initial-branch=main")
+    # The remote's receive-pack needs repo-level longpaths: git scrubs the
+    # GIT_CONFIG_* env config (set by conftest for local invocations) when
+    # spawning transport children, so object writes on the receive side can
+    # only read the setting from the remote's own config file.
+    _git(remote, "config", "core.longpaths", "true")
     clone = tmp_path / "clone"
     clone.mkdir(parents=True, exist_ok=True)
     _git(clone, "init", "--initial-branch=main")
@@ -404,6 +411,40 @@ def test_classify_dead_sessions_cross_repo_hop_escalates_on_first_occurrence(
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path / "repo")
     branch = "agent/issue-709"
+    worktree_path = worktree_path_for_branch(repo_root, branch)
+    # Environmental bound, not a code defect: git for Windows aborts
+    # `worktree add` during checkout with "fatal: '$GIT_DIR' too big" once
+    # the worktree path exceeds git's fixed internal buffer (empirically
+    # ~216 chars on this build — core.longpaths and worktree.useRelativePaths
+    # do not cover it, and create_worktree resolves the real path so a
+    # subst/junction alias cannot shorten what git sees). Probe git itself
+    # at the exact target path and skip only on the literal signature —
+    # run_captured's RuntimeError does not carry stderr, so a code change
+    # that regresses `worktree add` differently still fails. CI's short
+    # checkout paths exercise the test fully.
+    probe = subprocess.run(
+        ["git", "worktree", "add", "--detach", str(worktree_path), "origin/main"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    # Remove whatever the probe left (a completed worktree or partial admin
+    # state); a failure just means nothing was there to remove.
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(worktree_path)],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        if "too big" in probe.stderr:
+            pytest.skip(
+                "git's internal $GIT_DIR buffer rejects worktree creation at this checkout depth"
+            )
+        raise AssertionError(f"git worktree add probe failed: {probe.stderr}")
     info = create_worktree(repo_root, branch, base_ref="origin/main")
     sessions_dir, state_file = _make_classify_state(tmp_path)
     _write_dead_session_sidecar(sessions_dir, 709, branch, info.path)
