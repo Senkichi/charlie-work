@@ -28,7 +28,7 @@ from charlie_work.doctor import run_doctor
 from charlie_work.github import GitHubError
 from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.paths import runtime_paths
-from _doctor_fixtures import FakeDoctorGitHub, _config
+from _doctor_fixtures import FakeDoctorGitHub, _config, _write_workflow
 
 
 def _init_repo(repo_root: Path) -> None:
@@ -321,6 +321,123 @@ def test_doctor_flags_state_dir_not_gitignored(tmp_path: Path) -> None:
     assert by_name["state dir gitignored"].severity == "error"
     assert ".var" in by_name["state dir gitignored"].detail
     assert ok is False
+
+
+def test_doctor_state_dir_gitignored_dir_only_pattern_missing_dir(
+    tmp_path: Path,
+) -> None:
+    """A dir-only .gitignore pattern covers a state dir that does not exist yet.
+
+    ``git check-ignore -q <path>`` cannot tell that a nonexistent path is a
+    directory, so a dir-only pattern like ``.var/charlie-work/`` does not
+    match the bare state-dir path (rc=1) even though everything under it is
+    ignored. Probing the bare dir therefore reports a healthy fresh repo —
+    one whose state dir has simply not been created — as a blocking failure.
+    The probe must target a file inside the state dir (``paths.state_file``).
+    Every other state-dir test in this module uses the parent-level ``.var/``
+    pattern, which matches via the ignored parent and so masked this.
+    """
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".var/charlie-work/\n", encoding="utf-8")
+    issues_dir = tmp_path / "docs" / "issues"
+    _write_issue(issues_dir, 1)
+    config = _local_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    assert not paths.root.exists()  # the fresh-repo scenario under test
+    gh = _local_gh(tmp_path, issues_dir)
+
+    ok, checks = run_doctor(
+        tmp_path,
+        paths,
+        config,
+        tmp_path / "orchestrator.config.yaml",
+        gh,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+    by_name = _by_name(checks)
+    assert by_name["state dir gitignored"].ok is True
+    assert ok is True, [(c.name, c.detail) for c in checks if not c.ok and c.severity == "error"]
+
+
+def test_doctor_state_dir_gitignored_dir_only_pattern_existing_dir(
+    tmp_path: Path,
+) -> None:
+    """Same dir-only pattern with the state dir already created stays green.
+
+    Positive control for the missing-dir variant: once ``.var/charlie-work/``
+    exists on disk, check-ignore can classify the bare dir path too, so this
+    passes under either probe — it pins the steady-state behaviour.
+    """
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".var/charlie-work/\n", encoding="utf-8")
+    issues_dir = tmp_path / "docs" / "issues"
+    _write_issue(issues_dir, 1)
+    config = _local_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True)
+    gh = _local_gh(tmp_path, issues_dir)
+
+    ok, checks = run_doctor(
+        tmp_path,
+        paths,
+        config,
+        tmp_path / "orchestrator.config.yaml",
+        gh,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+    by_name = _by_name(checks)
+    assert by_name["state dir gitignored"].ok is True
+    assert ok is True, [(c.name, c.detail) for c in checks if not c.ok and c.severity == "error"]
+
+
+def test_doctor_check_name_gate_skipped_on_local_backend(tmp_path: Path) -> None:
+    """required_checks + a non-matching workflow emit no `check name:` entries.
+
+    On a PR-publishing backend this config produces a failing
+    ``check name: Tests`` entry (no workflow job reports that name). On a
+    no-PR backend the whole required-checks-vs-workflows gate is
+    capability-gated (``publishes_prs and ...``), so nothing is emitted and
+    ``required checks configured`` reports not-applicable while noting that
+    the configured auto_merge settings are inert. Dropping ``publishes_prs``
+    from that guard reintroduces the original #1706 false-positive failure.
+    """
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".var/\n", encoding="utf-8")
+    _write_workflow(
+        tmp_path,
+        "name: ci\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  lint:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: ruff check .\n",
+    )
+    issues_dir = tmp_path / "docs" / "issues"
+    _write_issue(issues_dir, 1)
+    config = _local_config(auto_merge=AutoMergeConfig(enabled=True, required_checks=("Tests",)))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = _local_gh(tmp_path, issues_dir)
+
+    ok, checks = run_doctor(
+        tmp_path,
+        paths,
+        config,
+        tmp_path / "orchestrator.config.yaml",
+        gh,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+    by_name = _by_name(checks)
+    assert not any(name.startswith("check name:") for name in by_name)
+    required = by_name["required checks configured"]
+    assert required.ok is True
+    assert required.severity == "warning"
+    assert "not applicable" in required.detail
+    assert "auto_merge settings are inert" in required.detail
+    assert ok is True, [(c.name, c.detail) for c in checks if not c.ok and c.severity == "error"]
 
 
 def test_doctor_state_dir_outside_repo_is_not_applicable(tmp_path: Path) -> None:

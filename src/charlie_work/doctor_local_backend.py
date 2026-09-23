@@ -49,7 +49,13 @@ def _check_local_issue_backend(
       can commit orchestrator bookkeeping into the consumer's history.
       ``git check-ignore`` is the authoritative answer -- it honours nested
       ``.gitignore`` files, negations, and ``.git/info/exclude``, which a
-      hand-rolled ``.gitignore`` text search would not.
+      hand-rolled ``.gitignore`` text search would not. The probe targets
+      ``paths.state_file`` (a file INSIDE the state dir), not the bare dir
+      path: check-ignore cannot classify a path that does not exist yet as a
+      directory, so a dir-only pattern like ``.var/charlie-work/`` matches the
+      state file but not the state dir itself -- probing the dir would
+      false-positive a healthy fresh repo whose state dir has not been
+      created.
 
     ``local_merge_queue`` does not exist as a config section yet; the getattr
     guard lets this light up with the section rather than needing a follow-up
@@ -93,7 +99,7 @@ def _check_local_issue_backend(
 
     repo_resolved = repo_root.resolve()
     try:
-        state_rel = paths.root.relative_to(repo_resolved)
+        state_rel = paths.state_file.relative_to(repo_resolved)
     except ValueError:
         add(
             "state dir gitignored",
@@ -112,9 +118,9 @@ def _check_local_issue_backend(
             add(
                 "state dir gitignored",
                 False,
-                f"{state_rel.as_posix()} is NOT ignored — add it to the consumer "
-                "repo's .gitignore so orchestrator state stays out of `git status` "
-                "and out of any worker `git add -A`",
+                f"{state_rel.as_posix()} is NOT ignored — add the state dir to the "
+                "consumer repo's .gitignore so orchestrator state stays out of "
+                "`git status` and out of any worker `git add -A`",
             )
         else:
             add(
