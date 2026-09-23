@@ -27,6 +27,7 @@ capability, not the lane being deleted outright).
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import Mock
@@ -69,16 +70,22 @@ import charlie_work.orchestration.dispatch_state as dispatch_state_module  # noq
 
 def _init_repo(repo_root: Path) -> None:
     """A fresh git repo with one commit and NO origin remote -- the exact
-    shape of a ``local_issues`` repo (e.g. ``local/mdls``)."""
+    shape of a ``local_issues`` repo (e.g. ``local/mdls``).
+
+    ``core.longpaths`` is set because pytest's basetemp under this repo's
+    ``.var/worker-tmp`` pushes ``.git/objects/<sha>`` paths past the Windows
+    MAX_PATH limit (``error: unable to write file ... Filename too long``,
+    commit exit 1); the knob is a no-op elsewhere. The child env is also
+    scrubbed of ``GIT_*`` variables so an ambient ``GIT_DIR``/
+    ``GIT_INDEX_FILE``/``GIT_CONFIG_*`` leaked by whatever shell spawned
+    pytest cannot redirect these commands at the *outer* repo instead of
+    the fresh one.
+    """
     repo_root.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    for command in (
         ["git", "init", "--initial-branch=main"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
+        ["git", "config", "core.longpaths", "true"],
         [
             "git",
             "-c",
@@ -90,11 +97,13 @@ def _init_repo(repo_root: Path) -> None:
             "-m",
             "chore: seed",
         ],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    ):
+        result = subprocess.run(command, cwd=repo_root, capture_output=True, text=True, env=env)
+        if result.returncode != 0:
+            raise AssertionError(
+                f"{command[:2]} rc={result.returncode}\n"
+                f"stdout: {result.stdout}\nstderr: {result.stderr}"
+            )
 
 
 def _config(*, local_enabled: bool) -> OrchestratorConfig:
