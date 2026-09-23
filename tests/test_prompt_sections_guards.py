@@ -1,4 +1,4 @@
-"""``assert_*`` prompt-guard function tests (issues #714, #715, #717, #1010).
+"""``assert_*`` prompt-guard function tests (issues #714, #715, #717, #1010, #1780).
 
 Split out of ``tests/test_prompt_sections.py`` (issue #1570, Track 1
 shoulder) -- bodies are verbatim relocations; shared helpers live in
@@ -374,3 +374,87 @@ def test_assert_containment_accepts_override_with_widened_clause(
     )
     # Must not raise — the override carries the widened containment clause.
     assert_containment(prompt)
+
+
+def test_assert_session_scratch_dir_passes_for_package_templates() -> None:
+    """The guard accepts prompts rendered from the package templates (issue #1780)."""
+    from charlie_work.prompts import assert_session_scratch_dir
+
+    for template_name in (
+        "worker.md",
+        "worker_claude_code.md",
+        "worker_local.md",
+        "rework.md",
+    ):
+        prompt = _render_worker_with_sections(template_name)
+        # Must not raise — every package worker/rework template references
+        # $section_session_scratch_dir.
+        assert_session_scratch_dir(prompt)
+
+
+def test_assert_session_scratch_dir_rejects_flat_override_without_section(
+    tmp_path: Path,
+) -> None:
+    """The guard catches a flat override that drops the scratch-dir rule (issue #1780).
+
+    This is the exact scenario the issue describes: a repo-local flat
+    whole-file ``worker.md`` override that does not reference
+    ``$section_session_scratch_dir`` renders without the ``$TMPDIR``
+    instruction, dispatching workers free to pick a literal ``/tmp/...``
+    path that resolves through MSYS's install-wide mount (Git Bash) or the
+    shared system temp — shared across every concurrent worker session,
+    the residual class #1767's env fix could not close.
+    """
+    from charlie_work.prompts import (
+        MissingSessionScratchDirError,
+        assert_session_scratch_dir,
+    )
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    (override_dir / "worker.md").write_text(
+        "# Worker Task\n\nGo fix the issue. No scratch-file rule here.\n",
+        encoding="utf-8",
+    )
+    prompt = render_prompt(
+        "worker.md",
+        ISSUE_VALUES,
+        search_dirs=(override_dir,),
+    )
+    assert "$TMPDIR" not in prompt
+
+    with pytest.raises(MissingSessionScratchDirError) as exc_info:
+        assert_session_scratch_dir(prompt, context="worker prompt for issue #123")
+    assert "issue #1780" in str(exc_info.value)
+    assert "worker prompt for issue #123" in str(exc_info.value)
+
+
+def test_assert_session_scratch_dir_accepts_override_with_rule(
+    tmp_path: Path,
+) -> None:
+    """The guard accepts a flat override that does carry the scratch-dir rule (issue #1780).
+
+    A repo-local override is not inherently wrong — it just must not drop
+    the ``$TMPDIR``-only instruction and the literal-``/tmp`` prohibition.
+    """
+    from charlie_work.prompts import assert_session_scratch_dir
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    # ``$$TMPDIR`` in template source renders as the literal ``$TMPDIR``
+    # (string.Template escaping); a bare ``$TMPDIR`` is an unresolved
+    # placeholder that strict rendering refuses before the guard ever runs.
+    (override_dir / "worker.md").write_text(
+        "# Worker Task\n\n"
+        "## Scratch files\n\n"
+        "Put every scratch file under `$$TMPDIR`; never a literal `/tmp/` "
+        "path — it is shared across every concurrent worker session.\n",
+        encoding="utf-8",
+    )
+    prompt = render_prompt(
+        "worker.md",
+        ISSUE_VALUES,
+        search_dirs=(override_dir,),
+    )
+    # Must not raise — the override carries the scratch-dir rule.
+    assert_session_scratch_dir(prompt)
