@@ -419,6 +419,7 @@ def record_fleet_pass_completed(
     """
     path = supervisor_heartbeat_path(fleet_dir_override)
     try:
+        # write-gate-exempt(issue=1832): standalone bookkeeping predates the WriteGate wave
         log_event(
             path,
             FLEET_PASS_COMPLETED,
@@ -511,6 +512,7 @@ def record_wedge_kill_loop(
     caller can also route it to the attention digest.
     """
     payload = dict(detection)
+    # write-gate-exempt(issue=1832): standalone bookkeeping predates the WriteGate wave
     log_event(
         supervisor_heartbeat_path(fleet_dir_override),
         SUPERVISOR_WEDGE_LOOP,
