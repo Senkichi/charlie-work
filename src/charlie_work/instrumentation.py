@@ -317,6 +317,15 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # routinely dominate warning volume, which this signal is designed
         # not to do.
         "operator_queue_impact": "warning",
+        # Issue #1505: the outbound body-write guard refused a
+        # ``pr_create``/``issue_comment``/``pr_comment`` because the text
+        # matched a vendored gitleaks credential rule. Warning, not error:
+        # the write was refused *before* submission, so nothing leaked -- but
+        # the payload is (by construction) a live credential somewhere in the
+        # pipeline that produced it, and the operator must learn that rotation
+        # is needed. Deliberately unbucketed: rare, and each refusal needs the
+        # flat detailed listing in heartbeat's warning report.
+        "outbound_body_secret_refused": "warning",
         # cw#1263: the orchestrator's own salvage-PR-body builders had to
         # rewrite the ``Closes #N`` line before handing the body to
         # ``gh pr create``. Warning, not error: the rewrite happens before
