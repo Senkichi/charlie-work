@@ -13,12 +13,13 @@ from pathlib import Path
 from charlie_work.markdown_fence import fenced_block
 from charlie_work.prompt_sections import section_variables
 from charlie_work.prompt_test_command import prompt_test_command_values
-from charlie_work.prompts import render_prompt, unresolved_rendered_identifiers
+from charlie_work.prompts import render_prompt
 
 from _prompt_sections_fixtures import (
     ISSUE_VALUES,
     TEST_COMMAND_VALUES,
     _render_worker_with_sections,
+    unresolved_rendered_identifiers,
 )
 
 

@@ -26,13 +26,7 @@ from .github import defang_closing_keywords
 from .markdown_fence import fenced_block
 from .prompt_skills import active_prompt_variants
 from .prompt_test_command import prompt_test_command_values
-from .prompts import (
-    assert_containment,
-    assert_execution_contract,
-    assert_no_merge_contract,
-    assert_session_scratch_dir,
-    render_prompt,
-)
+from .prompts import assert_rework_prompt_contracts, render_prompt
 from .review_decision import _round_history_entries  # noqa: F401  (re-exported)
 from .review_decision import resolve_decision_payload
 from .verdict_parsing import body_has_crash_signature
@@ -901,24 +895,12 @@ def _write_rework_prompt(
         config,
         repo_root=repo_root,
     )
-    # Issue #714: enforce the no-merge contract on the *rendered output* so a
-    # repo-local flat rework override that drops $section_no_merge_contract is
-    # caught at the dispatch boundary.
-    assert_no_merge_contract(prompt, context=f"rework prompt for PR #{pr_number}")
-    # Issue #717: enforce the execution-contract escalation trigger on the
-    # *rendered output* so a repo-local flat rework override that drops
-    # $section_execution_contract is caught at the dispatch boundary.
-    assert_execution_contract(prompt, context=f"rework prompt for PR #{pr_number}")
-    # Issue #1010: enforce the widened containment clause on the *rendered
-    # output* so a repo-local flat rework override that drops
-    # $section_scope_contract or reverts to the old repo-scoped wording is
-    # caught at the dispatch boundary.
-    assert_containment(prompt, context=f"rework prompt for PR #{pr_number}")
-    # Issue #1780: enforce the scratch-dir rule on the *rendered output* so a
-    # repo-local flat rework override that drops $section_session_scratch_dir
-    # is caught at the dispatch boundary — rework sessions run shell commands
-    # on the same host with the same shared-/tmp hazard as fresh dispatches.
-    assert_session_scratch_dir(prompt, context=f"rework prompt for PR #{pr_number}")
+    # Issues #714/#717/#1010/#1780: the rendered-output contract guards run
+    # here at the dispatch boundary, so a repo-local flat rework override
+    # that drops a $section_* reference is caught rather than shipped to a
+    # rework session that runs shell commands on the same host with the
+    # same hazards as a fresh dispatch.
+    assert_rework_prompt_contracts(prompt, context=f"rework prompt for PR #{pr_number}")
     # Issue #1268 (W11), item 1 binding-comment #4: both the live brief and
     # its sidecar are polled by dispatch-time readers (regeneration checks,
     # worker launch), so a plain write_text here is the same

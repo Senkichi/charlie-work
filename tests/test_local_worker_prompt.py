@@ -28,9 +28,10 @@ from charlie_work.prompts import (
     assert_containment,
     assert_execution_contract,
     assert_no_merge_contract,
-    unresolved_rendered_identifiers,
 )
 from charlie_work.workflow import OrchestratorApp, check_prompt_template_drift
+
+from _prompt_sections_fixtures import unresolved_rendered_identifiers
 
 # ---------------------------------------------------------------------------
 # Inlined helper -- self-contained per this repo's test-file convention.
@@ -47,9 +48,9 @@ def _fake_issue(number: int = 1) -> dict[str, object]:
 
 
 def _unresolved_placeholders(rendered: str) -> set[str]:
-    # Owned by the render layer (issue #1780): the scratch-dir section
-    # intentionally emits a literal ``$TMPDIR``, which
-    # ``prompts.INTENTIONAL_RENDERED_IDENTIFIERS`` declares exempt.
+    # Issue #1780: the scratch-dir section intentionally emits a literal
+    # ``$TMPDIR`` (``$$TMPDIR`` in source); the shared test helper exempts
+    # exactly the identifiers the ``$$IDENT`` escapes declare.
     return unresolved_rendered_identifiers(rendered)
 
 

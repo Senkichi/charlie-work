@@ -43,9 +43,10 @@ from charlie_work.prompts import (
     TEMPLATE_DIR,
     render_prompt,
     resolve_template,
-    unresolved_rendered_identifiers,
 )
 from charlie_work.workflow import OrchestratorApp, _write_rework_prompt
+
+from _prompt_sections_fixtures import unresolved_rendered_identifiers
 
 # Templates that are never passed through render_prompt at all: grepping
 # `orchestrator.md` and `fleet_burndown.md` across all of `src/` (not just
@@ -97,10 +98,11 @@ def _unresolved_placeholders_in_output(rendered: str) -> set[str]:
     is not ``$identifier``/``${identifier}`` shaped. Issue #1780 adds a
     second intentional literal shape -- ``session_scratch_dir.md``
     instructs the worker to use ``$TMPDIR``, so the name reaches rendered
-    output verbatim. Both are owned by the render layer itself:
-    ``prompts.unresolved_rendered_identifiers`` subtracts the declared
-    :data:`prompts.INTENTIONAL_RENDERED_IDENTIFIERS` set, keeping this
-    check aligned with what actually counts as an unresolved placeholder.
+    output verbatim. The shared test helper
+    ``_prompt_sections_fixtures.unresolved_rendered_identifiers`` exempts
+    exactly the identifiers the ``$$IDENT`` escapes in shipped prompt
+    sources declare, keeping this check aligned with what actually counts
+    as an unresolved placeholder.
     """
     return unresolved_rendered_identifiers(rendered)
 
@@ -457,6 +459,89 @@ def test_rework_writer_rejects_flat_override_without_execution_contract(
     with pytest.raises(MissingExecutionContractError) as exc_info:
         _write_rework_prompt(state_file, pr, 1, "A dispatch note.", config)
     assert "issue #717" in str(exc_info.value)
+
+
+def test_worker_writer_rejects_flat_override_without_scratch_dir(
+    tmp_path: Path,
+) -> None:
+    """Issue #1780: ``_write_worker_prompt`` must refuse to write a prompt
+    whose rendered output is missing the scratch-file rule — the exact
+    failure mode a repo-local flat ``worker.md`` override creates when it
+    drops the ``$section_session_scratch_dir`` reference, dispatching
+    workers free to use a literal ``/tmp/...`` path that resolves through
+    MSYS's install-wide mount (Git Bash) or the shared system temp, shared
+    across every concurrent worker session on the host."""
+    from charlie_work.prompts import MissingSessionScratchDirError
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    # The override carries the #714 no-merge contract, the #715
+    # conventional-commit title instruction, the #717 execution-contract
+    # escalation trigger, and the #1010 widened containment clause (so every
+    # earlier guard passes), but drops the scratch-file rule. ``$TMPDIR``
+    # must not appear at all: as a bare placeholder strict rendering would
+    # reject it, and as ``$$TMPDIR`` it would render the literal marker and
+    # satisfy the guard.
+    (override_dir / "worker.md").write_text(
+        "# Worker Task\n\n"
+        "## No-merge contract\n\n"
+        "Your deliverable ENDS at pushing the branch and opening the PR.\n\n"
+        "## PR requirements\n\n"
+        "- Title format: Conventional-Commits format (`type(scope): description`).\n\n"
+        "Execution contract (self-detect from your diff): run the **FULL "
+        "suite** locally at the final head before pushing.\n\n"
+        "**Containment:** All file edits happen in the assigned worktree; "
+        "never modify any path outside the assigned worktree root.\n"
+        "$issue_number $branch_name\n",
+        encoding="utf-8",
+    )
+    config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir=str(override_dir)))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, gh=None)
+
+    with pytest.raises(MissingSessionScratchDirError) as exc_info:
+        app._write_worker_prompt(_fake_issue())
+    assert "issue #1780" in str(exc_info.value)
+
+
+def test_rework_writer_rejects_flat_override_without_scratch_dir(
+    tmp_path: Path,
+) -> None:
+    """Issue #1780: ``_write_rework_prompt`` must refuse to write a rework
+    brief whose rendered output is missing the scratch-file rule — rework
+    sessions run shell commands on the same host with the same shared-/tmp
+    hazard as fresh dispatches."""
+    from charlie_work.prompts import MissingSessionScratchDirError
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    # The override carries the #714 no-merge contract, the #717
+    # execution-contract escalation trigger, and the #1010 widened
+    # containment clause (so every earlier guard passes), but drops the
+    # scratch-file rule.
+    (override_dir / "rework.md").write_text(
+        "# Rework Task\n\n"
+        "## No-merge contract\n\n"
+        "Your deliverable ENDS at pushing the branch and opening the PR.\n\n"
+        "Execution contract (self-detect from your diff): run the **FULL "
+        "suite** locally at the final head before pushing.\n\n"
+        "**Containment:** All file edits happen in the assigned worktree; "
+        "never modify any path outside the assigned worktree root.\n"
+        "$pr_number $pr_title $pr_url $issue_number $branch_name\n",
+        encoding="utf-8",
+    )
+    config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir=str(override_dir)))
+    state_file = tmp_path / ".var" / "charlie-work" / "state.json"
+    pr = {
+        "number": 2,
+        "title": "Fake PR title",
+        "url": "https://example.test/pull/2",
+        "headRefName": "agent/issue-1-fake",
+    }
+
+    with pytest.raises(MissingSessionScratchDirError) as exc_info:
+        _write_rework_prompt(state_file, pr, 1, "A dispatch note.", config)
+    assert "issue #1780" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------

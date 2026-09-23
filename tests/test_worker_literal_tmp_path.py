@@ -9,11 +9,12 @@ section + the ``assert_session_scratch_dir`` dispatch-boundary guard); this
 module's tests pin the other half of the issue — the structural signal that
 a dead claude/api session did it anyway:
 
-* ``claude_code.literal_tmp_shell_commands`` scans a session's stream-json
-  transcript for ``tool_use`` blocks carrying a shell ``command`` with a
-  literal ``/tmp`` token, and
+* ``worker_literal_tmp.literal_tmp_shell_commands`` scans a session's
+  stream-json transcript for ``tool_use`` blocks carrying a shell
+  ``command`` with a literal ``/tmp`` token, and
 * the dead-session lane in ``dead_worker_reap`` emits a warning-level
-  ``worker_literal_tmp_path`` event once per offending session.
+  ``worker_literal_tmp_path`` event once per offending session, via
+  ``worker_literal_tmp.emit_literal_tmp_path_warning``.
 """
 
 from __future__ import annotations
@@ -25,9 +26,10 @@ from pathlib import Path
 import pytest
 
 from _worker_fixtures import _wg
-from charlie_work.claude_code import ClaudeWorkerRecord, literal_tmp_shell_commands
+from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.claude_code import _sidecar_path as claude_sidecar_path
 from charlie_work.config import OrchestratorConfig, PostMortemConfig
+from charlie_work.worker_literal_tmp import literal_tmp_shell_commands
 
 
 def _assistant_tool_use(command: str, *, tool_name: str = "Bash") -> dict:

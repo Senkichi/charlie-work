@@ -291,6 +291,40 @@ def assert_session_scratch_dir(prompt: str, *, context: str = "worker prompt") -
         raise MissingSessionScratchDirError(context, missing)
 
 
+def assert_worker_prompt_contracts(prompt: str, *, context: str = "worker prompt") -> None:
+    """Run every rendered-output contract guard the worker-prompt writer owns.
+
+    Single point of enforcement for the dispatch-boundary guard block —
+    issues #714 (no-merge contract), #715 (conventional-commit title),
+    #717 (execution-contract escalation trigger), #1010 (widened
+    containment clause), and #1780 (scratch-dir rule). Each guard checks
+    the *rendered output*, so a repo-local flat ``worker.md`` override that
+    drops a ``$section_*`` reference is caught at the dispatch boundary
+    regardless of how the override was structured. Keeping the whole block
+    behind one call means the two dispatch-boundary writers cannot drift
+    on which guards run.
+    """
+    assert_no_merge_contract(prompt, context=context)
+    assert_conventional_commit_title(prompt, context=context)
+    assert_execution_contract(prompt, context=context)
+    assert_containment(prompt, context=context)
+    assert_session_scratch_dir(prompt, context=context)
+
+
+def assert_rework_prompt_contracts(prompt: str, *, context: str = "rework prompt") -> None:
+    """Run every rendered-output contract guard the rework-prompt writer owns.
+
+    Same dispatch-boundary block as :func:`assert_worker_prompt_contracts`
+    minus #715's conventional-commit title check — ``rework.md`` carries no
+    PR-title instruction for an override to drop. Issues #714, #717,
+    #1010, #1780.
+    """
+    assert_no_merge_contract(prompt, context=context)
+    assert_execution_contract(prompt, context=context)
+    assert_containment(prompt, context=context)
+    assert_session_scratch_dir(prompt, context=context)
+
+
 class PromptTemplateError(RuntimeError):
     """A prompt template references placeholders that nothing supplies.
 
@@ -454,36 +488,6 @@ def render_prompt(
     # Single substitution over the template: attacker-supplied values are leaf
     # replacements that are never re-scanned.
     return template.safe_substitute(final_safe_values)
-
-
-# Identifiers that may legitimately appear *literally* in rendered prompt
-# output. ``worker_sections/session_scratch_dir.md`` instructs the worker to
-# use the ``$TMPDIR`` environment variable (issue #1780) — the ``$``-prefixed
-# name must reach the worker verbatim, so it survives rendering and reads as
-# an unresolved placeholder to a bare ``Template.get_identifiers()`` scan of
-# the rendered text while being fully intentional. ``string.Template`` has no
-# escape that produces a literal ``$identifier`` shape in output — ``$$``
-# renders as ``$`` and is then re-read as a placeholder by a second scan —
-# so this set is the declared exemption, consumed by
-# :func:`unresolved_rendered_identifiers` (and the test-side scanners that
-# delegate to it) rather than scattered across call sites.
-INTENTIONAL_RENDERED_IDENTIFIERS: frozenset[str] = frozenset({"TMPDIR"})
-
-
-def unresolved_rendered_identifiers(rendered: str) -> set[str]:
-    """Placeholder-shaped identifiers left in *rendered* output.
-
-    ``Template.get_identifiers()`` on rendered text minus
-    :data:`INTENTIONAL_RENDERED_IDENTIFIERS`. Deliberately narrower than a
-    bare ``"$" in rendered`` check: a partial's prose can legitimately
-    contain a literal ``$`` that is not a placeholder at all (e.g.
-    ``$(command)`` substitution), and the intentional env-var literals are
-    exempted by the declared set above. This is the single point of
-    enforcement for "what counts as an unresolved placeholder in output" —
-    the render pipeline's own strict check stays on template *source*, so
-    this function exists for post-render verification only.
-    """
-    return set(Template(rendered).get_identifiers()) - INTENTIONAL_RENDERED_IDENTIFIERS
 
 
 def prompt_template_digest(template_name: str, search_dirs: Sequence[Path] = ()) -> str:
