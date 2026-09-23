@@ -65,6 +65,10 @@ PENDING_SYNC_FILENAME = "pending-sync.json"
 SELF_DEPLOY_FAILURE_STATE_FILENAME = "self-deploy-failures.json"
 ZERO_PASS_STREAK_STATE_FILENAME = "zero-pass-streak.json"
 QUEUE_SYNC_COVERAGE_CACHE_FILENAME = "queue-sync-coverage-cache.json"
+# Issue #1834: bounded ETag/conditional-GET cache for the pooled HTTP
+# transport's REST-GET requests. Sibling of QUEUE_SYNC_COVERAGE_CACHE_FILENAME
+# -- same directory, same atomic-write contract.
+HTTP_ETAG_CACHE_FILENAME = "http-etag-cache.json"
 
 ISSUES_DIRNAME = "issues"
 PRS_DIRNAME = "prs"
@@ -205,6 +209,19 @@ def queue_sync_coverage_cache_path(state_root: Path) -> Path:
     directory, same atomic-write contract.
     """
     return state_root / QUEUE_SYNC_COVERAGE_CACHE_FILENAME
+
+
+def http_etag_cache_path(state_root: Path) -> Path:
+    """Return the pooled HTTP transport's ETag cache path under ``state_root``.
+
+    Issue #1834: stores ``ETag``/response pairs for REST GET requests made by
+    ``github_capabilities/http_transport.py`` so a repeated call can send
+    ``If-None-Match`` and treat a ``304 Not Modified`` as a cache hit instead
+    of re-transferring an unchanged body. Sibling of
+    :func:`queue_sync_coverage_cache_path` -- same directory, same
+    atomic-write contract.
+    """
+    return state_root / HTTP_ETAG_CACHE_FILENAME
 
 
 def worktrees_dir(state_root: Path) -> Path:
