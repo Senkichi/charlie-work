@@ -1781,6 +1781,7 @@ def _touch_registry_last_seen(
                 changed = True
             if changed:
                 data["repos"] = repos
+                # write-gate-exempt(issue=1832): standalone bookkeeping predates the WriteGate wave
                 save_state(fleet_json_path, data)
     except Exception:
         logger.exception("Failed to bump fleet registry last_seen for touched repos")
@@ -2179,6 +2180,7 @@ def fleet_loop(
     # also in the returned CommandResult's ``deferred`` field.
     if deferred_repo_keys or deferred_autoscale_prologue:
         try:
+            # write-gate-exempt(issue=1832): no write_gate param; sibling raw calls remain
             log_event(
                 fleet_state_path,
                 "fleet_pass_deadline_deferred",
