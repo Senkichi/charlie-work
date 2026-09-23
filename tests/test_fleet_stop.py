@@ -21,7 +21,7 @@ from _fleet_dispatch_fixtures import (
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
 )
-from charlie_work import cli, layout
+from charlie_work import cli, fleet_stop, layout
 from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig, SupervisorConfig
 from charlie_work.fleet_dispatch import (
     FleetLocalSnapshot,
@@ -100,13 +100,24 @@ def _stop_args(
     return argparse.Namespace(fleet_dir=str(tmp_path), drain=drain, dry_run=dry_run)
 
 
+def test_run_fleet_stop_is_reexported_from_cli() -> None:
+    """The command implementation lives in fleet_stop; cli is the facade.
+
+    The file-size extraction moved the body verbatim — the dispatch table
+    calls ``cli.run_fleet_stop``, which must resolve to the same function.
+    """
+    assert cli.run_fleet_stop is fleet_stop.run_fleet_stop
+
+
 def test_run_fleet_stop_writes_the_marker_and_reports(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The command writes the marker and reports liveness/watchdog context."""
     monkeypatch.setattr(
-        cli, "probe_fleet_watchdog", lambda: WatchdogProbe(armed=True, detail="Enabled")
+        fleet_stop,
+        "probe_fleet_watchdog",
+        lambda: WatchdogProbe(armed=True, detail="Enabled"),
     )
 
     result = cli.run_fleet_stop(_stop_args(tmp_path, drain=True))
@@ -132,7 +143,9 @@ def test_run_fleet_stop_dry_run_writes_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """--dry-run previews the write without creating the marker."""
-    monkeypatch.setattr(cli, "probe_fleet_watchdog", lambda: WatchdogProbe(armed=None, detail="?"))
+    monkeypatch.setattr(
+        fleet_stop, "probe_fleet_watchdog", lambda: WatchdogProbe(armed=None, detail="?")
+    )
 
     result = cli.run_fleet_stop(_stop_args(tmp_path, dry_run=True))
 
@@ -148,7 +161,9 @@ def test_run_fleet_stop_reports_a_replaced_request(
     """A second ``fleet stop`` replaces the pending request — and says so."""
     write_fleet_stop_request(str(tmp_path), drain=True)
     monkeypatch.setattr(
-        cli, "probe_fleet_watchdog", lambda: WatchdogProbe(armed=False, detail="Disabled")
+        fleet_stop,
+        "probe_fleet_watchdog",
+        lambda: WatchdogProbe(armed=False, detail="Disabled"),
     )
 
     result = cli.run_fleet_stop(_stop_args(tmp_path, drain=False))
@@ -168,14 +183,16 @@ def test_run_fleet_stop_detects_a_live_supervisor(
 ) -> None:
     """A live heartbeat (pid alive, no exited_at) reports supervisor_live."""
     monkeypatch.setattr(
-        cli, "probe_fleet_watchdog", lambda: WatchdogProbe(armed=True, detail="Enabled")
+        fleet_stop,
+        "probe_fleet_watchdog",
+        lambda: WatchdogProbe(armed=True, detail="Enabled"),
     )
     monkeypatch.setattr(
-        cli,
+        fleet_stop,
         "read_supervisor_heartbeat",
         lambda _o: {"exited_at": None, "pid": 12345},
     )
-    monkeypatch.setattr(cli, "is_pid_alive", lambda pid: pid == 12345)
+    monkeypatch.setattr(fleet_stop, "is_pid_alive", lambda pid: pid == 12345)
 
     result = cli.run_fleet_stop(_stop_args(tmp_path))
 

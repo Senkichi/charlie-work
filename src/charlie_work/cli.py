@@ -39,7 +39,6 @@ from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import (
     compute_api_worker_fleet_report,
     fleet_loop,
-    probe_fleet_watchdog,
     run_allocation_pass_with_ci_fleet_guard,
     run_fleet_supervise,
     run_fleet_supervise_loop,
@@ -51,7 +50,7 @@ from .supervise_loop import (
 )
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
-from .fleet_stop import read_fleet_stop_request, write_fleet_stop_request
+from .fleet_stop import run_fleet_stop
 from .global_config import load_layered_config
 from .github import (
     CLOSING_KEYWORD_PR_FIELDS,
@@ -66,8 +65,6 @@ from . import layout
 from .dirty_tree import check_working_tree_clean
 from .logging_setup import configure_logging
 from .instrumentation import query_events
-from .process_utils import is_pid_alive
-from .supervisor_lifecycle import read_supervisor_heartbeat
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, RuntimePaths, find_repo_root, resolved_layout, runtime_paths
 from .quiesce import check_quiescence
@@ -1495,80 +1492,6 @@ def run_fleet_supervise_command(args: argparse.Namespace) -> CommandResult:
         dry_run=args.dry_run,
         poll_interval_override=args.poll_interval,
         max_runtime_override=args.max_runtime,
-    )
-
-
-def run_fleet_stop(args: argparse.Namespace) -> CommandResult:
-    """Write the operator stop/drain request marker for the fleet supervisor.
-
-    Issue #1716: the only clean stop for a hidden scheduled fleet. The marker
-    is the operative write; everything else here (audit event, liveness
-    report, watchdog hint) is observability around it.
-    """
-    drain = bool(getattr(args, "drain", False))
-    marker_path = layout.fleet_stop_request_path(args.fleet_dir)
-
-    if args.dry_run:
-        return CommandResult(
-            True,
-            f"dry-run: would write {'drain' if drain else 'stop'} request to {marker_path}",
-            {"dry_run": True, "drain": drain, "marker": str(marker_path)},
-        )
-
-    prior = read_fleet_stop_request(args.fleet_dir)
-    # write_fleet_stop_request also records the fleet_stop_requested audit
-    # event (best-effort) so every writer — not just this command — is traced.
-    path = write_fleet_stop_request(args.fleet_dir, drain=drain)
-
-    heartbeat = read_supervisor_heartbeat(args.fleet_dir)
-    supervisor_live = bool(
-        heartbeat
-        and not heartbeat.get("exited_at")
-        and isinstance(heartbeat.get("pid"), int)
-        and is_pid_alive(heartbeat["pid"])
-    )
-
-    # The marker is consumed when honored, so an armed charlie-fleet-pass
-    # trigger relaunches a clean supervisor on its next tick — the trap the
-    # runbook's "disable the task first" procedure exists for. Report the
-    # probe's actual answer rather than restating the doc.
-    watchdog = probe_fleet_watchdog()
-    if watchdog.armed is True:
-        watchdog_hint = (
-            "the charlie-fleet-pass task is armed and relaunches the fleet on "
-            "its next tick; disable the task first if the fleet must stay down"
-        )
-    elif watchdog.armed is False:
-        watchdog_hint = (
-            "the charlie-fleet-pass task is disabled; the fleet stays down "
-            "until it is re-enabled or supervise is started manually"
-        )
-    else:
-        watchdog_hint = (
-            "could not probe the charlie-fleet-pass task; if enabled, its "
-            "trigger relaunches the fleet on its next tick"
-        )
-
-    if drain:
-        action = "the supervisor dispatches nothing new and exits when live workers reach 0"
-    else:
-        action = "the supervisor exits at its next pass boundary (live workers untouched)"
-    message = f"stop request recorded at {path}: {action}"
-    if not supervisor_live:
-        message += "; no live supervisor detected — the request takes effect on the next start"
-    message += f"; {watchdog_hint}"
-
-    return CommandResult(
-        True,
-        message,
-        {
-            "marker": str(path),
-            "drain": drain,
-            "replaced_prior_request": prior is not None,
-            "supervisor_live": supervisor_live,
-            "watchdog_armed": watchdog.armed,
-            "watchdog_detail": watchdog.detail,
-        },
     )
 
 

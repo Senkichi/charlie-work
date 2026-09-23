@@ -39,7 +39,12 @@ from .fleet_health_baseline import (  # noqa: F401  (deliberate re-export)
 )
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .fleet_registry import _load_registry, count_fleet_runners
-from .fleet_stop import clear_fleet_stop_request, read_fleet_stop_request
+from .fleet_stop import (
+    FleetStopState,
+    apply_fleet_drain_config,
+    fleet_stop_pending,
+    supervise_loop_interrupted_result,
+)
 from . import layout
 from .github import GitHub, GitHubError
 from .global_config import describe_config_file, load_layered_config
@@ -1767,12 +1772,9 @@ def fleet_loop(
             action. Failures are recorded as events per repo, never raised,
             and never block the lane.
         drain: If True (issue #1716, ``fleet stop --drain``), suppress all
-            new launches — fresh dispatch, rework, and review dispatch — while
-            every other lane of the pass still runs (stalled/orphan reap,
-            verdict ingest, review, merge). Implemented by forcing each
-            repo's dispatch limit to 0 and ``review_dispatch.enabled`` off on
-            the pass-local config copy; the reap/finalize machinery a
-            finishing worker still needs lives on the non-dispatch side.
+            new launches while the reap/review/merge lanes still run —
+            see ``fleet_stop.apply_fleet_drain_config`` and the forced
+            ``limit=0`` at the dispatch call sites below.
         now: Injectable clock (issue #822/#828) used for stale-entry grace
             period computation (issue #1372). Defaults to
             ``datetime.now(UTC)`` when not supplied, so production behavior is
@@ -1892,16 +1894,7 @@ def fleet_loop(
             # both a per-repo and a fleet-level notification.
             config = replace(config, notify=replace(config.notify, enabled=False))
             if drain:
-                # Issue #1716: review dispatch is config-gated (dispatch_reviews
-                # early-returns after its reaper sweeps when the flag is off —
-                # those sweeps are exactly the cleanup a draining fleet still
-                # needs), so flip it off on this pass-local copy. Fresh and
-                # rework dispatch are suppressed by the forced limit=0 at the
-                # call site below.
-                config = replace(
-                    config,
-                    review_dispatch=replace(config.review_dispatch, enabled=False),
-                )
+                config = apply_fleet_drain_config(config)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
 
             # Non-blocking supervisor lock: fleet passes must be mutually exclusive
@@ -2280,17 +2273,6 @@ def _has_fleet_delta(
 ) -> bool:
     """Return True if any per-repo local signal changed between snapshots."""
     return before.repo_snapshots != after.repo_snapshots
-
-
-def _fleet_live_worker_count(snapshot: FleetLocalSnapshot) -> int:
-    """Total live workers across a fleet snapshot.
-
-    The drain-exit signal for ``fleet stop --drain`` (issue #1716): the
-    supervisor exits once this reaches zero. Read from the same config-aware
-    per-repo session dirs the delta machinery already walks — no separate
-    census, no hardcoded repo list.
-    """
-    return sum(repo_snap.live_count for _, repo_snap in snapshot.repo_snapshots)
 
 
 def _fleet_has_configured_repos(
@@ -2684,14 +2666,8 @@ def run_fleet_supervise(
     start_time = clock()
     # Set at every route out of the loop below; see RESTART_EXIT_REASONS.
     exit_reason: str | None = None
-    # Issue #1716: latched True when a `fleet stop --drain` marker is observed;
-    # suppresses new dispatch (fleet_loop(drain=True)) until the live-worker
-    # count reaches zero. Latched rather than re-derived from the marker each
-    # tick so a torn marker rewrite mid-drain cannot silently re-arm dispatch.
-    draining = False
-    # Last live-worker count reported while draining; the "N remaining" line
-    # prints only on change so a long drain doesn't spam the fleet pass log.
-    _drain_live_reported: int | None = None
+    # Issue #1716: operator stop/drain control plane (fleet_stop.FleetStopState).
+    drain_state = FleetStopState()
     full_pass_interval = cfg.full_pass_interval_seconds
     last_full_pass_at = start_time - full_pass_interval
     snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
@@ -2793,62 +2769,19 @@ def run_fleet_supervise(
                 _exit_reason = "max_passes"
                 break
 
-            # Issue #1716: operator stop/drain marker, polled every tick (i.e.
-            # between passes) — the only control surface a hidden scheduled
-            # supervisor has. A plain request exits here at the next boundary
-            # with live workers untouched; a drain request latches
-            # ``draining`` and the pass below launches nothing new. The marker
-            # is consumed only when honored, so a request written while no
-            # supervisor runs still takes effect on the next start.
-            stop_request = read_fleet_stop_request(fleet_dir_override)
-            if stop_request is not None:
-                if stop_request.get("drain"):
-                    if not draining:
-                        draining = True
-                        print(
-                            f"[{datetime.datetime.now().strftime('%H:%M:%S')}] "
-                            "operator drain requested: no new dispatch; "
-                            "exiting when live workers reach 0",
-                            flush=True,
-                        )
-                else:
-                    clear_fleet_stop_request(fleet_dir_override)
-                    print(
-                        f"[{datetime.datetime.now().strftime('%H:%M:%S')}] "
-                        "operator stop requested; exiting (live workers "
-                        "untouched)",
-                        flush=True,
-                    )
-                    exit_reason = "operator_stop"
-                    _exit_reason = "operator_stop"
-                    break
+            # Issue #1716: operator stop/drain marker, polled between passes.
+            stop_reason = drain_state.poll_stop_marker(fleet_dir_override)
+            if stop_reason is not None:
+                exit_reason = _exit_reason = stop_reason
+                break
 
             new_snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
             fallback_due = (now - last_full_pass_at) >= full_pass_interval
             run_pass = _has_fleet_delta(snapshot, new_snapshot) or fallback_due
 
-            if draining:
-                live_workers = _fleet_live_worker_count(new_snapshot)
-                if live_workers != _drain_live_reported:
-                    _drain_live_reported = live_workers
-                    print(
-                        f"[{datetime.datetime.now().strftime('%H:%M:%S')}] "
-                        f"drain: {live_workers} live worker(s) remaining",
-                        flush=True,
-                    )
-                if live_workers == 0 and not run_pass:
-                    # Nothing in flight and no pass due: honor the drain. A
-                    # due pass (e.g. the last worker's death IS the delta)
-                    # runs first below so its outcome is adopted.
-                    clear_fleet_stop_request(fleet_dir_override)
-                    print(
-                        f"[{datetime.datetime.now().strftime('%H:%M:%S')}] "
-                        "drain complete: 0 live workers; exiting",
-                        flush=True,
-                    )
-                    exit_reason = "operator_stop_drained"
-                    _exit_reason = "operator_stop_drained"
-                    break
+            if drain_state.drain_tick(fleet_dir_override, new_snapshot, pass_due=run_pass):
+                exit_reason = _exit_reason = "operator_stop_drained"
+                break
 
             if not run_pass:
                 snapshot = new_snapshot
@@ -2863,12 +2796,9 @@ def run_fleet_supervise(
             # Self-deploy before running the pass: FF-pull origin/main and sync
             # dependencies when pyproject.toml/uv.lock changed.  Non-fatal on a
             # diverged or dirty tree.
-            # Issue #1716: skipped while draining — a drain pass exists to reap
-            # and finalize in-flight work, not to move code underneath the
-            # shutdown path. A head-moved restart exit here would split the
-            # drain across watchdog ticks for no benefit (the wrapper refuses
-            # to relaunch under a pending stop marker, so the drain would only
-            # resume on the next scheduled tick).
+            # Issue #1716: skipped while draining — a head-moved restart exit
+            # here would split the drain across watchdog ticks for no benefit
+            # (the wrapper refuses to relaunch under a pending stop marker).
             deploy = (
                 self_deploy(
                     orchestrator_root(),
@@ -2878,7 +2808,7 @@ def run_fleet_supervise(
                     failure_alarm_threshold=cfg.self_deploy_failure_alarm,
                     pull_ci_fleet=cfg.self_deploy_pull_ci_fleet,
                 )
-                if not draining
+                if not drain_state.draining
                 else None
             )
             notify_config = getattr(global_config, "notify", None)
@@ -2986,11 +2916,11 @@ def run_fleet_supervise(
             # after an operator pulled origin/main while the daemon was
             # already running — self_deploy saw "already up to date" every
             # pass because HEAD was already at the new commit).
-            # Issue #1716: skipped while draining — the exit this check
-            # produces is a restart request, and the wrapper refuses to
-            # relaunch under a pending stop marker, so firing it would only
-            # suspend the drain until the next scheduled tick.
-            current_head = read_head_sha(orchestrator_root()) if not draining else startup_head
+            # Issue #1716: skipped while draining — same reasoning as the
+            # self-deploy skip above.
+            current_head = (
+                startup_head if drain_state.draining else read_head_sha(orchestrator_root())
+            )
             if startup_head and current_head and current_head != startup_head:
                 print(
                     f"[{now_str}] HEAD drift detected: startup={startup_head[:12]} "
@@ -3029,10 +2959,9 @@ def run_fleet_supervise(
                 # Issue #1339: ensure LabelConfig-derived labels exist on each
                 # repo on the first pass only (once per supervisor startup).
                 ensure_labels=labels_ensure_pending,
-                # Issue #1716: while an operator drain is latched the pass
-                # still runs — reap, verdict ingest, review, merge — but
-                # dispatches nothing new.
-                drain=draining,
+                # Issue #1716: a drain pass still runs reap/verdict/review/
+                # merge lanes but dispatches nothing new.
+                drain=drain_state.draining,
             )
             labels_ensure_pending = False
 
@@ -3132,17 +3061,9 @@ def run_fleet_supervise(
             snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
 
             # Issue #1716: drain completion is checked post-pass too — the
-            # due pass above (e.g. triggered by the last worker's death) has
-            # now adopted that worker's outcome, so exit here rather than on
-            # the next poll tick.
-            if draining and _fleet_live_worker_count(snapshot) == 0:
-                clear_fleet_stop_request(fleet_dir_override)
-                print(
-                    f"[{now_str}] drain complete: 0 live workers; exiting",
-                    flush=True,
-                )
-                exit_reason = "operator_stop_drained"
-                _exit_reason = "operator_stop_drained"
+            # due pass above adopted the last worker's outcome.
+            if drain_state.drain_complete_if_empty(fleet_dir_override, snapshot):
+                exit_reason = _exit_reason = "operator_stop_drained"
                 break
 
             sleep(
@@ -3420,10 +3341,9 @@ def run_fleet_supervise_loop(
     is responsible for its own watchdog (if any).
 
     ``fleet_dir_override`` scopes the operator stop-marker check (issue
-    #1716): when the child asks to be replaced, a pending
-    ``fleet-stop-request.json`` in the resolved fleet dir outranks the
-    relaunch. Must match the fleet dir the child itself uses — production
-    passes the same ``--fleet-dir`` the CLI resolved, tests pass a tmp path.
+    #1716): a pending ``fleet-stop-request.json`` outranks a child's
+    restart request. Must match the fleet dir the child uses — production
+    passes the resolved ``--fleet-dir``, tests a tmp path.
     """
     args = tuple(supervise_args)
     watchdog_factory: Callable[[subprocess.Popen[Any]], WedgeWatchdog | None] | None
@@ -3443,21 +3363,10 @@ def run_fleet_supervise_loop(
             on_cap_reached=(
                 on_cap_reached if on_cap_reached is not None else _record_supervise_loop_cap_event
             ),
-            stop_requested=lambda: read_fleet_stop_request(fleet_dir_override) is not None,
+            stop_requested=lambda: fleet_stop_pending(fleet_dir_override),
         )
     except KeyboardInterrupt:
-        # Issue #1716: the hidden scheduled deployment has no console, but a
-        # foreground `fleet supervise-loop` can still be interrupted — and
-        # interrupting the wrapper must not relaunch (the child keeps running
-        # detached either way). One clean line in the launcher log, no
-        # traceback; mirrors run_fleet_supervise's own KeyboardInterrupt ->
-        # clean-exit handling.
-        print("supervise-loop: interrupted; not relaunching", flush=True)
-        return CommandResult(
-            True,
-            "supervise-loop: interrupted; not relaunching",
-            {"interrupted": True},
-        )
+        return supervise_loop_interrupted_result()  # issue #1716
 
     # A cap is a *clean handoff*, not a failure: the wrapper deliberately gives
     # restart authority back to the 5-minute trigger rather than spinning. So the
