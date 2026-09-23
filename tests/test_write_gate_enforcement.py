@@ -853,6 +853,36 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
         ),
         in_predicate=False,
     ),
+    # Issue #1833: note_circuit_breaker_result is the per-pass circuit
+    # breaker's trip/reset event emitter (github_circuit_opened/
+    # github_circuit_closed), a free function in circuit_breaker_transport.py
+    # (moved out of transport.py's now-deleted Transport._emit_circuit_event
+    # to keep transport.py under the file-size ratchet cap -- issue #1442).
+    # Same disposition as the outbound_body_guard.py entry above and for the
+    # identical reason: the GitHub client layer has no WriteGate (WriteGate
+    # is an OrchestratorApp-owned serialization object; Transport/GitHub are
+    # deliberately constructible without one), and the breaker's state lives
+    # on the GitHub instance, not behind any state-lock. Threading a
+    # WriteGate through the GitHubLike surface for these two telemetry calls
+    # would be the same out-of-scope construction-contract refactor the
+    # #1505 entry above declines. `in_predicate=False` matches the real
+    # scan: `note_circuit_breaker_result` makes no
+    # `self.write_gate.*`/`write_gate.*` call and takes no `write_gate`
+    # parameter (it is not even a method -- a plain module-level function).
+    _RawPrimitiveSite(
+        path="github_capabilities/circuit_breaker_transport.py",
+        scope="note_circuit_breaker_result",
+        primitive="log_event",
+        call_source="log_event(state_path, 'github_circuit_opened', payload)",
+        in_predicate=False,
+    ),
+    _RawPrimitiveSite(
+        path="github_capabilities/circuit_breaker_transport.py",
+        scope="note_circuit_breaker_result",
+        primitive="log_event",
+        call_source="log_event(state_path, 'github_circuit_closed', payload)",
+        in_predicate=False,
+    ),
     # Issue #1832: `fleet_loop()`, `_touch_registry_last_seen()`,
     # `record_fleet_pass_completed()`, and `record_wedge_kill_loop()` are
     # new bookkeeping/observability call sites in fleet_dispatch.py and

@@ -232,7 +232,9 @@ def test_merged_pr_list_delegate_forwards_through_run(
     """
     calls: list[tuple[list[str], bool]] = []
 
-    def fake_run(self: GitHub, args: list[str], *, json_output: bool = False) -> list[dict]:
+    def fake_run(
+        self: GitHub, args: list[str], *, json_output: bool = False, long_call: bool = False
+    ) -> list[dict]:
         calls.append((args, json_output))
         if len(calls) == 1:
             return [
@@ -273,7 +275,9 @@ def test_merged_pr_list_delegate_raises_githuberror_on_bad_shape(
     catch).
     """
 
-    def fake_run(self: GitHub, args: list[str], *, json_output: bool = False) -> dict:
+    def fake_run(
+        self: GitHub, args: list[str], *, json_output: bool = False, long_call: bool = False
+    ) -> dict:
         return {"unexpected": "shape"}
 
     monkeypatch.setattr(GitHub, "run", fake_run)
