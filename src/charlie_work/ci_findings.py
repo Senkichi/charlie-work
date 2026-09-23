@@ -49,6 +49,7 @@ from .checks import (
 )
 from .collect_only_gate import COLLECT_ONLY_GATE_CHECK_NAME, parse_exemption_log_marker
 from .config import DispatchConfig
+from .dispatch_cadence import _dependency_root_blocker_progress
 from .github import _job_id_from_link, label_names
 from .state import is_dispatch_stale_alert_due, last_non_empty_dispatch
 
@@ -270,6 +271,19 @@ def check_dispatch_staleness(
     intact: when ``dispatchable == 0`` and ``blocked_by_open_dependency == 0``
     (no ready issues at all, e.g. all ``missing_ready``), the alarm still fires.
 
+    Issue #1682: the #1110 exemption is progress-BOUNDED, not unconditional.
+    When every root blocker (``dependency_root_blockers``) has gone longer
+    than ``config.dependency_stall_minutes`` without a recorded state/event
+    change, the backlog is not "sequenced" -- it is wedged on a root whose
+    PR may be sitting in a permanently-unmet state (e.g. ``janitor_blocked``
+    on required checks that can never run, the exact shape that also dodges
+    ``dispatch_blocked_chain_dead``'s #1133 transient exemption). The check
+    then returns ``stale: True`` with ``reason: dependency_root_blocker_idle``
+    and a payload naming each root issue and its tracked blocking PRs, so
+    the silent-wait state surfaces as a dispatch_stale event instead of
+    staying invisible for days. ``dependency_stall_minutes == 0`` restores
+    the unconditional exemption.
+
     Issue #1769: ``should_emit`` answers a second, orthogonal question --
     given that ``stale`` is true, should the caller actually record a
     ``dispatch_stale`` event *this pass*? It is edge-triggered (true on
@@ -352,6 +366,44 @@ def check_dispatch_staleness(
     # and still alarms.
     if result["backlog_dispatchable"] == 0 and result["backlog_blocked_by_open_dependency"] > 0:
         result["reason"] = "all_ready_blocked_by_dependencies"
+        # Issue #1682: ... but "correctly idle" has to stay TRUE. The
+        # exemption is bounded by whether the root blockers are still
+        # making progress: when every root's last recorded change is older
+        # than ``dependency_stall_minutes``, a wedged root (e.g. a
+        # janitor_blocked PR whose missing required checks can never run)
+        # stops looking like healthy sequencing. Only evaluated when the
+        # reachability dict carries the root list -- an older caller or a
+        # hand-built fixture that lacks it keeps the unconditional
+        # exemption rather than alarming on an unknown root set, matching
+        # the ``backlog_not_observed``/``no_baseline`` precedent.
+        stall_minutes = config.dependency_stall_minutes
+        roots = backlog_reachability.get("dependency_root_blockers")
+        if stall_minutes > 0 and isinstance(roots, list) and roots:
+            stall_seconds = stall_minutes * 60
+            details = _dependency_root_blocker_progress(state, roots, now)
+            result["dependency_root_blockers"] = details
+            if details and all(
+                d["idle_seconds"] is None or d["idle_seconds"] > stall_seconds for d in details
+            ):
+                result["threshold_seconds"] = stall_seconds
+                result["stale"] = True
+                result["reason"] = "dependency_root_blocker_idle"
+                result["age_seconds"] = max(
+                    (d["idle_seconds"] for d in details if d["idle_seconds"] is not None),
+                    default=None,
+                )
+                # Issue #1769's policy, applied to the new arm: edge-triggered
+                # plus a bounded reminder floored at 4 hours (a local, not
+                # module-level, constant -- this file's top-level names are
+                # pinned by tests/test_ci_findings_split.py), so a fast
+                # detection threshold cannot also mean a fast re-alert
+                # cadence.
+                min_reminder_minutes = 240
+                result["should_emit"] = is_dispatch_stale_alert_due(
+                    state,
+                    now=now,
+                    reminder_minutes=max(stall_minutes, min_reminder_minutes),
+                )
         return result
 
     latest = _latest_non_empty_dispatch(state)
