@@ -244,7 +244,7 @@ def test_fleet_status_never_mutates(
 
     mutating_calls = []
 
-    def mock_run(self, args, json_output=False, allow_failure=False):
+    def mock_run(self, args, json_output=False, allow_failure=False, long_call=False):
         mutating_calls.append(args)
         return ""
 

@@ -315,6 +315,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # recorded state_dir (which would resurrect a zombie directory).
         "fleet_registry_stale_entry": "warning",
         "flake_rerun_failed": "warning",
+        # Issue #1833: the per-pass gh circuit breaker tripped after N
+        # consecutive transport-class failures (connect/handshake/DNS/hang).
+        # Warning, not error: the lane is not escalated -- calls this pass
+        # fail fast as values until the cooldown elapses, and a fresh pass
+        # resets the breaker -- but a live fleet tripping this repeatedly
+        # means the network path to GitHub itself needs attention.
+        "github_circuit_opened": "warning",
         "graphql_rate_limit_deferred": "warning",
         "infra_rerun_failed": "warning",
         "janitor_rework_stalled": "warning",
@@ -557,6 +564,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # attempt) by `RetryOutcome`'s own contract; the `ok` payload field
         # distinguishes "recovered" from "exhausted" without a second kind.
         "git_network_retry": "info",
+        # Issue #1833: the per-pass gh circuit breaker recovered -- a
+        # half-open probe call succeeded (or a normal call succeeded while
+        # closed after a tripped-but-not-yet-probed state), closing the
+        # breaker. Info: this is recovery, the healthy end state, not a
+        # notable condition in itself (the trip that preceded it already
+        # emitted github_circuit_opened at warning level).
+        "github_circuit_closed": "info",
         "head_moved": "info",
         "infra_rerun_triggered": "info",
         "intake": "info",
