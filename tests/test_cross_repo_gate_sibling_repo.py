@@ -20,6 +20,37 @@ import charlie_work.cross_repo_gate as cross_repo_gate_module
 from charlie_work.cross_repo_gate import cross_repo_gate
 
 
+@pytest.fixture(autouse=True)
+def _git_discovery_isolated_from_enclosing_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep git subprocesses run under ``tmp_path`` from discovering the
+    enclosing checkout.
+
+    In the sandboxed worker environment ``tmp_path`` itself lives inside
+    the worktree's gitignored ``.var/`` tree, so ``git check-ignore`` and
+    ``git ls-files`` run against a fake ``this_repo``/``sibling_repo`` —
+    none of which are git repositories themselves — resolve the *outer*
+    checkout's repository instead of failing closed the way they do on a
+    normal CI host where the temp dir lives outside the checkout:
+    ``check-ignore`` matches the outer ``.var/`` rule and classifies every
+    candidate a "gitignored runtime artifact," and ``ls-files`` returns
+    the outer listing instead of driving the ``_all_repo_files`` fallback.
+    Setting ``GIT_CEILING_DIRECTORIES`` to ``tmp_path`` stops git's upward
+    repository discovery there, restoring fail-closed behavior — a no-op
+    on a host where discovery already finds nothing.
+
+    ``core.longpaths`` (via ``GIT_CONFIG_KEY_0``/``GIT_CONFIG_VALUE_0``)
+    keeps ``git init``/``add`` inside the deeply nested sandbox temp dir
+    from hitting Windows MAX_PATH ("Filename too long", exit 128);
+    harmless where paths are short.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.longpaths")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+
+
 def _git(repo: Path, *args: str) -> None:
     """Run a git command in *repo*, raising on failure."""
     subprocess.run(
@@ -433,7 +464,7 @@ def test_issue_1791_driveless_absolute_path_classified_as_absolute(
 
 
 def test_issue_1791_driveless_absolute_path_existing_outside_repo_blocks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     """Issue #1791, end-to-end: a POSIX-style absolute candidate that
     exists on disk outside ``repo_root`` escalates via the founding
@@ -442,14 +473,6 @@ def test_issue_1791_driveless_absolute_path_existing_outside_repo_blocks(
     ``test_absolute_path_outside_repo_blocks`` pins for its drive-letter
     spelling, reached through the missing-survivor path that
     ``_path_exists_in_repo`` decides.
-
-    ``_is_gitignored`` is patched out so the test is independent of where
-    the host puts ``tmp_path``: on a normal CI checkout it is a no-op
-    (``this_repo`` is not inside a git repository, so ``git check-ignore``
-    already fails closed to ``False``), while in a sandboxed worktree
-    that redirects the temp dir inside the checkout's gitignored
-    ``.var/`` tree it keeps an orthogonal classifier from swallowing the
-    candidate before the decision layer sees it.
     """
     this_repo = tmp_path / "charlie-work"
     this_repo.mkdir()
@@ -459,7 +482,6 @@ def test_issue_1791_driveless_absolute_path_existing_outside_repo_blocks(
     sibling_file.write_text("# suite_coverage", encoding="utf-8")
 
     driveless = "/" + sibling_file.relative_to(sibling_file.anchor).as_posix()
-    monkeypatch.setattr(cross_repo_gate_module, "_is_gitignored", lambda *_args: False)
 
     body = f"The file is at `{driveless}`."
     result = cross_repo_gate(body, this_repo)
