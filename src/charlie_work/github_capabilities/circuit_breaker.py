@@ -21,11 +21,12 @@ risk the same ``config`` -> ``github`` -> ``github_capabilities`` cycle
 state machine (constructed from plain ``int``/``float`` thresholds, not a
 config dataclass) sidesteps that entirely and makes the four required
 behaviors -- classification, trip, fast-fail, half-open, reset -- testable
-without mocking a filesystem or an event sink. ``transport.py`` (which
-already imports ``RuntimeConfig`` only under ``TYPE_CHECKING``) is
+without mocking a filesystem or an event sink. ``circuit_breaker_transport.py``
+(which already imports ``RuntimeConfig`` only under ``TYPE_CHECKING``) is
 responsible for reading ``RuntimeConfig.gh_circuit_breaker`` and for turning
 this module's transition signals into ``github_circuit_opened`` /
-``github_circuit_closed`` events.
+``github_circuit_closed`` events; ``transport.py`` itself only holds the thin
+``Transport`` wrapper methods that delegate to it.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
 
@@ -40,6 +42,7 @@ __all__ = [
     "GhFailureClass",
     "classify_gh_failure",
     "CircuitBreakerState",
+    "GhCircuitBreakerConfig",
 ]
 
 
@@ -132,8 +135,9 @@ def classify_gh_failure(error: str | None, *, timed_out: bool = False) -> GhFail
 _Phase = Literal["closed", "open", "half_open"]
 
 #: Transition signals ``CircuitBreakerState`` returns from ``record_*``, for
-#: the caller (``transport.py``) to turn into ``github_circuit_opened`` /
-#: ``github_circuit_closed`` events. ``None`` means no transition happened.
+#: the caller (``circuit_breaker_transport.note_circuit_breaker_result``) to
+#: turn into ``github_circuit_opened`` / ``github_circuit_closed`` events.
+#: ``None`` means no transition happened.
 BreakerTransition = Literal["opened", "closed"]
 
 
@@ -274,3 +278,43 @@ class CircuitBreakerState:
         self._phase = "closed"
         self._consecutive_failures = 0
         self._opened_at = None
+
+
+@dataclass(frozen=True)
+class GhCircuitBreakerConfig:
+    """Per-pass circuit breaker thresholds for ``gh`` transport failures
+    (issue #1833, follow-up to the #1832 overnight outage).
+
+    After ``failure_threshold`` consecutive transport-class ``gh`` failures
+    (connect/handshake/DNS/hang -- see ``classify_gh_failure`` above) in one
+    orchestrator pass, further ``gh`` calls that pass fail immediately as
+    values, without spawning a subprocess, until ``cooldown_seconds`` has
+    elapsed, at which point one probe call is allowed through. Semantic
+    failures (4xx/422/5xx, rate limits, auth) never count toward the
+    threshold. Reset to a clean slate at the start of every pass
+    (``GitHub.reset_circuit_breaker()``), so a bad pass cannot permanently
+    fail-fast every later one.
+
+    Ships enabled with these defaults (owner directive: every new
+    feature/knob ships enabled with sensible defaults; config exists only as
+    a kill switch, never a default-off opt-in). Five consecutive failures is
+    high enough above single-blip noise to avoid false trips while still
+    catching the #1832 pattern (every call in a pass failing the same way)
+    within the first handful of calls rather than exhausting the whole pass.
+    60s balances riding out a brief blip against blocking the bulk of a
+    pass's runtime once the network has recovered.
+
+    Lives here rather than in ``config.py`` for the same reason
+    ``RunnerCapacityEscalationConfig`` lives in
+    ``capacity_starvation_escalation.py`` (see that re-export's comment in
+    ``config.py``): new code should not land in that over-cap monolith
+    (file-size ratchet, issue #1442). This is a plain two-field dataclass
+    with no import of ``charlie_work.config``/``charlie_work.instrumentation``
+    of its own, so hosting it here does not compromise this module's
+    documented purity (module docstring above) -- ``config.py`` re-exports
+    it in place, unchanged, exactly like ``CircuitBreakerState``'s sibling
+    types.
+    """
+
+    failure_threshold: int = 5
+    cooldown_seconds: float = 60.0

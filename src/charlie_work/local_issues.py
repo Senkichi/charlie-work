@@ -289,7 +289,12 @@ class LocalFileGitHub:
     # -- owner members -----------------------------------------------------
 
     def run(
-        self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+        self,
+        args: list[str],
+        *,
+        json_output: bool = False,
+        allow_failure: bool = False,
+        long_call: bool = False,
     ) -> Any:
         """There is no ``gh`` to run. Same failure contract as the real client."""
         if allow_failure:

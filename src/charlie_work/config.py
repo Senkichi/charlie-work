@@ -40,6 +40,17 @@ from .capacity_starvation_escalation import (  # noqa: F401  (deliberate re-expo
     parse_runner_capacity_escalation,
 )
 
+# Re-exported from the domain module (issue #1833) for the same reason
+# ``RunnerCapacityEscalationConfig`` is re-exported from
+# ``.capacity_starvation_escalation`` above: the dataclass lives in its own
+# module so new code does not land in this over-cap monolith (file-size
+# ratchet, issue #1442). ``config.py`` still owns the ``gh_circuit_breaker``
+# section's YAML parsing/validation below and wires the dataclass into
+# ``RuntimeConfig``.
+from .github_capabilities.circuit_breaker import (  # noqa: F401  (deliberate re-export)
+    GhCircuitBreakerConfig,
+)
+
 from . import layout
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
 from .issue_comments import DEFAULT_INCLUDED_ASSOCIATIONS as DEFAULT_COMMENT_ASSOCIATIONS
@@ -1135,36 +1146,6 @@ class PreflightConfig:
     clock_sanity_fatal: bool = False
     venv_identity_fatal: bool = True
     config_freshness_fatal: bool = False
-
-
-@dataclass(frozen=True)
-class GhCircuitBreakerConfig:
-    """Per-pass circuit breaker thresholds for ``gh`` transport failures
-    (issue #1833, follow-up to the #1832 overnight outage).
-
-    After ``failure_threshold`` consecutive transport-class ``gh`` failures
-    (connect/handshake/DNS/hang -- see
-    ``github_capabilities.circuit_breaker.classify_gh_failure``) in one
-    orchestrator pass, further ``gh`` calls that pass fail immediately as
-    values, without spawning a subprocess, until ``cooldown_seconds`` has
-    elapsed, at which point one probe call is allowed through. Semantic
-    failures (4xx/422/5xx, rate limits, auth) never count toward the
-    threshold. Reset to a clean slate at the start of every pass
-    (``GitHub.reset_circuit_breaker()``), so a bad pass cannot permanently
-    fail-fast every later one.
-
-    Ships enabled with these defaults (owner directive: every new
-    feature/knob ships enabled with sensible defaults; config exists only as
-    a kill switch, never a default-off opt-in). Five consecutive failures is
-    high enough above single-blip noise to avoid false trips while still
-    catching the #1832 pattern (every call in a pass failing the same way)
-    within the first handful of calls rather than exhausting the whole pass.
-    60s balances riding out a brief blip against blocking the bulk of a
-    pass's runtime once the network has recovered.
-    """
-
-    failure_threshold: int = 5
-    cooldown_seconds: float = 60.0
 
 
 @dataclass(frozen=True)

@@ -39,13 +39,10 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ci_fleet.github import GitHubError
 
-from .. import layout
-from ..instrumentation import log_event
 from ._base import (
     CapabilityCollaborator,
     GitHubRunResult,
@@ -53,17 +50,16 @@ from ._base import (
     _is_mutating,
 )
 from .checks import PR_CHECKS_FIELDS
-from .circuit_breaker import CircuitBreakerState, GhFailureClass, classify_gh_failure
+from .circuit_breaker import GhFailureClass, classify_gh_failure
+from .circuit_breaker_transport import (
+    circuit_breaker_open_message,
+    circuit_breaker_state_path,
+    note_circuit_breaker_result,
+)
 from .issues import ISSUE_LIST_FIELDS, ISSUE_VIEW_FIELDS
 from .labels import LABEL_LIST_FIELDS
 from .pull_requests import MERGED_PR_LIST_FIELDS, PR_LIST_FIELDS, PR_VIEW_FIELDS
 from ..subprocess_runner import no_console_window_kwargs
-
-if TYPE_CHECKING:
-    # Type-only: importing charlie_work.config at module level would cycle
-    # (config -> github -> github_capabilities -> transport). See the module
-    # docstring's note on validate_field_lists' identical lazy import.
-    from ..config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -90,19 +86,6 @@ _DEFAULT_GH_TIMEOUT_SECONDS = 30.0
 # and ``merged_pr_list``'s manual REST pagination loop are the only two call
 # shapes that opt in; see their ``long_call=True`` call sites.
 _DEFAULT_GH_LONG_CALL_TIMEOUT_SECONDS = 120.0
-
-# Circuit breaker defaults (issue #1833). Owner directive: ships enabled by
-# default with sensible thresholds -- config exists only to retune or
-# disable it (threshold set high enough, or cooldown 0), never as an
-# opt-in flag. Five consecutive transport-class failures is enough above
-# normal single-blip noise to avoid false trips, while still catching the
-# #1832 pattern (every call in a pass failing the same way) within the
-# first handful of calls rather than the whole pass. 60s cooldown is long
-# enough to ride out a brief network blip without cycling to a probe every
-# few seconds, short enough that a fleet pass isn't blocked for the bulk of
-# its runtime once the network recovers.
-_DEFAULT_GH_CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
-_DEFAULT_GH_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 60.0
 
 # How many issue numbers to pack into one batched `gh api graphql` query.
 # Kept conservative to stay under the ~32KB Windows command-line limit and
@@ -144,30 +127,6 @@ def _parse_git_remote_url(url: str) -> tuple[str, str] | None:
     if not owner or not name:
         return None
     return owner, name
-
-
-def build_circuit_breaker_state(runtime: "RuntimeConfig | None") -> CircuitBreakerState:
-    """Construct the per-``GitHub``-instance breaker state (issue #1833).
-
-    Called exactly once, from ``GitHub.__post_init__`` -- before that
-    dataclass's ``_COLLABORATORS`` loop installs the collaborator instances,
-    so it cannot go through ``self._transport``/``CapabilityCollaborator``
-    delegation yet, and must be a plain module-level function rather than a
-    ``Transport`` method. Kept here (not duplicated in ``github.py``) as the
-    single place that knows the ``gh_circuit_breaker`` config keys and their
-    defaults, matching how ``_max_retries``/``_retry_base_seconds``/
-    ``_timeout_seconds`` are the single source for their own knobs.
-    """
-    if runtime is not None:
-        breaker_config = runtime.gh_circuit_breaker
-        return CircuitBreakerState(
-            failure_threshold=breaker_config.failure_threshold,
-            cooldown_seconds=breaker_config.cooldown_seconds,
-        )
-    return CircuitBreakerState(
-        failure_threshold=_DEFAULT_GH_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
-        cooldown_seconds=_DEFAULT_GH_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
-    )
 
 
 # Minimal field lists for drift detection (reconcile.py). headRefOid is a
@@ -277,78 +236,40 @@ class Transport(CapabilityCollaborator):
 
         Delegates to the owner's single persistent ``CircuitBreakerState``
         (constructed once in ``GitHub.__post_init__`` via
-        ``build_circuit_breaker_state`` below, alongside ``_list_cache`` --
-        both are mutable per-instance runtime state, not config). ``False``
-        means: the caller must fail this invocation as a value without
-        running a subprocess, matching the errors-as-values invariant.
+        ``circuit_breaker_transport.build_circuit_breaker_state``, alongside
+        ``_list_cache`` -- both are mutable per-instance runtime state, not
+        config). ``False`` means: the caller must fail this invocation as a
+        value without running a subprocess, matching the errors-as-values
+        invariant.
         """
         return self._circuit_breaker_state.allow_call()
 
     def _circuit_breaker_open_message(self, command: list[str]) -> str:
-        breaker = self._circuit_breaker_state
-        return (
-            f"GitHub circuit breaker open: refusing to run {' '.join(command)} "
-            f"after {breaker.consecutive_failures} consecutive transport-class "
-            f"gh failure(s) (threshold {breaker.failure_threshold}); cooldown "
-            f"{breaker.cooldown_seconds:g}s"
-        )
+        """Thin wrapper: this is a ``self.<name>()`` delegation target
+        reached from ``GitHub.run()``, so it must stay declared directly on
+        ``Transport``'s own class body (``github_delegation._build_routes()``
+        only routes members from a collaborator class's own ``__dict__``).
+        The message-building logic itself lives in
+        ``circuit_breaker_transport.circuit_breaker_open_message`` (issue
+        #1833 follow-up, file-size ratchet issue #1442).
+        """
+        return circuit_breaker_open_message(self._circuit_breaker_state, command)
 
     def _circuit_breaker_note_result(
         self, *, error: str | None = None, timed_out: bool = False
     ) -> None:
-        """Classify one completed ``gh`` invocation's outcome and update the
-        breaker (issue #1833).
-
-        Call with ``error=None`` for a genuine success. Call with the failure
-        text (or ``timed_out=True`` for a hang, or when the failure is known
-        transport-class by construction -- e.g. ``gh`` not found -- regardless
-        of its message text) for any failure; ``classify_gh_failure`` decides
-        whether it counts toward the breaker.
-
-        Called exactly once per logical ``gh`` invocation, at the point its
-        FINAL outcome is known -- never per internal retry attempt within
-        ``GitHub.run()``'s loop -- so "N consecutive failures" counts
-        invocations, matching the acceptance criteria's framing ("further
-        calls in the same pass fail immediately").
+        """Thin wrapper, same reason as ``_circuit_breaker_open_message``
+        above: a ``self.<name>()`` delegation target from ``GitHub.run()``,
+        so it stays on ``Transport``. The classification/recording/event
+        logic lives in
+        ``circuit_breaker_transport.note_circuit_breaker_result``.
         """
-        breaker = self._circuit_breaker_state
-        if classify_gh_failure(error, timed_out=timed_out) is GhFailureClass.TRANSPORT:
-            transition = breaker.record_transport_failure()
-            if transition == "opened":
-                self._emit_circuit_event(
-                    "github_circuit_opened",
-                    {
-                        "consecutive_failures": breaker.consecutive_failures,
-                        "failure_threshold": breaker.failure_threshold,
-                        "cooldown_seconds": breaker.cooldown_seconds,
-                    },
-                )
-        else:
-            transition = breaker.record_success()
-            if transition == "closed":
-                self._emit_circuit_event(
-                    "github_circuit_closed",
-                    {"cooldown_seconds": breaker.cooldown_seconds},
-                )
-
-    def _emit_circuit_event(self, kind: str, payload: dict[str, Any]) -> None:
-        """Best-effort event write; ``log_event`` never raises on failure."""
-        log_event(self._circuit_breaker_state_path(), kind, payload)
-
-    def _circuit_breaker_state_path(self) -> Path:
-        """Compute ``state.json``'s path without going through ``paths.py``
-        (which imports ``.config`` and would cycle -- see the module
-        docstring). Mirrors ``paths.runtime_paths``' resolution of
-        ``runtime.state_dir`` exactly (absolute as-is, relative joined to
-        ``repo_root``), using only ``layout.py`` primitives.
-        """
-        state_dir = (
-            self.runtime.state_dir if self.runtime is not None else layout.DEFAULT_STATE_DIR
+        note_circuit_breaker_result(
+            self._circuit_breaker_state,
+            circuit_breaker_state_path(self.runtime, self.repo_root),
+            error=error,
+            timed_out=timed_out,
         )
-        root = Path(state_dir)
-        if not root.is_absolute():
-            root = self.repo_root / root
-        return layout.state_file_path(root.resolve())
 
     def reset_circuit_breaker(self) -> None:
         """Per-pass reset hook (issue #1833).

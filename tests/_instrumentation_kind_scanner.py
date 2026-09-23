@@ -45,7 +45,7 @@ from charlie_work.instrumentation import _LEVEL_BY_KIND
 
 _EMIT_FUNCS = {"log_event", "append_event", "_record_event", "record_event"}
 
-_WRAPPER_FUNCS = {"_route_to_rework", "_emit_circuit_event"}
+_WRAPPER_FUNCS = {"_route_to_rework"}
 
 _VALID_LEVELS = {"info", "warning", "error"}
 
@@ -488,20 +488,6 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
             "state_rework_routing by leaf L01 b1 (#1632); the allow-list key "
             "follows the member to its new module -- scope/source/reason "
             "unchanged."
-        ),
-    ),
-    _UnresolvedKindSite(
-        path="github_capabilities/transport.py",
-        scope="_emit_circuit_event",
-        source="kind",
-        reason=(
-            "Transport._emit_circuit_event forwards its own `kind` parameter "
-            "to log_event. Same pass-through as _route_to_rework/event_kind; "
-            "it is in _WRAPPER_FUNCS, so every self._emit_circuit_event(...) "
-            "call site is scanned instead (both current call sites in "
-            "_circuit_breaker_note_result pass a literal: "
-            '"github_circuit_opened" / "github_circuit_closed"). Added for '
-            "issue #1833."
         ),
     ),
     _UnresolvedKindSite(

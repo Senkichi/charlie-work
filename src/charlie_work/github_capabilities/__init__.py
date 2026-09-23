@@ -23,6 +23,7 @@ from ._base import (
 )
 from .checks import PR_CHECKS_FIELDS, Checks, ChecksLike, _job_id_from_link
 from .circuit_breaker import CircuitBreakerState, GhFailureClass, classify_gh_failure
+from .circuit_breaker_transport import build_circuit_breaker_state
 from .comments import Comments, CommentsLike
 from .issues import (
     ISSUE_LIST_FIELDS,
@@ -47,7 +48,6 @@ from .transport import (
     RECONCILE_ISSUE_FIELDS,
     RECONCILE_PR_FIELDS,
     Transport,
-    build_circuit_breaker_state,
 )
 
 __all__ = [
