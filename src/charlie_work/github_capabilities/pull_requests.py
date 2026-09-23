@@ -74,6 +74,13 @@ from ..issue_linking import linked_issue_number
 # here).
 from ._base import CapabilityCollaborator, GitHubRunResult, _is_mutating, _LIST_LIMIT
 
+# Outbound secret guard (issue #1505): ``pr_create`` scans title+body before
+# any ``gh`` invocation -- a credential in a PR body survives deletion via
+# edit history, so refusal is the only safe failure. ``outbound_body_guard``
+# imports only layout/instrumentation (deferred) -- no ``charlie_work.github``
+# dependency, so this adds no cycle.
+from ..outbound_body_guard import OutboundBodyGuardError, check_outbound_write
+
 logger = logging.getLogger(__name__)
 
 # Moved from ``github.py`` verbatim alongside ``pr_list``/``pr_view`` (Track 2,
@@ -277,6 +284,33 @@ class PullRequests(CapabilityCollaborator):
         """
         if self.dry_run:
             return 0
+        # Issue #1505: scan title+body before gh runs. Both are written by the
+        # same call and land in the same visible edit history; a credential in
+        # either is unrecoverable once submitted. Refusal is an error *value*
+        # (None), identical to a gh failure from the caller's side -- the
+        # distinguishing detail lives in the warning log and the
+        # ``outbound_body_secret_refused`` event emitted by the guard.
+        try:
+            matches = check_outbound_write(
+                surface="pr_create",
+                parts=(("title", title), ("body", body)),
+                repo_root=self.repo_root,
+                state_dir=getattr(self.runtime, "state_dir", None),
+            )
+        except OutboundBodyGuardError as exc:
+            # Fail closed in this surface's vocabulary: a guard that cannot
+            # run is a guard that cannot pass text through.
+            logger.warning("gh pr create refused: %s", exc)
+            return None
+        if matches:
+            logger.warning(
+                "gh pr create refused (head=%s base=%s): %d credential-pattern "
+                "match(es) in outbound text",
+                head,
+                base,
+                len(matches),
+            )
+            return None
         result = self.run(
             [
                 "pr",

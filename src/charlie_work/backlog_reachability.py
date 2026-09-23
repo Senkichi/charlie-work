@@ -175,6 +175,16 @@ def classify_backlog_reachability(
         # passed). The bins still partition -- every fetched issue lands in
         # exactly one.
         "blocked_by_open_dependency": 0,
+        # Issue #1682: the distinct open blockers of every
+        # ``blocked_by_open_dependency`` issue that are NOT themselves
+        # dependency-blocked -- the roots the whole blocked tail waits on.
+        # Each entry is ``{"number": N, "updated_at": <GitHub updatedAt>}`` so
+        # ``check_dispatch_staleness`` can judge root-blocker progress
+        # (bounded exemption) without a second issue fetch. ``updatedAt`` is
+        # already in ``ISSUE_LIST_FIELDS``, so it costs nothing here; it is
+        # carried explicitly rather than re-fetched inside the staleness
+        # check, which performs no I/O.
+        "dependency_root_blockers": [],
         # Issue #1337: an automated-ready issue that a merged PR mentions in
         # free text (and whose mention-only exclusion has not been lifted by
         # operator re-arm) is excluded from dispatch by _dispatch_impl's
@@ -219,6 +229,10 @@ def classify_backlog_reachability(
     covered_prs: dict[int, list[int]] = {}
     ready_seen = 0
     examples: dict[str, list[int]] = {}
+    # Issue #1682: record which issues landed in the dependency bin and which
+    # open blockers they named, so the root set can be derived after the loop.
+    blocked_by_dep: set[int] = set()
+    open_blockers_of_blocked: set[int] = set()
     for issue in issues:
         number = issue.get("number")
         if number is None:
@@ -277,6 +291,8 @@ def classify_backlog_reachability(
                     _declared, open_blockers = _get_open_blockers_for_issue(gh, issue)
                     if open_blockers:
                         reason = "blocked_by_open_dependency"
+                        blocked_by_dep.add(number)
+                        open_blockers_of_blocked.update(open_blockers)
                     else:
                         reason = "dispatchable"
         reachability[reason] += 1
@@ -289,6 +305,19 @@ def classify_backlog_reachability(
     reachability["open_total"] = len(issues)
     reachability["unreachable_examples"] = {k: sorted(v) for k, v in sorted(examples.items())}
     reachability["mention_covered_prs"] = {k: v for k, v in sorted(covered_prs.items())}
+    # Issue #1682: a root blocker is an open blocker of a blocked-bin issue
+    # that is not itself dependency-blocked -- mid-chain blockers are
+    # excluded because their own stall is downstream of the real root's.
+    # ``updated_at`` carries the GitHub ``updatedAt`` the open-issue list
+    # already fetched (None if the payload lacked it -- the staleness check
+    # treats a root with no progress evidence as having none recorded).
+    open_by_number = {
+        int(issue["number"]): issue for issue in issues if issue.get("number") is not None
+    }
+    reachability["dependency_root_blockers"] = [
+        {"number": n, "updated_at": open_by_number.get(n, {}).get("updatedAt")}
+        for n in sorted(open_blockers_of_blocked - blocked_by_dep)
+    ]
     if ready_open_count is not None:
         # The unfiltered list must be a superset of the ready-labelled OPEN
         # issues the caller already fetched. If it is missing some, it cannot
