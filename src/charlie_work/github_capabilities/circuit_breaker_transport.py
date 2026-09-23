@@ -145,9 +145,11 @@ def note_circuit_breaker_result(
                 "failure_threshold": breaker.failure_threshold,
                 "cooldown_seconds": breaker.cooldown_seconds,
             }
+            # write-gate-exempt(issue=1833): GitHub client layer has no WriteGate; breaker state is lock-free
             log_event(state_path, "github_circuit_opened", payload)
     else:
         transition = breaker.record_success()
         if transition == "closed":
             payload = {"cooldown_seconds": breaker.cooldown_seconds}
+            # write-gate-exempt(issue=1833): GitHub client layer has no WriteGate; breaker state is lock-free
             log_event(state_path, "github_circuit_closed", payload)
