@@ -443,6 +443,18 @@ class DispatchConfig:
     # fires while the unfiltered backlog is observed to be non-empty. 0
     # disables the check.
     dispatch_staleness_minutes: int = 240
+    # Issue #1682: maximum idle time (in minutes) of a dependency root blocker
+    # before an otherwise-silent ``all_ready_blocked_by_dependencies`` backlog
+    # fires ``dependency_root_blocker_idle`` instead. "Idle" means no recorded
+    # progress on the root -- the newest of its GitHub ``updatedAt`` and any
+    # past-dated ``*_at``/``*_since`` timestamp on its ``state["issues"]`` /
+    # linked ``state["prs"]`` entries is older than this window (a root with
+    # no recorded progress at all counts as idle). 0 disables the bound,
+    # restoring the unconditional #1110 exemption. Defaults to 24h: short
+    # enough that a wedged root is surfaced within a day, long enough that a
+    # root merely waiting out a slow CI cycle or an overnight review is not
+    # paged as stuck.
+    dependency_stall_minutes: int = 1440
     # Issue #1001: when True, dispatch refuses to launch workers if no
     # sanctioned GitHub token is configured in the active adapter's
     # ``worker_env`` (the same predicate ``doctor._check_worker_github_token``
@@ -2329,6 +2341,21 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         raise ConfigError(
             f"config section 'dispatch' key 'dispatch_staleness_minutes' must be >= 0, "
             f"got {dispatch_staleness_minutes}"
+        )
+    # Issue #1682: same int/>=0 contract as dispatch_staleness_minutes -- 0 is
+    # the documented "disabled" value, not an error.
+    dependency_stall_minutes = dispatch_data.get("dependency_stall_minutes")
+    if dependency_stall_minutes is not None and (
+        isinstance(dependency_stall_minutes, bool) or not isinstance(dependency_stall_minutes, int)
+    ):
+        raise ConfigError(
+            "config section 'dispatch' key 'dependency_stall_minutes' must be an int, "
+            f"got {type(dependency_stall_minutes).__name__}"
+        )
+    if dependency_stall_minutes is not None and dependency_stall_minutes < 0:
+        raise ConfigError(
+            f"config section 'dispatch' key 'dependency_stall_minutes' must be >= 0, "
+            f"got {dependency_stall_minutes}"
         )
     injected_paths = dispatch_data.get("injected_paths")
     if injected_paths is not None:
