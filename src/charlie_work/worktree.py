@@ -4030,6 +4030,11 @@ def remove_worktree(
          short backoff, then retry the whole-tree rmtree once more.
       6. Verify the directory is actually gone; if not, report failure and
          log the worker-tmp dir explicitly when it is still the reason.
+         When the fallback (not ``git worktree remove`` itself) removed the
+         directory, run ``git worktree prune`` again: the pre-fallback prune
+         found nothing prunable while the directory still looked live, and a
+         stale admin entry left behind would block ``git branch -D`` with
+         "cannot delete branch ... used by worktree at ..." (issue #1786).
       7. If ``branch`` is provided, delete the branch with ``git branch -D``.
 
     Returns False for expected failures (real .venv dir without force, git
@@ -4109,6 +4114,16 @@ def remove_worktree(
                 worktree_path,
                 lingering_tmp_dir,
             )
+
+    if not git_result_ok and worktree_removed:
+        # Issue #1786: the prune above ran before the rmtree fallback, while
+        # the directory still existed and looked live, so it cleared nothing.
+        # Prune again now that the fallback actually removed the tree -- the
+        # stale "prunable" admin entry would otherwise survive to block
+        # ``git branch -D`` below, leaking the branch behind a false failure.
+        run_captured(
+            ["git", "worktree", "prune"], cwd=repo_root, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS
+        )
 
     # Delete the branch if provided (to prevent branch leaks on launch failure)
     # Attempt branch deletion independently of worktree-removal success to avoid
