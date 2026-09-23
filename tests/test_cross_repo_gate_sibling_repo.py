@@ -294,6 +294,42 @@ def test_path_exists_in_repo_containment_checks_relative_candidates(
     assert cross_repo_gate_module._path_exists_in_repo("src/real.py", this_repo) is True
 
 
+def test_path_exists_in_repo_containment_checks_posix_absolute_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1772, absolute branch: ``_path_exists_in_repo`` returns ``False``
+    for a POSIX-style absolute candidate (``/outside/secret.py``) even when a
+    file exists at the location the uncontained existence check would consult.
+
+    On Windows ``Path("/outside/secret.py").is_absolute()`` is ``False`` (no
+    drive letter), so pre-#1772 the candidate took the *relative* branch:
+    ``repo_root / candidate`` collapses to the drive root
+    (``C:\\outside\\secret.py`` — never ``repo_root\\outside\\secret.py``, so a
+    file planted inside ``tmp_path`` cannot stand in for the escaped location)
+    and ``exists()`` ran with no containment check at all, reporting a
+    coincidental file at the escaped location as "in the repo." Reporting
+    ``True`` from ``Path.exists`` for whatever path is consulted reproduces
+    that precondition portably: unfixed code consults the drive-root collapse
+    and wrongly returns ``True``; fixed code containment-checks via
+    :func:`_resolve_within_root` and returns ``False`` without consulting
+    ``exists()`` at all."""
+    this_repo = tmp_path / "charlie-work"
+    this_repo.mkdir()
+
+    consulted: list[Path] = []
+
+    def _always_exists(self: Path, *args: object, **kwargs: object) -> bool:
+        consulted.append(self)
+        return True
+
+    monkeypatch.setattr(Path, "exists", _always_exists)
+
+    assert cross_repo_gate_module._path_exists_in_repo("/outside/secret.py", this_repo) is False
+    # Containment runs before existence: the escaped location is never even
+    # consulted, so a file there can never leak an "exists in repo" verdict.
+    assert consulted == []
+
+
 def test_segment_boundary_match_ignores_untracked_worktree_copies(tmp_path: Path) -> None:
     """Review finding 2: sibling file listings come from ``git ls-files``
     (:func:`_repo_tracked_files`), so an untracked worktree/vendor copy of
