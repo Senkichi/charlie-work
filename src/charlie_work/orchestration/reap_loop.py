@@ -33,6 +33,7 @@ import charlie_work.workflow as _wf
 from charlie_work.dead_worker_reap import _detect_stalled_sessions
 from charlie_work.escalation import _escalation_flags
 from charlie_work.github import (
+    GitHub,
     GitHubError,
     GitHubNotFoundError,
     is_transient_repo_resolution_failure,
@@ -53,6 +54,16 @@ def _loop_body(
     # restarts (observed live: intake frozen at a stale issue set for the
     # daemon's entire lifetime).
     self.gh.invalidate_list_cache()
+    # Issue #1833: the gh circuit breaker is per-instance state, same
+    # lifetime problem as the list cache above -- a long-running supervisor
+    # reuses one GitHub instance across many passes, so a breaker tripped by
+    # one pass's network blip must not permanently fail-fast every later
+    # pass. Kept off the GitHubLike protocol surface (mirrors
+    # validate_field_lists()'s precedent just below in OrchestratorApp
+    # construction) so adding it costs zero edits to every FakeGitHub test
+    # double.
+    if isinstance(self.gh, GitHub):
+        self.gh.reset_circuit_breaker()
     sessions_dir = self._layout.sessions_dir
     # Issue #646: the worker census now logs from inside dispatch() itself
     # (the one chokepoint every dispatch path funnels through, including
