@@ -11,7 +11,9 @@ is unchanged.
 
 New module rather than ``tests/test_worktree.py``: that file's module-level
 attachment point is saturated, so new coverage lands here and imports the
-shared cleanup-lane fakes (``_FakeGH``, ``_make_state``) from it.
+shared cleanup-lane fake ``_FakeGH`` from ``tests/_worktree_fixtures.py``
+(the ``test_*.py -> test_*.py`` import the first draft used is banned by
+``tests/test_zero_cross_test_import_guard.py``).
 """
 
 from __future__ import annotations
@@ -19,8 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from _worktree_fixtures import _git, _init_repo
-from test_worktree import _FakeGH
+from _worktree_fixtures import _FakeGH, _git, _init_repo
 
 from charlie_work.config import OrchestratorConfig
 from charlie_work.worktree import _default_worktrees_dir, clean_worktrees, create_worktree

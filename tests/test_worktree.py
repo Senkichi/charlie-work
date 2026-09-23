@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from _sessions_db_fixtures import make_sessions_db
-from _worktree_fixtures import _clone_repo, _git, _init_repo
+from _worktree_fixtures import _FakeGH, _clone_repo, _git, _init_repo
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -21,7 +21,6 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
-from charlie_work.github import GitHubRunResult
 from charlie_work.process_utils import get_process_start_time
 from charlie_work.subprocess_runner import RunResult
 from charlie_work import worktree as worktree_module
@@ -34,7 +33,6 @@ from charlie_work.worktree import (
     WORKTREE_UNSAFE_KIND_LOCAL_COMMITS,
     WORKTREE_UNSAFE_KIND_SHIM_DIRT,
     WorktreeCleanResult,
-    WorktreeCleanGH,
     WorktreeInfo,
     WorktreeForeignWriterError,
     WorktreeProbeFailedError,
@@ -5599,97 +5597,6 @@ def _make_state(issue_number: int, pr_number: int, *, status: str = "merged") ->
         },
         "events": [],
     }
-
-
-class _FakeGH(WorktreeCleanGH):
-    """Fake ``GitHub`` for ``clean_worktrees`` tests.
-
-    Implements the ``WorktreeCleanGH`` protocol (the slice of ``GitHub`` the
-    cleanup lane depends on) so it is statically assignable to
-    ``clean_worktrees(..., gh=...)`` without ``cast`` (issue #641).
-
-    ``available=False`` simulates ``gh`` itself failing/being unreachable
-    (``GitHubRunResult(ok=False, ...)``), distinct from ``gh`` succeeding but
-    reporting a PR state other than ``MERGED``.
-
-    ``head_branch_prs`` maps a head-branch name to the PR numbers a
-    ``gh pr list --head <branch> --state all`` call should report -- the
-    issue-#1713 fallback lookup ``clean_worktrees`` makes when state.json
-    has no linked PR. Every invocation is recorded in ``calls`` so tests
-    can assert whether the fallback ran at all.
-    """
-
-    def __init__(
-        self,
-        pr_state: str = "MERGED",
-        merged_at: str | None = "2026-07-13T01:33:43Z",
-        head_sha: str | None = None,
-        *,
-        available: bool = True,
-        error: str = "gh: could not resolve to a PullRequest",
-        head_branch_prs: dict[str, list[int]] | None = None,
-    ) -> None:
-        self.pr_state = pr_state
-        self.merged_at = merged_at
-        self.head_sha = head_sha
-        self.available = available
-        self.error = error
-        self.head_branch_prs = head_branch_prs or {}
-        self.calls: list[list[str]] = []
-
-    def run(
-        self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> GitHubRunResult:
-        self.calls.append(list(args))
-        if args[:2] == ["pr", "list"] and "--head" in args and json_output and allow_failure:
-            if not self.available:
-                return GitHubRunResult(
-                    ok=False,
-                    returncode=1,
-                    stdout="",
-                    stderr=self.error,
-                    value=None,
-                    error=self.error,
-                )
-            head = args[args.index("--head") + 1]
-            return GitHubRunResult(
-                ok=True,
-                returncode=0,
-                stdout="",
-                stderr="",
-                value=[{"number": number} for number in self.head_branch_prs.get(head, [])],
-                error=None,
-            )
-        if args[:2] == ["pr", "view"] and json_output and allow_failure:
-            if not self.available:
-                return GitHubRunResult(
-                    ok=False,
-                    returncode=1,
-                    stdout="",
-                    stderr=self.error,
-                    value=None,
-                    error=self.error,
-                )
-            return GitHubRunResult(
-                ok=True,
-                returncode=0,
-                stdout="",
-                stderr="",
-                value={
-                    "state": self.pr_state,
-                    "mergedAt": self.merged_at,
-                    "headRefOid": self.head_sha,
-                },
-                error=None,
-            )
-        return GitHubRunResult(
-            ok=False,
-            returncode=1,
-            stdout="",
-            stderr="",
-            value=None,
-            error="unexpected fake gh command",
-        )
 
 
 def _create_shared_venv(repo_root: Path, pth_target: Path | None = None) -> Path:
