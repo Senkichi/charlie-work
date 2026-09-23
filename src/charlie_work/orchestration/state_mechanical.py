@@ -310,8 +310,9 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
             if isinstance(fresh_pr, dict):
                 reset_spec = self._REWORK_BUDGET_RESET_BY_ESCALATION_REASON.get(cleared_condition)
                 if reset_spec is not None:
-                    counter_field, companion_fields = reset_spec
-                    fresh_pr[counter_field] = 0
+                    counter_fields, companion_fields = reset_spec
+                    for _counter_field in counter_fields:
+                        fresh_pr[_counter_field] = 0
                     for _field in companion_fields:
                         fresh_pr.pop(_field, None)
                     counter_reset = True

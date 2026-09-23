@@ -18,10 +18,17 @@ Both counters are same-head-sensitive: ``review()``'s packet write
 preserves them whenever ``review_dispatch_attempt_last_head`` matches the
 packet head, and resets them only on a fresh dispatch cycle.  The reset
 must therefore also pop ``review_dispatch_attempt_last_head`` so the next
-packet write re-baselines the whole dispatch epoch (a streak clear alone
-would leave ``review_dispatch_attempt_count`` at cap -- every turn-limit
-miss is also a spent dispatch attempt -- and re-escalate under the OTHER
-reason before the epoch re-baselines).
+packet write re-baselines the whole dispatch epoch.
+
+The baseline pop alone does NOT re-arm the streak lane, though: the
+re-baseline only fires when ``review()`` regenerates the packet, and the
+normal post-clear state is a packet that is already current -- so the
+sweep's clear must also zero ``review_dispatch_attempt_count`` directly
+(every turn-limit miss is also a spent dispatch attempt, leaving it at
+cap).  ``dispatch_reviews()``'s escalation check reads that counter
+directly and never consults the baseline, so a clear that left it at cap
+re-escalated under the OTHER reason before any new claim.  The
+sweep-to-dispatch regression test below exercises exactly that path.
 
 The structural guard at the bottom of this file derives the full set of
 ``reason_class="mechanical"`` escalation reasons reachable through
@@ -34,13 +41,28 @@ mechanical lane cannot repeat this omission silently.
 from __future__ import annotations
 
 import ast
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 import charlie_work
 from charlie_work.config import DETERMINISTIC_ESCALATION_FAILURE_KINDS
-from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state, state_lock
+from charlie_work.state import (
+    PASSIVE_OPEN_STATUS,
+    _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
+    load_state,
+    save_state,
+    state_lock,
+)
 from charlie_work.unescalate_reset_fields import REWORK_BUDGET_RESET_BY_ESCALATION_REASON
 
+from _review_fixtures import (
+    _dispatch_reviews_app,
+    _fake_claude_worker_record,
+    _write_review_packet,
+)
 from _unescalate_fixtures import _app, _events
 
 
@@ -119,14 +141,18 @@ def test_sweep_resets_turn_limit_miss_streak_and_rebaselines_head(
 ) -> None:
     """A clear of ``max_consecutive_turn_limit_misses_exceeded`` must zero
     ``review_turn_limit_miss_streak`` -- the counter that gates the cleared
-    reason -- and pop ``review_dispatch_attempt_last_head``.
+    reason -- AND ``review_dispatch_attempt_count`` -- the sibling-lane
+    counter the next dispatch pass reads directly -- plus pop
+    ``review_dispatch_attempt_last_head``.
 
-    The head-baseline pop is load-bearing, not cosmetic: every turn-limit
-    miss also consumed a ``review_dispatch_attempt_count`` slot, so the
-    attempt counter is typically at cap too.  Popping the baseline forces
-    the next ``review()`` packet write down its fresh-dispatch-cycle path
-    (``_fresh_dispatch_cycle``), which zeroes BOTH counters in one epoch
-    reset -- without it the next dispatch pass would re-escalate under
+    The direct attempt-count zero is load-bearing, not cosmetic: every
+    turn-limit miss also consumed a ``review_dispatch_attempt_count``
+    slot, so the attempt counter is at cap too, and
+    ``dispatch_reviews()``'s escalation check reads it without consulting
+    the baseline.  Relying on the popped baseline to re-zero it via
+    ``review()``'s fresh-dispatch-cycle path leaves it at cap whenever
+    the packet is already current -- the normal post-clear state -- so
+    the next dispatch pass re-escalates under
     ``max_review_dispatch_attempts_exceeded`` before any new claim.
     """
     app = _app(tmp_path)
@@ -141,8 +167,8 @@ def test_sweep_resets_turn_limit_miss_streak_and_rebaselines_head(
             # baseline it is preserved under.
             "review_turn_limit_miss_streak": 3,
             "review_dispatch_attempt_last_head": "sha-escalated-head",
-            # The sibling lane's counter is NOT zeroed by the sweep itself --
-            # it resets on the next packet write via the popped baseline.
+            # The sibling lane's counter at cap -- every miss spent an
+            # attempt, so the sweep must zero it directly.
             "review_dispatch_attempt_count": 3,
             # Unrelated rework-lane counters -- must NOT be reset.
             "request_changes_count": 4,
@@ -167,9 +193,10 @@ def test_sweep_resets_turn_limit_miss_streak_and_rebaselines_head(
     # The shared epoch baseline is popped so both counters re-baseline on
     # the next packet write.
     assert "review_dispatch_attempt_last_head" not in pr_456
-    # The other lane's counter is left for the re-baselined packet write --
-    # the sweep resets only the counter that gates the cleared reason.
-    assert pr_456["review_dispatch_attempt_count"] == 3
+    # The sibling lane's counter is zeroed synchronously -- the deferred
+    # packet-write re-baseline cannot be relied on because the packet is
+    # typically already current after a clear.
+    assert pr_456["review_dispatch_attempt_count"] == 0
     # Unrelated rework lanes untouched.
     assert pr_456["request_changes_count"] == 4
     assert pr_456["no_op_rework_attempts"] == 2
@@ -181,6 +208,97 @@ def test_sweep_resets_turn_limit_miss_streak_and_rebaselines_head(
     cleared = _events(state, "deescalation_cleared")
     assert cleared[0]["payload"]["rework_budget_reset"] is True
     assert cleared[0]["payload"]["rework_budget_reset_needed"] is True
+
+
+def test_streak_clear_then_dispatch_pass_redispatches_instead_of_reescalating(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-to-end regression for the round-2 finding: after the sweep clears
+    ``max_consecutive_turn_limit_misses_exceeded``, the very next
+    ``dispatch_reviews()`` pass must see a PR with a genuinely fresh
+    dispatch budget -- claimed and launched as ONE new attempt -- not
+    re-escalated under ``max_review_dispatch_attempts_exceeded`` with zero
+    new ``review_dispatch_claim``s.
+
+    This is the exact hole a baseline-pop-only re-arm leaves: the cleared
+    PR's packet is already current (``review()``'s fresh-cycle re-baseline
+    never fires), while ``dispatch_reviews()``'s escalation check reads
+    ``review_dispatch_attempt_count`` directly and never consults
+    ``review_dispatch_attempt_last_head`` -- so a still-at-cap count
+    re-escalated under the sibling reason before any new dispatch attempt.
+    """
+    app = _dispatch_reviews_app(tmp_path)
+    # Packet already current at the live head -- the normal post-clear
+    # state, and the condition that makes the deferred review()
+    # re-baseline unreachable.
+    _write_review_packet(tmp_path, 456, "sha-abc123")
+    # _escalate_issue stamps these claim fields via pr_extra when the
+    # streak cap trips; age failed_at past the stale-claim timeout so the
+    # cleared PR is immediately re-dispatchable (the escalation sat far
+    # longer than the 5-minute claim timeout before the sweep cleared it).
+    stale_failed_at = (
+        (datetime.now(UTC) - timedelta(minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES + 5))
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    terminal_since = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "escalation_reason": "max_consecutive_turn_limit_misses_exceeded",
+            "review_turn_limit_miss_streak": 3,
+            "review_dispatch_attempt_count": 3,
+            "review_dispatch_attempt_last_head": "sha-abc123",
+            "review_dispatch_status": "review_dispatch_failed",
+            "review_dispatch_failed_at": stale_failed_at,
+            "review_dispatch_pending_at": None,
+            "review_dispatched_at": None,
+            "reviewer_pid": None,
+            "reviewer_process_start_time": None,
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "max_consecutive_turn_limit_misses_exceeded",
+            "reason_class": "mechanical",
+            "terminal_since": terminal_since,
+        }
+        save_state(app.paths.state_file, state)
+
+    app._maybe_deescalate_mechanical()
+
+    # Sanity: the sweep actually cleared the escalation -- otherwise the
+    # dispatch pass below proves nothing about the re-arm.
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == PASSIVE_OPEN_STATUS
+    assert "escalation_reason" not in state["issues"]["123"]
+
+    launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> Any:
+        launched.append((args, kwargs))
+        return _fake_claude_worker_record(456, "agent/issue-123-fix-search")
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    state = load_state(app.paths.state_file)
+    # The pre-fix shape: an immediate second escalation under the SIBLING
+    # reason on the still-at-cap attempt counter.
+    assert _events(state, "review_dispatch_escalated") == []
+    assert state["issues"]["123"]["status"] == PASSIVE_OPEN_STATUS
+    pr_456 = state["prs"]["456"]
+    assert pr_456.get("status") != "escalated"
+    # Exactly one new dispatch attempt since the clear -- the fresh claim
+    # the re-armed budget makes possible.
+    assert int(pr_456["review_dispatch_attempt_count"]) == 1
+    assert pr_456["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert len(launched) == 1
 
 
 # --- structural guard -------------------------------------------------

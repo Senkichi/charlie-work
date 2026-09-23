@@ -160,20 +160,24 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
 # untouched, so the router re-escalated on the very next detection -- the
 # promised "fresh rework budget" never applied to the lane it serves.
 #
-# Each lane's counter is reset together with its head-baseline
-# (``_last_head``) and stall-clock (``_stall_since`` / ``_stall_head``)
-# companions so the next detection re-baselines instead of inheriting a
-# stale head/stall snapshot from the exhausted episode.  Escalation
-# reasons with no per-mechanism rework counter (e.g.
-# ``session_failed_escalated``, ``worktree_unsafe``) are absent from the
-# map: there is no rework budget to reset for them, so the clear resets
-# nothing extra.  ``auto_deescalation_count`` still independently bounds
-# total clears (Issue #783 hazard (b)), so the per-episode reset cannot
-# unbound the paid-session loop.
-REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[str, tuple[str, ...]]] = {
-    "max_rework_cycles_exceeded": ("request_changes_count", ()),
+# Each map value is ``(counters_to_zero, companions_to_pop)``: the first
+# tuple names every per-mechanism counter whose over-cap value would
+# re-escalate the cleared reason (or a sibling reason sharing the lane's
+# dispatch epoch) on the very next detection pass, and the second names
+# the lane's head-baseline (``_last_head``) and stall-clock
+# (``_stall_since`` / ``_stall_head``) companions, popped so the next
+# detection re-baselines instead of inheriting a stale head/stall
+# snapshot from the exhausted episode.  Escalation reasons with no
+# per-mechanism rework counter (e.g. ``session_failed_escalated``,
+# ``worktree_unsafe``) are absent from the map: there is no rework budget
+# to reset for them, so the clear resets nothing extra.
+# ``auto_deescalation_count`` still independently bounds total clears
+# (Issue #783 hazard (b)), so the per-episode reset cannot unbound the
+# paid-session loop.
+REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "max_rework_cycles_exceeded": (("request_changes_count",), ()),
     "no_op_rework_attempts_cap_exceeded": (
-        "no_op_rework_attempts",
+        ("no_op_rework_attempts",),
         (
             "no_op_rework_attempts_last_head",
             "no_op_rework_attempts_stall_since",
@@ -181,7 +185,7 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[str, tuple[str, ...]]]
         ),
     ),
     "no_op_rework_attempts_stall_exceeded": (
-        "no_op_rework_attempts",
+        ("no_op_rework_attempts",),
         (
             "no_op_rework_attempts_last_head",
             "no_op_rework_attempts_stall_since",
@@ -189,7 +193,7 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[str, tuple[str, ...]]]
         ),
     ),
     "conflict_rework_attempts_cap_exceeded": (
-        "conflict_rework_attempts",
+        ("conflict_rework_attempts",),
         (
             "conflict_rework_attempts_last_head",
             "conflict_rework_attempts_stall_since",
@@ -197,7 +201,7 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[str, tuple[str, ...]]]
         ),
     ),
     "conflict_rework_attempts_stall_exceeded": (
-        "conflict_rework_attempts",
+        ("conflict_rework_attempts",),
         (
             "conflict_rework_attempts_last_head",
             "conflict_rework_attempts_stall_since",
@@ -218,17 +222,27 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[str, tuple[str, ...]]]
     # resets them only on a fresh dispatch cycle.  ``review_dispatch_
     # attempt_last_head`` is therefore a companion of BOTH lanes: popping
     # it forces the next packet write down the fresh-cycle path, which
-    # re-baselines the whole dispatch epoch.  That matters most for the
-    # streak lane -- every turn-limit miss also consumed a dispatch
-    # attempt, so ``review_dispatch_attempt_count`` is typically at cap
-    # too and would re-escalate under the OTHER reason before any new
-    # claim if the stale baseline survived.
+    # re-baselines the whole dispatch epoch.
+    #
+    # The baseline pop alone is NOT sufficient re-arm for the streak
+    # lane, though -- it only takes effect if ``review()`` actually
+    # regenerates the packet, and the normal post-clear state is a packet
+    # that is already current (``loop()``'s same-head skip never rebuilds
+    # it), so the deferred re-baseline never fires.  Meanwhile
+    # ``dispatch_reviews()``'s escalation check reads
+    # ``review_dispatch_attempt_count`` directly and never consults the
+    # baseline.  Every turn-limit miss also consumed a dispatch attempt,
+    # so the count is typically at cap when the streak cap trips: the
+    # streak lane must zero BOTH counters synchronously at clear time, or
+    # the next dispatch pass re-escalates under
+    # ``max_review_dispatch_attempts_exceeded`` before any new claim --
+    # burning a second ``auto_deescalation_count`` slot per real recovery.
     "max_review_dispatch_attempts_exceeded": (
-        "review_dispatch_attempt_count",
+        ("review_dispatch_attempt_count",),
         ("review_dispatch_attempt_last_head",),
     ),
     "max_consecutive_turn_limit_misses_exceeded": (
-        "review_turn_limit_miss_streak",
+        ("review_turn_limit_miss_streak", "review_dispatch_attempt_count"),
         ("review_dispatch_attempt_last_head",),
     ),
 }
