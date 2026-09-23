@@ -88,7 +88,14 @@ def test_check_cross_repo_escalations_surfaces_found_in_repo(tmp_path: Path) -> 
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
 
-    for issue_number, found_in_repo in ((101, "ci_runners"), (102, "ci_runners"), (103, "swole")):
+    # Fixture names must not be gated private slugs (a gated slug here trips
+    # the private-slug ratchet gate for zero coverage gain); the check
+    # aggregates the raw found_in_repo string, so any distinct names work.
+    for issue_number, found_in_repo in (
+        (101, "fleet_sibling"),
+        (102, "fleet_sibling"),
+        (103, "swole"),
+    ):
         log_event(
             paths.state_file,
             "dispatch_cross_repo_escalated",
@@ -112,7 +119,7 @@ def test_check_cross_repo_escalations_surfaces_found_in_repo(tmp_path: Path) -> 
     assert check.ok is False
     assert check.severity == "warning"
     assert "3 dispatch_cross_repo_escalated event(s)" in check.detail
-    assert "ci_runners (2)" in check.detail
+    assert "fleet_sibling (2)" in check.detail
     assert "swole (1)" in check.detail
     assert "unattributed" not in check.detail
     # A warning-severity finding must not by itself block the overall result.
