@@ -41,6 +41,13 @@ best-effort shape) makes even that one acquisition non-fatal to the pass.
 This also collapses what used to be up to N lock acquisitions and N
 ``state.json`` reads per pass (one per standing issue-less PR) into one of
 each, regardless of backlog size.
+
+Issue #1781 added the falling edge to the same call: the per-PR loop now
+also hands down ``linked_prs`` (every PR that DID resolve an issue this
+pass), and under the same lock any standing ``unlinked_pr_notice`` marker
+for one of those PRs is evicted with a ``pr_unlinked_resolved`` event --
+previously such a marker was orphaned forever once the PR stopped appearing
+in ``entries``.
 """
 
 from __future__ import annotations
@@ -52,7 +59,9 @@ from typing import Any
 import charlie_work.workflow as _wf
 from charlie_work.pr_unlinked_visibility import (
     UNLINKED_PR_NOTICE_KEY,
+    UNLINKED_PR_RESOLVED_EVENT_KIND,
     UNLINKED_PR_SKIPPED_EVENT_KIND,
+    compute_unlinked_pr_resolutions,
     compute_unlinked_pr_transition,
     unlinked_pr_author,
     unlinked_pr_fingerprint,
@@ -61,7 +70,11 @@ from charlie_work.state import StateLockBusy
 
 
 def _record_unlinked_pr_skips(
-    self, entries: list[tuple[dict[str, Any], int]], *, now: datetime
+    self,
+    entries: list[tuple[dict[str, Any], int]],
+    *,
+    now: datetime,
+    linked_prs: dict[int, int],
 ) -> None:
     """Batch edge-triggered notice for every PR the merge lane skipped this pass.
 
@@ -77,13 +90,22 @@ def _record_unlinked_pr_skips(
     at all -- no event, no rewrite -- so a standing backlog of unresolved PRs
     never becomes per-pass spam.
 
+    ``linked_prs`` is the same loop's complement (issue #1781): every PR
+    number that DID resolve a linked issue this pass, mapped to that issue
+    number. Diffing it against the standing ``unlinked_pr_notice`` markers
+    under the same lock is the falling edge the entries-only detector cannot
+    express -- a PR that resolves an issue stops appearing in ``entries``
+    and would otherwise leave its marker orphaned forever. Each stale marker
+    is evicted and recorded as ``pr_unlinked_resolved`` (info) so an
+    operator who saw the original warning can see it self-resolved.
+
     Failure here is by-value: an informational notice must never outrank the
     review/merge work this pass already completed, so lock contention or a
     write error is logged and swallowed rather than raised (matching the
     module docstring's rationale and the identical shape in
     ``_announce_unauthorized_merges``).
     """
-    if not entries:
+    if not entries and not linked_prs:
         return
     try:
         with _wf.state_lock(self.paths.state_file):
@@ -114,12 +136,29 @@ def _record_unlinked_pr_skips(
                     level="warning",
                 )
                 emitted = True
+            # Issue #1781 falling edge: evict markers for PRs that resolved a
+            # linked issue this pass. They can never re-enter ``entries``
+            # while linked, so without this their markers orphaned forever.
+            # Runs under the same lock/read as the entries above -- the whole
+            # batch is one read-modify-write per pass either way.
+            for resolution in compute_unlinked_pr_resolutions(state["prs"], linked_prs, now=now):
+                pr_state = dict(state["prs"][str(resolution["pr_number"])])
+                del pr_state[UNLINKED_PR_NOTICE_KEY]
+                state["prs"][str(resolution["pr_number"])] = pr_state
+                state = self._record_event(
+                    state,
+                    UNLINKED_PR_RESOLVED_EVENT_KIND,  # event-consumer: audit-only -- imported constant (defined in pr_unlinked_visibility.py) rather than a same-file literal, so the AST scanner cannot resolve it; registered "info" in _LEVEL_BY_KIND and read via query_events(kind="pr_unlinked_resolved") in tests/test_issue_1781_unlinked_marker_resolution.py.
+                    resolution,
+                    level="info",
+                )
+                emitted = True
             if emitted:
                 # Gated (unlike the removed direct `_wf.save_state` call this
                 # replaces): under dry-run this returns `state` unchanged and
                 # writes nothing, so a preview pass can never durably persist
                 # the marker for an event `_record_event` above already
-                # suppressed.
+                # suppressed. The marker evictions above share this same
+                # gate -- nothing here reaches disk under --dry-run.
                 self.write_gate.save_state(state)
     except (OSError, ValueError, StateLockBusy) as exc:
         logging.getLogger(__name__).warning(
