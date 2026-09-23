@@ -581,6 +581,15 @@ def test_review_md_renders_with_production_paths_and_no_state_dir_literal(
     # checking only the forward-slash spelling of DEFAULT_STATE_DIR would
     # pass vacuously on this host regardless of what the template contains.
     normalized = rendered.replace("\\", "/")
+    # tmp_path itself can legitimately contain the default state-dir
+    # literal -- every worker worktree lives under
+    # ``.var/charlie-work/worktrees/``, so a session-level pytest tmp dir
+    # carries it into pr_json_path/diff_path verbatim. Those are supplied
+    # values, not template prose: strip the tmp_path prefix so the
+    # assertion still checks exactly what this test exists for -- whether
+    # the template hardcodes the default -- instead of the environment's
+    # absolute path.
+    normalized = normalized.replace(str(tmp_path).replace("\\", "/"), "<TMP>")
     assert layout.DEFAULT_STATE_DIR not in normalized, (
         f"review.md rendered output contains the default state-dir literal "
         f"{layout.DEFAULT_STATE_DIR!r} despite runtime.state_dir being "
@@ -645,6 +654,11 @@ def test_review_md_repo_local_override_render_with_no_state_dir_literal(
         "repo-local review.md rendered with an unresolved $placeholder"
     )
     normalized = rendered.replace("\\", "/")
+    # Same tmp_path-prefix strip as the default-template case above: the
+    # assertion targets the template's prose, not the supplied values'
+    # absolute path (which carries `.var/charlie-work` under a worker
+    # worktree).
+    normalized = normalized.replace(str(tmp_path).replace("\\", "/"), "<TMP>")
     assert layout.DEFAULT_STATE_DIR not in normalized, (
         f"repo-local review.md contains the default state-dir literal "
         f"{layout.DEFAULT_STATE_DIR!r} -- the repo-local override must "
