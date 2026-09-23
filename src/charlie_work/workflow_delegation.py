@@ -61,6 +61,7 @@ import inspect
 import pkgutil
 import textwrap
 from collections.abc import Iterator
+from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable
 
@@ -294,6 +295,79 @@ def _install_delegates(owner_cls: type, modules: tuple[ModuleType, ...]) -> None
     setattr(owner_cls, _INSTALLED_MARKER, frozenset(installed))
 
 
+def _declared_top_level_defs(module: ModuleType) -> frozenset[str]:
+    """Return the names ``module``'s own source declares as top-level ``def``s.
+
+    Derived by AST-parsing the module's ``__file__`` (the same mechanism
+    ``_reserved_init_attrs`` uses on the owner's ``__init__``): only direct
+    children of the module body count, matching what ``vars(module)`` holds
+    after a *complete* import. A ``def`` nested inside ``if`` / ``try`` / a
+    class body binds no module-level name and is not expected. Dunder-named
+    defs are excluded -- ``_routable_defs`` never routes them, so their
+    absence is not an incomplete-module signal.
+
+    Returns an empty frozenset when no source is retrievable or parseable
+    (synthetic ``ModuleType``, stripped file): nothing can be derived, so
+    nothing is checked.
+    """
+    path = getattr(module, "__file__", None)
+    if path is None:
+        return frozenset()
+    try:
+        tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return frozenset()
+    return frozenset(
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not (node.name.startswith("__") and node.name.endswith("__"))
+    )
+
+
+def _assert_fully_initialized(module: ModuleType) -> None:
+    """Raise ``ImportError`` if ``module`` is only partially initialized.
+
+    A ``charlie_work.orchestration`` submodule can be in ``sys.modules`` but
+    still mid-import when discovery runs: importing the submodule directly
+    *before* ``charlie_work.workflow`` starts the submodule's own execution,
+    which suspends at its ``import charlie_work.workflow as _wf`` line while
+    ``workflow``'s module body -- including this discovery call -- runs to
+    completion. ``importlib.import_module`` then returns the partial module
+    object and ``vars(module)`` only sees names bound *above* that import
+    line; every ``def`` below it would be silently dropped from
+    ``OrchestratorApp`` (issue #1798).
+
+    Detection is derived, not heuristic: the module's own source declares
+    which top-level ``def`` names a complete import must produce
+    (``_declared_top_level_defs``), and any declared name missing from the
+    routable set proves the namespace is incomplete. ``_routable_defs`` is
+    materialized first so its own hard errors (e.g. a bare ``property``
+    object) keep their more specific messages. Failing here converts a
+    silent ``AttributeError`` on ``OrchestratorApp`` -- surfacing far from
+    the cause -- into an immediate import error that names the import-order
+    violation.
+    """
+    routable = {name for name, _fn in _routable_defs(module)}
+    missing = sorted(_declared_top_level_defs(module) - routable)
+    if not missing:
+        return
+    preview = ", ".join(missing[:10])
+    if len(missing) > 10:
+        preview += f", ... (+{len(missing) - 10} more)"
+    raise ImportError(
+        f"{module.__name__} is only partially initialized: {len(missing)} "
+        f"top-level def(s) declared in its source are not routable members "
+        f"({preview}). This is the partial-module import-order hazard: the "
+        f"submodule was imported while charlie_work.workflow was mid-import, "
+        f"so its own 'import charlie_work.workflow as _wf' line suspended "
+        f"execution and delegate discovery can only see the names bound "
+        f"above that line. Import charlie_work.workflow before importing "
+        f"charlie_work.orchestration.* submodules directly (or a top-level "
+        f"def was rebound to a non-function after definition)."
+    )
+
+
 def discover_delegate_modules(package: ModuleType) -> tuple[ModuleType, ...]:
     """Import and return every direct submodule of ``package``, sorted by name.
 
@@ -307,10 +381,16 @@ def discover_delegate_modules(package: ModuleType) -> tuple[ModuleType, ...]:
     an import or syntax error in any ``charlie_work.orchestration`` submodule
     propagates out of ``importlib.import_module`` here and fails importing
     ``workflow`` at import time, rather than silently dropping the broken module.
+    The same holds for a submodule that is present in ``sys.modules`` but only
+    partially executed (the issue #1798 import-order hazard):
+    ``_assert_fully_initialized`` rejects it rather than letting discovery
+    install an incomplete route set.
     """
     modules: list[ModuleType] = []
     for info in sorted(pkgutil.iter_modules(package.__path__), key=lambda i: i.name):
         if info.ispkg:
             continue
-        modules.append(importlib.import_module(f"{package.__name__}.{info.name}"))
+        module = importlib.import_module(f"{package.__name__}.{info.name}")
+        _assert_fully_initialized(module)
+        modules.append(module)
     return tuple(modules)
