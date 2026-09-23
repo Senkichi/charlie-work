@@ -436,36 +436,64 @@ def _follow_pagination(
 ) -> str:
     """Follow `Link: rel="next"` pages, concatenating JSON arrays -- the
     response shape every `--paginate` call site in this codebase actually
-    relies on (`_gh_api_list`, `merged_pr_list`). A non-array first page (an
-    object response with `--paginate`, which `gh` handles by merging keys --
-    a shape no call site in this codebase uses) is returned unmodified,
-    matching the "unsupported shape falls back" principle by simply not
-    attempting to paginate it.
+    relies on (`_gh_api_list`, `merged_pr_list`).
+
+    Every failure mode below raises `_HttpTransportUnavailable` instead of
+    returning whatever was collected so far, so `run_gh_command` falls back
+    to the real `gh` subprocess (which itself follows the full Link chain)
+    rather than silently handing a caller a truncated page set it cannot
+    tell apart from a complete one:
+
+      * the first page is not a JSON array -- an object response with
+        `--paginate` is a shape `gh` handles by merging keys, which no call
+        site in this codebase uses and this module does not replicate, so
+        it is unsupported rather than assumed complete;
+      * a later page responds non-2xx, or its body is not parseable JSON,
+        or is not a JSON array;
+      * `_MAX_PAGINATE_PAGES` is reached while a `rel="next"` link is still
+        present -- the safety cap firing at all means more data existed
+        than was fetched.
+
+    An `OSError`/`socket.timeout`/`ssl.SSLError` raised by `_send_once`
+    while fetching a later page is deliberately NOT caught here: it
+    propagates to `run_gh_command`'s own translation, exactly like a
+    first-page connection failure (module docstring: "NOT a fallback
+    trigger").
     """
     try:
         items = json.loads(first_body)
     except (json.JSONDecodeError, ValueError):
-        return first_body
+        raise _HttpTransportUnavailable("--paginate first page was not valid JSON") from None
     if not isinstance(items, list):
-        return first_body
+        raise _HttpTransportUnavailable("--paginate first page was a JSON object, not an array")
 
     all_items = list(items)
     page_headers = first_headers
     pages = 1
-    while pages < _MAX_PAGINATE_PAGES:
+    while True:
         next_url = _next_link(page_headers)
         if not next_url:
             break
+        if pages >= _MAX_PAGINATE_PAGES:
+            raise _HttpTransportUnavailable(
+                f"--paginate exceeded {_MAX_PAGINATE_PAGES} pages with a next link still present"
+            )
         next_path = _path_from_url(next_url)
         response = _send_once(state, repo_root, "GET", next_path, headers, None, timeout_seconds)
         if not (200 <= response.status < 300):
-            break
+            raise _HttpTransportUnavailable(
+                f"--paginate page {pages + 1} returned HTTP {response.status}"
+            )
         try:
             next_items = json.loads(response.body)
         except (json.JSONDecodeError, ValueError):
-            break
+            raise _HttpTransportUnavailable(
+                f"--paginate page {pages + 1} was not valid JSON"
+            ) from None
         if not isinstance(next_items, list):
-            break
+            raise _HttpTransportUnavailable(
+                f"--paginate page {pages + 1} was a JSON object, not an array"
+            )
         all_items.extend(next_items)
         page_headers = response.headers
         pages += 1

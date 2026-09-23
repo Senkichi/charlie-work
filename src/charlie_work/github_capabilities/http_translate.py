@@ -56,19 +56,129 @@ class HttpRequestPlan:
     paginate: bool
 
 
-def _rest_path(args: list[str]) -> str | None:
-    """Return the REST endpoint positional (`args[1]`) or None if absent/flag.
+@dataclass(frozen=True)
+class _RestArgs:
+    """The parsed shape of a REST-GET `gh api` call: the endpoint plus the
+    two flags this module understands how to translate."""
 
-    Every REST call site in this codebase places the endpoint immediately
-    after `"api"` (`["api", "rate_limit"]`, `["api", f"repos/{{owner}}/..."]`,
-    ...) -- there is no call shape here that puts a flag before the path.
+    path: str
+    headers: tuple[tuple[str, str], ...]
+    paginate: bool
+
+
+def _rest_path(args: list[str]) -> str | None:
+    """Return the REST endpoint -- the single non-flag positional after
+    `"api"` -- or `None` if the shape is not recognized.
+
+    The endpoint is NOT always `args[1]`: the only `--paginate` call site in
+    this codebase, `workflow._gh_api_list`, calls
+    `["api", "--paginate", path]`, which puts a flag before the path. This
+    walks the whole argv instead of assuming a fixed position, and returns
+    `None` (not a candidate) when there is no positional, more than one, or
+    any flag other than `--paginate`/`-H` -- see `_parse_rest_args`, which
+    this delegates to.
     """
-    if len(args) < 2:
+    parsed = _parse_rest_args(args)
+    return parsed.path if parsed is not None else None
+
+
+def _parse_rest_args(args: list[str]) -> _RestArgs | None:
+    """Parse the REST-GET argv (after `"api"`), returning `None` unless
+    every arg is the single endpoint positional, `--paginate`, or a
+    `-H <value>` / `-H<value>` header -- the only shapes every `gh api` GET
+    call site in this codebase uses.
+
+    Fails CLOSED on anything else: an unrecognized flag such as `--slurp`,
+    `-i`/`--include`, `-q`/`--jq`, `--template`/`-t`, `--method GET`,
+    `--hostname`, `--cache`, `-p`/`--preview`, or a second positional,
+    returns `None` rather than being silently ignored -- those shapes would
+    otherwise be served over HTTP with output that differs from `gh`'s own
+    (e.g. `--include` prepends response headers to stdout; `gh` never
+    reaches this translator at all for them since `is_http_candidate`
+    rejects the call up front).
+    """
+    path: str | None = None
+    headers: list[tuple[str, str]] = []
+    paginate = False
+    i = 1
+    while i < len(args):
+        arg = args[i]
+        if arg == "--paginate":
+            paginate = True
+            i += 1
+            continue
+        if arg == "-H":
+            if i + 1 >= len(args):
+                return None
+            header_text = args[i + 1]
+            i += 2
+        elif arg.startswith("-H") and len(arg) > 2:
+            header_text = arg[2:]
+            i += 1
+        elif arg.startswith("-"):
+            return None
+        else:
+            if path is not None:
+                return None
+            path = arg
+            i += 1
+            continue
+        if ":" in header_text:
+            name, _, value = header_text.partition(":")
+            headers.append((name.strip(), value.strip()))
+    if path is None:
         return None
-    path = args[1]
-    if path.startswith("-"):
-        return None
-    return path
+    return _RestArgs(path=path, headers=tuple(headers), paginate=paginate)
+
+
+_GRAPHQL_KNOWN_FIELDS = ("query", "owner", "name")
+
+
+def _graphql_field_name(field_arg: str) -> str | None:
+    if "=" in field_arg:
+        return field_arg.split("=", 1)[0]
+    return None
+
+
+def _graphql_args_are_recognized(args: list[str]) -> bool:
+    """True when every arg after `"api" "graphql"` is a `-f`/`--field`
+    field-value spelling for one of `query`/`owner`/`name` -- the only
+    fields `_build_graphql_plan` reads and the only ones
+    `Transport._graphql_query` (the sole `gh api graphql` call site in this
+    codebase) ever passes.
+
+    Mirrors `_graphql_field_value`'s own parsing (detached `-f`/
+    `--raw-field`/`-F`/`--field`, attached `-fname=value`, and
+    `--field=`/`--raw-field=`) but fails CLOSED: a header, `--jq`, an
+    unrecognized field name, or a malformed/missing value makes the whole
+    call not a candidate, rather than `_build_graphql_plan` silently
+    dropping the field it doesn't recognize.
+    """
+    i = 2
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-f", "--raw-field", "-F", "--field"):
+            if i + 1 >= len(args):
+                return False
+            field = _graphql_field_name(args[i + 1])
+            if field not in _GRAPHQL_KNOWN_FIELDS:
+                return False
+            i += 2
+            continue
+        if arg.startswith("-f") and len(arg) > 2:
+            field = _graphql_field_name(arg[2:].lstrip("="))
+            if field not in _GRAPHQL_KNOWN_FIELDS:
+                return False
+            i += 1
+            continue
+        if arg.startswith(("--field=", "--raw-field=")):
+            field = _graphql_field_name(arg.split("=", 1)[1])
+            if field not in _GRAPHQL_KNOWN_FIELDS:
+                return False
+            i += 1
+            continue
+        return False
+    return True
 
 
 def is_http_candidate(args: list[str]) -> bool:
@@ -76,18 +186,20 @@ def is_http_candidate(args: list[str]) -> bool:
     GraphQL-query `gh api` call this module can build an HTTP request for.
 
     Callers must not call `build_request_plan` unless this returns True.
+
+    Fails CLOSED, for both shapes: an arg this module does not specifically
+    recognize is never silently ignored (dropped) and served over HTTP with
+    output that could differ from `gh`'s own -- it makes the whole call not
+    a candidate, falling back to the real `gh` subprocess instead. See
+    `_parse_rest_args`/`_graphql_args_are_recognized` for the exact per-shape
+    rules.
     """
     if not args or args[0] != "api":
         return False
     if _api_is_mutating(args):
         return False
-    # --jq applies client-side jq filtering gh performs on the response
-    # before printing it; replicating that would mean vendoring jq
-    # semantics. Excluded -- falls back to gh.
-    if any(arg == "--jq" or arg.startswith("--jq=") for arg in args):
-        return False
     if _is_graphql_query(args):
-        return True
+        return _graphql_args_are_recognized(args)
     path = _rest_path(args)
     if path is None:
         return False
@@ -130,39 +242,27 @@ def _build_graphql_plan(args: list[str], owner: str, repo: str) -> HttpRequestPl
 
 
 def _build_rest_get_plan(args: list[str], owner: str, repo: str) -> HttpRequestPlan:
-    raw_path = _rest_path(args) or ""
-    substituted = raw_path.replace("{owner}", owner).replace("{repo}", repo)
+    """Build the REST-GET plan. `args` must already satisfy
+    `is_http_candidate` (guaranteed by `build_request_plan`'s contract), so
+    `_parse_rest_args` re-parsing it here cannot return `None` -- this reuses
+    that single parser instead of re-deriving the path/header/paginate scan a
+    second time, so a future shape change only needs to be taught to one
+    function.
+    """
+    parsed = _parse_rest_args(args)
+    if parsed is None:
+        raise ValueError(f"build_request_plan called with a non-candidate REST shape: {args!r}")
+
+    substituted = parsed.path.replace("{owner}", owner).replace("{repo}", repo)
     if not substituted.startswith("/"):
         substituted = "/" + substituted
-
-    headers: list[tuple[str, str]] = []
-    paginate = False
-    i = 2
-    while i < len(args):
-        arg = args[i]
-        if arg == "-H":
-            header_text = args[i + 1] if i + 1 < len(args) else ""
-            i += 2
-        elif arg.startswith("-H") and len(arg) > 2:
-            header_text = arg[2:]
-            i += 1
-        elif arg == "--paginate":
-            paginate = True
-            i += 1
-            continue
-        else:
-            i += 1
-            continue
-        if ":" in header_text:
-            name, _, value = header_text.partition(":")
-            headers.append((name.strip(), value.strip()))
 
     return HttpRequestPlan(
         method="GET",
         path=substituted,
-        headers=tuple(headers),
+        headers=parsed.headers,
         body=None,
-        paginate=paginate,
+        paginate=parsed.paginate,
     )
 
 

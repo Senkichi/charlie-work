@@ -171,10 +171,43 @@ def test_graphql_mutation_is_not_candidate():
         ["pr", "view", "1", "--json", "state"],
         ["pr", "merge", "1", "--squash"],
         ["api", "repos/{owner}/{repo}/issues", "--jq", ".[].number"],
+        # Issue #1834 review defect 1: unknown flags must fail CLOSED (not
+        # be silently dropped and served over HTTP with different output
+        # than gh's own).
+        ["api", "repos/{owner}/{repo}/issues", "--slurp"],
+        ["api", "repos/{owner}/{repo}/issues", "-i"],
+        ["api", "repos/{owner}/{repo}/issues", "--include"],
+        ["api", "repos/{owner}/{repo}/issues", "--template", "x"],
+        ["api", "repos/{owner}/{repo}/issues", "-t", "x"],
+        ["api", "repos/{owner}/{repo}/issues", "--method", "GET"],
+        ["api", "repos/{owner}/{repo}/issues", "--hostname", "example.com"],
+        ["api", "repos/{owner}/{repo}/issues", "--cache", "1h"],
+        ["api", "repos/{owner}/{repo}/issues", "-p", "1"],
+        ["api", "repos/{owner}/{repo}/issues", "--preview", "x"],
+        ["api", "-q", ".foo", "repos/{owner}/{repo}/issues"],
+        # A second positional (not a recognized flag's value) is also not a
+        # single unambiguous endpoint.
+        ["api", "repos/{owner}/{repo}/issues", "repos/{owner}/{repo}/pulls"],
+        # graphql-query shape, issue #1834 review defect 1 (fail-closed
+        # applies here too): only the query/owner/name -f fields
+        # `_build_graphql_plan` reads are recognized.
+        ["api", "graphql", "-f", "query=query { x }", "-H", "Accept: application/json"],
+        ["api", "graphql", "-f", "query=query { x }", "-f", "unknownfield=bar"],
+        ["api", "graphql", "-f", "query=query { x }", "--jq", ".data"],
     ],
 )
 def test_excluded_shapes_are_not_candidates(args):
     assert is_http_candidate(args) is False
+
+
+def test_paginate_before_path_is_candidate():
+    """Issue #1834 review defect 2: `workflow._gh_api_list` -- the only
+    `--paginate` call site in this codebase -- puts the flag before the
+    path (`["api", "--paginate", path]`). Before the fix, `_rest_path`
+    assumed `args[1]` was always the endpoint, so this exact production
+    shape was never a candidate and pagination was dead code.
+    """
+    assert is_http_candidate(["api", "--paginate", "repos/{owner}/{repo}/pulls"]) is True
 
 
 def test_build_request_plan_substitutes_owner_repo_and_headers():
@@ -198,6 +231,16 @@ def test_build_request_plan_detects_paginate_flag():
         ["api", "repos/{owner}/{repo}/issues", "--paginate"], "acme", "widgets"
     )
     assert plan.paginate is True
+
+
+def test_build_request_plan_detects_paginate_flag_before_path():
+    """Issue #1834 review defect 2: the real `--paginate` call shape
+    (`workflow._gh_api_list`) puts the flag before the path."""
+    plan = build_request_plan(
+        ["api", "--paginate", "repos/{owner}/{repo}/pulls"], "acme", "widgets"
+    )
+    assert plan.paginate is True
+    assert plan.path == "/repos/acme/widgets/pulls"
 
 
 def test_build_request_plan_graphql_body():
@@ -501,6 +544,145 @@ def test_paginate_follows_link_header_and_concatenates(monkeypatch, tmp_path: Pa
     assert result.returncode == 0
     assert json.loads(result.stdout) == [{"n": 1}, {"n": 2}]
     assert fake.requests[1][1] == "/repos/a/b/issues?page=2"
+
+
+def test_paginate_flag_before_path_paginates_across_two_pages(monkeypatch, tmp_path: Path):
+    """Issue #1834 review defect 2, end to end: the real `--paginate` call
+    shape (`workflow._gh_api_list`) is `["api", "--paginate", path]` -- flag
+    before the path. Before the fix this was never even a candidate (see
+    test_paginate_before_path_is_candidate), so pagination silently never
+    ran for it in production.
+    """
+    page1 = _FakeResponse(
+        200,
+        {"Link": '<https://api.github.com/repos/acme/widgets/pulls?page=2>; rel="next"'},
+        b'[{"n": 1}]',
+    )
+    page2 = _FakeResponse(200, {}, b'[{"n": 2}]')
+    result, fake = _run_http(
+        monkeypatch,
+        tmp_path,
+        args=["api", "--paginate", "repos/{owner}/{repo}/pulls"],
+        responses=[page1, page2],
+    )
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == [{"n": 1}, {"n": 2}]
+    assert fake.requests[0][1] == "/repos/acme/widgets/pulls"
+    assert fake.requests[1][1] == "/repos/acme/widgets/pulls?page=2"
+
+
+# ---------------------------------------------------------------------------
+# Partial pagination must fall back to gh, never return a truncated result
+# (issue #1834 review defect 3).
+# ---------------------------------------------------------------------------
+
+
+def _run_paginate_fallback(
+    monkeypatch, tmp_path: Path, responses: list, gh_stdout: str = "[]"
+) -> tuple[subprocess.CompletedProcess, list]:
+    _install_fake_connection(monkeypatch, responses)
+
+    def fake_gh_run(cmd, *args, **kwargs):
+        if cmd == ["gh", "auth", "token"]:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="gho_faketoken\n", stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=gh_stdout, stderr="")
+
+    monkeypatch.setattr(http_transport.subprocess, "run", fake_gh_run)
+
+    state = http_transport.build_http_transport_state()
+    runtime = RuntimeConfig(state_dir=str(tmp_path / ".var" / "charlie-work"))
+    result = http_transport.run_gh_command(
+        args=["api", "repos/{owner}/{repo}/issues", "--paginate"],
+        command=["gh", "api", "repos/{owner}/{repo}/issues", "--paginate"],
+        cwd=tmp_path,
+        timeout_seconds=30.0,
+        runtime=runtime,
+        transport_state=state,
+        resolve_owner_repo=_owner_repo,
+    )
+    events = query_events(_state_path(tmp_path), kind="github_transport_fallback")
+    return result, events
+
+
+def test_paginate_page_two_error_falls_back_to_gh_and_emits_event(monkeypatch, tmp_path: Path):
+    """A non-2xx later page must not be returned as a (silently partial)
+    success -- before the fix, a break here returned page 1's items alone
+    with returncode 0."""
+    page1 = _FakeResponse(
+        200,
+        {"Link": '<https://api.github.com/repos/a/b/issues?page=2>; rel="next"'},
+        b'[{"n": 1}]',
+    )
+    page2 = _FakeResponse(500, {}, b"Internal Server Error")
+    result, events = _run_paginate_fallback(
+        monkeypatch, tmp_path, [page1, page2], gh_stdout='[{"n": 1}, {"n": 2}]'
+    )
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == [{"n": 1}, {"n": 2}]
+    assert len(events) == 1
+    assert "page" in events[0]["payload"]["reason"].lower()
+
+
+def test_paginate_page_two_unparseable_json_falls_back(monkeypatch, tmp_path: Path):
+    page1 = _FakeResponse(
+        200,
+        {"Link": '<https://api.github.com/repos/a/b/issues?page=2>; rel="next"'},
+        b'[{"n": 1}]',
+    )
+    page2 = _FakeResponse(200, {}, b"not valid json")
+    result, events = _run_paginate_fallback(monkeypatch, tmp_path, [page1, page2])
+    assert result.returncode == 0
+    assert len(events) == 1
+    assert "page" in events[0]["payload"]["reason"].lower()
+
+
+def test_paginate_page_two_non_list_falls_back(monkeypatch, tmp_path: Path):
+    page1 = _FakeResponse(
+        200,
+        {"Link": '<https://api.github.com/repos/a/b/issues?page=2>; rel="next"'},
+        b'[{"n": 1}]',
+    )
+    page2 = _FakeResponse(200, {}, b'{"n": 2}')
+    result, events = _run_paginate_fallback(monkeypatch, tmp_path, [page1, page2])
+    assert result.returncode == 0
+    assert len(events) == 1
+    assert "page" in events[0]["payload"]["reason"].lower()
+
+
+def test_paginate_cap_reached_with_next_link_falls_back(monkeypatch, tmp_path: Path):
+    """Hitting `_MAX_PAGINATE_PAGES` while a `rel="next"` link is still
+    present means the result would have been truncated -- must fall back to
+    gh rather than silently returning the pages collected so far."""
+    monkeypatch.setattr(http_transport, "_MAX_PAGINATE_PAGES", 1)
+    page1 = _FakeResponse(
+        200,
+        {"Link": '<https://api.github.com/repos/a/b/issues?page=2>; rel="next"'},
+        b'[{"n": 1}]',
+    )
+    result, events = _run_paginate_fallback(monkeypatch, tmp_path, [page1])
+    assert result.returncode == 0
+    assert result.stdout == "[]"
+    assert len(events) == 1
+    assert "page" in events[0]["payload"]["reason"].lower()
+
+
+def test_paginate_object_first_page_falls_back(monkeypatch, tmp_path: Path):
+    """`gh --paginate` merges object-shaped pages by key; this module does
+    not replicate that, so an object first page must fall back to gh rather
+    than being returned as page 1 unmodified (which is a different, and
+    wrong, shape than gh's own merged-object output)."""
+    result, events = _run_paginate_fallback(
+        monkeypatch,
+        tmp_path,
+        [_FakeResponse(200, {}, b'{"total_count": 1}')],
+        gh_stdout='{"total_count": 1}',
+    )
+    assert result.returncode == 0
+    assert result.stdout == '{"total_count": 1}'
+    assert len(events) == 1
+    assert "object" in events[0]["payload"]["reason"].lower()
 
 
 def test_etag_cache_serves_body_on_304(monkeypatch, tmp_path: Path):
