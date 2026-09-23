@@ -90,10 +90,13 @@ from .supervise_loop import (
 )
 from .supervisor_lifecycle import (
     detect_prior_abnormal_exit,
+    detect_wedge_kill_loop,
     is_exit_alertable,
+    record_fleet_pass_completed,
     record_prior_abnormal_exit,
     record_supervisor_exit,
     record_supervisor_started,
+    record_wedge_kill_loop,
     supervisor_heartbeat_path,
     update_supervisor_heartbeat,
 )
@@ -1736,6 +1739,59 @@ def _prune_stale_registry_entries(
     return pruned
 
 
+def _touch_registry_last_seen(
+    fleet_json_path: Path,
+    touched_keys: list[str],
+    now: datetime.datetime,
+) -> None:
+    """Bump ``last_seen`` for every repo actually attempted this fleet pass.
+
+    Issue #1832: ``_select_repos`` orders an implicit (no explicit ``repos``)
+    pass by oldest ``last_seen`` first, but nothing previously bumped
+    ``last_seen`` after a fleet pass ran a repo's lane -- only the
+    single-repo CLI's ``fleet_registry.touch_repo`` did (cli.py), which a
+    fleet pass never calls. Without this, the ordering never changed pass to
+    pass: a repo whose lane runs to completion every time and a repo that
+    gets deferred every time would sort identically next pass, so a slow
+    repo that eats the whole in-pass deadline can starve the same later
+    repos every single pass. Bumping every attempted repo's ``last_seen`` to
+    "now" (including the slow one) means it sorts toward the back next pass,
+    while a deferred (never-attempted) repo keeps its old timestamp and
+    sorts toward the front -- rotation instead of static starvation.
+
+    Deliberately excludes stale entries (repo_root missing) and
+    deadline-deferred entries: a stale entry's ``last_seen`` drives issue
+    #1372's grace-period auto-prune, and bumping it here would mask a dead
+    registry entry as freshly active forever; a deferred entry was never
+    attempted, so touching it would defeat the rotation this function exists
+    to provide.
+
+    Atomic and best-effort, mirroring :func:`_prune_stale_registry_entries`:
+    the write happens under ``state_lock`` via ``save_state``'s temp-file +
+    ``replace()``, and a failure is logged (never raised) so a registry
+    write hiccup cannot fail the pass that already completed its lanes.
+    """
+    if not touched_keys:
+        return
+    stamp = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    try:
+        with state_lock(fleet_json_path):
+            data = _load_registry(fleet_json_path)
+            repos = data.get("repos", {})
+            changed = False
+            for key in touched_keys:
+                entry = repos.get(key)
+                if entry is None:
+                    continue
+                entry["last_seen"] = stamp
+                changed = True
+            if changed:
+                data["repos"] = repos
+                save_state(fleet_json_path, data)
+    except Exception:
+        logger.exception("Failed to bump fleet registry last_seen for touched repos")
+
+
 def fleet_loop(
     fleet_dir_override: str | None = None,
     global_config: Any = None,  # GlobalConfig from #159, but we don't have the type yet
@@ -1748,6 +1804,8 @@ def fleet_loop(
     ensure_labels: bool = False,
     drain: bool = False,
     now: datetime.datetime | None = None,
+    deadline_seconds: int | None = None,
+    pass_clock: Callable[[], float] = time.monotonic,
 ) -> CommandResult:
     """Run a fleet pass across all (or selected) registered repos.
 
@@ -1780,10 +1838,31 @@ def fleet_loop(
             ``datetime.now(UTC)`` when not supplied, so production behavior is
             byte-identical. Without it, the prune-after-grace test cannot
             control the cutoff deterministically.
+        deadline_seconds: Cooperative in-pass wall-clock budget (issue #1832).
+            When elapsed time since the pass started reaches this bound, the
+            pass stops starting new prologue steps/repo lanes and returns
+            cleanly with the remainder recorded under ``data["deferred"]``,
+            instead of running unboundedly until an external watchdog kills
+            the whole supervisor. ``None`` or <= 0 disables enforcement (the
+            pass always runs every prologue/repo, matching pre-#1832
+            behavior) -- the supervisor always passes its configured
+            ``SupervisorConfig.max_pass_runtime_seconds`` (nonzero by
+            default), so this only goes unenforced for direct/CLI callers
+            that do not pass it.
+        pass_clock: Injectable monotonic clock for the deadline check, so
+            tests can control elapsed time without a real sleep. Defaults to
+            ``time.monotonic``.
 
     Returns:
         A CommandResult with per-repo results and the consolidated digest.
     """
+    pass_started_at = pass_clock()
+
+    def _deadline_exceeded() -> bool:
+        if not deadline_seconds or deadline_seconds <= 0:
+            return False
+        return (pass_clock() - pass_started_at) >= deadline_seconds
+
     if now is None:
         now = datetime.datetime.now(datetime.UTC)
 
@@ -1826,19 +1905,61 @@ def fleet_loop(
     # into the daemon's own events.db — never into the dead entry's state_dir.
     stale_keys: list[str] = []
 
+    # Issue #1832: repos the in-pass deadline pushed out of this pass without
+    # even starting their lane. Excluded from per_repo_results (the lane
+    # genuinely never ran -- distinct from a "pass_skipped" stale entry) and
+    # from the last_seen rotation touch below, so they sort first next pass
+    # instead of a slow repo starving the same later repos every time.
+    deferred_repo_keys: list[str] = []
+    deferred_autoscale_prologue = False
+    # repo_keys whose lane actually reached the point of being attempted this
+    # pass (i.e. neither stale-skipped nor deadline-deferred). Bumped to "now"
+    # in the fleet registry after the pass so oldest-last_seen-first ordering
+    # rotates: an attempted repo (including the slow one that ate the
+    # deadline) sorts toward the back next pass, a deferred one keeps its old
+    # timestamp and sorts toward the front (issue #1832).
+    touched_repo_keys: list[str] = []
+
     # Run runner prologues if enabled (only for full loop, not work-only).
     # Allocation first: moving an idle slot to a starved repo is free, so it
     # runs before autoscale decides the host needs more runners registered.
     if not work_only:
+        allocation_lane_start = pass_clock()
         attention_events.extend(
             _run_fleet_allocation_prologue(fleet_dir_override, global_config, dry_run)
         )
-        autoscale_events = _run_fleet_autoscale_prologue(
-            fleet_dir_override, global_config, dry_run
+        logger.info(
+            "fleet pass lane elapsed: lane=allocation_prologue elapsed_seconds=%.1f",
+            pass_clock() - allocation_lane_start,
         )
-        attention_events.extend(autoscale_events)
+        if _deadline_exceeded():
+            # Cooperative cutoff (issue #1832): the allocation prologue alone
+            # already consumed the pass's whole budget. Skip starting the
+            # autoscale prologue and every repo lane below rather than
+            # running unboundedly until the external wedge-kill watchdog
+            # terminates the entire supervisor process.
+            deferred_autoscale_prologue = True
+        else:
+            autoscale_lane_start = pass_clock()
+            autoscale_events = _run_fleet_autoscale_prologue(
+                fleet_dir_override, global_config, dry_run
+            )
+            attention_events.extend(autoscale_events)
+            logger.info(
+                "fleet pass lane elapsed: lane=autoscale_prologue elapsed_seconds=%.1f",
+                pass_clock() - autoscale_lane_start,
+            )
 
     for repo_key, entry in selected:
+        if _deadline_exceeded():
+            # Issue #1832: stop starting new repo lanes once the pass is over
+            # its cooperative budget. The remaining repos are deferred (not
+            # failed) -- they sort first next pass via the last_seen rotation
+            # below instead of never getting a turn behind a slow repo.
+            deferred_repo_keys.append(repo_key)
+            continue
+
+        repo_lane_start = pass_clock()
         # Default to "" rather than None: a registry entry missing repo_root
         # entirely would make Path(None) raise, where the is_dir() check below
         # already has the right answer for a bad path.
@@ -1872,8 +1993,14 @@ def fleet_loop(
                 )
             except Exception:
                 logger.debug("Failed to record fleet_registry_stale_entry for %s", repo_key)
+            logger.info(
+                "fleet pass lane elapsed: lane=%s elapsed_seconds=%.1f",
+                repo_key,
+                pass_clock() - repo_lane_start,
+            )
             continue
 
+        touched_repo_keys.append(repo_key)
         try:
             # Load per-repo config through the global fleet layer so a fleet-wide
             # default (e.g. fleet.global_max_concurrent_sessions, watchdog knobs)
@@ -2011,6 +2138,18 @@ def fleet_loop(
                 {"repo_key": repo_key, "type": "error", "error": error_message}
             )
             _record_lane_failure_event(repo_root, repo_key, entry, error_message)
+        finally:
+            # Issue #1832: logged on every path that actually attempted this
+            # repo's lane -- success, the non-fatal ok=False branch, the
+            # supervisor-lock-held skip (its `continue` still runs this
+            # `finally`), and the exception branch above. Not logged for a
+            # stale entry or a deadline-deferred repo -- those never started
+            # a lane and have their own (or no) elapsed line.
+            logger.info(
+                "fleet pass lane elapsed: lane=%s elapsed_seconds=%.1f",
+                repo_key,
+                pass_clock() - repo_lane_start,
+            )
 
     # Issue #1372: prune stale registry entries past their grace period. The
     # grace_days knob is read from the global config's runtime section (the
@@ -2043,6 +2182,32 @@ def fleet_loop(
                     "Failed to record fleet_registry_stale_entry prune for %s",
                     pruned_key,
                 )
+
+    # Issue #1832: bump last_seen for every repo actually attempted this pass
+    # so oldest-last_seen-first ordering rotates instead of staying static --
+    # a deferred repo's last_seen is left untouched, so it sorts first next
+    # pass (see _touch_registry_last_seen).
+    _touch_registry_last_seen(fleet_json_path, touched_repo_keys, now)
+
+    # Issue #1832: the pass hit its cooperative deadline and pushed work to
+    # the next pass instead of running unboundedly until an external watchdog
+    # kills the whole supervisor. One summary event per pass (not one per
+    # deferred item) keeps volume low; the deferred repo keys themselves are
+    # also in the returned CommandResult's ``deferred`` field.
+    if deferred_repo_keys or deferred_autoscale_prologue:
+        try:
+            log_event(
+                fleet_state_path,
+                "fleet_pass_deadline_deferred",
+                {
+                    "deadline_seconds": deadline_seconds,
+                    "elapsed_seconds": pass_clock() - pass_started_at,
+                    "deferred_repo_keys": deferred_repo_keys,
+                    "deferred_autoscale_prologue": deferred_autoscale_prologue,
+                },
+            )
+        except Exception:
+            logger.debug("Failed to record fleet_pass_deadline_deferred event")
 
     # Issue #1078: record per-repo lane liveness to the fleet-level events.db
     # so an operator can observe every repo's last lane completion from one
@@ -2148,6 +2313,8 @@ def fleet_loop(
             "digest": digest,
             "stale": stale_keys,
             "pruned": pruned_keys,
+            "deferred": deferred_repo_keys,
+            "deferred_autoscale_prologue": deferred_autoscale_prologue,
             "api_worker_report": api_worker_report.to_dict()
             if api_worker_report is not None
             else None,
@@ -2708,6 +2875,41 @@ def run_fleet_supervise(
                 persistent=False,
             )
 
+    # Issue #1832: detect a supervisor stuck relaunching into repeated
+    # wedge-kills with no completed pass recovering in between -- the
+    # wedge-kill backstop (issue #728) is itself looping instead of the
+    # relaunch converging on a healthy supervisor. Checked once at startup,
+    # same as the abnormal-exit detection above, since each wedge-kill is
+    # exactly what produces a fresh supervisor start here.
+    wedge_loop = detect_wedge_kill_loop(fleet_dir_override, threshold=cfg.wedge_kill_loop_alarm)
+    if wedge_loop is not None:
+        record_wedge_kill_loop(fleet_dir_override, wedge_loop)
+        print(
+            f"[{datetime.datetime.now().strftime('%H:%M:%S')}] supervisor: "
+            f"{wedge_loop['count']} consecutive wedge-kills with no completed "
+            f"pass in between (threshold={wedge_loop['threshold']}); recorded "
+            f"supervisor_wedge_loop",
+            flush=True,
+        )
+        if notify_config is not None and getattr(notify_config, "enabled", False):
+            _emit_fleet_transition(
+                notify_config,
+                AttentionEntry(
+                    issue_number=-1,
+                    adapter_kind="fleet-supervisor",
+                    health="ERROR",
+                    previous_health=None,
+                    last_log_line=(
+                        f"{wedge_loop['count']} consecutive wedge-kills with no "
+                        f"completed pass in between "
+                        f"(threshold={wedge_loop['threshold']})"
+                    ),
+                    pid=None,
+                ),
+                fleet_dir_override,
+                persistent=False,
+            )
+
     started_at_iso = utc_now()
     record_supervisor_started(
         fleet_dir_override,
@@ -2715,6 +2917,7 @@ def run_fleet_supervise(
         started_at=started_at_iso,
         full_pass_interval_seconds=full_pass_interval,
         max_pass_runtime_seconds=cfg.max_pass_runtime_seconds,
+        wedge_kill_loop_alarm=cfg.wedge_kill_loop_alarm,
     )
 
     # Record where ci_fleet was actually imported from plus the sibling
@@ -2962,8 +3165,24 @@ def run_fleet_supervise(
                 # Issue #1716: a drain pass still runs reap/verdict/review/
                 # merge lanes but dispatches nothing new.
                 drain=drain_state.draining,
+                # Issue #1832: cooperative in-pass deadline, enforced from the
+                # same SupervisorConfig field the external wedge-kill
+                # watchdog's stale bound derives from (3x this), and the same
+                # injectable monotonic clock already used for this loop's own
+                # max_runtime check -- so a deadline test can control both
+                # without a real sleep.
+                deadline_seconds=cfg.max_pass_runtime_seconds,
+                pass_clock=clock,
             )
             labels_ensure_pending = False
+            # Issue #1832: the wedge-loop detector's reset signal -- this pass
+            # returned at all (success, business failure, or a deadline-
+            # deferred partial all count), so it was not wedged.
+            record_fleet_pass_completed(
+                fleet_dir_override,
+                pass_number=pass_number,
+                outcome="ok" if pass_result.ok else "failed",
+            )
 
             data = pass_result.data
             repos_data = data.get("repos", {}) if isinstance(data, dict) else {}
