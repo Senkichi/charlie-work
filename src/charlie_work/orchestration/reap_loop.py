@@ -33,6 +33,7 @@ import charlie_work.workflow as _wf
 from charlie_work.dead_worker_reap import _detect_stalled_sessions
 from charlie_work.escalation import _escalation_flags
 from charlie_work.github import (
+    GitHub,
     GitHubError,
     GitHubNotFoundError,
     is_transient_repo_resolution_failure,
@@ -53,6 +54,16 @@ def _loop_body(
     # restarts (observed live: intake frozen at a stale issue set for the
     # daemon's entire lifetime).
     self.gh.invalidate_list_cache()
+    # Issue #1833: the gh circuit breaker is per-instance state, same
+    # lifetime problem as the list cache above -- a long-running supervisor
+    # reuses one GitHub instance across many passes, so a breaker tripped by
+    # one pass's network blip must not permanently fail-fast every later
+    # pass. Kept off the GitHubLike protocol surface (mirrors
+    # validate_field_lists()'s precedent just below in OrchestratorApp
+    # construction) so adding it costs zero edits to every FakeGitHub test
+    # double.
+    if isinstance(self.gh, GitHub):
+        self.gh.reset_circuit_breaker()
     sessions_dir = self._layout.sessions_dir
     # Issue #646: the worker census now logs from inside dispatch() itself
     # (the one chokepoint every dispatch path funnels through, including
@@ -304,6 +315,11 @@ def _loop_body(
     # per-PR call site at the point of `continue` below could abort every
     # other PR's review/merge work in the same pass on lock contention.
     unlinked_pr_entries: list[tuple[dict[str, Any], int]] = []
+    # Issue #1781: the complement of unlinked_pr_entries -- every PR that DID
+    # resolve an issue number this pass, mapped to that issue number --
+    # so `_record_unlinked_pr_skips` can evict standing `unlinked_pr_notice`
+    # markers whose PR is no longer issue-less (the falling edge).
+    linked_prs: dict[int, int] = {}
     for pr in prs:
         issue_number = _wf.linked_issue_number(
             pr,
@@ -322,6 +338,7 @@ def _loop_body(
             unlinked_pr_entries.append((pr, int(pr["number"])))
             continue
         pr_number = int(pr["number"])
+        linked_prs[pr_number] = issue_number
         parked = (state_snapshot["prs"].get(str(pr_number)) or {}).get("foreign_issue_ref") or {}
         if parked.get("issue") == issue_number:
             # Issue #1132: a marker is only "confirmed" (skip all per-PR
@@ -638,8 +655,10 @@ def _loop_body(
     # Issue #1766: recorded once for the whole batch, after every PR above
     # has already had its real review/merge work attempted -- see
     # `_record_unlinked_pr_skips`'s docstring for why a per-PR call site
-    # ahead of this loop could abort that work on lock contention.
-    self._record_unlinked_pr_skips(unlinked_pr_entries, now=loop_now)
+    # ahead of this loop could abort that work on lock contention. The
+    # `linked_prs` complement (issue #1781) lets the same call evict stale
+    # `unlinked_pr_notice` markers for PRs that resolved an issue this pass.
+    self._record_unlinked_pr_skips(unlinked_pr_entries, now=loop_now, linked_prs=linked_prs)
     warnings: list[str] = []
     merge_alert_transitions: dict[int, dict[str, Any]] = {}
     for merge_entry in merges:

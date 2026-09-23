@@ -31,7 +31,7 @@ from _fakes_github import FakeGitHub
 def _counting_run(counter: dict[str, int]):
     """A GitHub.run replacement that counts calls per gh subcommand."""
 
-    def run(self, args, *, json_output=False, allow_failure=False):
+    def run(self, args, *, json_output=False, allow_failure=False, long_call=False):
         counter[args[0]] = counter.get(args[0], 0) + 1
         return [] if json_output else ""
 

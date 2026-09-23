@@ -229,6 +229,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # no fleet work and every surface reported green -- the kill is the
         # recovery, and the event is the only record that it happened.
         "supervisor_wedged_killed": "error",
+        # Fires once, the pass a run of consecutive supervisor_wedged_killed
+        # events (with no fleet_pass_completed in between) reaches the
+        # configured alarm threshold -- the wedge-kill backstop is itself
+        # looping instead of recovering (issue #1832). Error: every prior
+        # wedge-kill was silently "handled" by a relaunch, so this is the
+        # only signal that the loop isn't converging.
+        "supervisor_wedge_loop": "error",
         "supervisor_zero_pass_alarm": "error",
         "unauthorized_merge_detected": "error",
         # The supervisor's startup guard found an editable .pth in the running
@@ -294,6 +301,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "draft_pr_blocked": "warning",
         "draft_pr_ready_failed": "warning",
         "draft_pr_ready_held": "warning",
+        # Issue #1832: a fleet pass hit its cooperative in-pass deadline
+        # (max_pass_runtime_seconds) and deferred one or more repos/prologue
+        # steps to the next pass instead of running them. Warning, not error:
+        # the pass still ends cleanly and returns a CommandResult -- nothing
+        # crashed, work was rescheduled.
+        "fleet_pass_deadline_deferred": "warning",
         # Issue #1372: a fleet registry entry whose repo_root no longer exists
         # is stale, not a live failing lane. Warning, not error: the lane is
         # skipped (not crashed), the daemon's pass completes, and the entry is
@@ -302,6 +315,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # recorded state_dir (which would resurrect a zombie directory).
         "fleet_registry_stale_entry": "warning",
         "flake_rerun_failed": "warning",
+        # Issue #1833: the per-pass gh circuit breaker tripped after N
+        # consecutive transport-class failures (connect/handshake/DNS/hang).
+        # Warning, not error: the lane is not escalated -- calls this pass
+        # fail fast as values until the cooldown elapses, and a fresh pass
+        # resets the breaker -- but a live fleet tripping this repeatedly
+        # means the network path to GitHub itself needs attention.
+        "github_circuit_opened": "warning",
         "graphql_rate_limit_deferred": "warning",
         "infra_rerun_failed": "warning",
         "janitor_rework_stalled": "warning",
@@ -317,6 +337,15 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # routinely dominate warning volume, which this signal is designed
         # not to do.
         "operator_queue_impact": "warning",
+        # Issue #1505: the outbound body-write guard refused a
+        # ``pr_create``/``issue_comment``/``pr_comment`` because the text
+        # matched a vendored gitleaks credential rule. Warning, not error:
+        # the write was refused *before* submission, so nothing leaked -- but
+        # the payload is (by construction) a live credential somewhere in the
+        # pipeline that produced it, and the operator must learn that rotation
+        # is needed. Deliberately unbucketed: rare, and each refusal needs the
+        # flat detailed listing in heartbeat's warning report.
+        "outbound_body_secret_refused": "warning",
         # cw#1263: the orchestrator's own salvage-PR-body builders had to
         # rewrite the ``Closes #N`` line before handing the body to
         # ``gh pr create``. Warning, not error: the rewrite happens before
@@ -530,6 +559,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "fleet_canary": "info",
         "fleet_job_observations": "info",
         "fleet_lane_completed": "info",
+        # Issue #1832: a whole `fleet_loop()` pass returned -- success,
+        # business failure, or partial (deadline-deferred). Any of these
+        # means the pass was NOT wedged, so this is the reset signal the
+        # wedge-loop detector (detect_wedge_kill_loop) measures
+        # supervisor_wedged_killed streaks against.
+        "fleet_pass_completed": "info",
         # Issue #1773: a network-touching `git` call (fetch, ff-only pull)
         # needed `git_retry.run_git_with_retry` to recover from a transient
         # TLS/connection blip. Info, not warning: this is the retry
@@ -540,6 +575,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # attempt) by `RetryOutcome`'s own contract; the `ok` payload field
         # distinguishes "recovered" from "exhausted" without a second kind.
         "git_network_retry": "info",
+        # Issue #1833: the per-pass gh circuit breaker recovered -- a
+        # half-open probe call succeeded (or a normal call succeeded while
+        # closed after a tripped-but-not-yet-probed state), closing the
+        # breaker. Info: this is recovery, the healthy end state, not a
+        # notable condition in itself (the trip that preceded it already
+        # emitted github_circuit_opened at warning level).
+        "github_circuit_closed": "info",
         "head_moved": "info",
         "infra_rerun_triggered": "info",
         "intake": "info",
@@ -632,6 +674,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # failure. Emitted by both salvage lanes through the shared
         # ``salvage_superseded.salvage_skip_event_kind`` mapping.
         "salvage_skipped_superseded": "info",
+        # Issue #1781: a PR that carried an ``unlinked_pr_notice`` marker
+        # resolved a linked issue on a later pass, so the marker was evicted
+        # -- the falling edge of the warning-level ``pr_unlinked_skipped``
+        # rising-edge detector. Info, not warning: this is the self-heal
+        # completing (the operator who saw the warning can see it resolved),
+        # sibling to ``foreign_issue_ref_cleared``.
+        "pr_unlinked_resolved": "info",
         "quota_probe_succeeded": "info",
         "readiness_no_ci_rework_requested": "info",
         "reconcile": "info",
