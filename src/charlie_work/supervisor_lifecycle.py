@@ -41,7 +41,8 @@ from pathlib import Path
 from typing import Any
 
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
-from .instrumentation import log_event
+from .instrumentation import log_event, query_events
+from .wedge_watchdog import WEDGE_KILL_EVENT_KIND
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,14 @@ HEARTBEAT_FILENAME = "supervisor-heartbeat.json"
 # attention digest on abnormal exits.
 SUPERVISOR_STARTED = "supervisor_started"
 SUPERVISOR_EXITED = "supervisor_exited"
+#: A whole ``fleet_loop()`` pass returned (success, business failure, or
+#: deadline-deferred partial). The wedge-loop detector's reset signal --
+#: see :func:`detect_wedge_kill_loop` (issue #1832).
+FLEET_PASS_COMPLETED = "fleet_pass_completed"
+#: N consecutive ``WEDGE_KILL_EVENT_KIND`` events with no
+#: ``FLEET_PASS_COMPLETED`` in between -- the wedge-kill backstop is
+#: looping instead of recovering (issue #1832).
+SUPERVISOR_WEDGE_LOOP = "supervisor_wedge_loop"
 
 #: ``repo`` field stamped on fleet-level supervisor events. Matches the
 #: ``repo="fleet"`` used by the fleet attention digest.
@@ -178,6 +187,7 @@ def record_supervisor_started(
     started_at: str,
     full_pass_interval_seconds: int,
     max_pass_runtime_seconds: int | None = None,
+    wedge_kill_loop_alarm: int | None = None,
 ) -> None:
     """Emit ``supervisor_started`` and write a fresh heartbeat.
 
@@ -186,6 +196,11 @@ def record_supervisor_started(
     released on process death), so a stale heartbeat with no
     ``exited_at`` here means the prior supervisor was killed, not that
     it is still running.
+
+    ``wedge_kill_loop_alarm`` is stamped into the heartbeat (not just
+    logged) so ``scripts/heartbeat_check.py`` — which deliberately never
+    imports ``charlie_work.config`` — can read the configured threshold
+    without hardcoding a duplicate default (issue #1832).
     """
     if max_pass_runtime_seconds is None:
         max_pass_runtime_seconds = full_pass_interval_seconds
@@ -197,6 +212,7 @@ def record_supervisor_started(
         "pass_number": 0,
         "full_pass_interval_seconds": full_pass_interval_seconds,
         "max_pass_runtime_seconds": max_pass_runtime_seconds,
+        "wedge_kill_loop_alarm": wedge_kill_loop_alarm,
         "exited_at": None,
         "exit_code": None,
     }
@@ -216,6 +232,7 @@ def record_supervisor_started(
                 "started_at": started_at,
                 "full_pass_interval_seconds": full_pass_interval_seconds,
                 "max_pass_runtime_seconds": max_pass_runtime_seconds,
+                "wedge_kill_loop_alarm": wedge_kill_loop_alarm,
             },
             repo=_FLEET_REPO,
         )
@@ -382,3 +399,124 @@ def is_exit_alertable(exit_code: int | None) -> bool:
     routine restart must not page, a real kill must.
     """
     return exit_code != 0
+
+
+def record_fleet_pass_completed(
+    fleet_dir_override: str | None,
+    *,
+    pass_number: int,
+    outcome: str,
+) -> None:
+    """Emit ``fleet_pass_completed`` -- the wedge-loop detector's reset signal.
+
+    Called unconditionally whenever ``fleet_loop()`` returns, regardless
+    of whether the pass succeeded outright, hit a business failure, or
+    was partially deferred by the in-pass deadline -- all three mean the
+    pass was NOT wedged (issue #1832), which is the only thing
+    :func:`detect_wedge_kill_loop` needs from it. Best-effort: a logging
+    failure is swallowed so instrumentation never breaks the supervisor
+    loop.
+    """
+    path = supervisor_heartbeat_path(fleet_dir_override)
+    try:
+        # write-gate-exempt(issue=1832): standalone bookkeeping predates the WriteGate wave
+        log_event(
+            path,
+            FLEET_PASS_COMPLETED,
+            {"pass_number": pass_number, "outcome": outcome},
+            repo=_FLEET_REPO,
+        )
+    except OSError as exc:
+        logger.warning("Failed to log fleet_pass_completed event for %s: %s", path, exc)
+
+
+#: How many of the most recent fleet-level events :func:`detect_wedge_kill_loop`
+#: reads before giving up on finding a FLEET_PASS_COMPLETED boundary. Cheap to
+#: raise (one bounded SQLite query); 500 comfortably covers a many-repo fleet's
+#: per-pass fleet_lane_completed volume between two wedge-kills in practice.
+_WEDGE_LOOP_DETECTION_LOOKBACK = 500
+
+
+def detect_wedge_kill_loop(
+    fleet_dir_override: str | None,
+    *,
+    threshold: int,
+    lookback: int = _WEDGE_LOOP_DETECTION_LOOKBACK,
+) -> dict[str, Any] | None:
+    """Detect a run of wedge-kills with no completed pass recovering in between.
+
+    Walks the most recent ``lookback`` fleet-level events newest-first,
+    counting consecutive :data:`wedge_watchdog.WEDGE_KILL_EVENT_KIND` events
+    until either a :data:`FLEET_PASS_COMPLETED` event (the boundary -- a pass
+    recovered) or the window is exhausted. Returns a detection payload
+    exactly when that count equals ``threshold`` -- not on every kill past
+    it -- mirroring the ``self_deploy_failure_alarm`` / ``zero_pass_alarm``
+    "fires once, at the pass the streak reaches the cap" precedent so a
+    stuck wedge loop does not spam the attention digest once per kill.
+    ``threshold <= 0`` disables the check unconditionally (the same
+    "0 disables" convention as the other supervisor alarms).
+
+    Deliberately walks ``query_events``' id-ordered result set rather than
+    filtering by a ``ts``-based ``since`` boundary: ``log_event``'s
+    timestamps are 1-second resolution (``_now_iso``), so a kill and the
+    fresh child's own startup events -- routinely written in the same
+    wall-clock second, and near-guaranteed in a fast test -- would be
+    indistinguishable by a ``ts >= /  <= `` comparison. Walking in id order
+    (which ``query_events`` already guarantees) sidesteps that: ties in
+    ``ts`` are still correctly ordered by insertion.
+
+    Stateless by design: a kill is recorded by the supervise-loop WRAPPER
+    process's ``WedgeWatchdog`` thread, and a completed pass is recorded by
+    the supervisor CHILD process -- two different processes. Querying
+    events.db fresh each time avoids a persisted streak counter whose
+    increment/reset bookkeeping would need to stay correct across both
+    writers (issue #1832).
+    """
+    if threshold <= 0:
+        return None
+    path = supervisor_heartbeat_path(fleet_dir_override)
+    recent = query_events(path, limit=lookback)
+    count = 0
+    since: str | None = None
+    first_kill_at: str | None = None
+    last_kill_at: str | None = None
+    for event in reversed(recent):
+        kind = event.get("kind")
+        if kind == FLEET_PASS_COMPLETED:
+            since = event.get("ts")
+            break
+        if kind == WEDGE_KILL_EVENT_KIND:
+            count += 1
+            if last_kill_at is None:
+                last_kill_at = event.get("ts")
+            first_kill_at = event.get("ts")
+    if count != threshold:
+        return None
+    return {
+        "count": count,
+        "threshold": threshold,
+        "since_pass_completed_at": since,
+        "first_kill_at": first_kill_at,
+        "last_kill_at": last_kill_at,
+    }
+
+
+def record_wedge_kill_loop(
+    fleet_dir_override: str | None,
+    detection: dict[str, Any],
+) -> dict[str, Any]:
+    """Emit ``supervisor_wedge_loop`` for a detected wedge-kill loop.
+
+    Called once, the pass the streak reaches the configured threshold
+    (see :func:`detect_wedge_kill_loop`). Returns the payload so the
+    caller can also route it to the attention digest.
+    """
+    payload = dict(detection)
+    # write-gate-exempt(issue=1832): standalone bookkeeping predates the WriteGate wave
+    log_event(
+        supervisor_heartbeat_path(fleet_dir_override),
+        SUPERVISOR_WEDGE_LOOP,
+        payload,
+        repo=_FLEET_REPO,
+    )
+    return payload

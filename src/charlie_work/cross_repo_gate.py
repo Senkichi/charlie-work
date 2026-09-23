@@ -673,30 +673,23 @@ def _is_launcher_owned_path(candidate: str) -> bool:
 def _path_exists_in_repo(path_str: str, repo_root: Path) -> bool:
     """Return ``True`` when ``path_str`` resolves to an existing file inside ``repo_root``.
 
-    Uses :func:`_is_absolute_path` (not ``Path.is_absolute()``) so a
-    POSIX-style absolute candidate (no drive letter) is still recognized
-    as absolute on Windows — the one place in this module that branched on
-    the raw, platform-dependent check (issue #1791). Left as
-    ``is_absolute()``, such a candidate falls into the "relative" branch
-    and is joined onto ``repo_root``, which collapses to the drive root
-    plus the candidate's tail (``Path("C:/repo") / Path("/home/x.py") ==
-    Path("C:/home/x.py")``) — an existence check against a foreign
-    location with no containment check at all. Now matches
-    :func:`_resolve_within_root` and :func:`_is_confirmed_foreign_absolute_path`.
+    Containment runs before the existence check on *both* branches, via
+    :func:`_resolve_within_root` (``safe_path.contains`` resolves both
+    sides): a relative candidate carrying a ``..`` segment can walk outside
+    ``repo_root`` entirely, and a bare ``(repo_root / path).exists()`` would
+    report a coincidental file at that escaped location as "in the target
+    repo" (issue #1772). Routing the absolute branch through the same helper
+    also recognizes POSIX-style absolute candidates that
+    ``Path.is_absolute()`` misclassifies as relative on Windows — those were
+    previously joined onto ``repo_root`` (collapsing to the drive root) and
+    existence-checked without any containment check at all.
     """
-    path = Path(path_str)
-    if _is_absolute_path(path_str):
-        try:
-            if not path.exists():
-                return False
-            return contains(repo_root, path)
-        except (OSError, ValueError):
-            return False
-    # Relative path: resolve against the repo root.
-    resolved = repo_root / path
+    resolved = _resolve_within_root(repo_root, path_str)
+    if resolved is None:
+        return False
     try:
         return resolved.exists()
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
