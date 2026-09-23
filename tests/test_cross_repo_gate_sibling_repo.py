@@ -23,7 +23,9 @@ from charlie_work.cross_repo_gate import cross_repo_gate
 def _git(repo: Path, *args: str) -> None:
     """Run a git command in *repo*, raising on failure."""
     subprocess.run(
-        ["git", *args],
+        # core.longpaths: pytest's tmp_path can nest deep enough on Windows
+        # (agent-worktree .var dirs) to exceed MAX_PATH on object writes.
+        ["git", "-c", "core.longpaths=true", *args],
         cwd=str(repo),
         check=True,
         capture_output=True,
