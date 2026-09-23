@@ -769,6 +769,50 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
         ),
         in_predicate=False,
     ),
+    # Issue #1505: outer defense-in-depth around
+    # `self._maybe_report_outbound_secret_refusals()`, added inside
+    # `_loop_impl` immediately alongside the `operator_queue_impact_check_failed`
+    # sibling directly above -- same function, same reasoning. Routing it
+    # through `self.write_gate.log_event(...)` would flip `_loop_impl` into
+    # R9's in-predicate exclusive-use bucket, flagging every other raw
+    # telemetry site in that function as violations -- an out-of-scope
+    # conversion of a function this wave never targets. `in_predicate=False`
+    # matches the real scan.
+    _RawPrimitiveSite(
+        path="orchestration/instrumentation_ops.py",
+        scope="_loop_impl",
+        primitive="log_event",
+        call_source=(
+            "log_event(self.paths.state_file, "
+            "'outbound_secret_refusal_report_failed', "
+            "{'error': f'{type(exc).__name__}: {exc}'}, "
+            "repo=self.repo_root.name, correlation_id=cid, level='warning')"
+        ),
+        in_predicate=False,
+    ),
+    # Issue #1505: `outbound_body_guard.check_outbound_write` is the shared
+    # chokepoint the GitHub write surfaces (`pr_create`, `issue_comment`,
+    # `pr_comment` on both the gh-backed client and the local-file backend)
+    # call before any body text leaves the process. The refusal event it
+    # emits is exactly the case `instrumentation.log_event`'s own docstring
+    # prescribes: "for events outside state-lock contexts ... call
+    # log_event() directly" -- the GitHub client layer has no WriteGate
+    # (WriteGate is an OrchestratorApp-owned serialization object, and the
+    # client is deliberately constructible without one: tests and
+    # `github_client_for` build it bare), and the write runs outside any
+    # state-lock context by construction. Threading a WriteGate through the
+    # GitHubLike surface to gate this one telemetry call would be an
+    # out-of-scope refactor of the client's construction contract.
+    # `in_predicate=False` matches the real scan: `check_outbound_write`
+    # makes no `self.write_gate.*`/`write_gate.*` call and takes no
+    # `write_gate` parameter.
+    _RawPrimitiveSite(
+        path="outbound_body_guard.py",
+        scope="check_outbound_write",
+        primitive="log_event",
+        call_source=("log_event(state_path, REFUSAL_EVENT_KIND, payload, repo=repo_root.name)"),
+        in_predicate=False,
+    ),
     # Issue #1374 AC3: `emit_preflight_refusal` (preflight.py) is the
     # best-effort refusal emitter for FATAL preflight failures (disk full,
     # clock skew, venv drift). Its documented contract is "must never

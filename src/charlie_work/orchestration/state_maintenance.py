@@ -12,6 +12,11 @@ from typing import Any
 
 import charlie_work.workflow as _wf
 
+# Issue #1505: single source for the refusal kind shared by the emitter
+# (``outbound_body_guard.check_outbound_write``) and this consumer -- the
+# module imports only ``layout`` at top level, so this adds no cycle.
+from ..outbound_body_guard import REFUSAL_EVENT_KIND
+
 # Cap on the blocked-ready issue-number list carried in the ring-resident
 # ``operator_queue_impact`` event payload and the fire-path digest payload
 # (issue #1768 review finding 9), mirroring ``summarize_loop_errors``'s
@@ -903,3 +908,93 @@ def _mark_foreign_issue_ref(self, pr_number: int, issue_number: int, reason: str
         }
         _wf.save_state(self.paths.state_file, state)
     return emit
+
+
+def _maybe_report_outbound_secret_refusals(self) -> None:
+    """Surface new ``outbound_body_secret_refused`` events via the digest.
+
+    Issue #1505: the API-boundary guard in ``outbound_body_guard`` refuses
+    the write and records the event, but a warning row in ``events.db``
+    nobody reads is a silent guard -- this delegate is the consumer the
+    issue's signal-without-consumer check asks for. It diffs the full event
+    list against a persisted surfacing cursor
+    (``state["outbound_secret_refusals_surfaced"]``, a row count) and emits
+    one ``AttentionDigest`` entry per pass in which *new* refusals appeared
+    -- edge-triggered on the event log itself, so a recurring refusal is
+    re-reported each pass it recurs (each recurrence is a fresh, actionable
+    attempt) while an already-seen backlog is never re-announced.
+
+    A count marker rather than a timestamp: ``log_event``'s ``_now_iso``
+    truncates to whole seconds, and two refusals in one second would make a
+    timestamp cursor ambiguous. Caveats, both deliberate: if ``events.db``
+    is rebuilt empty while ``state.json`` survives, the cursor suppresses
+    digest emission until the row count climbs back past it (the warning
+    events themselves still list in heartbeat either way); and a refusal
+    that arrives while ``notify.enabled`` is false still advances the
+    cursor -- "surfaced" means consumed by this pass, matching the
+    operator-queue-impact sibling's semantics.
+    """
+    if self.dry_run:
+        return
+    state_file = self.paths.state_file
+    events = _wf.query_events(state_file, kind=REFUSAL_EVENT_KIND)
+    if not events:
+        return
+    with _wf.state_lock(state_file):
+        state = _wf.load_state(state_file)
+        try:
+            surfaced = int(state.get("outbound_secret_refusals_surfaced") or 0)
+        except (TypeError, ValueError):
+            surfaced = 0
+        if surfaced >= len(events):
+            return
+        new_events = events[surfaced:]
+
+        surfaces = sorted(
+            {str((e.get("payload") or {}).get("surface")) for e in new_events} - {"None"}
+        )
+        rule_ids = sorted(
+            {rid for e in new_events for rid in ((e.get("payload") or {}).get("rule_ids") or [])}
+        )
+        refs = sorted(
+            {
+                int(n)
+                for e in new_events
+                for n in (e.get("issue_number"), e.get("pr_number"))
+                if isinstance(n, int) and not isinstance(n, bool)
+            }
+        )
+        refs_text = str(refs[:10]) + (f" (+{len(refs) - 10} more)" if len(refs) > 10 else "")
+        # Emit inside the lock and persist the cursor only after a
+        # successful emit: if emit_digest raises, the containment wrapper in
+        # _loop_impl logs it and the batch is retried on the next pass
+        # rather than being silently consumed. Rare path -- new refusals
+        # only -- so holding the lock across the emit is fine.
+        if self.config.notify.enabled:
+            _wf.emit_digest(
+                self._layout.notify,
+                _wf.AttentionDigest(
+                    generated_at=_wf.utc_now(),
+                    repo=self.repo_root.name,
+                    transitions=(
+                        _wf.AttentionEntry(
+                            issue_number=refs[0] if refs else 0,
+                            adapter_kind="outbound_body_guard",
+                            health="OUTBOUND_BODY_SECRET_REFUSED",
+                            previous_health=None,
+                            last_log_line=(
+                                f"{len(new_events)} refused outbound body write(s): "
+                                f"surfaces={surfaces} rules={rule_ids} refs={refs_text} "
+                                f"-- credential material never left the process; "
+                                f"rotate it and find the source (query events.db "
+                                f"for outbound_body_secret_refused)"
+                            ),
+                            pid=None,
+                            terminal_tool=None,
+                            terminal_reason="outbound body write refused on credential-pattern match",
+                        ),
+                    ),
+                ),
+            )
+        state["outbound_secret_refusals_surfaced"] = len(events)
+        self.write_gate.save_state(state)
