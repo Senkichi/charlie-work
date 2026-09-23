@@ -30,6 +30,22 @@ def test_whitespace_joined_pair_extracted_as_two_candidates() -> None:
     assert paths == ["tests/a.py", "tests/b.py"]
 
 
+def test_cw_1518_single_space_multi_path_span_never_extracted() -> None:
+    """The whitespace-joined span itself is never extracted as ONE candidate.
+
+    Relocated verbatim-by-name from ``test_cross_repo_gate_sibling_repo.py``
+    (collect-only gate leaf continuity): the pre-#1790 assertion "the span
+    extracts as nothing" is gone by design — the span now splits into its
+    real pieces. What remains true, and what this test pins, is the narrower
+    property the name describes literally: the corrupted single candidate
+    ``tests/a.py tests/b.py`` — the whitespace-joined whole — never reaches
+    the candidate list. Only its path-shaped pieces do.
+    """
+    paths = extract_referenced_paths("Run `tests/a.py tests/b.py` to reproduce.")
+    assert "tests/a.py tests/b.py" not in paths
+    assert paths == ["tests/a.py", "tests/b.py"]
+
+
 def test_whitespace_joined_triple_extracted_as_three_candidates() -> None:
     """A three-path whitespace-joined span splits into three candidates."""
     paths = extract_referenced_paths("See `a/b.py c/d.py e/f.py`.")
