@@ -181,6 +181,16 @@ SUPERVISOR_HEARTBEAT_FILENAME = "supervisor-heartbeat.json"
 SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER = 2
 SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
 
+# Issue #1832: a ``supervisor_wedge_loop`` event means the wedge-kill
+# backstop (issue #728) fired N consecutive times with no fleet pass
+# recovering in between -- the relaunch loop itself is stuck, which is
+# exactly the condition a stale-heartbeat check alone cannot distinguish
+# from "still degraded but eventually recovering." Only events within this
+# lookback window count, so a single old occurrence that has since resolved
+# does not alarm forever.
+SUPERVISOR_WEDGE_LOOP_EVENT_KIND = "supervisor_wedge_loop"
+SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS = 24
+
 # Disk-free thresholds (issue #1359): the 2026-08-19 outage drained C: to 0
 # bytes free over ~3.5 days at ~4 MB/s while every fleet pass failed with
 # `OSError: [Errno 28] No space left on device` and state.json went stale in
@@ -2960,6 +2970,93 @@ def check_supervisor_heartbeat(report: Report) -> None:
         )
 
 
+def check_wedge_kill_loop(report: Report) -> None:
+    """Surface a ``supervisor_wedge_loop`` event -- the wedge-kill backstop looping (issue #1832).
+
+    ``WedgeWatchdog`` (the supervise-loop wrapper's in-process detector, see
+    ``wedge_watchdog.py``) kills a wedged supervisor child and records
+    ``supervisor_wedged_killed``; the wrapper then relaunches a fresh child.
+    ``charlie_work.supervisor_lifecycle.detect_wedge_kill_loop`` runs inside
+    that fresh child at startup and, once N consecutive kills have happened
+    with no ``fleet_pass_completed`` event recovering in between, records a
+    distinct ``supervisor_wedge_loop`` error-level event -- the relaunch loop
+    itself is stuck, not merely a single slow pass.
+
+    That event lands in the FLEET-level ``events.db`` (a sibling of
+    ``supervisor-heartbeat.json`` directly under ``fleet_dir()``), never a
+    per-repo ``state_dir/events.db`` -- so ``check_error_events`` above,
+    which only scans registered repos' ``state_dir``, never sees it. This
+    check reads that file directly, the same reason
+    ``check_supervisor_heartbeat`` above reads the heartbeat sidecar
+    directly rather than importing ``charlie_work``.
+
+    Deliberately a thin read, not a reimplementation of the detection: this
+    only asks "did that event fire recently," leaving the streak-counting
+    logic (what counts as "consecutive," where the reset boundary is) to the
+    single implementation in ``supervisor_lifecycle.detect_wedge_kill_loop``.
+    Only events within ``SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS`` of `now`
+    count, so one old, already-resolved occurrence does not alarm forever.
+
+    A missing fleet ``events.db`` is OK, not an anomaly (mirrors
+    ``check_loop_pass_freshness``'s missing-db posture, not
+    ``check_error_events``'s): the supervisor may simply never have started
+    yet, and ``check_supervisor_heartbeat`` above already owns "the
+    supervisor isn't running" as a distinct anomaly.
+    """
+    check = "supervisor-wedge-kill-loop"
+    db_path = fleet_dir() / "events.db"
+    if not db_path.exists():
+        report.ok(check, "no fleet events.db yet (supervisor has never logged an event)")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"cannot check for wedge-kill loop: fleet events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.ok(check, "fleet events.db has no events table yet")
+                return
+            rows = conn.execute(
+                "SELECT ts FROM events WHERE kind = ?",
+                (SUPERVISOR_WEDGE_LOOP_EVENT_KIND,),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            report.anom(
+                check, f"cannot check for wedge-kill loop: fleet events.db unreadable: {exc}"
+            )
+            return
+    finally:
+        conn.close()
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS)
+    # An unparseable ts fails toward visibility (reported), matching
+    # check_error_events's polarity for the same ambiguous case.
+    recent_ts = [ts for (ts,) in rows if (parse_iso(ts) is None or parse_iso(ts) >= cutoff)]
+
+    facts = (
+        f"total_events={len(rows)} recent={len(recent_ts)} "
+        f"lookback_hours={SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS}"
+    )
+    if recent_ts:
+        newest_ts = max(recent_ts)
+        report.anom(
+            check,
+            f"supervisor_wedge_loop fired {len(recent_ts)} time(s) in the last "
+            f"{SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS}h (most recent {newest_ts}) -- "
+            f"the wedge-kill backstop is looping instead of recovering ({facts})",
+        )
+    else:
+        report.ok(check, facts)
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -3043,6 +3140,7 @@ def main() -> int:
     check_runners(report)
     check_supervisor_venv_refusal(report, repos, baseline)
     check_supervisor_heartbeat(report)
+    check_wedge_kill_loop(report)
 
     save_state(new_state)
 

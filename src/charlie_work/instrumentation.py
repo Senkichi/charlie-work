@@ -229,6 +229,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # no fleet work and every surface reported green -- the kill is the
         # recovery, and the event is the only record that it happened.
         "supervisor_wedged_killed": "error",
+        # Fires once, the pass a run of consecutive supervisor_wedged_killed
+        # events (with no fleet_pass_completed in between) reaches the
+        # configured alarm threshold -- the wedge-kill backstop is itself
+        # looping instead of recovering (issue #1832). Error: every prior
+        # wedge-kill was silently "handled" by a relaunch, so this is the
+        # only signal that the loop isn't converging.
+        "supervisor_wedge_loop": "error",
         "supervisor_zero_pass_alarm": "error",
         "unauthorized_merge_detected": "error",
         # The supervisor's startup guard found an editable .pth in the running
@@ -294,6 +301,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "draft_pr_blocked": "warning",
         "draft_pr_ready_failed": "warning",
         "draft_pr_ready_held": "warning",
+        # Issue #1832: a fleet pass hit its cooperative in-pass deadline
+        # (max_pass_runtime_seconds) and deferred one or more repos/prologue
+        # steps to the next pass instead of running them. Warning, not error:
+        # the pass still ends cleanly and returns a CommandResult -- nothing
+        # crashed, work was rescheduled.
+        "fleet_pass_deadline_deferred": "warning",
         # Issue #1372: a fleet registry entry whose repo_root no longer exists
         # is stale, not a live failing lane. Warning, not error: the lane is
         # skipped (not crashed), the daemon's pass completes, and the entry is
@@ -528,6 +541,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "fleet_canary": "info",
         "fleet_job_observations": "info",
         "fleet_lane_completed": "info",
+        # Issue #1832: a whole `fleet_loop()` pass returned -- success,
+        # business failure, or partial (deadline-deferred). Any of these
+        # means the pass was NOT wedged, so this is the reset signal the
+        # wedge-loop detector (detect_wedge_kill_loop) measures
+        # supervisor_wedged_killed streaks against.
+        "fleet_pass_completed": "info",
         # Issue #1773: a network-touching `git` call (fetch, ff-only pull)
         # needed `git_retry.run_git_with_retry` to recover from a transient
         # TLS/connection blip. Info, not warning: this is the retry
