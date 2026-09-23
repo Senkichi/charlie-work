@@ -104,7 +104,13 @@ def test_compare_diff_returns_none_on_failure(monkeypatch, tmp_path: Path) -> No
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=0))
+    # gh_transport="gh": this test exercises the gh-subprocess failure path
+    # directly via `fake_run`. `compare_diff`'s REST-GET-with-header shape is
+    # an HTTP-transport candidate (issue #1834), and RuntimeConfig's
+    # gh_transport field defaults to "http" -- pinning "gh" here keeps this
+    # test exercising what it was written to test rather than the (already
+    # separately covered, see tests/test_http_transport.py) HTTP path.
+    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=0, gh_transport="gh"))
     result = gh.compare_diff("sha-old", "sha-new")
 
     assert result is None

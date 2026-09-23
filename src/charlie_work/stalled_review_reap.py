@@ -935,6 +935,7 @@ def _detect_and_handle_stalled_reviews(
                 # when ``changed`` is set by an unrelated sibling PR in the same
                 # pass, reintroducing the silent-drop under exactly the low-load
                 # conditions where the signal matters most.
+                # write-gate-exempt(issue=1264): R4/#708 skip must stay observable under dry_run
                 log_event(
                     state_file,
                     "review_stale_claim_recovery_skipped",
@@ -947,6 +948,7 @@ def _detect_and_handle_stalled_reviews(
                 continue
             prompt_path = Path(prompt_path_str)
             if not prompt_path.exists():
+                # write-gate-exempt(issue=1264): R4/#708 skip must stay observable under dry_run
                 log_event(
                     state_file,
                     "review_stale_claim_recovery_skipped",
@@ -979,6 +981,7 @@ def _detect_and_handle_stalled_reviews(
                 # Same ``log_event`` / ``review_stale_claim_recovery_skipped``
                 # pattern as the prompt_path skips above (issue #708): writes
                 # directly to events.db because this skip does not mutate state.
+                # write-gate-exempt(issue=1264): R4/#734 skip must stay observable under dry_run
                 log_event(
                     state_file,
                     "review_stale_claim_recovery_skipped",
@@ -1010,6 +1013,7 @@ def _detect_and_handle_stalled_reviews(
                 # this is expected behavior (the packet simply is not old
                 # enough), unlike the other two skips which indicate a PR that
                 # recovery cannot help.
+                # write-gate-exempt(issue=1264): R4/#734 skip must stay observable under dry_run
                 log_event(
                     state_file,
                     "review_stale_claim_recovery_skipped",

@@ -92,7 +92,13 @@ def test_github_merged_pr_list_gives_up_after_max_retries(monkeypatch, tmp_path:
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
 
-    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=2))
+    # gh_transport="gh": `merged_pr_list`'s REST-GET pagination shape is an
+    # HTTP-transport candidate (issue #1834), and RuntimeConfig's
+    # gh_transport field defaults to "http" -- pinning "gh" here keeps this
+    # test exercising the gh-subprocess retry path it was written to test
+    # via `fake_run` (the HTTP path has its own coverage in
+    # tests/test_http_transport.py).
+    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=2, gh_transport="gh"))
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
