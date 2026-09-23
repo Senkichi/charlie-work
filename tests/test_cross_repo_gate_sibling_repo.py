@@ -382,3 +382,89 @@ def test_dispatching_repo_excluded_by_root_when_name_mismatches(tmp_path: Path) 
     assert result.passed is True
     assert result.found_in_repo is None
     assert "abstaining" in result.reason
+
+
+def test_issue_1791_driveless_absolute_path_classified_as_absolute(
+    tmp_path: Path,
+) -> None:
+    """Issue #1791: ``_path_exists_in_repo`` classifies a POSIX-style
+    absolute candidate (leading ``/``, no drive letter) as absolute —
+    containment-checked directly — matching how ``_resolve_within_root``
+    treats the exact same string.
+
+    ``_path_exists_in_repo`` previously branched on the raw,
+    platform-dependent ``Path.is_absolute()``, which reports ``False``
+    for a driveless absolute path on Windows. The candidate then fell
+    into the "relative" branch and was joined onto ``repo_root``,
+    collapsing to the drive root plus the candidate's tail
+    (``Path("C:/repo") / Path("/x/y.py") == Path("C:/x/y.py")``) — an
+    existence check against a foreign location with no containment check
+    at all. Here that join lands on the real sibling file, so the
+    unfixed function reports the out-of-repo path as present in the repo.
+
+    The fixture spells a real on-disk sibling file in driveless form by
+    stripping its own anchor — the only way to materialize a POSIX-style
+    absolute path that genuinely exists on a Windows host without writing
+    outside ``tmp_path`` (see ``test_posix_style_absolute_path_outside_repo_blocks``
+    in ``test_cross_repo_gate.py`` for why a literal ``/home/...`` fixture
+    cannot be built there). On POSIX hosts the same construction yields
+    the file's ordinary absolute path verbatim, so both code paths agree
+    there either way; the regression this pins is Windows-only.
+    """
+    this_repo = tmp_path / "charlie-work"
+    this_repo.mkdir()
+    sibling_root = tmp_path / "ci_runners"
+    (sibling_root / "src" / "ci_fleet").mkdir(parents=True)
+    sibling_file = sibling_root / "src" / "ci_fleet" / "suite_coverage.py"
+    sibling_file.write_text("# suite_coverage", encoding="utf-8")
+
+    # ``C:/.../suite_coverage.py`` -> ``/.../suite_coverage.py``: the same
+    # file spelled without its drive letter — absolute per
+    # ``_is_absolute_path`` on every platform, but reported non-absolute
+    # by ``Path.is_absolute()`` on Windows (and resolving to the real file
+    # under the current drive when existence-checked).
+    driveless = "/" + sibling_file.relative_to(sibling_file.anchor).as_posix()
+
+    assert cross_repo_gate_module._is_absolute_path(driveless) is True
+    # Absolute and outside ``this_repo``'s root — the same verdict
+    # ``_resolve_within_root`` already gives this exact string.
+    assert cross_repo_gate_module._resolve_within_root(this_repo, driveless) is None
+    assert cross_repo_gate_module._path_exists_in_repo(driveless, this_repo) is False
+
+
+def test_issue_1791_driveless_absolute_path_existing_outside_repo_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1791, end-to-end: a POSIX-style absolute candidate that
+    exists on disk outside ``repo_root`` escalates via the founding
+    #1010/#953 foreign-checkout arm
+    (:func:`_is_confirmed_foreign_absolute_path`) — the same verdict
+    ``test_absolute_path_outside_repo_blocks`` pins for its drive-letter
+    spelling, reached through the missing-survivor path that
+    ``_path_exists_in_repo`` decides.
+
+    ``_is_gitignored`` is patched out so the test is independent of where
+    the host puts ``tmp_path``: on a normal CI checkout it is a no-op
+    (``this_repo`` is not inside a git repository, so ``git check-ignore``
+    already fails closed to ``False``), while in a sandboxed worktree
+    that redirects the temp dir inside the checkout's gitignored
+    ``.var/`` tree it keeps an orthogonal classifier from swallowing the
+    candidate before the decision layer sees it.
+    """
+    this_repo = tmp_path / "charlie-work"
+    this_repo.mkdir()
+    sibling_root = tmp_path / "ci_runners"
+    (sibling_root / "src" / "ci_fleet").mkdir(parents=True)
+    sibling_file = sibling_root / "src" / "ci_fleet" / "suite_coverage.py"
+    sibling_file.write_text("# suite_coverage", encoding="utf-8")
+
+    driveless = "/" + sibling_file.relative_to(sibling_file.anchor).as_posix()
+    monkeypatch.setattr(cross_repo_gate_module, "_is_gitignored", lambda *_args: False)
+
+    body = f"The file is at `{driveless}`."
+    result = cross_repo_gate(body, this_repo)
+
+    assert result.passed is False
+    assert result.referenced_paths == (driveless,)
+    assert result.missing_paths == (driveless,)
+    assert "positive evidence of a foreign checkout" in result.reason

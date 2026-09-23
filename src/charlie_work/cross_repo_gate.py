@@ -671,9 +671,21 @@ def _is_launcher_owned_path(candidate: str) -> bool:
 
 
 def _path_exists_in_repo(path_str: str, repo_root: Path) -> bool:
-    """Return ``True`` when ``path_str`` resolves to an existing file inside ``repo_root``."""
+    """Return ``True`` when ``path_str`` resolves to an existing file inside ``repo_root``.
+
+    Uses :func:`_is_absolute_path` (not ``Path.is_absolute()``) so a
+    POSIX-style absolute candidate (no drive letter) is still recognized
+    as absolute on Windows — the one place in this module that branched on
+    the raw, platform-dependent check (issue #1791). Left as
+    ``is_absolute()``, such a candidate falls into the "relative" branch
+    and is joined onto ``repo_root``, which collapses to the drive root
+    plus the candidate's tail (``Path("C:/repo") / Path("/home/x.py") ==
+    Path("C:/home/x.py")``) — an existence check against a foreign
+    location with no containment check at all. Now matches
+    :func:`_resolve_within_root` and :func:`_is_confirmed_foreign_absolute_path`.
+    """
     path = Path(path_str)
-    if path.is_absolute():
+    if _is_absolute_path(path_str):
         try:
             if not path.exists():
                 return False
