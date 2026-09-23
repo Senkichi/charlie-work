@@ -23,7 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from charlie_work.config import AutoMergeConfig, LocalIssuesConfig
+from charlie_work.config import AutoMergeConfig, LocalIssuesConfig, OrchestratorConfig
 from charlie_work.doctor import run_doctor
 from charlie_work.github import GitHubError
 from charlie_work.local_issues import LocalFileGitHub
@@ -130,6 +130,53 @@ def test_doctor_passes_on_healthy_local_file_repo(tmp_path: Path) -> None:
     assert "2 issue file(s)" in by_name["local issues dir"].detail
     assert by_name["local issue files"].ok is True
     assert by_name["state dir gitignored"].ok is True
+
+
+def test_doctor_stock_default_config_on_local_backend(tmp_path: Path) -> None:
+    """Acceptance (issue #1706): a STOCK ``OrchestratorConfig()`` stays green.
+
+    The healthy-repo test above runs ``_local_config()``, which overrides the
+    two knobs this scenario is about (``auto_merge`` off, ``review_dispatch``
+    on). A real first-time local repo runs on package defaults instead:
+    ``auto_merge.enabled=True`` with empty ``required_checks`` and
+    ``review_dispatch.enabled=False``/``rescue.enabled=False`` — the exact
+    inputs that make ``required checks configured`` and
+    ``review-to-verdict path`` fail on a PR-publishing backend. On a
+    ``LocalFileGitHub`` both must report not-applicable, or a healthy local
+    repo on stock defaults exits non-zero — the original #1706 bug.
+    """
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".var/\n", encoding="utf-8")
+    issues_dir = tmp_path / "docs" / "issues"
+    _write_issue(issues_dir, 1)
+    # Deliberately NOT _local_config()/_config(): the dataclass defaults are
+    # the scenario under test. Pin them so a default change makes this test
+    # say so rather than silently covering a different config.
+    config = OrchestratorConfig()
+    assert config.auto_merge.enabled is True
+    assert config.auto_merge.required_checks == ()
+    assert config.review_dispatch.enabled is False
+    assert config.rescue.enabled is False
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = _local_gh(tmp_path, issues_dir)
+
+    ok, checks = run_doctor(
+        tmp_path,
+        paths,
+        config,
+        tmp_path / "orchestrator.config.yaml",
+        gh,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+    by_name = _by_name(checks)
+    assert by_name["required checks configured"].ok is True
+    assert by_name["required checks configured"].severity == "warning"
+    assert "not applicable" in by_name["required checks configured"].detail
+    assert by_name["review-to-verdict path"].ok is True
+    assert by_name["review-to-verdict path"].severity == "warning"
+    assert "not applicable" in by_name["review-to-verdict path"].detail
+    assert ok is True, [(c.name, c.detail) for c in checks if not c.ok and c.severity == "error"]
 
 
 def test_doctor_gh_auth_failure_still_fails_on_publishing_backend(
