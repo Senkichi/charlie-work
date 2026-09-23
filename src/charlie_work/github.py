@@ -41,6 +41,7 @@ from .github_capabilities import (
     ChecksLike,
     CommentsLike,
     GitHubRunResult,
+    build_circuit_breaker_state,
     ISSUE_LIST_FIELDS,  # noqa: F401  (deliberate re-export; doctor.py et al.)
     ISSUE_VIEW_FIELDS,  # noqa: F401  (deliberate re-export; doctor.py et al.)
     IssuesLike,
@@ -100,6 +101,12 @@ logger = logging.getLogger(__name__)
 # A TimeoutExpired carries no returncode of its own, and callers that branch on
 # returncode must not see a 0 that reads as success.
 _TIMEOUT_RETURNCODE = 124
+
+# Sentinel returncode for "the circuit breaker refused this call" (issue
+# #1833) -- no gh subprocess ever ran, so there is no real exit status.
+# Distinct from _TIMEOUT_RETURNCODE: a caller branching on returncode needs
+# to tell "gh hung" from "gh was never spawned" apart.
+_CIRCUIT_OPEN_RETURNCODE = 125
 
 # Fractional jitter applied to each retry backoff (e.g. 0.25 => +/- 25%).
 _JITTER_FRACTION = 0.25
@@ -263,6 +270,18 @@ class GitHub:
         # filed issues and freshly opened/merged PRs stay invisible until the
         # process restarts.
         object.__setattr__(self, "_list_cache", {})
+        # Per-pass circuit breaker state (issue #1833): mutable, per-instance
+        # runtime state constructed once here, exactly like _list_cache above
+        # -- see reset_circuit_breaker() (reached through the _transport
+        # delegate below) for why it must be explicitly re-armed every pass
+        # rather than living for the process lifetime. Built here (not
+        # lazily) because build_circuit_breaker_state needs self.runtime,
+        # which is already available at this point, and because it must be
+        # constructed before the _COLLABORATORS loop below installs the
+        # delegate that exposes it.
+        object.__setattr__(
+            self, "_circuit_breaker_state", build_circuit_breaker_state(self.runtime)
+        )
         # Capability collaborators (Track 2, issue #1585, design doc
         # Section 3.3): each is constructed with a back-reference to this
         # instance and reached through the delegates _install_delegates()
@@ -277,16 +296,42 @@ class GitHub:
     # installed `_transport` delegate.
 
     def run(
-        self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+        self,
+        args: list[str],
+        *,
+        json_output: bool = False,
+        allow_failure: bool = False,
+        long_call: bool = False,
     ) -> Any:
         command = ["gh", *args]
         if self.dry_run and _is_mutating(args):
             return [] if json_output else "DRY-RUN: " + " ".join(command)
 
+        # Per-pass circuit breaker gate (issue #1833): after enough
+        # consecutive transport-class failures this pass, fail every further
+        # call immediately as a value -- never spawn gh -- until the cooldown
+        # elapses. Checked before the retry loop, not inside it: an open
+        # breaker must skip the subprocess entirely, not merely skip retries
+        # on one.
+        if not self._circuit_breaker_allow_call():
+            breaker_error = self._circuit_breaker_open_message(command)
+            if not allow_failure:
+                raise GitHubError(breaker_error)
+            return GitHubRunResult(
+                ok=False,
+                returncode=_CIRCUIT_OPEN_RETURNCODE,
+                stdout="",
+                stderr=breaker_error,
+                value=None,
+                error=breaker_error,
+            )
+
         is_mutating = _is_mutating(args)
         max_retries = self._max_retries()
         base_delay = self._retry_base_seconds()
-        timeout_seconds = self._timeout_seconds()
+        timeout_seconds = (
+            self._long_call_timeout_seconds() if long_call else self._timeout_seconds()
+        )
         last_result: subprocess.CompletedProcess[str] | None = None
 
         for attempt in range(max_retries + 1):
@@ -303,6 +348,11 @@ class GitHub:
                     **no_console_window_kwargs(),
                 )
             except FileNotFoundError as exc:
+                # Transport-class by construction (issue #1833): gh could not
+                # even be spawned, so there is no response to classify --
+                # reuse timed_out=True, which classify_gh_failure() always
+                # treats as transport regardless of message text.
+                self._circuit_breaker_note_result(timed_out=True)
                 if allow_failure:
                     return GitHubRunResult(
                         ok=False,
@@ -327,6 +377,11 @@ class GitHub:
                 # which classifies stderr from a process that actually returned
                 # and has no string to classify for a call that never did.
                 if is_mutating or attempt >= max_retries:
+                    # Terminal for this run() call -- record now, not on the
+                    # retryable branch below, since the breaker observes
+                    # each call's FINAL outcome, not every intra-call attempt
+                    # (issue #1833).
+                    self._circuit_breaker_note_result(timed_out=True)
                     if not allow_failure:
                         raise GitHubError(timeout_error) from exc
                     return GitHubRunResult(
@@ -359,6 +414,10 @@ class GitHub:
             output = result.stdout.strip()
 
             if result.returncode == 0:
+                # A response reached the caller -- the transport is provably
+                # fine right now regardless of what gh's exit code says
+                # elsewhere, so record it before branching (issue #1833).
+                self._circuit_breaker_note_result()
                 # Success path: parse and return exactly as before.
                 if not allow_failure:
                     if not json_output:
@@ -437,6 +496,12 @@ class GitHub:
         final_error = (
             last_result.stderr.strip() or last_result.stdout.strip() or str(last_result.returncode)
         )
+        # Terminal for this run() call: classify and record now (issue
+        # #1833). A response DID reach the caller here (unlike the
+        # TimeoutExpired/FileNotFoundError branches above), so this goes
+        # through classify_gh_failure() on the actual stderr text rather than
+        # a forced transport classification.
+        self._circuit_breaker_note_result(error=final_error)
         if not allow_failure:
             if _is_not_found_gh_error(final_error):
                 raise GitHubNotFoundError(final_error)
@@ -527,7 +592,12 @@ class GitHubLike(
     def dry_run(self) -> bool: ...
 
     def run(
-        self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+        self,
+        args: list[str],
+        *,
+        json_output: bool = False,
+        allow_failure: bool = False,
+        long_call: bool = False,
     ) -> Any: ...
 
     # Redeclared directly (see class docstring): inherited from MergeBranchLike.

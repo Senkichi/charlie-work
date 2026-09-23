@@ -145,8 +145,8 @@ def test_unescalate_reset_covers_every_rework_lane_companion() -> None:
 
     reset = set(OrchestratorApp._UNESCALATE_PR_RESET_FIELDS)
     missing: set[str] = set()
-    for counter, companions in OrchestratorApp._REWORK_BUDGET_RESET_BY_ESCALATION_REASON.values():
-        missing |= ({counter} | set(companions)) - reset
+    for counters, companions in OrchestratorApp._REWORK_BUDGET_RESET_BY_ESCALATION_REASON.values():
+        missing |= (set(counters) | set(companions)) - reset
     assert not missing, sorted(missing)
 
 

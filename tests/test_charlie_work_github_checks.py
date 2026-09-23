@@ -276,9 +276,15 @@ def test_validate_field_lists_fails_on_unsupported_field(monkeypatch, tmp_path: 
 
 
 def test_validate_field_lists_timeout_raises_config_error(monkeypatch, tmp_path: Path) -> None:
-    """A hung `gh` probe during startup field-list validation surfaces as
-    ConfigError rather than blocking boot forever. This probe runs once and
-    is not retried, and it is bound by the configured gh_timeout_seconds."""
+    """A hung `gh` probe during startup field-list validation is
+    transport-class, not a configuration error (issue #1833, follow-up to the
+    #1832 outage): it must no longer raise ConfigError -- doing so propagated
+    uncaught out of OrchestratorApp.__init__ via fleet_dispatch.py's
+    "Error processing repo" path, violating the errors-as-values invariant.
+    validate_field_lists() now returns normally, skipping the remaining
+    probes for this pass, and records the failure on the circuit breaker.
+    This probe runs once and is not retried, and it is bound by the
+    configured gh_timeout_seconds."""
     call_count = 0
     captured_timeouts: list[float] = []
 
@@ -291,11 +297,12 @@ def test_validate_field_lists_timeout_raises_config_error(monkeypatch, tmp_path:
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
     gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_timeout_seconds=45.0))
-    with pytest.raises(ConfigError, match="timed out"):
-        gh.validate_field_lists()
+    gh.validate_field_lists()  # must not raise
 
     # Fails fast on the first field list probed, not after trying all 10.
     assert call_count == 1
     # The timeout= kwarg passed to subprocess.run came from the configured
     # gh_timeout_seconds, not a hardcoded value.
     assert captured_timeouts == [45.0]
+    # The transport-class failure is recorded on the breaker.
+    assert gh._transport._circuit_breaker_state.consecutive_failures == 1
