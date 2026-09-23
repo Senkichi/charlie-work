@@ -307,6 +307,7 @@ def check_outbound_write(
             # events.db cannot weaken the refusal itself.
             # `repo_root` is non-None here -- state_path only resolves when
             # it is set.
+            # write-gate-exempt(issue=1505): no WriteGate by design; log_event is documented here
             log_event(state_path, REFUSAL_EVENT_KIND, payload, repo=repo_root.name)
         return tuple(matches)
     except OutboundBodyGuardError:

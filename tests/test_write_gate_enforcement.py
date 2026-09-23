@@ -29,10 +29,11 @@ primitives into exactly one of four buckets:
   (c) inside the primitive's own defining module (``state.py``,
       ``instrumentation.py``, ``labels.py``, ``process_utils.py``) -- the
       primitive's own internals, not an external call site;
-  (d) on the explicit, comment-justified allow-list below (the four
-      deliberately-unconditional ``log_event`` observability sites in
-      ``stalled_review_reap.py`` that issue #708/#734 require to stay raw --
-      issue #1264's R4 disposition).
+  (d) explicitly comment-justified via a ``write-gate-exempt`` marker on the
+      source line directly above the call (issue #1837; see "R13" below) --
+      e.g. the four deliberately-unconditional ``log_event`` observability
+      sites in ``stalled_review_reap.py`` that issue #708/#734 require to
+      stay raw (issue #1264's R4 disposition).
 
 Anything else in buckets (a)-(d) is accounted for; everything that remains
 is scoped by issue #1264's R9 ruling (comment 5324595347 on #1264), which
@@ -169,28 +170,77 @@ gap was found, why it was refused an allow-list exemption, and how it was
 closed, per issue #1329 (left open for the operator's post-merge completion
 comment and manual close, not closed by this commit).
 
+## R13: call-site markers replace the shared allow-list tuple (issue #1837)
+
+``_ALLOWED_RAW_PRIMITIVE_SITES`` -- the tuple this section (R4-R12) narrates
+building up entry by entry -- was itself the same shared-append-point defect
+class issue #1805 had already fixed for the ratchet baselines below (see
+``git show 89e7c0bb --stat`` for that precedent): every PR adding one new
+exemption appended to the SAME tuple's tail, so two concurrent PRs adding
+unrelated exemptions always conflicted on the same source lines (#1835 vs
+#1836, 2026-09-23), and a conflicting PR receives no ``pull_request`` CI run
+at all -- the conflict silently stalls CI rather than failing it loudly.
+
+The tuple is gone. Bucket (d) exemptions now live at the call site itself,
+as a marker comment on the source line directly above the exempted call::
+
+    # write-gate-exempt(issue=1832): <condensed reason>
+    log_event(...)
+
+``_scan_exemption_markers`` derives the exempt set by scanning every
+``.py`` file under ``src/charlie_work`` for this marker shape -- nothing is
+listed here to append to. Distinct exemptions land on distinct lines in
+distinct files, so two PRs adding unrelated exemptions never touch the same
+line and never conflict; two PRs exempting the SAME call still conflict on
+that call's own lines, which is the correct, unavoidable direction (they are
+editing the same code).
+
+Matching is deliberately line-based, not structural: a marker on line N-1
+exempts whichever raw primitive call the scanner finds starting on line N of
+the same file. A comment line immediately preceding a statement is never
+moved by ruff/black reformatting (formatters reflow expressions, not
+standalone leading comments), so this survives the call's own internals
+reflowing (argument wrapping, added kwargs) -- the "reflow" robustness
+requirement. It does NOT survive the call being deleted, moved to a
+different line, or reordered relative to its marker; that case is stale, not
+silently still-matching, exactly the direction ``test_write_gate_allowlist_entries_are_not_stale``
+enforces (see below).
+
+Enforcement is unchanged in strength, checked three ways:
+``_MarkerError`` (missing/non-numeric issue ref, or empty reason) fails
+loudly rather than silently degrading to "no marker" -- see
+``_parse_marker_comment``; an unmarked raw call remains unaccounted exactly
+as before; a marker matching no real call is stale and fails
+``test_write_gate_allowlist_entries_are_not_stale``.
+
 ## Structural anchors, not line numbers
 
-Every site (and every allow-list entry) is keyed by ``(module path,
-enclosing scope, primitive name, unparsed call source, occurrence index)``
--- never a bare line number, which rots as the surrounding file edits. The
-first four fields mirror ``tests/_instrumentation_kind_scanner.py``'s own
+Every raw-primitive-call SITE is keyed by ``(module path, enclosing scope,
+primitive name, unparsed call source, occurrence index)`` -- never a bare
+line number, which rots as the surrounding file edits. The first four
+fields mirror ``tests/_instrumentation_kind_scanner.py``'s own
 ``_UnresolvedKindSite.key`` idiom exactly. The fifth, ``occurrence``, is
 required because calling the same primitive with byte-identical arguments
 multiple times in one function is the dominant real shape (e.g.
 ``save_state(self.paths.state_file, state)``, repeated verbatim many times
-per function) -- without it, one allow-list entry would silently exempt
-every site with that shape, not the single site it names.
+per function) -- without it, a single marker's line-adjacency match would be
+ambiguous about which occurrence it covers if two identical calls sat on the
+same line, and downstream key-based bookkeeping (the ratchet, the
+in-predicate check) would silently conflate two distinct sites. The MARKER
+itself is intentionally simpler -- purely line-based (R13 above) -- because a
+human writes it next to the one call it means, and reformatting cannot move
+a leading comment away from the statement it precedes.
 
-``test_write_gate_allowlist_entries_are_not_stale`` enforces the same
-symmetric direction ``test_event_kind_registry_exhaustive`` does for its own
-allow-list: an allow-list entry that no longer matches a real site is a
-silent hole and must fail the build too, not just accumulate as dead weight.
+``test_write_gate_allowlist_entries_are_not_stale`` enforces the same symmetric direction
+``test_event_kind_registry_exhaustive`` does for its own allow-list: a
+marker that no longer matches a real site is a silent hole and must fail the
+build too, not just accumulate as dead weight.
 """
 
 from __future__ import annotations
 
 import ast
+import re
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -639,221 +689,180 @@ def _ratchet_violations(actual_counts: dict[str, int], baseline: dict[str, int])
 
 
 # ---------------------------------------------------------------------------
-# Bucket (d): explicit, comment-justified allow-list of raw sites.
+# Bucket (d): call-site exemption markers (issue #1837, R13 above).
 #
-# Every entry must be independently justified and traceable to a binding
-# decision -- this is not a shrink-only ratchet or a place to quietly
-# accumulate exceptions. `test_write_gate_allowlist_entries_are_not_stale`
-# enforces the symmetric direction: an entry that stops matching a real
-# site fails the build too.
+# `_ALLOWED_RAW_PRIMITIVE_SITES` -- a shared tuple every PR appended a new
+# entry to -- is gone. An exemption is now declared at the call site itself:
+#
+#     # write-gate-exempt(issue=<N>): <reason>
+#     <raw primitive call>
+#
+# on the source line directly above the exempted call. `_scan_exemption_markers`
+# derives the exempt set by scanning `src/charlie_work` for this shape; there
+# is nothing here to append to, so concurrent PRs adding unrelated exemptions
+# land on distinct lines in distinct files and never conflict.
 # ---------------------------------------------------------------------------
-_ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
-    # Issue #1264 R4 / #708: recovery declined to act because the prompt
-    # path is missing from state. Deliberately unconditional -- routing
-    # through WriteGate would newly suppress this observability event under
-    # dry_run=True, losing a signal the issue's own text says must survive
-    # every skip path.
-    _RawPrimitiveSite(
-        path="stalled_review_reap.py",
-        scope="_detect_and_handle_stalled_reviews",
-        primitive="log_event",
-        call_source=(
-            "log_event(state_file, 'review_stale_claim_recovery_skipped', "
-            "{'pr_number': int(pr_key) if pr_key.isdigit() else None, "
-            "'reason': 'prompt_path missing from state'}, level='warning')"
-        ),
-        in_predicate=True,
-    ),
-    # Issue #1264 R4 / #708: same pattern, prompt file missing on disk.
-    _RawPrimitiveSite(
-        path="stalled_review_reap.py",
-        scope="_detect_and_handle_stalled_reviews",
-        primitive="log_event",
-        call_source=(
-            "log_event(state_file, 'review_stale_claim_recovery_skipped', "
-            "{'pr_number': int(pr_key) if pr_key.isdigit() else None, "
-            "'reason': 'prompt_path file does not exist on disk', "
-            "'prompt_path': prompt_path_str}, level='warning')"
-        ),
-        in_predicate=True,
-    ),
-    # Issue #1264 R4 / #734: decision already recorded (second of three
-    # silent skip paths the issue requires to stay observable).
-    _RawPrimitiveSite(
-        path="stalled_review_reap.py",
-        scope="_detect_and_handle_stalled_reviews",
-        primitive="log_event",
-        call_source=(
-            "log_event(state_file, 'review_stale_claim_recovery_skipped', "
-            "{'pr_number': int(pr_key) if pr_key.isdigit() else None, "
-            "'reason': 'decision_already_recorded', 'decision': decision_value}, "
-            "level='warning')"
-        ),
-        in_predicate=True,
-    ),
-    # Issue #1264 R4 / #734: packet not stale yet (third of three silent
-    # skip paths).
-    _RawPrimitiveSite(
-        path="stalled_review_reap.py",
-        scope="_detect_and_handle_stalled_reviews",
-        primitive="log_event",
-        call_source=(
-            "log_event(state_file, 'review_stale_claim_recovery_skipped', "
-            "{'pr_number': int(pr_key) if pr_key.isdigit() else None, "
-            "'reason': 'packet_not_stale', 'packet_age': packet_age}, level='info')"
-        ),
-        in_predicate=True,
-    ),
-    # Issue #1363: preflight non-fatal-failure warning emission, added
-    # inside `_loop_impl` (workflow.py) alongside that same function's two
-    # long-standing raw `log_event` calls for `loop_started`/`loop_completed`.
-    # `tests/test_write_gate_dry_run_loop.py`'s module docstring documents
-    # those two as deliberate, orthogonal pass-level telemetry that fires
-    # "on every pass, dry-run or not" and states plainly that "none of the
-    # wave's clusters ever targeted this wrapper -- it is not a 'caller
-    # migrated onto WriteGate' in C1.2's sense." This third `log_event` call
-    # is the same kind of telemetry for the same function, by the same
-    # design: a preflight warning (config gone stale, clock skew) must
-    # survive `dry_run=True` exactly like the sibling calls it sits next to,
-    # so routing it through `self.write_gate.log_event(...)` would be wrong
-    # twice over -- it would newly suppress the warning under dry-run
-    # (contradicting the documented invariant), and it would flip
-    # `_loop_impl` into R9's in-predicate exclusive-use bucket, which would
-    # then flag its two untouched sibling `log_event` calls as violations
-    # too, forcing an out-of-scope conversion of telemetry this wave never
-    # targeted. `in_predicate=False` here matches the real scan (the
-    # function makes no direct `self.write_gate.*`/`write_gate.*` call), so
-    # this entry is not an R9-exclusivity exemption -- it keeps this
-    # genuinely-new, by-design raw site off the per-module shrink-only
-    # ratchet the same way the ratchet's own ~1160-1162 sentence intends for
-    # sites that are correct as designed rather than an unconverted debt.
-    #
-    # Track 2 Phase B leaf L05 (#1636): `_loop_impl` moved verbatim out of
-    # workflow.py into `orchestration/instrumentation_ops.py`. The call_source,
-    # scope, and design rationale are unchanged; only the file it lives in
-    # moved, so this entry's `path` is repointed to the new module. Leaving it
-    # at "workflow.py" would make it stale (matches nothing) AND leave the
-    # relocated raw site unaccounted at its new path -- both failure directions
-    # of the two symmetric write-gate tests.
-    _RawPrimitiveSite(
-        path="orchestration/instrumentation_ops.py",
-        scope="_loop_impl",
-        primitive="log_event",
-        call_source=(
-            "log_event(self.paths.state_file, kind, {'check': check.name, "
-            "'detail': check.detail}, repo=self.repo_root.name, level='warning')"
-        ),
-        in_predicate=False,
-    ),
-    # Issue #1768 review finding 1: outer defense-in-depth around
-    # `self._maybe_emit_operator_queue_impact()`, added inside `_loop_impl`
-    # immediately alongside the `_loop_impl` preflight-warning site directly
-    # above -- same function, same reasoning. Routing this through
-    # `self.write_gate.log_event(...)` would flip `_loop_impl` into R9's
-    # in-predicate exclusive-use bucket, which would then flag that sibling
-    # site (and the `loop_started`/`loop_completed` telemetry
-    # `test_write_gate_dry_run_loop.py` documents as deliberately orthogonal
-    # to the wave) as violations too -- an out-of-scope conversion of a
-    # function this wave never targets, exactly as the sibling entry's own
-    # comment explains. `in_predicate=False` matches the real scan (the
-    # function makes no direct `self.write_gate.*`/`write_gate.*` call).
-    _RawPrimitiveSite(
-        path="orchestration/instrumentation_ops.py",
-        scope="_loop_impl",
-        primitive="log_event",
-        call_source=(
-            "log_event(self.paths.state_file, "
-            "'operator_queue_impact_check_failed', "
-            "{'error': f'{type(exc).__name__}: {exc}'}, "
-            "repo=self.repo_root.name, correlation_id=cid, level='warning')"
-        ),
-        in_predicate=False,
-    ),
-    # Issue #1505: outer defense-in-depth around
-    # `self._maybe_report_outbound_secret_refusals()`, added inside
-    # `_loop_impl` immediately alongside the `operator_queue_impact_check_failed`
-    # sibling directly above -- same function, same reasoning. Routing it
-    # through `self.write_gate.log_event(...)` would flip `_loop_impl` into
-    # R9's in-predicate exclusive-use bucket, flagging every other raw
-    # telemetry site in that function as violations -- an out-of-scope
-    # conversion of a function this wave never targets. `in_predicate=False`
-    # matches the real scan.
-    _RawPrimitiveSite(
-        path="orchestration/instrumentation_ops.py",
-        scope="_loop_impl",
-        primitive="log_event",
-        call_source=(
-            "log_event(self.paths.state_file, "
-            "'outbound_secret_refusal_report_failed', "
-            "{'error': f'{type(exc).__name__}: {exc}'}, "
-            "repo=self.repo_root.name, correlation_id=cid, level='warning')"
-        ),
-        in_predicate=False,
-    ),
-    # Issue #1505: `outbound_body_guard.check_outbound_write` is the shared
-    # chokepoint the GitHub write surfaces (`pr_create`, `issue_comment`,
-    # `pr_comment` on both the gh-backed client and the local-file backend)
-    # call before any body text leaves the process. The refusal event it
-    # emits is exactly the case `instrumentation.log_event`'s own docstring
-    # prescribes: "for events outside state-lock contexts ... call
-    # log_event() directly" -- the GitHub client layer has no WriteGate
-    # (WriteGate is an OrchestratorApp-owned serialization object, and the
-    # client is deliberately constructible without one: tests and
-    # `github_client_for` build it bare), and the write runs outside any
-    # state-lock context by construction. Threading a WriteGate through the
-    # GitHubLike surface to gate this one telemetry call would be an
-    # out-of-scope refactor of the client's construction contract.
-    # `in_predicate=False` matches the real scan: `check_outbound_write`
-    # makes no `self.write_gate.*`/`write_gate.*` call and takes no
-    # `write_gate` parameter.
-    _RawPrimitiveSite(
-        path="outbound_body_guard.py",
-        scope="check_outbound_write",
-        primitive="log_event",
-        call_source=("log_event(state_path, REFUSAL_EVENT_KIND, payload, repo=repo_root.name)"),
-        in_predicate=False,
-    ),
-    # Issue #1374 AC3: `emit_preflight_refusal` (preflight.py) is the
-    # best-effort refusal emitter for FATAL preflight failures (disk full,
-    # clock skew, venv drift). Its documented contract is "must never
-    # silence the refusal": when the event DB is unreachable or the write
-    # itself raises, it falls back to printing to stderr (which the
-    # `fleet supervise` wrapper captures into the pass log). The
-    # `log_event_fn=log_event` injectable default is for testability --
-    # the function's own docstring states ``log_event_fn`` is "injectable
-    # so this can be unit-tested without a real disk-full condition" --
-    # which is exactly the injectable-default-for-testability pattern
-    # issue #1374 names and this scanner now resolves.
-    #
-    # Routing through WriteGate would be wrong twice over, mirroring the
-    # two R4 dispositions above:
-    #   (1) WriteGate's `dry_run=True` path performs zero event emissions,
-    #       so routing through it would newly suppress a fatal-check-
-    #       failure observability signal under dry-run -- the same reason
-    #       the stalled_review_reap.py entries and the _loop_impl preflight
-    #       warning above stay raw. A preflight REFUSAL (the loop will not
-    #       run at all) is at least as load-bearing as a preflight warning.
-    #   (2) `emit_preflight_refusal` is a standalone module-level function
-    #       with no `self.write_gate` access and no `write_gate` parameter;
-    #       its sole caller (`_loop_impl` at workflow.py) passes no
-    #       `write_gate` either. Threading a WriteGate in would be an
-    #       out-of-scope refactor that breaks the "never silenced, even
-    #       when the DB is down" contract the function exists to enforce.
-    # `in_predicate=False` matches the real scan: the function makes no
-    # `self.write_gate.*`/`write_gate.*` call and has no `write_gate`
-    # parameter, so this is not an R9 exclusivity exemption -- it keeps a
-    # genuinely by-design raw site off the per-module shrink-only ratchet,
-    # the same role the _loop_impl entry above plays.
-    _RawPrimitiveSite(
-        path="preflight.py",
-        scope="emit_preflight_refusal",
-        primitive="log_event",
-        call_source=(
-            "log_event_fn(state_path, 'loop_refused_preflight', payload, repo=repo, level='error')"
-        ),
-        in_predicate=False,
-    ),
+
+_MARKER_PREFIX = "write-gate-exempt"
+_MARKER_RE = re.compile(
+    r"^\s*#\s*write-gate-exempt\(issue=(?P<issue>[^)]*)\)\s*:\s*(?P<reason>.*?)\s*$"
 )
+
+
+class _MarkerError(ValueError):
+    """A comment has the write-gate-exempt marker shape but is malformed --
+    missing/non-numeric issue ref, or an empty reason.
+
+    Raised eagerly (not swallowed into "not a marker") so a malformed marker
+    fails loudly and specifically: a plain unmarked call would report as
+    merely unaccounted, which would hide that someone actually tried to add
+    an exemption and got the syntax wrong.
+    """
+
+
+@dataclass(frozen=True)
+class _ExemptionMarker:
+    """One parsed `write-gate-exempt` marker comment.
+
+    `path`/`lineno` locate the marker COMMENT itself (not the call it
+    exempts) -- `_resolve_exemptions` looks up the call on the very next
+    line. `issue` and `reason` are both guaranteed non-empty by construction:
+    a marker that reaches this dataclass already passed
+    `_parse_marker_comment`'s validation, which raises `_MarkerError`
+    otherwise.
+    """
+
+    path: str
+    lineno: int
+    issue: int
+    reason: str
+
+
+def _parse_marker_comment(line: str, *, path: str, lineno: int) -> _ExemptionMarker | None:
+    """Parse one source line as a write-gate-exempt marker.
+
+    Returns None if `line` isn't a marker comment at all -- the common case,
+    since most lines in src/charlie_work aren't. Raises `_MarkerError` if the
+    line IS a `# write-gate-exempt...` comment but doesn't match the required
+    `(issue=<N>): <reason>` shape, the issue ref isn't a positive integer, or
+    the reason is empty after stripping -- the acceptance criteria 'a marker
+    with no reason fails' and 'a marker with no issue ref fails', both
+    enforced the same way.
+    """
+    stripped = line.strip()
+    if not stripped.startswith("#"):
+        return None
+    body = stripped[1:].strip()
+    if not body.startswith(_MARKER_PREFIX):
+        return None
+    match = _MARKER_RE.match(line)
+    if match is None:
+        raise _MarkerError(
+            f"{path}:{lineno}: malformed write-gate-exempt marker -- expected "
+            f"'# write-gate-exempt(issue=<N>): <reason>', got {line.strip()!r}"
+        )
+    issue_text = match.group("issue").strip()
+    reason = match.group("reason").strip()
+    if not issue_text.isdigit():
+        raise _MarkerError(
+            f"{path}:{lineno}: write-gate-exempt marker issue ref must be a positive "
+            f"integer (got {issue_text!r}): {line.strip()!r}"
+        )
+    if not reason:
+        raise _MarkerError(
+            f"{path}:{lineno}: write-gate-exempt marker is missing a reason: {line.strip()!r}"
+        )
+    return _ExemptionMarker(path=path, lineno=lineno, issue=int(issue_text), reason=reason)
+
+
+def _scan_text_for_markers(
+    text: str, *, path: str
+) -> tuple[dict[int, _ExemptionMarker], list[str]]:
+    """Marker-scan one already-read module's source text.
+
+    Split out from `_scan_exemption_markers` (the tree-wide scan) so the
+    self-tests below can feed synthetic source directly without writing a
+    file to disk -- mirrors `_scan_module_for_raw_primitive_calls` being
+    exposed separately from `_scan_gated_mutator_layer` for the same reason.
+    Returns `({line number -> parsed marker}, [error message, ...])`; a
+    malformed marker is collected as an error rather than raising, so a
+    caller scanning many files can report every malformed marker at once.
+    """
+    module_markers: dict[int, _ExemptionMarker] = {}
+    errors: list[str] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        try:
+            marker = _parse_marker_comment(line, path=path, lineno=lineno)
+        except _MarkerError as exc:
+            errors.append(str(exc))
+            continue
+        if marker is not None:
+            module_markers[lineno] = marker
+    return module_markers, errors
+
+
+def _scan_exemption_markers(
+    root: Path,
+) -> tuple[dict[str, dict[int, _ExemptionMarker]], list[str]]:
+    """Walk every `.py` file under `root` (dynamically discovered, no
+    hardcoded module list -- mirrors `_scan_gated_mutator_layer`) and collect
+    every write-gate-exempt marker. Returns `({relative path -> {line number
+    -> marker}}, [error message, ...])`."""
+    markers: dict[str, dict[int, _ExemptionMarker]] = {}
+    errors: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        rel_path = path.relative_to(root).as_posix()
+        text = path.read_text(encoding="utf-8")
+        module_markers, module_errors = _scan_text_for_markers(text, path=rel_path)
+        errors.extend(module_errors)
+        if module_markers:
+            markers[rel_path] = module_markers
+    return markers, errors
+
+
+def _resolve_exemptions(
+    sites: list[_RawPrimitiveSite],
+    markers: dict[str, dict[int, _ExemptionMarker]],
+) -> tuple[set[tuple[str, str, str, str, int]], set[tuple[str, int]]]:
+    """Match each raw-call site to a marker on the line directly above it.
+
+    Returns `(exempted_keys, matched_marker_locations)`:
+    - `exempted_keys` is the set of `_RawPrimitiveSite.key` values that have
+      a valid marker immediately above them -- this replaces
+      `_ALLOWED_RAW_PRIMITIVE_SITES` everywhere it used to be consumed.
+    - `matched_marker_locations` is the `(path, lineno)` of every marker that
+      actually exempted a real site, used by `_stale_markers` to find
+      markers that exempted nothing.
+    """
+    exempted_keys: set[tuple[str, str, str, str, int]] = set()
+    matched: set[tuple[str, int]] = set()
+    for site in sites:
+        module_markers = markers.get(site.path)
+        if not module_markers:
+            continue
+        marker = module_markers.get(site.lineno - 1)
+        if marker is not None:
+            exempted_keys.add(site.key)
+            matched.add((site.path, marker.lineno))
+    return exempted_keys, matched
+
+
+def _stale_markers(
+    markers: dict[str, dict[int, _ExemptionMarker]],
+    matched: set[tuple[str, int]],
+) -> list[_ExemptionMarker]:
+    """Every marker that did not exempt any real raw-primitive-call site --
+    the call below it was removed, moved, or the marker was misplaced.
+    Mirrors the staleness direction the old `_ALLOWED_RAW_PRIMITIVE_SITES`
+    tuple enforced: a marker that matches nothing is a silent hole, not
+    inert dead weight."""
+    stale = [
+        marker
+        for module_markers in markers.values()
+        for lineno, marker in module_markers.items()
+        if (marker.path, lineno) not in matched
+    ]
+    return sorted(stale, key=lambda m: (m.path, m.lineno))
 
 
 # ---------------------------------------------------------------------------
@@ -1522,71 +1531,183 @@ def test_real_pr2_pr3_converted_sites_are_not_flagged() -> None:
     `_append_sweep_events` and both its callers, closing the R5 boundary.
     At this PR's base, `_detect_and_handle_stalled_reviews` is the ONLY
     scope in this module with any raw (non-gate-covered) call, and every
-    one of those is on the R4 allow-list -- if bucket (a)'s receiver-shape
-    check were subtly wrong against real repo formatting, or if R5's
-    completion had left a residual raw call, this module's unaccounted
-    count would be nonzero."""
+    one of those carries a write-gate-exempt marker -- if bucket (a)'s
+    receiver-shape check were subtly wrong against real repo formatting, or
+    if R5's completion had left a residual raw call, this module's
+    unaccounted count would be nonzero."""
     module_path = _SRC_ROOT / "stalled_review_reap.py"
     tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
     sites = _scan_module_for_raw_primitive_calls(tree, "stalled_review_reap.py")
 
     scopes_found = {s.scope for s in sites}
     assert scopes_found <= {"_detect_and_handle_stalled_reviews"}, (
-        f"unexpected raw call site outside the R4-allowlisted scope "
+        f"unexpected raw call site outside the R4-marked scope "
         f"(R5 completion should have closed _append_sweep_events): {sites}"
     )
-    allowed_keys = {e.key for e in _ALLOWED_RAW_PRIMITIVE_SITES}
-    non_allowlisted = [s for s in sites if s.key not in allowed_keys]
-    assert non_allowlisted == [], (
+    markers, marker_errors = _scan_exemption_markers(_SRC_ROOT)
+    assert not marker_errors, "malformed write-gate-exempt marker(s):\n" + "\n".join(marker_errors)
+    exempted_keys, _ = _resolve_exemptions(sites, markers)
+    non_exempted = [s for s in sites if s.key not in exempted_keys]
+    assert non_exempted == [], (
         f"expected zero unaccounted raw sites in stalled_review_reap.py post-PR3, "
-        f"found: {non_allowlisted}"
+        f"found: {non_exempted}"
     )
 
 
 def test_write_gate_allowlist_entries_are_not_stale() -> None:
     """Symmetric direction of the main enforcement check, mirroring
     test_instrumentation.py's `test_event_kind_registry_exhaustive` 'stale'
-    assertion: every _ALLOWED_RAW_PRIMITIVE_SITES entry must match a real
-    site found by today's scan. An entry that matches nothing is a silent
-    hole -- the code it was written to justify moved or changed, and the
-    allow-list is now lying about what it covers."""
-    sites = _scan_gated_mutator_layer(_SRC_ROOT)
-    found_keys = {s.key for s in sites}
+    assertion. Name kept from the pre-#1837 `_ALLOWED_RAW_PRIMITIVE_SITES`-tuple
+    era (a rename here reads as a deletion to the collect-only leaf-name
+    gate) even though the mechanism it now exercises is markers, not tuple
+    entries: every write-gate-exempt marker found in src/ must match a real
+    raw-primitive-call site on the line directly below it. A marker that
+    matches nothing is a silent hole -- the code it was written to justify
+    moved or changed, and the marker is now lying about what it covers."""
+    markers, marker_errors = _scan_exemption_markers(_SRC_ROOT)
+    assert not marker_errors, "malformed write-gate-exempt marker(s):\n" + "\n".join(marker_errors)
 
-    stale = [entry for entry in _ALLOWED_RAW_PRIMITIVE_SITES if entry.key not in found_keys]
+    sites = _scan_gated_mutator_layer(_SRC_ROOT)
+    _, matched = _resolve_exemptions(sites, markers)
+    stale = _stale_markers(markers, matched)
     assert not stale, (
-        "_ALLOWED_RAW_PRIMITIVE_SITES entry no longer matches any real raw call site -- "
-        "remove it or update it to match the current source:\n"
-        + "\n".join(f"  {e.path} in {e.scope}(): {e.primitive}(...)" for e in stale)
+        "write-gate-exempt marker(s) do not match any real raw call site on the line "
+        "directly below them -- remove the marker or move it to match the current source:\n"
+        + "\n".join(f"  {m.path}:{m.lineno} (issue={m.issue}): {m.reason}" for m in stale)
     )
 
 
 def test_write_gate_allowlist_staleness_check_detects_a_truly_dead_entry() -> None:
-    """Task requirement: 'Dead allow-list/exemption entries must FAIL the
-    test.' `test_write_gate_allowlist_entries_are_not_stale` above proves
-    the CURRENT real entries all still match (the correct-state case) --
-    this test is the positive control proving the staleness check itself
-    would actually catch a dead one, using the exact same logic against a
-    synthetic entry that cannot possibly match any real site."""
-    sites = _scan_gated_mutator_layer(_SRC_ROOT)
-    found_keys = {s.key for s in sites}
-
-    dead_entry = _RawPrimitiveSite(
-        path="stalled_review_reap.py",
-        scope="_detect_and_handle_stalled_reviews",
-        primitive="log_event",
-        call_source="log_event(state_file, 'this_call_source_does_not_exist_anywhere', {})",
+    """Task requirement: 'stale markers (no raw primitive call in the marked
+    statement) fail.' Name kept from the pre-#1837 tuple era for the same
+    collect-only leaf-name reason as the sibling test above.
+    `test_write_gate_allowlist_entries_are_not_stale` proves the CURRENT real
+    markers all still match (the correct-state case) -- this test is the
+    positive control proving the staleness check itself would actually catch
+    a dead one: a marker directly above a line that makes no raw primitive
+    call at all."""
+    source = textwrap.dedent(
+        """
+        def _do_something(state):
+            # write-gate-exempt(issue=1837): no longer matches anything below
+            return state
+        """
     )
-    assert dead_entry.key not in found_keys, (
-        "test premise violated: the synthetic dead entry unexpectedly matched a real site"
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+    assert sites == [], "test premise: the fixture makes no raw primitive call at all"
+
+    module_markers, errors = _scan_text_for_markers(source, path="synthetic_fixture.py")
+    assert errors == []
+    markers = {"synthetic_fixture.py": module_markers}
+    _, matched = _resolve_exemptions(sites, markers)
+    stale = _stale_markers(markers, matched)
+
+    assert len(stale) == 1, f"expected exactly the seeded dead marker to be stale: {stale}"
+    assert stale[0].issue == 1837
+
+
+# ---------------------------------------------------------------------------
+# write-gate-exempt marker mechanics (issue #1837).
+# ---------------------------------------------------------------------------
+
+
+def test_marker_scanner_detects_a_seeded_exemption() -> None:
+    """A valid write-gate-exempt marker directly above a raw call exempts
+    exactly that call -- the seeded-violation positive control for the
+    marker mechanism, mirroring `test_scanner_detects_a_seeded_bare_primitive_call`."""
+    source = textwrap.dedent(
+        """
+        def _do_something(state):
+            # write-gate-exempt(issue=1837): condensed reason text
+            state = append_event(state, "some_kind", {"x": 1})
+            return state
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+    module_markers, errors = _scan_text_for_markers(source, path="synthetic_fixture.py")
+    assert errors == []
+    markers = {"synthetic_fixture.py": module_markers}
+
+    assert len(sites) == 1
+    exempted_keys, matched = _resolve_exemptions(sites, markers)
+    assert sites[0].key in exempted_keys
+    assert matched == {("synthetic_fixture.py", sites[0].lineno - 1)}
+
+
+def test_marker_scanner_requires_a_reason() -> None:
+    """Acceptance criterion: a marker with no reason fails -- raised as a
+    `_MarkerError`, not silently ignored (which would just make the call
+    below it unaccounted, hiding that someone tried and typo'd the marker)."""
+    with pytest.raises(_MarkerError, match="reason"):
+        _parse_marker_comment(
+            "    # write-gate-exempt(issue=1837):", path="synthetic_fixture.py", lineno=1
+        )
+
+
+def test_marker_scanner_requires_a_numeric_issue_ref() -> None:
+    """Acceptance criterion: a marker with a missing/non-numeric issue ref
+    fails the same way an empty reason does."""
+    with pytest.raises(_MarkerError, match="issue ref"):
+        _parse_marker_comment(
+            "    # write-gate-exempt(issue=): some reason", path="synthetic_fixture.py", lineno=1
+        )
+    with pytest.raises(_MarkerError):
+        _parse_marker_comment(
+            "    # write-gate-exempt: missing parens entirely",
+            path="synthetic_fixture.py",
+            lineno=1,
+        )
+
+
+def test_marker_scanner_ignores_non_marker_comments() -> None:
+    """Negative control: an ordinary comment (including one that happens to
+    mention the marker prefix in prose, or trails a code line) is not a
+    marker and raises nothing."""
+    assert (
+        _parse_marker_comment(
+            "    # this write-gate change needs review", path="synthetic_fixture.py", lineno=1
+        )
+        is None
+    )
+    assert (
+        _parse_marker_comment(
+            "    state = 1  # write-gate-exempt(issue=1): not a standalone comment line",
+            path="synthetic_fixture.py",
+            lineno=1,
+        )
+        is None
     )
 
-    stale = [
-        entry
-        for entry in (*_ALLOWED_RAW_PRIMITIVE_SITES, dead_entry)
-        if entry.key not in found_keys
-    ]
-    assert dead_entry in stale, "the staleness check did not flag the seeded dead entry"
+
+def test_marker_scanner_exempts_only_the_occurrence_directly_below_it() -> None:
+    """Two identical-shaped raw calls in the same scope (the dominant real
+    shape per the occurrence-index discipline) -- marking only the first
+    must exempt only that occurrence, leaving the second unaccounted."""
+    source = textwrap.dedent(
+        """
+        def _do_something(state):
+            # write-gate-exempt(issue=1837): first call is fine
+            state = save_state(path, state)
+            state["a"] = 1
+            state = save_state(path, state)
+            return state
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+    module_markers, errors = _scan_text_for_markers(source, path="synthetic_fixture.py")
+    assert errors == []
+    markers = {"synthetic_fixture.py": module_markers}
+
+    assert len(sites) == 2
+    exempted_keys, _ = _resolve_exemptions(sites, markers)
+    exempted = [s for s in sites if s.key in exempted_keys]
+    unaccounted = [s for s in sites if s.key not in exempted_keys]
+    assert len(exempted) == 1
+    assert len(unaccounted) == 1
+    assert exempted[0].occurrence != unaccounted[0].occurrence
 
 
 def test_ratchet_passes_when_module_count_holds_or_shrinks() -> None:
@@ -1628,7 +1749,8 @@ def test_ratchet_treats_a_brand_new_module_as_baseline_zero() -> None:
 # Two independent checks, both fail-closed, together covering every raw
 # call to a gated primitive in src/charlie_work:
 #   1. Every IN-PREDICATE site (its enclosing function uses WriteGate) must
-#      be gate-routed or on the R4 allow-list -- zero tolerance, no ratchet.
+#      be gate-routed or carry a write-gate-exempt marker -- zero tolerance,
+#      no ratchet.
 #   2. Every OUT-OF-PREDICATE module's raw-call count must not exceed its
 #      recorded tests/baselines/write_gate/ entry -- shrink or hold only.
 # ---------------------------------------------------------------------------
@@ -1636,23 +1758,26 @@ def test_write_gate_no_unaccounted_raw_primitive_calls() -> None:
     """The PR4 keystone. Fails loudly, naming every offending site or
     module, otherwise."""
     sites = _scan_gated_mutator_layer(_SRC_ROOT)
-    allowed_keys = {entry.key for entry in _ALLOWED_RAW_PRIMITIVE_SITES}
+    markers, marker_errors = _scan_exemption_markers(_SRC_ROOT)
+    assert not marker_errors, "malformed write-gate-exempt marker(s):\n" + "\n".join(marker_errors)
+    exempted_keys, _ = _resolve_exemptions(sites, markers)
 
     in_predicate_unaccounted = [
-        site for site in sites if site.in_predicate and site.key not in allowed_keys
+        site for site in sites if site.in_predicate and site.key not in exempted_keys
     ]
     assert not in_predicate_unaccounted, (
         "Raw (un-gated) call(s) to a WriteGate primitive found inside a function that "
         "itself uses WriteGate (issue #1264 R9's exclusive-use predicate). Route through "
         "self.write_gate.<method>(...) (Convention A) or an explicit write_gate: WriteGate "
-        "parameter validated by require_write_gate() (Convention B), or add a reasoned "
-        "_ALLOWED_RAW_PRIMITIVE_SITES entry if this site is deliberately raw by design:\n"
+        "parameter validated by require_write_gate() (Convention B), or add a "
+        "`# write-gate-exempt(issue=<N>): <reason>` marker on the line directly above the "
+        "call if this site is deliberately raw by design:\n"
         + _format_inventory(in_predicate_unaccounted)
     )
 
     out_of_predicate_counts: dict[str, int] = {}
     for site in sites:
-        if site.in_predicate or site.key in allowed_keys:
+        if site.in_predicate or site.key in exempted_keys:
             continue
         out_of_predicate_counts[site.path] = out_of_predicate_counts.get(site.path, 0) + 1
 
