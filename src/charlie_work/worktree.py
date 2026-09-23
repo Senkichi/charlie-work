@@ -35,6 +35,7 @@ from .config import (
     WRITER_MARKER_FILENAME,
 )
 from . import git_pull_blockers
+from .git_retry import run_git_with_retry
 from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS, WORKTREE_PR_HEAD_FIELDS
 from .issue_linking import linked_issue_number
 from .janitor import _calculate_patch_id
@@ -80,11 +81,33 @@ def _run_remote_captured(
     sites even though they never asked for extra env vars.
     """
     kwargs: dict[str, Any] = {"extra_env": extra_env} if extra_env else {}
-    result = run_captured(command, cwd=cwd, timeout_seconds=_REMOTE_TIMEOUT_SECONDS, **kwargs)
+
+    def _invoke(cmd: list[str], *, cwd: Path, timeout_seconds: int) -> RunResult:
+        return run_captured(cmd, cwd=cwd, timeout_seconds=timeout_seconds, **kwargs)
+
+    # Issue #1778: every command routed through this chokepoint is a
+    # read-only/idempotent remote call (``git fetch``, ``git ls-remote``), so
+    # ``run_git_with_retry``'s shared transient-network classifier applies --
+    # a TLS/connection blip is retried in place rather than collapsing into
+    # the same failure value as "branch genuinely missing" on the
+    # phantom-reap ``ls-remote`` probes. ``run_command`` is bound explicitly
+    # (never defaulted) so the ``worktree.run_captured`` monkeypatch seam the
+    # existing suite relies on keeps intercepting these calls; the default
+    # would resolve ``subprocess_runner.run_captured`` instead.
+    result = run_git_with_retry(
+        command,
+        cwd=cwd,
+        timeout_seconds=_REMOTE_TIMEOUT_SECONDS,
+        run_command=_invoke,
+    )
     # Retry once on timeout: a transient network stall should not permanently
-    # block reclaim of a pristine worktree.
+    # block reclaim of a pristine worktree. ``run_git_with_retry`` never
+    # retries a bare timeout itself -- "command timed out after Ns" matches
+    # none of the shared allowlist's substrings, and a stalled connection
+    # often produces no classifiable stderr at all -- so this pre-existing
+    # second attempt stays layered on top of it.
     if result.timed_out:
-        result = run_captured(command, cwd=cwd, timeout_seconds=_REMOTE_TIMEOUT_SECONDS, **kwargs)
+        result = _invoke(command, cwd=cwd, timeout_seconds=_REMOTE_TIMEOUT_SECONDS)
     return result
 
 
@@ -4007,6 +4030,11 @@ def remove_worktree(
          short backoff, then retry the whole-tree rmtree once more.
       6. Verify the directory is actually gone; if not, report failure and
          log the worker-tmp dir explicitly when it is still the reason.
+         When the fallback (not ``git worktree remove`` itself) removed the
+         directory, run ``git worktree prune`` again: the pre-fallback prune
+         found nothing prunable while the directory still looked live, and a
+         stale admin entry left behind would block ``git branch -D`` with
+         "cannot delete branch ... used by worktree at ..." (issue #1786).
       7. If ``branch`` is provided, delete the branch with ``git branch -D``.
 
     Returns False for expected failures (real .venv dir without force, git
@@ -4086,6 +4114,16 @@ def remove_worktree(
                 worktree_path,
                 lingering_tmp_dir,
             )
+
+    if not git_result_ok and worktree_removed:
+        # Issue #1786: the prune above ran before the rmtree fallback, while
+        # the directory still existed and looked live, so it cleared nothing.
+        # Prune again now that the fallback actually removed the tree -- the
+        # stale "prunable" admin entry would otherwise survive to block
+        # ``git branch -D`` below, leaking the branch behind a false failure.
+        run_captured(
+            ["git", "worktree", "prune"], cwd=repo_root, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS
+        )
 
     # Delete the branch if provided (to prevent branch leaks on launch failure)
     # Attempt branch deletion independently of worktree-removal success to avoid

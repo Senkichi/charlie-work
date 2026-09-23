@@ -110,6 +110,42 @@ def _isolate_fleet_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.fixture(autouse=True)
+def _isolate_git_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate git invocations under ``tmp_path`` from any *enclosing* repo.
+
+    Worker sandboxes redirect ``TEMP``/``TMP`` into a worktree-local dir, so
+    pytest's ``tmp_path`` can sit *inside* this repo's worktree. Without a
+    ceiling, ``git`` commands run with a ``tmp_path``-relative ``cwd`` (the
+    gate's ``git check-ignore``/``git ls-files``, and tests' own ``git``
+    calls) ascend past ``tmp_path`` and discover the *enclosing* worktree:
+    candidates classify as gitignored by an unrelated repo's ``.var/`` rule,
+    and ``ls-files`` lists the wrong repository entirely — the plain-pytest
+    failures the suite documents as environmental.
+
+    The ceiling is anchored at ``tmp_path.parent`` (the per-run basetemp),
+    not ``tmp_path`` itself: git examines ``cwd`` before ascending, so a
+    ``tmp_path`` that is itself a git repo still resolves, while nothing
+    above the basetemp — the enclosing worktree, ``%TEMP%``, ``%HOME%`` —
+    is ever consulted. ``tempfile.gettempdir()`` is ceilinged too so repos
+    created via ``tempfile.mkdtemp()`` (outside basetemp) get the same
+    isolation under a redirected ``TEMP``.
+
+    ``core.longpaths`` is enabled for every git child so object reads/writes
+    succeed at the depth a long worktree name plus pytest's basetemp impose
+    (``.git/objects/...`` paths past ``MAX_PATH`` fail with "Filename too
+    long"); injected via the ``GIT_CONFIG_*`` env mechanism so it also
+    covers ``git`` spawned by production code, not just tests' own calls.
+    """
+    monkeypatch.setenv(
+        "GIT_CEILING_DIRECTORIES",
+        os.pathsep.join([str(tmp_path.parent), _tempfile_module.gettempdir()]),
+    )
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.longpaths")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+
+
+@pytest.fixture(autouse=True)
 def _redirect_temp_dir_for_touch_repo_backstop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

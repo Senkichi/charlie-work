@@ -41,6 +41,14 @@ from .issue_linking import linked_issue_number
 #: first seen, or when its fingerprint changes.
 UNLINKED_PR_SKIPPED_EVENT_KIND = "pr_unlinked_skipped"
 
+#: Event kind recorded when a PR that carried ``unlinked_pr_notice`` resolves
+#: a linked issue on a later pass -- the falling edge the rising-edge-only
+#: detector below cannot see, because ``compute_unlinked_pr_transition`` is
+#: only ever invoked for PRs that are STILL issue-less (issue #1781).
+#: Info-level, sibling to ``foreign_issue_ref_cleared``: this is the self-heal
+#: completing, not a new fault.
+UNLINKED_PR_RESOLVED_EVENT_KIND = "pr_unlinked_resolved"
+
 #: Key under ``state["prs"][str(pr_number)]`` holding this PR's persisted
 #: edge-detector marker (``first_seen_at`` / ``last_fingerprint`` /
 #: ``last_emitted_at``). Mirrors the ``foreign_issue_ref`` marker's placement
@@ -193,6 +201,57 @@ def compute_unlinked_pr_transition(
         "previous_state": previous_fingerprint,
     }
     return new_marker, event_extra
+
+
+def compute_unlinked_pr_resolutions(
+    state_prs: dict[str, Any],
+    linked_prs: dict[int, int],
+    *,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """The falling edge ``compute_unlinked_pr_transition`` cannot see.
+
+    The transition detector is only invoked for PRs that are *still*
+    issue-less this pass, so a PR that newly resolves a linked issue (an
+    operator edits the body to add ``Closes #N``, a closing-keyword comment
+    is retrofitted, ...) never re-enters it -- and nothing else ever touches
+    its persisted ``unlinked_pr_notice`` marker, which would otherwise sit
+    orphaned under ``state["prs"][<n>]`` forever (issue #1781). This helper
+    is the diff half of the fix.
+
+    ``linked_prs`` maps every PR number that resolved an issue this pass to
+    that issue number -- the merge lane's ``issue_number is not None`` set,
+    including parked/foreign-ref PRs, because the marker tracks issue
+    *resolution*, not what the lane did with the PR afterward. Returns one
+    event-payload dict per PR whose standing marker is now stale, sorted by
+    PR number so the caller emits deterministically. Each payload carries
+    ``first_seen_at`` / ``observed_days`` read from the marker being evicted
+    so the ``pr_unlinked_resolved`` event preserves how long the PR stood
+    issue-less -- the same fields the rising-edge event carries.
+
+    Markers on PRs absent from ``linked_prs`` are untouched by design: a
+    still-issue-less PR keeps its baseline, and a PR that left the open-PR
+    list entirely (merged/closed while still issue-less) orphans its marker
+    the same way ``foreign_issue_ref`` and the other per-PR marker keys
+    already do -- permanent, bounded, one small entry per PR that ever went
+    issue-less.
+    """
+    resolutions: list[dict[str, Any]] = []
+    for pr_number in sorted(linked_prs):
+        pr_state = state_prs.get(str(pr_number)) or {}
+        marker = pr_state.get(UNLINKED_PR_NOTICE_KEY)
+        if marker is None:
+            continue
+        first_seen_at = marker.get("first_seen_at") if isinstance(marker, dict) else None
+        resolutions.append(
+            {
+                "pr_number": pr_number,
+                "issue_number": linked_prs[pr_number],
+                "first_seen_at": first_seen_at,
+                "observed_days": _observed_days_since(first_seen_at, now),
+            }
+        )
+    return resolutions
 
 
 def summarize_unlinked_prs(
