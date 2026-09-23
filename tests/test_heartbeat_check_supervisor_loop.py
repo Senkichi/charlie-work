@@ -337,4 +337,81 @@ def test_check_loop_pass_freshness_recent_iso_row_not_misjudged_stale(
     _write_events_db(repo.state_dir, [(_iso(2), "loop_started")])
     report = hb.Report()
     hb.check_loop_pass_freshness(report, repo)
-    assert not report.anomaly, report.lines
+
+
+# ---------------------------------------------------------------------------
+# Wedge-kill loop detection (issue #1832)
+# ---------------------------------------------------------------------------
+
+
+def test_check_wedge_kill_loop_ok_when_no_fleet_events_db(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """No fleet events.db yet (fresh install) is OK, not an anomaly."""
+    _set_fleet_dir(hb, monkeypatch, tmp_path)
+    report = hb.Report()
+    hb.check_wedge_kill_loop(report)
+    assert not report.anomaly
+
+
+def test_check_wedge_kill_loop_ok_when_no_wedge_loop_event(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A fleet events.db with unrelated events (no supervisor_wedge_loop) is OK."""
+    fleet_dir = _set_fleet_dir(hb, monkeypatch, tmp_path)
+    _write_events_db(
+        fleet_dir,
+        [
+            (_iso(5), "supervisor_started"),
+            (_iso(4), "fleet_pass_completed"),
+            (_iso(3), "supervisor_wedged_killed", "error"),
+        ],
+    )
+    report = hb.Report()
+    hb.check_wedge_kill_loop(report)
+    assert not report.anomaly
+
+
+def test_check_wedge_kill_loop_anomaly_when_recent_event(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A recent supervisor_wedge_loop event is its own distinct ANOMALY."""
+    fleet_dir = _set_fleet_dir(hb, monkeypatch, tmp_path)
+    _write_events_db(
+        fleet_dir,
+        [
+            (_iso(120), "supervisor_wedged_killed", "error"),
+            (_iso(90), "supervisor_wedged_killed", "error"),
+            (_iso(60), "supervisor_wedged_killed", "error"),
+            (_iso(30), "supervisor_wedge_loop", "error"),
+        ],
+    )
+    report = hb.Report()
+    hb.check_wedge_kill_loop(report)
+    assert report.anomaly
+    assert "supervisor_wedge_loop" in report.lines[0]
+    assert "wedge-kill backstop is looping" in report.lines[0]
+
+
+def test_check_wedge_kill_loop_ignores_event_outside_lookback_window(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A supervisor_wedge_loop event older than the lookback window does not alarm forever."""
+    fleet_dir = _set_fleet_dir(hb, monkeypatch, tmp_path)
+    old_ts = _iso(60 * (hb.SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS + 1))
+    _write_events_db(fleet_dir, [(old_ts, "supervisor_wedge_loop", "error")])
+    report = hb.Report()
+    hb.check_wedge_kill_loop(report)
+    assert not report.anomaly
+
+
+def test_check_wedge_kill_loop_anomaly_on_unreadable_db(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    fleet_dir = _set_fleet_dir(hb, monkeypatch, tmp_path)
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    (fleet_dir / "events.db").write_text("not a sqlite file", encoding="utf-8")
+    report = hb.Report()
+    hb.check_wedge_kill_loop(report)
+    assert report.anomaly
+    assert "unreadable" in report.lines[0]
