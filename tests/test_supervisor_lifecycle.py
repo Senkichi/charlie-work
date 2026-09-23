@@ -14,19 +14,25 @@ from typing import Any
 
 import pytest
 
-from charlie_work.instrumentation import close_db, query_events
+from charlie_work.instrumentation import close_db, log_event, query_events
 from charlie_work.supervisor_lifecycle import (
+    FLEET_PASS_COMPLETED,
     HEARTBEAT_FILENAME,
     SUPERVISOR_EXITED,
     SUPERVISOR_STARTED,
+    SUPERVISOR_WEDGE_LOOP,
     detect_prior_abnormal_exit,
+    detect_wedge_kill_loop,
     is_exit_alertable,
+    record_fleet_pass_completed,
     record_prior_abnormal_exit,
     record_supervisor_exit,
     record_supervisor_started,
+    record_wedge_kill_loop,
     supervisor_heartbeat_path,
     update_supervisor_heartbeat,
 )
+from charlie_work.wedge_watchdog import WEDGE_KILL_EVENT_KIND
 
 
 def _iso(dt: datetime) -> str:
@@ -420,3 +426,107 @@ def test_record_supervisor_started_swallows_event_log_failure(
     # The heartbeat sidecar is still written even though the event log failed.
     hb = json.loads(_heartbeat_file(tmp_path / "fleet").read_text(encoding="utf-8"))
     assert hb["pid"] == 12345
+
+
+def test_record_supervisor_started_stamps_wedge_kill_loop_alarm(tmp_path: Path) -> None:
+    """Issue #1832: the configured alarm threshold is stamped into the heartbeat.
+
+    ``scripts/heartbeat_check.py`` deliberately never imports
+    ``charlie_work.config``, so it cannot read ``SupervisorConfig`` directly --
+    the heartbeat sidecar is the only channel a config-free reader has.
+    """
+    fleet_dir = str(tmp_path / "fleet")
+    record_supervisor_started(
+        fleet_dir,
+        pid=12345,
+        started_at=STARTED_AT,
+        full_pass_interval_seconds=300,
+        wedge_kill_loop_alarm=5,
+    )
+    hb = json.loads(_heartbeat_file(tmp_path / "fleet").read_text(encoding="utf-8"))
+    assert hb["wedge_kill_loop_alarm"] == 5
+    events = query_events(supervisor_heartbeat_path(fleet_dir), kind=SUPERVISOR_STARTED)
+    assert events[0]["payload"]["wedge_kill_loop_alarm"] == 5
+
+
+def test_record_fleet_pass_completed_writes_event(tmp_path: Path) -> None:
+    fleet_dir = str(tmp_path / "fleet")
+    record_fleet_pass_completed(fleet_dir, pass_number=3, outcome="ok")
+    events = query_events(supervisor_heartbeat_path(fleet_dir), kind=FLEET_PASS_COMPLETED)
+    assert len(events) == 1
+    assert events[0]["payload"] == {"pass_number": 3, "outcome": "ok"}
+
+
+def test_detect_wedge_kill_loop_disabled_at_zero_threshold(tmp_path: Path) -> None:
+    fleet_dir = str(tmp_path / "fleet")
+    path = supervisor_heartbeat_path(fleet_dir)
+    for _ in range(5):
+        log_event(path, WEDGE_KILL_EVENT_KIND, {}, repo="fleet")
+    assert detect_wedge_kill_loop(fleet_dir, threshold=0) is None
+
+
+def test_detect_wedge_kill_loop_no_events_returns_none(tmp_path: Path) -> None:
+    fleet_dir = str(tmp_path / "fleet")
+    assert detect_wedge_kill_loop(fleet_dir, threshold=3) is None
+
+
+def test_detect_wedge_kill_loop_fires_exactly_at_threshold(tmp_path: Path) -> None:
+    """Issue #1832: three consecutive kills with no completed pass in between."""
+    fleet_dir = str(tmp_path / "fleet")
+    path = supervisor_heartbeat_path(fleet_dir)
+    for _ in range(3):
+        log_event(path, WEDGE_KILL_EVENT_KIND, {"reason": "stale_beat"}, repo="fleet")
+
+    detection = detect_wedge_kill_loop(fleet_dir, threshold=3)
+    assert detection is not None
+    assert detection["count"] == 3
+    assert detection["threshold"] == 3
+    assert detection["since_pass_completed_at"] is None
+
+
+def test_detect_wedge_kill_loop_does_not_refire_past_threshold(tmp_path: Path) -> None:
+    """Issue #1832: fires once, at the pass the streak reaches the cap -- not every kill past it."""
+    fleet_dir = str(tmp_path / "fleet")
+    path = supervisor_heartbeat_path(fleet_dir)
+    for _ in range(4):
+        log_event(path, WEDGE_KILL_EVENT_KIND, {}, repo="fleet")
+
+    assert detect_wedge_kill_loop(fleet_dir, threshold=3) is None
+
+
+def test_detect_wedge_kill_loop_resets_after_completed_pass(tmp_path: Path) -> None:
+    """Issue #1832: a fleet_pass_completed event between kills breaks the streak.
+
+    Two kills, then a completed pass, then two more kills: only the two
+    most recent count -- the streak reset the moment a pass recovered.
+    """
+    fleet_dir = str(tmp_path / "fleet")
+    path = supervisor_heartbeat_path(fleet_dir)
+    log_event(path, WEDGE_KILL_EVENT_KIND, {}, repo="fleet")
+    log_event(path, WEDGE_KILL_EVENT_KIND, {}, repo="fleet")
+    log_event(path, FLEET_PASS_COMPLETED, {"pass_number": 1, "outcome": "ok"}, repo="fleet")
+    log_event(path, WEDGE_KILL_EVENT_KIND, {}, repo="fleet")
+    log_event(path, WEDGE_KILL_EVENT_KIND, {}, repo="fleet")
+
+    assert detect_wedge_kill_loop(fleet_dir, threshold=4) is None
+    detection = detect_wedge_kill_loop(fleet_dir, threshold=2)
+    assert detection is not None
+    assert detection["count"] == 2
+    assert detection["since_pass_completed_at"] is not None
+
+
+def test_record_wedge_kill_loop_writes_event(tmp_path: Path) -> None:
+    fleet_dir = str(tmp_path / "fleet")
+    detection = {
+        "count": 3,
+        "threshold": 3,
+        "since_pass_completed_at": None,
+        "first_kill_at": "2026-01-01T00:00:00Z",
+        "last_kill_at": "2026-01-01T00:10:00Z",
+    }
+    payload = record_wedge_kill_loop(fleet_dir, detection)
+    assert payload == detection
+    events = query_events(supervisor_heartbeat_path(fleet_dir), kind=SUPERVISOR_WEDGE_LOOP)
+    assert len(events) == 1
+    assert events[0]["payload"]["count"] == 3
+    assert events[0]["level"] == "error"
