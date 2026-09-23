@@ -31,11 +31,11 @@ Scope, deliberately narrow -- callers must not point this at anything else:
   the classifier, not by a second check here.
 - ``worktree.py``'s ``_run_remote_captured`` -- the repo's own chokepoint
   fronting ~15 more read-only ``git fetch``/``git ls-remote`` call sites,
-  including the phantom-reap ``ls-remote`` probes -- is deliberately not
-  wrapped by this landing either; it hits the identical failure class over
-  the identical network path and is exactly the kind of call this primitive
-  is for, but wiring it is scoped out as its own focused change (issue
-  #1778) rather than folded into this one.
+  including the phantom-reap ``ls-remote`` probes -- was wired in a follow-up
+  landing (issue #1778): it runs this primitive around ``run_captured`` with
+  its own ``_REMOTE_TIMEOUT_SECONDS``, keeping its pre-existing
+  retry-once-on-timeout second chance layered on top (a bare timeout has no
+  classifiable stderr, so the loop below would never retry one itself).
 """
 
 from __future__ import annotations

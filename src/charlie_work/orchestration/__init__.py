@@ -28,6 +28,16 @@ object registered in ``sys.modules`` and resolves the attribute at call time).
 Correspondingly, this package must never import ``charlie_work.workflow`` at
 package-import time -- importing ``charlie_work.orchestration`` must not pull in
 ``charlie_work.workflow``.
+
+Partial-module guard (issue #1798): importing a submodule of this package
+*before* ``charlie_work.workflow`` suspends the submodule at its own
+``import charlie_work.workflow as _wf`` line while workflow's module-level
+``discover_delegate_modules()`` runs; discovery would otherwise see only the
+names bound above that line and silently drop every ``def`` below it from
+``OrchestratorApp``. ``workflow_delegation._assert_fully_initialized`` detects
+the incomplete namespace and raises ``ImportError`` instead -- so the
+import-order violation fails loudly at import time rather than surfacing as a
+missing ``OrchestratorApp`` attribute.
 """
 
 from __future__ import annotations

@@ -769,6 +769,50 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
         ),
         in_predicate=False,
     ),
+    # Issue #1505: outer defense-in-depth around
+    # `self._maybe_report_outbound_secret_refusals()`, added inside
+    # `_loop_impl` immediately alongside the `operator_queue_impact_check_failed`
+    # sibling directly above -- same function, same reasoning. Routing it
+    # through `self.write_gate.log_event(...)` would flip `_loop_impl` into
+    # R9's in-predicate exclusive-use bucket, flagging every other raw
+    # telemetry site in that function as violations -- an out-of-scope
+    # conversion of a function this wave never targets. `in_predicate=False`
+    # matches the real scan.
+    _RawPrimitiveSite(
+        path="orchestration/instrumentation_ops.py",
+        scope="_loop_impl",
+        primitive="log_event",
+        call_source=(
+            "log_event(self.paths.state_file, "
+            "'outbound_secret_refusal_report_failed', "
+            "{'error': f'{type(exc).__name__}: {exc}'}, "
+            "repo=self.repo_root.name, correlation_id=cid, level='warning')"
+        ),
+        in_predicate=False,
+    ),
+    # Issue #1505: `outbound_body_guard.check_outbound_write` is the shared
+    # chokepoint the GitHub write surfaces (`pr_create`, `issue_comment`,
+    # `pr_comment` on both the gh-backed client and the local-file backend)
+    # call before any body text leaves the process. The refusal event it
+    # emits is exactly the case `instrumentation.log_event`'s own docstring
+    # prescribes: "for events outside state-lock contexts ... call
+    # log_event() directly" -- the GitHub client layer has no WriteGate
+    # (WriteGate is an OrchestratorApp-owned serialization object, and the
+    # client is deliberately constructible without one: tests and
+    # `github_client_for` build it bare), and the write runs outside any
+    # state-lock context by construction. Threading a WriteGate through the
+    # GitHubLike surface to gate this one telemetry call would be an
+    # out-of-scope refactor of the client's construction contract.
+    # `in_predicate=False` matches the real scan: `check_outbound_write`
+    # makes no `self.write_gate.*`/`write_gate.*` call and takes no
+    # `write_gate` parameter.
+    _RawPrimitiveSite(
+        path="outbound_body_guard.py",
+        scope="check_outbound_write",
+        primitive="log_event",
+        call_source=("log_event(state_path, REFUSAL_EVENT_KIND, payload, repo=repo_root.name)"),
+        in_predicate=False,
+    ),
     # Issue #1374 AC3: `emit_preflight_refusal` (preflight.py) is the
     # best-effort refusal emitter for FATAL preflight failures (disk full,
     # clock skew, venv drift). Its documented contract is "must never
@@ -806,6 +850,98 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
         primitive="log_event",
         call_source=(
             "log_event_fn(state_path, 'loop_refused_preflight', payload, repo=repo, level='error')"
+        ),
+        in_predicate=False,
+    ),
+    # Issue #1833: note_circuit_breaker_result is the per-pass circuit
+    # breaker's trip/reset event emitter (github_circuit_opened/
+    # github_circuit_closed), a free function in circuit_breaker_transport.py
+    # (moved out of transport.py's now-deleted Transport._emit_circuit_event
+    # to keep transport.py under the file-size ratchet cap -- issue #1442).
+    # Same disposition as the outbound_body_guard.py entry above and for the
+    # identical reason: the GitHub client layer has no WriteGate (WriteGate
+    # is an OrchestratorApp-owned serialization object; Transport/GitHub are
+    # deliberately constructible without one), and the breaker's state lives
+    # on the GitHub instance, not behind any state-lock. Threading a
+    # WriteGate through the GitHubLike surface for these two telemetry calls
+    # would be the same out-of-scope construction-contract refactor the
+    # #1505 entry above declines. `in_predicate=False` matches the real
+    # scan: `note_circuit_breaker_result` makes no
+    # `self.write_gate.*`/`write_gate.*` call and takes no `write_gate`
+    # parameter (it is not even a method -- a plain module-level function).
+    _RawPrimitiveSite(
+        path="github_capabilities/circuit_breaker_transport.py",
+        scope="note_circuit_breaker_result",
+        primitive="log_event",
+        call_source="log_event(state_path, 'github_circuit_opened', payload)",
+        in_predicate=False,
+    ),
+    _RawPrimitiveSite(
+        path="github_capabilities/circuit_breaker_transport.py",
+        scope="note_circuit_breaker_result",
+        primitive="log_event",
+        call_source="log_event(state_path, 'github_circuit_closed', payload)",
+        in_predicate=False,
+    ),
+    # Issue #1832: `fleet_loop()`, `_touch_registry_last_seen()`,
+    # `record_fleet_pass_completed()`, and `record_wedge_kill_loop()` are
+    # new bookkeeping/observability call sites in fleet_dispatch.py and
+    # supervisor_lifecycle.py, neither of which has begun issue #1264's
+    # WriteGate conversion wave: every sibling `log_event`/`save_state`
+    # call already in these same files and scopes (e.g. `fleet_loop`'s
+    # pre-existing `fleet_registry_stale_entry`/`fleet_lane_completed`
+    # calls, `_prune_stale_registry_entries`'s sibling `save_state`,
+    # `record_supervisor_started`'s `log_event`) remains raw and is part
+    # of the per-module shrink-only baseline, not gated. None of the four
+    # functions below takes a `write_gate` parameter, and their callers
+    # (`run_fleet_supervise`, the per-repo loop body) pass none either --
+    # threading one through the whole supervisor-pass call chain for a
+    # targeted in-pass-deadline bugfix would be the out-of-scope refactor
+    # `instrumentation.log_event`'s own docstring warns against, not the
+    # minimal fix. This matches the documented standalone-function pattern
+    # (CLAUDE.md: "For events outside state-lock contexts ... call
+    # log_event() directly from instrumentation.py") and the
+    # `outbound_body_guard.py`/`preflight.py` entries' reasoning above.
+    # `in_predicate=False` matches the real scan: none of these four
+    # scopes makes a `self.write_gate.*`/`write_gate.*` call or takes a
+    # `write_gate` parameter.
+    _RawPrimitiveSite(
+        path="fleet_dispatch.py",
+        scope="_touch_registry_last_seen",
+        primitive="save_state",
+        call_source="save_state(fleet_json_path, data)",
+        in_predicate=False,
+    ),
+    _RawPrimitiveSite(
+        path="fleet_dispatch.py",
+        scope="fleet_loop",
+        primitive="log_event",
+        call_source=(
+            "log_event(fleet_state_path, 'fleet_pass_deadline_deferred', "
+            "{'deadline_seconds': deadline_seconds, 'elapsed_seconds': "
+            "pass_clock() - pass_started_at, 'deferred_repo_keys': "
+            "deferred_repo_keys, 'deferred_autoscale_prologue': "
+            "deferred_autoscale_prologue})"
+        ),
+        in_predicate=False,
+    ),
+    _RawPrimitiveSite(
+        path="supervisor_lifecycle.py",
+        scope="record_fleet_pass_completed",
+        primitive="log_event",
+        call_source=(
+            "log_event(path, FLEET_PASS_COMPLETED, {'pass_number': pass_number, "
+            "'outcome': outcome}, repo=_FLEET_REPO)"
+        ),
+        in_predicate=False,
+    ),
+    _RawPrimitiveSite(
+        path="supervisor_lifecycle.py",
+        scope="record_wedge_kill_loop",
+        primitive="log_event",
+        call_source=(
+            "log_event(supervisor_heartbeat_path(fleet_dir_override), "
+            "SUPERVISOR_WEDGE_LOOP, payload, repo=_FLEET_REPO)"
         ),
         in_predicate=False,
     ),

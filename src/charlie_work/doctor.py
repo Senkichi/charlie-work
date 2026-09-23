@@ -18,6 +18,7 @@ from typing import Any
 import yaml
 
 from .config import ApiWorkerConfig, OrchestratorConfig
+from .doctor_local_backend import _check_local_issue_backend
 from .env_sanitize import worker_github_token_findings
 from .fleet_paths import fleet_dir, fleet_dir_virtualization
 from .fleet_registry import _load_registry
@@ -36,6 +37,7 @@ from .github import (
     RECONCILE_ISSUE_FIELDS,
     RECONCILE_PR_FIELDS,
 )
+from .local_work_park import publishes_pull_requests
 from .paths import RuntimePaths, resolved_layout
 from .prompts import resolve_template
 from ci_fleet.charlie_work_adapter import (
@@ -1443,15 +1445,43 @@ def run_doctor(
     def add(name: str, ok: bool, detail: str, *, severity: str = "error") -> None:
         checks.append(DoctorCheck(name=name, ok=ok, detail=detail, severity=severity))
 
+    # -- backend capability (issue #1706) -------------------------------------
+    # The codebase's chosen probe for "this backend cannot host a PR": a
+    # local-file backend (``LocalFileGitHub``) has no GitHub remote, so there
+    # is no ``gh`` to authenticate, no label registry to bootstrap, no PR
+    # surface for the merge-oriented checks, and nothing for --live field
+    # probes to interrogate. Discriminate on the capability, not on
+    # ``config.local_issues.enabled`` or the ``local/`` name prefix, so every
+    # existing test double keeps the gh-shaped path unchanged.
+    publishes_prs = publishes_pull_requests(gh)
+
     # -- environment ---------------------------------------------------------
-    gh_path = shutil.which("gh")
-    add("gh on PATH", gh_path is not None, gh_path or "GitHub CLI `gh` not found on PATH")
-    if gh_path:
-        try:
-            gh.run(["auth", "status"])
-            add("gh auth", True, "authenticated")
-        except GitHubError as exc:
-            add("gh auth", False, str(exc))
+    if publishes_prs:
+        gh_path = shutil.which("gh")
+        add(
+            "gh on PATH",
+            gh_path is not None,
+            gh_path or "GitHub CLI `gh` not found on PATH",
+        )
+        if gh_path:
+            try:
+                gh.run(["auth", "status"])
+                add("gh auth", True, "authenticated")
+            except GitHubError as exc:
+                add("gh auth", False, str(exc))
+    else:
+        add(
+            "gh on PATH",
+            True,
+            "not applicable — this backend has no GitHub remote and never runs `gh`",
+            severity="warning",
+        )
+        add(
+            "gh auth",
+            True,
+            "not applicable — no `gh` to authenticate",
+            severity="warning",
+        )
 
     # -- config --------------------------------------------------------------
     if config_path is None:
@@ -1465,18 +1495,31 @@ def run_doctor(
     else:
         add("config file", True, str(config_path))
 
-    if config.auto_merge.enabled and not config.auto_merge.required_checks:
-        add(
-            "required checks configured",
-            False,
-            "auto_merge.enabled is true but required_checks is empty — merge-ready "
-            "would gate on the review decision alone",
-        )
+    if publishes_prs:
+        if config.auto_merge.enabled and not config.auto_merge.required_checks:
+            add(
+                "required checks configured",
+                False,
+                "auto_merge.enabled is true but required_checks is empty — merge-ready "
+                "would gate on the review decision alone",
+            )
+        else:
+            add(
+                "required checks configured",
+                True,
+                f"{len(config.auto_merge.required_checks)} required check(s)",
+            )
     else:
         add(
             "required checks configured",
             True,
-            f"{len(config.auto_merge.required_checks)} required check(s)",
+            "not applicable — no pull requests means no merge gate"
+            + (
+                "; auto_merge settings are inert on this backend"
+                if (config.auto_merge.enabled or config.auto_merge.required_checks)
+                else ""
+            ),
+            severity="warning",
         )
 
     # -- required checks vs live workflow files ------------------------------
@@ -1487,7 +1530,7 @@ def run_doctor(
     # replaced could pass a stale suffixed required-check entry against a
     # non-matrix job merely because a sibling workflow gained a matrix job.
     job_matrix_flags = workflow_job_matrix_flags(repo_root)
-    if config.auto_merge.required_checks:
+    if publishes_prs and config.auto_merge.required_checks:
         if job_names:
             for required in config.auto_merge.required_checks:
                 kind = _check_name_match_kind(required, job_names)
@@ -1538,20 +1581,37 @@ def run_doctor(
             )
 
     # -- labels --------------------------------------------------------------
-    try:
-        live_labels = {
-            str(item.get("name") or "") for item in gh.label_list() if isinstance(item, dict)
-        }
-        missing = [label for label in config.labels.all if label not in live_labels]
+    if publishes_prs:
+        try:
+            live_labels = {
+                str(item.get("name") or "") for item in gh.label_list() if isinstance(item, dict)
+            }
+            missing = [label for label in config.labels.all if label not in live_labels]
+            add(
+                "github labels",
+                not missing,
+                "all orchestration labels exist"
+                if not missing
+                else f"missing labels {missing} — run `bootstrap-labels`",
+            )
+        except GitHubError as exc:
+            add("github labels", False, f"could not list labels: {exc}", severity="warning")
+    else:
+        # ``label_list`` on a file-backed backend reports only labels already
+        # present in issue frontmatter, and ``label_create`` is a documented
+        # no-op — every unused LabelConfig name would read as "missing" with
+        # no satisfiable remediation (issue #1706).
         add(
             "github labels",
-            not missing,
-            "all orchestration labels exist"
-            if not missing
-            else f"missing labels {missing} — run `bootstrap-labels`",
+            True,
+            "not applicable — file-backed issues carry free-form frontmatter "
+            "labels; there is no label registry to bootstrap",
+            severity="warning",
         )
-    except GitHubError as exc:
-        add("github labels", False, f"could not list labels: {exc}", severity="warning")
+
+    # -- local-file backend (issue #1706) ------------------------------------
+    if not publishes_prs:
+        _check_local_issue_backend(add, gh, repo_root, paths, config)
 
     # -- state ---------------------------------------------------------------
     # Read-only preflight: parse the raw bytes with json.loads so we never
@@ -1641,7 +1701,19 @@ def run_doctor(
     # -- worker GitHub token (issue #873 Part 2) -----------------------------
     # Config-only, no I/O: reads devin.worker_env/claude_code.worker_env, never
     # the process environment or sanitize_env's output.
-    _check_worker_github_token(add, config)
+    if publishes_prs:
+        _check_worker_github_token(add, config)
+    else:
+        # A worker on a no-remote backend is told never to run `gh`
+        # (prompts/worker_sections/local_no_merge_contract.md), so the missing
+        # scoped-token finding is a false positive here (issue #1706).
+        add(
+            "worker GitHub token",
+            True,
+            "not applicable — workers on this backend never run `gh`, so "
+            "sanitize_env has no token to restore",
+            severity="warning",
+        )
 
     # -- api worker observability (issue #483) ------------------------------
     # Always runs (not gated on --adapter-probe): these are config/environment
@@ -1658,7 +1730,15 @@ def run_doctor(
         _surface_in_progress_corroboration(add, repo_root, config, now=resolved_now)
 
     if live:
-        _validate_gh_field_lists(add, gh)
+        if publishes_prs:
+            _validate_gh_field_lists(add, gh)
+        else:
+            add(
+                "gh field lists",
+                True,
+                "skipped — this backend has no `gh` to probe",
+                severity="warning",
+            )
 
     # -- review-to-verdict path (gap that let 34 reviews sit unread) ---------
     # review_dispatch.enabled and rescue.enabled are the two paths that call
@@ -1667,18 +1747,30 @@ def run_doctor(
     # are off there is no automated route from a completed review to a
     # recorded verdict at all: PRs pile up in "reviewing" with valid reports
     # and no decision, invisible to any other check here.
-    has_review_to_verdict_path = config.review_dispatch.enabled or config.rescue.enabled
-    add(
-        "review-to-verdict path",
-        has_review_to_verdict_path,
-        "ok"
-        if has_review_to_verdict_path
-        else (
-            "review_dispatch.enabled and rescue.enabled are both "
-            "false: no automated path from review to verdict; PRs accumulate "
-            "in reviewing with valid reports and no decision"
-        ),
-    )
+    if publishes_prs:
+        has_review_to_verdict_path = config.review_dispatch.enabled or config.rescue.enabled
+        add(
+            "review-to-verdict path",
+            has_review_to_verdict_path,
+            "ok"
+            if has_review_to_verdict_path
+            else (
+                "review_dispatch.enabled and rescue.enabled are both "
+                "false: no automated path from review to verdict; PRs accumulate "
+                "in reviewing with valid reports and no decision"
+            ),
+        )
+    else:
+        # The check's premise is PR-shaped: without pull requests there is no
+        # "reviewing" lane to accumulate in — parked branches are handed to a
+        # human via the review-ready label instead (issue #1706).
+        add(
+            "review-to-verdict path",
+            True,
+            "not applicable — no pull requests; completed work is parked on its "
+            "branch under the review-ready label for a human to merge",
+            severity="warning",
+        )
 
     # -- prompts -------------------------------------------------------------
     prompts_dir = config.runtime.prompts_dir

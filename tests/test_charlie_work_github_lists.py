@@ -129,7 +129,14 @@ def test_issue_list_raises_limit_to_500_and_warns_on_truncation(
     caplog.set_level(logging.WARNING)
     limit = github_module._LIST_LIMIT
 
-    def fake_run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
+    def fake_run(
+        self,
+        args: list[str],
+        *,
+        json_output: bool = False,
+        allow_failure: bool = False,
+        long_call: bool = False,
+    ):
         assert json_output is True
         assert args[:2] == ["issue", "list"]
         assert str(limit) in args, f"expected --limit {limit} in {args}"
@@ -150,7 +157,14 @@ def test_pr_list_raises_limit_to_500_and_warns_on_truncation(
     caplog.set_level(logging.WARNING)
     limit = github_module._LIST_LIMIT
 
-    def fake_run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
+    def fake_run(
+        self,
+        args: list[str],
+        *,
+        json_output: bool = False,
+        allow_failure: bool = False,
+        long_call: bool = False,
+    ):
         assert json_output is True
         assert args[:2] == ["pr", "list"]
         assert str(limit) in args, f"expected --limit {limit} in {args}"

@@ -327,13 +327,18 @@ def test_issue_comment_delegate_forwards_through_run(
     monkeypatch.setattr(GitHub, "run", fake_run)
 
     gh = GitHub(tmp_path)
-    body_file = Path("comment-body.md")
+    # Issue #1505: issue_comment/pr_comment scan the body file's *contents*
+    # before forwarding (the outbound secret guard), so it must be a real
+    # file on disk now -- a bare name would be refused as unreadable before
+    # run() is ever reached.
+    body_file = tmp_path / "comment-body.md"
+    body_file.write_text("delegation test body\n", encoding="utf-8")
     gh.issue_comment(7, body_file)
     gh.pr_comment(9, body_file)
 
     assert calls == [
-        (["issue", "comment", "7", "--body-file", "comment-body.md"], False, False),
-        (["pr", "comment", "9", "--body-file", "comment-body.md"], False, False),
+        (["issue", "comment", "7", "--body-file", str(body_file)], False, False),
+        (["pr", "comment", "9", "--body-file", str(body_file)], False, False),
     ]
 
 

@@ -37,6 +37,11 @@ from typing import Any, ClassVar
 from .config import OrchestratorConfig
 from .github import GitHubError, GitHubLike, GitHubRunResult
 from .github_capabilities.pull_requests import MergedPRSearchResult
+from .outbound_body_guard import (
+    OutboundBodyGuardError,
+    check_outbound_write,
+    refusal_summary,
+)
 from .local_issue_files import (
     IssueFileError,
     IssueFileProblem,
@@ -73,6 +78,12 @@ class LocalFileGitHub:
     repo_root: Path
     issues_dir: Path
     dry_run: bool = False
+    # ``runtime.state_dir`` carried through ``github_client_for`` so the
+    # outbound-body secret guard (issue #1505) can locate ``events.db`` for
+    # the refusal event -- the same resolution the real client's
+    # ``RuntimeConfig`` provides. ``None`` falls back to the default state
+    # dir; only test/direct constructions omit it.
+    state_dir: str | None = None
     # Holds exactly one kind of entry: ``("issue_dependencies", n) -> []``,
     # the warm-cache contract ``Issues.issue_dependencies`` documents. The
     # per-issue ``get_github_issue_dependencies`` reads this key before it
@@ -253,8 +264,22 @@ class LocalFileGitHub:
         stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
             comment = body_file.read_text(encoding="utf-8")
+            # Issue #1505: the appended comment persists inside a git-visible
+            # issue file in the consumer repo, so the same credential guard
+            # that fronts the gh API boundary fronts this write too.
+            matches = check_outbound_write(
+                surface="issue_comment",
+                parts=(("body", comment),),
+                repo_root=self.repo_root,
+                state_dir=self.state_dir,
+                issue_number=number,
+            )
+            if matches:
+                raise GitHubError(refusal_summary("issue_comment", matches))
             text = issue.path.read_bytes().decode("utf-8")
             write_text_atomic(issue.path, append_comment(text, comment, timestamp=stamp))
+        except OutboundBodyGuardError as exc:
+            raise GitHubError(f"issue_comment #{number}: {exc}") from exc
         except (OSError, UnicodeDecodeError) as exc:
             raise GitHubError(f"local issue #{number}: could not append comment: {exc}") from exc
 
@@ -264,7 +289,12 @@ class LocalFileGitHub:
     # -- owner members -----------------------------------------------------
 
     def run(
-        self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+        self,
+        args: list[str],
+        *,
+        json_output: bool = False,
+        allow_failure: bool = False,
+        long_call: bool = False,
     ) -> Any:
         """There is no ``gh`` to run. Same failure contract as the real client."""
         if allow_failure:
@@ -395,5 +425,8 @@ def github_client_for(
     if not local.enabled:
         return github(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
     return LocalFileGitHub(
-        repo_root=repo_root, issues_dir=repo_root / local.issues_dir, dry_run=dry_run
+        repo_root=repo_root,
+        issues_dir=repo_root / local.issues_dir,
+        dry_run=dry_run,
+        state_dir=config.runtime.state_dir,
     )
