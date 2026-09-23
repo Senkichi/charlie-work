@@ -30,6 +30,7 @@ from .prompts import (
     assert_containment,
     assert_execution_contract,
     assert_no_merge_contract,
+    assert_session_scratch_dir,
     render_prompt,
 )
 from .review_decision import _round_history_entries  # noqa: F401  (re-exported)
@@ -913,6 +914,11 @@ def _write_rework_prompt(
     # $section_scope_contract or reverts to the old repo-scoped wording is
     # caught at the dispatch boundary.
     assert_containment(prompt, context=f"rework prompt for PR #{pr_number}")
+    # Issue #1780: enforce the scratch-dir rule on the *rendered output* so a
+    # repo-local flat rework override that drops $section_session_scratch_dir
+    # is caught at the dispatch boundary — rework sessions run shell commands
+    # on the same host with the same shared-/tmp hazard as fresh dispatches.
+    assert_session_scratch_dir(prompt, context=f"rework prompt for PR #{pr_number}")
     # Issue #1268 (W11), item 1 binding-comment #4: both the live brief and
     # its sidecar are polled by dispatch-time readers (regeneration checks,
     # worker launch), so a plain write_text here is the same

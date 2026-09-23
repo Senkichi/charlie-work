@@ -8,7 +8,6 @@ worker-declared-blocked-outcome section every template ships).
 
 from __future__ import annotations
 
-import string
 from pathlib import Path
 
 import pytest
@@ -29,6 +28,7 @@ from charlie_work.prompts import (
     assert_containment,
     assert_execution_contract,
     assert_no_merge_contract,
+    unresolved_rendered_identifiers,
 )
 from charlie_work.workflow import OrchestratorApp, check_prompt_template_drift
 
@@ -47,7 +47,10 @@ def _fake_issue(number: int = 1) -> dict[str, object]:
 
 
 def _unresolved_placeholders(rendered: str) -> set[str]:
-    return set(string.Template(rendered).get_identifiers())
+    # Owned by the render layer (issue #1780): the scratch-dir section
+    # intentionally emits a literal ``$TMPDIR``, which
+    # ``prompts.INTENTIONAL_RENDERED_IDENTIFIERS`` declares exempt.
+    return unresolved_rendered_identifiers(rendered)
 
 
 # ---------------------------------------------------------------------------

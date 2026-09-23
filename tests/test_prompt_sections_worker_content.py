@@ -8,13 +8,12 @@ shoulder) -- bodies are verbatim relocations; shared helpers live in
 from __future__ import annotations
 
 import re
-import string
 from pathlib import Path
 
 from charlie_work.markdown_fence import fenced_block
 from charlie_work.prompt_sections import section_variables
 from charlie_work.prompt_test_command import prompt_test_command_values
-from charlie_work.prompts import render_prompt
+from charlie_work.prompts import render_prompt, unresolved_rendered_identifiers
 
 from _prompt_sections_fixtures import (
     ISSUE_VALUES,
@@ -169,7 +168,7 @@ def test_rework_prompt_includes_push_then_verify_final_step() -> None:
         # shell snippet `git show $(git merge-base ...)` uses `$(` (command
         # substitution), which `get_identifiers()` correctly ignores because it
         # is not `$identifier`/`${identifier}` shaped.
-        assert not string.Template(prompt).get_identifiers(), (
+        assert not unresolved_rendered_identifiers(prompt), (
             f"Unresolved placeholders found in rendered prompt:\n{prompt}"
         )
 

@@ -232,6 +232,65 @@ def assert_containment(prompt: str, *, context: str = "worker prompt") -> None:
         raise MissingContainmentError(context, missing)
 
 
+# Markers that must appear in every rendered worker/rework prompt's
+# scratch-file rule.  Issue #1780: #1767 retargeted TMP/TEMP/TMPDIR at a
+# worktree-local directory, but a literal ``/tmp/...`` path typed into a
+# shell command still resolves through MSYS's install-wide cached mount
+# under Git Bash (and to the one shared temp directory on POSIX) — a file
+# there is visible to every concurrent worker session on the host, which
+# is how a ``gh pr view ... > /tmp/pr-body.md`` scratch write got
+# corrupted by a sibling worker.  A repo-local flat whole-file override
+# can silently drop the ``$section_session_scratch_dir`` reference,
+# dispatching workers with no instruction away from the shared dir, so
+# these markers are checked against the *rendered output* — not the
+# template source — at the dispatch boundary.
+SESSION_SCRATCH_DIR_MARKERS: tuple[str, ...] = (
+    "## Scratch files",
+    "$TMPDIR",
+    "literal `/tmp",
+)
+
+
+class MissingSessionScratchDirError(RuntimeError):
+    """A rendered worker/rework prompt is missing the scratch-dir rule.
+
+    Issue #1780: a repo-local flat whole-file override of ``worker.md`` or
+    ``rework.md`` can silently drop the ``$section_session_scratch_dir``
+    reference, dispatching workers free to pick a literal ``/tmp/...``
+    path that resolves through MSYS's install-wide mount under Git Bash —
+    shared across every concurrent worker session, the residual class
+    #1767's TMP/TEMP/TMPDIR env fix could not close.  This post-render
+    guard catches that drift at the dispatch boundary — the single point
+    of enforcement — rather than relying on every consumer repo's override
+    to remember the section.
+    """
+
+    def __init__(self, context: str, missing: tuple[str, ...]) -> None:
+        self.context = context
+        self.missing = missing
+        super().__init__(
+            f"{context} is missing the scratch-file rule (issue #1780): "
+            f"required marker(s) not found: {', '.join(missing)}. "
+            f"A repo-local flat override may have dropped the "
+            f"$section_session_scratch_dir reference, leaving workers "
+            f"free to use a literal /tmp/... path shared across "
+            f"concurrent sessions."
+        )
+
+
+def assert_session_scratch_dir(prompt: str, *, context: str = "worker prompt") -> None:
+    """Verify a rendered worker/rework prompt carries the scratch-dir rule.
+
+    Checks the *rendered output* (not the template source) so that a
+    repo-local flat override that drops the ``$section_session_scratch_dir``
+    reference is caught regardless of how the override was structured.
+    """
+
+    missing = tuple(m for m in SESSION_SCRATCH_DIR_MARKERS if m not in prompt)
+    if missing:
+        raise MissingSessionScratchDirError(context, missing)
+
+
 class PromptTemplateError(RuntimeError):
     """A prompt template references placeholders that nothing supplies.
 
@@ -395,6 +454,36 @@ def render_prompt(
     # Single substitution over the template: attacker-supplied values are leaf
     # replacements that are never re-scanned.
     return template.safe_substitute(final_safe_values)
+
+
+# Identifiers that may legitimately appear *literally* in rendered prompt
+# output. ``worker_sections/session_scratch_dir.md`` instructs the worker to
+# use the ``$TMPDIR`` environment variable (issue #1780) — the ``$``-prefixed
+# name must reach the worker verbatim, so it survives rendering and reads as
+# an unresolved placeholder to a bare ``Template.get_identifiers()`` scan of
+# the rendered text while being fully intentional. ``string.Template`` has no
+# escape that produces a literal ``$identifier`` shape in output — ``$$``
+# renders as ``$`` and is then re-read as a placeholder by a second scan —
+# so this set is the declared exemption, consumed by
+# :func:`unresolved_rendered_identifiers` (and the test-side scanners that
+# delegate to it) rather than scattered across call sites.
+INTENTIONAL_RENDERED_IDENTIFIERS: frozenset[str] = frozenset({"TMPDIR"})
+
+
+def unresolved_rendered_identifiers(rendered: str) -> set[str]:
+    """Placeholder-shaped identifiers left in *rendered* output.
+
+    ``Template.get_identifiers()`` on rendered text minus
+    :data:`INTENTIONAL_RENDERED_IDENTIFIERS`. Deliberately narrower than a
+    bare ``"$" in rendered`` check: a partial's prose can legitimately
+    contain a literal ``$`` that is not a placeholder at all (e.g.
+    ``$(command)`` substitution), and the intentional env-var literals are
+    exempted by the declared set above. This is the single point of
+    enforcement for "what counts as an unresolved placeholder in output" —
+    the render pipeline's own strict check stays on template *source*, so
+    this function exists for post-render verification only.
+    """
+    return set(Template(rendered).get_identifiers()) - INTENTIONAL_RENDERED_IDENTIFIERS
 
 
 def prompt_template_digest(template_name: str, search_dirs: Sequence[Path] = ()) -> str:

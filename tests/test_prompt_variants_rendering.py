@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import dataclasses
 import re
-import string
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +24,7 @@ import pytest
 from charlie_work.config import OrchestratorConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.prompt_skills import declared_skills
+from charlie_work.prompts import unresolved_rendered_identifiers
 from charlie_work.prompt_test_command import UNRESOLVED_FULL_SUITE, UNRESOLVED_TARGETED
 from charlie_work.workflow import OrchestratorApp
 
@@ -323,7 +323,9 @@ def test_no_shape_leaves_a_placeholder_or_the_flat_test_path(tmp_path: Path, sha
     rendered = _render(tmp_path, shape)
 
     for prompt in (rendered.worker, rendered.rework):
-        assert not string.Template(prompt).get_identifiers()
+        # unresolved_rendered_identifiers subtracts the declared
+        # INTENTIONAL_RENDERED_IDENTIFIERS (literal $TMPDIR, issue #1780).
+        assert not unresolved_rendered_identifiers(prompt)
         assert "test_<touched_module>" not in prompt
         assert PRECEDENCE in prompt
         assert "tests/<package>/test_<module>.py" in prompt
@@ -338,7 +340,7 @@ def test_every_worker_template_carries_the_precedence_clause(
 
     assert PRECEDENCE in worker
     assert "`CLAUDE.md` or `CONTRIBUTING.md` documents a different command" in worker
-    assert not string.Template(worker).get_identifiers()
+    assert not unresolved_rendered_identifiers(worker)
     assert (
         _full_suite(worker)
         == {

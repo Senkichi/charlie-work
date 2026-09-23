@@ -28,6 +28,7 @@ from charlie_work.prompts import (
     assert_conventional_commit_title,
     assert_execution_contract,
     assert_no_merge_contract,
+    assert_session_scratch_dir,
     prompt_template_digest,
 )
 from charlie_work.prompt_skills import active_prompt_variants
@@ -114,6 +115,12 @@ def _write_worker_prompt(self, issue: dict[str, Any], *, dry_run: bool = False) 
     # boundary rather than shipping a worker with no effective prohibition
     # against editing a sibling repo's checkout.
     assert_containment(prompt, context=f"worker prompt for issue #{issue_number}")
+    # Issue #1780: enforce the scratch-dir rule on the *rendered output* so a
+    # repo-local flat override that drops $section_session_scratch_dir is
+    # caught at the dispatch boundary rather than shipping a worker free to
+    # use a literal /tmp/... path shared across concurrent sessions (the
+    # MSYS usertemp-mount gap #1767's env fix could not close).
+    assert_session_scratch_dir(prompt, context=f"worker prompt for issue #{issue_number}")
     # Issue #618: the dry-run dispatch branch promises "skip all state
     # writes, label transitions, and file mutations" — mkdir + write_text
     # here would violate that, and for a dead-worker recovery candidate

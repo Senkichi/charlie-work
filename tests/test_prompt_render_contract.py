@@ -39,7 +39,12 @@ from charlie_work import layout
 from charlie_work.config import DispatchConfig, OrchestratorConfig, RuntimeConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.prompt_sections import section_variables
-from charlie_work.prompts import TEMPLATE_DIR, render_prompt, resolve_template
+from charlie_work.prompts import (
+    TEMPLATE_DIR,
+    render_prompt,
+    resolve_template,
+    unresolved_rendered_identifiers,
+)
 from charlie_work.workflow import OrchestratorApp, _write_rework_prompt
 
 # Templates that are never passed through render_prompt at all: grepping
@@ -89,11 +94,15 @@ def _unresolved_placeholders_in_output(rendered: str) -> set[str]:
     ``string.Template`` placeholder at all -- e.g. ``mutation_check.md``'s
     shell snippet ``git show $(git merge-base ...)`` uses ``$(`` (command
     substitution), which ``get_identifiers()`` correctly ignores because it
-    is not ``$identifier``/``${identifier}`` shaped. Using the same
-    identifier extraction the render pipeline itself uses keeps this check
-    aligned with what actually counts as an unresolved placeholder.
+    is not ``$identifier``/``${identifier}`` shaped. Issue #1780 adds a
+    second intentional literal shape -- ``session_scratch_dir.md``
+    instructs the worker to use ``$TMPDIR``, so the name reaches rendered
+    output verbatim. Both are owned by the render layer itself:
+    ``prompts.unresolved_rendered_identifiers`` subtracts the declared
+    :data:`prompts.INTENTIONAL_RENDERED_IDENTIFIERS` set, keeping this
+    check aligned with what actually counts as an unresolved placeholder.
     """
-    return set(string.Template(rendered).get_identifiers())
+    return unresolved_rendered_identifiers(rendered)
 
 
 def _assert_no_default_state_dir_literal(rendered: str, *, template_name: str) -> None:

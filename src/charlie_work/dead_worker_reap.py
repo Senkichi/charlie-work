@@ -1778,7 +1778,10 @@ def _classify_dead_sessions_and_update_throttle_state(
     wall-clock-tolerance proximity check.
     """
     write_gate = require_write_gate(write_gate)
-    from .claude_code import update_worker_record_with_failure_classification
+    from .claude_code import (
+        literal_tmp_shell_commands,
+        update_worker_record_with_failure_classification,
+    )
     from .devin_shell import update_session_record_with_failure_classification
     from .post_mortem import classify_and_record
     from .state import load_state, set_throttled_until, state_lock
@@ -2162,6 +2165,43 @@ def _classify_dead_sessions_and_update_throttle_state(
                     "pid": w.pid,
                 }
             )
+
+            # Issue #1780: post-hoc signal for the residual class #1767 could
+            # not close. sanitize_env retargets TMP/TEMP/TMPDIR per session,
+            # but MSYS resolves a literal ``/tmp/...`` token through its
+            # install-wide cached mount, so a worker that types the path
+            # anyway (``gh pr view N > /tmp/pr-body.md`` — the incident
+            # shape) still lands in a directory shared with every concurrent
+            # session. The rendered prompt now forbids it; this warning is
+            # the diagnosable record when a session did it anyway. The scan
+            # reads the session's own log via iter_claude_events: api
+            # sessions always tee stream-json (claude-code sessions when
+            # configured), exposing the Bash tool_use commands; a non-tee
+            # plain-text log yields no tool calls and the scan is a silent
+            # no-op there — the prompt instruction is the primary
+            # mitigation for that gap. The scan never raises (unusable
+            # input is an empty result), so it cannot break the reap pass,
+            # and it fires once per session by construction: the sidecar
+            # was just reaped above, so no later pass can re-see this worker.
+            if w.adapter_kind in ("claude-code", "api"):
+                tmp_commands = literal_tmp_shell_commands(w.log_path)
+                if tmp_commands:
+                    with state_lock(state_file):
+                        state = load_state(state_file)
+                        state = write_gate.append_event(
+                            state,
+                            "worker_literal_tmp_path",
+                            {
+                                "issue_number": w.issue_number,
+                                "adapter_kind": w.adapter_kind,
+                                "pid": w.pid,
+                                "log_path": w.log_path,
+                                "command_count": len(tmp_commands),
+                                "commands": [c[:300] for c in tmp_commands[:3]],
+                            },
+                            level="warning",
+                        )
+                        write_gate.save_state(state)
 
             # Issue #1342: emit a distinct error-level event on the FIRST
             # detection of a provider account suspension so the operator learns
