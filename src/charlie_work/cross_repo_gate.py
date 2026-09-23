@@ -153,12 +153,20 @@ repo).
 
 Also added as cheap defense-in-depth: a candidate containing *any* embedded
 whitespace (not just runs of 2+, issue #1756's own narrower proposal) is
-dropped at extraction, alongside the existing glob/placeholder/launcher-owned
-filters. This closes #1756's newline-corrupted-candidate shape and a
+filtered at extraction, alongside the existing glob/placeholder/launcher-owned
+filters. This closes #1756's newline-corrupted-candidate shape. The
 related single-space multi-path-in-one-backtick-span shape found live in cw
 issue #1518's body (`` `tests/a.py tests/b.py` `` extracting as one
-corrupted candidate containing an embedded space, which a "2+ whitespace"
-filter alone would not catch).
+candidate containing an embedded space, which a "2+ whitespace" filter
+alone would not catch) is *split* rather than dropped wholesale (issue
+#1790): each whitespace-separated piece is re-run through the normal
+candidate pipeline, and the whole candidate falls back to being dropped
+only when the split yields fewer than 2 path-shaped pieces — which is what
+keeps the #1756 corrupted-single-path protection intact, since one real
+path hard-wrapped mid-token or followed by prose produces at most one
+path-shaped piece. Split pieces share the whole span's ``(start, end)``
+offsets — the span is a single citation unit, so evidence markers and
+citation-section headings apply to every piece uniformly.
 
 All of these shapes are classified **neutral**: excluded from the pass/escalate
 decision and reported separately (``CrossRepoGateResult.neutral_paths``)
@@ -261,6 +269,14 @@ _PLACEHOLDER_SEGMENT = re.compile(r"^(?:[A-Za-z]+-N|.*[<>].*)$")
 # filter — a single embedded space is not "2+ whitespace" and would slip
 # that narrower version, but is exactly the same class of corrupted,
 # can-never-exist candidate.
+#
+# Issue #1790: a whitespace-containing candidate is no longer dropped
+# unconditionally — it is first split on whitespace and each piece re-run
+# through the normal pipeline (:func:`_split_whitespace_candidate`), so a
+# genuine two-paths-in-one-span citation (the cw #1518 shape) is recovered
+# as two candidates. The whole candidate is still dropped when the split
+# yields fewer than 2 path-shaped pieces — the #1756 corrupted-single-path
+# shape produces at most one.
 _EMBEDDED_WHITESPACE_RE = re.compile(r"\s")
 
 # Glob metacharacters: ``*``, ``?``, ``[``, ``]``. A candidate containing any
@@ -561,10 +577,14 @@ def extract_referenced_paths(issue_body: str) -> list[str]:
     body cannot fire the gate (issue #1343).
 
     Candidates containing embedded whitespace of any width (a space, tab, or
-    line break) are dropped — no real file path contains one, so a
-    whitespace-corrupted candidate (a hard-wrapped backtick-quoted path, or
-    two paths cited together in one backtick span separated by a single
-    space) can never exist and would false-positive the gate (issue #1756).
+    line break) are first split on whitespace and each piece re-run through
+    this same pipeline (issue #1790) — a genuine two-paths-in-one-backtick-
+    span citation (`` `tests/a.py tests/b.py` ``) is recovered as two
+    candidates. The whole candidate is dropped only when the split yields
+    fewer than 2 path-shaped pieces — no real file path contains whitespace,
+    so a corrupted candidate that does not decompose into multiple paths
+    (a hard-wrapped backtick-quoted path) can never exist and would
+    false-positive the gate (issue #1756).
 
     Candidates containing glob metacharacters (``*``, ``?``, ``[``, ``]``)
     are dropped — a glob pattern is not a literal file path, and no file
@@ -611,13 +631,24 @@ def _iter_candidate_matches(issue_body: str) -> tuple[list[tuple[str, int, int]]
         raw = next((g for g in match.groups() if g is not None), "")
         if not raw:
             continue
-        # Drop whitespace-corrupted candidates: a real path never contains a
-        # space, tab, or line break. Catches both a hard-wrapped
-        # backtick-quoted path (embedded \r\n, issue #1756) and a
-        # single-space multi-path span in one backtick pair (cw #1518) —
-        # deliberately wider than a "2+ whitespace" filter, which the
-        # single-space shape would slip.
+        # A candidate containing embedded whitespace is not a single real
+        # path — but before dropping it, try splitting it into path-shaped
+        # pieces (issue #1790): the cw #1518 shape is TWO real paths cited
+        # together in one backtick span (`` `tests/a.py tests/b.py` ``), and
+        # discarding the pair wholesale loses the positive sibling-repo
+        # evidence either piece could supply. ``_split_whitespace_candidate``
+        # re-runs each piece through the normal pipeline and returns an
+        # empty list — the pre-#1790 drop-the-whole-thing behavior — unless
+        # the split yields 2+ path-shaped pieces, which is what preserves
+        # #1756's corrupted-single-path protection. Every piece inherits the
+        # whole span's ``(start, end)``: the span is a single citation unit,
+        # so each piece sees the same clause/section context the un-split
+        # candidate would have.
         if _EMBEDDED_WHITESPACE_RE.search(raw):
+            for piece in _split_whitespace_candidate(raw):
+                if piece not in seen:
+                    seen.add(piece)
+                    candidates.append((piece, match.start(), match.end()))
             continue
         # Drop templated/placeholder paths: a segment like ``pr-N`` or
         # ``<state-dir>`` is documentation template text, not a real file
@@ -668,6 +699,55 @@ def _is_launcher_owned_path(candidate: str) -> bool:
     """
     segments = re.split(r"[\\/]+", candidate, maxsplit=1)
     return bool(segments) and segments[0] in LAUNCHER_OWNED_DIRS
+
+
+def _split_whitespace_candidate(raw: str) -> list[str]:
+    """Return the path-shaped pieces of a whitespace-joined candidate.
+
+    Issue #1790: the embedded-whitespace filter (issue #1756, cw #1518)
+    dropped an entire candidate the moment it contained any whitespace —
+    including the deliberate cw #1518 shape where two real, distinct paths
+    are cited together inside one backtick span separated by a single
+    space (`` `tests/a.py tests/b.py` ``). Both paths were discarded rather
+    than classified, silently losing the positive sibling-repo evidence
+    either could have supplied.
+
+    Each whitespace-separated piece is re-run through the normal candidate
+    pipeline — the ``_PATH_RE`` extraction shape check, then the
+    placeholder/glob/launcher-owned filters — exactly as if it had been its
+    own extracted candidate. The call site reports every emitted piece at
+    the whole span's ``(start, end)`` offsets rather than at per-piece
+    offsets: the backtick span is a single citation unit, so a clause-local
+    evidence marker, a suffix marker, or a citation-section heading that
+    describes the span describes every piece of it. Per-piece offsets would
+    let the first piece's own ``.ext`` period sever the clause for the
+    second piece (``.`` is a clause boundary), inconsistently neutralizing
+    only half of one citation.
+
+    Falls back to the pre-#1790 "drop the whole thing" behavior — an empty
+    list — unless the split yields 2+ path-shaped pieces: a single real
+    path hard-wrapped mid-token (`` `dir/\\na.py` ``) or followed by prose
+    inside the span yields at most one path-shaped piece, so the #1756
+    corrupted-candidate protection is preserved.
+    """
+    path_shaped = 0
+    pieces: list[str] = []
+    for span in re.finditer(r"\S+", raw):
+        for sub in _PATH_RE.finditer(span.group(0)):
+            piece = next((g for g in sub.groups() if g is not None), "")
+            if not piece:
+                continue
+            path_shaped += 1
+            if (
+                _has_placeholder_segment(piece)
+                or _GLOB_METACHAR.search(piece)
+                or _is_launcher_owned_path(piece)
+            ):
+                continue
+            pieces.append(piece)
+    if path_shaped < 2:
+        return []
+    return pieces
 
 
 def _path_exists_in_repo(path_str: str, repo_root: Path) -> bool:
