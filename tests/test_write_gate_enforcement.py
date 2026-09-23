@@ -883,6 +883,25 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
         call_source="log_event(state_path, 'github_circuit_closed', payload)",
         in_predicate=False,
     ),
+    # Issue #1834: `_emit_fallback_event` is the pooled HTTP transport's
+    # per-call fallback telemetry emitter (`github_transport_fallback`), a
+    # plain module-level function in the new `http_transport.py` -- same
+    # disposition as the two `circuit_breaker_transport.py` entries directly
+    # above and for the identical reason: `Transport`/`GitHub` are
+    # deliberately constructible without a `WriteGate` (that is an
+    # `OrchestratorApp`-owned serialization object), so this telemetry call
+    # has no `WriteGate` to route through. `in_predicate=False` matches the
+    # real scan: `_emit_fallback_event` makes no
+    # `self.write_gate.*`/`write_gate.*` call and takes no `write_gate`
+    # parameter (it is not even a method -- a plain module-level function,
+    # like `note_circuit_breaker_result`).
+    _RawPrimitiveSite(
+        path="github_capabilities/http_transport.py",
+        scope="_emit_fallback_event",
+        primitive="log_event",
+        call_source="log_event(state_path, 'github_transport_fallback', payload)",
+        in_predicate=False,
+    ),
     # Issue #1832: `fleet_loop()`, `_touch_registry_last_seen()`,
     # `record_fleet_pass_completed()`, and `record_wedge_kill_loop()` are
     # new bookkeeping/observability call sites in fleet_dispatch.py and
