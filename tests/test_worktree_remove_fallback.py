@@ -30,6 +30,22 @@ from charlie_work.subprocess_runner import RunResult
 from charlie_work.worktree import remove_worktree
 
 
+@pytest.fixture(autouse=True)
+def _longpaths_for_nested_test_repos(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Env-scope ``core.longpaths`` for every git child these tests spawn.
+
+    Worker worktrees nest deep (``.var/charlie-work/worktrees/<slug>``), so
+    pytest's ``tmp_path`` under one can push a fixture repo's
+    ``.git/objects/...`` past Windows MAX_PATH and make ``git add`` exit 128
+    before the test even starts. ``GIT_CONFIG_*`` env vars reach every
+    spawned ``git`` without touching any config file; on shallow checkouts
+    they are a no-op.
+    """
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.longpaths")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+
+
 def _force_git_remove_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make ``git worktree remove`` fail while every other git call runs for
     real, driving ``remove_worktree`` into its rmtree fallback path (e.g. a
