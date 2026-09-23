@@ -2057,6 +2057,12 @@ class SupervisorConfig:
     solely to be deployed to -- without it the daemon's editable ``ci_fleet``
     is a silent version freeze, since ``self_deploy`` otherwise only ever
     pulls the orchestrator checkout.
+    ``wedge_kill_loop_alarm``: consecutive ``supervisor_wedged_killed`` events
+    with no ``fleet_pass_completed`` event in between (i.e. the wedge-kill
+    backstop firing without the supervisor ever completing a pass again)
+    before a ``supervisor_wedge_loop`` events.db entry fires (default 3,
+    mirrors ``self_deploy_failure_alarm``/``zero_pass_alarm``). 0 disables
+    the alarm (issue #1832).
     """
 
     poll_interval_seconds: int = 20
@@ -2067,6 +2073,7 @@ class SupervisorConfig:
     self_deploy_failure_alarm: int = 3
     self_deploy_pull_ci_fleet: bool = False
     zero_pass_alarm: int = 3
+    wedge_kill_loop_alarm: int = 3
 
 
 @dataclass(frozen=True)
@@ -3931,6 +3938,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         "max_pass_runtime_seconds",
         "self_deploy_failure_alarm",
         "zero_pass_alarm",
+        "wedge_kill_loop_alarm",
     ):
         value = supervisor_data.get(int_key)
         if value is not None and not isinstance(value, int):

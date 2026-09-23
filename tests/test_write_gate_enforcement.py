@@ -883,6 +883,68 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
         call_source="log_event(state_path, 'github_circuit_closed', payload)",
         in_predicate=False,
     ),
+    # Issue #1832: `fleet_loop()`, `_touch_registry_last_seen()`,
+    # `record_fleet_pass_completed()`, and `record_wedge_kill_loop()` are
+    # new bookkeeping/observability call sites in fleet_dispatch.py and
+    # supervisor_lifecycle.py, neither of which has begun issue #1264's
+    # WriteGate conversion wave: every sibling `log_event`/`save_state`
+    # call already in these same files and scopes (e.g. `fleet_loop`'s
+    # pre-existing `fleet_registry_stale_entry`/`fleet_lane_completed`
+    # calls, `_prune_stale_registry_entries`'s sibling `save_state`,
+    # `record_supervisor_started`'s `log_event`) remains raw and is part
+    # of the per-module shrink-only baseline, not gated. None of the four
+    # functions below takes a `write_gate` parameter, and their callers
+    # (`run_fleet_supervise`, the per-repo loop body) pass none either --
+    # threading one through the whole supervisor-pass call chain for a
+    # targeted in-pass-deadline bugfix would be the out-of-scope refactor
+    # `instrumentation.log_event`'s own docstring warns against, not the
+    # minimal fix. This matches the documented standalone-function pattern
+    # (CLAUDE.md: "For events outside state-lock contexts ... call
+    # log_event() directly from instrumentation.py") and the
+    # `outbound_body_guard.py`/`preflight.py` entries' reasoning above.
+    # `in_predicate=False` matches the real scan: none of these four
+    # scopes makes a `self.write_gate.*`/`write_gate.*` call or takes a
+    # `write_gate` parameter.
+    _RawPrimitiveSite(
+        path="fleet_dispatch.py",
+        scope="_touch_registry_last_seen",
+        primitive="save_state",
+        call_source="save_state(fleet_json_path, data)",
+        in_predicate=False,
+    ),
+    _RawPrimitiveSite(
+        path="fleet_dispatch.py",
+        scope="fleet_loop",
+        primitive="log_event",
+        call_source=(
+            "log_event(fleet_state_path, 'fleet_pass_deadline_deferred', "
+            "{'deadline_seconds': deadline_seconds, 'elapsed_seconds': "
+            "pass_clock() - pass_started_at, 'deferred_repo_keys': "
+            "deferred_repo_keys, 'deferred_autoscale_prologue': "
+            "deferred_autoscale_prologue})"
+        ),
+        in_predicate=False,
+    ),
+    _RawPrimitiveSite(
+        path="supervisor_lifecycle.py",
+        scope="record_fleet_pass_completed",
+        primitive="log_event",
+        call_source=(
+            "log_event(path, FLEET_PASS_COMPLETED, {'pass_number': pass_number, "
+            "'outcome': outcome}, repo=_FLEET_REPO)"
+        ),
+        in_predicate=False,
+    ),
+    _RawPrimitiveSite(
+        path="supervisor_lifecycle.py",
+        scope="record_wedge_kill_loop",
+        primitive="log_event",
+        call_source=(
+            "log_event(supervisor_heartbeat_path(fleet_dir_override), "
+            "SUPERVISOR_WEDGE_LOOP, payload, repo=_FLEET_REPO)"
+        ),
+        in_predicate=False,
+    ),
 )
 
 
