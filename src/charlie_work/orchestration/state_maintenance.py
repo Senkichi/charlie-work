@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.local_work_park import publishes_pull_requests
 
 # Issue #1505: single source for the refusal kind shared by the emitter
 # (``outbound_body_guard.check_outbound_write``) and this consumer -- the
@@ -173,6 +174,13 @@ def _maybe_reclaim_superseded_main_ci(self) -> None:
     pass.
     """
     if not self.config.main_ci_reclaim.enabled:
+        return
+    # Issue #1810: the reclaim starts with ``git fetch origin`` -- a repo
+    # whose backend cannot publish pull requests has no remote at all, so
+    # the call is a guaranteed main_ci_reclaim_failed every pass. Skip it
+    # on the same capability predicate dead_worker_reap already gates on,
+    # rather than catching the fetch failure per call site.
+    if not publishes_pull_requests(self.gh):
         return
 
     import logging
@@ -484,6 +492,13 @@ def _maybe_reconcile_drift(self, *, now: datetime | None = None) -> None:
     the reconcile call's own duration.
     """
     if not self.config.reconcile_pass.enabled:
+        return
+    # Issue #1810: ``_reconcile_locked`` -> ``detect_drift`` -> ``_fetch_prs``
+    # calls ``gh.run(...)``, which raises ``GitHubError`` on a backend that
+    # cannot publish pull requests -- a guaranteed reconcile_pass_failed
+    # every due pass with zero repair value. Skip the whole call on the
+    # same capability predicate dead_worker_reap already gates on.
+    if not publishes_pull_requests(self.gh):
         return
 
     resolved_now = now if now is not None else datetime.now(UTC)
