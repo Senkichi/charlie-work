@@ -22,6 +22,8 @@ from ._base import (
     _LIST_LIMIT,
 )
 from .checks import PR_CHECKS_FIELDS, Checks, ChecksLike, _job_id_from_link
+from .circuit_breaker import CircuitBreakerState, GhFailureClass, classify_gh_failure
+from .circuit_breaker_transport import build_circuit_breaker_state
 from .comments import Comments, CommentsLike
 from .issues import (
     ISSUE_LIST_FIELDS,
@@ -42,13 +44,19 @@ from .pull_requests import (
     _pr_number_from_url,
 )
 from .repo_meta import RepoMeta, RepoMetaLike
-from .transport import RECONCILE_ISSUE_FIELDS, RECONCILE_PR_FIELDS, Transport
+from .transport import (
+    RECONCILE_ISSUE_FIELDS,
+    RECONCILE_PR_FIELDS,
+    Transport,
+)
 
 __all__ = [
     "Checks",
     "ChecksLike",
+    "CircuitBreakerState",
     "Comments",
     "CommentsLike",
+    "GhFailureClass",
     "GitHubRunResult",
     "ISSUE_LIST_FIELDS",
     "ISSUE_VIEW_FIELDS",
@@ -78,5 +86,7 @@ __all__ = [
     "_is_mutating",
     "_job_id_from_link",
     "_pr_number_from_url",
+    "build_circuit_breaker_state",
+    "classify_gh_failure",
     "get_github_issue_dependencies",
 ]

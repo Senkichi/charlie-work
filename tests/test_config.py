@@ -599,8 +599,11 @@ def test_load_config_escalated_label_repair_max_per_pass_accepts_zero(
 
 
 def test_runtime_config_gh_timeout_seconds_default() -> None:
-    """RuntimeConfig.gh_timeout_seconds defaults to 120.0 seconds."""
-    assert RuntimeConfig().gh_timeout_seconds == 120.0
+    """RuntimeConfig.gh_timeout_seconds defaults to 30.0 seconds (issue #1833:
+    lowered from 120.0 so a connect/hang failure fails fast; legitimately
+    long calls opt into gh_long_call_timeout_seconds instead).
+    """
+    assert RuntimeConfig().gh_timeout_seconds == 30.0
 
 
 def test_load_config_gh_timeout_seconds_override(tmp_path: Path) -> None:
