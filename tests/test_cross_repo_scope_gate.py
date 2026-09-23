@@ -233,6 +233,11 @@ def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
     remote = tmp_path / "remote"
     remote.mkdir(parents=True, exist_ok=True)
     _git(remote, "init", "--bare", "--initial-branch=main")
+    # The remote's receive-pack needs repo-level longpaths: git scrubs the
+    # GIT_CONFIG_* env config (set by conftest for local invocations) when
+    # spawning transport children, so object writes on the receive side can
+    # only read the setting from the remote's own config file.
+    _git(remote, "config", "core.longpaths", "true")
     clone = tmp_path / "clone"
     clone.mkdir(parents=True, exist_ok=True)
     _git(clone, "init", "--initial-branch=main")
