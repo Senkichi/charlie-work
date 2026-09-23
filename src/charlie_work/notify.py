@@ -112,6 +112,11 @@ _DESKTOP_SEVERITIES = frozenset(
         # other members of this set -- it belongs in the desktop-toast path,
         # not filtered out of it.
         "OPERATOR_QUEUE_IMPACT",
+        # Issue #1505: an outbound body write refused on a credential-pattern
+        # match means live secret material exists in the pipeline -- the
+        # operator needs to rotate it, so the alert belongs on the
+        # desktop-toast path, not only in the digest file.
+        "OUTBOUND_BODY_SECRET_REFUSED",
     }
 )
 _MAX_DESKTOP_REASON_LENGTH = 80
