@@ -811,6 +811,23 @@ def _loop_impl(
                 correlation_id=cid,
                 level="warning",
             )
+        # Issue #1505: surface refused outbound body writes (the
+        # ``outbound_body_secret_refused`` events the API-boundary guard
+        # emits) to the operator attention digest once per new batch. Same
+        # advisory containment as the queue-impact check above -- the
+        # consumer reads events.db and emits a digest; it must never be able
+        # to crash an otherwise-successful pass.
+        try:
+            self._maybe_report_outbound_secret_refusals()
+        except Exception as exc:  # noqa: BLE001 - containment is deliberate; see docstring
+            log_event(
+                self.paths.state_file,
+                "outbound_secret_refusal_report_failed",  # event-consumer: audit-only -- containment record for issue #1505; the actionable behavior is the except block itself keeping the pass alive
+                {"error": f"{type(exc).__name__}: {exc}"},
+                repo=self.repo_root.name,
+                correlation_id=cid,
+                level="warning",
+            )
         log_event(
             self.paths.state_file,
             "loop_completed",
