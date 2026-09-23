@@ -53,8 +53,10 @@ trying again; there is no loop to cap.
 
 Stdlib-only (same constraint as ``worker_stop_gate`` -- worker sessions
 are not guaranteed to have the ``dev`` extra installed). It shells out
-to ``ruff`` via ``uv run --no-sync`` through the reused ``_run_ruff``,
-so the script itself never needs third-party packages to run.
+to ``ruff`` as ``sys.executable -m ruff`` through the reused ``_run_ruff``
+(#1793: never ``uv run``, which silently creates a fresh ``.venv`` inside
+a gated worktree), so the script itself never needs third-party packages
+to run.
 
 Hook contract (Claude Code PreToolUse format, consistent with
 ``merge_preflight_hook``): blocking is done via stdout JSON

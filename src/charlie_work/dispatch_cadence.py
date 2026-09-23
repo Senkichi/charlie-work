@@ -24,6 +24,14 @@ high-water mark (``file_size_ratchet_baseline/``). A byte-identical
 extraction shrinks ``state.py`` back under its mark and passes the ratchet
 trivially, the same remedy ``tests/test_file_size_ratchet.py`` names for any
 over-cap-monolith growth.
+
+Issue #1682 added ``_past_dated_state_timestamps`` and
+``_dependency_root_blocker_progress`` -- the root-blocker progress scan that
+bounds the #1110 dependency-blocked exemption in
+``ci_findings.check_dispatch_staleness``. They live here rather than in
+``ci_findings.py`` because that module is at the file-size ratchet cap
+(issue #1442), and they are staleness bookkeeping of the same kind this
+module already holds.
 """
 
 from __future__ import annotations
@@ -258,3 +266,137 @@ def clear_dispatch_stale_alert(
         return data
     section["last_stale_alert_at"] = None
     return {**data, "dispatch_cadence": section}
+
+
+# ---------------------------------------------------------------------------
+# Issue #1682: dependency-root-blocker progress bookkeeping -- the bounded
+# form of ci_findings.check_dispatch_staleness's #1110 exemption. Lives here
+# rather than in ci_findings.py because that module is at the file-size
+# ratchet cap (issue #1442); these are staleness bookkeeping, same theme as
+# the baseline marker and alert-cadence arms above.
+# ---------------------------------------------------------------------------
+
+
+def _past_dated_state_timestamps(entry: dict[str, Any], now: datetime) -> list[datetime]:
+    """Every parseable ``*_at``/``*_since`` timestamp on a state entry that is
+    not in the future (issue #1682).
+
+    The ``*_at``/``*_since`` naming convention covers the durable lifecycle
+    stamps this codebase writes (``dispatched_at``, ``reviewed_at``,
+    ``terminal_since``, ``stale_checks_last_retrigger_at``, …) without a
+    hardcoded field list that would silently miss the next stamp added. Only
+    PAST-dated values count: a ``next_*_at``-style field records a scheduled
+    FUTURE event, not a state change, and letting one win would pin
+    ``last_change_at`` in the future and silence the idle check forever.
+    """
+    # Deferred import: ci_findings imports this module at top level for
+    # ``_dependency_root_blocker_progress``, so a module-level import of
+    # ``_parse_iso_ts`` here would close an import cycle -- the same reason
+    # ``backfill_dispatch_baseline`` defers its ``query_events`` import.
+    from .ci_findings import _parse_iso_ts
+
+    times: list[datetime] = []
+    for key, value in entry.items():
+        if not isinstance(value, str):
+            continue
+        if not (key.endswith("_at") or key.endswith("_since")):
+            continue
+        ts = _parse_iso_ts(value)
+        if ts is not None and ts <= now:
+            times.append(ts)
+    return times
+
+
+def _dependency_root_blocker_progress(
+    state: dict[str, Any],
+    roots: list[Any],
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """Issue #1682: last recorded change time per dependency root blocker.
+
+    ``roots`` is the ``dependency_root_blockers`` list emitted by
+    ``classify_backlog_reachability`` (``{"number", "updated_at"}`` entries).
+    Returns one ``{"issue", "last_change_at", "idle_seconds",
+    "blocking_prs"}`` detail dict per well-formed root, sorted-input order
+    preserved.
+
+    "Last change" is the newest of:
+
+    * the root issue's GitHub ``updatedAt`` -- already fetched by the
+      classifier, and the only signal that also captures progress the
+      orchestrator never writes to state (human review, comments, label
+      edits, a force-push), and
+    * every past-dated ``*_at``/``*_since`` timestamp on the root's own
+      ``state["issues"]`` entry and on each ``state["prs"]`` entry bound to
+      it by ``issue_number`` (dispatch claims, review verdicts, janitor
+      transitions, CI retriggers -- each one writes a stamp).
+
+    A root with no parseable evidence gets ``last_change_at: None`` /
+    ``idle_seconds: None`` -- the caller treats that as idle, because there
+    is no recorded progress to bound the wait against (matching the
+    ``no_baseline`` precedent's fail-LOUD direction for a detected stall:
+    silence about progress is itself the finding).
+    """
+    # Deferred import for the same cycle reason documented in
+    # ``_past_dated_state_timestamps`` above.
+    from .ci_findings import _parse_iso_ts
+
+    issues_state = state.get("issues")
+    prs_state = state.get("prs")
+    details: list[dict[str, Any]] = []
+    for root in roots:
+        if not isinstance(root, dict) or not isinstance(root.get("number"), int):
+            continue
+        number = root["number"]
+        candidates: list[datetime] = []
+        updated_at = root.get("updated_at")
+        if isinstance(updated_at, str):
+            ts = _parse_iso_ts(updated_at)
+            if ts is not None and ts <= now:
+                candidates.append(ts)
+        entry = issues_state.get(str(number)) if isinstance(issues_state, dict) else None
+        if isinstance(entry, dict):
+            candidates.extend(_past_dated_state_timestamps(entry, now))
+        blocking_prs: list[dict[str, Any]] = []
+        if isinstance(prs_state, dict):
+            for key, pr_entry in sorted(
+                prs_state.items(),
+                key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0,
+            ):
+                if not isinstance(pr_entry, dict):
+                    continue
+                if str(pr_entry.get("issue_number")) != str(number):
+                    continue
+                pr_times = _past_dated_state_timestamps(pr_entry, now)
+                candidates.extend(pr_times)
+                pr_last = max(pr_times) if pr_times else None
+                pr_number = pr_entry.get("number")
+                blocking_prs.append(
+                    {
+                        "number": (
+                            pr_number
+                            if isinstance(pr_number, int)
+                            else int(key)
+                            if str(key).isdigit()
+                            else None
+                        ),
+                        "status": pr_entry.get("status"),
+                        "last_change_at": (
+                            pr_last.isoformat().replace("+00:00", "Z") if pr_last else None
+                        ),
+                    }
+                )
+        last_change = max(candidates) if candidates else None
+        details.append(
+            {
+                "issue": number,
+                "last_change_at": (
+                    last_change.isoformat().replace("+00:00", "Z") if last_change else None
+                ),
+                "idle_seconds": (
+                    int((now - last_change).total_seconds()) if last_change else None
+                ),
+                "blocking_prs": blocking_prs,
+            }
+        )
+    return details
