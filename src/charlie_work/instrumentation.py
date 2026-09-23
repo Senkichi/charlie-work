@@ -621,6 +621,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # failure. Emitted by both salvage lanes through the shared
         # ``salvage_superseded.salvage_skip_event_kind`` mapping.
         "salvage_skipped_superseded": "info",
+        # Issue #1781: a PR that carried an ``unlinked_pr_notice`` marker
+        # resolved a linked issue on a later pass, so the marker was evicted
+        # -- the falling edge of the warning-level ``pr_unlinked_skipped``
+        # rising-edge detector. Info, not warning: this is the self-heal
+        # completing (the operator who saw the warning can see it resolved),
+        # sibling to ``foreign_issue_ref_cleared``.
+        "pr_unlinked_resolved": "info",
         "quota_probe_succeeded": "info",
         "readiness_no_ci_rework_requested": "info",
         "reconcile": "info",
