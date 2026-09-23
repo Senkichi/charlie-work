@@ -203,7 +203,7 @@ standalone leading comments), so this survives the call's own internals
 reflowing (argument wrapping, added kwargs) -- the "reflow" robustness
 requirement. It does NOT survive the call being deleted, moved to a
 different line, or reordered relative to its marker; that case is stale, not
-silently still-matching, exactly the direction ``test_write_gate_no_marker_is_stale``
+silently still-matching, exactly the direction ``test_write_gate_allowlist_entries_are_not_stale``
 enforces (see below).
 
 Enforcement is unchanged in strength, checked three ways:
@@ -211,7 +211,7 @@ Enforcement is unchanged in strength, checked three ways:
 loudly rather than silently degrading to "no marker" -- see
 ``_parse_marker_comment``; an unmarked raw call remains unaccounted exactly
 as before; a marker matching no real call is stale and fails
-``test_write_gate_no_marker_is_stale``.
+``test_write_gate_allowlist_entries_are_not_stale``.
 
 ## Structural anchors, not line numbers
 
@@ -231,7 +231,7 @@ itself is intentionally simpler -- purely line-based (R13 above) -- because a
 human writes it next to the one call it means, and reformatting cannot move
 a leading comment away from the statement it precedes.
 
-``test_write_gate_no_marker_is_stale`` enforces the same symmetric direction
+``test_write_gate_allowlist_entries_are_not_stale`` enforces the same symmetric direction
 ``test_event_kind_registry_exhaustive`` does for its own allow-list: a
 marker that no longer matches a real site is a silent hole and must fail the
 build too, not just accumulate as dead weight.
@@ -1554,15 +1554,16 @@ def test_real_pr2_pr3_converted_sites_are_not_flagged() -> None:
     )
 
 
-def test_write_gate_no_marker_is_stale() -> None:
+def test_write_gate_allowlist_entries_are_not_stale() -> None:
     """Symmetric direction of the main enforcement check, mirroring
     test_instrumentation.py's `test_event_kind_registry_exhaustive` 'stale'
-    assertion (and the old `_ALLOWED_RAW_PRIMITIVE_SITES`-tuple version of
-    this same test): every write-gate-exempt marker found in src/ must match
-    a real raw-primitive-call site on the line directly below it. A marker
-    that matches nothing is a silent hole -- the code it was written to
-    justify moved or changed, and the marker is now lying about what it
-    covers."""
+    assertion. Name kept from the pre-#1837 `_ALLOWED_RAW_PRIMITIVE_SITES`-tuple
+    era (a rename here reads as a deletion to the collect-only leaf-name
+    gate) even though the mechanism it now exercises is markers, not tuple
+    entries: every write-gate-exempt marker found in src/ must match a real
+    raw-primitive-call site on the line directly below it. A marker that
+    matches nothing is a silent hole -- the code it was written to justify
+    moved or changed, and the marker is now lying about what it covers."""
     markers, marker_errors = _scan_exemption_markers(_SRC_ROOT)
     assert not marker_errors, "malformed write-gate-exempt marker(s):\n" + "\n".join(marker_errors)
 
@@ -1576,13 +1577,15 @@ def test_write_gate_no_marker_is_stale() -> None:
     )
 
 
-def test_write_gate_stale_marker_detection_positive_control() -> None:
+def test_write_gate_allowlist_staleness_check_detects_a_truly_dead_entry() -> None:
     """Task requirement: 'stale markers (no raw primitive call in the marked
-    statement) fail.' `test_write_gate_no_marker_is_stale` above proves the
-    CURRENT real markers all still match (the correct-state case) -- this
-    test is the positive control proving the staleness check itself would
-    actually catch a dead one: a marker directly above a line that makes no
-    raw primitive call at all."""
+    statement) fail.' Name kept from the pre-#1837 tuple era for the same
+    collect-only leaf-name reason as the sibling test above.
+    `test_write_gate_allowlist_entries_are_not_stale` proves the CURRENT real
+    markers all still match (the correct-state case) -- this test is the
+    positive control proving the staleness check itself would actually catch
+    a dead one: a marker directly above a line that makes no raw primitive
+    call at all."""
     source = textwrap.dedent(
         """
         def _do_something(state):
