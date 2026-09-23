@@ -115,8 +115,7 @@ def test_run_fleet_stop_writes_the_marker_and_reports(
 ) -> None:
     """The command writes the marker and reports liveness/watchdog context."""
     monkeypatch.setattr(
-        fleet_stop,
-        "probe_fleet_watchdog",
+        "charlie_work.fleet_dispatch.probe_fleet_watchdog",
         lambda: WatchdogProbe(armed=True, detail="Enabled"),
     )
 
@@ -144,7 +143,8 @@ def test_run_fleet_stop_dry_run_writes_nothing(
 ) -> None:
     """--dry-run previews the write without creating the marker."""
     monkeypatch.setattr(
-        fleet_stop, "probe_fleet_watchdog", lambda: WatchdogProbe(armed=None, detail="?")
+        "charlie_work.fleet_dispatch.probe_fleet_watchdog",
+        lambda: WatchdogProbe(armed=None, detail="?"),
     )
 
     result = cli.run_fleet_stop(_stop_args(tmp_path, dry_run=True))
@@ -161,8 +161,7 @@ def test_run_fleet_stop_reports_a_replaced_request(
     """A second ``fleet stop`` replaces the pending request — and says so."""
     write_fleet_stop_request(str(tmp_path), drain=True)
     monkeypatch.setattr(
-        fleet_stop,
-        "probe_fleet_watchdog",
+        "charlie_work.fleet_dispatch.probe_fleet_watchdog",
         lambda: WatchdogProbe(armed=False, detail="Disabled"),
     )
 
@@ -183,8 +182,7 @@ def test_run_fleet_stop_detects_a_live_supervisor(
 ) -> None:
     """A live heartbeat (pid alive, no exited_at) reports supervisor_live."""
     monkeypatch.setattr(
-        fleet_stop,
-        "probe_fleet_watchdog",
+        "charlie_work.fleet_dispatch.probe_fleet_watchdog",
         lambda: WatchdogProbe(armed=True, detail="Enabled"),
     )
     monkeypatch.setattr(
@@ -199,6 +197,89 @@ def test_run_fleet_stop_detects_a_live_supervisor(
     assert result.ok is True
     assert result.data["supervisor_live"] is True
     assert "no live supervisor" not in result.message
+
+
+def test_fleet_stop_through_cli_main_uses_the_real_probe_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression: ``charlie fleet stop`` end-to-end must not NameError.
+
+    The extracted ``run_fleet_stop`` called a bare ``probe_fleet_watchdog()``
+    that a PEP 562 module ``__getattr__`` could not serve — module
+    ``__getattr__`` covers attribute access, never in-module ``LOAD_GLOBAL``
+    lookups — so the real command crashed after writing the marker while
+    every test masked it by injecting the name into ``fleet_stop``. This
+    drives the command through ``cli.main`` and fakes only the lowest layer:
+    the probe on ``fleet_dispatch`` itself.
+    """
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.probe_fleet_watchdog",
+        lambda: WatchdogProbe(armed=True, detail="Enabled"),
+    )
+
+    rc = cli.main(["--fleet-dir", str(tmp_path), "fleet", "stop"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "stop request recorded" in out
+    # Armed watchdog -> the relaunch-trap hint must reach the operator.
+    assert "disable the task" in out
+    assert read_fleet_stop_request(str(tmp_path)) is not None
+
+
+def test_fleet_stop_global_loads_all_resolve() -> None:
+    """Structural guard: no fleet_stop function loads an unbound global.
+
+    Same hole as above, checked mechanically: every ``LOAD_GLOBAL`` name in
+    every code object reachable from the module (functions, methods, nested
+    definitions) must resolve in the module's own ``__dict__`` or builtins.
+    ``vars()`` — not ``hasattr()`` — so a future module ``__getattr__``
+    cannot fake a binding the bytecode would never find.
+    """
+    import builtins
+    import dis
+    import types
+
+    def _global_names(code: types.CodeType) -> set[str]:
+        names = {
+            instr.argval for instr in dis.get_instructions(code) if instr.opname == "LOAD_GLOBAL"
+        }
+        for const in code.co_consts:
+            if isinstance(const, types.CodeType):
+                names |= _global_names(const)
+        return names
+
+    def _code_objects(obj: Any) -> list[types.CodeType]:
+        # Only objects DEFINED in fleet_stop — an imported Path/CommandResult
+        # carries globals from its own module, which are not our problem.
+        if isinstance(obj, types.FunctionType):
+            return [obj.__code__] if obj.__module__ == fleet_stop.__name__ else []
+        if isinstance(obj, (staticmethod, classmethod)):
+            return _code_objects(obj.__func__)
+        if isinstance(obj, property):
+            codes = []
+            for accessor in (obj.fget, obj.fset, obj.fdel):
+                if accessor is not None:
+                    codes.extend(_code_objects(accessor))
+            return codes
+        if isinstance(obj, type) and obj.__module__ == fleet_stop.__name__:
+            codes = []
+            for member in vars(obj).values():
+                codes.extend(_code_objects(member))
+            return codes
+        return []
+
+    unresolved: set[str] = set()
+    module_ns = vars(fleet_stop)
+    for obj in list(module_ns.values()):
+        for code in _code_objects(obj):
+            for name in _global_names(code):
+                if name not in module_ns and not hasattr(builtins, name):
+                    unresolved.add(name)
+
+    assert not unresolved, f"unbound globals in fleet_stop: {sorted(unresolved)}"
 
 
 # --- supervisor honoring ----------------------------------------------------

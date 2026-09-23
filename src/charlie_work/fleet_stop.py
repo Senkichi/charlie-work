@@ -51,23 +51,9 @@ from .workflow import CommandResult
 
 if TYPE_CHECKING:
     from .config import OrchestratorConfig
-    from .fleet_dispatch import FleetLocalSnapshot, probe_fleet_watchdog
+    from .fleet_dispatch import FleetLocalSnapshot
 
 logger = logging.getLogger(__name__)
-
-
-def __getattr__(name: str) -> Any:
-    # ``fleet_dispatch`` imports this module, so a top-level
-    # ``from .fleet_dispatch import probe_fleet_watchdog`` would be a
-    # circular import. Resolving it lazily (PEP 562) keeps
-    # ``run_fleet_stop`` a verbatim relocation from ``cli.py`` while still
-    # letting callers patch either module's binding — the lookup runs at
-    # call time, so ``monkeypatch`` on this module's attribute shadows it.
-    if name == "probe_fleet_watchdog":
-        from .fleet_dispatch import probe_fleet_watchdog
-
-        return probe_fleet_watchdog
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 #: events.db kind recorded when ``charlie fleet stop`` writes the marker.
@@ -341,6 +327,12 @@ def run_fleet_stop(args: argparse.Namespace) -> CommandResult:
     # trigger relaunches a clean supervisor on its next tick — the trap the
     # runbook's "disable the task first" procedure exists for. Report the
     # probe's actual answer rather than restating the doc.
+    # Function-local import: ``fleet_dispatch`` imports this module, so a
+    # module-level import would be circular. Resolving at call time also
+    # means tests patch the name on ``fleet_dispatch`` itself — there is no
+    # fleet_stop-local binding to shadow.
+    from .fleet_dispatch import probe_fleet_watchdog
+
     watchdog = probe_fleet_watchdog()
     if watchdog.armed is True:
         watchdog_hint = (
