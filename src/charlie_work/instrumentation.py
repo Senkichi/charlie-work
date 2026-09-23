@@ -322,6 +322,14 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # resets the breaker -- but a live fleet tripping this repeatedly
         # means the network path to GitHub itself needs attention.
         "github_circuit_opened": "warning",
+        # Issue #1834: one `gh api` REST-GET/graphql call could not be served
+        # by the pooled HTTP transport (token resolution failed, or an
+        # unexpected/unparseable response shape) and fell through to the
+        # `gh` subprocess for that call only. Warning, not error: the call
+        # still completed via the fallback -- but a high rate of these means
+        # the HTTP path itself needs attention (a stale/broken `gh auth
+        # token`, or a response shape this module does not yet handle).
+        "github_transport_fallback": "warning",
         "graphql_rate_limit_deferred": "warning",
         "infra_rerun_failed": "warning",
         "janitor_rework_stalled": "warning",
