@@ -392,6 +392,10 @@ class PullRequests(CapabilityCollaborator):
                     f"repos/{{owner}}/{{repo}}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}",
                 ],
                 json_output=True,
+                # issue #1833: up to _LIST_LIMIT (500) items across pages of
+                # 100, like _list_json's large-limit calls -- legitimately
+                # longer than the fail-fast default.
+                long_call=True,
             )
             # run() returns None when gh exits 0 with empty stdout. A genuine
             # empty page comes back as the JSON array ``[]`` (a list), so a

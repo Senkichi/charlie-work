@@ -1138,6 +1138,36 @@ class PreflightConfig:
 
 
 @dataclass(frozen=True)
+class GhCircuitBreakerConfig:
+    """Per-pass circuit breaker thresholds for ``gh`` transport failures
+    (issue #1833, follow-up to the #1832 overnight outage).
+
+    After ``failure_threshold`` consecutive transport-class ``gh`` failures
+    (connect/handshake/DNS/hang -- see
+    ``github_capabilities.circuit_breaker.classify_gh_failure``) in one
+    orchestrator pass, further ``gh`` calls that pass fail immediately as
+    values, without spawning a subprocess, until ``cooldown_seconds`` has
+    elapsed, at which point one probe call is allowed through. Semantic
+    failures (4xx/422/5xx, rate limits, auth) never count toward the
+    threshold. Reset to a clean slate at the start of every pass
+    (``GitHub.reset_circuit_breaker()``), so a bad pass cannot permanently
+    fail-fast every later one.
+
+    Ships enabled with these defaults (owner directive: every new
+    feature/knob ships enabled with sensible defaults; config exists only as
+    a kill switch, never a default-off opt-in). Five consecutive failures is
+    high enough above single-blip noise to avoid false trips while still
+    catching the #1832 pattern (every call in a pass failing the same way)
+    within the first handful of calls rather than exhausting the whole pass.
+    60s balances riding out a brief blip against blocking the bulk of a
+    pass's runtime once the network has recovered.
+    """
+
+    failure_threshold: int = 5
+    cooldown_seconds: float = 60.0
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     state_dir: str = layout.DEFAULT_STATE_DIR
     # Preflight gate thresholds (issue #1363) -- see PreflightConfig.
@@ -1220,7 +1250,24 @@ class RuntimeConfig:
     # intervenes (observed 2026-08-05, loop pass 0636dca635de). Retries do not
     # help a call that never returns — only a timeout converts the hang into a
     # failure the existing retry/next-pass machinery can absorb.
-    gh_timeout_seconds: float = 120.0
+    #
+    # Lowered from 120.0 to 30.0 (issue #1833, follow-up to the #1832
+    # overnight outage): TLS handshake timeouts and 120s gh timeouts, retried
+    # serially across many calls, stretched a single fleet pass past 90
+    # minutes. A connect/handshake/DNS failure or a genuine hang should fail
+    # fast at 30s, not tie up a retry attempt for two minutes. Calls with a
+    # legitimately long response (large paginated lists) use
+    # gh_long_call_timeout_seconds instead via GitHub.run(long_call=True).
+    gh_timeout_seconds: float = 30.0
+    # Budget for calls known in advance to be legitimately long-running --
+    # large paginated issue/PR list and search responses -- as opposed to
+    # gh_timeout_seconds' fail-fast default above (issue #1833).
+    gh_long_call_timeout_seconds: float = 120.0
+    # Per-pass circuit breaker for gh transport-class failures (issue #1833).
+    # Ships enabled by default with sensible thresholds (owner directive: no
+    # default-off knobs) -- this section exists to retune or disable it, not
+    # to opt in. See GhCircuitBreakerConfig for the field-level rationale.
+    gh_circuit_breaker: GhCircuitBreakerConfig = field(default_factory=GhCircuitBreakerConfig)
     # cw#1273: outer retry for `gh pr create` specifically, layered on top of
     # GitHub.run()'s inner pre-connection-only retry above. The inner retry's
     # ~7s default span is far shorter than the ~45s TLS blips observed on
@@ -3002,6 +3049,20 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 "config section 'runtime' key 'gh_timeout_seconds' must be > 0, "
                 f"got {gh_timeout_seconds}"
             )
+    gh_long_call_timeout_seconds = runtime_data.get("gh_long_call_timeout_seconds")
+    if gh_long_call_timeout_seconds is not None:
+        if isinstance(gh_long_call_timeout_seconds, bool) or not isinstance(
+            gh_long_call_timeout_seconds, (int, float)
+        ):
+            raise ConfigError(
+                "config section 'runtime' key 'gh_long_call_timeout_seconds' must be a "
+                f"number, got {type(gh_long_call_timeout_seconds).__name__}"
+            )
+        if gh_long_call_timeout_seconds <= 0:
+            raise ConfigError(
+                "config section 'runtime' key 'gh_long_call_timeout_seconds' must be > 0, "
+                f"got {gh_long_call_timeout_seconds}"
+            )
     pr_create_retry_max_attempts = runtime_data.get("pr_create_retry_max_attempts")
     if pr_create_retry_max_attempts is not None and not isinstance(
         pr_create_retry_max_attempts, int
@@ -3156,6 +3217,49 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                     f"got {type(bool_value).__name__}"
                 )
         runtime_data["preflight"] = PreflightConfig(**preflight_data)
+    # Parse gh_circuit_breaker sub-section (issue #1833).
+    gh_circuit_breaker_data = runtime_data.get("gh_circuit_breaker")
+    if gh_circuit_breaker_data is not None:
+        if not isinstance(gh_circuit_breaker_data, dict):
+            raise ConfigError(
+                "config section 'runtime' key 'gh_circuit_breaker' must be a mapping, "
+                f"got {type(gh_circuit_breaker_data).__name__}"
+            )
+        breaker_fields = {f.name for f in fields(GhCircuitBreakerConfig)}
+        unknown_breaker_keys = sorted(set(gh_circuit_breaker_data) - breaker_fields)
+        if unknown_breaker_keys:
+            raise ConfigError(
+                "config section 'runtime' key 'gh_circuit_breaker' has unknown key(s): "
+                f"{', '.join(unknown_breaker_keys)} "
+                f"(valid: {', '.join(sorted(breaker_fields))})"
+            )
+        failure_threshold = gh_circuit_breaker_data.get("failure_threshold")
+        if failure_threshold is not None:
+            if not isinstance(failure_threshold, int) or isinstance(failure_threshold, bool):
+                raise ConfigError(
+                    "config section 'runtime' key 'gh_circuit_breaker.failure_threshold' "
+                    f"must be an int, got {type(failure_threshold).__name__}"
+                )
+            if failure_threshold < 1:
+                raise ConfigError(
+                    "config section 'runtime' key 'gh_circuit_breaker.failure_threshold' "
+                    f"must be >= 1, got {failure_threshold}"
+                )
+        cooldown_seconds = gh_circuit_breaker_data.get("cooldown_seconds")
+        if cooldown_seconds is not None:
+            if not isinstance(cooldown_seconds, (int, float)) or isinstance(
+                cooldown_seconds, bool
+            ):
+                raise ConfigError(
+                    "config section 'runtime' key 'gh_circuit_breaker.cooldown_seconds' "
+                    f"must be a number, got {type(cooldown_seconds).__name__}"
+                )
+            if cooldown_seconds < 0:
+                raise ConfigError(
+                    "config section 'runtime' key 'gh_circuit_breaker.cooldown_seconds' "
+                    f"must be >= 0, got {cooldown_seconds}"
+                )
+        runtime_data["gh_circuit_breaker"] = GhCircuitBreakerConfig(**gh_circuit_breaker_data)
     runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
     devin_data = _section(data, "devin")
     for command_key in ("dispatch_command", "shell_command"):

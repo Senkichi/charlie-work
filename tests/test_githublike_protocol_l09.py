@@ -194,7 +194,7 @@ def test_retry_knobs_read_from_runtime_config_through_delegates(tmp_path: Path) 
     gh_default = GitHub(tmp_path)
     assert gh_default._max_retries() == 3
     assert gh_default._retry_base_seconds() == 1.0
-    assert gh_default._timeout_seconds() == 120.0
+    assert gh_default._timeout_seconds() == 30.0
 
     gh_configured = GitHub(
         tmp_path,
@@ -265,7 +265,12 @@ def test_run_monkeypatchable_at_class_level_with_moved_body_observing_it(
     calls: list[list[str]] = []
 
     def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+        self: GitHub,
+        args: list[str],
+        *,
+        json_output: bool = False,
+        allow_failure: bool = False,
+        long_call: bool = False,
     ):
         calls.append(args)
         return [{"number": 1}]

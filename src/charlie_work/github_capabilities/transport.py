@@ -39,10 +39,13 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from ci_fleet.github import GitHubError
 
+from .. import layout
+from ..instrumentation import log_event
 from ._base import (
     CapabilityCollaborator,
     GitHubRunResult,
@@ -50,10 +53,17 @@ from ._base import (
     _is_mutating,
 )
 from .checks import PR_CHECKS_FIELDS
+from .circuit_breaker import CircuitBreakerState, GhFailureClass, classify_gh_failure
 from .issues import ISSUE_LIST_FIELDS, ISSUE_VIEW_FIELDS
 from .labels import LABEL_LIST_FIELDS
 from .pull_requests import MERGED_PR_LIST_FIELDS, PR_LIST_FIELDS, PR_VIEW_FIELDS
 from ..subprocess_runner import no_console_window_kwargs
+
+if TYPE_CHECKING:
+    # Type-only: importing charlie_work.config at module level would cycle
+    # (config -> github -> github_capabilities -> transport). See the module
+    # docstring's note on validate_field_lists' identical lazy import.
+    from ..config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +73,36 @@ logger = logging.getLogger(__name__)
 # alongside ``_max_retries``/``_retry_base_seconds``/``_timeout_seconds``
 # (Track 2, issue #1593; design doc Section 5, L09). No other consumer
 # referenced these three, so they are relocated without a re-export.
+#
+# Lowered from 120.0 to 30.0 (issue #1833, follow-up to the #1832 overnight
+# outage): a connect/handshake-class failure or a genuine hang should fail
+# fast, not tie up a serial retry loop for two minutes per attempt. Calls
+# with a legitimately long response body (large paginated lists) opt into
+# ``_DEFAULT_GH_LONG_CALL_TIMEOUT_SECONDS`` via ``run(..., long_call=True)``
+# instead of raising this shared default.
 _DEFAULT_GH_MAX_RETRIES = 3
 _DEFAULT_GH_RETRY_BASE_SECONDS = 1.0
-_DEFAULT_GH_TIMEOUT_SECONDS = 120.0
+_DEFAULT_GH_TIMEOUT_SECONDS = 30.0
+
+# Budget for calls that are known to legitimately take longer than the
+# fail-fast default above (issue #1833) -- large paginated list/search
+# responses, not a hang. ``_list_json`` (every ``issue list``/``pr list`` call)
+# and ``merged_pr_list``'s manual REST pagination loop are the only two call
+# shapes that opt in; see their ``long_call=True`` call sites.
+_DEFAULT_GH_LONG_CALL_TIMEOUT_SECONDS = 120.0
+
+# Circuit breaker defaults (issue #1833). Owner directive: ships enabled by
+# default with sensible thresholds -- config exists only to retune or
+# disable it (threshold set high enough, or cooldown 0), never as an
+# opt-in flag. Five consecutive transport-class failures is enough above
+# normal single-blip noise to avoid false trips, while still catching the
+# #1832 pattern (every call in a pass failing the same way) within the
+# first handful of calls rather than the whole pass. 60s cooldown is long
+# enough to ride out a brief network blip without cycling to a probe every
+# few seconds, short enough that a fleet pass isn't blocked for the bulk of
+# its runtime once the network recovers.
+_DEFAULT_GH_CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
+_DEFAULT_GH_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 60.0
 
 # How many issue numbers to pack into one batched `gh api graphql` query.
 # Kept conservative to stay under the ~32KB Windows command-line limit and
@@ -107,6 +144,30 @@ def _parse_git_remote_url(url: str) -> tuple[str, str] | None:
     if not owner or not name:
         return None
     return owner, name
+
+
+def build_circuit_breaker_state(runtime: "RuntimeConfig | None") -> CircuitBreakerState:
+    """Construct the per-``GitHub``-instance breaker state (issue #1833).
+
+    Called exactly once, from ``GitHub.__post_init__`` -- before that
+    dataclass's ``_COLLABORATORS`` loop installs the collaborator instances,
+    so it cannot go through ``self._transport``/``CapabilityCollaborator``
+    delegation yet, and must be a plain module-level function rather than a
+    ``Transport`` method. Kept here (not duplicated in ``github.py``) as the
+    single place that knows the ``gh_circuit_breaker`` config keys and their
+    defaults, matching how ``_max_retries``/``_retry_base_seconds``/
+    ``_timeout_seconds`` are the single source for their own knobs.
+    """
+    if runtime is not None:
+        breaker_config = runtime.gh_circuit_breaker
+        return CircuitBreakerState(
+            failure_threshold=breaker_config.failure_threshold,
+            cooldown_seconds=breaker_config.cooldown_seconds,
+        )
+    return CircuitBreakerState(
+        failure_threshold=_DEFAULT_GH_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+        cooldown_seconds=_DEFAULT_GH_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+    )
 
 
 # Minimal field lists for drift detection (reconcile.py). headRefOid is a
@@ -200,6 +261,108 @@ class Transport(CapabilityCollaborator):
             return self.runtime.gh_timeout_seconds
         return _DEFAULT_GH_TIMEOUT_SECONDS
 
+    def _long_call_timeout_seconds(self) -> float:
+        """Budget for a call known in advance to be legitimately long-running
+        (large paginated list/search responses -- see ``_list_json`` and
+        ``merged_pr_list``'s ``long_call=True`` call sites), as opposed to
+        ``_timeout_seconds``'s fail-fast default for everything else
+        (issue #1833).
+        """
+        if self.runtime is not None:
+            return self.runtime.gh_long_call_timeout_seconds
+        return _DEFAULT_GH_LONG_CALL_TIMEOUT_SECONDS
+
+    def _circuit_breaker_allow_call(self) -> bool:
+        """Whether ``GitHub.run()`` may spawn ``gh`` right now (issue #1833).
+
+        Delegates to the owner's single persistent ``CircuitBreakerState``
+        (constructed once in ``GitHub.__post_init__`` via
+        ``build_circuit_breaker_state`` below, alongside ``_list_cache`` --
+        both are mutable per-instance runtime state, not config). ``False``
+        means: the caller must fail this invocation as a value without
+        running a subprocess, matching the errors-as-values invariant.
+        """
+        return self._circuit_breaker_state.allow_call()
+
+    def _circuit_breaker_open_message(self, command: list[str]) -> str:
+        breaker = self._circuit_breaker_state
+        return (
+            f"GitHub circuit breaker open: refusing to run {' '.join(command)} "
+            f"after {breaker.consecutive_failures} consecutive transport-class "
+            f"gh failure(s) (threshold {breaker.failure_threshold}); cooldown "
+            f"{breaker.cooldown_seconds:g}s"
+        )
+
+    def _circuit_breaker_note_result(
+        self, *, error: str | None = None, timed_out: bool = False
+    ) -> None:
+        """Classify one completed ``gh`` invocation's outcome and update the
+        breaker (issue #1833).
+
+        Call with ``error=None`` for a genuine success. Call with the failure
+        text (or ``timed_out=True`` for a hang, or when the failure is known
+        transport-class by construction -- e.g. ``gh`` not found -- regardless
+        of its message text) for any failure; ``classify_gh_failure`` decides
+        whether it counts toward the breaker.
+
+        Called exactly once per logical ``gh`` invocation, at the point its
+        FINAL outcome is known -- never per internal retry attempt within
+        ``GitHub.run()``'s loop -- so "N consecutive failures" counts
+        invocations, matching the acceptance criteria's framing ("further
+        calls in the same pass fail immediately").
+        """
+        breaker = self._circuit_breaker_state
+        if classify_gh_failure(error, timed_out=timed_out) is GhFailureClass.TRANSPORT:
+            transition = breaker.record_transport_failure()
+            if transition == "opened":
+                self._emit_circuit_event(
+                    "github_circuit_opened",
+                    {
+                        "consecutive_failures": breaker.consecutive_failures,
+                        "failure_threshold": breaker.failure_threshold,
+                        "cooldown_seconds": breaker.cooldown_seconds,
+                    },
+                )
+        else:
+            transition = breaker.record_success()
+            if transition == "closed":
+                self._emit_circuit_event(
+                    "github_circuit_closed",
+                    {"cooldown_seconds": breaker.cooldown_seconds},
+                )
+
+    def _emit_circuit_event(self, kind: str, payload: dict[str, Any]) -> None:
+        """Best-effort event write; ``log_event`` never raises on failure."""
+        log_event(self._circuit_breaker_state_path(), kind, payload)
+
+    def _circuit_breaker_state_path(self) -> Path:
+        """Compute ``state.json``'s path without going through ``paths.py``
+        (which imports ``.config`` and would cycle -- see the module
+        docstring). Mirrors ``paths.runtime_paths``' resolution of
+        ``runtime.state_dir`` exactly (absolute as-is, relative joined to
+        ``repo_root``), using only ``layout.py`` primitives.
+        """
+        state_dir = (
+            self.runtime.state_dir if self.runtime is not None else layout.DEFAULT_STATE_DIR
+        )
+        root = Path(state_dir)
+        if not root.is_absolute():
+            root = self.repo_root / root
+        return layout.state_file_path(root.resolve())
+
+    def reset_circuit_breaker(self) -> None:
+        """Per-pass reset hook (issue #1833).
+
+        Called from ``OrchestratorApp._loop_body`` alongside
+        ``invalidate_list_cache()``, for the same reason: a long-running
+        ``charlie fleet supervise`` process reuses one ``GitHub`` instance
+        across many passes, so per-pass state must be explicitly re-armed at
+        the top of each pass rather than living for the life of the process --
+        otherwise a breaker tripped by one bad pass's network blip would
+        permanently fail-fast every later pass.
+        """
+        self._circuit_breaker_state.reset()
+
     def _normalize_rest_pr(self, pr: dict[str, Any]) -> dict[str, Any]:
         """Map a PR object from the REST pulls endpoint to the shape expected
         by consumers of merged_pr_list().
@@ -255,7 +418,13 @@ class Transport(CapabilityCollaborator):
     def _list_json(self, args: list[str], *, limit: int, kind: str) -> list[dict[str, Any]]:
         # run() now applies the fleet-wide bounded retry policy for transient
         # failures, so _list_json no longer needs its own ad-hoc retry loop.
-        result = self.run(args, json_output=True)
+        # long_call=True (issue #1833): every _list_json call requests up to
+        # `limit` items (hundreds), which legitimately takes longer than the
+        # fail-fast default -- this is the single chokepoint for both
+        # issue_list/pr_list's large-limit calls, so marking it here covers
+        # them with zero call-site changes (CLAUDE.md's single-point-of-
+        # enforcement invariant).
+        result = self.run(args, json_output=True, long_call=True)
         items = result if isinstance(result, list) else []
         if len(items) >= limit:
             logger.warning(
@@ -404,6 +573,20 @@ class Transport(CapabilityCollaborator):
         ]
 
         for name, args, fields in field_lists:
+            # issue #1833: gate each probe on the breaker so a degraded
+            # network fails the rest of this loop fast (as values, per the
+            # errors-as-values invariant) instead of spawning gh ten times at
+            # up to _timeout_seconds() each. A hard ConfigError below still
+            # means "gh answered but the field list is wrong" -- that is a
+            # genuine misconfiguration this function exists to catch, not a
+            # transport problem, so it is deliberately left to raise.
+            if not self._circuit_breaker_allow_call():
+                logger.warning(
+                    "Skipping remaining gh --json field-list validation this pass: %s",
+                    self._circuit_breaker_open_message(["gh", *args]),
+                )
+                return
+
             try:
                 result = subprocess.run(
                     ["gh", *args],
@@ -418,14 +601,24 @@ class Transport(CapabilityCollaborator):
                 )
             except FileNotFoundError as exc:
                 raise ConfigError("GitHub CLI `gh` is not installed or not on PATH") from exc
-            except subprocess.TimeoutExpired as exc:
-                # No retry here: this probe runs once at startup to validate
-                # field lists, and a hang means the environment cannot answer
-                # the question at all. Surfacing it as ConfigError matches the
-                # other failure modes of this loop rather than hanging boot.
-                raise ConfigError(
-                    f"gh timed out validating field list {name} after {self._timeout_seconds():g}s"
-                ) from exc
+            except subprocess.TimeoutExpired:
+                # issue #1833: a hang here is transport-class, not a config
+                # error -- the #1832 outage's other signature alongside TLS
+                # handshake timeouts. Previously this always raised
+                # ConfigError and propagated out of OrchestratorApp.__init__
+                # uncaught (fleet_dispatch.py's "Error processing repo"
+                # path), which is exactly the errors-as-values invariant this
+                # fix restores: record the failure, skip the remaining
+                # probes this pass, and return normally instead of raising.
+                self._circuit_breaker_note_result(timed_out=True)
+                logger.warning(
+                    "gh timed out validating field list %s after %gs; skipping remaining "
+                    "field-list validation this pass (transport-class failure, not a "
+                    "config error)",
+                    name,
+                    self._timeout_seconds(),
+                )
+                return
 
             if result.returncode == 0:
                 raise ConfigError(
@@ -434,9 +627,31 @@ class Transport(CapabilityCollaborator):
 
             stderr = result.stderr
             if "Unknown JSON field" not in stderr and "Available fields" not in stderr:
+                # issue #1833: this branch previously assumed any non-zero
+                # exit without the expected stderr shape meant a config
+                # problem worth a hard ConfigError. That is also reachable by
+                # a genuine transport-class failure (e.g. a connection reset
+                # mid-probe) whose stderr never mentions JSON fields at all --
+                # the same misclassification as the TimeoutExpired case
+                # above, via a different branch. Reclassify before deciding.
+                if classify_gh_failure(stderr) is GhFailureClass.TRANSPORT:
+                    self._circuit_breaker_note_result(error=stderr)
+                    logger.warning(
+                        "Could not validate field list %s due to a transport-class gh "
+                        "failure; skipping remaining field-list validation this pass: %s",
+                        name,
+                        stderr.strip() or result.stdout.strip(),
+                    )
+                    return
                 raise ConfigError(
                     f"Could not validate field list {name}: {stderr.strip() or result.stdout.strip()}"
                 )
+
+            # A non-zero exit with the expected "Unknown JSON field"/
+            # "Available fields" stderr shape proves gh answered normally --
+            # record it so a prior transport-class streak this pass doesn't
+            # carry forward past evidence the transport is fine.
+            self._circuit_breaker_note_result()
 
             available: set[str] = set()
             match = re.search(r"Available fields:\n((?:  .+\n)+)", stderr)
