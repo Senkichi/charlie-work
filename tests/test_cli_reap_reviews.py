@@ -24,6 +24,7 @@ from _review_fixtures import (
 )
 from charlie_work import cli, layout
 from charlie_work.claude_code import ClaudeWorkerRecord
+from charlie_work.instrumentation import query_events
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.supervise import try_acquire_supervisor_lock
 
@@ -102,6 +103,12 @@ def test_reap_reviews_frees_dead_claim_while_supervisor_lock_held(tmp_path: Path
         and event.get("payload", {}).get("pr_number") == 100
         for event in state.get("events", [])
     )
+    # The command records its own invocation for post-incident forensics:
+    # which mode ran and which PRs the sweep freed.
+    invoked = query_events(app.paths.state_file, kind="review_reap_invoked")
+    assert len(invoked) == 1
+    assert invoked[0]["payload"]["mode"] == "reap_only"
+    assert invoked[0]["payload"]["reaped_prs"] == [100]
     # The dead sidecar is reaped so it cannot resurface as a phantom claim.
     assert not sidecar.exists()
 
@@ -139,6 +146,9 @@ def test_reap_reviews_dispatches_freed_claim_when_lock_free(monkeypatch, tmp_pat
         and event.get("payload", {}).get("pr_number") == 100
         for event in state.get("events", [])
     )
+    invoked = query_events(app.paths.state_file, kind="review_reap_invoked")
+    assert len(invoked) == 1
+    assert invoked[0]["payload"]["mode"] == "reap_and_dispatch"
 
 
 def test_reap_reviews_dry_run_reports_without_mutating(tmp_path: Path) -> None:
