@@ -58,6 +58,15 @@ stdlib-only; see the notes below before "fixing" one.
   only permitted import; anything else needing sharing from inside the
   package still needs the reimplement-locally treatment `fleet_dir` and the
   stale-open-issue-mention primitives already get, not a new exception here.
+- **`heartbeat_local_repo.py`** — local-only-repo (`local_issues.enabled`)
+  gating helpers extracted out of `heartbeat_check.py` (file-size ratchet,
+  #1879): the layered-config resolver and the per-check skip helpers that
+  need more than a bare `report.ok(...)` one-liner. Loaded from
+  `heartbeat_check.py` via `importlib.util.spec_from_file_location` from the
+  sibling script path, not a bare `import` — `scripts/` is not a package and
+  the test harness (`tests/_script_loader.py`) deliberately keeps it off
+  `sys.path`, the same pattern `git_push_lint_hook.py` uses to load
+  `worker_stop_gate.py`. Stdlib-only, same constraint as `heartbeat_check.py`.
 - **`backfill_stale_rework_briefs.py`** — one-shot operator tool (F6 of
   `docs/plans/rework-findings-channel.md`) that bumps a `review-decision.json`
   verdict's mtime (`os.utime` only — never rewrites its contents) for PRs
