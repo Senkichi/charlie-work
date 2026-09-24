@@ -467,6 +467,7 @@ from .dead_worker_reap import (  # noqa: F401  (deliberate re-export)
 from .live_handoff_finalize import (
     collect_stale_live_handoff_pids,
     finalize_live_handoff_candidates,
+    partition_dispatched_by_pid_liveness,
     resolve_live_handoff_candidates,
 )
 
@@ -1681,10 +1682,7 @@ def _detect_and_handle_orphaned_workers(
     watchdog (e.g. to work around a shim log-mtime blindness) must not lose
     the #935 pushed-branch salvage backstop, the #417 ground-truth label
     reclaim, or the orphan drift diagnostics -- all of which are keyed off
-    state.json PID records, not log mtimes.
-
-    Issue #1867: a live PID alone is not proof of in-flight work -- see
-    ``live_handoff_finalize.py`` for the PID-independent finalize lane.
+    state.json PID records, not log mtimes. Issue #1867: ``live_handoff_finalize.py``.
     """
     write_gate = require_write_gate(write_gate)
 
@@ -1695,30 +1693,16 @@ def _detect_and_handle_orphaned_workers(
     with state_lock(state_file):
         state = load_state(state_file)
 
-    orphaned_issues: list[int] = []
-    # Issue #1867: live-PID entries (every other lane assumes dead).
-    live_pid_entries: dict[int, dict[str, Any]] = {}
-    for issue_number_str, entry in state.get("issues", {}).items():
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("status") != "dispatched":
-            continue
-
-        if _worker_pid_alive(entry):
-            live_pid_entries[int(issue_number_str)] = entry
-        else:
-            orphaned_issues.append(int(issue_number_str))
-
-    # Issue #935/#1453: computed once, before any pre-lock loop.
-    now = datetime.now(UTC)
+    orphaned_issues, live_pid_entries = partition_dispatched_by_pid_liveness(
+        state, worker_pid_alive=_worker_pid_alive
+    )
+    now = datetime.now(UTC)  # Issue #935/#1453: computed once, before any pre-lock loop.
     repo_root = getattr(gh, "repo_root", None)
     worktrees_dir = None
     if repo_root is not None:
         worktrees_dir = resolved_layout(config, repo_root).worktrees
 
-    # Issue #1867 (round-2): filesystem-only, so the return below still
-    # skips gh.pr_list()/state_lock when nothing needs finalizing.
-    stale_live_handoff_pids = collect_stale_live_handoff_pids(
+    stale_live_handoff_pids = collect_stale_live_handoff_pids(  # Issue #1867 round-2
         live_pid_entries,
         worker_outcome_finalize_minutes=config.watchdog.worker_outcome_finalize_minutes,
         repo_root=repo_root,
@@ -1786,8 +1770,7 @@ def _detect_and_handle_orphaned_workers(
     # fire before reclaim adds ``automated-ready``.  Reused by the second
     # loop (pushed-branch candidates) without re-reading.
     worker_outcomes: dict[int, dict[str, Any] | None] = {}
-    # Also used below by the live-handoff lane; populated at most once.
-    issues_by_number: dict[int, dict[str, Any]] = {}
+    issues_by_number: dict[int, dict[str, Any]] = {}  # also used by the live-handoff lane below
 
     if no_pr_orphans:
         for issue in gh.issue_list(state="open"):
@@ -2201,8 +2184,7 @@ def _detect_and_handle_orphaned_workers(
                 "active_labels": active_labels,
             }
 
-    # Issue #1867: resolve against the now-fetched ``pr_by_issue``.
-    live_handoff_candidates = resolve_live_handoff_candidates(
+    live_handoff_candidates = resolve_live_handoff_candidates(  # Issue #1867
         stale_live_handoff_pids,
         pr_by_issue=pr_by_issue,
         issues_by_number=issues_by_number,
@@ -3137,8 +3119,7 @@ def _detect_and_handle_orphaned_workers(
 
             state["issues"][str(issue_number)] = entry
 
-        # Issue #1867: finalize live-PID handoffs; mutates state/sweep_events.
-        finalize_live_handoff_candidates(
+        finalize_live_handoff_candidates(  # Issue #1867
             gh=gh,
             config=config,
             repo_root=repo_root,

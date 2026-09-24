@@ -49,6 +49,40 @@ from .state import PASSIVE_OPEN_STATUS, utc_now
 from .worktree import read_worker_outcome, worktree_path_for_branch
 
 
+def partition_dispatched_by_pid_liveness(
+    state: dict[str, Any],
+    *,
+    worker_pid_alive: Callable[[dict[str, Any]], bool],
+) -> tuple[list[int], dict[int, dict[str, Any]]]:
+    """Split ``status: dispatched`` issues into dead-PID orphans and
+    live-PID entries.
+
+    ``worker_pid_alive`` is taken as a parameter (not imported here)
+    deliberately: it must resolve through the caller's own module globals
+    (``workflow._worker_pid_alive``) at call time, since that is the name
+    the test suite patches to simulate PID liveness -- importing it
+    directly into this module would make that patch a no-op.
+
+    Issue #1867: ``live_pid_entries`` is kept separate from the dead-PID
+    ``orphaned_issues`` on purpose -- every lane but the live-handoff
+    finalize assumes the process has exited, and mixing live entries in
+    would let the label-reclaim/redispatch-cap/drift lanes act on a
+    running worker.
+    """
+    orphaned_issues: list[int] = []
+    live_pid_entries: dict[int, dict[str, Any]] = {}
+    for issue_number_str, entry in state.get("issues", {}).items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("status") != "dispatched":
+            continue
+        if worker_pid_alive(entry):
+            live_pid_entries[int(issue_number_str)] = entry
+        else:
+            orphaned_issues.append(int(issue_number_str))
+    return orphaned_issues, live_pid_entries
+
+
 def collect_stale_live_handoff_pids(
     live_pid_entries: dict[int, dict[str, Any]],
     *,
