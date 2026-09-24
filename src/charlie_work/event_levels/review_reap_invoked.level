@@ -1,0 +1,7 @@
+info
+# Issue #1874: the `reap-reviews` operator command ran. Info, not warning:
+# the command is routine operational bookkeeping — the dead-claim condition
+# it acts on is already surfaced by the sweep's own events
+# (review_dispatch_stalled, review_dispatch_lifecycle_reaped). The payload's
+# mode field distinguishes reap_and_dispatch (lock free) from reap_only
+# (supervisor lock held) for post-incident review.

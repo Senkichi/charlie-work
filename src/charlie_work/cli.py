@@ -199,6 +199,27 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("review-queue")
     subparsers.add_parser("operator-queue")
 
+    reap_reviews = subparsers.add_parser(
+        "reap-reviews",
+        help=(
+            "Force-reap dead review claims without waiting for a loop pass "
+            "(issue #1874). Runs the same stalled/verdict/orphan sweeps "
+            "dispatch_reviews runs at the top of every pass. When the repo's "
+            "supervisor lock is free it also runs dispatch_reviews under the "
+            "lock so freed claims re-dispatch immediately; when the lock is "
+            "held (a live or wedged supervisor owns the lane) it reaps "
+            "anyway — the sweeps never launch a reviewer — and freed claims "
+            "re-dispatch on the next pass."
+        ),
+    )
+    reap_reviews.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Cap reviewer launches on the dispatch phase (lock-free mode only).",
+    )
+    _add_dry_run(reap_reviews)
+
     dispatch = subparsers.add_parser("work")
     dispatch.add_argument("--limit", type=int, default=None)
     dispatch.add_argument(
@@ -676,7 +697,7 @@ def _assert_config_repo_matches(config_arg: Path | None, repo_root: Path) -> Non
 #: Read-only commands are deliberately exempt: their cwd-defaulted resolution
 #: is harmless and changing it would break operator workflows that routinely
 #: run ``charlie status`` from worktree cwds.
-_STATE_AFFECTING_COMMANDS = frozenset({"verdict", "merge-authorize", "unescalate"})
+_STATE_AFFECTING_COMMANDS = frozenset({"verdict", "merge-authorize", "unescalate", "reap-reviews"})
 
 
 def _assert_not_sibling_clone(ctx: CommandContext, args: argparse.Namespace) -> None:
@@ -2544,6 +2565,8 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
         if args.tripwire_command == "status":
             return app.tripwire_status()
         return CommandResult(False, f"unknown tripwire command: {args.tripwire_command}", {})
+    if args.command == "reap-reviews":
+        return app.reap_reviews(limit=args.limit)
     if args.command == "bash-rats":
         from .supervise import run_supervised, try_acquire_supervisor_lock
 
