@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 import tempfile as _tempfile_module
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import create_autospec
@@ -51,6 +51,76 @@ def autospec_patch(
 def autospec() -> Callable[..., Any]:
     """Provide the autospec_patch helper to tests."""
     return autospec_patch
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _kill_on_close_job() -> None:
+    """Issue #1851: on Windows, put this pytest process in a Job Object with
+    ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` so every descendant — at any
+    depth — dies with pytest however the session ends.
+
+    Launch-path tests spawn real children that nothing waits on (the
+    adapters are non-blocking by design); a stopped run used to orphan them,
+    and on Windows the orphaned venv launchers busy-spun for hours. Off
+    Windows this is a no-op; a process already inside a job that forbids
+    nesting is logged and tolerated.
+
+    Under pytest-xdist each worker runs this for itself — a child of an
+    xdist worker is contained by that worker's job.
+    """
+    from _process_guard import enter_kill_on_close_job
+
+    enter_kill_on_close_job()
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_child_processes() -> Iterator[None]:
+    """Issue #1851: fail a test that leaves a live descendant behind.
+
+    Snapshots this process's descendants at setup; at teardown gives new
+    children a short grace to exit on their own, kills the survivors, and
+    fails the test naming each survivor's pid and command line. Measured
+    cost: two ``psutil`` child enumerations per test ≈ 7.5 ms — ~60 s over
+    the 7909-test suite (~7 % of the ~14.5 min CI Tests job). A cheaper
+    ``create_time``-vs-``time.time()`` cutoff was tried and rejected:
+    ``time.time()`` granularity/stepping on some Windows hosts can place a
+    pre-existing child above the cutoff (see ``descendant_snapshot``).
+    """
+    from _process_guard import descendant_snapshot, reap_leaked_descendants
+
+    before = descendant_snapshot()
+    yield
+    report = reap_leaked_descendants(before)
+    if report:
+        pytest.fail("test left live child process(es) behind:\n  " + "\n  ".join(report))
+
+
+@pytest.fixture(autouse=True)
+def _reap_launched_worker_pids(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Issue #1851: reap every pid a non-blocking launch function returns.
+
+    ``launch_api_worker`` / ``launch_claude_worker`` / ``launch_devin_session``
+    return immediately by design; the record's ``pid`` is the only handle the
+    caller gets back. Wrapping every binding of them reachable in
+    ``sys.modules`` — test-module globals and the production ``from``-import
+    references alike — collects every returned pid so teardown can kill any
+    that are still alive: the "wait on or kill every process handle they get
+    back" hygiene applied uniformly, rather than relying on each call site
+    to remember. Tests that monkeypatch a launcher themselves replace the
+    wrapper and opt out for that call — their fakes return fabricated pids
+    that ``reap_pid`` declines to touch anyway.
+
+    Setup order matters: this fixture is defined after
+    ``_no_leaked_child_processes``, so its teardown runs first and a reaped
+    launch never reaches the guard.
+    """
+    from _process_guard import reap_pid, wrap_launchers
+
+    pids: list[int] = []
+    wrap_launchers(monkeypatch, pids)
+    yield
+    for pid in pids:
+        reap_pid(pid)
 
 
 @pytest.fixture(autouse=True)
@@ -240,6 +310,30 @@ def _no_real_pr_create_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     import charlie_work.pr_create_retry as pr_create_retry_module
 
     monkeypatch.setattr(pr_create_retry_module, "_default_sleep", lambda seconds: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_host_load_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a governor's host-load probe spawn a real process listing.
+
+    Issue #1843: ``host_load.measure_host_load`` defaults its ``lister`` to
+    ``list_host_processes``, which on this host invokes a real PowerShell
+    ``Get-CimInstance Win32_Process`` enumeration inside every governor call.
+    The feature ships on by default (``dispatch.host_load_max_pytest_processes``
+    defaults to the host's CPU count), so without this stub every test that
+    reaches ``_apply_concurrency_governor`` with a positive limit would pay a
+    subprocess spawn -- and, worse, would clamp or not depending on whatever
+    pytest suites happened to be running on the machine that moment, making
+    unrelated tests order-dependent. An empty snapshot (zero pytest trees)
+    is the correct neutral reading for every test not specifically about
+    host-load behavior. Tests that exercise the clamp re-patch
+    ``charlie_work.host_load.list_host_processes`` inside their own body,
+    which cleanly overrides this default; tests of the lister itself
+    inject ``lister=``/``proc_root=`` seams directly and never consult it.
+    """
+    import charlie_work.host_load as host_load_module
+
+    monkeypatch.setattr(host_load_module, "list_host_processes", lambda: ((), None))
 
 
 def _healthy_preflight(*args: object, **kwargs: object) -> PreflightResult:

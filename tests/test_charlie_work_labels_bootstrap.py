@@ -14,6 +14,7 @@ from charlie_work.config import (
     OrchestratorConfig,
 )
 from charlie_work.instrumentation import query_events
+from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
 
@@ -239,3 +240,49 @@ def test_ensure_labels_never_raises_on_unexpected_exception(tmp_path: Path) -> N
     assert len(failed) == 1, failed
     assert failed[0]["level"] == "error"
     assert "RuntimeError" in failed[0]["payload"]["error"]
+
+
+def test_ensure_labels_no_remote_backend_reports_ok(tmp_path: Path) -> None:
+    """Issue #1862: a backend with no remote has no label registry to ensure.
+
+    ``LocalFileGitHub.label_create`` is a documented no-op and
+    ``label_list`` only reports labels already present in issue
+    frontmatter, so every LabelConfig name that has not yet appeared on a
+    local issue reads as permanently missing. The ensure must
+    short-circuit to ``label_ensure_ok`` instead of emitting a
+    ``label_ensure_incomplete`` warning on every supervisor startup.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    issues_dir = tmp_path / "issues"
+    issues_dir.mkdir()
+    # An empty-but-real local issues dir: label_list() returns [], so
+    # without the capability short-circuit every label reads missing.
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir)
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    result = app.ensure_labels()
+
+    assert result.ok is True
+    assert result.data["missing"] == []
+    ok_events = query_events(paths.state_file, kind="label_ensure_ok")
+    assert len(ok_events) == 1, ok_events
+    assert ok_events[0]["level"] == "info"
+    assert query_events(paths.state_file, kind="label_ensure_incomplete") == []
+
+
+def test_bootstrap_labels_no_remote_backend_reports_ok(tmp_path: Path) -> None:
+    """Issue #1862: bootstrap-labels shares ``_ensure_labels_core``, so the
+    no-remote short-circuit applies to the explicit CLI door too — a local
+    backend has no registry for bootstrap to populate."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    issues_dir = tmp_path / "issues"
+    issues_dir.mkdir()
+    gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir)
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    result = app.bootstrap_labels()
+
+    assert result.ok is True
+    assert result.data["missing"] == []

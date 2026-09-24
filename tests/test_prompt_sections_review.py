@@ -182,3 +182,59 @@ def test_review_rendered_with_no_untested_files() -> None:
 
     # Verify the untested files line does NOT appear
     assert "Untested product files:" not in section
+
+
+# The literal ``values`` dict ``OrchestratorApp.review`` passes to
+# ``self._render("review.md", {...})`` -- mirrors
+# ``test_prompt_render_contract.py``'s pinned key set (cross-test-module
+# imports are banned by ``test_zero_cross_test_import_guard``, so the dict
+# is repeated inline here).
+_REVIEW_MD_VALUES = {
+    "pr_number": 1,
+    "pr_title": "t",
+    "pr_url": "u",
+    "issue_number": 2,
+    "issue_title": "it",
+    "issue_url": "iu",
+    "pr_json_path": "p.json",
+    "diff_path": "d.patch",
+    "janitor_section": "",
+    "test_adequacy_section": "",
+    "static_probe_section": "",
+    "diff_size_section": "",
+    "ci_status_section": "",
+    "collect_gate_exemption_section": "",
+    "over_cap_section": "",
+    "attachment_budget_section": "",
+    "prior_review_section": "",
+}
+
+
+def test_rendered_review_prompt_compares_against_context_and_standards() -> None:
+    """Verify the rendered review prompt's invariant-comparison step also
+    names CONTEXT.md and CODING_STANDARDS.md where present (issue #1850)."""
+    from charlie_work.prompts import render_prompt
+
+    rendered = " ".join(render_prompt("review.md", _REVIEW_MD_VALUES).split())
+
+    assert (
+        "Compare the implementation against project invariants in `CLAUDE.md`, "
+        "and in `CONTEXT.md` and `CODING_STANDARDS.md` where present."
+    ) in rendered
+
+
+def test_rendered_review_prompt_honours_cited_out_of_scope_claims() -> None:
+    """Verify the rendered review prompt's self-report section treats an
+    "out of scope" claim that cites the issue's own "Out of scope" section
+    or a ``.out-of-scope/`` record as checkable text -- not a finding when
+    the text supports it (issue #1850)."""
+    from charlie_work.prompts import render_prompt
+
+    rendered = " ".join(render_prompt("review.md", _REVIEW_MD_VALUES).split())
+
+    assert (
+        'An "out of scope" claim that cites the issue\'s own "Out of scope" '
+        "section, or a file under `.out-of-scope/`, is checked against that "
+        "text. When the text supports the claim, it is not a finding. Claims "
+        "with no such citation are handled as today."
+    ) in rendered

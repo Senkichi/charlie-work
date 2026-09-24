@@ -29,6 +29,7 @@ from charlie_work.ci_headroom import ci_headroom_available
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.github import GitHubError, GraphQLBudgetError
+from charlie_work.host_load import measure_host_load
 from charlie_work.instrumentation import log_event
 from charlie_work.janitor import JanitorVerdict
 from charlie_work.safe_ref import require_valid_sha
@@ -140,6 +141,12 @@ def _apply_concurrency_governor(
     ci_headroom_ratio = (
         self.config.dispatch.ci_capacity_headroom_ratio if apply_open_pr_backpressure else 0.0
     )
+    # Issue #1843: unlike the two WIP-shaping terms above, the host-load
+    # clamp applies to EVERY caller -- rework and recovery launches spawn
+    # real local suites too, and the host does not care which lane
+    # oversubscribed it. Read unconditionally; the probe below still only
+    # runs when a launch could actually happen (dispatch_limit > 0).
+    host_load_max = self.config.dispatch.host_load_max_pytest_processes
     # Issue #1770 review finding 10: captured once, before any term below can
     # tighten ``dispatch_limit``, so every ``dispatch_backpressure`` event
     # this call writes reports the same "requested" baseline -- the caller's
@@ -155,6 +162,7 @@ def _apply_concurrency_governor(
     fleet_live_count = 0
     open_pr_count = 0
     ci_headroom: int | None = None
+    host_load_reading = None
 
     # Issue #1770 review finding 3: live_count/open_pr_count are also the
     # cheapest available floor on "demand ci_fleet's last allocation pass
@@ -281,6 +289,47 @@ def _apply_concurrency_governor(
             clamped = True
             clamped_by = "ci_headroom"
 
+    if host_load_max > 0 and dispatch_limit > 0:
+        # Issue #1843: defer worker launches while the host is saturated.
+        # Applies to every governor caller (loop wave budget, rework, fresh
+        # dispatch) -- a launch spawns a real local suite whichever lane asks
+        # for it, unlike the WIP-shaping terms above. Probed only when the
+        # running limit is still positive: a pass already clamped to 0
+        # cannot launch anyway, so spending a subprocess spawn on the probe
+        # would buy no decision. ``measure_host_load`` returns None on probe
+        # failure (fail-open -- dispatch proceeds; it logs a rate-limited
+        # host_load_unavailable event itself), so only a real over-threshold
+        # reading ever reaches the clamp.
+        host_load_reading = measure_host_load(
+            diagnostic_state_path=self.paths.state_file,
+            diagnostic_repo=self.repo_root.name,
+        )
+        if host_load_reading is not None and (
+            host_load_reading.pytest_process_count > host_load_max
+        ):
+            # Same dispatch_backpressure kind as the open_pr_max/ci_headroom
+            # clamps above: one existing consumer sees every deferral reason,
+            # distinguished by ``clamped_by``. Same dry-run write-suppression
+            # discipline -- the clamp applies either way so a dry-run preview
+            # reports the same deferral a live pass would.
+            if not self.dry_run:
+                log_event(
+                    self.paths.state_file,
+                    "dispatch_backpressure",
+                    {
+                        "clamped_by": "host_load",
+                        "host_load_pytest_processes": host_load_reading.pytest_process_count,
+                        "host_load_pytest_trees": host_load_reading.pytest_tree_count,
+                        "host_load_max_pytest_processes": host_load_max,
+                        "requested_limit": original_dispatch_limit,
+                        "clamped_limit": 0,
+                    },
+                    repo=self.repo_root.name,
+                )
+            dispatch_limit = 0
+            clamped = True
+            clamped_by = "host_load"
+
     return _wf.ConcurrencyGovernorResult(
         clamped=clamped,
         max_concurrent=max_concurrent,
@@ -293,6 +342,13 @@ def _apply_concurrency_governor(
         open_pr_max=open_pr_max,
         ci_headroom=ci_headroom,
         ci_headroom_ratio=ci_headroom_ratio,
+        host_load_max_pytest_processes=host_load_max,
+        host_load_pytest_processes=(
+            host_load_reading.pytest_process_count if host_load_reading is not None else None
+        ),
+        host_load_pytest_trees=(
+            host_load_reading.pytest_tree_count if host_load_reading is not None else None
+        ),
         clamped_by=clamped_by,
     )
 
