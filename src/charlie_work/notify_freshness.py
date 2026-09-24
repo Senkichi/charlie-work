@@ -110,6 +110,7 @@ def check_notify_digest_freshness(
         return
     _stale_episodes[file_key] = now_ts
     try:
+        # write-gate-exempt(issue=1859): fleet-level supervisor telemetry; no repo WriteGate in scope
         log_event(
             fleet_state_path,
             "notify_digest_stale",
@@ -177,6 +178,7 @@ def report_notify_resolution(
         )
 
     try:
+        # write-gate-exempt(issue=1859): fleet-level supervisor telemetry; no repo WriteGate in scope
         log_event(
             fleet_state_path,
             "notify_resolution",
