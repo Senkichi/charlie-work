@@ -92,7 +92,7 @@ def _check_triage_label_map(add: Any, repo_root: Path, config: OrchestratorConfi
     path = repo_root / TRIAGE_LABEL_MAP_PATH
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         add("triage-label map", False, f"could not read {path}: {exc}")
         return
 
@@ -152,7 +152,7 @@ def _check_aviator_required_checks(add: Any, repo_root: Path, config: Orchestrat
     path = repo_root / AVIATOR_CONFIG_PATH
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         add(
             "aviator required checks",
             False,

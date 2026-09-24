@@ -124,6 +124,19 @@ def test_triage_label_map_reads_ready_from_config_not_literal(tmp_path: Path) ->
     assert "custom-ready" in detail
 
 
+def test_triage_label_map_invalid_utf8_is_error_not_exception(tmp_path: Path) -> None:
+    target = tmp_path / "docs" / "agents" / "triage-labels.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"\xff\xfe# not utf-8\n")
+
+    results = _collect(_check_triage_label_map, tmp_path, _config())
+
+    [(name, ok, detail, severity)] = results
+    assert ok is False
+    assert severity == "error"
+    assert "could not read" in detail
+
+
 # -- aviator required checks ---------------------------------------------------
 
 
@@ -178,11 +191,42 @@ def test_aviator_required_checks_no_list_passes(tmp_path: Path) -> None:
     target = tmp_path / ".aviator" / "config.yml"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("merge_rules:\n  labels:\n    trigger: mergequeue\n", encoding="utf-8")
+    # Non-empty config side: if the absent Aviator list were silently read as
+    # an empty list, the set comparison would report a drift, not a pass.
+    config = _config(auto_merge=AutoMergeConfig(required_checks=("Tests",)))
+
+    results = _collect(_check_aviator_required_checks, tmp_path, config)
+
+    [(name, ok, detail, severity)] = results
+    assert ok is True
+    assert severity == "warning"
+    assert "merge_rules.preconditions.required_checks" in detail
+
+
+def test_aviator_required_checks_unparseable_yaml_is_warning(tmp_path: Path) -> None:
+    target = tmp_path / ".aviator" / "config.yml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("merge_rules: [unclosed\n", encoding="utf-8")
 
     results = _collect(_check_aviator_required_checks, tmp_path, _config())
 
     [(name, ok, detail, severity)] = results
-    assert ok is True
+    assert ok is False
+    assert severity == "warning"
+    assert "could not parse" in detail
+
+
+def test_aviator_required_checks_invalid_utf8_is_warning(tmp_path: Path) -> None:
+    target = tmp_path / ".aviator" / "config.yml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"\xff\xfe not utf-8\n")
+
+    results = _collect(_check_aviator_required_checks, tmp_path, _config())
+
+    [(name, ok, detail, severity)] = results
+    assert ok is False
+    assert severity == "warning"
+    assert "could not parse" in detail
 
 
 # -- run_doctor wiring ---------------------------------------------------------
@@ -199,6 +243,43 @@ def test_run_doctor_reports_both_config_drift_checks(tmp_path: Path) -> None:
     ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
 
     by_name = {check.name: check for check in checks}
-    assert by_name["triage-label map"].ok is True
-    assert by_name["aviator required checks"].ok is True
+    triage = by_name["triage-label map"]
+    aviator = by_name["aviator required checks"]
+    assert triage.ok is True
+    # Only the adopted path emits the mapped label — the "not adopted"
+    # detail would name the file, never `automated-ready`.
+    assert "automated-ready" in triage.detail
+    assert aviator.ok is True
+    assert "1 required check(s) match" in aviator.detail
+    assert ok is True
+
+
+def test_run_doctor_triage_drift_fails_overall_aviator_drift_does_not(
+    tmp_path: Path,
+) -> None:
+    _write_workflow(tmp_path, "jobs:\n  test:\n    name: Tests\n    runs-on: ubuntu-latest\n")
+    config = _config(auto_merge=AutoMergeConfig(required_checks=("Tests",)))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    # A mismatched triage row is severity=error: it hard-fails the run.
+    _write_triage_map(tmp_path, "| `ready-for-agent` | `agent:ready` | ready |")
+    _write_aviator(tmp_path, ["Tests"])
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    assert by_name["triage-label map"].ok is False
+    assert by_name["triage-label map"].severity == "error"
+    assert "agent:ready" in by_name["triage-label map"].detail
+    assert ok is False
+
+    # Aviator drift alone is severity=warning: reported, never gating.
+    _write_triage_map(tmp_path, "| `ready-for-agent` | `automated-ready` | ready |")
+    _write_aviator(tmp_path, ["Tests", "Lint"])
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    assert by_name["aviator required checks"].ok is False
+    assert by_name["aviator required checks"].severity == "warning"
+    assert "Lint" in by_name["aviator required checks"].detail
     assert ok is True
