@@ -5,6 +5,10 @@
 # Cloud-only on purpose: on the operator's host the main checkout's .venv is the
 # live orchestrator's interpreter, and a uv sync there could swap packages out
 # from under a running process.
+#
+# No `|| true` in settings.json, unlike the PreToolUse gates, on purpose: a
+# SessionStart failure never blocks the session, so a failed sync should
+# surface as a visible hook error rather than be swallowed.
 set -euo pipefail
 
 if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
