@@ -6436,38 +6436,14 @@ class OrchestratorApp:
         # re-enabled (the reap is what makes it re-dispatchable). Before this
         # fix these sweeps sat below the ``enabled`` early return and were
         # unreachable whenever dispatch was disabled.
-        verdict_result = {"recorded": [], "missed": []}
-        reconciled_verdicts: list[dict[str, Any]] = []
-        if not self.dry_run:
-            verdict_result = self._reap_review_verdicts(reviews_dir)
-            # Issue #736: ingest completed on-disk verdicts that were never
-            # recorded into state. This runs BEFORE the stale-claim sweep so
-            # the sweep's ``decision_already_recorded`` skip (issue #734)
-            # never fires for a PR this reconciliation just ingested -- after
-            # ``record_review`` the PR's ``review_dispatch_status`` is
-            # ``review_dispatch_completed`` and the stale-claim branch (which
-            # only matches ``review_dispatch_status is None``) no longer
-            # applies. Like the other sweeps here, this runs ahead of the
-            # ``review_dispatch.enabled`` gate (issue #868) so a stranded
-            # verdict is ingested even when dispatch is disabled fleet-wide.
-            reconciled_verdicts = self._reconcile_stranded_verdicts()
-            _detect_and_handle_stalled_reviews(
-                reviews_dir,
-                self.paths.state_file,
-                self.config,
-                self.repo_root,
-                write_gate=self.write_gate,
-                now=resolved_now,
-            )
-            _reap_completed_review_checkouts(self.repo_root, reviews_dir, self.paths.state_file)
-            _reap_orphaned_review_checkouts(
-                self.gh,
-                self.repo_root,
-                reviews_dir,
-                self.paths.state_file,
-                self.config,
-                write_gate=self.write_gate,
-            )
+        #
+        # The block itself lives in ``_run_review_reap_sweeps`` so the
+        # standalone ``reap-reviews`` operator command (issue #1874) runs the
+        # identical sweep set — same five sweeps, same order — without
+        # duplicating the sequence here.
+        sweep_result = self._run_review_reap_sweeps(resolved_now)
+        verdict_result = sweep_result["verdict_result"]
+        reconciled_verdicts = sweep_result["reconciled_verdicts"]
         recorded_verdicts = verdict_result.get("recorded", [])
         missed_verdicts = verdict_result.get("missed", [])
 
