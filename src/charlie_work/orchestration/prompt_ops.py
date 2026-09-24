@@ -11,9 +11,9 @@ importing it directly: ``tests/test_prompt_template_drift_check.py`` patches
 (``monkeypatch.setattr(workflow_mod, "render_prompt", ...)``), so the call must
 resolve through that seam (Tier D, #1627). ``render_prompt`` therefore stays a
 deliberate re-export in ``charlie_work.workflow``. The remaining free functions
-used here (``fenced_block`` and the four ``assert_*`` prompt contracts, plus
-``prompt_template_digest``) are patched by no test, so they are imported
-directly from their source modules.
+used here (``fenced_block`` and the ``assert_worker_prompt_contracts``
+dispatch-boundary guard composite, plus ``prompt_template_digest``) are
+patched by no test, so they are imported directly from their source modules.
 """
 
 from __future__ import annotations
@@ -24,10 +24,7 @@ from typing import Any
 import charlie_work.workflow as _wf
 from charlie_work.markdown_fence import fenced_block
 from charlie_work.prompts import (
-    assert_containment,
-    assert_conventional_commit_title,
-    assert_execution_contract,
-    assert_no_merge_contract,
+    assert_worker_prompt_contracts,
     prompt_template_digest,
 )
 from charlie_work.prompt_skills import active_prompt_variants
@@ -87,33 +84,19 @@ def _write_worker_prompt(self, issue: dict[str, Any], *, dry_run: bool = False) 
             self.config.worker.harness, self.repo_root, self.prompt_dirs
         ),
     )
-    # Issue #714: enforce the no-merge contract on the *rendered output*
-    # so a repo-local flat override that drops $section_no_merge_contract
-    # is caught at the dispatch boundary rather than shipping a worker
-    # with no instruction against merging/closing/relabeling its own PR.
-    assert_no_merge_contract(prompt, context=f"worker prompt for issue #{issue_number}")
-    # Issue #715: enforce the conventional-commit title instruction on the
-    # *rendered output* so a repo-local flat override that mandates a stale
-    # non-conventional-commit title format (e.g. 'Fix #N: ...') is caught
-    # at the dispatch boundary rather than shipping a worker whose every PR
-    # trips the janitor's _check_title_conventional warning.
-    assert_conventional_commit_title(prompt, context=f"worker prompt for issue #{issue_number}")
-    # Issue #717: enforce the execution-contract escalation trigger on the
-    # *rendered output* so a repo-local flat override that drops
-    # $section_execution_contract — leaving a blanket "never run the full
-    # local suite" prohibition with no carve-out for contract-changing diffs
-    # (public function signature/return shape, exception type/message
-    # consumed elsewhere, DB schema, or module re-export) — is caught at the
-    # dispatch boundary rather than shipping a worker who can change a
-    # contract surface and push without ever exercising the wider suite.
-    assert_execution_contract(prompt, context=f"worker prompt for issue #{issue_number}")
-    # Issue #1010: enforce the widened containment clause on the *rendered
-    # output* so a repo-local flat override that drops
-    # $section_scope_contract or reverts to the old repo-scoped wording
-    # (which does not cover a different repo) is caught at the dispatch
-    # boundary rather than shipping a worker with no effective prohibition
-    # against editing a sibling repo's checkout.
-    assert_containment(prompt, context=f"worker prompt for issue #{issue_number}")
+    # Issues #714/#715/#717/#1010/#1780: the rendered-output contract guards
+    # (no-merge contract, conventional-commit title, execution-contract
+    # escalation trigger, widened containment clause, scratch-dir rule) run
+    # here at the dispatch boundary, so a repo-local flat override that
+    # drops a $section_* reference is caught rather than shipping a worker
+    # without the instruction — e.g. a stale 'Fix #N: ...' title format
+    # (#715), a blanket "never run the full local suite" with no carve-out
+    # for contract-changing diffs (#717), repo-scoped-only containment
+    # wording (#1010), or no prohibition on the literal /tmp/... path the
+    # MSYS usertemp-mount gap leaves shared across sessions (#1780). The
+    # guards live behind one call so the worker and rework writers cannot
+    # drift on which contracts apply.
+    assert_worker_prompt_contracts(prompt, context=f"worker prompt for issue #{issue_number}")
     # Issue #618: the dry-run dispatch branch promises "skip all state
     # writes, label transitions, and file mutations" — mkdir + write_text
     # here would violate that, and for a dead-worker recovery candidate
