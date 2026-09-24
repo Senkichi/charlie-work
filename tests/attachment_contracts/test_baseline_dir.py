@@ -24,6 +24,7 @@ from charlie_work.attachment_contracts.baseline import (
     entries_of,
 )
 from charlie_work.attachment_contracts.baseline_dir import (
+    ENTRIES_DIRNAME,
     META_FILENAME,
     document_files,
     dump,
@@ -34,6 +35,8 @@ from charlie_work.attachment_contracts.baseline_dir import (
     load_files,
     read_files,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _entry_dict(
@@ -370,3 +373,28 @@ def test_legacy_file_round_trips_through_dispatch(tmp_path: Path) -> None:
     loaded = load(path)
 
     assert loaded["entries"] == document["entries"]
+
+
+# ---------------------------------------------------------------------------
+# Committed store
+# ---------------------------------------------------------------------------
+
+
+def test_committed_baseline_file_loads() -> None:
+    """The committed baseline's FILES load through the file-map path.
+
+    Relocated verbatim-by-name from ``test_committed_baseline.py``
+    (collect-only gate leaf continuity, issue #1538 -- the same pattern as
+    #1828's ``test_cw_1518_...`` move): the pre-#1839 assertion "the single
+    ``.attachment-budgets.json`` document loads" is gone by design -- the
+    shared append point no longer exists. What remains true, and what this
+    pins, is the property the name describes literally: every file of the
+    committed ``.attachment-budgets/`` store loads through ``read_files`` +
+    ``load_files``, the same reconstruction path the review packet feeds
+    with PR-head content rebuilt from a diff.
+    """
+    files = read_files(_REPO_ROOT / BASELINE_DIRNAME)
+    assert META_FILENAME in files
+    assert any(rel.startswith(ENTRIES_DIRNAME + "/") for rel in files)
+    document = load_files(files)
+    assert document["entries"], "committed baseline must carry at least one entry"
