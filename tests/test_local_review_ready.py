@@ -47,10 +47,23 @@ from charlie_work.write_gate import WriteGate
 
 
 def _init_repo(repo_root: Path) -> None:
-    """A fresh git repo with one commit and NO origin remote."""
+    """A fresh git repo with one commit and NO origin remote.
+
+    ``core.longpaths`` is set because pytest's basetemp under this repo's
+    ``.var/worker-tmp`` pushes ``.git/objects/<sha>`` paths past the Windows
+    MAX_PATH limit (``error: unable to write file ... Filename too long``,
+    commit exit 1); the knob is a no-op elsewhere.
+    """
     repo_root.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["git", "init", "--initial-branch=main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "core.longpaths", "true"],
         cwd=repo_root,
         check=True,
         capture_output=True,

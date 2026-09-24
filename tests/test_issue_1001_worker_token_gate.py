@@ -140,11 +140,24 @@ def test_doctor_and_dispatch_gate_share_one_predicate() -> None:
         "source of truth (issue #1001)"
     )
 
-    # workflow._dispatch_impl must call the same function.
+    # workflow._dispatch_impl must call the same function -- via the
+    # issue #1810 capability-gated wrapper (a backend that cannot publish
+    # pull requests never has a worker push or open a PR, so the probe is
+    # skipped before the predicate is reached). Both hops are asserted so
+    # neither layer can grow its own copy of the predicate.
+    import charlie_work.local_work_park as lwp_mod
+
     dispatch_src = inspect.getsource(workflow_mod.OrchestratorApp._dispatch_impl)
-    assert "worker_github_token_findings" in dispatch_src, (
-        "workflow._dispatch_impl must call env_sanitize.worker_github_token_findings, "
-        "not inline its own copy"
+    assert "worker_github_token_findings_if_publishing" in dispatch_src, (
+        "workflow._dispatch_impl must call the shared predicate through "
+        "local_work_park.worker_github_token_findings_if_publishing, not "
+        "inline its own copy"
+    )
+    wrapper_src = inspect.getsource(lwp_mod.worker_github_token_findings_if_publishing)
+    assert "worker_github_token_findings(" in wrapper_src, (
+        "local_work_park.worker_github_token_findings_if_publishing must "
+        "delegate to env_sanitize.worker_github_token_findings, not inline "
+        "its own copy"
     )
 
 
