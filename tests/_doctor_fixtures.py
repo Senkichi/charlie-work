@@ -31,7 +31,7 @@ def _write_workflow(repo_root: Path, body: str) -> None:
 def _collect_allocation_checks(
     config: Any, fleet_dir: Path, *, now: Any = None
 ) -> list[tuple[str, bool, str]]:
-    from charlie_work.doctor import _check_runner_allocation
+    from charlie_work.doctor_allocation import _check_runner_allocation
 
     collected: list[tuple[str, bool, str]] = []
 
@@ -141,6 +141,18 @@ def _write_allocation_stamp(
     if skip_reason is not None:
         payload["skip_reason"] = skip_reason
     (fleet_dir / ALLOCATION_STATE_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_supervisor_heartbeat(fleet_dir: Path, payload: dict) -> None:
+    """Plant a ``supervisor-heartbeat.json`` sidecar in the fleet dir.
+
+    The doctor probe's ``fleet_dir_override`` makes ``fleet_dir`` the
+    host-wide fleet directory, so the heartbeat lands beside the allocation
+    stamp exactly as the real supervisor writes it.
+    """
+    from charlie_work.supervisor_lifecycle import HEARTBEAT_FILENAME
+
+    (fleet_dir / HEARTBEAT_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _config(**kwargs) -> OrchestratorConfig:
