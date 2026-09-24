@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
@@ -396,6 +397,26 @@ class DispatchConfig:
     # same rationale as max_open_agent_prs -- they reduce WIP rather than
     # adding to it. 0 = off, preserving current behavior.
     ci_capacity_headroom_ratio: float = 0.0
+    # Issue #1843: host-load backpressure for every dispatch lane that can
+    # launch a worker (fresh, rework, and the loop's shared wave budget).
+    # When > 0, the concurrency governor counts the processes inside live
+    # pytest process trees on this host (host_load.py -- a suite's xdist
+    # workers count as members of its tree) and clamps the pass's dispatch
+    # limit to 0 whenever the count exceeds this threshold, deferring the
+    # launch to a later pass instead of oversubscribing the box further.
+    # Unlike max_open_agent_prs/ci_capacity_headroom_ratio this term is NOT
+    # fresh-dispatch-only: a rework launch spawns a real local suite too,
+    # and the host does not care which lane oversubscribed it.
+    #
+    # Default: this host's logical CPU count (os.cpu_count()), i.e. "more
+    # runnable test processes than cores" is the built-in saturation line --
+    # the feature ships ON, and this knob is the kill switch/tuning point
+    # per the issue's acceptance criteria. 0 disables the check entirely
+    # (also the effective behavior on hosts where os.cpu_count() returns
+    # None). A failed measurement fails OPEN (dispatch proceeds) and is
+    # reported via a rate-limited host_load_unavailable event, never by
+    # silently treating the host as idle.
+    host_load_max_pytest_processes: int = field(default_factory=lambda: os.cpu_count() or 0)
     # Repo-root-relative paths copied into each worktree after creation
     # (e.g. [".devin"]). Copy-not-link (workers may write marker files);
     # skip-if-tracked (tracked paths are already present). Errors surface as
@@ -2518,6 +2539,19 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'dispatch' key 'ci_capacity_headroom_ratio' must be >= 0, "
                 f"got {_cchr}"
+            )
+    # Issue #1843: int validation for host_load_max_pytest_processes.
+    _hlmpp = dispatch_data.get("host_load_max_pytest_processes")
+    if _hlmpp is not None:
+        if isinstance(_hlmpp, bool) or not isinstance(_hlmpp, int):
+            raise ConfigError(
+                "config section 'dispatch' key 'host_load_max_pytest_processes' must be "
+                f"an int, got {type(_hlmpp).__name__}"
+            )
+        if _hlmpp < 0:
+            raise ConfigError(
+                "config section 'dispatch' key 'host_load_max_pytest_processes' must be "
+                f">= 0, got {_hlmpp}"
             )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review_data = _section(data, "review")
