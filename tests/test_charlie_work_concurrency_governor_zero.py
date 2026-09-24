@@ -206,7 +206,12 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
     # a dispatch_rework event -- the event payload is what this scenario
     # exercises (the early-return paths in scenarios 1/2 don't record events).
     partial_config = OrchestratorConfig(
-        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        # Issue #1843: the pinned concurrency_governor event payload below is
+        # an exact dict match, so this config disables the (default-on)
+        # host-load term to keep the asserted shape about max_concurrent only.
+        dispatch=DispatchConfig(
+            max_concurrent_sessions=2, default_limit=5, host_load_max_pytest_processes=0
+        ),
         devin=DevinConfig(
             dispatch_command=(
                 sys.executable,
@@ -343,7 +348,12 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
     monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live_one)
 
     config = OrchestratorConfig(
-        dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=5),
+        # Issue #1843: the pinned concurrency_governor event payload below is
+        # an exact dict match, so this config disables the (default-on)
+        # host-load term to keep the asserted shape about max_concurrent only.
+        dispatch=DispatchConfig(
+            max_concurrent_sessions=1, default_limit=5, host_load_max_pytest_processes=0
+        ),
         devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -451,7 +461,10 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
 
     fleet_config = OrchestratorConfig(
         fleet=FleetConfig(global_max_concurrent_sessions=3),
-        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        # Issue #1843: same pinned-payload rationale as the config above.
+        dispatch=DispatchConfig(
+            max_concurrent_sessions=2, default_limit=5, host_load_max_pytest_processes=0
+        ),
         devin=DevinConfig(),
     )
     fleet_gh = SaturatedGitHub(3)

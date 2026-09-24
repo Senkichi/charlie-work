@@ -382,6 +382,21 @@ Mitigations (the fleet is charlie-work's, but the test config is the
   cleanup hazard described above; bound parallelism with `PYTEST_XDIST_AUTO_NUM_WORKERS`
   instead of disabling isolation.
 
+Those are *static* bounds — they shape how much load each worker adds, but a
+worker-count budget alone cannot see load the fleet did not create (CI runs on
+the same box, other repos' fleets, a sibling repo's test suite). Issue #1843 added the
+dynamic counterpart: before launching a worker, the dispatch governor counts
+the processes inside live `pytest` process trees on the host (a suite's xdist
+workers count as members of its tree) and **defers the launch** when the count
+exceeds `dispatch.host_load_max_pytest_processes` — which defaults to the
+host's logical CPU count, so "more runnable test processes than cores" is the
+built-in saturation line and the check is on out of the box. Set it to `0` to
+disable entirely, or raise/lower it to tune. A deferred launch writes a
+`dispatch_backpressure` event (`clamped_by: "host_load"`, with the measured
+process/tree counts) to the repo's `events.db`, and a failed measurement fails
+*open* — dispatch proceeds — with a rate-limited `host_load_unavailable`
+warning instead of a silent missing clamp.
+
 ## Shared-venv isolation for devin-shell
 
 Per-worktree venvs are also the default for `devin-shell` (the `devin.venv_source`
