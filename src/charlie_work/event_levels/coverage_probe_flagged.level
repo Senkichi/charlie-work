@@ -1,0 +1,7 @@
+warning
+# Issue #1260: the diff-coverage static probe (W3) flagged one or more
+# non-test files whose added branch logic outran the diff's added
+# tests. Warning, not error: the probe is advisory-only and never
+# blocks -- the flag is the signal, not a hold -- but this is the
+# substrate for the 2-week false-positive measurement window before
+# any promotion to a hard gate is considered.

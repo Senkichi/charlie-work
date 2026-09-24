@@ -1,0 +1,5 @@
+warning
+# Issue #1363: a non-fatal preflight check (clock_sanity) failed at
+# the top of a loop pass. Warning, not error: the pass still ran
+# (_loop_body was not skipped) -- this is a tripwire for an operator
+# to notice, not a terminal outcome for the pass.

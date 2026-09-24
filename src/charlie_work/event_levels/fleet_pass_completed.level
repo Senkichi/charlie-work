@@ -1,0 +1,6 @@
+info
+# Issue #1832: a whole `fleet_loop()` pass returned -- success,
+# business failure, or partial (deadline-deferred). Any of these
+# means the pass was NOT wedged, so this is the reset signal the
+# wedge-loop detector (detect_wedge_kill_loop) measures
+# supervisor_wedged_killed streaks against.

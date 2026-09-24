@@ -1,0 +1,6 @@
+error
+# Issue #1383: fleet-wide infra block (Actions budget/runner outage)
+# has persisted across the configured pass threshold -- one
+# operator-facing escalation per window, not per PR. Terminal for
+# the affected PRs' lane this pass -> error, parallel to
+# infra_rerun_escalated.

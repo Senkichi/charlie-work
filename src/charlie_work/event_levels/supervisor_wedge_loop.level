@@ -1,0 +1,7 @@
+error
+# Fires once, the pass a run of consecutive supervisor_wedged_killed
+# events (with no fleet_pass_completed in between) reaches the
+# configured alarm threshold -- the wedge-kill backstop is itself
+# looping instead of recovering (issue #1832). Error: every prior
+# wedge-kill was silently "handled" by a relaunch, so this is the
+# only signal that the loop isn't converging.

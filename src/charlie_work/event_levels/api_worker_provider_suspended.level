@@ -1,0 +1,4 @@
+error
+# Issue #1342: a provider account suspension is a terminal billing
+# failure — the operator must learn about it in minutes, not after the
+# redispatch cap drains. Error, like the other *_escalated kinds.

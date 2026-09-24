@@ -1,0 +1,9 @@
+info
+# Issue #1241: the pre-open reachability re-check found the salvage
+# branch's tip already reachable from origin/main (the work merged via
+# a merge commit whose tree differed from the salvage head's tree --
+# the case ``salvage_skipped_already_landed``'s empty-diff check
+# misses) and skipped opening a vestigial duplicate PR. Info, sibling
+# to ``salvage_skipped_already_landed``: the intended outcome, not a
+# failure. Emitted by both salvage lanes through the shared
+# ``salvage_superseded.salvage_skip_event_kind`` mapping.

@@ -1,0 +1,4 @@
+warning
+# Issues #1756/#1758: an operator-applied override label skipped both
+# cross-repo gates for this issue. Warning, not info: a safety gate was
+# deliberately bypassed, and the dispatch that follows is unguarded.

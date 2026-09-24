@@ -1,0 +1,5 @@
+error
+# Issue #1010: the pre-flight cross-repo gate escalated an issue whose
+# referenced file paths were all absent from the target repo, ending
+# its dispatch lane this pass. Terminal for the lane -> error, like the
+# other *_escalated kinds.
