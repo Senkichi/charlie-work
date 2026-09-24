@@ -80,6 +80,25 @@ def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _short_spelling(path: Path) -> Path:
+    """The 8.3 short-name spelling of ``path`` on Windows, else ``path`` itself.
+
+    windows-latest spells ``%TEMP%`` short (``RUNNER~1``), which is how the
+    create-vs-reuse spelling split in ``ensure_branch_worktree`` first
+    surfaced in CI. Where no short name exists (non-Windows host, or a
+    volume with 8.3 generation disabled) the original path comes back and
+    callers exercise the plain-path case.
+    """
+    if sys.platform != "win32":
+        return path
+    import ctypes
+
+    buf = ctypes.create_unicode_buffer(1024)
+    if ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf)):
+        return Path(buf.value)
+    return path
+
+
 def _init_repo(repo_root: Path) -> None:
     """A fresh git repo on ``main`` with one commit and NO origin remote."""
     repo_root.mkdir(parents=True, exist_ok=True)
@@ -278,6 +297,29 @@ class TestLocalLanePrimitives:
         assert worktree_for_branch(repo, "agent/issue-7-x") == wt
         # Reuse reports the identical Path, not the alias spelling again.
         assert ensure_branch_worktree(repo, "agent/issue-7-x", alias) == wt
+
+    def test_ensure_branch_worktree_returns_gits_recorded_spelling(self, repo: Path) -> None:
+        """Create-path and reuse-path return the same canonical spelling.
+
+        Regression for the windows-latest CI failure on #1844's head:
+        ``%TEMP%`` there is the 8.3 short-name form, so the ``target``
+        constructed from ``repo_root`` differed from the canonical path git
+        records at ``worktree add`` time and
+        ``worktree_for_branch(...) == wt`` failed. Spelling ``repo`` through
+        its 8.3 name reproduces that split on any host with 8.3 generation
+        enabled; elsewhere ``_short_spelling`` is the identity and the
+        assertions still pin the create-vs-reuse invariant.
+        """
+        _init_repo(repo)
+        _make_branch(repo, "agent/issue-7-x", "a.py", "a = 1\n")
+        spelled = _short_spelling(repo)
+        worktrees_dir = spelled / "wt"
+
+        wt = ensure_branch_worktree(spelled, "agent/issue-7-x", worktrees_dir)
+
+        assert wt is not None and wt.is_dir()
+        assert wt == worktree_for_branch(repo, "agent/issue-7-x")
+        assert ensure_branch_worktree(spelled, "agent/issue-7-x", worktrees_dir) == wt
 
     def test_suite_command_argv(self, repo: Path) -> None:
         argv = suite_command_argv("python -m pytest", repo)
