@@ -13,7 +13,7 @@ neither restatement is verified anywhere today:
   ``auto_merge.required_checks`` owns for the merge gate. The existing
   required-check verification compares the config list against workflow job
   names only, never against Aviator's copy; a drift between the two lists
-  (job-cannon and swole, 2026-09-23) surfaced nowhere.
+  across two sibling repos (2026-09-23) surfaced nowhere.
 
 Both checks are opt-in by adoption: a repo without the file passes with a
 "not adopted"/"absent" detail, so no consumer repo has to add anything for
@@ -132,7 +132,7 @@ def _check_aviator_required_checks(add: Any, repo_root: Path, config: Orchestrat
     while the merge gate's list lives in ``auto_merge.required_checks``; they
     are the same fact stated twice. Doctor already validates the config list
     against workflow job names, but nothing compared the two lists to each
-    other -- the 2026-09-23 job-cannon/swole drift was found by hand.
+    other -- the 2026-09-23 sibling-repo drift was found by hand.
 
     File absent, or present without a ``required_checks`` list: pass. Any
     set difference: warning (not error -- Aviator and the merge gate fail
