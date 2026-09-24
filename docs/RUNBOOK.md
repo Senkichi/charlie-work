@@ -384,7 +384,7 @@ Mitigations (the fleet is charlie-work's, but the test config is the
 
 Those are *static* bounds — they shape how much load each worker adds, but a
 worker-count budget alone cannot see load the fleet did not create (CI runs on
-the same box, other repos' fleets, a `ci_runners` suite). Issue #1843 added the
+the same box, other repos' fleets, a sibling repo's test suite). Issue #1843 added the
 dynamic counterpart: before launching a worker, the dispatch governor counts
 the processes inside live `pytest` process trees on the host (a suite's xdist
 workers count as members of its tree) and **defers the launch** when the count
