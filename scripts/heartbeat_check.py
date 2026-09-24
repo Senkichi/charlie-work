@@ -191,19 +191,16 @@ SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
 SUPERVISOR_WEDGE_LOOP_EVENT_KIND = "supervisor_wedge_loop"
 SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS = 24
 
-# Issue #1859: the notify digest shipped as a signal without a consumer --
-# the daemon's writer was dead for three weeks while nothing read the file.
-# The consumer reads two fleet events.db kinds the supervisor emits
-# (check_wedge_kill_loop precedent): notify_resolution, which publishes
-# what the daemon actually resolved -- enabled/sink and the absolute,
-# cwd-anchored digest path -- and notify_digest_stale, the writer-side
-# tripwire. charlie_work.notify_digest_check is the stdlib-only leaf the
-# file probe is delegated to, behind the same guarded import as event_kinds.
+# Issue #1859: notify_digest_check is the stdlib-only file-probe leaf;
+# notify_digest_heartbeat holds the events.db-read-plus-verdict logic (see
+# its docstring), both behind the same guarded import as event_kinds.
 # NOTIFY_DIGEST_STALE_HOURS is re-exported for tests.
 try:
     from charlie_work import notify_digest_check as _ndc
+    from charlie_work import notify_digest_heartbeat as _ndh
 except ImportError:
     _ndc = None
+    _ndh = None
 NOTIFY_DIGEST_STALE_HOURS = _ndc.NOTIFY_DIGEST_STALE_HOURS if _ndc else 72
 NOTIFY_RESOLUTION_EVENT_KIND = "notify_resolution"
 NOTIFY_DIGEST_STALE_EVENT_KIND = "notify_digest_stale"
@@ -3077,160 +3074,26 @@ def check_wedge_kill_loop(report: Report) -> None:
 def check_notify_digest_freshness(report: Report, *, now: datetime | None = None) -> None:
     """Issue #1859 consumer: flag an enabled file sink whose digest is dead.
 
-    Reads the FLEET-level ``events.db`` (the sibling of
-    ``supervisor-heartbeat.json`` directly under ``fleet_dir()`` that
-    ``check_wedge_kill_loop`` already reads) for two kinds the fleet
-    supervisor emits:
-
-    * ``notify_resolution`` -- once per supervisor start, publishing what
-      the daemon *actually resolved*: enabled/sink and the absolute,
-      cwd-anchored digest path. Consumed here instead of re-deriving the
-      ``notify:`` section from this script's own checkout -- on this host
-      the script's checkout and the daemon's config root are different
-      trees and resolved different answers (round-1 review).
-    * ``notify_digest_stale`` -- the writer-side per-pass tripwire,
-      surfaced in the facts line so the heartbeat's verdict and the
-      supervisor's own detector visibly agree or disagree.
-
-    The freshness verdict comes from probing the supervisor-published path
-    read-only (``notify_digest_check.probe_digest_file``). Every
-    cannot-tell outcome -- missing/unreadable events.db, no resolution row,
-    unparseable payload, an unexpected exception -- degrades to WARN rather
-    than crashing the beat before ``save_state`` and report output, or
-    flipping the exit code on a fleet that may simply never have opted in.
+    Thin wrapper around ``notify_digest_heartbeat.check_notify_digest_freshness``
+    (see its docstring); only job here is the guarded-leaf contract -- WARN,
+    never raise, when the delegate modules aren't importable or the call raises.
     """
-    if _ndc is None:
+    if _ndc is None or _ndh is None:
         report.warn(
-            "notify-digest",
-            "check unavailable: charlie_work.notify_digest_check not importable",
+            "notify-digest", "check unavailable: charlie_work.notify_digest_check not importable"
         )
         return
     try:
-        _check_notify_digest_freshness_impl(report, now=now)
+        _ndh.check_notify_digest_freshness(
+            report,
+            now=now if now is not None else datetime.now(timezone.utc),
+            ndc=_ndc,
+            fleet_dir=fleet_dir(),
+            parse_iso=parse_iso,
+            stale_hours=NOTIFY_DIGEST_STALE_HOURS,
+        )
     except Exception as exc:
         report.warn("notify-digest", f"check failed unexpectedly: {exc!r}")
-
-
-def _check_notify_digest_freshness_impl(report: Report, *, now: datetime | None) -> None:
-    check = "notify-digest"
-    resolved_now = now if now is not None else datetime.now(timezone.utc)
-    db_path = fleet_dir() / "events.db"
-    if not db_path.exists():
-        report.warn(
-            check,
-            "no fleet events.db -- the supervisor has never reported a "
-            "notify resolution on this host",
-        )
-        return
-
-    try:
-        conn = sqlite3.connect(str(db_path))
-    except sqlite3.Error as exc:
-        report.warn(check, f"cannot check notify digest: fleet events.db unreadable: {exc}")
-        return
-
-    try:
-        try:
-            table_row = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
-            ).fetchone()
-            if table_row is None:
-                report.warn(check, "fleet events.db has no events table yet")
-                return
-            res_row = conn.execute(
-                "SELECT ts, payload FROM events WHERE kind = ? ORDER BY id DESC LIMIT 1",
-                (NOTIFY_RESOLUTION_EVENT_KIND,),
-            ).fetchone()
-            stale_rows = conn.execute(
-                "SELECT ts FROM events WHERE kind = ?",
-                (NOTIFY_DIGEST_STALE_EVENT_KIND,),
-            ).fetchall()
-        except sqlite3.Error as exc:
-            report.warn(check, f"cannot check notify digest: fleet events.db unreadable: {exc}")
-            return
-    finally:
-        conn.close()
-
-    stale_cutoff = resolved_now - timedelta(hours=NOTIFY_DIGEST_STALE_HOURS)
-    # An unparseable ts fails toward visibility (counted as recent), the
-    # same polarity check_wedge_kill_loop uses for the same ambiguous case.
-    recent_stale_ts = [
-        ts for (ts,) in stale_rows if (parse_iso(ts) is None or parse_iso(ts) >= stale_cutoff)
-    ]
-    stale_fact = f"stale_events_{NOTIFY_DIGEST_STALE_HOURS}h={len(recent_stale_ts)}"
-
-    if res_row is None:
-        report.warn(
-            check,
-            "no notify_resolution event yet -- the supervisor predates this "
-            f"instrumentation or died before its startup report ({stale_fact})",
-        )
-        return
-    res_ts_raw, res_payload_raw = res_row
-    try:
-        resolution = json.loads(res_payload_raw) if isinstance(res_payload_raw, str) else None
-    except json.JSONDecodeError:
-        resolution = None
-    if not isinstance(resolution, dict):
-        report.warn(
-            check,
-            f"latest notify_resolution payload is not a JSON object: "
-            f"{str(res_payload_raw)[:120]!r}",
-        )
-        return
-    res_ts = parse_iso(res_ts_raw if isinstance(res_ts_raw, str) else None)
-    res_fact = f"resolved at {(res_ts.isoformat() if res_ts else res_ts_raw)}"
-
-    if not resolution.get("enabled"):
-        report.warn(
-            check,
-            "supervisor resolved notify enabled=false -- the digest writer "
-            "is off. If this fleet opted in to notifications, its notify: "
-            f"block was lost ({res_fact}; {stale_fact})",
-        )
-        return
-
-    sink = str(resolution.get("sink") or "file").lower()
-    if sink != "file":
-        report.ok(check, f"enabled with sink={sink} (no digest file to tail; {res_fact})")
-        return
-
-    resolved_raw = resolution.get("resolved_file_path")
-    if resolution.get("file_path_empty") or not isinstance(resolved_raw, str) or not resolved_raw:
-        report.anom(
-            check,
-            "enabled with sink=file but file_path is unset -- every emit "
-            "fails 'file_path is empty' (per the supervisor's own "
-            f"notify_resolution event; {res_fact})",
-        )
-        return
-
-    digest_path = Path(resolved_raw)
-    probe = _ndc.probe_digest_file(digest_path, now=resolved_now, parse_iso=parse_iso)
-    if probe.error is not None:
-        report.anom(check, f"{digest_path} unreadable: {probe.error} ({stale_fact})")
-        return
-    if not probe.exists:
-        report.anom(
-            check,
-            f"notify enabled but {digest_path} does not exist -- the writer "
-            f"has never landed a line ({res_fact}; {stale_fact})",
-        )
-        return
-
-    age_hours = probe.age_hours if probe.age_hours is not None else 0.0
-    facts = (
-        f"last entry {age_hours:.1f}h old ({probe.age_source}); "
-        f"threshold={NOTIFY_DIGEST_STALE_HOURS}h path={digest_path}; {stale_fact}"
-    )
-    if age_hours > NOTIFY_DIGEST_STALE_HOURS:
-        report.anom(
-            check,
-            f"notify digest writer looks dead: {facts} -- the enabled file "
-            "sink has produced nothing past the staleness bound",
-        )
-    else:
-        report.ok(check, facts)
 
 
 # --------------------------------------------------------------------------
