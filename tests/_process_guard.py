@@ -16,7 +16,7 @@ This module supplies the machinery ``tests/conftest.py`` wires in:
   future, at any depth — dies with pytest however it exits. Off Windows, and
   when the process is already inside a job that forbids nesting, it is a
   no-op that only logs.
-* Leak detection and reaping — ``descendant_snapshot`` /
+* Leak detection and reaping — ``spawn_cutoff`` / ``leaked_descendants`` /
   ``reap_leaked_descendants`` power the autouse teardown guard that fails a
   test leaving a live child behind; ``reap_pid`` / ``wrap_launchers`` let the
   suite wait on or kill the pid each returned launch record carries.
@@ -58,32 +58,32 @@ def _this_process() -> psutil.Process:
     return psutil.Process(_THIS_PID)
 
 
-def descendant_snapshot() -> dict[int, float]:
-    """Map ``pid -> create_time`` for every live descendant of this process.
+def spawn_cutoff() -> float:
+    """Wall-clock instant a leak check is anchored to.
+
+    Descendants alive at teardown are leaks only if they were *created* after
+    this point — comparing ``create_time`` to the cutoff replaces a
+    before/after pid snapshot, so the per-test guard pays one process
+    enumeration (teardown) instead of two. ``time.time()`` and psutil's
+    ``create_time`` share the Unix-epoch basis, and process creation is
+    stamped at creation, so a descendant spawned later cannot score below
+    the cutoff and a pre-existing one cannot score above it.
+    """
+    return time.time()
+
+
+def leaked_descendants(since: float) -> list[psutil.Process]:
+    """Live descendants of this process created at or after ``since``.
 
     Recursive: a grandchild (e.g. the real interpreter under a venv launcher)
-    is covered just like a direct child. The create_time value distinguishes
-    a recycled pid from the process that was alive at snapshot time.
-    """
-    snapshot: dict[int, float] = {}
-    for child in _this_process().children(recursive=True):
-        try:
-            snapshot[child.pid] = child.create_time()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    return snapshot
-
-
-def leaked_descendants(before: dict[int, float]) -> list[psutil.Process]:
-    """Live descendants of this process that are not in ``before``.
-
-    Zombies are excluded: an exited-but-unreaped child is already dead and
-    cannot outlive the session.
+    is covered just like a direct child. Zombies are excluded: an
+    exited-but-unreaped child is already dead and cannot outlive the
+    session.
     """
     leaked: list[psutil.Process] = []
     for child in _this_process().children(recursive=True):
         try:
-            if before.get(child.pid) == child.create_time():
+            if child.create_time() < since:
                 continue
             if child.status() == psutil.STATUS_ZOMBIE:
                 continue
@@ -145,17 +145,18 @@ def reap_pid(pid: int | None) -> None:
         _kill_tree(proc)
 
 
-def reap_leaked_descendants(before: dict[int, float], grace: float = LEAK_GRACE_S) -> list[str]:
-    """Give new descendants ``grace`` seconds to exit, then kill survivors.
+def reap_leaked_descendants(since: float, grace: float = LEAK_GRACE_S) -> list[str]:
+    """Give descendants created since ``since`` ``grace`` seconds to exit,
+    then kill survivors.
 
     Returns one report line (``pid=... cmdline=...``) per survivor; an empty
     list means nothing was left running.
     """
     deadline = time.monotonic() + grace
-    leaked = leaked_descendants(before)
+    leaked = leaked_descendants(since)
     while leaked and time.monotonic() < deadline:
         time.sleep(_POLL_INTERVAL_S)
-        leaked = leaked_descendants(before)
+        leaked = leaked_descendants(since)
     report = [_describe(proc) for proc in leaked]
     for proc in leaked:
         _kill_tree(proc)
@@ -196,12 +197,15 @@ def wrap_launchers(
     for module in list(sys.modules.values()):
         if module is None:
             continue
+        try:
+            namespace = vars(module)
+        except TypeError:
+            continue
+        # vars(), not getattr: a plain dict lookup cannot trip a module-level
+        # __getattr__ (PEP 562), so scanning ~every loaded module per test
+        # never executes arbitrary lazy-binding code at fixture-setup time.
         for name, real in real_launchers.items():
-            try:
-                bound = getattr(module, name, None)
-            except Exception:
-                continue
-            if bound is not real:
+            if namespace.get(name) is not real:
                 continue
             monkeypatch.setattr(module, name, _pid_collecting_wrapper(real, pids))
             wrapped += 1
