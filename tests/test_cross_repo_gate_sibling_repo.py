@@ -474,3 +474,98 @@ def test_dispatching_repo_excluded_by_root_when_name_mismatches(tmp_path: Path) 
     assert result.passed is True
     assert result.found_in_repo is None
     assert "abstaining" in result.reason
+
+
+def test_issue_1791_driveless_absolute_path_classified_as_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1791: ``_path_exists_in_repo`` classifies a POSIX-style
+    absolute candidate (leading ``/``, no drive letter) as absolute —
+    containment-checked directly — matching how ``_resolve_within_root``
+    treats the exact same string.
+
+    ``_path_exists_in_repo`` previously branched on the raw,
+    platform-dependent ``Path.is_absolute()``, which reports ``False``
+    for a driveless absolute path on Windows. The candidate then fell
+    into the "relative" branch and was joined onto ``repo_root``,
+    collapsing to the drive root plus the candidate's tail
+    (``Path("C:/repo") / Path("/x/y.py") == Path("C:/x/y.py")``) — an
+    existence check against a foreign location with no containment check
+    at all. Here that join lands on the real sibling file, so the
+    unfixed function reports the out-of-repo path as present in the repo.
+
+    The fixture spells a real on-disk sibling file in driveless form by
+    stripping its own anchor — the only way to materialize a POSIX-style
+    absolute path that genuinely exists on a Windows host without writing
+    outside ``tmp_path`` (see ``test_posix_style_absolute_path_outside_repo_blocks``
+    in ``test_cross_repo_gate.py`` for why a literal ``/home/...`` fixture
+    cannot be built there). On POSIX hosts the same construction yields
+    the file's ordinary absolute path verbatim, so both code paths agree
+    there either way; the regression this pins is Windows-only.
+    """
+    # A driveless absolute path resolves against the *current drive* when
+    # existence-checked on Windows, and the checkout's drive need not be
+    # the temp dir's — the Windows CI runner keeps the checkout on ``D:``
+    # but ``TEMP`` on ``C:``, where ``/Users/runneradmin/...`` resolves to
+    # ``D:\Users\runneradmin\...`` (nonexistent) and the existence +
+    # containment path this test pins is never exercised. ``chdir`` puts
+    # the process CWD on ``tmp_path``'s drive so the driveless spelling
+    # below resolves to the real file on any drive split; a no-op where
+    # the two already share one.
+    monkeypatch.chdir(tmp_path)
+
+    this_repo = tmp_path / "charlie-work"
+    this_repo.mkdir()
+    sibling_root = tmp_path / "sibling_checkout"
+    (sibling_root / "src" / "ci_fleet").mkdir(parents=True)
+    sibling_file = sibling_root / "src" / "ci_fleet" / "suite_coverage.py"
+    sibling_file.write_text("# suite_coverage", encoding="utf-8")
+
+    # ``C:/.../suite_coverage.py`` -> ``/.../suite_coverage.py``: the same
+    # file spelled without its drive letter — absolute per
+    # ``_is_absolute_path`` on every platform, but reported non-absolute
+    # by ``Path.is_absolute()`` on Windows (and resolving to the real file
+    # under the current drive pinned by the ``chdir`` above).
+    driveless = "/" + sibling_file.relative_to(sibling_file.anchor).as_posix()
+
+    assert cross_repo_gate_module._is_absolute_path(driveless) is True
+    # Absolute and outside ``this_repo``'s root — the same verdict
+    # ``_resolve_within_root`` already gives this exact string.
+    assert cross_repo_gate_module._resolve_within_root(this_repo, driveless) is None
+    assert cross_repo_gate_module._path_exists_in_repo(driveless, this_repo) is False
+
+
+def test_issue_1791_driveless_absolute_path_existing_outside_repo_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1791, end-to-end: a POSIX-style absolute candidate that
+    exists on disk outside ``repo_root`` escalates via the founding
+    #1010/#953 foreign-checkout arm
+    (:func:`_is_confirmed_foreign_absolute_path`) — the same verdict
+    ``test_absolute_path_outside_repo_blocks`` pins for its drive-letter
+    spelling, reached through the missing-survivor path that
+    ``_path_exists_in_repo`` decides.
+    """
+    # Same current-drive pin as the test above: without it, a
+    # checkout/temp drive split (the Windows CI runner's ``D:`` checkout
+    # vs. ``C:`` ``TEMP``) resolves the driveless candidate to a
+    # nonexistent location — the file "exists nowhere," the
+    # foreign-checkout arm never fires, and the gate abstains.
+    monkeypatch.chdir(tmp_path)
+
+    this_repo = tmp_path / "charlie-work"
+    this_repo.mkdir()
+    sibling_root = tmp_path / "sibling_checkout"
+    (sibling_root / "src" / "ci_fleet").mkdir(parents=True)
+    sibling_file = sibling_root / "src" / "ci_fleet" / "suite_coverage.py"
+    sibling_file.write_text("# suite_coverage", encoding="utf-8")
+
+    driveless = "/" + sibling_file.relative_to(sibling_file.anchor).as_posix()
+
+    body = f"The file is at `{driveless}`."
+    result = cross_repo_gate(body, this_repo)
+
+    assert result.passed is False
+    assert result.referenced_paths == (driveless,)
+    assert result.missing_paths == (driveless,)
+    assert "positive evidence of a foreign checkout" in result.reason
