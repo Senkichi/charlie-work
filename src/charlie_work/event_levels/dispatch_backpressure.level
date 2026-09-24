@@ -1,0 +1,6 @@
+info
+# Issue #1129: open-PR backpressure clamped fresh-issue dispatch. Info,
+# not warning: this is the intended self-pacing behavior (armed issues
+# wait in the backlog instead of as open stale PRs), not a fault. The
+# event exists so "0 dispatched with N dispatchable" is diagnosable from
+# events.db rather than reading as idleness.

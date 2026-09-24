@@ -1,0 +1,7 @@
+info
+# Issue #1132: a parked foreign_issue_ref marker was cleared after a
+# re-probe resolved the issue (the linked issue now exists in this repo,
+# or a transient repo-resolution failure cleared). Info, not warning:
+# this is the self-heal recovery doing its job -- the PR resumes per-PR
+# processing instead of skipping forever. Sibling to the info-level
+# recovery events (e.g. deescalation_cleared, runner_capacity_recovered).

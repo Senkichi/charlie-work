@@ -1,0 +1,8 @@
+warning
+# Issue #1834: one `gh api` REST-GET/graphql call could not be served
+# by the pooled HTTP transport (token resolution failed, or an
+# unexpected/unparseable response shape) and fell through to the
+# `gh` subprocess for that call only. Warning, not error: the call
+# still completed via the fallback -- but a high rate of these means
+# the HTTP path itself needs attention (a stale/broken `gh auth
+# token`, or a response shape this module does not yet handle).
