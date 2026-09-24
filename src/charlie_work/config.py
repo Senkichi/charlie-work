@@ -487,16 +487,12 @@ class DispatchConfig:
     # root merely waiting out a slow CI cycle or an overnight review is not
     # paged as stuck.
     dependency_stall_minutes: int = 1440
-    # Issue #1001: when True, dispatch refuses to launch workers if no
-    # sanctioned GitHub token is configured in the active adapter's
-    # ``worker_env`` (the same predicate ``doctor._check_worker_github_token``
-    # uses). Defaults False (warn-only: escalate once, dispatch anyway) so the
-    # gate does not take the fleet down on a config that has not yet been
-    # provisioned with a token — see the issue #1001 sequencing hazard
-    # comment. Flip to True only after an operator has provisioned a scoped
-    # token in ``devin.worker_env`` / ``claude_code.worker_env`` and confirmed
-    # workers reach ``gh pr create`` successfully. Issue #1224 tracks that
-    # staged rollout, including the eventual flip of this default to True.
+    # Issue #1853: DEPRECATED no-op, kept only so existing config files that
+    # set it still parse. The worker-GitHub-token dispatch gate (issue #1001)
+    # was retired when the operator decided workers stay credential-free by
+    # design — PR mutations flow through ``.worker-outcome.json`` and the
+    # authenticated orchestrator applies them (see ``rework_outcome.py``).
+    # The staged-rollout plan this flag served (issue #1224) is superseded.
     require_worker_github_token: bool = False
 
     def __post_init__(self) -> None:

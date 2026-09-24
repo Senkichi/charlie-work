@@ -228,8 +228,8 @@ def test_apply_concurrency_governor_open_pr_backpressure_no_event_under_dry_run(
     The clamp behavior (dispatch_limit reduction, clamped flag, open_pr_count/
     open_pr_max on the result) must still engage so a dry-run preview reports
     the same clamped selected_count a live pass would -- matching the
-    worker_token_missing refusal precedent in _dispatch_impl, where the
-    refusal is NOT dry-run-gated but the durable event/marker writes are.
+    provider_throttled deferral precedent in
+    _dispatch_impl, where the deferral is NOT dry-run-gated.
     Only the log_event write to events.db is suppressed under dry_run.
     """
 
