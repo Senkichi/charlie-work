@@ -1,7 +1,13 @@
-2
+3
 # Issue #1770: +1 raw log_event call in _apply_concurrency_governor's new
 # CI-headroom clamp branch (the dispatch_backpressure event recorded when
 # ci_headroom_available()'s reading clamps fresh dispatch, mirroring the
 # pre-existing open_pr_max clamp's own raw log_event call in the same
 # function). Same out-of-wave class as that pre-existing site -- the
 # ratchet holds at the new count (1 -> 2).
+# Issue #1843: +1 raw log_event call in _apply_concurrency_governor's new
+# host-load clamp branch (the dispatch_backpressure event recorded when the
+# host's live pytest process-tree count exceeds
+# dispatch.host_load_max_pytest_processes, mirroring the pre-existing
+# open_pr_max/ci_headroom clamp sites in the same function). Same
+# out-of-wave class -- the ratchet holds at the new count (2 -> 3).
