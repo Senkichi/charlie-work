@@ -2747,10 +2747,18 @@ def run_fleet_supervise(
         describe_config_file(global_config_path),
     )
 
-    # Issue #1859: report the resolved notify sink once per supervisor start,
-    # next to the global-layer provenance line -- a lost ``notify:`` section
-    # otherwise degrades the whole pipeline to silence with no error anywhere.
-    report_notify_resolution(getattr(global_config, "notify", None), global_config_path)
+    # Issue #1859: publish the resolved notify sink once per supervisor
+    # start, next to the global-layer provenance line -- a lost ``notify:``
+    # section otherwise degrades the whole pipeline to silence with no
+    # error anywhere. The fleet-state path targets the same events.db the
+    # heartbeat consumer reads, so the resolution (including the absolute
+    # digest path this daemon anchored) is a consumed signal, not a
+    # write-only log line.
+    report_notify_resolution(
+        getattr(global_config, "notify", None),
+        global_config_path,
+        layout.state_file_path(fleet_dir(override=fleet_dir_override)),
+    )
 
     overrides: dict[str, int] = {}
     if poll_interval_override is not None:

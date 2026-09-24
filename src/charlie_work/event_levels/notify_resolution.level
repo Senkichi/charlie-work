@@ -1,0 +1,8 @@
+info
+# Issue #1859: once-per-supervisor-start publication of the notify sink the
+# daemon actually resolved (enabled / sink / cwd-anchored absolute digest
+# path). The heartbeat reads the latest row to answer "what is the daemon
+# writing to" instead of re-deriving config from the script's own checkout.
+# Emitted with level="warning" explicitly when the resolution is the
+# incoherent enabled + sink=file + empty file_path combination; info is the
+# registry default for the healthy shapes.

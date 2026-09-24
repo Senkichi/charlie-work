@@ -7,9 +7,12 @@ directory, wedged volume) is otherwise invisible indefinitely. The daemon's
 real digest writer was dead for three weeks before anyone noticed because
 nothing ever looked at the file. This module is the writer-side half of
 the fix: a once-per-pass staleness check the fleet supervisor runs, plus
-the startup resolution report that makes the sink's configured target
-observable in the supervisor log. The consumer half (the heartbeat
-script's verdict) lives in ``notify_digest_check.py``.
+the startup ``notify_resolution`` event that publishes what the daemon
+*actually resolved* -- enabled/sink and the absolute digest path after
+cwd-anchoring -- so the heartbeat consumer answers questions about the
+daemon's world, not its own checkout's. The consumer half (the heartbeat
+script's verdict) lives in ``scripts/heartbeat_check.py`` on top of
+``notify_digest_check.py``.
 
 Imported only by ``fleet_dispatch`` -- this module pulls in
 ``instrumentation`` (and transitively ``ci_fleet``), so it is deliberately
@@ -30,17 +33,42 @@ from .notify_digest_check import NOTIFY_DIGEST_STALE_HOURS
 logger = logging.getLogger(__name__)
 
 #: Writer-side staleness bound, derived from the shared consumer constant
-#: so the two tripwires can never drift. A digest older than this means the
-#: enabled writer has produced nothing for a full day -- itself the anomaly.
+#: so the two tripwires can never drift. Sized from the real daemon
+#: digest's measured healthy-gap distribution (max 47.1h) -- see the
+#: constant's own comment in ``notify_digest_check``.
 NOTIFY_DIGEST_STALE_SECONDS = NOTIFY_DIGEST_STALE_HOURS * 60 * 60
 
-#: Module-level latch so a persistently-stale digest emits one warning event
-#: per episode per supervisor process rather than one per pass (~144/day at
-#: the default cadence). Keyed on the configured file path; the key is
-#: cleared when the file goes fresh again so a *new* stale episode
-#: re-fires, and a supervisor restart re-fires once -- both edge directions
-#: stay visible.
+#: Module-level latch so a persistently-stale digest emits at most one
+#: ``notify_digest_stale`` event per staleness-bound interval per process
+#: rather than one per pass (~144/day at the default cadence). Keyed on the
+#: configured file path; the key is cleared when the file goes fresh again
+#: so a *new* stale episode re-fires, a supervisor restart re-fires once,
+#: and a still-stale digest re-fires once per bound -- the re-fire is what
+#: keeps a fresh event inside the heartbeat consumer's lookback window for
+#: the whole episode. Both edge directions stay visible.
 _stale_episodes: dict[str, float] = {}
+
+
+def _resolve_for_event(file_path: str) -> str | None:
+    """Absolute form of a configured ``file_path`` for event payloads.
+
+    ``_file_sink`` interprets a relative path against the supervisor's cwd,
+    so the resolved form is the location the daemon is actually writing to
+    -- the value the heartbeat consumer needs, since its own checkout can
+    differ from the daemon's (round-1 review). ``Path.resolve()`` can raise
+    on unresolvable paths; degrade to ``absolute()`` (which itself reads
+    cwd and can raise when the cwd is gone), then to the raw string, rather
+    than lose the event.
+    """
+    if not file_path:
+        return None
+    try:
+        return str(Path(file_path).resolve())
+    except (OSError, RuntimeError, ValueError):
+        try:
+            return str(Path(file_path).absolute())
+        except (OSError, RuntimeError, ValueError):
+            return file_path
 
 
 def check_notify_digest_freshness(
@@ -53,12 +81,12 @@ def check_notify_digest_freshness(
     file the same way ``_file_sink`` resolves it; a missing/unreadable file
     and an mtime older than ``NOTIFY_DIGEST_STALE_SECONDS`` are both stale
     -- the former is the "writer never landed a line" shape. Emits at most
-    one ``notify_digest_stale`` warning event per stale episode per process
-    (see ``_stale_episodes``); a quiet-but-healthy fleet can go a day
-    without attention transitions, so this is deliberately a warning event
-    for the events.db record, not a pass failure. Never raises: the check
-    itself failing must not take the pass down with the pipeline it
-    watches.
+    one ``notify_digest_stale`` warning event per staleness-bound interval
+    while stale (see ``_stale_episodes``) -- a long-lived dead writer keeps
+    a fresh event inside the heartbeat's lookback window instead of firing
+    once and going quiet -- and clears the latch on recovery so the *next*
+    episode re-fires. Never raises: the check itself failing must not take
+    the pass down with the pipeline it watches.
     """
     try:
         status = digest_file_status(notify_config, now=now)
@@ -66,7 +94,8 @@ def check_notify_digest_freshness(
         return
     if status is None:
         # Not a file sink, or file_path unset (the incoherent enabled/file/
-        # empty-path combination is reported at supervisor startup instead).
+        # empty-path combination is published by report_notify_resolution's
+        # notify_resolution event at supervisor startup instead).
         return
     now_ts = time.time() if now is None else now
     file_key = str(getattr(notify_config, "file_path", "") or "")
@@ -86,6 +115,7 @@ def check_notify_digest_freshness(
             "notify_digest_stale",
             {
                 "file_path": file_key,
+                "resolved_file_path": _resolve_for_event(file_key),
                 "exists": status.exists,
                 "age_seconds": (None if status.age_seconds is None else round(status.age_seconds)),
                 "stale_after_seconds": NOTIFY_DIGEST_STALE_SECONDS,
@@ -95,8 +125,10 @@ def check_notify_digest_freshness(
         logger.debug("Failed to record notify_digest_stale", exc_info=True)
 
 
-def report_notify_resolution(notify_config: Any, global_config_path: Path) -> None:
-    """Log the resolved notify sink once per supervisor start (issue #1859).
+def report_notify_resolution(
+    notify_config: Any, global_config_path: Path, fleet_state_path: Path
+) -> None:
+    """Publish the resolved notify sink once per supervisor start (issue #1859).
 
     ``NotifyConfig.enabled`` defaults False and an absent ``notify:``
     section is a deliberate no-op, so a config file that is lost or never
@@ -106,19 +138,35 @@ def report_notify_resolution(notify_config: Any, global_config_path: Path) -> No
     that never opted in is legitimate); the incoherent
     enabled/file-sink/empty-file_path combination is a WARNING because
     every emit fails "file_path is empty" and nothing else surfaces it.
+
+    The same resolution is written to the fleet ``events.db`` as a
+    ``notify_resolution`` event carrying the absolute, cwd-anchored digest
+    path -- the heartbeat consumer reads it to learn what the daemon
+    actually resolved rather than re-deriving the notify config from the
+    script's own checkout (which resolves a *different* tree on this host).
+    The event is also what surfaces the enabled/file/empty-path state
+    through a consumed signal: the heartbeat anomalies on it, where the
+    startup log line alone was write-only.
     """
     if notify_config is None:
+        enabled, sink, file_path = False, "", ""
+    else:
+        enabled = bool(getattr(notify_config, "enabled", False))
+        sink = str(getattr(notify_config, "sink", "") or "").lower()
+        file_path = str(getattr(notify_config, "file_path", "") or "")
+    resolved = _resolve_for_event(file_path) if sink == "file" else None
+    misconfigured = enabled and sink == "file" and not file_path
+
+    if notify_config is None:
         logger.info("Fleet supervisor notify config: no notify section (disabled)")
-        return
-    sink = str(getattr(notify_config, "sink", "") or "").lower()
-    file_path = getattr(notify_config, "file_path", "") or ""
-    logger.info(
-        "Fleet supervisor notify config: enabled=%s sink=%s file_path=%s",
-        getattr(notify_config, "enabled", False),
-        sink or "(unset)",
-        file_path or "(unset)",
-    )
-    if getattr(notify_config, "enabled", False) and sink == "file" and not file_path:
+    else:
+        logger.info(
+            "Fleet supervisor notify config: enabled=%s sink=%s file_path=%s",
+            enabled,
+            sink or "(unset)",
+            file_path or "(unset)",
+        )
+    if misconfigured:
         logger.warning(
             "Fleet supervisor notify config: enabled with sink=file but "
             "file_path is unset -- every emit_digest call will fail "
@@ -127,3 +175,20 @@ def report_notify_resolution(notify_config: Any, global_config_path: Path) -> No
             "orchestrator.config.yaml)",
             global_config_path,
         )
+
+    try:
+        log_event(
+            fleet_state_path,
+            "notify_resolution",
+            {
+                "enabled": enabled,
+                "sink": sink,
+                "file_path": file_path,
+                "resolved_file_path": resolved,
+                "file_path_empty": misconfigured,
+                "global_config_path": str(global_config_path),
+            },
+            level="warning" if misconfigured else "info",
+        )
+    except Exception:
+        logger.debug("Failed to record notify_resolution", exc_info=True)
