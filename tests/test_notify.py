@@ -11,11 +11,13 @@ from charlie_work.config import ConfigError, NotifyConfig, load_config
 from charlie_work.notify import (
     AttentionDigest,
     AttentionEntry,
+    DigestFileStatus,
     NotifyResult,
     _desktop_sink,
     _file_sink,
     _shell_sink,
     _webhook_sink,
+    digest_file_status,
     emit_digest,
 )
 from charlie_work.workflow import _build_attention_digest
@@ -718,3 +720,52 @@ def test_desktop_sink_powershell_toast_succeeds_on_windows():
 
     result = _desktop_sink(config, digest)
     assert result.ok is True
+
+
+# ---------------------------------------------------------------------------
+# digest_file_status (issue #1859)
+# ---------------------------------------------------------------------------
+
+
+def test_digest_file_status_none_for_non_file_sink(tmp_path):
+    """Non-file sinks have no digest file to probe -- None, not a stale verdict."""
+    config = NotifyConfig(enabled=True, sink="shell", shell_command=("true",))
+    assert digest_file_status(config) is None
+
+    config = NotifyConfig(enabled=True, sink="desktop", file_path=str(tmp_path / "d.jsonl"))
+    assert digest_file_status(config) is None
+
+
+def test_digest_file_status_none_when_file_path_unset():
+    """enabled/file-sink/empty-path is the incoherent combination the supervisor
+    startup report flags; the probe declines to invent a path for it."""
+    config = NotifyConfig(enabled=True, sink="file")
+    assert digest_file_status(config) is None
+
+
+def test_digest_file_status_missing_file(tmp_path):
+    config = NotifyConfig(enabled=True, sink="file", file_path=str(tmp_path / "digest.jsonl"))
+    assert digest_file_status(config, now=1000.0) == DigestFileStatus(
+        exists=False, age_seconds=None
+    )
+
+
+def test_digest_file_status_reports_mtime_age(tmp_path):
+    path = tmp_path / "digest.jsonl"
+    path.write_text("{}\n", encoding="utf-8")
+    mtime = path.stat().st_mtime
+    config = NotifyConfig(enabled=True, sink="file", file_path=str(path))
+    status = digest_file_status(config, now=mtime + 30.0)
+    assert status is not None
+    assert status.exists is True
+    assert status.age_seconds == pytest.approx(30.0)
+
+
+def test_digest_file_status_is_read_only(tmp_path):
+    """The probe must not create the file or its parent -- a probe that writes
+    would itself mask the writer-dead condition it exists to detect."""
+    path = tmp_path / "notify" / "digest.jsonl"
+    config = NotifyConfig(enabled=True, sink="file", file_path=str(path))
+    digest_file_status(config)
+    assert not path.exists()
+    assert not path.parent.exists()

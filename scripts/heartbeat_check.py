@@ -191,6 +191,20 @@ SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
 SUPERVISOR_WEDGE_LOOP_EVENT_KIND = "supervisor_wedge_loop"
 SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS = 24
 
+# Issue #1859: notify_digest_check is the stdlib-only file-probe leaf;
+# notify_digest_heartbeat holds the events.db-read-plus-verdict logic (see
+# its docstring), both behind the same guarded import as event_kinds.
+# NOTIFY_DIGEST_STALE_HOURS is re-exported for tests.
+try:
+    from charlie_work import notify_digest_check as _ndc
+    from charlie_work import notify_digest_heartbeat as _ndh
+except ImportError:
+    _ndc = None
+    _ndh = None
+NOTIFY_DIGEST_STALE_HOURS = _ndc.NOTIFY_DIGEST_STALE_HOURS if _ndc else 72
+NOTIFY_RESOLUTION_EVENT_KIND = "notify_resolution"
+NOTIFY_DIGEST_STALE_EVENT_KIND = "notify_digest_stale"
+
 # Disk-free thresholds (issue #1359): the 2026-08-19 outage drained C: to 0
 # bytes free over ~3.5 days at ~4 MB/s while every fleet pass failed with
 # `OSError: [Errno 28] No space left on device` and state.json went stale in
@@ -3057,6 +3071,31 @@ def check_wedge_kill_loop(report: Report) -> None:
         report.ok(check, facts)
 
 
+def check_notify_digest_freshness(report: Report, *, now: datetime | None = None) -> None:
+    """Issue #1859 consumer: flag an enabled file sink whose digest is dead.
+
+    Thin wrapper around ``notify_digest_heartbeat.check_notify_digest_freshness``
+    (see its docstring); only job here is the guarded-leaf contract -- WARN,
+    never raise, when the delegate modules aren't importable or the call raises.
+    """
+    if _ndc is None or _ndh is None:
+        report.warn(
+            "notify-digest", "check unavailable: charlie_work.notify_digest_check not importable"
+        )
+        return
+    try:
+        _ndh.check_notify_digest_freshness(
+            report,
+            now=now if now is not None else datetime.now(timezone.utc),
+            ndc=_ndc,
+            fleet_dir=fleet_dir(),
+            parse_iso=parse_iso,
+            stale_hours=NOTIFY_DIGEST_STALE_HOURS,
+        )
+    except Exception as exc:
+        report.warn("notify-digest", f"check failed unexpectedly: {exc!r}")
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -3141,6 +3180,7 @@ def main() -> int:
     check_supervisor_venv_refusal(report, repos, baseline)
     check_supervisor_heartbeat(report)
     check_wedge_kill_loop(report)
+    check_notify_digest_freshness(report, now=now)
 
     save_state(new_state)
 

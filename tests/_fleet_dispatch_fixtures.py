@@ -8,6 +8,7 @@ for shared test helpers (see ``tests/test_zero_cross_test_import_guard.py``).
 
 from __future__ import annotations
 
+import dataclasses
 import json as _json
 import os
 import subprocess
@@ -16,14 +17,22 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 import pytest
+from charlie_work import fleet_dispatch as _fleet_dispatch_module
 from charlie_work.config import (
     OrchestratorConfig,
     RunnerAllocationConfig,
     RunnerScalingConfig,
 )
 from charlie_work.fleet_dispatch import _CiFleetDirtyCheck
+from charlie_work.notify import NotifyResult
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.workflow import CommandResult
+
+
+#: Where the notify-digest isolation in ``_patch_self_deploy_for_fleet_tests``
+#: redirects file-sink writes, relative to the test's ``tmp_path``. Tests that
+#: need to prove the redirect happened read the digest at this location.
+ISOLATED_NOTIFY_DIGEST_REL = Path("notify") / "digest.jsonl"
 
 
 def _iso(dt: datetime) -> str:
@@ -56,7 +65,7 @@ class _FakeClock:
 
 
 @pytest.fixture(autouse=True)
-def _patch_self_deploy_for_fleet_tests(monkeypatch: Any) -> dict[str, MagicMock]:
+def _patch_self_deploy_for_fleet_tests(monkeypatch: Any, tmp_path: Path) -> dict[str, MagicMock]:
     """Self-deploy hits the real git/uv CLI; keep fleet supervisor unit tests hermetic.
 
     Also no-op the supervisor lifecycle instrumentation (issue #627) so existing
@@ -66,6 +75,22 @@ def _patch_self_deploy_for_fleet_tests(monkeypatch: Any) -> dict[str, MagicMock]
     calls. ``detect_prior_abnormal_exit`` defaults to ``None`` (no prior exit)
     and ``is_exit_alertable`` defaults to ``False`` so existing tests do not
     trip the prior-exit or alert branches.
+
+    Issue #1859: notify emissions are redirected too. ``run_fleet_supervise``
+    resolves ``notify.file_path`` from the *ambient* per-repo config at
+    ``Path.cwd()``; a relative ``file_path`` (the production spelling
+    ``.var/charlie-work/notify/digest.jsonl``) is then interpreted by
+    ``_file_sink`` against the pytest cwd, so a suite run from a checkout
+    whose own ``orchestrator.config.yaml`` enables notify appended synthetic
+    ``"test no-op"`` entries to that checkout's REAL digest file -- the leak
+    that made the dev checkout's digest look falsely alive for a month while
+    the live daemon's writer was dead. The redirect mirrors what
+    ``_patch_ci_fleet_dirty_for_hermetic_tests`` does for the real ci_fleet
+    tree: file-sink emits run for real but land in this test's ``tmp_path``
+    (under ``ISOLATED_NOTIFY_DIGEST_REL``), and the other sinks (desktop /
+    shell / webhook -- also real side effects) return ``ok`` without firing.
+    Dedicated tests that patch ``charlie_work.fleet_dispatch.emit_digest``
+    themselves still see their own double.
     """
     monkeypatch.setattr(
         "charlie_work.fleet_dispatch.self_deploy",
@@ -91,6 +116,31 @@ def _patch_self_deploy_for_fleet_tests(monkeypatch: Any) -> dict[str, MagicMock]
         mocks[name] = m
     mocks["detect_prior_abnormal_exit"].return_value = None
     mocks["is_exit_alertable"].return_value = False
+
+    real_emit_digest = _fleet_dispatch_module.emit_digest
+    isolated_digest = tmp_path / ISOLATED_NOTIFY_DIGEST_REL
+
+    def _isolated_emit_digest(config: Any, digest: Any) -> NotifyResult:
+        sink = str(getattr(config, "sink", "") or "").lower()
+        if sink != "file":
+            return NotifyResult(ok=True)
+        file_path = getattr(config, "file_path", "")
+        if not file_path:
+            # Nothing to redirect -- preserve the real "file_path is empty"
+            # error path, which cannot write anyway.
+            return real_emit_digest(config, digest)
+        try:
+            redirected = dataclasses.replace(config, file_path=str(isolated_digest))
+        except TypeError:
+            # A non-dataclass config cannot be repointed safely; fail closed
+            # rather than letting a real path through.
+            return NotifyResult(
+                ok=False,
+                error="test isolation: notify config is not a dataclass; refusing real emit",
+            )
+        return real_emit_digest(redirected, digest)
+
+    monkeypatch.setattr("charlie_work.fleet_dispatch.emit_digest", _isolated_emit_digest)
     return mocks
 
 
