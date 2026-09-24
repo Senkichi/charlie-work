@@ -342,6 +342,14 @@ def test_merge_ready_mergequeue_parked_pr_skips_charlie_branch_sync(
     assert first.data["mergequeue_label_applied"] is True
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "mergequeue"
 
+    # "Parked in Aviator's queue" means the queue label is actually still on
+    # the live PR — FakeGitHub.add_pr_label only logs the call, so the label
+    # must be placed on the PR explicitly. Without it the next pass observes
+    # a stripped label (mergequeue_label_reverted), which is the abandoned-
+    # handoff case issue #1873 un-deadlocks by re-syncing — the opposite of
+    # the skip this test pins.
+    fake_gh.prs[0]["labels"] = [{"name": "mergequeue"}]
+
     # Simulate main having advanced past this PR's merge-base — a stale base,
     # exactly as would happen once Aviator (or anything else) merges another
     # PR into main while #456 sits in the queue.
@@ -354,6 +362,128 @@ def test_merge_ready_mergequeue_parked_pr_skips_charlie_branch_sync(
 
     assert second.data["can_merge"] is False
     assert fake_gh.pr_update_branch_calls == []
+
+
+def test_merge_ready_mergequeue_reverted_handoff_syncs_stale_base(
+    tmp_path: Path,
+) -> None:
+    """Issue #1873: an Aviator-abandoned mergequeue handoff must not deadlock
+    on a stale base.
+
+    Once a PR is handed off (state status 'mergequeue'), the base-currency
+    sync is deliberately skipped so Aviator owns the rebase — but the skip
+    is keyed on the persisted status, not on the label still being present.
+    When Aviator silently strips the label (the #823 revert shape) while the
+    base is stale, the stale-base early return fired every pass BEFORE the
+    mergequeue_handoff_failed recovery could run, and the sync skip was the
+    only thing that could make the base current — swole PR #321 looped
+    merge_deferred_stale_base 23+ passes until an operator ran
+    `gh pr update-branch` by hand.
+
+    A reverted handoff is void: the PR is not in Aviator's queue, so charlie
+    runs its own sync (pr_update_branch), the approval carries forward to
+    the verified sync head, the handoff is retried this same pass, and the
+    revert is still accounted as a failed handoff."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    # Pass 1: fresh handoff, succeeds. Status becomes "mergequeue".
+    first = app.merge_ready(456, merge=True)
+    assert first.data["mergequeue_label_applied"] is True
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "mergequeue"
+
+    # Aviator silently bounces the PR out of its queue — the mergequeue label
+    # is stripped. FakeGitHub.add_pr_label only logs the call, so the live PR
+    # the next pass observes already shows the label absent (same #823 revert
+    # shape as the silent-revert tests). Meanwhile main advanced past the
+    # PR's merge-base, exactly what the stale-base gate checks.
+    fake_gh.compare_overrides[("main", "sha-abc123")] = {
+        "base_commit": {"sha": "new-main-tip"},
+        "merge_base_commit": {"sha": "stale-ancestor"},
+    }
+
+    # Pass 2: the abandoned handoff no longer suppresses charlie's own sync,
+    # so the stale-base deferral never fires — the deadlock's two halves
+    # (skip-the-sync + early-return-before-recovery) are both broken.
+    second = app.merge_ready(456, merge=True)
+
+    assert fake_gh.pr_update_branch_calls == [456]
+    assert second.data.get("stale_base") is not True
+    assert second.data["consecutive_stale_base_deferrals"] == 0
+    # The verified sync advanced the head, the approval carried forward, and
+    # the mergequeue handoff was retried in the same pass. The revert is
+    # still detected cross-pass and counted as a failed handoff.
+    assert second.data["can_merge"] is True
+    assert second.data["mergequeue_label_applied"] is True
+    assert second.data["consecutive_failed_merge_attempts"] == 1
+    persisted = load_state(paths.state_file)
+    assert persisted["prs"]["456"]["status"] == "mergequeue"
+    assert not any(event["kind"] == "merge_deferred_stale_base" for event in persisted["events"])
+
+    # Pass 3: still reverted (the fake never mutates labels) but the base is
+    # now current, so no further sync is attempted — only the handoff retry
+    # and its accounting continue. This is the steady-state the bug denied:
+    # the counter climbs toward the alarm threshold instead of the stale-base
+    # deferral looping forever.
+    third = app.merge_ready(456, merge=True)
+    assert fake_gh.pr_update_branch_calls == [456]
+    assert third.data["mergequeue_label_applied"] is True
+    assert third.data["consecutive_failed_merge_attempts"] == 2
+
+
+def test_merge_ready_mergequeue_reverted_handoff_sync_failure_still_recovers(
+    tmp_path: Path,
+) -> None:
+    """Issue #1873 companion: even when charlie's own sync write fails, a
+    reverted handoff must escape the stale-base deferral loop.
+
+    pr_update_branch failing sets sync_failed, which bypasses the stale-base
+    early return entirely — so the pass reaches the shared failed-attempt
+    accounting instead of looping merge_deferred_stale_base with a counter
+    nothing escalates on. consecutive_failed_merge_attempts increments every
+    pass toward failed_attempt_alarm; consecutive_stale_base_deferrals stays
+    at 0 because no deferral was recorded."""
+
+    class UpdateBranchFailGitHub(FakeGitHub):
+        """gh pr update-branch fails without moving the head."""
+
+        def pr_update_branch(self, pr_number: int) -> bool:
+            self.pr_update_branch_calls.append(pr_number)
+            return False
+
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = UpdateBranchFailGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+
+    # Pass 1: fresh handoff, succeeds. Status becomes "mergequeue".
+    first = app.merge_ready(456, merge=True)
+    assert first.data["mergequeue_label_applied"] is True
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "mergequeue"
+
+    # Label stripped by Aviator (absent on the live PR) + stale base.
+    fake_gh.compare_overrides[("main", "sha-abc123")] = {
+        "base_commit": {"sha": "new-main-tip"},
+        "merge_base_commit": {"sha": "stale-ancestor"},
+    }
+
+    # Pass 2: the sync is attempted (not skipped) and fails; the pass falls
+    # through to the generic approved-but-unmergeable accounting rather than
+    # the stale-base deferral, so the failure counter advances.
+    second = app.merge_ready(456, merge=True)
+
+    assert fake_gh.pr_update_branch_calls == [456]
+    assert second.data.get("stale_base") is not True
+    assert second.data["can_merge"] is False
+    assert second.data["mergequeue_label_applied"] is None
+    assert second.data["consecutive_failed_merge_attempts"] == 1
+    assert second.data["consecutive_stale_base_deferrals"] == 0
+    persisted = load_state(paths.state_file)
+    assert not any(event["kind"] == "merge_deferred_stale_base" for event in persisted["events"])
 
 
 def test_merge_ready_mergequeue_label_add_failure_does_not_advance_status(
