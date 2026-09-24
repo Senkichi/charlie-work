@@ -464,6 +464,12 @@ from .dead_worker_reap import (  # noqa: F401  (deliberate re-export)
     _open_pr_for_orphaned_branch,
     _issues_with_live_workers,
 )
+from .live_handoff_finalize import (
+    collect_stale_live_handoff_pids,
+    finalize_live_handoff_candidates,
+    partition_dispatched_by_pid_liveness,
+    resolve_live_handoff_candidates,
+)
 
 
 def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
@@ -1676,7 +1682,7 @@ def _detect_and_handle_orphaned_workers(
     watchdog (e.g. to work around a shim log-mtime blindness) must not lose
     the #935 pushed-branch salvage backstop, the #417 ground-truth label
     reclaim, or the orphan drift diagnostics -- all of which are keyed off
-    state.json PID records, not log mtimes.
+    state.json PID records, not log mtimes. Issue #1867: ``live_handoff_finalize.py``.
     """
     write_gate = require_write_gate(write_gate)
 
@@ -1687,17 +1693,24 @@ def _detect_and_handle_orphaned_workers(
     with state_lock(state_file):
         state = load_state(state_file)
 
-    orphaned_issues: list[int] = []
-    for issue_number_str, entry in state.get("issues", {}).items():
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("status") != "dispatched":
-            continue
+    orphaned_issues, live_pid_entries = partition_dispatched_by_pid_liveness(
+        state, worker_pid_alive=_worker_pid_alive
+    )
+    now = datetime.now(UTC)  # Issue #935/#1453: computed once, before any pre-lock loop.
+    repo_root = getattr(gh, "repo_root", None)
+    worktrees_dir = None
+    if repo_root is not None:
+        worktrees_dir = resolved_layout(config, repo_root).worktrees
 
-        if not _worker_pid_alive(entry):
-            orphaned_issues.append(int(issue_number_str))
+    stale_live_handoff_pids = collect_stale_live_handoff_pids(  # Issue #1867 round-2
+        live_pid_entries,
+        worker_outcome_finalize_minutes=config.watchdog.worker_outcome_finalize_minutes,
+        repo_root=repo_root,
+        worktrees_dir=worktrees_dir,
+        now=now,
+    )
 
-    if not orphaned_issues:
+    if not orphaned_issues and not stale_live_handoff_pids:
         return
 
     # Fetch PRs once before acquiring the lock (avoid network I/O under lock)
@@ -1757,15 +1770,7 @@ def _detect_and_handle_orphaned_workers(
     # fire before reclaim adds ``automated-ready``.  Reused by the second
     # loop (pushed-branch candidates) without re-reading.
     worker_outcomes: dict[int, dict[str, Any] | None] = {}
-    issues_by_number: dict[int, dict[str, Any]] = {}
-    # Issue #935 / #1453: compute repo_root and worktrees_dir once, before any
-    # of the pre-lock loops, so the first loop (reclaim/escalation) can read
-    # worker outcomes for the blocked-outcome check and the second loop
-    # (pushed-branch candidates) can reuse the same pre-computed outcomes.
-    repo_root = getattr(gh, "repo_root", None)
-    worktrees_dir = None
-    if repo_root is not None:
-        worktrees_dir = resolved_layout(config, repo_root).worktrees
+    issues_by_number: dict[int, dict[str, Any]] = {}  # also used by the live-handoff lane below
 
     if no_pr_orphans:
         for issue in gh.issue_list(state="open"):
@@ -2178,6 +2183,14 @@ def _detect_and_handle_orphaned_workers(
                 "issue_labels": issue_labels,
                 "active_labels": active_labels,
             }
+
+    live_handoff_candidates = resolve_live_handoff_candidates(  # Issue #1867
+        stale_live_handoff_pids,
+        pr_by_issue=pr_by_issue,
+        issues_by_number=issues_by_number,
+        gh=gh,
+        config=config,
+    )
 
     # Handle orphaned workers. Head-advanced request_changes findings are
     # collected and routed to the review lane outside the state lock (review()
@@ -3105,6 +3118,18 @@ def _detect_and_handle_orphaned_workers(
                 )
 
             state["issues"][str(issue_number)] = entry
+
+        finalize_live_handoff_candidates(  # Issue #1867
+            gh=gh,
+            config=config,
+            repo_root=repo_root,
+            state=state,
+            state_file=state_file,
+            live_handoff_candidates=live_handoff_candidates,
+            pr_by_issue=pr_by_issue,
+            sweep_events=sweep_events,
+            drift_fingerprint=_drift_fingerprint,
+        )
 
         state = _append_sweep_events(
             state,
