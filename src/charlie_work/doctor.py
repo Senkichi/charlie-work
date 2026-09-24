@@ -49,6 +49,7 @@ from ci_fleet.charlie_work_adapter import (
 )
 from ci_fleet.provenance import REFUSAL_STATE_FILENAME, load_refusal_streak
 from .supervise import _self_deploy_state_path, orchestrator_root, try_acquire_supervisor_lock
+from .supervisor_lifecycle import read_supervisor_heartbeat
 
 
 @dataclass(frozen=True)
@@ -660,6 +661,48 @@ def _allocation_writer_label(source: str | None) -> str:
     return f"an unrecognised writer {source!r}"
 
 
+def _positive_seconds(value: Any) -> int | None:
+    """Coerce a seconds field (JSON or config) to a positive ``int``, else ``None``."""
+    try:
+        parsed = int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def _allocation_pass_runtime_cap(
+    config: OrchestratorConfig, heartbeat: dict[str, Any] | None
+) -> tuple[int, str]:
+    """Resolve the per-pass runtime cap feeding the allocation staleness bound.
+
+    ``runner-allocation.json`` is rewritten only in the pass prologue, so a
+    single pass holds the stamp unrewritten for up to
+    ``max_pass_runtime_seconds`` — the cap must join the three-interval bound
+    or every healthy pass longer than it fires a false "not running
+    unattended" (issue #1852).
+
+    The cap's primary source is the supervisor heartbeat's
+    ``max_pass_runtime_seconds`` — the running daemon's own record of the
+    bound it is operating under — falling back to
+    ``config.supervisor.max_pass_runtime_seconds`` when the file is absent,
+    unreadable, or predates the field (the same "written before the field
+    existed" shape as the recorded-interval fallback below), and to ``0``
+    when neither provides a usable value — e.g. a config object built by
+    code that predates the knob — which collapses the bound to the pre-#1852
+    ``3 × interval``.
+
+    Returns ``(cap_seconds, source_label)``; the label names where the cap
+    came from so the warning detail can state the bound it actually used.
+    """
+    cap = _positive_seconds((heartbeat or {}).get("max_pass_runtime_seconds"))
+    if cap is not None:
+        return cap, "supervisor-heartbeat.json"
+    cap = _positive_seconds(getattr(config.supervisor, "max_pass_runtime_seconds", None))
+    if cap is not None:
+        return cap, "config supervisor.max_pass_runtime_seconds"
+    return 0, "none"
+
+
 def _check_runner_allocation(
     add: Any,
     config: OrchestratorConfig,
@@ -703,6 +746,17 @@ def _check_runner_allocation(
       daemon ran it and found no runners" are different problems with different
       fixes.
 
+    The staleness bound is three intervals *plus* the pass runtime cap
+    (``max_pass_runtime_seconds``, issue #1852): the stamp is rewritten only in
+    the pass prologue, so a single healthy pass holds it unrewritten for the
+    whole pass — measured p90 ~20 min, max ~54 min (see
+    ``scripts/heartbeat_check.py``) — and a bare three-interval bound (900 s)
+    false-flagged a mid-pass stamp at 1,492 s and 2,132 s on 2026-09-23. The
+    cap is read from ``supervisor-heartbeat.json`` (the running daemon's own
+    record of the bound it operates under), falling back to this probe's config
+    when the file is absent or lacks the field, and to the bare three-interval
+    bound when neither records a cap.
+
     ``now`` is the injectable clock used for the age computation below (issue
     #828): defaults to ``datetime.datetime.now(datetime.timezone.utc)`` when
     not supplied, so production behavior is byte-identical. ``run_doctor``
@@ -724,9 +778,6 @@ def _check_runner_allocation(
     # written before the interval was recorded.
     recorded_interval = stamp.full_pass_interval_seconds if stamp is not None else None
     interval = max(recorded_interval or config.supervisor.full_pass_interval_seconds, 1)
-    # Three intervals: one missed pass is normal jitter (a pass can run long), a
-    # sustained gap is not.
-    stale_after = interval * 3
 
     if stamp is None:
         add(
@@ -755,6 +806,28 @@ def _check_runner_allocation(
     age = max(0, int((resolved_now - stamp.updated_at).total_seconds()))
     writer = _allocation_writer_label(stamp.source)
 
+    # Three intervals alone are not the bound: the stamp is rewritten only in
+    # the pass prologue, so one pass can legitimately hold it unrewritten for
+    # up to max_pass_runtime_seconds — a mid-pass stamp is in-flight evidence,
+    # not a gap (issue #1852). The cap is read from the supervisor heartbeat
+    # (the running daemon's own record), falling back to config and then to
+    # the bare three-interval bound. One missed pass is normal jitter (a pass
+    # can run long); a gap outliving a whole pass plus three intervals is not.
+    cap_seconds, cap_source = _allocation_pass_runtime_cap(
+        config, read_supervisor_heartbeat(fleet_dir_override)
+    )
+    stale_after = cap_seconds + interval * 3
+    if cap_seconds:
+        bound_detail = (
+            f"{stale_after}s staleness bound "
+            f"({cap_seconds}s pass-runtime cap from {cap_source} + 3 × {interval}s interval)"
+        )
+    else:
+        bound_detail = (
+            f"{stale_after}s staleness bound "
+            f"(3 × {interval}s interval, no pass-runtime cap recorded)"
+        )
+
     # A recorded skip reason is the pass saying "I ran, and here is why I did not
     # act." Report that instead of guessing #590: a fresh unattended skip is the
     # daemon reaching allocation and declining — a named, different problem — not
@@ -782,9 +855,7 @@ def _check_runner_allocation(
                 "so it cannot confirm the daemon is rebalancing"
             )
         if age > stale_after:
-            clauses.append(
-                f"over the {stale_after}s staleness bound, allocation is not running unattended"
-            )
+            clauses.append(f"over the {bound_detail}, allocation is not running unattended")
         if clauses:
             detail += " — " + "; ".join(clauses) + " (issue #590)"
         add("runner allocation", False, detail, severity="warning")
@@ -795,7 +866,7 @@ def _check_runner_allocation(
             "runner allocation",
             False,
             f"enabled (budget {budget}) but the last pass ({writer}) was {age}s ago, "
-            f"over the {stale_after}s staleness bound — allocation is configured but "
+            f"over the {bound_detail} — allocation is configured but "
             f"is not running unattended (issue #590)",
             severity="warning",
         )
@@ -1733,7 +1804,8 @@ def run_doctor(
 
     # -- host-wide runner allocation (issue #590) ----------------------------
     # Read-only: compares the allocation state file's age against the pass
-    # interval. Never starts, parks, or plans anything.
+    # runtime cap plus intervals (issue #1852). Never starts, parks, or plans
+    # anything.
     _check_runner_allocation(add, config, fleet_dir_override=fleet_dir_override, now=resolved_now)
 
     # -- ci_fleet provenance refusal streak (issue #1753) ---------------------

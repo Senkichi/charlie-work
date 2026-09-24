@@ -143,6 +143,18 @@ def _write_allocation_stamp(
     (fleet_dir / ALLOCATION_STATE_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _write_supervisor_heartbeat(fleet_dir: Path, payload: dict) -> None:
+    """Plant a ``supervisor-heartbeat.json`` sidecar in the fleet dir.
+
+    The doctor probe's ``fleet_dir_override`` makes ``fleet_dir`` the
+    host-wide fleet directory, so the heartbeat lands beside the allocation
+    stamp exactly as the real supervisor writes it.
+    """
+    from charlie_work.supervisor_lifecycle import HEARTBEAT_FILENAME
+
+    (fleet_dir / HEARTBEAT_FILENAME).write_text(json.dumps(payload), encoding="utf-8")
+
+
 def _config(**kwargs) -> OrchestratorConfig:
     # The real default (review_dispatch.enabled=False, rescue.enabled=False)
     # is exactly the "no automated review-to-verdict path" gap the new

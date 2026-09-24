@@ -16,6 +16,7 @@ from _doctor_fixtures import (
     _collect_allocation_checks,
     _doctor_allocation_config,
     _write_allocation_stamp,
+    _write_supervisor_heartbeat,
 )
 
 
@@ -59,7 +60,13 @@ def test_allocation_probe_flags_a_stale_pass(tmp_path: Path) -> None:
     from ci_fleet.charlie_work_adapter import ALLOCATION_STATE_FILENAME
 
     config = _doctor_allocation_config()
-    stale_by = config.supervisor.full_pass_interval_seconds * 3 + 60
+    # The staleness bound is the pass runtime cap plus three intervals
+    # (issue #1852): 1800 + 300*3 = 2700 s under the default config.
+    stale_by = (
+        config.supervisor.max_pass_runtime_seconds
+        + config.supervisor.full_pass_interval_seconds * 3
+        + 60
+    )
     old = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=stale_by)
     (tmp_path / ALLOCATION_STATE_FILENAME).write_text(
         json.dumps(
@@ -157,18 +164,20 @@ def test_allocation_probe_measures_staleness_against_the_recorded_interval(
     interval is far shorter than the config default, so a stamp that is fresh
     under the config bound is stale under the recorded one.
     """
-    # Recorded interval 10s -> stale_after 30s. Config default is 300s -> 900s.
-    # Age 60s is stale under the recorded bound but fresh under config.
+    # Recorded interval 10s + heartbeat cap 30s -> bound 60s. Config defaults
+    # are interval 300s / cap 1800s -> bound 2700s. Age 90s is stale under the
+    # recorded bound but fresh under the config-resolved one.
     _write_allocation_stamp(
         tmp_path,
-        age_seconds=60,
+        age_seconds=90,
         source="prologue",
         full_pass_interval_seconds=10,
     )
+    _write_supervisor_heartbeat(tmp_path, {"max_pass_runtime_seconds": 30})
     checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
     _, ok, detail = checks[0]
     assert ok is False
-    assert "30s staleness bound" in detail
+    assert "60s staleness bound" in detail
     assert "not running unattended" in detail
 
 
@@ -177,15 +186,166 @@ def test_allocation_probe_falls_back_to_config_interval_when_none_recorded(
 ) -> None:
     """A file written before interval recording uses the config bound."""
     config = _doctor_allocation_config()
-    # Age just past the config bound (300*3=900), no recorded interval.
+    # Age just past the config-resolved bound — cap 1800 + interval 300*3
+    # = 2700 (issue #1852) — with no recorded interval. The 2700s bound in
+    # the detail pins that the interval fell back to config's 300s.
     _write_allocation_stamp(
         tmp_path,
-        age_seconds=config.supervisor.full_pass_interval_seconds * 3 + 60,
+        age_seconds=(
+            config.supervisor.max_pass_runtime_seconds
+            + config.supervisor.full_pass_interval_seconds * 3
+            + 60
+        ),
         source="prologue",
     )
     checks = _collect_allocation_checks(config, tmp_path)
     _, ok, detail = checks[0]
     assert ok is False
+    assert "2700s staleness bound" in detail
+    assert "not running unattended" in detail
+
+
+def test_allocation_probe_tolerates_a_stamp_inside_the_pass_runtime_cap(
+    tmp_path: Path,
+) -> None:
+    """Issue #1852: a mid-pass stamp is not stale while the pass is in its cap.
+
+    The stamp is rewritten only in the pass prologue, so a healthy pass holds
+    it unrewritten for up to ``max_pass_runtime_seconds``. This is the
+    observed false positive: on 2026-09-23 doctor flagged a stamp 2,132 s old
+    as stale at the bare 900 s bound while the supervisor was mid-pass. With
+    the heartbeat's cap the bound is 1800 + 3 x 300 = 2700 s, so 2,132 s is
+    fresh.
+    """
+    _write_allocation_stamp(
+        tmp_path,
+        age_seconds=2132,
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+    _write_supervisor_heartbeat(tmp_path, {"max_pass_runtime_seconds": 1800})
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, detail = checks[0]
+    assert ok is True
+    assert "unattended" in detail
+
+
+def test_allocation_probe_flags_a_stamp_beyond_cap_plus_intervals(
+    tmp_path: Path,
+) -> None:
+    """Past cap + 3 x interval the stamp is genuinely stale -- and the warning
+    names the bound it used and where the cap came from."""
+    _write_allocation_stamp(
+        tmp_path,
+        age_seconds=3000,
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+    _write_supervisor_heartbeat(tmp_path, {"max_pass_runtime_seconds": 1800})
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "2700s staleness bound" in detail
+    assert "supervisor-heartbeat.json" in detail
+    assert "not running unattended" in detail
+
+
+def test_allocation_probe_uses_the_heartbeat_cap_over_config(tmp_path: Path) -> None:
+    """The heartbeat's recorded cap wins over the probe's own config load.
+
+    Heartbeat cap 3600 + interval 300 x 3 = 4500 s bound; age 3000 s is fresh
+    under the heartbeat cap but stale under config's (1800 + 900 = 2700 s), so
+    an ok here can only mean the heartbeat supplied the cap.
+    """
+    _write_allocation_stamp(
+        tmp_path,
+        age_seconds=3000,
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+    _write_supervisor_heartbeat(tmp_path, {"max_pass_runtime_seconds": 3600})
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, _detail = checks[0]
+    assert ok is True
+
+
+def test_allocation_probe_falls_back_to_config_cap_when_heartbeat_absent(
+    tmp_path: Path,
+) -> None:
+    """No heartbeat file -> the cap falls back to config.supervisor's knob.
+
+    Age 960 s is over the bare 3 x 300 s bound but inside 1800 + 900 = 2700 s,
+    so an ok here proves the config cap was applied. The bound named in a
+    stale verdict must say the cap came from config (checked below at 3000 s).
+    """
+    _write_allocation_stamp(
+        tmp_path,
+        age_seconds=960,
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, _detail = checks[0]
+    assert ok is True
+
+    _write_allocation_stamp(
+        tmp_path,
+        age_seconds=3000,
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "2700s staleness bound" in detail
+    assert "config supervisor.max_pass_runtime_seconds" in detail
+
+
+def test_allocation_probe_falls_back_to_config_cap_when_heartbeat_lacks_field(
+    tmp_path: Path,
+) -> None:
+    """A heartbeat that predates the field -> config cap, same as absent."""
+    _write_allocation_stamp(
+        tmp_path,
+        age_seconds=960,
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+    _write_supervisor_heartbeat(tmp_path, {"pid": 1, "pass_number": 4})
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, _detail = checks[0]
+    assert ok is True
+
+
+def test_allocation_probe_falls_back_to_bare_interval_bound_when_no_cap(
+    tmp_path: Path,
+) -> None:
+    """Neither heartbeat nor config records a cap -> the bound is 3 x interval.
+
+    ``config.supervisor`` is replaced with a namespace that predates the
+    ``max_pass_runtime_seconds`` knob (the same "config object built by code
+    that predates the section" shape the probe already tolerates for the
+    runner_allocation section itself), and the heartbeat lacks the field, so
+    the bound collapses to today's 3 x 300 = 900 s.
+    """
+    import dataclasses
+    from types import SimpleNamespace
+
+    config = dataclasses.replace(
+        _doctor_allocation_config(),
+        supervisor=SimpleNamespace(full_pass_interval_seconds=300),
+    )
+    _write_allocation_stamp(
+        tmp_path,
+        age_seconds=960,
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+    _write_supervisor_heartbeat(tmp_path, {"pid": 1, "pass_number": 4})
+    checks = _collect_allocation_checks(config, tmp_path)
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "900s staleness bound" in detail
     assert "not running unattended" in detail
 
 
@@ -214,7 +374,7 @@ def test_allocation_probe_joins_skip_reason_and_staleness_when_stale(
     """A stale skip reports both the recorded reason and the #590 reading."""
     _write_allocation_stamp(
         tmp_path,
-        age_seconds=2000,
+        age_seconds=3000,
         source="prologue",
         full_pass_interval_seconds=300,
         skip_reason="no configured runners found under /actions-runners",
@@ -300,7 +460,7 @@ def test_allocation_probe_joins_source_and_staleness_for_a_stale_manual_skip(
     """
     _write_allocation_stamp(
         tmp_path,
-        age_seconds=2000,
+        age_seconds=3000,
         source="cli",
         full_pass_interval_seconds=300,
         skip_reason="no configured runners found under /actions-runners",
