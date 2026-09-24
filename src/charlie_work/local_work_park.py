@@ -33,6 +33,7 @@ from .env_sanitize import WorkerTokenFinding, worker_github_token_findings
 from .github import GitHubError, GitHubLike
 from .labels import TransitionOutcome
 from .paths import runtime_paths
+from .rework_prompts import _write_text_atomic
 from .state import load_state, state_lock
 from .write_gate import WriteGate
 
@@ -132,15 +133,32 @@ def _post_branch_comment(
     not hide behind a warning.
     """
     body_dir = runtime_paths(repo_root, config.runtime.state_dir).issues / f"issue-{issue_number}"
+    # Issue #1844: when the local review/merge lane is enabled (the default),
+    # ``agent:review-ready`` is the lane's *input* -- the next loop pass adopts
+    # the branch, reviews it, runs the suite, and merges with no operator
+    # action. The comment describes which mode is actually armed so the
+    # operator never reads "you must merge this by hand" on a repo whose lane
+    # will do it automatically.
+    lane_enabled = config.review_dispatch.enabled and config.auto_merge.enabled
+    body_text = (
+        f"Work for this issue is committed on branch `{branch}`. This repo has no "
+        "remote, so nothing was pushed and no PR exists: the local review lane "
+        "will pick the branch up on the next pass -- review, full test suite, "
+        "and merge into the base branch all run automatically. No action is "
+        "needed unless the lane escalates."
+        if lane_enabled
+        else (
+            f"Work for this issue is committed on branch `{branch}`. This repo has no "
+            "remote, so nothing was pushed and no PR exists, and the local "
+            "review/merge lane is disabled (review_dispatch.enabled and "
+            "auto_merge.enabled): review the branch, merge it, and close the "
+            "issue."
+        )
+    )
     try:
         body_dir.mkdir(parents=True, exist_ok=True)
         body_path = body_dir / "review-ready-comment.md"
-        body_path.write_text(
-            f"Work for this issue is committed on branch `{branch}`. This repo has no "
-            "remote, so nothing was pushed and no PR exists: review the branch, merge it, "
-            "and close the issue.",
-            encoding="utf-8",
-        )
+        _write_text_atomic(body_path, body_text)
         gh.issue_comment(issue_number, body_path)
     except (OSError, GitHubError):
         logger.warning("review-ready comment post failed issue=%d", issue_number, exc_info=True)

@@ -396,6 +396,17 @@ _NO_COUNTER_ALLOWLIST: dict[str, str] = {
     "worktree_unsafe_shim_dirt": "Deterministic failure kind; escalates on first occurrence.",
     "rework_branch_conflict": "Deterministic failure kind; escalates on first occurrence.",
     "provider_suspended": "Deterministic failure kind; escalates on first occurrence.",
+    # --- local (no-remote) lane, issue #1844: condition-driven, no counter ---
+    "local_branch_missing": (
+        "Fires when the branch a local lane record points at no longer "
+        "resolves to a commit; the guard is the branch ref itself, not a "
+        "resettable counter."
+    ),
+    "local_merge_error": (
+        "Fires on a local merge-gate infrastructure failure (worktree "
+        "attach, base-sync exception, unresolvable suite command, merge "
+        "refusal); event-driven, no counter."
+    ),
 }
 
 # Dynamic ``reason`` domains that cannot be reduced to a finite literal

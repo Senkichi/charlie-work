@@ -1,0 +1,4 @@
+info
+# Issue #1844: a parked ``agent:review-ready`` branch was adopted into a
+# synthetic local ``state["prs"]`` record. Fired once per adoption; the
+# audit trail for the local lane's intake phase.

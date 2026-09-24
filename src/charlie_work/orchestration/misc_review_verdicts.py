@@ -151,7 +151,17 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                 )
                 if outcome is not None:
                     try:
-                        self._comment_pr(pr_number, outcome.text)
+                        if pr_state_dict.get("local") and issue_number is not None:
+                            # Issue #1844: no PR to comment on -- the issue is
+                            # the operator-facing channel for a local record.
+                            body_path = self.paths.prs / f"pr-{pr_number}" / "review-comment.md"
+                            body_path.write_text(
+                                f"{_wf.ORCHESTRATOR_COMMENT_MARKER}\n{outcome.text}",
+                                encoding="utf-8",
+                            )
+                            self.gh.issue_comment(issue_number, body_path)
+                        else:
+                            self._comment_pr(pr_number, outcome.text)
                     except Exception:
                         pass
                     with _wf.state_lock(self.paths.state_file):
@@ -246,6 +256,12 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
         session_metrics = _reviewer_session_metrics(
             _events_path(reviews_dir, pr_number, review=True), verdict_source
         )
+        # Issue #1844: a ``"local": True`` record has no GitHub PR backing, so
+        # the verdict goes to ``record_local_review`` (same decision file,
+        # same labels, same rework routing -- minus the ``pr_view``/external-
+        # findings seams that need a remote). The explicit branch (not a
+        # chosen-name indirection) keeps the literal ``.record_review(`` call
+        # site visible to the verdict-provenance enforcement scanner.
         # Fold the review_effort experiment's arm/effort assignment (set
         # at claim time in dispatch_reviews) into session_metrics so the
         # record_review event alone is enough to split spend/quality by
@@ -258,21 +274,33 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                 "review_effort_arm": review_effort_arm,
                 "review_effort_used": review_effort_used,
             }
-        result = self.record_review(
-            pr_number,
-            verdict["decision"],
-            summary=verdict["summary"],
-            reviewed_head=packet_head_sha,
-            required_changes=verdict["required_changes"],
-            session_metrics=session_metrics,
-            verdict_provenance="fresh_llm_review",
-            # Issue #1340: thread the parser-level provenance into the
-            # decision file so a later reader can distinguish a
-            # log-extracted verdict (dead reviewer) from a clean
-            # structured completion. ``verdict_source`` is the same value
-            # already threaded into ``session_metrics`` above.
-            verdict_source=verdict_source,
-        )
+        if pr_state.get("local"):
+            result = self.record_local_review(
+                pr_number,
+                verdict["decision"],
+                summary=verdict["summary"],
+                reviewed_head=packet_head_sha,
+                required_changes=verdict["required_changes"],
+                session_metrics=session_metrics,
+                verdict_provenance="fresh_llm_review",
+                # Issue #1340: thread the parser-level provenance into the
+                # decision file so a later reader can distinguish a
+                # log-extracted verdict (dead reviewer) from a clean
+                # structured completion. ``verdict_source`` is the same value
+                # already threaded into ``session_metrics`` above.
+                verdict_source=verdict_source,
+            )
+        else:
+            result = self.record_review(
+                pr_number,
+                verdict["decision"],
+                summary=verdict["summary"],
+                reviewed_head=packet_head_sha,
+                required_changes=verdict["required_changes"],
+                session_metrics=session_metrics,
+                verdict_provenance="fresh_llm_review",
+                verdict_source=verdict_source,
+            )
         if result.ok:
             recorded.append(
                 {

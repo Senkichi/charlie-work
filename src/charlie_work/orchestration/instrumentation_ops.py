@@ -431,14 +431,30 @@ def _reconcile_stranded_verdicts(self) -> list[dict[str, Any]]:
         # A head-drifted stranded verdict is correctly refused this pass
         # and left for the stale-claim sweep / a fresh review dispatch.
         pr_number = int(pr_key)
-        record_result = self.record_review(
-            pr_number,
-            on_disk_decision,
-            summary=decision_data.get("summary", ""),
-            reviewed_head=decision_data.get("reviewed_head_sha"),
-            required_changes=decision_data.get("required_changes"),
-            verdict_provenance="stranded_reconciliation",
-        )
+        # Issue #1844: a ``"local": True`` record has no GitHub PR backing;
+        # ingest through ``record_local_review`` (same decision file/state
+        # transition, minus the ``pr_view``/external-findings seams). The
+        # explicit branch (not a chosen-name indirection) keeps the literal
+        # ``.record_review(`` call site visible to the verdict-provenance
+        # enforcement scanner.
+        if pr_state.get("local"):
+            record_result = self.record_local_review(
+                pr_number,
+                on_disk_decision,
+                summary=decision_data.get("summary", ""),
+                reviewed_head=decision_data.get("reviewed_head_sha"),
+                required_changes=decision_data.get("required_changes"),
+                verdict_provenance="stranded_reconciliation",
+            )
+        else:
+            record_result = self.record_review(
+                pr_number,
+                on_disk_decision,
+                summary=decision_data.get("summary", ""),
+                reviewed_head=decision_data.get("reviewed_head_sha"),
+                required_changes=decision_data.get("required_changes"),
+                verdict_provenance="stranded_reconciliation",
+            )
         entry: dict[str, Any] = {
             "pr_number": pr_number,
             "decision": on_disk_decision,

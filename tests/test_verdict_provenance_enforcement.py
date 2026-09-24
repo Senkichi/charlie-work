@@ -442,11 +442,15 @@ def _nodes_outside_function_definition(tree: ast.AST, function_name: str) -> lis
 
 def _record_review_call_sites(tree: ast.AST) -> list[ast.Call]:
     sites: list[ast.Call] = []
+    # ``record_local_review`` (issue #1844's no-remote lane) is the same
+    # verdict-ingest contract under a different name -- required
+    # verdict_provenance kwarg, same provenance literals -- so its call
+    # sites are held to the identical mapping table.
     for node in _nodes_outside_function_definition(tree, "record_review"):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "record_review"
+            and node.func.attr in ("record_review", "record_local_review")
         ):
             sites.append(node)
     return sites
@@ -486,8 +490,22 @@ def _dict_var_has_key(func_node: ast.AST, var_name: str, key: str) -> bool:
     ``key``, OR ever subscript-assigned that key directly (the
     read-modify-write shape ``_update_approval_head`` uses: ``updated_decision
     = dict(current_decision)`` followed by
-    ``updated_decision["verdict_provenance"] = "carried_forward"``)."""
+    ``updated_decision["verdict_provenance"] = "carried_forward"``).
+
+    Covers ``ast.AnnAssign`` as well as ``ast.Assign`` -- the annotated
+    binding ``decision_payload: dict[str, Any] = {...}`` is the same write
+    with a type annotation (issue #1844's ``record_local_review`` binds it
+    that way); an Assign-only walk would fail open on the rephrase."""
     for node in ast.walk(func_node):
+        if isinstance(node, ast.AnnAssign):
+            if (
+                isinstance(node.target, ast.Name)
+                and node.target.id == var_name
+                and isinstance(node.value, ast.Dict)
+                and any(isinstance(k, ast.Constant) and k.value == key for k in node.value.keys)
+            ):
+                return True
+            continue
         if not isinstance(node, ast.Assign):
             continue
         for target in node.targets:
@@ -663,16 +681,21 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
     # the exemption census -- so a silent drop (the _wf. form evading the
     # receiver-sensitive matcher) could not be caught. Pinning the total
     # means a future drop fails loudly instead of eroding coverage quietly.
-    # Today there are exactly 7 sites: 6 checked (two in review in
+    # Today there are exactly 10 sites: 9 checked (two in review in
     # workflow.py -- the #1695 archive-before-void write and the
     # pending-stub write -- plus _update_approval_head in
-    # state_approval.py, record_review in state_record_review.py, and two
-    # new sites in unescalate() in state_operator_commands.py -- issue
+    # state_approval.py, record_review in state_record_review.py, two
+    # sites in unescalate() in state_operator_commands.py -- issue
     # #1765 finding 1's own archive-before-void write and pending-stub
     # write, the same two-call pattern review() already uses, applied here
-    # to void a still-valid terminal verdict before re-arming a PR) + 1
-    # exempted (merge_authorize in state_operator_commands.py).
-    assert len(scanned_write_sites) + len(exempted_write_sites) == 7, {
+    # to void a still-valid terminal verdict before re-arming a PR -- and
+    # three in orchestration/local_lanes.py for issue #1844's local
+    # (no-remote) lane: _local_build_packet's archive-before-void write and
+    # pending-stub write (the same two-call pattern, applied to the local
+    # review packet) plus record_local_review's verdict write, which
+    # mirrors record_review's) + 1 exempted (merge_authorize in
+    # state_operator_commands.py).
+    assert len(scanned_write_sites) + len(exempted_write_sites) == 10, {
         "checked": scanned_write_sites,
         "exempted": exempted_write_sites,
     }
@@ -763,14 +786,20 @@ def test_review_decision_write_sites_collects_bare_name_form() -> None:
 # record_review() call site (the "stranded_reconciliation" literal) now reports
 # that module -- the same address change of a known site as #1645/#1660,
 # discovered via the same rglob; the total_sites == 7 control below is unchanged.
+# Issue #1844: ``record_local_review`` call sites are held to the same
+# table (the matcher accepts both attribute names). ``_reap_review_verdicts``
+# and ``_reconcile_stranded_verdicts`` each branch to the local variant on
+# ``pr_state["local"]`` with the same provenance literal, so their Counters
+# are 2 (one ``record_review`` call + one ``record_local_review`` call).
 _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE: dict[tuple[str, str], Counter[str]] = {
     ("workflow.py", "review"): Counter({"ci_gate_auto_reject": 2, "test_adequacy_auto_reject": 1}),
-    ("misc_review_verdicts.py", "_reap_review_verdicts"): Counter({"fresh_llm_review": 1}),
+    ("misc_review_verdicts.py", "_reap_review_verdicts"): Counter({"fresh_llm_review": 2}),
     ("instrumentation_ops.py", "_reconcile_stranded_verdicts"): Counter(
-        {"stranded_reconciliation": 1}
+        {"stranded_reconciliation": 2}
     ),
     ("state_rescue.py", "_process_rescue_review"): Counter({"rescue_review": 1}),
     ("cli.py", "run_command"): Counter({"operator_manual": 1}),
+    ("local_lanes.py", "_local_build_packet"): Counter({"test_adequacy_auto_reject": 1}),
 }
 
 
@@ -808,14 +837,17 @@ def test_record_review_call_sites_map_to_expected_provenance_literal() -> None:
         f"actual:   {dict(actual)}"
     )
 
-    # Positive control: the table itself must cover all 9 known call sites --
+    # Positive control: the table itself must cover all known call sites --
     # an accidentally-empty expected table would make the equality assertion
     # above vacuously true if `actual` were also empty (e.g. a scanner
-    # regression that stopped matching anything).
+    # regression that stopped matching anything). 7 ``record_review`` sites
+    # plus 3 ``record_local_review`` sites (issue #1844's local lane:
+    # _reap_review_verdicts, _reconcile_stranded_verdicts, and
+    # _local_build_packet's test-adequacy auto-reject).
     total_sites = sum(
         sum(counter.values()) for counter in _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE.values()
     )
-    assert total_sites == 7, _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE
+    assert total_sites == 10, _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE
 
 
 # ---------------------------------------------------------------------------

@@ -625,6 +625,13 @@ def test_valid_issue_statuses_covers_every_assigned_status_literal() -> None:
         "mergequeue",
         "pending",
         "unclaimed",
+        # Issue #1844: LocalMergeOutcome.status / merge-gate per-entry
+        # "outcome" values -- merge-attempt results on PR-lane records and
+        # result payloads, never an issue workflow status.
+        "already",
+        "conflict",
+        "deferred",
+        "error",
     }
 
     unclassified = found - VALID_ISSUE_STATUSES - pr_or_event_only

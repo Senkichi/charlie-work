@@ -55,6 +55,8 @@ from .github import (
 from .issue_linking import linked_issue_number
 from .instrumentation import log_event, query_events
 from .labels import TransitionOutcome, _edges, transition
+from .local_lane import synthesize_open_pr
+from .local_work_park import publishes_pull_requests
 from .merge_finalize import _merged_issue_fields
 from .paths import resolved_layout, runtime_paths
 from .pr_create_retry import create_pr_with_retry
@@ -1173,8 +1175,16 @@ def detect_drift(
         _escalation_label(labels_cfg, _escalation_edge("escalated", reason_class))
         for reason_class in ESCALATION_REASON_CLASSES
     }
-    prs = _fetch_prs(gh)
-    issues = _fetch_issues(gh)
+    # Issue #1844: on a no-remote backend there is no PR/issues API to page
+    # -- ``_fetch_prs``/``_fetch_issues`` would raise ``GitHubError``. The PR
+    # snapshot stays empty (local lane records are projected in below); the
+    # issue snapshot comes from the local backend's own ``issue_list``.
+    if publishes_pull_requests(gh):
+        prs = _fetch_prs(gh)
+        issues = _fetch_issues(gh)
+    else:
+        prs = []
+        issues = gh.issue_list(state="all")
     issues_by_number = {int(issue["number"]): issue for issue in issues if issue.get("number")}
     # Issue #762: issues are now fetched via a paginated REST ``issues``
     # snapshot. The list is either complete (we stopped because GitHub returned
@@ -1184,6 +1194,22 @@ def detect_drift(
     # genuinely missing issue, and the warning remains defensive dead code.
     issue_snapshot_truncated = False
     state_prs: dict[str, Any] = state.get("prs", {})
+    # Issue #1844: on a no-remote backend ``_fetch_prs`` returns [] by
+    # construction, but a local lane record in ``state["prs"]`` IS the live
+    # review unit. Project each non-terminal local record into the PR
+    # snapshot as a synthetic OPEN PR linked to its issue (the branch name
+    # carries the ``<prefix>-<n>`` convention ``linked_issue_number`` already
+    # parses), so ``state_pr_missing_on_github`` stays quiet and
+    # ``issue_active_label_no_open_pr`` never strips a local issue's
+    # ``reviewing``/``needs_rework`` labels. Terminal records produce no
+    # entry -- nothing live left to protect. These entries flow through the
+    # same per-PR loop below; every check that would misfire on them
+    # (MERGED/CLOSED branches, gh-backed checks) keys on ``state`` values the
+    # synthetic record does not carry.
+    for _local_entry in state_prs.values():
+        _synth = synthesize_open_pr(_local_entry)
+        if _synth is not None:
+            prs.append(_synth)
     # Issue #762: PRs are now fetched via a paginated REST ``pulls`` snapshot.
     # The list is either complete (we stopped because GitHub returned an
     # under-full page) or the fetch raised. It is no longer a fixed

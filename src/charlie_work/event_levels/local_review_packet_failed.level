@@ -1,0 +1,4 @@
+warning
+# Issue #1844: building a local review packet (diff capture, packet
+# files, prompt render) failed. The issue escalates through
+# ``_escalate_issue``; the event records which phase failed.

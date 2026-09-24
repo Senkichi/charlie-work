@@ -1,0 +1,4 @@
+warning
+# Issue #1844: adopting a parked ``agent:review-ready`` branch failed
+# (e.g. the recorded branch no longer resolves). The issue keeps its
+# label; this is the audit record of the failed adoption attempt.
