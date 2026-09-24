@@ -389,6 +389,62 @@ def test_allocation_probe_joins_skip_reason_and_staleness_when_stale(
     assert "#590" in detail
 
 
+def test_allocation_probe_does_not_flag_a_mid_pass_skip_as_stale(
+    tmp_path: Path,
+) -> None:
+    """Issue #1852: a mid-pass *skip* stamp is fresh inside cap + 3 x interval.
+
+    The skip_reason branch shares the widened bound (cap + 3 x interval =
+    2700 s under the default config). Age 2,132 s sits between the pre-#1852
+    bound (3 x 300 = 900 s) and the new one: a mutant that reverts only this
+    branch to ``interval * 3`` would append the staleness clause and fail
+    both negative assertions below.
+    """
+    _write_allocation_stamp(
+        tmp_path,
+        age_seconds=2132,
+        source="prologue",
+        full_pass_interval_seconds=300,
+        skip_reason="no configured runners found under /actions-runners",
+    )
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "declined to act" in detail
+    assert "no configured runners found under /actions-runners" in detail
+    # Fresh unattended skip: neither staleness nor source-mismatch clause
+    # applies, so the #590 framing must not appear at all.
+    assert "not running unattended" not in detail
+    assert "#590" not in detail
+
+
+def test_allocation_probe_skip_branch_names_the_cap_aware_staleness_bound(
+    tmp_path: Path,
+) -> None:
+    """A stale skip's joined clause states the bound used and the cap source.
+
+    Heartbeat cap 1,800 + interval 300 x 3 = 2,700 s bound; age 3,000 s is
+    stale, and the detail must render the same ``bound_detail`` string the
+    plain stale branch produces — including where the cap was read from.
+    """
+    _write_allocation_stamp(
+        tmp_path,
+        age_seconds=3000,
+        source="prologue",
+        full_pass_interval_seconds=300,
+        skip_reason="no configured runners found under /actions-runners",
+    )
+    _write_supervisor_heartbeat(tmp_path, {"max_pass_runtime_seconds": 1800})
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    _, ok, detail = checks[0]
+    assert ok is False
+    assert "declined to act" in detail
+    assert "no configured runners found under /actions-runners" in detail
+    assert "2700s staleness bound" in detail
+    assert "supervisor-heartbeat.json" in detail
+    assert "not running unattended" in detail
+
+
 def test_allocation_probe_reports_a_manual_skip_with_the_recorded_reason(
     tmp_path: Path,
 ) -> None:
