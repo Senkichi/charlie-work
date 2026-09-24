@@ -989,10 +989,12 @@ def _should_retry(args: list[str], error: str, is_mutating: bool) -> bool:
 
 
 # Blocker declaration patterns for dependency gate
-# Case-insensitive patterns: "Blocked by #N", "Depends on #N", "Blocked-by: #N"
-# Handles comma-separated lists like "Blocked by #743, #744"
+# Case-insensitive patterns: "Blocked by #N", "Blocked by: #N", "Depends on #N",
+# "Blocked-by: #N". Handles comma-separated lists like "Blocked by #743, #744".
+# The optional colon after "blocked by" (issue #1847) covers the shape Matt's
+# GitHub fallback writes.
 _BLOCKER_PATTERNS = [
-    re.compile(r"blocked\s+by\s+#\d+(?:\s*,\s*#\d+)*", flags=re.IGNORECASE),
+    re.compile(r"blocked\s+by\s*:?\s*#\d+(?:\s*,\s*#\d+)*", flags=re.IGNORECASE),
     re.compile(r"depends\s+on\s+#\d+(?:\s*,\s*#\d+)*", flags=re.IGNORECASE),
     re.compile(r"blocked-by:\s*#\d+(?:\s*,\s*#\d+)*", flags=re.IGNORECASE),
 ]
@@ -1009,6 +1011,24 @@ _DOUBLE_QUOTE_SPAN_RE = re.compile(r'"([^"]*)"')
 # backticks or tildes (optionally followed by an info string). CommonMark
 # allows up to 3 leading spaces; we tolerate any leading whitespace.
 _FENCE_OPEN_RE = re.compile(r"^[ \t]*([`~]{3,})")
+
+# Issue #1847 — heading-list blocker sections ("## Blocked by\n- #N").
+# ATX heading: up to three leading spaces, 1-6 '#' characters, then optional
+# whitespace-separated text. CommonMark requires whitespace or end-of-line
+# after the opening run, so "###foo" is not a heading.
+_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]+(.*?))?[ \t]*$")
+# Optional CommonMark closing sequence of '#'s at the end of heading text
+# ("## Blocked by ##" -> text "Blocked by").
+_HEADING_CLOSING_RUN_RE = re.compile(r"[ \t]+#+[ \t]*$")
+# Heading text that opens a blocker section: "Blocked by" or "Depends on"
+# (case-insensitive, space or hyphen between the words, optional trailing colon).
+_BLOCKER_HEADING_TEXT_RE = re.compile(
+    r"(?:blocked[ \t-]+by|depends[ \t-]+on):?", flags=re.IGNORECASE
+)
+# List-item marker: '-', '*', '+' or an ordered 'N.' followed by whitespace.
+_LIST_ITEM_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+\.)[ \t]+(.*)$")
+# An item or bare line that declares "no blockers" ("None", "n/a").
+_NONE_SENTINEL_RE = re.compile(r"(?:none|n/a)\b", flags=re.IGNORECASE)
 
 
 def _inside_code_span(text: str, start: int, end: int) -> bool:
@@ -1136,13 +1156,94 @@ def is_infrastructure_failure(job: dict[str, Any], annotations: list[dict[str, A
     return is_infra_blocked_check(job, annotations, InfraBlockedConfig())
 
 
+def _is_blockquote_line(line: str) -> bool:
+    """True if the line's first non-space character is ``>`` (a Markdown blockquote)."""
+    return line.lstrip(" \t").startswith(">")
+
+
+def _is_thematic_break(line: str) -> bool:
+    """True if the line is a CommonMark thematic break (3+ of ``-``, ``_`` or ``*``)."""
+    stripped = re.sub(r"[ \t]", "", line.strip())
+    return len(stripped) >= 3 and stripped[0] in "-_*" and len(set(stripped)) == 1
+
+
+def _scan_blocker_sections(text: str) -> tuple[list[int], bool]:
+    """Scan ``Blocked by``/``Depends on`` heading sections for issue refs.
+
+    Issue #1847: issue bodies written by the mattpocock-skills ``/to-tickets``
+    skill (and some written by hand) declare blockers as a Markdown section —
+    a heading plus a list — rather than an inline sentence. A heading of any
+    level whose text is "Blocked by" or "Depends on" (case-insensitive, a
+    space or hyphen between the words, optional trailing colon) opens a
+    section that runs to the next heading or the start of a fenced code
+    block. Inside it, each list item contributes the issue reference it
+    starts with (the item's later references are ignored, not fatal — the
+    foreign-issue-ref guard that voids an inline clause does not apply per
+    item), and a line that is only an issue reference counts the same way.
+    An item or line starting with "None"/"n/a" contributes nothing, and a
+    ``Parent`` section never opens here so it never contributes. Inline
+    forms inside the section are left to the caller's normal inline scan —
+    they parse exactly as they do elsewhere. Blockquote lines contribute
+    nothing in any form.
+
+    Returns ``(refs, unreadable)`` where ``unreadable`` is True when a
+    blocker section holds an item that is neither a same-repo issue
+    reference nor a none-sentinel nor an inline declaration (a URL, an
+    ``owner/repo`` reference, free prose) — the signal
+    :func:`detect_prose_only_dependencies` uses to park the issue for a
+    human instead of silently freeing it.
+    """
+    fenced = _fenced_block_ranges(text)
+    refs: list[int] = []
+    unreadable = False
+    in_section = False
+    fence_idx = 0
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        line_start = pos
+        pos += len(line)
+        while fence_idx < len(fenced) and fenced[fence_idx][1] <= line_start:
+            fence_idx += 1
+        if fence_idx < len(fenced) and fenced[fence_idx][0] <= line_start:
+            # Inside a fenced block. The range starts at the opening fence
+            # line, so reaching it closes any open blocker section; content
+            # lines are quoted prose and never parsed.
+            in_section = False
+            continue
+        heading = _HEADING_RE.match(line.rstrip("\r\n"))
+        if heading is not None:
+            heading_text = _HEADING_CLOSING_RUN_RE.sub("", heading.group(1) or "")
+            in_section = bool(_BLOCKER_HEADING_TEXT_RE.fullmatch(heading_text.strip()))
+            continue
+        if not in_section or _is_blockquote_line(line) or _is_thematic_break(line):
+            continue
+        item = _LIST_ITEM_RE.match(line)
+        candidate = item.group(1).strip() if item is not None else line.strip()
+        if not candidate:
+            continue
+        ref = _ISSUE_REF.match(candidate)
+        if ref is not None and (item is not None or ref.end() == len(candidate)):
+            # A list item contributes the reference it starts with; a bare
+            # (non-list) line counts only when it IS just a reference.
+            refs.append(int(ref.group(0)[1:]))
+            continue
+        if _NONE_SENTINEL_RE.match(candidate) or any(
+            p.search(candidate) for p in _BLOCKER_PATTERNS
+        ):
+            continue
+        unreadable = True
+    return refs, unreadable
+
+
 def parse_blockers(text: str) -> list[int]:
     """Parse blocker issue numbers from issue body text.
 
     Returns a list of issue numbers declared as blockers using patterns like:
-    - "Blocked by #N"
+    - "Blocked by #N" (an optional colon after "by" is accepted, issue #1847)
     - "Depends on #N"
     - "Blocked-by: #N"
+    - a "Blocked by"/"Depends on" Markdown heading section whose list items
+      each start with ``#N`` (issue #1847; see :func:`_scan_blocker_sections`)
 
     Handles comma-separated lists (e.g., "Blocked by #743, #744").
 
@@ -1170,7 +1271,11 @@ def parse_blockers(text: str) -> list[int]:
        issues, not this one. This generalizes the original backward-only
        ``_clause_preceding`` guard (issue #159) to also look forward, so
        issue-referencing parentheticals after the match are excluded too.
-    3. The remaining matches are honored as genuine self-declarations.
+    3. **Blockquote exclusion** — a match on a line whose first non-space
+       character is ``>`` is a quoted reply, not a self-declaration (issue
+       #1847). The rule applies to every form: an inline declaration, and any
+       line scanned inside a heading-list blocker section.
+    4. The remaining matches are honored as genuine self-declarations.
 
     Returns an empty list if no blockers are found.
     """
@@ -1178,6 +1283,12 @@ def parse_blockers(text: str) -> list[int]:
         return []
 
     blockers: set[int] = set()
+    # Heading-list blocker sections (issue #1847) contribute refs through a
+    # separate per-item scan; the unreadable flag is consumed by
+    # detect_prose_only_dependencies, not here.
+    section_refs, _section_unreadable = _scan_blocker_sections(text)
+    blockers.update(section_refs)
+
     # Check if they appear in blocker context
     for pattern in _BLOCKER_PATTERNS:
         for match in pattern.finditer(text):
@@ -1191,6 +1302,14 @@ def parse_blockers(text: str) -> list[int]:
             # fence markers). This check therefore runs against the full
             # document with absolute offsets (issue #1454 rework round 2).
             if _inside_fenced_block(text, match_start, match_end):
+                continue
+
+            # Guard 1c (issue #1847): a match on a Markdown blockquote line —
+            # first non-space character is ``>`` — is a quoted reply, not a
+            # self-declaration. The ``>`` precedes the match, so checking the
+            # line prefix is equivalent to checking the line.
+            line_start = text.rfind("\n", 0, match_start) + 1
+            if _is_blockquote_line(text[line_start:match_start]):
                 continue
 
             # Both remaining guards judge the match against its containing
@@ -1255,6 +1374,12 @@ def detect_prose_only_dependencies(text: str) -> bool:
     marker mentions like "implements P2-T4" or title suffixes "(P2-T4)" are
     NOT matched, to avoid flagging every plan-generated issue for human review.
 
+    Additionally (issue #1847), a "Blocked by"/"Depends on" heading section
+    that holds an item the parser cannot read — neither a same-repo issue
+    reference nor a none-sentinel (a URL, an ``owner/repo`` reference, free
+    prose) — returns True so the issue is parked for a human instead of
+    silently freed.
+
     Args:
         text: The issue body text to check
 
@@ -1291,6 +1416,12 @@ def detect_prose_only_dependencies(text: str) -> bool:
     if re.search(
         r"wait\s+for\s+(?:this|that|these|those)?\s*(?:PR|merge|land)", text, flags=re.IGNORECASE
     ):
+        return True
+
+    # Issue #1847: an unreadable item inside a "Blocked by"/"Depends on"
+    # heading section is a dependency declaration we cannot read.
+    _section_refs, section_unreadable = _scan_blocker_sections(text)
+    if section_unreadable:
         return True
 
     return False

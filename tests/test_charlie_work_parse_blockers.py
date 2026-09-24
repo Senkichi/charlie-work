@@ -233,3 +233,191 @@ def test_parse_blockers_genuine_declaration_outside_fenced_block_still_gates() -
 
     body = "## Summary\n\nFix the parser.\n\n```python\nblocked by #886\n```\n\nBlocked by #743\n"
     assert parse_blockers(body) == [743]
+
+
+# --- Issue #1847: heading-list blocker sections, colon inline form, ---------
+# --- blockquote exclusion ---------------------------------------------------
+
+
+def test_parse_blockers_heading_section_list_items() -> None:
+    """Issue #1847: a '## Blocked by' heading opens a blocker section whose
+    list items contribute the issue reference they start with. Later refs in
+    the same item are ignored, not fatal — the foreign-issue-ref guard that
+    voids an inline clause does not apply per item."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Blocked by\n- #12 (schema migration)\n- #14 after #9 lands\n"
+    assert parse_blockers(body) == [12, 14]
+
+
+def test_parse_blockers_heading_section_level_3_with_colon() -> None:
+    """Issue #1847: a level-3 'Depends on:' heading (optional trailing colon)
+    opens a blocker section."""
+    from charlie_work.github import parse_blockers
+
+    body = "### Depends on:\n- #7\n"
+    assert parse_blockers(body) == [7]
+
+
+def test_parse_blockers_heading_section_all_levels_and_variants() -> None:
+    """Issue #1847: heading levels 1-6, up to three leading spaces, a hyphen
+    between the words, and case-insensitivity all open a blocker section."""
+    from charlie_work.github import parse_blockers
+
+    for hashes in ("#", "##", "###", "####", "#####", "######"):
+        assert parse_blockers(f"{hashes} Blocked by\n- #5\n") == [5]
+    assert parse_blockers("   ## Blocked-by\n- #6\n") == [6]
+    assert parse_blockers("## blocked by\n- #7\n") == [7]
+    # Four leading spaces is an indented code block, not a heading.
+    assert parse_blockers("    ## Blocked by\n- #8\n") == []
+
+
+def test_parse_blockers_heading_section_none_sentinel() -> None:
+    """Issue #1847: an item or line starting with 'None'/'n/a' contributes
+    nothing and is not unreadable."""
+    from charlie_work.github import detect_prose_only_dependencies, parse_blockers
+
+    body = "### Depends on:\nNone (can start immediately)\n- #8\n"
+    assert parse_blockers(body) == [8]
+    assert detect_prose_only_dependencies(body) is False
+
+    body = "## Blocked by\n- n/a\n- #9\n"
+    assert parse_blockers(body) == [9]
+    assert detect_prose_only_dependencies(body) is False
+
+
+def test_parse_blockers_heading_section_all_list_markers() -> None:
+    """Issue #1847: '-', '*', '+' and ordered 'N.' list markers each start an
+    item that contributes its leading issue reference."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Blocked by\n- #1\n* #2\n+ #3\n1. #4\n"
+    assert parse_blockers(body) == [1, 2, 3, 4]
+
+
+def test_parse_blockers_heading_section_bare_ref_line() -> None:
+    """Issue #1847: a bare line that is only an issue reference counts the
+    same way as a list item."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Blocked by\n#20\n"
+    assert parse_blockers(body) == [20]
+
+
+def test_parse_blockers_heading_section_inline_form_parses_normally() -> None:
+    """Issue #1847: inline forms inside a heading section parse exactly as
+    they do elsewhere, so a prose line carrying 'Depends on #N' contributes
+    and is not unreadable."""
+    from charlie_work.github import detect_prose_only_dependencies, parse_blockers
+
+    body = "## Blocked by\n- #1\nSome prose. Depends on #9.\n"
+    assert parse_blockers(body) == [1, 9]
+    assert detect_prose_only_dependencies(body) is False
+
+
+def test_parse_blockers_unreadable_section_item_flags_prose_only() -> None:
+    """Issue #1847: a blocker-section item that is neither a same-repo issue
+    reference nor a none-sentinel (a URL, an owner/repo reference, free
+    prose) makes detect_prose_only_dependencies return True so the issue is
+    parked for a human instead of silently freed."""
+    from charlie_work.github import detect_prose_only_dependencies, parse_blockers
+
+    body = "## Blocked by\n- https://github.com/other/repo/issues/7\n"
+    assert parse_blockers(body) == []
+    assert detect_prose_only_dependencies(body) is True
+
+    body = "## Blocked by\n- owner/repo#7\n"
+    assert parse_blockers(body) == []
+    assert detect_prose_only_dependencies(body) is True
+
+    body = "## Depends on\nSome free prose about dependencies.\n"
+    assert parse_blockers(body) == []
+    assert detect_prose_only_dependencies(body) is True
+
+
+def test_parse_blockers_parent_section_never_contributes() -> None:
+    """Issue #1847: a 'Parent' heading never opens a blocker section, so its
+    contents contribute nothing and are not unreadable."""
+    from charlie_work.github import detect_prose_only_dependencies, parse_blockers
+
+    body = "## Blocked by\n- #3\n\n## Parent\n#20\n"
+    assert parse_blockers(body) == [3]
+    assert detect_prose_only_dependencies(body) is False
+
+
+def test_parse_blockers_inline_colon_form() -> None:
+    """Issue #1847: the inline 'Blocked by' pattern accepts an optional colon
+    after 'by' (the shape Matt's GitHub fallback writes)."""
+    from charlie_work.github import parse_blockers
+
+    assert parse_blockers("Blocked by: #3, #4") == [3, 4]
+    assert parse_blockers("blocked by:#8") == [8]
+
+
+def test_parse_blockers_blockquoted_inline_ignored() -> None:
+    """Issue #1847: a line whose first non-space character is '>' is a quoted
+    reply and contributes no blockers, in any form."""
+    from charlie_work.github import parse_blockers
+
+    assert parse_blockers("> Blocked by #5") == []
+    assert parse_blockers("  > Depends on #6") == []
+    # A '>' later in the line is not a blockquote marker.
+    assert parse_blockers("see docs > blocked by #7") == [7]
+
+
+def test_parse_blockers_blockquote_lines_inside_section_contribute_nothing() -> None:
+    """Issue #1847: blockquoted items inside a blocker section are quoted
+    reply content — they contribute nothing and are not unreadable."""
+    from charlie_work.github import detect_prose_only_dependencies, parse_blockers
+
+    body = "## Blocked by\n- #1\n> - #2\n> #3\n"
+    assert parse_blockers(body) == [1]
+    assert detect_prose_only_dependencies(body) is False
+
+
+def test_parse_blockers_heading_section_inside_fenced_block_ignored() -> None:
+    """Issue #1847: a heading-form blocker section quoted inside a fenced
+    code block opens no section and contributes nothing."""
+    from charlie_work.github import detect_prose_only_dependencies, parse_blockers
+
+    body = "## Blocked by\n- #1\n```text\n## Blocked by\n- #5\n```\n"
+    assert parse_blockers(body) == [1]
+    assert detect_prose_only_dependencies(body) is False
+
+
+def test_parse_blockers_section_closed_by_next_heading() -> None:
+    """Issue #1847: a blocker section runs to the next heading, so items
+    after it are not parsed as section content."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Blocked by\n- #5\n\n## Notes\n- #6\n"
+    assert parse_blockers(body) == [5]
+
+
+def test_parse_blockers_section_closed_by_fenced_block() -> None:
+    """Issue #1847: a blocker section ends at the start of a fenced block;
+    items after the fence are outside the section."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Blocked by\n- #5\n```\n- #6\n```\n- #7\n"
+    assert parse_blockers(body) == [5]
+
+
+def test_parse_blockers_section_blank_line_does_not_close() -> None:
+    """Issue #1847: only the next heading or a fenced block closes a blocker
+    section — blank lines do not."""
+    from charlie_work.github import parse_blockers
+
+    body = "## Blocked by\n- #5\n\n- #6\n"
+    assert parse_blockers(body) == [5, 6]
+
+
+def test_parse_blockers_non_blocker_heading_does_not_open_section() -> None:
+    """Issue #1847: a heading whose text merely CONTAINS 'blocked by' (rather
+    than being exactly 'Blocked by'/'Depends on' plus an optional colon)
+    opens no section."""
+    from charlie_work.github import detect_prose_only_dependencies, parse_blockers
+
+    body = "## Blocked by\n- #2\n\n## Not blocked by anything\n- #5\n"
+    assert parse_blockers(body) == [2]
+    assert detect_prose_only_dependencies(body) is False
