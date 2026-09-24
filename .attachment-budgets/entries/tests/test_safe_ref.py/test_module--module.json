@@ -1,0 +1,8 @@
+{
+ "boundary": 41.0,
+ "bumps": [],
+ "file": "tests/test_safe_ref.py",
+ "identity": "tests/test_safe_ref.py::module",
+ "kind": "test_module",
+ "member_count": 44
+}

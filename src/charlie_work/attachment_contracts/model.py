@@ -110,7 +110,7 @@ class Bump:
 
 @dataclass(frozen=True)
 class BaselineEntry:
-    """One frozen saturated point in .attachment-budgets.json."""
+    """One frozen saturated point in the ``.attachment-budgets/`` store."""
 
     kind: Kind
     identity: str

@@ -7,7 +7,6 @@ import json
 from charlie_work.attachment_contracts.baseline import (
     KIND_STATS_KEY,
     TamperError,
-    check_tamper,
     compare,
     dumps,
     entries_of,
@@ -18,6 +17,7 @@ from charlie_work.attachment_contracts.baseline import (
     validate_bump,
     with_kind_stats,
 )
+from charlie_work.attachment_contracts.tamper import check_tamper
 from charlie_work.attachment_contracts.model import (
     AttachmentPoint,
     BaselineEntry,
