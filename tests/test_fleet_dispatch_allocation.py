@@ -18,7 +18,7 @@ from _fleet_dispatch_fixtures import (
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
 )
 from charlie_work import layout
-from charlie_work.doctor import _check_runner_allocation
+from charlie_work.doctor_allocation import _check_runner_allocation
 from charlie_work.config import (
     OrchestratorConfig,
     RunnerAllocationConfig,
