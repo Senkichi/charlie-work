@@ -11,7 +11,8 @@ import io
 import json
 from pathlib import Path
 
-from charlie_work.attachment_contracts.baseline import BASELINE_FILENAME, dump, generate
+from charlie_work.attachment_contracts import baseline_dir
+from charlie_work.attachment_contracts.baseline import BASELINE_DIRNAME, generate
 from charlie_work.attachment_contracts.excludes import load_excludes
 from charlie_work.attachment_contracts.archetypes import scan_tree
 from charlie_work.attachment_contracts.hook_entry import main
@@ -65,7 +66,7 @@ def _freeze_baseline_at(root: Path, big_member_count: int) -> None:
     kinds = sorted({p.kind for p in scan.points})
     verdicts = saturate_all(scan.points, kinds)
     document = generate(verdicts, generated_by="test", generated_at="t", floor=4)
-    dump(document, root / BASELINE_FILENAME)
+    baseline_dir.dump(document, root / BASELINE_DIRNAME)
 
 
 def _over_budget_repo(root: Path) -> Path:

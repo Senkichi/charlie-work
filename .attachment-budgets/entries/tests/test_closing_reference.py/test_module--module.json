@@ -1,0 +1,8 @@
+{
+ "boundary": 32.0,
+ "bumps": [],
+ "file": "tests/test_closing_reference.py",
+ "identity": "tests/test_closing_reference.py::module",
+ "kind": "test_module",
+ "member_count": 33
+}

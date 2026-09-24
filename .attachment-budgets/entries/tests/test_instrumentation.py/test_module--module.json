@@ -1,0 +1,8 @@
+{
+ "boundary": 32.0,
+ "bumps": [],
+ "file": "tests/test_instrumentation.py",
+ "identity": "tests/test_instrumentation.py::module",
+ "kind": "test_module",
+ "member_count": 34
+}

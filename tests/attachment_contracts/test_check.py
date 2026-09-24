@@ -8,12 +8,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from charlie_work.attachment_contracts import baseline_dir
 from charlie_work.attachment_contracts.baseline import (
+    BASELINE_DIRNAME,
     BASELINE_FILENAME,
-    dump,
     generate,
-    load,
 )
+from charlie_work.attachment_contracts.baseline import dump as dump_legacy
+from charlie_work.attachment_contracts.baseline import load as load_legacy
 from charlie_work.attachment_contracts.check import check_file, check_tree
 from charlie_work.attachment_contracts.excludes import load_excludes
 from charlie_work.attachment_contracts.archetypes import scan_tree
@@ -61,12 +63,32 @@ def _build_repo(root: Path, big_member_count: int = 20) -> None:
 
 
 def _freeze_baseline(root: Path) -> None:
+    """Write the current (issue #1839) per-entry directory layout."""
     excludes = load_excludes(root)
     scan = scan_tree(root, excludes)
     kinds = sorted({p.kind for p in scan.points})
     verdicts = saturate_all(scan.points, kinds)
     document = generate(verdicts, generated_by="test", generated_at="t", floor=4)
-    dump(document, root / BASELINE_FILENAME)
+    baseline_dir.dump(document, root / BASELINE_DIRNAME)
+
+
+def _freeze_baseline_legacy(root: Path) -> None:
+    """Write the pre-#1839 single-file layout -- the fallback readers must
+    still honor on checkouts that have not migrated."""
+    excludes = load_excludes(root)
+    scan = scan_tree(root, excludes)
+    kinds = sorted({p.kind for p in scan.points})
+    verdicts = saturate_all(scan.points, kinds)
+    document = generate(verdicts, generated_by="test", generated_at="t", floor=4)
+    dump_legacy(document, root / BASELINE_FILENAME)
+
+
+def _load_baseline(root: Path) -> dict:
+    return baseline_dir.load(root / BASELINE_DIRNAME)
+
+
+def _dump_baseline(document: dict, root: Path) -> None:
+    baseline_dir.dump(document, root / BASELINE_DIRNAME)
 
 
 def test_check_tree_clean_when_matching_baseline(tmp_path: Path) -> None:
@@ -176,9 +198,9 @@ def test_check_tree_tamper_detects_hand_raised_baseline(tmp_path: Path) -> None:
     _build_repo(tmp_path, big_member_count=20)
     _freeze_baseline(tmp_path)
 
-    document = load(tmp_path / BASELINE_FILENAME)
-    document["entries"][0]["member_count"] = 999  # hand-edit the JSON
-    dump(document, tmp_path / BASELINE_FILENAME)
+    document = _load_baseline(tmp_path)
+    document["entries"][0]["member_count"] = 999  # hand-edit the baseline
+    _dump_baseline(document, tmp_path)
 
     findings = check_tree(tmp_path)
 
@@ -237,7 +259,7 @@ def test_check_tree_frozen_fence_keeps_findings_stable_when_median_module_added(
     _freeze_baseline(tmp_path)
 
     # Sanity: the frozen baseline carries kind_stats and Big is the only entry.
-    document = load(tmp_path / BASELINE_FILENAME)
+    document = _load_baseline(tmp_path)
     assert "kind_stats" in document
     assert document["kind_stats"]["class"]["boundary"] == 17.0
     assert [e["identity"] for e in document["entries"]] == ["Big"]
@@ -271,9 +293,9 @@ def test_check_tree_live_fence_positive_control_when_kind_stats_absent(
     _freeze_baseline(tmp_path)
 
     # Strip kind_stats to simulate a pre-#1614 baseline (live fallback path).
-    document = load(tmp_path / BASELINE_FILENAME)
+    document = _load_baseline(tmp_path)
     document.pop("kind_stats", None)
-    dump(document, tmp_path / BASELINE_FILENAME)
+    _dump_baseline(document, tmp_path)
 
     # Add the same median module as the frozen-fence test.
     (tmp_path / "src" / "pkg" / "median.py").write_text(
@@ -306,16 +328,16 @@ def test_check_tree_flags_forged_kind_stats_with_bumped_generated_at(
 
     # The committed baseline at the base ref -- what CI hands check_tree via
     # ``check-tree --base-ref``.
-    previous_document = load(tmp_path / BASELINE_FILENAME)
+    previous_document = _load_baseline(tmp_path)
     assert previous_document["kind_stats"]["class"]["boundary"] == 17.0
 
     # Hand-forge the on-disk baseline: raise the frozen class boundary and
     # bump generated_at to impersonate a regen. No live recompute of this
     # tree produces these statistics.
-    forged = load(tmp_path / BASELINE_FILENAME)
+    forged = _load_baseline(tmp_path)
     forged["kind_stats"]["class"]["boundary"] = 1000.0
     forged["generated_at"] = "t-forged"
-    dump(forged, tmp_path / BASELINE_FILENAME)
+    _dump_baseline(forged, tmp_path)
 
     # Without a previous document the forgery is invisible by design (the
     # guard needs an independent reference point) -- the contrast proves the
@@ -327,7 +349,59 @@ def test_check_tree_flags_forged_kind_stats_with_bumped_generated_at(
 
     assert len(findings) == 1
     assert findings[0].severity == "error"
-    assert findings[0].file == BASELINE_FILENAME
+    # kind_stats lives in the directory layout's meta.json -- the finding
+    # points at the file where the tampered fence actually sits.
+    assert findings[0].file == ".attachment-budgets/meta.json"
     assert findings[0].identity == "kind_stats:class"
     assert "tamper" in findings[0].message
     assert "17.0" in findings[0].message and "1000.0" in findings[0].message
+
+
+# ---------------------------------------------------------------------------
+# Issue #1839: legacy single-file layout fallback
+# ---------------------------------------------------------------------------
+
+
+def test_check_tree_on_legacy_single_file_layout(tmp_path: Path) -> None:
+    """A pre-#1839 checkout (only `.attachment-budgets.json`, no directory)
+    must still enforce identically -- readers honor both layouts."""
+    _build_repo(tmp_path, big_member_count=20)
+    _freeze_baseline_legacy(tmp_path)
+    assert not (tmp_path / BASELINE_DIRNAME).exists()
+
+    assert check_tree(tmp_path) == []
+
+    (tmp_path / "src" / "pkg" / "big.py").write_text(_big_class_source(25), encoding="utf-8")
+    findings = check_tree(tmp_path)
+
+    block_findings = [f for f in findings if f.severity == "block"]
+    assert len(block_findings) == 1
+    assert block_findings[0].identity == "Big"
+
+
+def test_check_tree_legacy_tamper_still_detected(tmp_path: Path) -> None:
+    _build_repo(tmp_path, big_member_count=20)
+    _freeze_baseline_legacy(tmp_path)
+
+    document = load_legacy(tmp_path / BASELINE_FILENAME)
+    document["entries"][0]["member_count"] = 999
+    dump_legacy(document, tmp_path / BASELINE_FILENAME)
+
+    findings = check_tree(tmp_path)
+
+    tamper_findings = [f for f in findings if f.severity == "error" and "tamper" in f.message]
+    assert len(tamper_findings) == 1
+
+
+def test_check_tree_malformed_directory_baseline_is_error_finding(tmp_path: Path) -> None:
+    """A present-but-corrupt baseline directory is an error Finding, never a
+    crash -- same fail-closed contract the single file had."""
+    _build_repo(tmp_path, big_member_count=20)
+    _freeze_baseline(tmp_path)
+    (tmp_path / BASELINE_DIRNAME / "meta.json").write_text("not json {{{", encoding="utf-8")
+
+    findings = check_tree(tmp_path)
+
+    error_findings = [f for f in findings if f.severity == "error" and "tamper" in f.message]
+    assert len(error_findings) == 1
+    assert error_findings[0].file == BASELINE_DIRNAME
