@@ -115,7 +115,7 @@ predictable.
 | `charlie bash-rats` | run one pass of intake → work → review → merge |
 | `charlie mop-up` | detect (and with `--fix`, repair) label/state drift |
 | `charlie doctor` | preflight diagnostics (env, labels, CI-check names, config, adapter) |
-| `charlie bootstrap-labels` | create the nine `agent:*` / `automated-ready` labels once |
+| `charlie bootstrap-labels` | create the `agent:*` and `automated-ready` labels once |
 | `charlie fleet status` | aggregate `roll-call` across every registered repo |
 | `charlie fleet work` | dispatch-only wave across all (or `--repos`-selected) registered repos, under one global concurrency budget |
 | `charlie fleet bash-rats` | full intake→work→review→merge pass across all registered repos, under one global budget |
