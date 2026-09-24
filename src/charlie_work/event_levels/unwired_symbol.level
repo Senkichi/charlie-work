@@ -1,0 +1,6 @@
+warning
+# Issue #1261: the unwired-symbol static probe (W20 item 1) flagged a
+# new public function/method/class referenced only from tests/ and
+# nowhere in src/. Warning, not error: same posture as
+# coverage_probe_flagged above -- advisory-only, never blocking, and
+# the substrate for the same 2-week false-positive measurement window.

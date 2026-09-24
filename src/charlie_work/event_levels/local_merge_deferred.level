@@ -1,0 +1,5 @@
+info
+# Issue #1844: the base checkout could not accept the merge this pass
+# (e.g. local uncommitted changes on a path the merge touches). The
+# record stays ``approved`` and the lane retries next pass; this event
+# is the audit trail of the deferral.

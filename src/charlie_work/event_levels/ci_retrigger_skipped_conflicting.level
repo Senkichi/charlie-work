@@ -1,0 +1,7 @@
+info
+# Issue #1451: the ci_run_never_created remediation declined to
+# close/reopen a CONFLICTING PR (GitHub cannot build refs/pull/N/merge
+# while conflicted, so no pull_request workflow run can be created for
+# ANY event) and routed to the existing merge-conflict rework path
+# instead. Info, not warning: this is the chooser correctly
+# discriminating, mirroring ci_retriggered_stale_checks' level.

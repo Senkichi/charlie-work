@@ -1,0 +1,4 @@
+info
+# Issue #1844: the merge-gate suite run failed; the local record routes
+# to rework. Separate from ``local_suite_result`` so the failure kind is
+# countable without parsing payloads.

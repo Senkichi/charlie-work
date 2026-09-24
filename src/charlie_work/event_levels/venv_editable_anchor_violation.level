@@ -1,0 +1,5 @@
+error
+# The supervisor's startup guard found an editable .pth in the running
+# interpreter's venv pointing outside the interpreter-derived checkout
+# (the 2026-08-05 scratch-clone repoint shape). The pass is refused
+# before config load, so this is terminal for the pass -> error.
