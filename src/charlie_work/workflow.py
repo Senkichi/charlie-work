@@ -6411,38 +6411,14 @@ class OrchestratorApp:
         # re-enabled (the reap is what makes it re-dispatchable). Before this
         # fix these sweeps sat below the ``enabled`` early return and were
         # unreachable whenever dispatch was disabled.
-        verdict_result = {"recorded": [], "missed": []}
-        reconciled_verdicts: list[dict[str, Any]] = []
-        if not self.dry_run:
-            verdict_result = self._reap_review_verdicts(reviews_dir)
-            # Issue #736: ingest completed on-disk verdicts that were never
-            # recorded into state. This runs BEFORE the stale-claim sweep so
-            # the sweep's ``decision_already_recorded`` skip (issue #734)
-            # never fires for a PR this reconciliation just ingested -- after
-            # ``record_review`` the PR's ``review_dispatch_status`` is
-            # ``review_dispatch_completed`` and the stale-claim branch (which
-            # only matches ``review_dispatch_status is None``) no longer
-            # applies. Like the other sweeps here, this runs ahead of the
-            # ``review_dispatch.enabled`` gate (issue #868) so a stranded
-            # verdict is ingested even when dispatch is disabled fleet-wide.
-            reconciled_verdicts = self._reconcile_stranded_verdicts()
-            _detect_and_handle_stalled_reviews(
-                reviews_dir,
-                self.paths.state_file,
-                self.config,
-                self.repo_root,
-                write_gate=self.write_gate,
-                now=resolved_now,
-            )
-            _reap_completed_review_checkouts(self.repo_root, reviews_dir, self.paths.state_file)
-            _reap_orphaned_review_checkouts(
-                self.gh,
-                self.repo_root,
-                reviews_dir,
-                self.paths.state_file,
-                self.config,
-                write_gate=self.write_gate,
-            )
+        #
+        # The block itself lives in ``_run_review_reap_sweeps`` so the
+        # standalone ``reap-reviews`` operator command (issue #1874) runs the
+        # identical sweep set — same five sweeps, same order — without
+        # duplicating the sequence here.
+        sweep_result = self._run_review_reap_sweeps(resolved_now)
+        verdict_result = sweep_result["verdict_result"]
+        reconciled_verdicts = sweep_result["reconciled_verdicts"]
         recorded_verdicts = verdict_result.get("recorded", [])
         missed_verdicts = verdict_result.get("missed", [])
 
@@ -7904,7 +7880,27 @@ class OrchestratorApp:
                 # deferral gate below); only the write is skipped. See the
                 # merge-train exclusion in _merge_train_candidates for the
                 # sibling half of this fix.
-                already_in_mergequeue = existing_pr_state.get("status") == "mergequeue"
+                #
+                # Issue #1873: the deferral is void the moment the queue
+                # label is gone. mergequeue_label_reverted means the label
+                # was stripped after the handoff (Aviator's #823 silent
+                # rejection, or reconcile's own #1402 revocation) — the PR
+                # is no longer in Aviator's queue, so there is no second
+                # writer to race — yet the persisted status still says
+                # "mergequeue". Skipping the sync in that state deadlocked:
+                # the stale-base early return below fired every pass before
+                # the mergequeue_handoff_failed recovery could run, while
+                # this skip was the only thing that could make the base
+                # current (swole PR #321 looped merge_deferred_stale_base
+                # 23+ passes until an operator ran gh pr update-branch by
+                # hand). Treat the handoff as void for this pass so
+                # charlie's own sync runs; the revert is still detected
+                # cross-pass and accounted for by the handoff-failure path
+                # below.
+                already_in_mergequeue = (
+                    existing_pr_state.get("status") == "mergequeue"
+                    and not mergequeue_label_reverted
+                )
                 if not already_in_mergequeue and self._should_update_pr_branch(pr, base_current):
                     if self.gh.pr_update_branch(pr_number):
                         new_head = self._verify_synced_head(pr_number, live_head_sha)
