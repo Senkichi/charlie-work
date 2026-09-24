@@ -74,6 +74,124 @@ def test_check_recent_lane_failures_silent_when_no_events(tmp_path: Path) -> Non
     assert "recent lane failures" not in by_name
 
 
+def test_check_cross_repo_escalations_surfaces_found_in_repo(tmp_path: Path) -> None:
+    """Issue #1789: dispatch_cross_repo_escalated events recorded to this
+    repo's events.db surface as a doctor finding aggregated by the payload's
+    ``found_in_repo`` field -- the sibling repo a missing candidate was
+    positively matched under.
+
+    Severity is a warning, not a hard error (mirrors "recent lane failures"):
+    the escalation already happened and may since be triaged -- it must not
+    by itself flip run_doctor()'s overall ok to False.
+    """
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    # Fixture names must not be gated private slugs (a gated slug here trips
+    # the private-slug ratchet gate for zero coverage gain); the check
+    # aggregates the raw found_in_repo string, so any distinct names work.
+    for issue_number, found_in_repo in (
+        (101, "fleet_sibling"),
+        (102, "fleet_sibling"),
+        (103, "swole"),
+    ):
+        log_event(
+            paths.state_file,
+            "dispatch_cross_repo_escalated",
+            {
+                "issue_number": issue_number,
+                "reason": (
+                    "cross_repo_target: a referenced file path is absent from "
+                    "the target repo but found under exactly one other "
+                    f"managed fleet repo ({found_in_repo!r})"
+                ),
+                "neutral_paths": [],
+                "missing_paths": ["src/some/file.py"],
+                "found_in_repo": found_in_repo,
+            },
+        )
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {c.name: c for c in checks}
+    check = by_name["cross-repo escalations"]
+    assert check.ok is False
+    assert check.severity == "warning"
+    assert "3 dispatch_cross_repo_escalated event(s)" in check.detail
+    assert "fleet_sibling (2)" in check.detail
+    assert "swole (1)" in check.detail
+    assert "unattributed" not in check.detail
+    # A warning-severity finding must not by itself block the overall result.
+    assert ok is True
+
+
+def test_check_cross_repo_escalations_buckets_unattributed_by_reason(
+    tmp_path: Path,
+) -> None:
+    """Issue #1789: escalations whose payload has no ``found_in_repo`` -- a
+    ``cross_repo_scope`` title-prefix escalation or a confirmed foreign
+    absolute path, both None by construction -- land in an unattributed
+    bucket keyed on the ``reason`` prefix, not silently dropped."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    log_event(
+        paths.state_file,
+        "dispatch_cross_repo_escalated",
+        {
+            "issue_number": 104,
+            "reason": (
+                "cross_repo_scope: issue title starts with 'other-repo': -- "
+                "the issue's deliverables target other-repo"
+            ),
+            "neutral_paths": [],
+            "missing_paths": [],
+            "found_in_repo": None,
+        },
+    )
+    log_event(
+        paths.state_file,
+        "dispatch_cross_repo_escalated",
+        {
+            "issue_number": 105,
+            "reason": (
+                "cross_repo_target: 'C:\\\\elsewhere\\\\foo.py' is an absolute "
+                "path outside the target repo and exists on disk"
+            ),
+            "neutral_paths": [],
+            "missing_paths": ["C:\\elsewhere\\foo.py"],
+            "found_in_repo": None,
+        },
+    )
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {c.name: c for c in checks}
+    check = by_name["cross-repo escalations"]
+    assert check.ok is False
+    assert check.severity == "warning"
+    assert "2 dispatch_cross_repo_escalated event(s)" in check.detail
+    assert "pointing at:" not in check.detail
+    assert "cross_repo_scope (1)" in check.detail
+    assert "cross_repo_target (1)" in check.detail
+    assert ok is True
+
+
+def test_check_cross_repo_escalations_silent_when_no_events(tmp_path: Path) -> None:
+    """No dispatch_cross_repo_escalated events -> no "cross-repo escalations"
+    finding at all, so a healthy repo's doctor output stays unchanged."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    _, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {c.name: c for c in checks}
+    assert "cross-repo escalations" not in by_name
+
+
 def test_doctor_surfaces_in_progress_corroboration_alive_but_polling(
     tmp_path: Path, monkeypatch
 ) -> None:
