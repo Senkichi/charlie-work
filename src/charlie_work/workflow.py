@@ -7880,7 +7880,27 @@ class OrchestratorApp:
                 # deferral gate below); only the write is skipped. See the
                 # merge-train exclusion in _merge_train_candidates for the
                 # sibling half of this fix.
-                already_in_mergequeue = existing_pr_state.get("status") == "mergequeue"
+                #
+                # Issue #1873: the deferral is void the moment the queue
+                # label is gone. mergequeue_label_reverted means the label
+                # was stripped after the handoff (Aviator's #823 silent
+                # rejection, or reconcile's own #1402 revocation) — the PR
+                # is no longer in Aviator's queue, so there is no second
+                # writer to race — yet the persisted status still says
+                # "mergequeue". Skipping the sync in that state deadlocked:
+                # the stale-base early return below fired every pass before
+                # the mergequeue_handoff_failed recovery could run, while
+                # this skip was the only thing that could make the base
+                # current (swole PR #321 looped merge_deferred_stale_base
+                # 23+ passes until an operator ran gh pr update-branch by
+                # hand). Treat the handoff as void for this pass so
+                # charlie's own sync runs; the revert is still detected
+                # cross-pass and accounted for by the handoff-failure path
+                # below.
+                already_in_mergequeue = (
+                    existing_pr_state.get("status") == "mergequeue"
+                    and not mergequeue_label_reverted
+                )
                 if not already_in_mergequeue and self._should_update_pr_branch(pr, base_current):
                     if self.gh.pr_update_branch(pr_number):
                         new_head = self._verify_synced_head(pr_number, live_head_sha)
