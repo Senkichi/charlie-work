@@ -1,0 +1,6 @@
+error
+# Issue #1243: the orphan-sweep no-open-PR redispatch path hit the
+# same per-issue cap the rework lane enforces (worker_death_loop)
+# with an unchanged branch head across attempts -- a death loop with
+# no progress and no bound. Terminal for the issue -> error, parallel
+# to session_failed_escalated.

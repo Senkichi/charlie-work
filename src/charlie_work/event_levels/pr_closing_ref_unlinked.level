@@ -1,0 +1,7 @@
+warning
+# cw#1263: after ``gh pr create`` succeeded, GitHub's own
+# ``closingIssuesReferences`` resolution did not include the
+# intended issue -- the PR was created but will not auto-close it on
+# merge. Warning, not error: the PR still exists and is still
+# actionable, but the issue's lifecycle labels will not flip
+# automatically without a human or a later reconcile pass noticing.

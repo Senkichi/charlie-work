@@ -1,0 +1,11 @@
+warning
+# Issue #1768 (replaces the #1314 item 3 "operator_queue_depth"
+# gauge). Warning, not error: an operator-queue impact signal is a
+# growing backlog of mechanical/judgment escalations blocking
+# automated-ready work, not a fault that ended a lane or lost work.
+# Edge-triggered (fires only on a root-set change, an
+# impact-vs-threshold crossing, or a bounded low-rate reminder --
+# never unconditionally every pass), so it is deliberately NOT in
+# ``EXPECTED_OPERATIONAL_KINDS``: that bucket exists for kinds that
+# routinely dominate warning volume, which this signal is designed
+# not to do.
