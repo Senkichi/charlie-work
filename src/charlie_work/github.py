@@ -1036,6 +1036,14 @@ _BLOCKER_HEADING_TEXT_RE = re.compile(
 _LIST_ITEM_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+\.)[ \t]+(.*)$")
 # An item or bare line that declares "no blockers" ("None", "n/a").
 _NONE_SENTINEL_RE = re.compile(r"(?:none|n/a)\b", flags=re.IGNORECASE)
+# A leading run of same-repo issue refs joined by ',' or 'and' separators
+# ("#12, #13", "#12 and #13", "#12, #13, and #14"). A ref followed by
+# non-separator prose ends the run ("#14 after #9 lands" -> "#14"), so
+# trailing annotation text in an item is ignored rather than misparsed.
+_BLOCKER_ITEM_REF_RUN_RE = re.compile(
+    r"#\d+(?:[ \t]*(?:,[ \t]*(?:and[ \t]+)?|and[ \t]+)#\d+)*",
+    flags=re.IGNORECASE,
+)
 
 
 def _inside_code_span(text: str, start: int, end: int) -> bool:
@@ -1183,10 +1191,13 @@ def _scan_blocker_sections(text: str) -> tuple[list[int], bool]:
     level whose text is "Blocked by" or "Depends on" (case-insensitive, a
     space or hyphen between the words, optional trailing colon) opens a
     section that runs to the next heading or the start of a fenced code
-    block. Inside it, each list item contributes the issue reference it
-    starts with (the item's later references are ignored, not fatal — the
+    block. Inside it, each list item contributes the leading run of issue
+    references it starts with — refs joined by ``,`` or ``and`` separators
+    all count ("- #12, #13" -> [12, 13]), while refs after non-separator
+    prose are ignored, not fatal ("- #14 after #9 lands" -> [14]; the
     foreign-issue-ref guard that voids an inline clause does not apply per
-    item), and a line that is only an issue reference counts the same way.
+    item). A line that is only a run of issue references counts the same
+    way.
     An item or line starting with "None"/"n/a" contributes nothing, and a
     ``Parent`` section never opens here so it never contributes. Inline
     forms inside the section are left to the caller's normal inline scan —
@@ -1228,11 +1239,13 @@ def _scan_blocker_sections(text: str) -> tuple[list[int], bool]:
         candidate = item.group(1).strip() if item is not None else line.strip()
         if not candidate:
             continue
-        ref = _ISSUE_REF.match(candidate)
-        if ref is not None and (item is not None or ref.end() == len(candidate)):
-            # A list item contributes the reference it starts with; a bare
-            # (non-list) line counts only when it IS just a reference.
-            refs.append(int(ref.group(0)[1:]))
+        ref_run = _BLOCKER_ITEM_REF_RUN_RE.match(candidate)
+        if ref_run is not None and (item is not None or ref_run.end() == len(candidate)):
+            # A list item contributes its leading run of references —
+            # every ','/'and'-joined ref counts, so '- #12, #13' yields
+            # both rather than silently dropping #13. A bare (non-list)
+            # line counts only when it IS just a run of references.
+            refs.extend(int(m.group(0)[1:]) for m in _ISSUE_REF.finditer(ref_run.group(0)))
             continue
         if _NONE_SENTINEL_RE.match(candidate) or any(
             p.search(candidate) for p in _BLOCKER_PATTERNS
@@ -1250,7 +1263,9 @@ def parse_blockers(text: str) -> list[int]:
     - "Depends on #N"
     - "Blocked-by: #N"
     - a "Blocked by"/"Depends on" Markdown heading section whose list items
-      each start with ``#N`` (issue #1847; see :func:`_scan_blocker_sections`)
+      each start with ``#N`` — a leading run of ``,``/``and``-separated refs
+      all count ("- #12, #13" -> [12, 13]) — (issue #1847; see
+      :func:`_scan_blocker_sections`)
 
     Handles comma-separated lists (e.g., "Blocked by #743, #744").
 

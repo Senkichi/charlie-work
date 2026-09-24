@@ -139,11 +139,12 @@ Add any of these patterns to your issue body to declare blockers:
 - `Blocked-by: #N` — case-insensitive, supports comma-separated lists
 - A **`Blocked by`** or **`Depends on`** heading section — a Markdown heading
   of any level (`#`–`######`, optional trailing colon) followed by a list
-  whose items each start with `#N`. The section runs to the next heading or
-  fenced code block. An item or line starting with `None`/`n/a` declares no
-  blockers; an item the parser cannot read (a URL, an `owner/repo`
-  reference, free prose) flags the issue for human review rather than being
-  silently ignored.
+  whose items each start with `#N`. An item may lead with several refs joined
+  by `,` or `and` (`- #123, #124` counts both); refs after other prose in the
+  item are ignored. The section runs to the next heading or fenced code
+  block. An item or line starting with `None`/`n/a` declares no blockers; an
+  item the parser cannot read (a URL, an `owner/repo` reference, free prose)
+  flags the issue for human review rather than being silently ignored.
 
 Examples:
 ```

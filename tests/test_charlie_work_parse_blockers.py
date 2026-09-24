@@ -250,6 +250,28 @@ def test_parse_blockers_heading_section_list_items() -> None:
     assert parse_blockers(body) == [12, 14]
 
 
+def test_parse_blockers_heading_section_multi_ref_item() -> None:
+    """Issue #1847 rework round 1: a list item that leads with several issue
+    refs joined by ',' or 'and' contributes ALL of them. Keeping only the
+    first silently drops the rest — the issue is freed while those blockers
+    are still open, and the prose-only park never sees it (the remaining
+    refs made the item readable, so it was never flagged unreadable)."""
+    from charlie_work.github import detect_prose_only_dependencies, parse_blockers
+
+    assert parse_blockers("## Blocked by\n- #12, #13\n") == [12, 13]
+    assert parse_blockers("## Blocked by\n- #12 and #13\n") == [12, 13]
+    assert parse_blockers("## Blocked by\n- #12, #13, and #14\n") == [12, 13, 14]
+    # A leading run may still carry annotation prose after it.
+    assert parse_blockers("## Blocked by\n- #12, #13 (schema migrations)\n") == [12, 13]
+    # A bare line that is only a run of references counts the same way.
+    assert parse_blockers("## Blocked by\n#20, #21\n") == [20, 21]
+    # A ref after non-separator prose is annotation, not a list member —
+    # '- #14 after #9 lands' still yields 14 only.
+    assert parse_blockers("## Blocked by\n- #14 after #9 lands\n") == [14]
+    # A multi-ref item is readable: no prose-only park.
+    assert detect_prose_only_dependencies("## Blocked by\n- #12, #13\n") is False
+
+
 def test_parse_blockers_heading_section_level_3_with_colon() -> None:
     """Issue #1847: a level-3 'Depends on:' heading (optional trailing colon)
     opens a blocker section."""
