@@ -487,3 +487,55 @@ def test_live_pid_without_outcome_file_does_not_finalize(tmp_path: Path) -> None
     assert "pr_number" not in entry
     assert fake_gh.prs_created == []
     assert state.get("events", []) == []
+
+
+def test_live_pid_no_stale_outcome_never_calls_pr_list(tmp_path: Path) -> None:
+    """Round-2 review: the common case for an active fleet -- every
+    dispatched worker's PID alive, none with a stale/handoff-confirmed
+    outcome file -- must not pay for ``gh.pr_list()`` (network) or the
+    ``state_lock`` below it. Relaxing the early return to cover "any live
+    PID" instead of "an actual finalize candidate" would make both fire on
+    nearly every pass of an active fleet.
+    """
+    from charlie_work.paths import resolved_layout, runtime_paths
+    from charlie_work.state import load_state
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+    from charlie_work.worktree import worktree_path_for_branch
+
+    config = _config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    branch = "agent/issue-1867-live-worker-still-working"
+    repo_root = _make_repo_with_pushed_branch(tmp_path, branch)
+    _seed_dispatched_issue(paths, issue_number=1867, branch=branch)
+
+    # Worktree exists (worker is running in it) but no outcome file at all --
+    # the overwhelmingly common case: a live worker still mid-task.
+    worktrees_dir = resolved_layout(config, repo_root).worktrees
+    worktree_path_for_branch(repo_root, branch, worktrees_dir).mkdir(parents=True)
+
+    fake_gh = _fake_gh(
+        repo_root,
+        issue_number=1867,
+        in_progress=config.labels.in_progress,
+        pr_create_return=9001,
+    )
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch.object(fake_gh, "pr_list", wraps=fake_gh.pr_list) as pr_list_spy,
+        patch("charlie_work.workflow._worker_pid_alive", return_value=True),
+    ):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+
+    pr_list_spy.assert_not_called()
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1867"]
+    assert entry.get("status") == "dispatched"
+    assert "pr_number" not in entry
+    assert fake_gh.prs_created == []
+    assert state.get("events", []) == []

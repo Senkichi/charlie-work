@@ -27,7 +27,6 @@ from .checks import (
     summarize_checks,
 )
 from .config import (
-    WORKER_OUTCOME_FILENAME,
     ApiWorkerConfig,
     AutoMergeConfig,
     OrchestratorConfig,
@@ -464,6 +463,11 @@ from .dead_worker_reap import (  # noqa: F401  (deliberate re-export)
     _attempt_salvage,
     _open_pr_for_orphaned_branch,
     _issues_with_live_workers,
+)
+from .live_handoff_finalize import (
+    collect_stale_live_handoff_pids,
+    finalize_live_handoff_candidates,
+    resolve_live_handoff_candidates,
 )
 
 
@@ -1679,21 +1683,8 @@ def _detect_and_handle_orphaned_workers(
     reclaim, or the orphan drift diagnostics -- all of which are keyed off
     state.json PID records, not log mtimes.
 
-    Issue #1867: a live PID is not itself proof of in-flight work. A worker
-    that pushed its branch and wrote a complete ``.worker-outcome.json``
-    (``push_succeeded: true`` / ``pr_created: false``) has finished the
-    handoff contract -- the file's own instruction is "then stop", so a
-    still-running PID at that point is a process that hung on exit, not a
-    worker still doing work. When the outcome file is older than
-    ``watchdog.worker_outcome_finalize_minutes``, the live-handoff lane below
-    opens the PR from the worker's drafted title/body through the same
-    ``_open_pr_for_orphaned_branch`` used for the dead-PID case, without
-    waiting for the PID to exit (the swole #163 incident: a completed worker
-    left its PR unopened ~2h because every finalize path keyed off PID
-    death). Only the PR-open action runs for a live PID -- none of the
-    dead-PID lanes (label reclaim, escalation, redispatch cap, drift) apply
-    to a process that has not exited; the stall watchdog remains responsible
-    for reaping the hung process itself on its own cadence.
+    Issue #1867: a live PID alone is not proof of in-flight work -- see
+    ``live_handoff_finalize.py`` for the PID-independent finalize lane.
     """
     write_gate = require_write_gate(write_gate)
 
@@ -1705,11 +1696,7 @@ def _detect_and_handle_orphaned_workers(
         state = load_state(state_file)
 
     orphaned_issues: list[int] = []
-    # Issue #1867: dispatched entries whose recorded worker PID is still
-    # alive. Kept separate from ``orphaned_issues`` on purpose: every lane
-    # below except the live-handoff finalize assumes the process is dead,
-    # and mixing live entries in would let the label-reclaim/redispatch-cap/
-    # drift lanes act on a running worker.
+    # Issue #1867: live-PID entries (every other lane assumes dead).
     live_pid_entries: dict[int, dict[str, Any]] = {}
     for issue_number_str, entry in state.get("issues", {}).items():
         if not isinstance(entry, dict):
@@ -1722,7 +1709,24 @@ def _detect_and_handle_orphaned_workers(
         else:
             orphaned_issues.append(int(issue_number_str))
 
-    if not orphaned_issues and not live_pid_entries:
+    # Issue #935/#1453: computed once, before any pre-lock loop.
+    now = datetime.now(UTC)
+    repo_root = getattr(gh, "repo_root", None)
+    worktrees_dir = None
+    if repo_root is not None:
+        worktrees_dir = resolved_layout(config, repo_root).worktrees
+
+    # Issue #1867 (round-2): filesystem-only, so the return below still
+    # skips gh.pr_list()/state_lock when nothing needs finalizing.
+    stale_live_handoff_pids = collect_stale_live_handoff_pids(
+        live_pid_entries,
+        worker_outcome_finalize_minutes=config.watchdog.worker_outcome_finalize_minutes,
+        repo_root=repo_root,
+        worktrees_dir=worktrees_dir,
+        now=now,
+    )
+
+    if not orphaned_issues and not stale_live_handoff_pids:
         return
 
     # Fetch PRs once before acquiring the lock (avoid network I/O under lock)
@@ -1782,15 +1786,8 @@ def _detect_and_handle_orphaned_workers(
     # fire before reclaim adds ``automated-ready``.  Reused by the second
     # loop (pushed-branch candidates) without re-reading.
     worker_outcomes: dict[int, dict[str, Any] | None] = {}
+    # Also used below by the live-handoff lane; populated at most once.
     issues_by_number: dict[int, dict[str, Any]] = {}
-    # Issue #935 / #1453: compute repo_root and worktrees_dir once, before any
-    # of the pre-lock loops, so the first loop (reclaim/escalation) can read
-    # worker outcomes for the blocked-outcome check and the second loop
-    # (pushed-branch candidates) can reuse the same pre-computed outcomes.
-    repo_root = getattr(gh, "repo_root", None)
-    worktrees_dir = None
-    if repo_root is not None:
-        worktrees_dir = resolved_layout(config, repo_root).worktrees
 
     if no_pr_orphans:
         for issue in gh.issue_list(state="open"):
@@ -2204,75 +2201,14 @@ def _detect_and_handle_orphaned_workers(
                 "active_labels": active_labels,
             }
 
-    # Issue #1867: PID-independent finalize candidates -- dispatched issues
-    # whose recorded worker PID is still alive but whose worktree carries a
-    # completed ``.worker-outcome.json`` handoff that has gone stale. The
-    # outcome file's mtime -- not ``last_activity_at`` -- is the staleness
-    # trigger: writing the file IS the handoff declaration (the contract's
-    # last step is "then stop"), and a hung process can keep emitting
-    # incidental log/worktree noise that would mask a settled declaration.
-    # Detection runs pre-lock because it touches the filesystem; the actual
-    # ``gh pr create`` happens in the in-lock sweep below through the same
-    # ``_open_pr_for_orphaned_branch`` the dead-PID lane uses.
-    live_handoff_candidates: dict[int, dict[str, Any]] = {}
-    if (
-        live_pid_entries
-        and config.watchdog.worker_outcome_finalize_minutes > 0
-        and repo_root is not None
-        and worktrees_dir is not None
-    ):
-        # Outcome checks first: pure filesystem work with no GitHub cost, and
-        # the overwhelmingly common case (a live worker still mid-task) has
-        # no outcome file at all -- so ``issue_list`` is only fetched when at
-        # least one outcome-declared candidate survives.
-        declared: dict[int, dict[str, Any]] = {}
-        for issue_number, live_entry in live_pid_entries.items():
-            if issue_number in pr_by_issue:
-                # A PR already exists (opened by an earlier pass, a sibling
-                # orchestrator, or a human) -- never open a duplicate.
-                continue
-            branch = live_entry.get("branch_name")
-            if not branch:
-                continue
-            worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
-            try:
-                outcome_age = now - datetime.fromtimestamp(
-                    (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
-                )
-            except OSError:
-                continue
-            if outcome_age <= timedelta(minutes=config.watchdog.worker_outcome_finalize_minutes):
-                continue
-            worker_outcome = read_worker_outcome(worktree_path)
-            if not (
-                isinstance(worker_outcome, dict)
-                and worker_outcome.get("push_succeeded") is True
-                and worker_outcome.get("pr_created") is False
-            ):
-                continue
-            declared[issue_number] = {
-                "branch": branch,
-                "worktree_path": worktree_path,
-                "worker_outcome": worker_outcome,
-                "worker_pid": live_entry.get("worker_pid"),
-                "outcome_age_minutes": outcome_age.total_seconds() / 60,
-            }
-        if declared:
-            if not issues_by_number:
-                for issue in gh.issue_list(state="open"):
-                    number = issue.get("number")
-                    if number is not None:
-                        issues_by_number[int(number)] = issue
-            for issue_number, candidate in declared.items():
-                issue = issues_by_number.get(issue_number)
-                if issue is None:
-                    # Issue closed or inaccessible -- never open a PR for it.
-                    continue
-                issue_labels = label_names(issue)
-                candidate["issue"] = issue
-                candidate["issue_labels"] = issue_labels
-                candidate["active_labels"] = issue_labels & config.labels.active
-                live_handoff_candidates[issue_number] = candidate
+    # Issue #1867: resolve against the now-fetched ``pr_by_issue``.
+    live_handoff_candidates = resolve_live_handoff_candidates(
+        stale_live_handoff_pids,
+        pr_by_issue=pr_by_issue,
+        issues_by_number=issues_by_number,
+        gh=gh,
+        config=config,
+    )
 
     # Handle orphaned workers. Head-advanced request_changes findings are
     # collected and routed to the review lane outside the state lock (review()
@@ -3201,101 +3137,18 @@ def _detect_and_handle_orphaned_workers(
 
             state["issues"][str(issue_number)] = entry
 
-        # Issue #1867: finalize completed handoffs whose recorded worker PID
-        # is still alive (the swole #163 zombie-on-exit pattern). Only the
-        # PR-open action runs here -- none of the dead-PID lanes above
-        # (label reclaim, escalation, redispatch cap, drift) apply to a
-        # process that has not exited, and the stall watchdog remains
-        # responsible for reaping the hung process on its own cadence.
-        for issue_number in live_handoff_candidates:
-            entry = state["issues"].get(str(issue_number), {})
-            if not isinstance(entry, dict):
-                continue
-            # Re-verify status (state may have changed between lock windows).
-            if entry.get("status") != "dispatched":
-                continue
-            # A PR may have appeared between the pre-lock snapshot and this
-            # lock -- never open a duplicate.
-            if issue_number in pr_by_issue:
-                continue
-            candidate = live_handoff_candidates[issue_number]
-            # ``repo_root`` comes from ``getattr(gh, "repo_root", None)`` and
-            # is not statically typed; narrow to ``Path | None`` before the
-            # salvage helper (``None`` is an error value it already handles).
-            salvage_repo_root = repo_root if isinstance(repo_root, Path) else None
-            pr_number, pr_error, _closing_ref = _open_pr_for_orphaned_branch(
-                gh=gh,
-                config=config,
-                repo_root=salvage_repo_root,
-                branch=candidate["branch"],
-                base_ref=config.dispatch.base_ref,
-                issue_number=issue_number,
-                active_labels=candidate["active_labels"],
-                issue_labels=candidate["issue_labels"],
-                issue_title=(candidate["issue"] or {}).get("title"),
-                state_file=state_file,
-                worker_outcome=candidate["worker_outcome"],
-            )
-            if pr_number is not None:
-                entry["status"] = PASSIVE_OPEN_STATUS
-                entry["pr_number"] = pr_number
-                # Same honest-handoff kind as the dead-PID lane's confirmed-
-                # outcome case; the payload additionally records that the
-                # worker PID was still running at finalize time (the "log
-                # line noting the PID was still running" the issue asks
-                # for), plus the outcome-file age that tripped the
-                # finalize threshold.
-                sweep_events.append(
-                    (
-                        "worker_handoff_pr_opened",
-                        {
-                            "issue_number": issue_number,
-                            "pr_number": pr_number,
-                            "branch_name": candidate["branch"],
-                            "worker_reported": True,
-                            "previous_status": "dispatched",
-                            "reason": "worker_outcome_stale_live_pid",
-                            "worker_pid": candidate["worker_pid"],
-                            "worker_pid_still_running": True,
-                            "outcome_age_minutes": round(candidate["outcome_age_minutes"], 1),
-                            "label_write_ok": pr_error is None,
-                            "pr_error": pr_error,
-                        },
-                    )
-                )
-                state["issues"][str(issue_number)] = entry
-                continue
-
-            # PR creation failed after the bounded retry -- the branch is
-            # pushed and stranded. Same fingerprinted-drift pattern as the
-            # dead-PID lane: emit the drift event once per unchanged finding
-            # while the next pass re-attempts the create itself.
-            fingerprint = _drift_fingerprint(
-                reason="live_worker_handoff_pr_create_failed",
-                branch_name=candidate["branch"],
-                error=pr_error or "unknown",
-            )
-            if entry.get("orphan_drift_fingerprint") == fingerprint:
-                state["issues"][str(issue_number)] = entry
-                continue
-            entry["orphan_drift_fingerprint"] = fingerprint
-            entry["orphan_drift_at"] = utc_now()
-            sweep_events.append(
-                (
-                    "pr_create_failed_branch_stranded",
-                    {
-                        "issue_number": issue_number,
-                        "branch_name": candidate["branch"],
-                        "previous_status": "dispatched",
-                        "reason": "live_worker_handoff_pr_create_failed",
-                        "pr_create_error": pr_error,
-                        "worker_reported": True,
-                        "worker_pid": candidate["worker_pid"],
-                        "worker_pid_still_running": True,
-                    },
-                )
-            )
-            state["issues"][str(issue_number)] = entry
+        # Issue #1867: finalize live-PID handoffs; mutates state/sweep_events.
+        finalize_live_handoff_candidates(
+            gh=gh,
+            config=config,
+            repo_root=repo_root,
+            state=state,
+            state_file=state_file,
+            live_handoff_candidates=live_handoff_candidates,
+            pr_by_issue=pr_by_issue,
+            sweep_events=sweep_events,
+            drift_fingerprint=_drift_fingerprint,
+        )
 
         state = _append_sweep_events(
             state,
