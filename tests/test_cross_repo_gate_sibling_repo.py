@@ -110,13 +110,17 @@ def test_1756_newline_corrupted_candidate_never_extracted(tmp_path: Path) -> Non
     assert result.reason == "no file paths referenced in issue body"
 
 
-def test_cw_1518_single_space_multi_path_span_never_extracted(tmp_path: Path) -> None:
+def test_cw_1518_single_space_multi_path_span_split_into_two_candidates(
+    tmp_path: Path,
+) -> None:
     """cw #1518's shape: two paths cited together inside one backtick span,
-    separated by a single space (`` `tests/a.py tests/b.py` ``), extracts as
-    one candidate containing an embedded space. The embedded-whitespace
-    filter (deliberately wider than #1756's own "2+ whitespace" proposal)
-    drops it at extraction, so it never reaches the missing-path/sibling
-    lookup and the gate passes."""
+    separated by a single space (`` `tests/a.py tests/b.py` ``). The
+    embedded-whitespace filter used to drop the whole span as one corrupted
+    candidate; issue #1790 splits it on whitespace and re-runs each piece
+    through the normal pipeline, so the span now yields two real candidates.
+    With both pieces missing here and under no registered sibling, the gate
+    abstains (positive-evidence redesign, #1756-#1758) rather than
+    escalating on bare absence."""
     this_repo = tmp_path / "charlie-work"
     this_repo.mkdir()
     sibling_repo = tmp_path / "ci_runners"
@@ -132,8 +136,9 @@ def test_cw_1518_single_space_multi_path_span_never_extracted(tmp_path: Path) ->
     )
 
     assert result.passed is True
-    assert result.referenced_paths == ()
-    assert result.reason == "no file paths referenced in issue body"
+    assert result.referenced_paths == ("tests/a.py", "tests/b.py")
+    assert result.missing_paths == ("tests/a.py", "tests/b.py")
+    assert "abstaining" in result.reason
 
 
 def test_module_relative_suffix_path_present_only_in_dispatching_repo_abstains(

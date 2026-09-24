@@ -153,12 +153,20 @@ repo).
 
 Also added as cheap defense-in-depth: a candidate containing *any* embedded
 whitespace (not just runs of 2+, issue #1756's own narrower proposal) is
-dropped at extraction, alongside the existing glob/placeholder/launcher-owned
-filters. This closes #1756's newline-corrupted-candidate shape and a
+filtered at extraction, alongside the existing glob/placeholder/launcher-owned
+filters. This closes #1756's newline-corrupted-candidate shape. The
 related single-space multi-path-in-one-backtick-span shape found live in cw
 issue #1518's body (`` `tests/a.py tests/b.py` `` extracting as one
-corrupted candidate containing an embedded space, which a "2+ whitespace"
-filter alone would not catch).
+candidate containing an embedded space, which a "2+ whitespace" filter
+alone would not catch) is *split* rather than dropped wholesale (issue
+#1790): each whitespace-separated piece is re-run through the normal
+candidate pipeline, and the whole candidate falls back to being dropped
+only when the split yields fewer than 2 path-shaped pieces — which is what
+keeps the #1756 corrupted-single-path protection intact, since one real
+path hard-wrapped mid-token or followed by prose produces at most one
+path-shaped piece. Split pieces share the whole span's ``(start, end)``
+offsets — the span is a single citation unit, so evidence markers and
+citation-section headings apply to every piece uniformly.
 
 All of these shapes are classified **neutral**: excluded from the pass/escalate
 decision and reported separately (``CrossRepoGateResult.neutral_paths``)
@@ -179,7 +187,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import LAUNCHER_OWNED_DIRS
+from .cross_repo_gate_candidates import (
+    _EMBEDDED_WHITESPACE_RE,
+    _PATH_RE,
+    _is_dropped_candidate,
+    _split_whitespace_candidate,
+)
 from .cross_repo_gate_shorthand import _is_dotdot_shorthand, _resolve_list_shorthand
 from .safe_path import contains
 from .subprocess_runner import run_captured
@@ -199,28 +212,10 @@ _CHECK_IGNORE_TIMEOUT_SECONDS = 5
 #: against a wedged index lock, not the expected runtime.
 _LS_FILES_TIMEOUT_SECONDS = 15
 
-# A file extension: 1-10 word characters after a dot.  Bounds the length so
-# the regex does not match version strings like ``1.2.3.4.5.6.7.8.9.0``.
-_EXT = r"\.[a-zA-Z][a-zA-Z0-9]{0,9}"
-
-# A relative path with at least one path separator and a file extension.
-# Requires at least 2 segments (e.g. ``src/foo.py``, ``ci_fleet/suite_coverage.py``)
-# to avoid matching bare filenames like ``main.py`` that may appear in prose
-# without being file-path references.
-_REL_PATH = rf"(?<![\w/.])((?:[\w.-]+/)+[\w.-]+{_EXT})(?![\w])"
-
-# An absolute path: drive letter (Windows) or leading ``/`` (POSIX), followed
-# by path segments and a file extension.
-_ABS_WIN_PATH = rf"(?<![\w])([A-Za-z]:[\\/](?:[\w.-]+[\\/])+[\w.-]+{_EXT})(?![\w])"
-_ABS_POSIX_PATH = rf"(?<![\w])(/(?:[\w.-]+/)+[\w.-]+{_EXT})(?![\w])"
-
-# Backtick-quoted paths: `` `...ext` `` — catches paths quoted in markdown
-# regardless of whether they are relative or absolute.
-_TICK_PATH = rf"`([^`]*(?:/|\\)[^`]*{_EXT})`"
-
-_PATH_RE = re.compile(
-    "|".join((_TICK_PATH, _ABS_WIN_PATH, _ABS_POSIX_PATH, _REL_PATH)),
-)
+# The path-candidate regexes and the placeholder/glob/launcher-owned drop
+# filters live in ``cross_repo_gate_candidates`` (extracted for the
+# file-size ratchet, issue #1442); this module keeps the pipeline that runs
+# them and the verdicts.
 
 # A scheme-less domain-shaped token followed by a path, e.g.
 # ``pultegroupinc.com/careers/default.aspx``.  This is not a file-path
@@ -236,42 +231,6 @@ _PATH_RE = re.compile(
 # token packed tightly against a real path in a table cell —
 # ``|domain.com/x.aspx|src/real.py |`` — does not swallow its neighbor.
 _DOMAIN_PATH = r"\b(?:[\w-]+\.)+[a-zA-Z]{2,24}/[^\s|`)\]]*"
-
-# A placeholder path segment: a template stand-in that can never name a real
-# file. Issue #1343: a templated documentation path in an issue body (e.g. a
-# runtime-state example ``<state-dir>/prs/pr-N/review-decision.json``) was
-# extracted as a path candidate and, because the runtime state dir is a real
-# top-level directory in the checkout, false-positived as a cross-repo
-# target. A placeholder segment can never be a genuine cross-repo reference,
-# so candidates containing one are dropped before existence checks.
-#
-# Matches either:
-#   - an angle-bracket placeholder (``<state-dir>``, ``<pr-N>``, ``<...>``) —
-#     any segment containing ``<`` or ``>``; or
-#   - a placeholder-numbered segment (``pr-N``, ``issue-N``) — one or more
-#     letters, a dash, then a literal capital ``N`` standing in for an
-#     unknown number.
-_PLACEHOLDER_SEGMENT = re.compile(r"^(?:[A-Za-z]+-N|.*[<>].*)$")
-
-# Embedded whitespace of any width (issue #1756, and the single-space
-# shape found live in cw #1518, ``_TICK_PATH`` capturing
-# `` `tests/a.py tests/b.py` `` as one corrupted candidate): no real
-# relative or absolute file path contains a space, tab, or line break. This
-# is deliberately wider than #1756's own proposed "\r, \n, or 2+ whitespace"
-# filter — a single embedded space is not "2+ whitespace" and would slip
-# that narrower version, but is exactly the same class of corrupted,
-# can-never-exist candidate.
-_EMBEDDED_WHITESPACE_RE = re.compile(r"\s")
-
-# Glob metacharacters: ``*``, ``?``, ``[``, ``]``. A candidate containing any
-# of these is a glob pattern, not a literal file path — no file literally
-# named ``*.py`` exists, so a glob candidate is always "missing" and would
-# false-positive the gate. The backtick-quoted path regex (``_TICK_PATH``)
-# captures globs because it matches anything inside backticks that contains a
-# separator and ends with an extension; the non-tick regexes exclude ``*``
-# from their character classes, so only backtick-quoted globs reach this
-# filter (issue #1391).
-_GLOB_METACHAR = re.compile(r"[*?\[\]]")
 
 # Evidence/authority-citation markers (issues #1452, #1460): a candidate
 # preceded by one of these words in its own clause is being cited as a
@@ -561,10 +520,14 @@ def extract_referenced_paths(issue_body: str) -> list[str]:
     body cannot fire the gate (issue #1343).
 
     Candidates containing embedded whitespace of any width (a space, tab, or
-    line break) are dropped — no real file path contains one, so a
-    whitespace-corrupted candidate (a hard-wrapped backtick-quoted path, or
-    two paths cited together in one backtick span separated by a single
-    space) can never exist and would false-positive the gate (issue #1756).
+    line break) are first split on whitespace and each piece re-run through
+    this same pipeline (issue #1790) — a genuine two-paths-in-one-backtick-
+    span citation (`` `tests/a.py tests/b.py` ``) is recovered as two
+    candidates. The whole candidate is dropped only when the split yields
+    fewer than 2 path-shaped pieces — no real file path contains whitespace,
+    so a corrupted candidate that does not decompose into multiple paths
+    (a hard-wrapped backtick-quoted path) can never exist and would
+    false-positive the gate (issue #1756).
 
     Candidates containing glob metacharacters (``*``, ``?``, ``[``, ``]``)
     are dropped — a glob pattern is not a literal file path, and no file
@@ -611,63 +574,36 @@ def _iter_candidate_matches(issue_body: str) -> tuple[list[tuple[str, int, int]]
         raw = next((g for g in match.groups() if g is not None), "")
         if not raw:
             continue
-        # Drop whitespace-corrupted candidates: a real path never contains a
-        # space, tab, or line break. Catches both a hard-wrapped
-        # backtick-quoted path (embedded \r\n, issue #1756) and a
-        # single-space multi-path span in one backtick pair (cw #1518) —
-        # deliberately wider than a "2+ whitespace" filter, which the
-        # single-space shape would slip.
+        # A candidate containing embedded whitespace is not a single real
+        # path — but before dropping it, try splitting it into path-shaped
+        # pieces (issue #1790): the cw #1518 shape is TWO real paths cited
+        # together in one backtick span (`` `tests/a.py tests/b.py` ``), and
+        # discarding the pair wholesale loses the positive sibling-repo
+        # evidence either piece could supply. ``_split_whitespace_candidate``
+        # re-runs each piece through the ``_PATH_RE`` shape check and the
+        # shared drop predicate below, returning an empty list — the
+        # pre-#1790 drop-the-whole-thing behavior — unless the split yields
+        # 2+ path-shaped pieces, which is what preserves #1756's
+        # corrupted-single-path protection. Every piece inherits the whole
+        # span's ``(start, end)``: the span is a single citation unit, so
+        # each piece sees the same clause/section context the un-split
+        # candidate would have.
         if _EMBEDDED_WHITESPACE_RE.search(raw):
+            for piece in _split_whitespace_candidate(raw):
+                if piece not in seen:
+                    seen.add(piece)
+                    candidates.append((piece, match.start(), match.end()))
             continue
-        # Drop templated/placeholder paths: a segment like ``pr-N`` or
-        # ``<state-dir>`` is documentation template text, not a real file
-        # reference, and can never be a genuine cross-repo target.
-        if _has_placeholder_segment(raw):
-            continue
-        # Drop glob patterns: a candidate containing ``*``, ``?``, ``[``, or
-        # ``]`` is a glob, not a literal path. No file named ``*.py`` exists,
-        # so a glob is always "missing" and would false-positive the gate.
-        if _GLOB_METACHAR.search(raw):
-            continue
-        # Drop launcher-owned worktree paths: paths under ``.devin/`` or
-        # ``.git_worktree_dir/`` live only inside agent worktrees, not in the
-        # repo tree, so they are not evidence of a cross-repo target.
-        if _is_launcher_owned_path(raw):
+        # Drop candidates that can never name a real cross-repo target —
+        # template placeholders (``pr-N``, ``<state-dir>``), glob patterns,
+        # launcher-owned worktree paths — via the predicate the split path
+        # above applies to each recovered piece.
+        if _is_dropped_candidate(raw):
             continue
         if raw not in seen:
             seen.add(raw)
             candidates.append((raw, match.start(), match.end()))
     return candidates, stripped
-
-
-def _has_placeholder_segment(candidate: str) -> bool:
-    """Return ``True`` when any segment of ``candidate`` is a template placeholder.
-
-    A placeholder segment (``<state-dir>``, ``pr-N``, ``<...>``) can never
-    name a real file — it is documentation template text, not a cross-repo
-    reference.  Candidates containing one are dropped before existence
-    checks so a templated example path in an issue body cannot fire the gate
-    (issue #1343).
-    """
-    return any(_PLACEHOLDER_SEGMENT.match(seg) for seg in re.split(r"[\\/]+", candidate))
-
-
-def _is_launcher_owned_path(candidate: str) -> bool:
-    """Return ``True`` when ``candidate`` is under a launcher-owned worktree dir.
-
-    Paths under ``.devin/`` or ``.git_worktree_dir/`` live only inside agent
-    worktrees — the shim materializes them on every dispatch — not in the
-    repo tree. A candidate whose first path segment names one of these
-    directories is not evidence of a cross-repo target: it will always be
-    "missing" from the repo and would false-positive the gate (issue #1391).
-
-    The launcher-owned directory set is sourced from
-    :data:`charlie_work.config.LAUNCHER_OWNED_DIRS`, shared with
-    :mod:`charlie_work.worktree`'s dirty check so the two modules share one
-    definition of "launcher-owned, not evidence."
-    """
-    segments = re.split(r"[\\/]+", candidate, maxsplit=1)
-    return bool(segments) and segments[0] in LAUNCHER_OWNED_DIRS
 
 
 def _path_exists_in_repo(path_str: str, repo_root: Path) -> bool:
