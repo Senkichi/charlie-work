@@ -147,7 +147,12 @@ def ensure_branch_worktree(repo_root: Path, branch: str, worktrees_dir: Path) ->
     )
     if not result.ok:
         return None
-    return target
+    # Return the spelling git recorded, matching the reuse path above: git
+    # canonicalizes the worktree path at registration (8.3 short names
+    # expand to long names on Windows), so returning ``target`` verbatim
+    # hands callers a different spelling of the same directory depending on
+    # whether the worktree was created or found.
+    return worktree_for_branch(repo_root, branch) or target.resolve()
 
 
 def suite_command_argv(configured_runner: str, repo_root: Path) -> list[str] | None:
