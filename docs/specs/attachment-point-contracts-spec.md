@@ -128,9 +128,14 @@ Deterministic nearest-rank quartiles (no interpolation ambiguity across platform
 FLOOR is a named module constant with the rationale in a docstring — it is a
 statistical-validity floor (outlier tests are meaningless at n<4), not a size threshold.
 
-## Baseline (baseline.py) — freeze-on-adopt + ratchet + tamper guard
+## Baseline (baseline.py + baseline_dir.py) — freeze-on-adopt + ratchet + tamper guard
 
-`.attachment-budgets.json` at repo root, GENERATED only (`baseline` CLI cmd), schema:
+`.attachment-budgets/` at repo root, GENERATED only (`baseline` CLI cmd). Per-entry
+layout (issue #1839): `meta.json` carries the top-level keys (everything except
+`entries`); each saturated point is one self-describing file at
+`entries/<file>/<kind>--<leaf>.json` where the leaf is the identity minus its
+redundant `<file>::` prefix, percent-escaped. The document-level schema the
+layout reassembles:
 ```json
 {"version": 1, "generated_by": "charlie_work.attachment_contracts <pkg-version>",
  "generated_at": "<iso8601>", "floor": 4,
@@ -181,7 +186,8 @@ report when `--report-only` (Week-1 shadow mode).
 ## hook_entry.py — PreToolUse protocol
 
 stdin JSON: `{"tool_name": "Write|Edit|MultiEdit", "tool_input": {"file_path": ...}}`.
-- No `.attachment-budgets.json` found walking up from target -> exit 0 silently (fast
+- No `.attachment-budgets/` (or legacy `.attachment-budgets.json`) found walking up
+  from target -> exit 0 silently (fast
   no-op outside piloted repos).
 - Unattended detection: env `CHARLIE_FLEET_WORKER=1` (the fleet dispatch env) OR
   `CLAUDE_CODE_UNATTENDED=1` -> ALWAYS advisory (never exit 2) — print redirect JSON

@@ -7,7 +7,6 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .attachment_contracts import baseline as attachment_baseline
 from .attachment_contracts.archetypes import scan_tree
 from .attachment_contracts.excludes import load_excludes
 from .attachment_contracts.review_delta import (
@@ -658,7 +657,7 @@ def classify_infra_failures(
 def compute_ratchetable_points(
     repo_root: Path,
     diff: str,
-    head_baseline_text: str | None,
+    head_document: dict[str, object] | None,
     hosts_baselined: set[str],
     changed_files: frozenset[str],
 ) -> tuple[RatchetablePoint, ...]:
@@ -680,15 +679,20 @@ def compute_ratchetable_points(
     are ratchetable -- the review packet renders a remedy row instructing
     the worker to run ``baseline --ratchet`` and commit the tightening.
 
-    Advisory-only: any failure (missing file, reconstruction mismatch,
-    parse error, tamper-guard trip) degrades to an empty tuple, never
-    raises -- the rest of the budget section still renders.
+    ``head_document`` is the already-loaded PR-head baseline document
+    (``None`` when it doesn't exist or couldn't be loaded/reconstructed --
+    no ratchetable rows are computable then). Advisory-only: any failure
+    (missing file, reconstruction mismatch, parse error, tamper-guard trip)
+    degrades to an empty tuple, never raises -- the rest of the budget
+    section still renders.
 
     ``iter_diff_files`` is imported lazily because ``janitor`` imports from
     this module at load time (``checks`` -> ``janitor`` -> ``checks`` would
     cycle); by the time this function runs, ``janitor`` is fully loaded.
     """
     try:
+        if head_document is None:
+            return ()
         from .janitor import iter_diff_files  # deferred: janitor imports from checks
 
         content_overrides: dict[str, str] = {}
@@ -714,7 +718,6 @@ def compute_ratchetable_points(
             return ()
         excludes = load_excludes(repo_root)
         scan = scan_tree(repo_root, excludes, content_overrides=content_overrides)
-        head_document = attachment_baseline.loads(head_baseline_text)
         return compute_ratchetable(scan.points, head_document, changed_files)
     except Exception:
         return ()

@@ -1,0 +1,8 @@
+{
+ "boundary": 29.5,
+ "bumps": [],
+ "file": "tests/attachment_contracts/test_archetypes.py",
+ "identity": "tests/attachment_contracts/test_archetypes.py::module",
+ "kind": "test_module",
+ "member_count": 31
+}
