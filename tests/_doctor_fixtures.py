@@ -31,7 +31,7 @@ def _write_workflow(repo_root: Path, body: str) -> None:
 def _collect_allocation_checks(
     config: Any, fleet_dir: Path, *, now: Any = None
 ) -> list[tuple[str, bool, str]]:
-    from charlie_work.doctor import _check_runner_allocation
+    from charlie_work.doctor_allocation import _check_runner_allocation
 
     collected: list[tuple[str, bool, str]] = []
 
