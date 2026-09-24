@@ -1,0 +1,4 @@
+error
+# Issue #1844: the local merge gate hit an infrastructure error (missing
+# branch, unresolvable suite command, merge plumbing failure). The issue
+# escalates mechanically; the event records the failing stage.
