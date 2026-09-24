@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,48 @@ class AttentionDigest:
     generated_at: str
     repo: str
     transitions: tuple[AttentionEntry, ...]  # one per issue whose health changed this pass
+
+
+@dataclass(frozen=True)
+class DigestFileStatus:
+    """Probe result for the file sink's digest file (issue #1859).
+
+    ``exists`` is False when the file cannot be ``stat()``ed at all -- absent,
+    unready volume, or unresolvable path are deliberately collapsed into one
+    outcome, the same collapse ``_file_sink`` would hit on its next append.
+    ``age_seconds`` is the file's mtime age at probe time; it is only ever set
+    when ``exists`` is True.
+    """
+
+    exists: bool
+    age_seconds: float | None
+
+
+def digest_file_status(config: Any, *, now: float | None = None) -> DigestFileStatus | None:
+    """Probe the file sink's digest file without writing to it.
+
+    Returns ``None`` when this config does not target the file sink at all
+    (``sink`` is not ``"file"``, or ``file_path`` is unset -- the latter being
+    the combination ``_file_sink`` already fails on, which callers report
+    through their own channel rather than a staleness verdict). Otherwise
+    returns a :class:`DigestFileStatus` for ``Path(config.file_path)`` resolved
+    exactly the way ``_file_sink`` resolves it -- relative paths are therefore
+    interpreted against the *caller's* cwd, matching the sink.
+
+    Read-only: never creates the file or its parent. ``now`` is an injectable
+    ``time.time()`` value so tests can pin the age computation.
+    """
+    if str(getattr(config, "sink", "") or "").lower() != "file":
+        return None
+    file_path = getattr(config, "file_path", "")
+    if not file_path:
+        return None
+    try:
+        mtime = Path(file_path).stat().st_mtime
+    except OSError:
+        return DigestFileStatus(exists=False, age_seconds=None)
+    current = time.time() if now is None else now
+    return DigestFileStatus(exists=True, age_seconds=current - mtime)
 
 
 def _webhook_sink(config: Any, digest: AttentionDigest) -> NotifyResult:
