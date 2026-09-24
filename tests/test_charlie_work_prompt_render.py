@@ -107,10 +107,13 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
     override_dir.mkdir()
     # The override must carry the no-merge contract markers (issue #714),
     # the conventional-commit title instruction (issue #715), the
-    # execution-contract escalation trigger (issue #717), and the widened
-    # containment clause markers (issue #1010):
+    # execution-contract escalation trigger (issue #717), the widened
+    # containment clause markers (issue #1010), and the scratch-file
+    # $TMPDIR rule (issue #1780):
     # _write_worker_prompt's post-render guards reject a flat override that
-    # drops any of these.
+    # drops any of these. ``$$TMPDIR`` escapes to a literal ``$TMPDIR`` in
+    # rendered output -- a bare ``$TMPDIR`` in template source is an
+    # unsupplied placeholder and fails render-time validation.
     (override_dir / "worker.md").write_text(
         "REPO-LOCAL #$issue_number\n\n"
         "## No-merge contract\n\n"
@@ -122,7 +125,10 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
         "signature/return shape, run the **FULL suite** locally at the final "
         "head before pushing.\n\n"
         "**Containment:** All file edits happen in the assigned worktree; "
-        "never modify any path outside the assigned worktree root.\n",
+        "never modify any path outside the assigned worktree root.\n\n"
+        "## Scratch files\n\n"
+        "Write every scratch file under `$$TMPDIR`; never use a literal "
+        "`/tmp/...` path.\n",
         encoding="utf-8",
     )
     config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir="orchestrator-prompts"))
@@ -144,5 +150,8 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
         "signature/return shape, run the **FULL suite** locally at the final "
         "head before pushing.\n\n"
         "**Containment:** All file edits happen in the assigned worktree; "
-        "never modify any path outside the assigned worktree root.\n"
+        "never modify any path outside the assigned worktree root.\n\n"
+        "## Scratch files\n\n"
+        "Write every scratch file under `$TMPDIR`; never use a literal "
+        "`/tmp/...` path.\n"
     )

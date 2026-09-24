@@ -8,6 +8,7 @@ the ``workflow_delegation`` installer re-attaches each ``def`` onto the class.
 from __future__ import annotations
 
 from charlie_work.github import GitHubError
+from charlie_work.local_work_park import publishes_pull_requests
 
 import charlie_work.workflow as _wf
 
@@ -67,6 +68,22 @@ def _ensure_labels_core(self) -> _wf.CommandResult:
     """
     labels = self.config.labels
     desired = list(labels.all)
+    # Issue #1862: a backend that cannot publish pull requests
+    # (``LocalFileGitHub``) has no GitHub remote and no label registry at
+    # all -- ``label_create`` is a documented no-op and ``label_list``
+    # only reports labels already present in issue frontmatter, so every
+    # not-yet-used LabelConfig name reads as "missing" forever and the
+    # ensure emits ``label_ensure_incomplete`` on every supervisor
+    # startup. Missing there is definitional, not drift, and can never
+    # converge: report ok instead. Discriminate on the same capability
+    # probe doctor (#1706) and the PR-capability loop lanes (#1810) use,
+    # not on isinstance or the ``local/`` name prefix.
+    if not publishes_pull_requests(self.gh):
+        return _wf.CommandResult(
+            True,
+            "no remote label registry on this backend — nothing to ensure",
+            {"labels": desired, "missing": []},
+        )
     descriptions = self._label_descriptions()
     for label in desired:
         # A brand-new LabelConfig field may ship before its entry in

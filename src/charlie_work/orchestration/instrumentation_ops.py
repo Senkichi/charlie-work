@@ -430,14 +430,30 @@ def _reconcile_stranded_verdicts(self) -> list[dict[str, Any]]:
         # A head-drifted stranded verdict is correctly refused this pass
         # and left for the stale-claim sweep / a fresh review dispatch.
         pr_number = int(pr_key)
-        record_result = self.record_review(
-            pr_number,
-            on_disk_decision,
-            summary=decision_data.get("summary", ""),
-            reviewed_head=decision_data.get("reviewed_head_sha"),
-            required_changes=decision_data.get("required_changes"),
-            verdict_provenance="stranded_reconciliation",
-        )
+        # Issue #1844: a ``"local": True`` record has no GitHub PR backing;
+        # ingest through ``record_local_review`` (same decision file/state
+        # transition, minus the ``pr_view``/external-findings seams). The
+        # explicit branch (not a chosen-name indirection) keeps the literal
+        # ``.record_review(`` call site visible to the verdict-provenance
+        # enforcement scanner.
+        if pr_state.get("local"):
+            record_result = self.record_local_review(
+                pr_number,
+                on_disk_decision,
+                summary=decision_data.get("summary", ""),
+                reviewed_head=decision_data.get("reviewed_head_sha"),
+                required_changes=decision_data.get("required_changes"),
+                verdict_provenance="stranded_reconciliation",
+            )
+        else:
+            record_result = self.record_review(
+                pr_number,
+                on_disk_decision,
+                summary=decision_data.get("summary", ""),
+                reviewed_head=decision_data.get("reviewed_head_sha"),
+                required_changes=decision_data.get("required_changes"),
+                verdict_provenance="stranded_reconciliation",
+            )
         entry: dict[str, Any] = {
             "pr_number": pr_number,
             "decision": on_disk_decision,
@@ -683,6 +699,7 @@ def _loop_impl(
         kind = (
             "preflight_config_stale" if check.name == "config_freshness" else "preflight_warning"
         )
+        # write-gate-exempt(issue=1363): pass-level telemetry, must survive dry_run like siblings
         log_event(
             self.paths.state_file,
             kind,
@@ -803,6 +820,7 @@ def _loop_impl(
         try:
             self._maybe_emit_operator_queue_impact()
         except Exception as exc:  # noqa: BLE001 - containment is deliberate; see docstring
+            # write-gate-exempt(issue=1768): sibling raw calls in _loop_impl are unconverted
             log_event(
                 self.paths.state_file,
                 "operator_queue_impact_check_failed",  # event-consumer: audit-only -- ad hoc containment record for issue #1768; the actionable behavior is this except block itself swallowing the exception so the pass survives, not a downstream reader of the event
@@ -820,6 +838,7 @@ def _loop_impl(
         try:
             self._maybe_report_outbound_secret_refusals()
         except Exception as exc:  # noqa: BLE001 - containment is deliberate; see docstring
+            # write-gate-exempt(issue=1505): sibling raw calls in _loop_impl are unconverted
             log_event(
                 self.paths.state_file,
                 "outbound_secret_refusal_report_failed",  # event-consumer: audit-only -- containment record for issue #1505; the actionable behavior is the except block itself keeping the pass alive

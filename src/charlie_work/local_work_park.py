@@ -15,6 +15,12 @@ issue names the branch for the human who will review and merge it.
 Lives outside ``dead_worker_reap`` on purpose: that module is a cap-exempt
 moved unit whose symbol set and size are pinned by
 ``tests/test_dead_worker_reap_split.py``; it carries only the call.
+
+The same capability predicate also gates the other PR-shaped per-pass
+``loop()`` lanes (issue #1810): the in-loop reconcile and main-CI reclaim
+delegates in ``orchestration/state_pr_capability_lanes.py`` consult
+``publishes_pull_requests`` directly, and the dispatch worker-token probe
+reaches it through ``worker_github_token_findings_if_publishing`` below.
 """
 
 from __future__ import annotations
@@ -23,9 +29,11 @@ import logging
 from pathlib import Path
 
 from .config import OrchestratorConfig
+from .env_sanitize import WorkerTokenFinding, worker_github_token_findings
 from .github import GitHubError, GitHubLike
 from .labels import TransitionOutcome
 from .paths import runtime_paths
+from .rework_prompts import _write_text_atomic
 from .state import load_state, state_lock
 from .write_gate import WriteGate
 
@@ -41,6 +49,23 @@ def publishes_pull_requests(gh: GitHubLike) -> bool:
     class attribute.
     """
     return bool(getattr(gh, "publishes_pull_requests", True))
+
+
+def worker_github_token_findings_if_publishing(
+    config: OrchestratorConfig, gh: GitHubLike
+) -> list[WorkerTokenFinding]:
+    """``worker_github_token_findings`` gated on PR capability (issue #1810).
+
+    A backend that cannot publish pull requests never has a worker push a
+    branch or open a PR, so a missing scoped worker GitHub token is not a
+    defect there: return no findings, which skips the escalation path the
+    findings feed in ``_dispatch_impl`` (the ``worker_token_missing``
+    warning plus the ``require_worker_github_token`` deferral) instead of
+    reporting a defect that cannot exist on such a repo.
+    """
+    if not publishes_pull_requests(gh):
+        return []
+    return worker_github_token_findings(config)
 
 
 def park_unpublishable_work(
@@ -108,15 +133,32 @@ def _post_branch_comment(
     not hide behind a warning.
     """
     body_dir = runtime_paths(repo_root, config.runtime.state_dir).issues / f"issue-{issue_number}"
+    # Issue #1844: when the local review/merge lane is enabled (the default),
+    # ``agent:review-ready`` is the lane's *input* -- the next loop pass adopts
+    # the branch, reviews it, runs the suite, and merges with no operator
+    # action. The comment describes which mode is actually armed so the
+    # operator never reads "you must merge this by hand" on a repo whose lane
+    # will do it automatically.
+    lane_enabled = config.review_dispatch.enabled and config.auto_merge.enabled
+    body_text = (
+        f"Work for this issue is committed on branch `{branch}`. This repo has no "
+        "remote, so nothing was pushed and no PR exists: the local review lane "
+        "will pick the branch up on the next pass -- review, full test suite, "
+        "and merge into the base branch all run automatically. No action is "
+        "needed unless the lane escalates."
+        if lane_enabled
+        else (
+            f"Work for this issue is committed on branch `{branch}`. This repo has no "
+            "remote, so nothing was pushed and no PR exists, and the local "
+            "review/merge lane is disabled (review_dispatch.enabled and "
+            "auto_merge.enabled): review the branch, merge it, and close the "
+            "issue."
+        )
+    )
     try:
         body_dir.mkdir(parents=True, exist_ok=True)
         body_path = body_dir / "review-ready-comment.md"
-        body_path.write_text(
-            f"Work for this issue is committed on branch `{branch}`. This repo has no "
-            "remote, so nothing was pushed and no PR exists: review the branch, merge it, "
-            "and close the issue.",
-            encoding="utf-8",
-        )
+        _write_text_atomic(body_path, body_text)
         gh.issue_comment(issue_number, body_path)
     except (OSError, GitHubError):
         logger.warning("review-ready comment post failed issue=%d", issue_number, exc_info=True)

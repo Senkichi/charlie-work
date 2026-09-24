@@ -55,6 +55,8 @@ from .github import (
 from .issue_linking import linked_issue_number
 from .instrumentation import log_event, query_events
 from .labels import TransitionOutcome, _edges, transition
+from .local_lane import synthesize_open_pr
+from .local_work_park import publishes_pull_requests
 from .merge_finalize import _merged_issue_fields
 from .paths import resolved_layout, runtime_paths
 from .pr_create_retry import create_pr_with_retry
@@ -1173,8 +1175,16 @@ def detect_drift(
         _escalation_label(labels_cfg, _escalation_edge("escalated", reason_class))
         for reason_class in ESCALATION_REASON_CLASSES
     }
-    prs = _fetch_prs(gh)
-    issues = _fetch_issues(gh)
+    # Issue #1844: on a no-remote backend there is no PR/issues API to page
+    # -- ``_fetch_prs``/``_fetch_issues`` would raise ``GitHubError``. The PR
+    # snapshot stays empty (local lane records are projected in below); the
+    # issue snapshot comes from the local backend's own ``issue_list``.
+    if publishes_pull_requests(gh):
+        prs = _fetch_prs(gh)
+        issues = _fetch_issues(gh)
+    else:
+        prs = []
+        issues = gh.issue_list(state="all")
     issues_by_number = {int(issue["number"]): issue for issue in issues if issue.get("number")}
     # Issue #762: issues are now fetched via a paginated REST ``issues``
     # snapshot. The list is either complete (we stopped because GitHub returned
@@ -1184,6 +1194,22 @@ def detect_drift(
     # genuinely missing issue, and the warning remains defensive dead code.
     issue_snapshot_truncated = False
     state_prs: dict[str, Any] = state.get("prs", {})
+    # Issue #1844: on a no-remote backend ``_fetch_prs`` returns [] by
+    # construction, but a local lane record in ``state["prs"]`` IS the live
+    # review unit. Project each non-terminal local record into the PR
+    # snapshot as a synthetic OPEN PR linked to its issue (the branch name
+    # carries the ``<prefix>-<n>`` convention ``linked_issue_number`` already
+    # parses), so ``state_pr_missing_on_github`` stays quiet and
+    # ``issue_active_label_no_open_pr`` never strips a local issue's
+    # ``reviewing``/``needs_rework`` labels. Terminal records produce no
+    # entry -- nothing live left to protect. These entries flow through the
+    # same per-PR loop below; every check that would misfire on them
+    # (MERGED/CLOSED branches, gh-backed checks) keys on ``state`` values the
+    # synthetic record does not carry.
+    for _local_entry in state_prs.values():
+        _synth = synthesize_open_pr(_local_entry)
+        if _synth is not None:
+            prs.append(_synth)
     # Issue #762: PRs are now fetched via a paginated REST ``pulls`` snapshot.
     # The list is either complete (we stopped because GitHub returned an
     # under-full page) or the fetch raised. It is no longer a fixed
@@ -2223,6 +2249,67 @@ def detect_drift(
                 )
                 issues_status_repaired.add(issue_number)
 
+        # Issue #1498: ``state["issues"][N]["pr_number"]`` is only written by
+        # the orchestrator's own PR-opening paths (dispatch salvage,
+        # orphaned-branch recovery). A PR that links itself to an issue via
+        # its own closing keyword -- opened outside those paths -- never
+        # updates the cache, so it can keep pointing at a dead
+        # closed-unmerged PR while a live open PR also links the issue.
+        # That staleness defeats
+        # ``_closed_pr_superseded_by_newer_session``'s signal 1: the cached
+        # value equals the closed PR being evaluated, so "the issue moved
+        # on" cannot be proven and the two closed-unmerged rules flap
+        # ``agent:pr-open`` off while ``issue_active_label_with_open_pr``
+        # flaps it back on the next pass (issue #1068: 23 transitions in
+        # 16h). Repoint the cache at the issue's current open PR -- the
+        # same ``min(open PR number)`` pick the label repair above reports
+        # -- so the next pass's supersession guard sees the live PR and
+        # both rules converge.
+        #
+        # Gates:
+        # - the GitHub issue must be OPEN: for a closed issue ``pr_number``
+        #   is a historical record of which PR resolved it
+        #   (``_merged_issue_fields`` preserves it verbatim), not a live
+        #   pointer to repair.
+        # - the issue must already have a state entry: this kind repairs a
+        #   stale *cached* pointer, it does not invent records for issues
+        #   the orchestrator never tracked (the same boundary
+        #   ``closed_unmerged_pr_state_converged`` keeps for untracked PRs).
+        # - issues_status_repaired: when issue_active_label_with_open_pr
+        #   fired this pass it already lands the same pointer in its own
+        #   state write -- emitting a second item for the same issue in the
+        #   same pass would be a duplicate repair, not new drift.
+        if (
+            open_prs
+            and _issue_state(issue) == "OPEN"
+            and isinstance(tracked_entry, dict)
+            and issue_number not in issues_status_repaired
+        ):
+            current_open_pr = min(int(pr["number"]) for pr in open_prs)
+            cached_pr_raw = tracked_entry.get("pr_number")
+            try:
+                cached_pr = int(cached_pr_raw) if cached_pr_raw is not None else None
+            except (TypeError, ValueError):
+                # A corrupt cached value counts as drift -- repoint it to
+                # the live PR rather than leaving it unreadable forever.
+                cached_pr = None
+            if cached_pr != current_open_pr:
+                drift.append(
+                    DriftItem(
+                        kind="stale_issue_pr_number",
+                        issue_number=issue_number,
+                        pr_number=current_open_pr,
+                        detail=(
+                            f"issue #{issue_number} state pr_number is {cached_pr_raw!r} "
+                            f"but open PR #{current_open_pr} links to it"
+                        ),
+                        fix_actions=(
+                            f"set state issues[{issue_number}].pr_number = "
+                            f"{current_open_pr} (was {cached_pr_raw!r})",
+                        ),
+                    )
+                )
+
         if terminal_present and active_present:
             drift.append(
                 DriftItem(
@@ -2853,6 +2940,13 @@ def apply_fixes(
                     "status": item.new_status or PASSIVE_OPEN_STATUS,
                     "merge_alert": "OK",
                 }
+                if item.pr_number is not None:
+                    # Issue #1498: the repair asserts this open PR is the
+                    # issue's current one -- record the pointer too, so the
+                    # entry it writes is not itself born with the stale
+                    # ``pr_number`` the stale_issue_pr_number drift kind
+                    # exists to repair.
+                    new_issue["pr_number"] = item.pr_number
                 new_issue.pop("worker_pid", None)
                 new_issue.pop("worker_process_start_time", None)
                 new_issues[issue_key] = new_issue
@@ -3002,6 +3096,22 @@ def apply_fixes(
                     }
                 else:
                     new_issues[issue_key] = {**existing_issue, "status": item.new_status}
+
+        elif item.kind == "stale_issue_pr_number":
+            # Issue #1498: repoint the cached ``issues[N]["pr_number"]`` at
+            # the issue's current open PR (item.pr_number -- the min open
+            # linked PR detect_drift resolved). Same pure state-field
+            # rewrite shape as issue_status_normalized above -- no GitHub
+            # writes. ``"number"`` is written alongside so an issue with no
+            # prior state entry still lands a well-formed record.
+            if item.issue_number is not None and item.pr_number is not None:
+                issue_key = str(item.issue_number)
+                existing_issue = new_issues.get(issue_key, {})
+                new_issues[issue_key] = {
+                    **existing_issue,
+                    "number": item.issue_number,
+                    "pr_number": item.pr_number,
+                }
 
         elif item.kind == "pr_status_normalized":
             # A tracked PR record with no status field is normalized to the

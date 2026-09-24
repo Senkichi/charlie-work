@@ -1,0 +1,5 @@
+info
+# The #502 tripwire recognized a mergequeue sync-merge (#1194) and
+# suppressed the finding. Routine under an active merge queue -- fires
+# on every legitimate sync-merge -- but kept in the audit trail so
+# suppressions are queryable next to the findings they replaced.

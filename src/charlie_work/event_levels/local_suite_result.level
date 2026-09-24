@@ -1,0 +1,4 @@
+info
+# Issue #1844: the full test suite ran in the branch worktree during the
+# local merge gate. Carries the suite outcome (passed/failed) so suite
+# gating is observable from events.db.

@@ -57,8 +57,9 @@ logger = logging.getLogger(__name__)
 
 
 #: events.db kind recorded when ``charlie fleet stop`` writes the marker.
-#: Registered at ``info`` in ``instrumentation._LEVEL_BY_KIND`` — an
-#: operator-initiated request, not an anomaly.
+#: Registered at ``info`` in ``event_levels/fleet_stop_requested.level``
+#: (loaded into ``instrumentation._LEVEL_BY_KIND``) — an operator-initiated
+#: request, not an anomaly.
 FLEET_STOP_REQUESTED = "fleet_stop_requested"
 
 

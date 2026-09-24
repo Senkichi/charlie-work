@@ -1,0 +1,5 @@
+info
+# Issue #1128: a dead worker with an OPEN but unreviewed PR is
+# advanced from ``agent:in-progress`` to ``agent:pr-open`` so review
+# dispatch can claim the salvage PR. Info-level recovery bookkeeping,
+# sibling to ``orphaned_worker_opened_pr``.

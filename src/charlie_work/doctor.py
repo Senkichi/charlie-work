@@ -18,6 +18,8 @@ from typing import Any
 import yaml
 
 from .config import ApiWorkerConfig, OrchestratorConfig
+from .doctor_config_drift import _check_aviator_required_checks, _check_triage_label_map
+from .doctor_cross_repo import _check_cross_repo_escalations
 from .doctor_local_backend import _check_local_issue_backend
 from .env_sanitize import worker_github_token_findings
 from .fleet_paths import fleet_dir, fleet_dir_virtualization
@@ -1504,6 +1506,14 @@ def run_doctor(
                 severity="warning",
             )
 
+    # -- config drift pairs (issue #1849) ------------------------------------
+    # Two repo files restate values this config owns: docs/agents/
+    # triage-labels.md restates labels.ready for the skills plugin, and
+    # .aviator/config.yml restates auto_merge.required_checks for the merge
+    # queue. Both drift silently; both checks pass unadopted. Read-only.
+    _check_triage_label_map(add, repo_root, config)
+    _check_aviator_required_checks(add, repo_root, config)
+
     # -- labels --------------------------------------------------------------
     if publishes_prs:
         try:
@@ -1753,6 +1763,13 @@ def run_doctor(
     # the orchestrator's self-deploy state file. Flags exhausted retries
     # (ok: false) as a warning; adds nothing when the window is empty.
     _check_git_network_retries(add, paths)
+
+    # -- recent dispatch_cross_repo_escalated events (issue #1789) -----------
+    # Read-only: aggregates this repo's own events.db by the escalation
+    # payload's found_in_repo field -- the sibling repo a missing candidate
+    # was positively matched under. Warning-severity, silent when the
+    # window is empty.
+    _check_cross_repo_escalations(add, paths)
 
     hard_failures = [check for check in checks if not check.ok and check.severity == "error"]
     return (not hard_failures, checks)

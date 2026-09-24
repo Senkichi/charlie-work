@@ -1,0 +1,7 @@
+warning
+# Issue #1393: a pre-launch environment block (e.g.
+# worktree_foreign_writer) prevented a dispatch from starting. Warning,
+# not error: the issue is not terminal — the cap may not yet be
+# exhausted, and the operator can resolve the conflict (e.g. remove a
+# stale checkout) to unblock the next pass. The escalation when the
+# cap IS exhausted goes through session_failed_escalated (error).

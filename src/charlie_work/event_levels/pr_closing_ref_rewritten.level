@@ -1,0 +1,7 @@
+warning
+# cw#1263: the orchestrator's own salvage-PR-body builders had to
+# rewrite the ``Closes #N`` line before handing the body to
+# ``gh pr create``. Warning, not error: the rewrite happens before
+# creation, so the body is still usable -- but a recurring burst
+# indicates the salvage builders are drifting from the canonical
+# form again.

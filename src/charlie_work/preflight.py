@@ -398,6 +398,7 @@ def emit_preflight_refusal(
 
     if available:
         try:
+            # write-gate-exempt(issue=1374): must not be silenced by dry_run; no write_gate access
             log_event_fn(state_path, "loop_refused_preflight", payload, repo=repo, level="error")
             return
         except Exception as exc:  # noqa: BLE001 -- must never raise

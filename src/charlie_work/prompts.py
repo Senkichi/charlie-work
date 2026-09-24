@@ -232,6 +232,99 @@ def assert_containment(prompt: str, *, context: str = "worker prompt") -> None:
         raise MissingContainmentError(context, missing)
 
 
+# Markers that must appear in every rendered worker/rework prompt's
+# scratch-file rule.  Issue #1780: #1767 retargeted TMP/TEMP/TMPDIR at a
+# worktree-local directory, but a literal ``/tmp/...`` path typed into a
+# shell command still resolves through MSYS's install-wide cached mount
+# under Git Bash (and to the one shared temp directory on POSIX) — a file
+# there is visible to every concurrent worker session on the host, which
+# is how a ``gh pr view ... > /tmp/pr-body.md`` scratch write got
+# corrupted by a sibling worker.  A repo-local flat whole-file override
+# can silently drop the ``$section_session_scratch_dir`` reference,
+# dispatching workers with no instruction away from the shared dir, so
+# these markers are checked against the *rendered output* — not the
+# template source — at the dispatch boundary.
+SESSION_SCRATCH_DIR_MARKERS: tuple[str, ...] = (
+    "## Scratch files",
+    "$TMPDIR",
+    "literal `/tmp",
+)
+
+
+class MissingSessionScratchDirError(RuntimeError):
+    """A rendered worker/rework prompt is missing the scratch-dir rule.
+
+    Issue #1780: a repo-local flat whole-file override of ``worker.md`` or
+    ``rework.md`` can silently drop the ``$section_session_scratch_dir``
+    reference, dispatching workers free to pick a literal ``/tmp/...``
+    path that resolves through MSYS's install-wide mount under Git Bash —
+    shared across every concurrent worker session, the residual class
+    #1767's TMP/TEMP/TMPDIR env fix could not close.  This post-render
+    guard catches that drift at the dispatch boundary — the single point
+    of enforcement — rather than relying on every consumer repo's override
+    to remember the section.
+    """
+
+    def __init__(self, context: str, missing: tuple[str, ...]) -> None:
+        self.context = context
+        self.missing = missing
+        super().__init__(
+            f"{context} is missing the scratch-file rule (issue #1780): "
+            f"required marker(s) not found: {', '.join(missing)}. "
+            f"A repo-local flat override may have dropped the "
+            f"$section_session_scratch_dir reference, leaving workers "
+            f"free to use a literal /tmp/... path shared across "
+            f"concurrent sessions."
+        )
+
+
+def assert_session_scratch_dir(prompt: str, *, context: str = "worker prompt") -> None:
+    """Verify a rendered worker/rework prompt carries the scratch-dir rule.
+
+    Checks the *rendered output* (not the template source) so that a
+    repo-local flat override that drops the ``$section_session_scratch_dir``
+    reference is caught regardless of how the override was structured.
+    """
+
+    missing = tuple(m for m in SESSION_SCRATCH_DIR_MARKERS if m not in prompt)
+    if missing:
+        raise MissingSessionScratchDirError(context, missing)
+
+
+def assert_worker_prompt_contracts(prompt: str, *, context: str = "worker prompt") -> None:
+    """Run every rendered-output contract guard the worker-prompt writer owns.
+
+    Single point of enforcement for the dispatch-boundary guard block —
+    issues #714 (no-merge contract), #715 (conventional-commit title),
+    #717 (execution-contract escalation trigger), #1010 (widened
+    containment clause), and #1780 (scratch-dir rule). Each guard checks
+    the *rendered output*, so a repo-local flat ``worker.md`` override that
+    drops a ``$section_*`` reference is caught at the dispatch boundary
+    regardless of how the override was structured. Keeping the whole block
+    behind one call means the two dispatch-boundary writers cannot drift
+    on which guards run.
+    """
+    assert_no_merge_contract(prompt, context=context)
+    assert_conventional_commit_title(prompt, context=context)
+    assert_execution_contract(prompt, context=context)
+    assert_containment(prompt, context=context)
+    assert_session_scratch_dir(prompt, context=context)
+
+
+def assert_rework_prompt_contracts(prompt: str, *, context: str = "rework prompt") -> None:
+    """Run every rendered-output contract guard the rework-prompt writer owns.
+
+    Same dispatch-boundary block as :func:`assert_worker_prompt_contracts`
+    minus #715's conventional-commit title check — ``rework.md`` carries no
+    PR-title instruction for an override to drop. Issues #714, #717,
+    #1010, #1780.
+    """
+    assert_no_merge_contract(prompt, context=context)
+    assert_execution_contract(prompt, context=context)
+    assert_containment(prompt, context=context)
+    assert_session_scratch_dir(prompt, context=context)
+
+
 class PromptTemplateError(RuntimeError):
     """A prompt template references placeholders that nothing supplies.
 

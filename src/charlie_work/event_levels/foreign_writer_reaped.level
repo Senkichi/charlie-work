@@ -1,0 +1,9 @@
+warning
+# Issue #1423: a foreign writer that was alive but idle past the stall
+# threshold was reaped (killed + marker cleaned) instead of blocking
+# dispatch or escalating to a human. Warning, not error: the reap is a
+# recovery, not a fault — the zombie is gone and dispatch proceeds. The
+# sibling ``dispatch_blocked_environment_reaped`` /
+# ``rework_dispatch_blocked_environment_reaped`` record the same reap at
+# the blocked-environment cap exhaustion point (counter reset + retry
+# instead of escalation).

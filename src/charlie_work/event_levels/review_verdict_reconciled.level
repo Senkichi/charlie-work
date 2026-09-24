@@ -1,0 +1,9 @@
+info
+# Issue #736: the stranded-verdict reconciliation sweep found an
+# on-disk decision that state never ingested (state write lost, but
+# the packet head still matches live) and successfully replayed it
+# through ``record_review``. Info, not warning: this is the sweep
+# doing its job -- recovering a verdict that was always valid, just
+# never applied. The failure case is the sibling
+# ``review_verdict_reconcile_failed``, emitted from the same call
+# site at warning level.

@@ -1,0 +1,9 @@
+warning
+# Issue #1383: a required check failed due to a fleet-wide infra
+# condition (Actions budget/runner outage) rather than the PR's
+# code. Warning, not error: the PR is held without rework (not
+# escalated), and the operator-facing escalation is the separate
+# ``infra_blocked_escalated`` error kind, emitted once per window
+# only when the condition persists. Consumed by heartbeat_check.py's
+# ``check_infra_blocked_events`` (AC4) and by the cross-pass
+# escalation tracker in ``_loop_impl``.

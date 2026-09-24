@@ -122,9 +122,13 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
         # there is no remote to push to, so the branch is the deliverable.
         # A success state, deliberately NOT one of the escalation edges --
         # see ``LabelConfig.review_ready``. ``ready`` is kept (unlike
-        # "merged") because the issue is not done until a human merges the
-        # branch and closes it; ``review_ready`` being terminal is what holds
-        # it out of dispatch meanwhile.
+        # "merged") because the issue is not done until the branch is merged
+        # and the issue closed. With the local review/merge lane enabled
+        # (the default for local_issues repos, issue #1844) this is only a
+        # brief parking spot: the next loop pass adopts the branch into the
+        # lane, which runs review + suite + merge automatically. When the
+        # lane is disabled, ``review_ready`` being terminal is what holds
+        # the issue out of dispatch for a human to merge by hand.
         "local_work_ready": (
             (labels.review_ready,),
             _compute_remove((labels.review_ready,)),

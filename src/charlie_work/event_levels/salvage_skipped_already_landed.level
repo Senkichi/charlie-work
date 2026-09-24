@@ -1,0 +1,8 @@
+info
+# Issue #1221: the pre-open re-check found the work already landed
+# (issue closed, a PR already merged, or the branch's diff against
+# main is empty) and skipped opening a vestigial duplicate PR. Info,
+# not warning: this is the intended outcome of the fix -- the caller
+# treats the skip as "handled" (no redispatch), sibling to
+# ``salvage_pushed_stranded_commits`` rather than to
+# ``salvage_push_failed`` (which is a genuine failure to publish).

@@ -29,6 +29,8 @@ $section_no_merge_contract
 
 $section_process_lifetime
 
+$section_session_scratch_dir
+
 $section_api_shape_validation
 
 $section_caller_sweep
@@ -41,8 +43,8 @@ $section_config_parity
 
 1. Branch off the current `main`:
    `git fetch origin && git switch -c $branch_name origin/main`
-2. Read `CLAUDE.md`, the issue, and the relevant code paths (callers, callees,
-   data flow).
+2. Read `CLAUDE.md`, `CONTEXT.md` (where present), the issue, and the relevant
+   code paths (callers, callees, data flow).
 3. Reproduce or precisely explain the defect/requirement.
 4. Implement the smallest correct change at the right abstraction layer.
 

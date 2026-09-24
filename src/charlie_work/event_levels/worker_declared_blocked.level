@@ -1,0 +1,5 @@
+error
+# Issue #1453: a worker deliberately concluded the task is structurally
+# impossible and declared a ``blocked`` outcome. Terminal for the issue
+# -- escalated to the operator queue with zero redispatches -> error,
+# parallel to session_failed_escalated / orphan_sweep_redispatch_escalated.
