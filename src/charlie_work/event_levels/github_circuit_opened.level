@@ -1,0 +1,7 @@
+warning
+# Issue #1833: the per-pass gh circuit breaker tripped after N
+# consecutive transport-class failures (connect/handshake/DNS/hang).
+# Warning, not error: the lane is not escalated -- calls this pass
+# fail fast as values until the cooldown elapses, and a fresh pass
+# resets the breaker -- but a live fleet tripping this repeatedly
+# means the network path to GitHub itself needs attention.

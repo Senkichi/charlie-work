@@ -1,0 +1,6 @@
+info
+# Issue #1274 (W17): a mechanical retrigger (close/reopen, or an
+# empty-commit push fallback) was actually issued for a PR whose
+# head was marked ci_run_never_created. Info, not warning: this is
+# the intended follow-up mechanism working as designed, mirroring
+# flake_rerun_triggered / infra_rerun_triggered below.

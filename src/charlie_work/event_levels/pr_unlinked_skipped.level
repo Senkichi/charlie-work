@@ -1,0 +1,10 @@
+warning
+# Issue #1766: the merge lane's per-PR loop could not resolve a
+# linked issue for an open PR (e.g. Dependabot's own branch/body
+# convention) and skipped it -- edge-triggered, so this fires once
+# on first sight and again only when the PR's material state
+# changes. Warning, not info: the operator-facing signal the issue
+# asks for must actually reach `charlie doctor`/heartbeat checks,
+# which only look at warning/error levels; not error, since nothing
+# is broken -- the PR is simply outside the pipeline's unit of work
+# and stays queryable via `charlie status`'s `unlinked_prs`.

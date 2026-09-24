@@ -1,0 +1,7 @@
+info
+# Issue #1781: a PR that carried an ``unlinked_pr_notice`` marker
+# resolved a linked issue on a later pass, so the marker was evicted
+# -- the falling edge of the warning-level ``pr_unlinked_skipped``
+# rising-edge detector. Info, not warning: this is the self-heal
+# completing (the operator who saw the warning can see it resolved),
+# sibling to ``foreign_issue_ref_cleared``.

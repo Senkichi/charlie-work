@@ -1,0 +1,6 @@
+info
+# Local-file issue source: the dead session left commits on its
+# branch and the backend cannot host PRs, so salvage parked the
+# issue as review-ready instead of pushing. Info: this is the
+# success path for a repo with no remote, the local counterpart of
+# ``session_salvaged`` without that kind's "a worker died" reading.

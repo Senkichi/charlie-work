@@ -1,0 +1,6 @@
+warning
+# Issue #1832: a fleet pass hit its cooperative in-pass deadline
+# (max_pass_runtime_seconds) and deferred one or more repos/prologue
+# steps to the next pass instead of running them. Warning, not error:
+# the pass still ends cleanly and returns a CommandResult -- nothing
+# crashed, work was rescheduled.

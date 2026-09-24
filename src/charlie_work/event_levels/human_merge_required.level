@@ -1,0 +1,9 @@
+info
+# Issue #1598: a bound PR whose issue carries a configured
+# human_merge_labels label is handed off to a human for merging
+# instead of being fleet-merged. ``human_merge_required`` is the
+# hand-off event (issue escalated to agent:operator-queue with
+# reason_class="policy"); ``human_merge_label_removed`` is the
+# de-escalation event that fires when the operator removes the
+# label without merging, restoring the PR to the normal
+# queue/merge path. Both are info-level audit events.

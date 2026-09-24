@@ -1,0 +1,8 @@
+error
+# Issue #1274 (W17): stale_checks_retrigger_attempts reached
+# stale_checks_max_retriggers and the check suite is still missing --
+# no code-fix rework path exists for a run GitHub never created, so
+# this escalates straight to a human via _escalate_issue +
+# transition(..., "escalated"), the same pair infra_rerun_escalated /
+# janitor_rework_escalated use. Terminal for the lane -> error, like
+# the other *_escalated kinds in this section.

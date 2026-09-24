@@ -1,0 +1,5 @@
+warning
+# Issue #1363: config_freshness detected a config file mtime change
+# since the supervisor loaded it (or since the last pass that
+# observed it) -- the silent-inert-edit trap made loud. Warning, not
+# error: this does not hot-reload or block the pass.

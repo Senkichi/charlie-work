@@ -1,0 +1,5 @@
+warning
+# Issue #849: rescue capture preserves work before a reset. Warning
+# level because it means a worktree had uncommitted work that was
+# about to be lost — the capture succeeded, but the condition that
+# triggered it is worth attention.
