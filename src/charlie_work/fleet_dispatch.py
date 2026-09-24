@@ -51,6 +51,7 @@ from .global_config import describe_config_file, load_layered_config
 from .instrumentation import log_event
 from .local_issues import github_client_for
 from .notify import AttentionDigest, AttentionEntry, emit_digest
+from .notify_freshness import check_notify_digest_freshness, report_notify_resolution
 from .paths import RepoNotFoundError, runtime_paths
 from .venv_anchor import verify_interpreter_anchored_editables
 from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
@@ -1900,6 +1901,13 @@ def fleet_loop(
     resolved_fleet_dir = fleet_dir(override=fleet_dir_override)
     fleet_state_path = layout.state_file_path(resolved_fleet_dir)
 
+    # Issue #1859: dead-man's switch for the notify file sink, checked at the
+    # top of every pass. Cheap (one stat) and edge-latched inside the helper;
+    # skipped entirely when notify is off or the sink is not ``file``.
+    _notify_cfg = getattr(global_config, "notify", None) if global_config else None
+    if _notify_cfg is not None and getattr(_notify_cfg, "enabled", False):
+        check_notify_digest_freshness(_notify_cfg, fleet_state_path)
+
     # Issue #1372: stale registry entries (repo_root no longer exists) are
     # collected during the pass for prune-after-grace processing. They are
     # skipped (not counted as failures) and reported via a warning-level event
@@ -2754,6 +2762,19 @@ def run_fleet_supervise(
         "Fleet supervisor global config: path=%s %s",
         global_config_path,
         describe_config_file(global_config_path),
+    )
+
+    # Issue #1859: publish the resolved notify sink once per supervisor
+    # start, next to the global-layer provenance line -- a lost ``notify:``
+    # section otherwise degrades the whole pipeline to silence with no
+    # error anywhere. The fleet-state path targets the same events.db the
+    # heartbeat consumer reads, so the resolution (including the absolute
+    # digest path this daemon anchored) is a consumed signal, not a
+    # write-only log line.
+    report_notify_resolution(
+        getattr(global_config, "notify", None),
+        global_config_path,
+        layout.state_file_path(fleet_dir(override=fleet_dir_override)),
     )
 
     overrides: dict[str, int] = {}
