@@ -265,6 +265,15 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # runner_allocation event every pass, so a repeating burst here means
         # that channel itself needs attention.
         "ci_headroom_unavailable": "warning",
+        # Issue #1843: host_load.measure_host_load (host_load.py) could not
+        # take a process snapshot, so the dispatch governor's host-load clamp
+        # had no reading this pass. Warning, not error: the caller fails OPEN
+        # on this (dispatch proceeds unclamped) precisely so a broken probe
+        # never becomes a dispatch outage -- but a repeating burst here means
+        # the probe channel itself (PowerShell/CIM on Windows, /proc on
+        # POSIX) needs attention. Rate-limited per repo (at most once per
+        # reason per interval) so a stuck condition cannot flood the store.
+        "host_load_unavailable": "warning",
         # Issue #1260: the diff-coverage static probe (W3) flagged one or more
         # non-test files whose added branch logic outran the diff's added
         # tests. Warning, not error: the probe is advisory-only and never

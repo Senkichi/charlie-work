@@ -26,6 +26,11 @@ dispatch:
   # suite's `-n` (don't let it inherit `-n auto`). See RUNBOOK.md
   # "Local host saturation ceiling (claude-code adapter)".
   default_limit: 3
+  # Issue #1843: host-load backoff -- before launching a worker, the dispatch
+  # governor counts processes inside live pytest process trees on this host
+  # and defers the launch while the count exceeds this threshold. Default is
+  # the host's logical CPU count (on by default); set 0 to disable.
+  # host_load_max_pytest_processes: 16
   # Per-pass cap for merge-finalization of merged-PR-referenced closed issues
   # (stale ready-label cleanup). Irrelevant here (no PRs) but harmless — 0
   # disables finalization outright if you'd rather make that explicit.
