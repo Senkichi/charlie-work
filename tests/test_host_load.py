@@ -38,7 +38,7 @@ from charlie_work.config import (
     OrchestratorConfig,
     build_config_from_data,
 )
-from charlie_work.instrumentation import query_events
+from charlie_work.instrumentation import _classify_level, query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
@@ -280,6 +280,20 @@ def test_measure_host_load_logs_unavailable_event(tmp_path: Path) -> None:
     assert events[0]["repo"] == "repo"
     assert events[0]["payload"]["reason"] == "measurement_failed"
     assert "powershell exploded" in events[0]["payload"]["detail"]
+    assert events[0]["level"] == "warning"
+
+
+def test_host_load_unavailable_registered_at_warning() -> None:
+    """``host_load_unavailable`` is registered at ``warning`` in
+    ``event_levels/host_load_unavailable.level``.
+
+    The emit site passes ``level="warning"`` explicitly, so the row's level
+    does not depend on the registry -- but ``_WARNING_KINDS``-iterating
+    surfaces (heartbeat's per-kind warning coverage) only see registered
+    kinds, and the ``{base}_sweep`` level inheritance consults the registry
+    too. An absent or mis-leveled entry would silently reclassify the kind.
+    """
+    assert _classify_level("host_load_unavailable") == "warning"
 
 
 def test_measure_host_load_rate_limits_repeated_failures(tmp_path: Path) -> None:
