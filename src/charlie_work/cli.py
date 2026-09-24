@@ -697,9 +697,7 @@ def _assert_config_repo_matches(config_arg: Path | None, repo_root: Path) -> Non
 #: Read-only commands are deliberately exempt: their cwd-defaulted resolution
 #: is harmless and changing it would break operator workflows that routinely
 #: run ``charlie status`` from worktree cwds.
-_STATE_AFFECTING_COMMANDS = frozenset(
-    {"verdict", "merge-authorize", "unescalate", "reap-reviews"}
-)
+_STATE_AFFECTING_COMMANDS = frozenset({"verdict", "merge-authorize", "unescalate", "reap-reviews"})
 
 
 def _assert_not_sibling_clone(ctx: CommandContext, args: argparse.Namespace) -> None:

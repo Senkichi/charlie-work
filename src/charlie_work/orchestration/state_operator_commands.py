@@ -961,8 +961,7 @@ def reap_reviews(self, limit: int | None = None) -> _wf.CommandResult:
         reapable = [c["pr"] for c in claims if c["would_reap"]]
         return _wf.CommandResult(
             True,
-            f"dry-run: {len(reapable)} of {len(claims)} open review claim(s) "
-            "would be reaped",
+            f"dry-run: {len(reapable)} of {len(claims)} open review claim(s) would be reaped",
             {
                 "dry_run": True,
                 "claims": claims,

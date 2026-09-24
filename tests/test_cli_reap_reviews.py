@@ -106,9 +106,7 @@ def test_reap_reviews_frees_dead_claim_while_supervisor_lock_held(tmp_path: Path
     assert not sidecar.exists()
 
 
-def test_reap_reviews_dispatches_freed_claim_when_lock_free(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_reap_reviews_dispatches_freed_claim_when_lock_free(monkeypatch, tmp_path: Path) -> None:
     """With no supervisor running, reap + re-dispatch happen in one call.
 
     The claim is reaped by the sweep block at the top of dispatch_reviews,
@@ -182,9 +180,7 @@ def test_reap_reviews_skips_fresh_dead_claim(tmp_path: Path) -> None:
         reviews_dir,
         100,
         "ordinary crash output\n",
-        started_at=(datetime.now(UTC) - timedelta(seconds=30))
-        .isoformat()
-        .replace("+00:00", "Z"),
+        started_at=(datetime.now(UTC) - timedelta(seconds=30)).isoformat().replace("+00:00", "Z"),
     )
 
     lock = try_acquire_supervisor_lock(layout.supervisor_lock_path(app.paths.root))
