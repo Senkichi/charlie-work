@@ -1786,6 +1786,7 @@ def _classify_dead_sessions_and_update_throttle_state(
         is_worker_confirmed_dead,
         iter_workers,
     )
+    from .worker_literal_tmp import emit_literal_tmp_path_warning
     from .worktree import WorktreeState
 
     now_for_health = now if now is not None else datetime.now(UTC)
@@ -2162,6 +2163,13 @@ def _classify_dead_sessions_and_update_throttle_state(
                     "pid": w.pid,
                 }
             )
+
+            # Issue #1780: post-hoc signal for the residual class #1767
+            # could not close — a literal ``/tmp`` shell command resolves
+            # through MSYS's install-wide mount regardless of the
+            # per-session TMPDIR. Fires at most once per session: the
+            # sidecar was just reaped above. See worker_literal_tmp.py.
+            emit_literal_tmp_path_warning(state_file, w, write_gate)
 
             # Issue #1342: emit a distinct error-level event on the FIRST
             # detection of a provider account suspension so the operator learns

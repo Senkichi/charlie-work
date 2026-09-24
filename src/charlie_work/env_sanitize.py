@@ -55,11 +55,14 @@ in a shared, install-wide table seeded once while any ``bash.exe`` from that
 Git install is alive, and does not recompute it from a new process's own
 TMP/TEMP -- verified by launching a standalone ``bash.exe`` with TMP/TEMP
 overridden and observing ``cygpath -w /tmp`` still resolve to the pre-existing
-shared temp dir, unchanged. See issue #1767 for the full probe, and issue
-#1780 for the tracked follow-up: a worker's Git-Bash shell commands (the
-common case for the ``claude-code``/``api`` adapters) must use ``$TMPDIR``
-and never a literal ``/tmp/...`` path, which this change cannot enforce by
-itself.
+shared temp dir, unchanged. See issue #1767 for the full probe. Issue #1780
+closed the residual at the layers environment sanitizing cannot reach: the
+``session_scratch_dir`` prompt section instructs workers to use ``$TMPDIR``
+and never a literal ``/tmp/...`` path, ``assert_session_scratch_dir`` keeps
+that instruction present in every rendered worker/rework prompt even under a
+repo-local flat override, and the dead-session lane in ``dead_worker_reap``
+emits a ``worker_literal_tmp_path`` warning when a reaped session's
+stream-json transcript shows a literal ``/tmp`` shell command anyway.
 
 Shared-venv confinement (issue #649): ``sanitize_env`` does not rely on a
 ``UV_PROJECT_ENVIRONMENT`` pin to protect a junctioned shared venv. Once the
