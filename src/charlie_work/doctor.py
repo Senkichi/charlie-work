@@ -19,6 +19,7 @@ import yaml
 
 from .config import ApiWorkerConfig, OrchestratorConfig
 from .doctor_allocation import _check_runner_allocation
+from .doctor_config_drift import _check_aviator_required_checks, _check_triage_label_map
 from .doctor_cross_repo import _check_cross_repo_escalations
 from .doctor_local_backend import _check_local_issue_backend
 from .env_sanitize import worker_github_token_findings
@@ -1324,6 +1325,14 @@ def run_doctor(
                 "required_checks configured but no parseable .github/workflows/*.yml found",
                 severity="warning",
             )
+
+    # -- config drift pairs (issue #1849) ------------------------------------
+    # Two repo files restate values this config owns: docs/agents/
+    # triage-labels.md restates labels.ready for the skills plugin, and
+    # .aviator/config.yml restates auto_merge.required_checks for the merge
+    # queue. Both drift silently; both checks pass unadopted. Read-only.
+    _check_triage_label_map(add, repo_root, config)
+    _check_aviator_required_checks(add, repo_root, config)
 
     # -- labels --------------------------------------------------------------
     if publishes_prs:

@@ -43,7 +43,8 @@ $section_available_skills
 ## Required implementation loop
 
 1. $section_loop_branch_step
-2. Read `CLAUDE.md`, `CONTRIBUTING.md`, the issue, and relevant code.
+2. Read `CLAUDE.md`, `CONTRIBUTING.md`, `CONTEXT.md` (where present), the
+   issue, and relevant code.
 3. Reproduce or precisely explain the defect/requirement.
 4. Implement the smallest correct change.
 
