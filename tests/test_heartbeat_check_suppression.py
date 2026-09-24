@@ -260,13 +260,16 @@ def test_suppression_integration_with_check_stale_open_issue_mentions(
     assert "PR #824" in report.lines[-1]
 
 
-def test_seeded_registry_loads_as_one_fleet_wide_entry(hb: ModuleType) -> None:
+def test_seeded_registry_loads_and_matches_both_fleet_repos(hb: ModuleType) -> None:
     """The registry checked into the repo (scripts/heartbeat-suppressions.yaml)
     parses cleanly as a single fleet-wide entry with a live (non-expired, as
     of this test's authorship) tracking issue: `repo` is omitted so the
     suppression covers every current and future fleet repo by construction
     (issue #1860 -- the prior per-repo enumeration missed Senkichi/jobcannon
-    and Senkichi/swole when they onboarded)."""
+    and Senkichi/swole when they onboarded). The leaf name predates #1860
+    and is kept verbatim: the collect-only gate (issue #1538) fails test
+    renames fail-closed, and it stays accurate since the one fleet-wide
+    entry still matches both repos it names, along with every other."""
     registry_path = Path(__file__).parent.parent / "scripts" / "heartbeat-suppressions.yaml"
     entries, err = hb.load_suppression_registry(registry_path)
 
