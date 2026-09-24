@@ -237,6 +237,20 @@ SCHTASKS_OK_RESULT_CODES = {0, 267009, 267011, -2147020576}
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+# ``charlie_work.layout.GLOBAL_CONFIG_FILENAME`` mirrored under the
+# stdlib-only invariant (scripts/README.md): the fleet-wide config layer
+# ``load_repos`` consults for ``local_issues.enabled`` when a repo's own
+# config does not set the key.
+FLEET_GLOBAL_CONFIG_FILENAME = "config.yaml"
+
+# Skip detail emitted by every gh-based check on a ``local_issues.enabled``
+# repo (issue #1861). A local-only repo has no GitHub remote, so
+# ``gh <issue|pr> list -R <slug>`` can only ever fail with "Could not
+# resolve to a Repository" -- a permanent spurious ANOMALY per beat per
+# check. The check reports this OK line instead: visible, uniform with the
+# one-line-per-check contract, and never an anomaly.
+LOCAL_ONLY_SKIP_DETAIL = "skipped: local-only repo (local_issues.enabled; no GitHub remote)"
+
 
 @dataclass(frozen=True)
 class RepoInfo:
@@ -244,6 +258,13 @@ class RepoInfo:
     repo_root: Path
     state_dir: Path
     config_path: Path
+    # Whether the repo's effective config sets ``local_issues.enabled`` --
+    # the local-file issue backend (``LocalFileGitHub``) for a repo with no
+    # GitHub remote. Resolved in ``load_repos`` from the layered config
+    # (repo config, then fleet global layer), mirroring the
+    # ``publishes_pull_requests`` capability gate #1831 put on the
+    # orchestrator side. False = GitHub-backed repo (the default).
+    local_issues_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -481,6 +502,27 @@ def state_file() -> Path:
     return fleet_dir() / "heartbeat-state.json"
 
 
+def _local_issues_enabled(repo_config: dict[str, Any], fleet_config: dict[str, Any]) -> bool:
+    """Effective ``local_issues.enabled`` under layered-config precedence (issue #1861).
+
+    Mirrors ``global_config.load_layered_config``'s per-key precedence for
+    this one knob (stdlib-only reimplementation -- the script cannot import
+    the package): the repo's own config wins when it sets
+    ``local_issues.enabled``; otherwise the fleet layer's value applies; a
+    layer that does not set the key falls through to the next. Anything
+    that is not a mapping or not literally ``True`` reads as disabled --
+    an unreadable or ambiguous config cannot prove the repo is local, so it
+    is treated as GitHub-backed and the gh-based checks still run (the same
+    posture ``fleet_registry`` documents for its runner count: fall through
+    to the GitHub path on unclassifiable config).
+    """
+    for layer in (repo_config, fleet_config):
+        section = layer.get("local_issues")
+        if isinstance(section, dict) and "enabled" in section:
+            return section["enabled"] is True
+    return False
+
+
 def load_repos() -> tuple[list[RepoInfo], str | None]:
     """Load registered repos from fleet.json. Returns (repos, error)."""
     fleet_json = fleet_dir() / "fleet.json"
@@ -490,15 +532,24 @@ def load_repos() -> tuple[list[RepoInfo], str | None]:
         data = json.loads(fleet_json.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return [], f"fleet.json unreadable: {exc}"
+    # The fleet global layer may hold ``local_issues.enabled`` for a repo
+    # whose own config does not set it -- load_layered_config merges it
+    # under the per-repo file, and fleet_registry relies on that same
+    # layering for its runner count. A bare per-repo read would resolve to
+    # the dataclass default (False) and misclassify such a repo.
+    fleet_config, _fleet_err = load_orchestrator_config(fleet_dir() / FLEET_GLOBAL_CONFIG_FILENAME)
     repos: list[RepoInfo] = []
     for slug, entry in data.get("repos", {}).items():
         try:
+            config_path = Path(entry.get("config_path", ""))
+            repo_config, _config_err = load_orchestrator_config(config_path)
             repos.append(
                 RepoInfo(
                     slug=slug,
                     repo_root=Path(entry["repo_root"]),
                     state_dir=Path(entry["state_dir"]),
-                    config_path=Path(entry.get("config_path", "")),
+                    config_path=config_path,
+                    local_issues_enabled=_local_issues_enabled(repo_config, fleet_config),
                 )
             )
         except KeyError:
@@ -1161,6 +1212,19 @@ def check_dispatch_coverage(
 ) -> None:
     """``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``."""
     check = f"dispatch-coverage {repo.slug}"
+    if repo.local_issues_enabled:
+        report.ok(check, LOCAL_ONLY_SKIP_DETAIL)
+        # Nothing gh-derived was measured this beat; carry the last real
+        # beat's snapshot forward untouched, same as skip_delta.
+        new_repo_state["dispatchable_issues"] = prev_repo_state.get("dispatchable_issues", [])
+        # The two sub-checks below are state-file checks, not gh checks --
+        # the throttle line's contract is that it always prints, and the
+        # staleness check emits its own local-only skip line.
+        check_dispatch_throttle(report, repo, now=now)
+        check_in_progress_staleness(
+            report, repo, [], prev_repo_state, new_repo_state, skip_delta, now=now
+        )
+        return
     args = [
         "issue",
         "list",
@@ -1332,6 +1396,9 @@ def check_armable_backlog(
     around.
     """
     check = f"armable-backlog {repo.slug}"
+    if repo.local_issues_enabled:
+        report.ok(check, LOCAL_ONLY_SKIP_DETAIL)
+        return
     args = [
         "issue",
         "list",
@@ -1432,6 +1499,18 @@ def check_in_progress_staleness(
     """
     check = f"in-progress-stale {repo.slug}"
     prev_map: dict[str, str] = prev_repo_state.get("in_progress", {})
+
+    if repo.local_issues_enabled:
+        # The in-progress set is gh-derived (check_dispatch_coverage's
+        # `gh issue list`), which cannot run on a local-only repo. Skipping
+        # rather than deriving it from state.json's issue mirror on purpose:
+        # the mirror lags (observed: a merged issue still carried
+        # `agent:in-progress` a day after its file went `state: closed`),
+        # so deriving here would manufacture exactly the kind of permanent
+        # false ANOMALY the #1861 gate exists to remove.
+        new_repo_state["in_progress"] = prev_map
+        report.ok(check, LOCAL_ONLY_SKIP_DETAIL)
+        return
 
     if skip_delta:
         # Leave the last real beat's snapshot untouched; this is not a real
@@ -1698,6 +1777,13 @@ def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | Non
     prs_dir = repo.state_dir / "prs"
     if not prs_dir.exists():
         report.ok(check, "open_claims=0 (no prs dir)")
+        return
+
+    if repo.local_issues_enabled:
+        # Local-lane review claims live under the same prs/pr-<n>/ packet
+        # dirs, but the "still open" set this check filters them against
+        # comes from `gh pr list` -- unrunnable here.
+        report.ok(check, LOCAL_ONLY_SKIP_DETAIL)
         return
 
     ok, open_data, err = run_gh_json(
@@ -2486,6 +2572,17 @@ def check_merge_flow(
     skip_delta: bool,
 ) -> None:
     check = f"merge-flow {repo.slug}"
+    if repo.local_issues_enabled:
+        # Carry the delta snapshot forward untouched, same as skip_delta:
+        # nothing was measured this beat.
+        new_repo_state["mergequeue_count"] = prev_repo_state.get("mergequeue_count")
+        new_repo_state["mergequeue_unchanged_streak"] = prev_repo_state.get(
+            "mergequeue_unchanged_streak", 0
+        )
+        new_repo_state["last_merged_at"] = prev_repo_state.get("last_merged_at")
+        report.ok(check, LOCAL_ONLY_SKIP_DETAIL)
+        return
+
     ok_open, open_data, err_open = run_gh_json(
         ["pr", "list", "-R", repo.slug, "--state", "open", "--json", "number,labels"],
         repo.repo_root,
@@ -2629,6 +2726,9 @@ def check_stale_open_issue_mentions(report: Report, repo: RepoInfo) -> None:
     "+K more" suffix) so a large true positive count cannot flood the beat.
     """
     check = f"stale-open-issue-mentions {repo.slug}"
+    if repo.local_issues_enabled:
+        report.ok(check, LOCAL_ONLY_SKIP_DETAIL)
+        return
 
     ok_open, open_data, err_open = run_gh_json(
         [
