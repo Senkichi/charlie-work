@@ -263,41 +263,6 @@ class TestLocalLanePrimitives:
         # Second call returns the same worktree rather than re-adding.
         assert ensure_branch_worktree(repo, "agent/issue-7-x", worktrees_dir) == wt
 
-    @pytest.mark.skipif(
-        sys.platform != "win32", reason="junction path spellings are Windows-specific"
-    )
-    def test_ensure_branch_worktree_returns_git_recorded_path(self, repo: Path) -> None:
-        """Create and reuse must report the same path spelling.
-
-        ``git worktree add`` canonicalizes the path it records -- an 8.3
-        short name or a junction inside ``worktrees_dir`` comes back from
-        ``git worktree list`` as the real path -- while
-        ``worktree_path_for_branch`` keeps the caller's spelling. When the
-        two diverge (GitHub's windows runners set TEMP to the 8.3
-        ``C:\\Users\\RUNNER~1\\...`` form), returning the computed target
-        makes ``worktree_for_branch(...) == wt`` flake. A junction stands
-        in for the 8.3 divergence: it needs no admin rights and resolves
-        regardless of whether NTFS 8.3 name generation is enabled.
-        """
-        import _winapi
-
-        _init_repo(repo)
-        _make_branch(repo, "agent/issue-7-x", "a.py", "a = 1\n")
-        real_dir = repo / "wt-real"
-        real_dir.mkdir()
-        alias = repo / "wt-alias"
-        _winapi.CreateJunction(str(real_dir), str(alias))
-
-        wt = ensure_branch_worktree(repo, "agent/issue-7-x", alias)
-
-        assert wt is not None and wt.is_dir()
-        # The returned path is git's canonical record, not the junction
-        # spelling the caller passed.
-        assert "wt-alias" not in str(wt)
-        assert worktree_for_branch(repo, "agent/issue-7-x") == wt
-        # Reuse reports the identical Path, not the alias spelling again.
-        assert ensure_branch_worktree(repo, "agent/issue-7-x", alias) == wt
-
     def test_ensure_branch_worktree_returns_gits_recorded_spelling(self, repo: Path) -> None:
         """Create-path and reuse-path return the same canonical spelling.
 
