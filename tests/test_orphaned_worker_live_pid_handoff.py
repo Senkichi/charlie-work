@@ -539,3 +539,46 @@ def test_live_pid_no_stale_outcome_never_calls_pr_list(tmp_path: Path) -> None:
     assert "pr_number" not in entry
     assert fake_gh.prs_created == []
     assert state.get("events", []) == []
+
+
+def test_live_pid_finalize_honors_workflow_patch_of_open_pr_helper(tmp_path: Path) -> None:
+    """Issue #1867 round 3: the live-handoff lane reaches
+    ``_open_pr_for_orphaned_branch`` through the ``charlie_work.workflow``
+    module object, so patching the name there (as every orphan test does)
+    intercepts this lane too instead of silently running the real helper.
+    """
+    from charlie_work.paths import resolved_layout, runtime_paths
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+    from charlie_work.worktree import worktree_path_for_branch
+
+    config = _config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    branch = "agent/issue-1867-patched-open-pr-helper"
+    repo_root = _make_repo_with_pushed_branch(tmp_path, branch)
+    _seed_dispatched_issue(paths, issue_number=1867, branch=branch)
+    worktrees_dir = resolved_layout(config, repo_root).worktrees
+    _write_outcome(
+        worktree_path_for_branch(repo_root, branch, worktrees_dir),
+        {"push_succeeded": True, "pr_created": False, "pr_title": "t", "pr_body": "Closes #1867"},
+        age_seconds=3600,
+    )
+    fake_gh = _fake_gh(
+        repo_root, issue_number=1867, in_progress=config.labels.in_progress, pr_create_return=9001
+    )
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch("charlie_work.workflow._worker_pid_alive", return_value=True),
+        patch(
+            "charlie_work.workflow._open_pr_for_orphaned_branch",
+            return_value=(None, "stubbed failure", None),
+        ) as open_pr,
+    ):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+
+    assert open_pr.call_count == 1
+    assert open_pr.call_args.kwargs["branch"] == branch
+    assert fake_gh.prs_created == []

@@ -43,7 +43,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import WORKER_OUTCOME_FILENAME, OrchestratorConfig
-from .dead_worker_reap import _open_pr_for_orphaned_branch
 from .github import GitHubLike, label_names
 from .state import PASSIVE_OPEN_STATUS, utc_now
 from .worktree import read_worker_outcome, worktree_path_for_branch
@@ -204,6 +203,13 @@ def finalize_live_handoff_candidates(
     not exited; the stall watchdog remains responsible for reaping the hung
     process on its own cadence.
     """
+    # Resolved through the workflow module object at call time (the
+    # ``import charlie_work.workflow as _wf`` seam), so a test patching
+    # ``charlie_work.workflow._open_pr_for_orphaned_branch`` also reaches this
+    # lane -- the same reason ``worker_pid_alive`` is a parameter. Imported
+    # here, not at module level: workflow.py imports this module at import time.
+    import charlie_work.workflow as _wf
+
     for issue_number in live_handoff_candidates:
         entry = state["issues"].get(str(issue_number), {})
         if not isinstance(entry, dict):
@@ -220,7 +226,7 @@ def finalize_live_handoff_candidates(
         # not statically typed; narrow to ``Path | None`` before the salvage
         # helper (``None`` is an error value it already handles).
         salvage_repo_root = repo_root if isinstance(repo_root, Path) else None
-        pr_number, pr_error, _closing_ref = _open_pr_for_orphaned_branch(
+        pr_number, pr_error, _closing_ref = _wf._open_pr_for_orphaned_branch(
             gh=gh,
             config=config,
             repo_root=salvage_repo_root,
