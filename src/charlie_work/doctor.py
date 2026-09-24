@@ -18,6 +18,7 @@ from typing import Any
 import yaml
 
 from .config import ApiWorkerConfig, OrchestratorConfig
+from .doctor_cross_repo import _check_cross_repo_escalations
 from .doctor_local_backend import _check_local_issue_backend
 from .env_sanitize import worker_github_token_findings
 from .fleet_paths import fleet_dir, fleet_dir_virtualization
@@ -1753,6 +1754,13 @@ def run_doctor(
     # the orchestrator's self-deploy state file. Flags exhausted retries
     # (ok: false) as a warning; adds nothing when the window is empty.
     _check_git_network_retries(add, paths)
+
+    # -- recent dispatch_cross_repo_escalated events (issue #1789) -----------
+    # Read-only: aggregates this repo's own events.db by the escalation
+    # payload's found_in_repo field -- the sibling repo a missing candidate
+    # was positively matched under. Warning-severity, silent when the
+    # window is empty.
+    _check_cross_repo_escalations(add, paths)
 
     hard_failures = [check for check in checks if not check.ok and check.severity == "error"]
     return (not hard_failures, checks)
