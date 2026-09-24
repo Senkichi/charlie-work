@@ -147,11 +147,13 @@ def ensure_branch_worktree(repo_root: Path, branch: str, worktrees_dir: Path) ->
     )
     if not result.ok:
         return None
-    # Report the path git recorded, not the spelling we passed: git
-    # canonicalizes it at add time (an 8.3 short name or a junction inside
-    # worktrees_dir comes back from `worktree list` as the real path), so
-    # returning `target` would make the create path and the reuse path
-    # report different spellings of the same directory.
+    # Re-read the path from git's own registry rather than trusting `target`
+    # verbatim: git can canonicalize the path it was given (e.g. resolving an
+    # 8.3 short-name component such as Windows CI's `RUNNER~1` temp dir to its
+    # long form) when it records the worktree. Returning git's own value here
+    # keeps this branch in agreement with the `existing` early-return above --
+    # the same branch never yields two different-but-equal-on-disk Path
+    # objects depending on whether the worktree was just created or reused.
     return worktree_for_branch(repo_root, branch) or target
 
 
