@@ -306,6 +306,40 @@ def test_rework_md_renders_via_real_writer_with_required_changes(tmp_path: Path)
     _assert_no_default_state_dir_literal(rendered, template_name="rework.md")
 
 
+def test_rework_local_md_renders_via_real_writer(tmp_path: Path) -> None:
+    """rework_local.md's real caller is the same ``_write_rework_prompt``
+    rework.md uses -- the template is selected by
+    ``config.dispatch.rework_template`` (``rework_prompts.py``'s render
+    call), which ``load_config`` re-defaults to ``rework_local.md`` when
+    ``local_issues.enabled`` (issue #1844). This exercises the no-verdict
+    shape on a local-lane-shaped ``pr`` dict (no GitHub url).
+
+    Rendered under a non-default ``runtime.state_dir`` so the companion
+    literal-absence assertion is non-vacuous -- see
+    ``test_worker_md_renders_via_real_writer`` for the rationale."""
+    config = OrchestratorConfig(
+        runtime=RuntimeConfig(state_dir="custom-state"),
+        dispatch=DispatchConfig(rework_template="rework_local.md"),
+    )
+    state_file = runtime_paths(tmp_path, config.runtime.state_dir).state_file
+    # The local lane's synthesized record shape (local_lane.local_pr_dict):
+    # no url/headRefOid from GitHub -- branch and issue linkage only.
+    pr = {
+        "number": 5,
+        "title": "Fake local issue",
+        "headRefName": "agent/issue-5-fake",
+        "local": True,
+    }
+
+    prompt_path = _write_rework_prompt(state_file, pr, 5, "A dispatch note.", config)
+
+    rendered = prompt_path.read_text(encoding="utf-8")
+    assert not _unresolved_placeholders_in_output(rendered), (
+        "rendered prompt still contains an unresolved $placeholder"
+    )
+    _assert_no_default_state_dir_literal(rendered, template_name="rework_local.md")
+
+
 def test_worker_writer_rejects_flat_override_without_no_merge_contract(
     tmp_path: Path,
 ) -> None:
@@ -578,8 +612,32 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "prior_review_section",
 }
 
+# orchestration/local_lanes.py::_local_build_packet, the literal values dict
+# passed to ``self._render("review_local.md", {...})`` -- the local
+# (no-remote) review packet's prompt (issue #1844). Same packet-section
+# seams as review.md minus the GitHub-only fields (no pr_url/issue_url/ci
+# status), plus the local-only branch/base pinning keys.
+REVIEW_LOCAL_MD_SUPPLIED_KEYS = {
+    "pr_number",
+    "issue_number",
+    "issue_title",
+    "branch_name",
+    "head_sha",
+    "base_ref",
+    "pr_json_path",
+    "diff_path",
+    "diff_size_section",
+    "janitor_section",
+    "test_adequacy_section",
+    "static_probe_section",
+    "over_cap_section",
+    "attachment_budget_section",
+    "prior_review_section",
+}
+
 _PINNED_KEY_SETS = {
     "review.md": REVIEW_MD_SUPPLIED_KEYS,
+    "review_local.md": REVIEW_LOCAL_MD_SUPPLIED_KEYS,
 }
 
 
@@ -762,6 +820,7 @@ _COVERED_TEMPLATES = {
     "worker_claude_code.md",
     "worker_local.md",
     "rework.md",
+    "rework_local.md",
     *_PINNED_KEY_SETS,
 }
 

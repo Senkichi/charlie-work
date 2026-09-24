@@ -1967,6 +1967,10 @@ class NotifyConfig:
 # push, no PR. Becomes ``dispatch.worker_template``'s default when
 # ``local_issues.enabled`` (see ``load_config``).
 LOCAL_WORKER_TEMPLATE = "worker_local.md"
+# Package rework template for the same lane: commits to the existing branch
+# instead of pushing to a PR. Becomes ``dispatch.rework_template``'s default
+# under ``local_issues.enabled`` (see ``load_config``).
+LOCAL_REWORK_TEMPLATE = "rework_local.md"
 
 
 @dataclass(frozen=True)
@@ -3817,6 +3821,14 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     # wins: only the *default* moves.
     if local_issues.enabled and "worker_template" not in dispatch_data:
         dispatch = replace(dispatch, worker_template=LOCAL_WORKER_TEMPLATE)
+    if local_issues.enabled and "rework_template" not in dispatch_data:
+        dispatch = replace(dispatch, rework_template=LOCAL_REWORK_TEMPLATE)
+    # Issue #1844: a no-remote repo has no GitHub review lane to defer to, so
+    # the automated local review lane IS the review -- default it on, the same
+    # way the worker/rework templates re-default above. An explicit
+    # ``review_dispatch.enabled`` (either value) wins: only the default moves.
+    if local_issues.enabled and "enabled" not in review_dispatch_data:
+        review_dispatch = replace(review_dispatch, enabled=True)
     runners_data = _section(data, "runners")
     # Validate runners config fields
     for bool_key in ("enabled", "cancel_superseded_main_runs"):

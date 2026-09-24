@@ -181,6 +181,10 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "loop_refused_preflight": "error",
         "merge_blocked": "error",
         "merge_deferred_stale_base_alarm": "error",
+        # Issue #1844: the local (no-remote) merge lane hit a git failure that
+        # was neither a conflict (routes to rework) nor a transient deferral --
+        # the record escalates to a human. Error, like ``merge_failed``.
+        "local_merge_failed": "error",
         "merge_failed": "error",
         "merge_failed_attempt_alarm": "error",
         "operator_claim_failed": "error",
@@ -255,6 +259,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # see that launches are being held by the budget, not silently dropped.
         "api_budget_refused": "warning",
         "ci_fleet_worktree_dirty": "warning",
+        # Issue #1844: local-lane adoption could not resolve a parked issue's
+        # branch/commits, or packet generation failed to diff the branch. The
+        # record is parked/escalated rather than dropped, so this is a
+        # notable-but-handled condition -- the same warning class the remote
+        # lane uses for review-packet failures.
+        "local_review_adopt_failed": "warning",
+        "local_review_packet_failed": "warning",
         # Issue #1770: ci_headroom_available (ci_headroom.py)
         # could not compute a repo's CI dispatch headroom from the freshest
         # runner_allocation event (missing, stale, unconfigured repo, a
@@ -602,6 +613,20 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "intake_prose_only_deps": "info",
         "janitor_gate": "info",
         "live_worker_redispatch_averted": "info",
+        # Issue #1844: the local (no-remote) lane adopted a parked worker
+        # branch into a reviewable record (the local counterpart of the
+        # remote lane's PR discovery). Info -- the lane doing its job.
+        "local_review_adopted": "info",
+        # Issue #1844: outcome of the local merge gate's full-suite run inside
+        # the branch worktree, and the rework routing when it fails. Info:
+        # the pass/fail record is routine bookkeeping; a failure routes to
+        # rework like ``merge_conflict_rework_requested``, not to a human.
+        "local_suite_result": "info",
+        "local_suite_failed": "info",
+        # Issue #1844: the local merge gate found the base checkout unsafe to
+        # advance this pass (dirty worktree, racing ref) and will retry.
+        # Info, sibling to ``merge_deferred_stale_base``.
+        "local_merge_deferred": "info",
         "loop_completed": "info",
         "loop_started": "info",
         "main_ci_reclaim_cancelled": "info",

@@ -236,6 +236,16 @@ def _loop_body(
     # instant as the rest of this pass instead of resampling.
     dispatch_reviews = self.dispatch_reviews(now=now)
 
+    # Issue #1844: the local (no-remote) review/merge lane. On a
+    # ``LocalFileGitHub`` backend every remote stage in this pass is a no-op
+    # (``pr_list`` is empty, no PRs to iterate), so without this hook a
+    # finished worker would park at ``agent:review-ready`` forever. The lane
+    # adopts parked branches into review records, launches reviewers on the
+    # branch diff, runs the base-merge + full-suite + merge gate, and
+    # re-dispatches rework -- the whole worker->merge lifecycle with no
+    # operator gate. It is itself a no-op on a remote backend.
+    local_lane_result = self._local_lane(now=now)
+
     reviews: list[dict[str, Any]] = []
     merges: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -713,7 +723,14 @@ def _loop_body(
             ),
         )
 
-    ok = intake.ok and dispatch.ok and dispatch_rework.ok and dispatch_reviews.ok and not errors
+    ok = (
+        intake.ok
+        and dispatch.ok
+        and dispatch_rework.ok
+        and dispatch_reviews.ok
+        and local_lane_result.ok
+        and not errors
+    )
     message = "loop complete"
     if errors:
         message = f"loop completed with {len(errors)} PR error(s)"
@@ -725,11 +742,14 @@ def _loop_body(
         message = dispatch_rework.message
     elif not dispatch_reviews.ok:
         message = "loop completed with review dispatch failures"
+    elif not local_lane_result.ok:
+        message = "loop completed with local-lane failures"
     data = {
         "intake": intake.data,
         "dispatch": dispatch.data,
         "dispatch_rework": dispatch_rework.data,
         "dispatch_reviews": dispatch_reviews.data,
+        "local_lane": local_lane_result.data,
         "reviews": reviews,
         "merges": merges,
         "errors": errors,

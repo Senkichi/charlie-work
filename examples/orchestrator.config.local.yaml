@@ -3,11 +3,14 @@
 #
 # For a repo with NO GitHub remote: issues are markdown files under
 # local_issues.issues_dir instead of GitHub issues (local_issues.py /
-# local_issue_files.py). Everything PR/CI/merge-shaped (review_dispatch,
-# auto_merge, required_checks, …) is a null object here — reads answer
-# empty, writes fail as values — so those sections below are declared for
-# parity with the other shipped profiles but have nothing to act on. See
-# README.md#local-file-issue-source for the full mechanism and limitations.
+# local_issue_files.py). The GitHub-API surface is a null object here —
+# reads answer empty, writes fail as values — but review and merge are NOT
+# dead ends: with review_dispatch + auto_merge enabled (both default on for
+# local repos) the supervisor runs a local lane per finished ticket —
+# reviewer diff against the base branch, base sync + full suite in the
+# branch worktree, then a fast-forward (or --no-ff) merge of the base
+# branch — all without an operator gate. See
+# README.md#local-file-issue-source for the full mechanism.
 
 local_issues:
   enabled: true
@@ -31,44 +34,64 @@ dispatch:
   # disables finalization outright if you'd rather make that explicit.
   finalize_limit: 25
   branch_prefix: agent/issue
-  # No worker_template set here deliberately: local_issues.enabled above
-  # re-defaults dispatch.worker_template to worker_local.md automatically
-  # (config.load_config) — commit-only, no push, no PR. Set this explicitly
-  # only to override that default with your own repo-local template.
+  # No worker_template/rework_template set here deliberately:
+  # local_issues.enabled above re-defaults them to worker_local.md /
+  # rework_local.md automatically (config.load_config) — commit-only, no
+  # push, no PR, and rework loops back through the local review lane. Set
+  # these explicitly only to override the defaults with your own repo-local
+  # templates.
   # worker_template: worker_claude_code.md
+  # rework_template: rework.md
   # Runner prefix for templates that render a test command (worker.md,
   # worker_claude_code.md, rework.md); the prompt adds the impacted test files
-  # and "-q --tb=short". No effect under the default worker_local.md, which tells
-  # the worker to use the repo's own documented test command.
+  # and "-q --tb=short". Also used as the full-suite command at the local
+  # merge gate (the suite runs in the updated branch worktree before the
+  # base branch is advanced). No effect under the default worker_local.md,
+  # which tells the worker to use the repo's own documented test command.
   # test_command: uv run --directory server pytest
   # Dispatch order: "oldest" (default) or "newest" (previous behavior)
   # order: oldest
 
 review:
-  # Escalates to agent:human-needed past this many request_changes cycles.
-  # Irrelevant for local issues (there is no PR to review), kept for parity.
+  # Escalates to agent:human-needed past this many request_changes cycles —
+  # applies to the local review lane as well (a local reviewer verdict is
+  # required before the base branch is advanced).
   max_rework_cycles: 2
   require_tests_or_rationale: true
   require_issue_link: true
 
 review_dispatch:
-  # No PRs exist for a local-file issue source, so there is nothing for an
-  # automated reviewer to dispatch against. Leave this off.
-  enabled: false
+  # For local repos this is ON by default (config.load_config re-defaults it
+  # when local_issues.enabled is true and the key is absent) and drives the
+  # local review lane: a reviewer session inspects `git diff <base>...<branch>`
+  # in a read-only checkout, exactly like the remote lane inspects a PR diff.
+  # Verdicts reuse the remote vocabulary (approved / request_changes /
+  # blocked) and labels. Set enabled: false only as a kill switch — parked
+  # branches then wait for a human to review and merge them by hand.
+  enabled: true
   reviews_dir: .var/charlie-work/dispatches/reviews
-  max_local_review_processes: 0
+  # Per-host bound on concurrent local reviewer processes (0 = unlimited).
+  # Reviewers run on THIS host next to the workers — keep this small.
+  max_local_review_processes: 2
 
 auto_merge:
-  # LocalFileGitHub.merge_pr always fails (GitHubError) — there is no PR to
-  # merge. Leaving this on is harmless (ship-it has nothing to act on); flip
-  # it off if the "enabled but never fires" state bothers you operationally.
+  # For local repos this drives the local merge gate: once a reviewer
+  # approves, the current base is merged into the branch worktree, the full
+  # suite runs there, and on green the base branch is fast-forwarded (or
+  # merged with --no-ff when it has diverged) — no operator action. Set
+  # enabled: false to keep the approve-by-reviewer step but land merges by
+  # hand. Conflicts and suite failures route back through the rework lane
+  # automatically.
   enabled: true
+  # strategy/delete_branch/required_checks are GitHub-PR mechanics — no-ops
+  # for the local lane, which always merges the head branch as-is.
   strategy: squash
   delete_branch: true
   require_approved_review: true
   # MUST match the check-run names GitHub reports for your CI. Irrelevant
-  # here (no CI integration for local repos) — kept for parity with the
-  # other shipped profiles.
+  # here (no CI integration for local repos; the local lane runs the full
+  # suite directly instead of polling check runs) — kept for parity with
+  # the other shipped profiles.
   required_checks:
     - Test
     - "Lint, Types & Pre-commit"
@@ -88,9 +111,8 @@ worker:
   harness: claude-code
 
 reviewer:
-  # No automated reviewer is dispatched in this profile (review_dispatch is
-  # off above, and there are no PRs to review regardless); harness is
-  # declared for config-shape parity with the other shipped profiles.
+  # Harness for the local-lane reviewer sessions (claude-code runs them
+  # headless in read-only checkouts on this host).
   harness: claude-code
 
 devin:
