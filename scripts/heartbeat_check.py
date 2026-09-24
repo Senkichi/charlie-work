@@ -191,6 +191,18 @@ SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
 SUPERVISOR_WEDGE_LOOP_EVENT_KIND = "supervisor_wedge_loop"
 SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS = 24
 
+# Issue #1859: the notify digest shipped as a signal without a consumer --
+# the daemon's writer was dead for three weeks while nothing read the file.
+# Verdict logic lives in charlie_work.notify_digest_check, a stdlib-only
+# leaf imported behind the same guard as event_kinds; this script injects
+# its own fleet_dir / load_orchestrator_config / parse_iso so nothing is
+# duplicated. NOTIFY_DIGEST_STALE_HOURS is re-exported for tests.
+try:
+    from charlie_work import notify_digest_check as _ndc
+except ImportError:
+    _ndc = None
+NOTIFY_DIGEST_STALE_HOURS = _ndc.NOTIFY_DIGEST_STALE_HOURS if _ndc else 24
+
 # Disk-free thresholds (issue #1359): the 2026-08-19 outage drained C: to 0
 # bytes free over ~3.5 days at ~4 MB/s while every fleet pass failed with
 # `OSError: [Errno 28] No space left on device` and state.json went stale in
@@ -3057,6 +3069,35 @@ def check_wedge_kill_loop(report: Report) -> None:
         report.ok(check, facts)
 
 
+def _script_checkout_root() -> Path:
+    """This script's checkout -- the supervisor's cwd anchor for a relative
+    notify.file_path and for the checkout's own config layer."""
+    return Path(__file__).resolve().parent.parent
+
+
+def check_notify_digest_freshness(
+    report: Report,
+    *,
+    now: datetime | None = None,
+    checkout_root: Path | None = None,
+) -> None:
+    """Issue #1859 consumer: flag an enabled file sink whose digest is dead."""
+    if _ndc is None:
+        report.warn(
+            "notify-digest",
+            "check unavailable: charlie_work.notify_digest_check not importable",
+        )
+        return
+    _ndc.check_notify_digest_freshness(
+        report,
+        now=now,
+        checkout_root=checkout_root if checkout_root is not None else _script_checkout_root(),
+        fleet_dir=fleet_dir(),
+        load_orchestrator_config=load_orchestrator_config,
+        parse_iso=parse_iso,
+    )
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -3141,6 +3182,7 @@ def main() -> int:
     check_supervisor_venv_refusal(report, repos, baseline)
     check_supervisor_heartbeat(report)
     check_wedge_kill_loop(report)
+    check_notify_digest_freshness(report, now=now)
 
     save_state(new_state)
 

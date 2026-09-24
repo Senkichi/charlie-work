@@ -1,0 +1,7 @@
+warning
+# Issue #1859: dead-man's switch for the notify file sink. Fires once per
+# stale episode when notify.enabled is true but digest.jsonl has produced no
+# writes for a day -- the writer-dead shape the daemon hid for three weeks.
+# Warning, not error: a quiet-but-healthy fleet can legitimately emit no
+# attention transitions for a day, so this is a tripwire for an operator to
+# investigate, not a proven outage.
