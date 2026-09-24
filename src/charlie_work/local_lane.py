@@ -147,7 +147,12 @@ def ensure_branch_worktree(repo_root: Path, branch: str, worktrees_dir: Path) ->
     )
     if not result.ok:
         return None
-    return target
+    # Report the path git recorded, not the spelling we passed: git
+    # canonicalizes it at add time (an 8.3 short name or a junction inside
+    # worktrees_dir comes back from `worktree list` as the real path), so
+    # returning `target` would make the create path and the reuse path
+    # report different spellings of the same directory.
+    return worktree_for_branch(repo_root, branch) or target
 
 
 def suite_command_argv(configured_runner: str, repo_root: Path) -> list[str] | None:
