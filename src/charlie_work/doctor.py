@@ -20,7 +20,6 @@ import yaml
 from .config import ApiWorkerConfig, OrchestratorConfig
 from .doctor_cross_repo import _check_cross_repo_escalations
 from .doctor_local_backend import _check_local_issue_backend
-from .env_sanitize import worker_github_token_findings
 from .fleet_paths import fleet_dir, fleet_dir_virtualization
 from .fleet_registry import _load_registry
 from . import layout
@@ -221,101 +220,6 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
             "adapter probe",
             True,
             f"adapter `{adapter}` launches nothing itself — no CLI probe applies",
-            severity="warning",
-        )
-
-
-#  Issue #873 Part 2 / #1001: the token variable names and the adapter-path
-#  predicate live in env_sanitize.py now — shared by this preflight check and
-#  the dispatch gate in workflow.py so they cannot drift (issue #1001). The
-#  pre-#1001 private _STRIPPED_GH_TOKEN_VARS copy was deleted when
-#  worker_github_token_findings became the single predicate.
-
-
-def _check_worker_github_token(add: Any, config: OrchestratorConfig) -> None:
-    """Flag a dispatch-enabled adapter with no scoped GitHub token configured
-    for its workers (issue #873 Part 2).
-
-    Delegates to :func:`env_sanitize.worker_github_token_findings` — the single
-    predicate shared with the dispatch gate in ``workflow.py:_dispatch_impl``
-    (issue #1001) — so the doctor preflight and the dispatch gate cannot
-    disagree about whether the fleet is healthy.
-
-    Background: ``env_sanitize.sanitize_env`` (issue #502) is a deliberate
-    security control — it strips ``GH_TOKEN``/``GITHUB_TOKEN`` (and the GHES
-    equivalents) from every worker subprocess's environment and points
-    ``GH_CONFIG_DIR`` at an empty, worktree-local directory, so a worker can
-    never use the orchestrator's own ``gh`` credentials. The *only* sanctioned
-    way for a worker to reach ``gh`` is an operator-supplied token in
-    ``devin.worker_env``/``claude_code.worker_env``, which ``launch_devin_session``
-    (devin_shell.py) and ``launch_claude_worker`` (claude_code.py) each merge
-    back in AFTER ``sanitize_env()`` runs — see the "Merge order" comments on
-    ``DevinConfig.worker_env``/``ClaudeCodeConfig.worker_env`` in config.py.
-
-    Without an operator-configured token, a dispatched worker has no
-    sanctioned credential and either stalls waiting on a human, or — the
-    porousness issue #873 also names — improvises its way to a locally cached
-    Git Credential Manager entry that ``sanitize_env`` does not (and, per that
-    issue, deliberately does not yet) neutralize. Both outcomes are silent
-    until this check: nothing about a missing token fails loudly before
-    dispatch today.
-
-    This check reads only ``config.devin.worker_env`` /
-    ``config.claude_code.worker_env`` — it never reads the process
-    environment and never calls ``sanitize_env`` — so it cannot report a
-    false-healthy result from an ambient ``GH_TOKEN`` the sanitizer would
-    strip anyway, and it cannot widen what ``sanitize_env`` passes through;
-    it only observes whether the sanctioned provisioning path (the config
-    ``worker_env`` mapping) has been used. It reports presence as a boolean
-    only — it never logs a token value or any prefix of one.
-
-    Only fires for the adapter families that actually route through
-    ``sanitize_env``'s merge: ``devin-shell`` (sources ``devin.worker_env``)
-    and ``claude-code``/``api`` (both source ``claude_code.worker_env`` — the
-    ``api`` adapter reuses the claude-code launch path, see
-    ``workflow.py:_adapter_settings``). ``manual`` only writes a session
-    manifest for a human to act on and never launches a worker subprocess;
-    ``command`` runs ``subprocess_runner.run_captured`` with no ``sanitize_env``
-    call at all, so it inherits the orchestrator's full (unsanitized)
-    environment. Neither has the failure mode this check targets.
-
-    Two other paths dispatch through the claude-code launch path
-    (``claude_code.worker_env``) regardless of the configured default
-    ``worker.harness``, so a ``devin-shell``/``manual``/``command`` default
-    can still stall a worker mid-pass with no visible finding unless both are
-    covered:
-
-    * ``config.api_worker.enabled`` being ``True`` enables the ``api``
-      adapter tier, which reuses the claude-code launch path
-      (``claude_code.worker_env``) — so a missing ``claude_code`` token
-      can stall an api-adapter worker even when the default
-      ``worker.harness`` is not claude-code.
-    * ``_rescue_adapter_settings`` (workflow.py) *always* forces
-      ``adapter="claude-code"`` for the bounded rescue tier (issue #555)
-      once ``config.rescue.enabled`` is true, independent of
-      ``api_worker.enabled`` — rescue and the paid api tier are unrelated
-      toggles, so checking one does not imply the other is off.
-
-    Either toggle alone is enough for a dispatched worker to hit the
-    claude-code path, so this fires as a second, separately-named finding
-    whenever *either* is true, so that combination isn't hidden behind the
-    primary adapter's check.
-
-    Severity is ``warning``, not the default ``error``: issue #873 is
-    explicit that the sanctioned fix (an operator configuring a scoped token)
-    is a deferred, human action this check only surfaces — not one this
-    check performs or can force. An ``error`` severity would make
-    ``run_doctor``'s overall ``ok`` unconditionally ``False`` on every
-    production config that hasn't yet been given a token, with no path to
-    green except that same deferred human step (see ``cli.py``'s
-    severity-independent ``failed`` list — the finding is exactly as visible
-    at ``warning``, it just doesn't block).
-    """
-    for finding in worker_github_token_findings(config):
-        add(
-            finding.name,
-            finding.ok,
-            finding.detail,
             severity="warning",
         )
 
@@ -1622,23 +1526,6 @@ def run_doctor(
         f"reviewer: harness={config.reviewer.harness} model={config.reviewer.model or '(CLI default)'} | "
         f"cross-family: {cross_family_status}",
     )
-
-    # -- worker GitHub token (issue #873 Part 2) -----------------------------
-    # Config-only, no I/O: reads devin.worker_env/claude_code.worker_env, never
-    # the process environment or sanitize_env's output.
-    if publishes_prs:
-        _check_worker_github_token(add, config)
-    else:
-        # A worker on a no-remote backend is told never to run `gh`
-        # (prompts/worker_sections/local_no_merge_contract.md), so the missing
-        # scoped-token finding is a false positive here (issue #1706).
-        add(
-            "worker GitHub token",
-            True,
-            "not applicable — workers on this backend never run `gh`, so "
-            "sanitize_env has no token to restore",
-            severity="warning",
-        )
 
     # -- api worker observability (issue #483) ------------------------------
     # Always runs (not gated on --adapter-probe): these are config/environment
