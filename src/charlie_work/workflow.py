@@ -4474,10 +4474,13 @@ class OrchestratorApp:
         # Issue #1848: scan the open-issue blocker graph for cycles -- a loop
         # of open issues blocking each other (or an issue listing itself)
         # stalls every member forever while each still looks armed. Reporting
-        # only: one warning per distinct cycle is logged inside the scan, and
-        # one blocker_cycle event per cycle is recorded below. Runs with the
-        # rest of intake's reads, outside the state lock; fail-open.
-        blocker_cycles = detect_open_blocker_cycles(self.gh)
+        # only: one warning per reported cycle is logged inside the scan, and
+        # one blocker_cycle event per reported cycle is recorded below (both
+        # bounded by MAX_REPORTED_CYCLES; the intake event carries the
+        # truncation marker). Runs with the rest of intake's reads, outside
+        # the state lock; fail-open.
+        blocker_cycle_scan = detect_open_blocker_cycles(self.gh)
+        blocker_cycles = blocker_cycle_scan.cycles
         # Single lock for all state updates — skipped in dry-run (issue #618)
         if not self.dry_run:
             with state_lock(self.paths.state_file):
@@ -4514,7 +4517,14 @@ class OrchestratorApp:
                         {"issue_numbers": cycle},
                     )
                 state = self._record_event(
-                    state, "intake", {"issue_count": len(issues), "failed_count": len(failed)}
+                    state,
+                    "intake",
+                    {
+                        "issue_count": len(issues),
+                        "failed_count": len(failed),
+                        "blocker_cycles_reported": len(blocker_cycles),
+                        "blocker_cycles_truncated": blocker_cycle_scan.truncated,
+                    },
                 )
                 save_state(self.paths.state_file, state)
         message = "intake complete"
@@ -4534,6 +4544,7 @@ class OrchestratorApp:
                 "failed": failed,
                 "prose_only_deps_issues": prose_only_deps_issues,
                 "blocker_cycles": blocker_cycles,
+                "blocker_cycles_truncated": blocker_cycle_scan.truncated,
             },
         )
 
