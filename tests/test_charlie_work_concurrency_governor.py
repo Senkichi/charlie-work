@@ -36,7 +36,11 @@ from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # no
 def test_concurrency_governor_unlimited_when_unset(tmp_path: Path) -> None:
     """When max_concurrent_sessions is 0 (default), dispatch should behave as before (unlimited)."""
     config = OrchestratorConfig(
-        dispatch=DispatchConfig(max_concurrent_sessions=0),
+        # Issue #1843: host-load backpressure is ON by default, which would
+        # splat its report_fields (including concurrency_limit) into
+        # result.data -- this test pins the all-terms-off shape, so the new
+        # knob is disabled here explicitly.
+        dispatch=DispatchConfig(max_concurrent_sessions=0, host_load_max_pytest_processes=0),
         devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

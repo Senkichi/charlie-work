@@ -1,0 +1,10 @@
+1
+# Issue #1843: +1 raw log_event call in measure_host_load's _log_unavailable
+# helper (the rate-limited host_load_unavailable diagnostic event). A
+# standalone function in a new module, not an OrchestratorApp method, so it
+# has no self.write_gate receiver -- same out-of-wave pattern as
+# ci_headroom.py's own _log_unavailable above. Lives at top-level
+# charlie_work/host_load.py (not under orchestration/): every top-level def
+# in a flat orchestration/ submodule is auto-installed onto OrchestratorApp
+# (see workflow_delegation.py), and this module's functions are plain
+# standalone helpers with no ``self``, never meant to become members.
