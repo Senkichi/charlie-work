@@ -263,6 +263,53 @@ def test_headroom_none_and_logged_when_targets_is_not_a_list(tmp_path: Path) -> 
     assert _unavailable_events(state_path)[0]["payload"]["reason"] == "unconfigured"
 
 
+def test_headroom_none_and_logged_when_event_payload_is_null_in_db(tmp_path: Path) -> None:
+    """A ``runner_allocation`` row with a NULL payload must not crash the lane.
+
+    Regression for issue #1883: ``instrumentation._row_to_event`` fed the raw
+    column straight into ``json.loads``, so a NULL payload raised
+    ``TypeError: the JSON object must be str, bytes or bytearray, not
+    NoneType`` — outside ``query_events``' ``sqlite3.Error`` catch, escaping
+    this function's documented never-raises contract and aborting the fleet
+    pass with an unclassified ``fleet_pass_config_error``. NULL can only
+    arrive via an ``events`` table this module's schema did not create
+    (``CREATE TABLE IF NOT EXISTS`` preserves it) or a corrupted file; the
+    row now degrades to an empty payload, which fails open as
+    ``"unconfigured"`` like any other unusable reading.
+    """
+    import sqlite3
+
+    state_path = tmp_path / "state.json"
+    db_path = state_path.parent / "events.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT, kind TEXT, payload TEXT,
+            repo TEXT, correlation_id TEXT, pr_number INTEGER,
+            issue_number INTEGER, level TEXT DEFAULT 'info'
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO events (ts, kind, payload) VALUES (?, ?, NULL)",
+        (datetime.now(UTC).isoformat(), ALLOCATION_EVENT_KIND),
+    )
+    conn.commit()
+    conn.close()
+
+    result = ci_headroom_available(
+        "Senkichi/job-cannon", headroom_ratio=1.5, fleet_state_path=state_path
+    )
+
+    assert result is None
+    events = _unavailable_events(state_path)
+    assert len(events) == 1
+    assert events[0]["payload"]["reason"] == "unconfigured"
+
+
 def test_headroom_none_and_logged_for_non_integer_capacity_or_demand(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     _log_allocation(
