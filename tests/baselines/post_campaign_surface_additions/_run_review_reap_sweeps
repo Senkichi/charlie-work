@@ -1,0 +1,10 @@
+issue #1874: shared review-claim reap block extracted from
+``dispatch_reviews`` so the standalone ``reap_reviews`` command and the
+in-pass path run the identical five sweeps in the identical order (verdict
+reap, stranded-verdict reconcile, stalled-claim sweep, completed/orphaned
+checkout reaps) — the single point of enforcement preventing the two call
+sites from drifting. Net-new OrchestratorApp member added after the
+Track 2 Phase B surface baseline was pinned; declared here so the
+member-surface conservation check in tests/test_workflow_delegation_l00.py
+subtracts it before comparing moved delegates against the pre-campaign
+total (133).

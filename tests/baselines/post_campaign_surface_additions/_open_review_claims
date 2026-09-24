@@ -1,0 +1,7 @@
+issue #1874: read-only open-review-claim scan backing ``reap_reviews``'s
+``--dry-run`` preview (the sweeps delete checkouts/sidecars outside the
+write gate, so the preview must not reach them). Net-new OrchestratorApp
+member added after the Track 2 Phase B surface baseline was pinned;
+declared here so the member-surface conservation check in
+tests/test_workflow_delegation_l00.py subtracts it before comparing moved
+delegates against the pre-campaign total (133).
