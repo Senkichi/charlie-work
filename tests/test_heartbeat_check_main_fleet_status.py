@@ -224,14 +224,34 @@ def test_get_blocked_issue_numbers_warns_on_stale_cache(
     older than ``STATUS_CACHE_STALE_SECONDS``. The blocked data is still
     returned (it is the best available) — only the error string signals
     degradation so downstream checks annotate their output."""
-    payload = _fleet_status_payload(cache_age_seconds=900.0)
+    payload = _fleet_status_payload(cache_age_seconds=1900.0)
     monkeypatch.setattr(hb.subprocess, "run", lambda *a, **k: _FakeStatusProc(stdout=payload))
 
     blocked, err = hb.get_blocked_issue_numbers(tmp_path)
 
     assert blocked == {"owner/repo": {42}}, "blocked data must still be returned"
     assert "stale" in err.lower(), f"expected staleness warning in err; got: {err!r}"
-    assert "900" in err, f"expected cache age in warning; got: {err!r}"
+    assert "1900" in err, f"expected cache age in warning; got: {err!r}"
+    # Issue #1886: the warning names the repo whose snapshot drove it.
+    assert "owner/repo" in err, f"expected offending repo slug in warning; got: {err!r}"
+
+
+def test_get_blocked_issue_numbers_no_warning_within_serving_ttl(
+    hb: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1886: a served snapshot's age is bounded by the producer's own
+    freshness contract — ``read_status_snapshot`` only serves a snapshot
+    younger than ``runtime.status_snapshot_ttl_seconds`` (default 900s) — so
+    an age in the old (600, 900] band is routine healthy refresh cadence, not
+    degradation. The 881s age this issue observed firing on every repo, every
+    tick must NOT produce a staleness warning."""
+    payload = _fleet_status_payload(cache_age_seconds=881.0)
+    monkeypatch.setattr(hb.subprocess, "run", lambda *a, **k: _FakeStatusProc(stdout=payload))
+
+    blocked, err = hb.get_blocked_issue_numbers(tmp_path)
+
+    assert blocked == {"owner/repo": {42}}
+    assert err == "", f"served age inside the producer's serving TTL must not warn; got: {err!r}"
 
 
 def test_get_blocked_issue_numbers_no_warning_on_fresh_cache(
