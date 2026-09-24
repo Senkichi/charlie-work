@@ -1,6 +1,0 @@
-3
-# test_split_piece_found_in_sibling_escalates names the ci_runners sibling
-# repo (dir name, registry key, found_in_repo assertion) — the real private
-# slug is deliberate: the test exercises sibling-repo resolution against a
-# realistically named fleet member, matching the convention in
-# test_cross_repo_gate_sibling_repo.py (baseline 20).

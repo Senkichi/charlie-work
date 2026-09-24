@@ -189,10 +189,8 @@ from pathlib import Path
 
 from .cross_repo_gate_candidates import (
     _EMBEDDED_WHITESPACE_RE,
-    _GLOB_METACHAR,
     _PATH_RE,
-    _has_placeholder_segment,
-    _is_launcher_owned_path,
+    _is_dropped_candidate,
     _split_whitespace_candidate,
 )
 from .cross_repo_gate_shorthand import _is_dotdot_shorthand, _resolve_list_shorthand
@@ -582,12 +580,13 @@ def _iter_candidate_matches(issue_body: str) -> tuple[list[tuple[str, int, int]]
         # together in one backtick span (`` `tests/a.py tests/b.py` ``), and
         # discarding the pair wholesale loses the positive sibling-repo
         # evidence either piece could supply. ``_split_whitespace_candidate``
-        # re-runs each piece through the normal pipeline and returns an
-        # empty list — the pre-#1790 drop-the-whole-thing behavior — unless
-        # the split yields 2+ path-shaped pieces, which is what preserves
-        # #1756's corrupted-single-path protection. Every piece inherits the
-        # whole span's ``(start, end)``: the span is a single citation unit,
-        # so each piece sees the same clause/section context the un-split
+        # re-runs each piece through the ``_PATH_RE`` shape check and the
+        # shared drop predicate below, returning an empty list — the
+        # pre-#1790 drop-the-whole-thing behavior — unless the split yields
+        # 2+ path-shaped pieces, which is what preserves #1756's
+        # corrupted-single-path protection. Every piece inherits the whole
+        # span's ``(start, end)``: the span is a single citation unit, so
+        # each piece sees the same clause/section context the un-split
         # candidate would have.
         if _EMBEDDED_WHITESPACE_RE.search(raw):
             for piece in _split_whitespace_candidate(raw):
@@ -595,20 +594,11 @@ def _iter_candidate_matches(issue_body: str) -> tuple[list[tuple[str, int, int]]
                     seen.add(piece)
                     candidates.append((piece, match.start(), match.end()))
             continue
-        # Drop templated/placeholder paths: a segment like ``pr-N`` or
-        # ``<state-dir>`` is documentation template text, not a real file
-        # reference, and can never be a genuine cross-repo target.
-        if _has_placeholder_segment(raw):
-            continue
-        # Drop glob patterns: a candidate containing ``*``, ``?``, ``[``, or
-        # ``]`` is a glob, not a literal path. No file named ``*.py`` exists,
-        # so a glob is always "missing" and would false-positive the gate.
-        if _GLOB_METACHAR.search(raw):
-            continue
-        # Drop launcher-owned worktree paths: paths under ``.devin/`` or
-        # ``.git_worktree_dir/`` live only inside agent worktrees, not in the
-        # repo tree, so they are not evidence of a cross-repo target.
-        if _is_launcher_owned_path(raw):
+        # Drop candidates that can never name a real cross-repo target —
+        # template placeholders (``pr-N``, ``<state-dir>``), glob patterns,
+        # launcher-owned worktree paths — via the predicate the split path
+        # above applies to each recovered piece.
+        if _is_dropped_candidate(raw):
             continue
         if raw not in seen:
             seen.add(raw)
@@ -727,45 +717,6 @@ def _all_repo_files(repo_root: Path) -> list[str]:
     return files
 
 
-def _repo_is_toplevel(repo_root: Path) -> bool:
-    """Return ``True`` when ``repo_root`` is itself the toplevel of a git
-    worktree.
-
-    ``git`` resolves the repository for a cwd by walking UP the directory
-    tree, so any git command run in a plain directory nested inside an
-    enclosing checkout answers with that enclosing repository's data —
-    ``check-ignore`` consults its ignore rules, ``ls-files`` lists its
-    tracked files. The callers of this check (``_is_gitignored``,
-    ``_repo_tracked_files``) cannot detect that substitution from the
-    command's output alone: the foreign answer is well-formed, just about
-    the wrong repository. Both therefore gate on this check so a
-    ``repo_root`` that is not its own repo root — a fixture directory, a
-    removed ``.git``, a nested non-repo subtree — degrades to its
-    documented failure fallback rather than trusting a foreign repo.
-
-    Comparison is against ``rev-parse --show-toplevel`` (not ``--git-dir``
-    or a ``.git`` existence check) so a linked-worktree root — whose git
-    dir lives under the main checkout's ``.git/worktrees/`` — still
-    counts as its own toplevel, and a subdirectory of a repo (whose
-    ``.git`` lives above it) does not. ``normcase``/``normpath`` on both
-    sides keeps the comparison stable across git's forward-slash output,
-    drive-letter case, and symlink/junction resolution.
-    """
-    result = run_captured(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=repo_root,
-        timeout_seconds=_CHECK_IGNORE_TIMEOUT_SECONDS,
-    )
-    if not result.ok:
-        return False
-    try:
-        toplevel = os.path.normcase(os.path.normpath(result.stdout.strip()))
-        root = os.path.normcase(os.path.normpath(str(repo_root.resolve())))
-    except OSError:
-        return False
-    return toplevel == root
-
-
 def _repo_tracked_files(repo_root: Path) -> list[str]:
     """Return every git-tracked file under ``repo_root``, POSIX-separated
     and relative to it.
@@ -783,15 +734,9 @@ def _repo_tracked_files(repo_root: Path) -> list[str]:
     exception).
 
     Falls back to :func:`_all_repo_files` (a pruned ``os.walk``) when ``git
-    ls-files`` fails — including when ``repo_root`` is not itself a git
-    toplevel (:func:`_repo_is_toplevel`), because ``ls-files`` run in a
-    plain directory nested inside an enclosing checkout would list the
-    ENCLOSING repo's tracked files under that path: a wrong-repository
-    answer that could falsely "find" a candidate. The fallback is
-    strictly noisier, never wrong: see its own docstring.
+    ls-files`` fails. The fallback is strictly noisier, never wrong: see
+    its own docstring.
     """
-    if not _repo_is_toplevel(repo_root):
-        return _all_repo_files(repo_root)
     result = run_captured(
         ["git", "ls-files"],
         cwd=repo_root,
@@ -998,19 +943,7 @@ def _is_gitignored(candidate: str, repo_root: Path) -> bool:
     ``False`` — "not ignored" — so a broken git invocation degrades to the
     *narrower* neutral set, not a wider one: a candidate that should
     escalate keeps escalating rather than being silently suppressed.
-
-    The :func:`_repo_is_toplevel` guard exists because ``git
-    check-ignore`` resolves its repository by walking *up* from the cwd:
-    when ``repo_root`` is not itself a git toplevel — a plain directory
-    inside some enclosing checkout — the verdict comes from that
-    enclosing repository's ignore rules, not ``repo_root``'s (the
-    enclosing repo's own ``.gitignore`` can match the fixture path
-    prefix, answering "ignored" about a repository the gate never asked
-    about). A wrong-repository answer is a failure, so it shares the
-    documented ``False`` fallback.
     """
-    if not _repo_is_toplevel(repo_root):
-        return False
     result = run_captured(
         ["git", "check-ignore", "-q", "--", candidate],
         cwd=repo_root,

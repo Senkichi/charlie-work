@@ -117,6 +117,29 @@ def _is_launcher_owned_path(candidate: str) -> bool:
     return bool(segments) and segments[0] in LAUNCHER_OWNED_DIRS
 
 
+def _is_dropped_candidate(candidate: str) -> bool:
+    """Return ``True`` when ``candidate`` fails a drop filter.
+
+    The single predicate behind the drop filters in
+    ``cross_repo_gate._iter_candidate_matches``, shared with
+    :func:`_split_whitespace_candidate` so a recovered piece faces exactly
+    the same drops as a directly extracted candidate:
+
+    - a placeholder segment (``pr-N``, ``<state-dir>``) is documentation
+      template text, never a real file (issue #1343);
+    - a glob metacharacter (``*``, ``?``, ``[``, ``]``) makes the candidate
+      a pattern, not a literal path — always "missing" (issue #1391);
+    - a launcher-owned first segment (``.devin/``, ``.git_worktree_dir/``)
+      names a path that exists only inside agent worktrees, not in the
+      repo tree (issue #1391).
+    """
+    return (
+        _has_placeholder_segment(candidate)
+        or _GLOB_METACHAR.search(candidate) is not None
+        or _is_launcher_owned_path(candidate)
+    )
+
+
 def _split_whitespace_candidate(raw: str) -> list[str]:
     """Return the path-shaped pieces of a whitespace-joined candidate.
 
@@ -128,17 +151,24 @@ def _split_whitespace_candidate(raw: str) -> list[str]:
     than classified, silently losing the positive sibling-repo evidence
     either could have supplied.
 
-    Each whitespace-separated piece is re-run through the normal candidate
-    pipeline — the ``_PATH_RE`` extraction shape check, then the
-    placeholder/glob/launcher-owned filters — exactly as if it had been its
-    own extracted candidate. The call site reports every emitted piece at
-    the whole span's ``(start, end)`` offsets rather than at per-piece
-    offsets: the backtick span is a single citation unit, so a clause-local
-    evidence marker, a suffix marker, or a citation-section heading that
-    describes the span describes every piece of it. Per-piece offsets would
-    let the first piece's own ``.ext`` period sever the clause for the
-    second piece (``.`` is a clause boundary), inconsistently neutralizing
-    only half of one citation.
+    Each whitespace-separated piece is re-run through the same filters an
+    un-split candidate faces in ``_iter_candidate_matches``: the
+    ``_PATH_RE`` extraction shape check, then the shared drop predicate
+    :func:`_is_dropped_candidate`. One asymmetry is structural, not a
+    second filter chain: a whitespace-free piece contains no backticks, so
+    only the non-tick ``_PATH_RE`` alternations can match it — and their
+    character classes exclude glob metacharacters, so the predicate's glob
+    arm can never fire on a piece (only ``_TICK_PATH`` captures globs,
+    issue #1391).
+
+    The call site reports every emitted piece at the whole span's
+    ``(start, end)`` offsets rather than at per-piece offsets: the
+    backtick span is a single citation unit, so a clause-local evidence
+    marker, a suffix marker, or a citation-section heading that describes
+    the span describes every piece of it. Per-piece offsets would let the
+    first piece's own ``.ext`` period sever the clause for the second
+    piece (``.`` is a clause boundary), inconsistently neutralizing only
+    half of one citation.
 
     Falls back to the pre-#1790 "drop the whole thing" behavior — an empty
     list — unless the split yields 2+ path-shaped pieces: a single real
@@ -154,11 +184,7 @@ def _split_whitespace_candidate(raw: str) -> list[str]:
             if not piece:
                 continue
             path_shaped += 1
-            if (
-                _has_placeholder_segment(piece)
-                or _GLOB_METACHAR.search(piece)
-                or _is_launcher_owned_path(piece)
-            ):
+            if _is_dropped_candidate(piece):
                 continue
             pieces.append(piece)
     if path_shaped < 2:

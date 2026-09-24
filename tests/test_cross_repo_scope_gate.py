@@ -17,10 +17,7 @@ workflow functions, not ``cross_repo_scope_gate`` in isolation.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
-import tempfile
-from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -42,7 +39,7 @@ from charlie_work.devin_shell import SessionRecord
 from charlie_work.fleet_registry import managed_repo_names
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
-from charlie_work.worktree import create_worktree
+from charlie_work.worktree import create_worktree, worktree_path_for_branch
 from charlie_work.write_gate import WriteGate
 
 from _fakes_github import FakeGitHub
@@ -230,43 +227,7 @@ def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    # core.longpaths: pytest's tmp_path can nest deep enough on Windows
-    # (agent-worktree .var dirs) to exceed MAX_PATH on object writes.
-    # Injected via GIT_CONFIG_* env (not -c) so the setting propagates to
-    # git-spawned children too -- e.g. the receive-pack a `push` into a
-    # local bare remote forks on the far side.
-    env = {
-        **os.environ,
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "core.longpaths",
-        "GIT_CONFIG_VALUE_0": "true",
-    }
-    return subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-
-
-@pytest.fixture
-def shallow_repo_base() -> Iterator[Path]:
-    """A git-fixture root much shallower than ``tmp_path``.
-
-    pytest's per-test ``tmp_path`` nests under
-    ``<basetemp>/pytest-of-senki/pytest-N/test_<name>0`` — inside an agent
-    worktree's ``.var`` dir on Windows that alone pushes git's internal
-    object/worktree paths past MAX_PATH, which ``core.longpaths`` does not
-    cover (``$GIT_DIR too big``, ``unable to create temporary object
-    directory`` on the receive-pack side of a local push). A bare
-    ``tempfile`` root skips the two pytest nesting levels, keeping every
-    git-internal path under the limit on both shallow-CI and deep-worktree
-    hosts.
-    """
-    with tempfile.TemporaryDirectory(prefix="scope-gate-") as d:
-        yield Path(d)
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
 
 def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
@@ -429,7 +390,6 @@ def test_orphan_sweep_escalates_cross_repo_scoped_issue(tmp_path: Path) -> None:
 
 def test_classify_dead_sessions_cross_repo_hop_escalates_on_first_occurrence(
     tmp_path: Path,
-    shallow_repo_base: Path,
 ) -> None:
     """``_classify_dead_sessions_and_update_throttle_state`` overrides
     ``failure_kind`` to ``cross_repo_hop`` and escalates on the FIRST
@@ -449,14 +409,43 @@ def test_classify_dead_sessions_cross_repo_hop_escalates_on_first_occurrence(
     """
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
-    remote, repo_root = _init_bare_remote_and_clone(shallow_repo_base / "repo")
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path / "repo")
     branch = "agent/issue-709"
-    # worktrees_dir is shallow-rooted too: the default worktrees dir nests
-    # under <repo>/.var/charlie-work/worktrees/, which pushes git's
-    # worktree-add internal path buffers past MAX_PATH on a deep host.
-    info = create_worktree(
-        repo_root, branch, base_ref="origin/main", worktrees_dir=shallow_repo_base / "wt"
+    worktree_path = worktree_path_for_branch(repo_root, branch)
+    # Environmental bound, not a code defect: git for Windows aborts
+    # `worktree add` during checkout with "fatal: '$GIT_DIR' too big" once
+    # the worktree path exceeds git's fixed internal buffer (empirically
+    # ~216 chars on this build — core.longpaths and worktree.useRelativePaths
+    # do not cover it, and create_worktree resolves the real path so a
+    # subst/junction alias cannot shorten what git sees). Probe git itself
+    # at the exact target path and skip only on the literal signature —
+    # run_captured's RuntimeError does not carry stderr, so a code change
+    # that regresses `worktree add` differently still fails. CI's short
+    # checkout paths exercise the test fully.
+    probe = subprocess.run(
+        ["git", "worktree", "add", "--detach", str(worktree_path), "origin/main"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
+    # Remove whatever the probe left (a completed worktree or partial admin
+    # state); a failure just means nothing was there to remove.
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(worktree_path)],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        if "too big" in probe.stderr:
+            pytest.skip(
+                "git's internal $GIT_DIR buffer rejects worktree creation at this checkout depth"
+            )
+        raise AssertionError(f"git worktree add probe failed: {probe.stderr}")
+    info = create_worktree(repo_root, branch, base_ref="origin/main")
     sessions_dir, state_file = _make_classify_state(tmp_path)
     _write_dead_session_sidecar(sessions_dir, 709, branch, info.path)
 

@@ -192,7 +192,7 @@ def test_split_piece_found_in_sibling_escalates(tmp_path: Path) -> None:
     sibling escalates with ``found_in_repo`` set."""
     this_repo = tmp_path / "charlie-work"
     this_repo.mkdir()
-    sibling_repo = tmp_path / "ci_runners"
+    sibling_repo = tmp_path / "sibling_repo"
     (sibling_repo / "src" / "ci_fleet").mkdir(parents=True)
     (sibling_repo / "src" / "ci_fleet" / "runner_slots.py").write_text(
         "# runner_slots", encoding="utf-8"
@@ -203,14 +203,14 @@ def test_split_piece_found_in_sibling_escalates(tmp_path: Path) -> None:
     result = cross_repo_gate(
         body,
         this_repo,
-        {"charlie-work": this_repo, "ci_runners": sibling_repo},
+        {"charlie-work": this_repo, "sibling_repo": sibling_repo},
         "charlie-work",
     )
 
     assert result.passed is False
     assert result.referenced_paths == ("tests/a.py", "ci_fleet/runner_slots.py")
     assert result.missing_paths == ("tests/a.py", "ci_fleet/runner_slots.py")
-    assert result.found_in_repo == "ci_runners"
+    assert result.found_in_repo == "sibling_repo"
     assert "cross_repo_target" in result.reason
 
 
