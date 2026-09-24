@@ -2,7 +2,7 @@
 #
 # This is a SEPARATE distribution from the root ``charlie-work`` pyproject.toml.
 # It builds a wheel from the SINGLE in-tree source at
-# ``src/charlie_work/attachment_contracts/`` -- no second copy of the 13 modules
+# ``src/charlie_work/attachment_contracts/`` -- no second copy of the modules
 # exists anywhere in this repo.  The import package is unchanged
 # (``charlie_work.attachment_contracts``), so the global hook's hardcoded module
 # path keeps working.
@@ -22,7 +22,7 @@
 # hatchling and setuptools reject ``..`` in package paths (paths must be
 # relative to the project root and cannot escape it).  The backend builds the
 # wheel directly from ``src/charlie_work/attachment_contracts/*.py`` -- no
-# second copy of the 13 modules exists anywhere in this repo.
+# second copy of the modules exists anywhere in this repo.
 #
 # ``backend-path`` makes the backend importable under standard PEP 517 build
 # isolation: the frontend adds this directory to ``sys.path`` before importing

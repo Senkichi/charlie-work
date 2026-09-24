@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 15
     steps:
       # fetch-depth: 0 (full history) is required so `--base-ref` below can
-      # `git show <base>:.attachment-budgets.json` -- the diff-based
+      # `git show`/`git ls-tree` the baseline store at <base> -- the diff-based
       # ratchet-tamper guard (round-1 review finding #1: raise-to-match
       # laundering) needs the PREVIOUS commit's baseline as an independent
       # reference point, which a shallow clone would not have.
@@ -120,7 +120,7 @@ jobs:
           whl = 'packages/attachment-contracts/dist/charlie_work_attachment_contracts-0.1.1-py3-none-any.whl'
           names = zipfile.ZipFile(whl).namelist()
           py_files = [n for n in names if n.endswith('.py') and 'dist-info' not in n]
-          assert len(py_files) == 14, f'expected 14 .py files, got {len(py_files)}: {py_files}'
+          assert len(py_files) == 16, f'expected 16 .py files, got {len(py_files)}: {py_files}'
           assert 'charlie_work/__init__.py' not in names, 'wheel must NOT include charlie_work/__init__.py (namespace package)'
           assert 'charlie_work/attachment_contracts/_windows.py' in names, 'wheel must include _windows.py'
           print(f'Wheel OK: {len(py_files)} .py files, no charlie_work/__init__.py')

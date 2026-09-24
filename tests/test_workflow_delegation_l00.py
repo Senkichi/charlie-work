@@ -87,7 +87,7 @@ def _apc_orchestratorapp_member_count() -> int:
     """The APC ``member_count`` for ``workflow.py::OrchestratorApp``, computed
     by the contracts scanner over the live source.
 
-    ``scan_source`` is the same counter the ``.attachment-budgets.json``
+    ``scan_source`` is the same counter the ``.attachment-budgets/``
     pipeline uses, so it is the identical oracle the committed budget entry
     used to provide -- without depending on the entry's presence. Track-2
     extraction dropped the class below the frozen class fence, so

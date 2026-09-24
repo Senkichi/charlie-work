@@ -1,0 +1,8 @@
+{
+ "boundary": 37.0,
+ "bumps": [],
+ "file": "tests/attachment_contracts/test_baseline.py",
+ "identity": "tests/attachment_contracts/test_baseline.py::module",
+ "kind": "test_module",
+ "member_count": 41
+}
