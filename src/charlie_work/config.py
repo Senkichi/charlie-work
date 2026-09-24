@@ -1249,6 +1249,15 @@ class RuntimeConfig:
     # default-off knobs) -- this section exists to retune or disable it, not
     # to opt in. See GhCircuitBreakerConfig for the field-level rationale.
     gh_circuit_breaker: GhCircuitBreakerConfig = field(default_factory=GhCircuitBreakerConfig)
+    # Issue #1834: pooled stdlib HTTP transport for the high-volume `gh api`
+    # REST-GET/graphql read shapes, behind the same `GitHub.run()` seam.
+    # Ships enabled by default (owner directive: no default-off knobs) --
+    # "gh" is a kill-switch value for reverting a single repo to the
+    # subprocess-only path, not an opt-in. `GitHub` instances constructed
+    # without a `RuntimeConfig` at all (tests, legacy direct callers) do NOT
+    # get this default -- see `github_capabilities/http_transport.py`'s
+    # `_DEFAULT_GH_TRANSPORT` for why that fallback stays "gh".
+    gh_transport: str = "http"
     # cw#1273: outer retry for `gh pr create` specifically, layered on top of
     # GitHub.run()'s inner pre-connection-only retry above. The inner retry's
     # ~7s default span is far shorter than the ~45s TLS blips observed on
@@ -3050,6 +3059,13 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'runtime' key 'gh_long_call_timeout_seconds' must be > 0, "
                 f"got {gh_long_call_timeout_seconds}"
+            )
+    gh_transport = runtime_data.get("gh_transport")
+    if gh_transport is not None:
+        if not isinstance(gh_transport, str) or gh_transport not in ("http", "gh"):
+            raise ConfigError(
+                "config section 'runtime' key 'gh_transport' must be one of "
+                f"'http', 'gh', got {gh_transport!r}"
             )
     pr_create_retry_max_attempts = runtime_data.get("pr_create_retry_max_attempts")
     if pr_create_retry_max_attempts is not None and not isinstance(

@@ -42,6 +42,7 @@ from .github_capabilities import (
     CommentsLike,
     GitHubRunResult,
     build_circuit_breaker_state,
+    build_http_transport_state,
     ISSUE_LIST_FIELDS,  # noqa: F401  (deliberate re-export; doctor.py et al.)
     ISSUE_VIEW_FIELDS,  # noqa: F401  (deliberate re-export; doctor.py et al.)
     IssuesLike,
@@ -61,6 +62,7 @@ from .github_capabilities import (
     _ADMIN_FLAG,
     _STRATEGY_FLAGS,
     _is_mutating,
+    run_gh_command,
 )
 
 # ``_LIST_LIMIT`` is no longer referenced inside ``github.py`` itself -- its
@@ -92,7 +94,6 @@ from .github_delegation import _ROUTES, _SIGNATURE_SOURCE, _make_delegate  # noq
 # ``issue_linking`` (issue #1627), so the re-exports are gone -- the names are
 # no longer reachable through ``charlie_work.github``.
 from .issue_linking import _CLOSING_KEYWORDS_ALT
-from .subprocess_runner import no_console_window_kwargs
 from .transient_errors import is_transient_network_error
 
 logger = logging.getLogger(__name__)
@@ -275,6 +276,11 @@ class GitHub:
         object.__setattr__(
             self, "_circuit_breaker_state", build_circuit_breaker_state(self.runtime)
         )
+        # Per-instance pooled HTTP transport state (issue #1834): mutable,
+        # constructed once here for the same reason as
+        # `_circuit_breaker_state` above -- `run_gh_command` needs it before
+        # the `_COLLABORATORS` loop below installs any delegate.
+        object.__setattr__(self, "_http_transport_state", build_http_transport_state())
         # Capability collaborators (Track 2, issue #1585, design doc
         # Section 3.3): each is constructed with a back-reference to this
         # instance and reached through the delegates _install_delegates()
@@ -329,16 +335,22 @@ class GitHub:
 
         for attempt in range(max_retries + 1):
             try:
-                result = subprocess.run(
-                    command,
+                # Issue #1834: `run_gh_command` chooses HTTP or the `gh`
+                # subprocess per call (config-default HTTP for
+                # `http_translate.is_http_candidate` shapes, `gh` for
+                # everything else or on per-call HTTP fallback) and always
+                # returns a `subprocess.CompletedProcess`-shaped result (or
+                # raises the same two exceptions a direct `subprocess.run`
+                # call would) -- every line below this point is unchanged
+                # regardless of which transport actually produced `result`.
+                result = run_gh_command(
+                    args=args,
+                    command=command,
                     cwd=self.repo_root,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    capture_output=True,
-                    check=False,
-                    timeout=timeout_seconds,
-                    **no_console_window_kwargs(),
+                    timeout_seconds=timeout_seconds,
+                    runtime=self.runtime,
+                    transport_state=self._http_transport_state,
+                    resolve_owner_repo=self._repo_owner_name,
                 )
             except FileNotFoundError as exc:
                 # Transport-class by construction (issue #1833): gh could not
