@@ -1,0 +1,7 @@
+issue #1874: the ``charlie reap-reviews`` operator command — a standalone
+review-claim reap that runs the dispatch_reviews sweep block outside a loop
+pass (reap-only when the repo's supervisor lock is held, reap+dispatch when
+free). Net-new OrchestratorApp member added after the Track 2 Phase B
+surface baseline was pinned; declared here so the member-surface
+conservation check in tests/test_workflow_delegation_l00.py subtracts it
+before comparing moved delegates against the pre-campaign total (133).

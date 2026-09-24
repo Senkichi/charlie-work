@@ -34,8 +34,10 @@ Honors the same fail-open fallbacks as ``worker_stop_gate``:
   ``()`` and silently narrows the changed-set to working-tree-only scope.
   Inherited automatically by reusing ``_all_changed_files``.
 - **Missing interpreter** -- the ``.claude/settings.json`` command line
-  uses ``.venv/Scripts/python.exe``; if the venv is missing the hook
-  cannot launch at all, which is the intentionally safe direction for an
+  launches through ``scripts/hook-python.sh``, which picks the platform's
+  venv interpreter (``.venv/Scripts/python.exe`` on Windows,
+  ``.venv/bin/python`` elsewhere); if the venv is missing it skips the
+  hook with exit 0, which is the intentionally safe direction for an
   environment-setup failure that is not this gate's job to diagnose (same
   as the Stop gate).
 
@@ -298,8 +300,7 @@ def _resolve_cwd(payload: dict[str, Any], command: str = "") -> Path:
     A parsed ``cd`` target is trusted only when it is **absolute**. A
     relative target (``cd ../other && git push``) or a ``~``-prefixed
     target (``cd ~/x && git push``) resolves against a *base* directory
-    the hook cannot know: the hook is spawned at a fixed project-root cwd
-    (the relative command path in ``settings.json``) while
+    the hook cannot know: the hook is spawned at a fixed project-root cwd while
     ``payload.cwd`` is dynamic, so a relative target silently resolves
     against the wrong base -- reintroducing #1468's own defect class for
     the relative case. ``~`` is never expanded by ``shlex``, so
