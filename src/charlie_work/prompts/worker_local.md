@@ -33,6 +33,8 @@ $section_local_no_merge_contract
 
 $section_process_lifetime
 
+$section_session_scratch_dir
+
 $section_api_shape_validation
 
 $section_caller_sweep

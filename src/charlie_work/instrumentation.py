@@ -438,6 +438,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "rework_stranded_commits_salvaged": "warning",
         "runner_allocation_refused": "warning",
         "runner_allocation_skipped": "warning",
+        # ci_fleet 0.2.0 runner health sweep: baseline-derived resource alert,
+        # desktop-heap pressure on the private launch desktop, and a visible
+        # non-console window there (almost certainly a job blocked on a dialog).
+        "runner_health_alert": "warning",
+        "runner_health_desktop_pressure": "warning",
+        "runner_health_stuck_window": "warning",
         "runner_capacity_starved": "warning",
         # Error: sustained-window escalation of runner_capacity_starved (#763).
         "runner_capacity_starvation_escalation": "error",
@@ -476,6 +482,17 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # mirrors `worker_module_map_failed` -- the dispatch proceeds with an
         # omitted clause, never a dispatch failure.
         "worker_attachment_budget_failed": "warning",
+        # Issue #1780: a dead claude/api session's stream-json transcript
+        # shows a shell command that used a literal ``/tmp/...`` path -- the
+        # shared-dir shape the prompt now forbids (MSYS's install-wide mount
+        # defeats per-session TMPDIR). Warning, not error: the session's own
+        # work may be fine -- the hazard is cross-session scratch-file
+        # corruption on a *sibling* lane, so this is a diagnosable record for
+        # post-incident triage and drift measurement, not a terminal verdict
+        # on this worker. The consumer is heartbeat_check.py's
+        # check_warning_events, which reads every level='warning' row
+        # (derived from the level column, never a hardcoded kind list).
+        "worker_literal_tmp_path": "warning",
         # Issue #1393: a pre-launch environment block (e.g.
         # worktree_foreign_writer) prevented a dispatch from starting. Warning,
         # not error: the issue is not terminal — the cap may not yet be
@@ -728,6 +745,8 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "rework_already_pushed": "info",
         "rework_brief_regenerated": "info",
         "runner_allocation": "info",
+        # ci_fleet 0.2.0: per-pass runner process-tree totals (CPU/RSS/count).
+        "runner_health": "info",
         "runner_capacity_recovered": "info",
         "self_deploy_skipped": "info",
         "self_deploy_succeeded": "info",
