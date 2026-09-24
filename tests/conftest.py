@@ -77,19 +77,20 @@ def _kill_on_close_job() -> None:
 def _no_leaked_child_processes() -> Iterator[None]:
     """Issue #1851: fail a test that leaves a live descendant behind.
 
-    Records a spawn cutoff at setup; at teardown gives children created
-    after it a short grace to exit on their own, kills the survivors, and
-    fails the test naming each survivor's pid and command line. The cutoff
-    (a ``time.time()`` compared against each descendant's ``create_time``)
-    replaces a before/after pid snapshot, halving the per-test cost of the
-    guard to a single process enumeration — measured at ~4 ms per
-    enumeration on this host, i.e. ~30 s instead of ~60 s suite-wide.
+    Snapshots this process's descendants at setup; at teardown gives new
+    children a short grace to exit on their own, kills the survivors, and
+    fails the test naming each survivor's pid and command line. Measured
+    cost: two ``psutil`` child enumerations per test ≈ 7.5 ms — ~60 s over
+    the 7909-test suite (~7 % of the ~14.5 min CI Tests job). A cheaper
+    ``create_time``-vs-``time.time()`` cutoff was tried and rejected:
+    ``time.time()`` granularity/stepping on some Windows hosts can place a
+    pre-existing child above the cutoff (see ``descendant_snapshot``).
     """
-    from _process_guard import reap_leaked_descendants, spawn_cutoff
+    from _process_guard import descendant_snapshot, reap_leaked_descendants
 
-    since = spawn_cutoff()
+    before = descendant_snapshot()
     yield
-    report = reap_leaked_descendants(since)
+    report = reap_leaked_descendants(before)
     if report:
         pytest.fail("test left live child process(es) behind:\n  " + "\n  ".join(report))
 

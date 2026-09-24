@@ -21,11 +21,11 @@ import pytest
 
 from _process_guard import (
     _pid_collecting_wrapper,
+    descendant_snapshot,
     enter_kill_on_close_job,
     leaked_descendants,
     reap_leaked_descendants,
     reap_pid,
-    spawn_cutoff,
     wrap_launchers,
 )
 
@@ -102,10 +102,10 @@ def _spawn_orphan_sleeper(tmp_path: Path, seconds: int = 120) -> int:
 def test_leaked_sleeper_is_reported_and_killed() -> None:
     """The guard's report path: a deliberately leaked sleeper is named by
     pid and command line, and killed rather than merely flagged."""
-    since = spawn_cutoff()
+    before = descendant_snapshot()
     proc = _spawn_sleeper()
     try:
-        report = reap_leaked_descendants(since, grace=0.0)
+        report = reap_leaked_descendants(before, grace=0.0)
         assert report, "expected the leaked sleeper to be reported"
         assert any(str(proc.pid) in line and "time.sleep" in line for line in report), (
             f"report does not name the sleeper's cmdline: {report}"
@@ -117,10 +117,10 @@ def test_leaked_sleeper_is_reported_and_killed() -> None:
 
 
 def test_leaked_descendants_names_the_new_child() -> None:
-    since = spawn_cutoff()
+    before = descendant_snapshot()
     proc = _spawn_sleeper()
     try:
-        leaked = leaked_descendants(since)
+        leaked = leaked_descendants(before)
         assert any(p.pid == proc.pid for p in leaked), (
             f"sleeper pid={proc.pid} missing from leaked descendants"
         )
@@ -129,20 +129,20 @@ def test_leaked_descendants_names_the_new_child() -> None:
 
 
 def test_preexisting_children_are_not_leaks() -> None:
-    """A descendant created before the cutoff is not this test's leak."""
-    # direct=True: no venv-launcher grandchild can appear after the cutoff.
+    """A descendant already alive at snapshot time is not this test's leak."""
+    # direct=True: no venv-launcher grandchild can appear after the snapshot.
     proc = _spawn_sleeper(direct=True)
     try:
-        since = spawn_cutoff()
-        assert leaked_descendants(since) == []
-        assert reap_leaked_descendants(since, grace=0.0) == []
+        before = descendant_snapshot()
+        assert leaked_descendants(before) == []
+        assert reap_leaked_descendants(before, grace=0.0) == []
     finally:
         _reap(proc)
 
 
 def test_child_that_exits_within_grace_is_not_a_leak() -> None:
     """A fast-exiting child mid-flight at teardown must not fail the test."""
-    since = spawn_cutoff()
+    before = descendant_snapshot()
     proc = subprocess.Popen(
         [sys.executable, "-c", "pass"],
         stdin=subprocess.DEVNULL,
@@ -150,7 +150,7 @@ def test_child_that_exits_within_grace_is_not_a_leak() -> None:
         stderr=subprocess.DEVNULL,
     )
     try:
-        assert reap_leaked_descendants(since, grace=10.0) == []
+        assert reap_leaked_descendants(before, grace=10.0) == []
     finally:
         _reap(proc)
 
