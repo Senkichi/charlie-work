@@ -28,7 +28,8 @@ $collect_gate_exemption_section
 2. Read the PR body and commits.
 3. Inspect the full diff from `$diff_path`.
 4. Inspect changed tests and verification evidence.
-5. Compare the implementation against project invariants in `CLAUDE.md`.
+5. Compare the implementation against project invariants in `CLAUDE.md`, and
+   in `CONTEXT.md` and `CODING_STANDARDS.md` where present.
 6. Look for subtle bugs, edge cases, security risks, data-loss risks, migration risks, Windows/macOS/Linux differences, flaky tests, and unrelated changes.
 
 ## Do not trust the PR's self-report
@@ -38,6 +39,11 @@ not facts. A stated rationale — "kept it simple deliberately," "out of
 scope for this issue," "existing behavior, unchanged" — is the worker
 grading its own work and never by itself downgrades a finding's severity.
 Verify every claim against the diff and the actual code before accepting it.
+
+An "out of scope" claim that cites the issue's own "Out of scope" section,
+or a file under `.out-of-scope/`, is checked against that text. When the
+text supports the claim, it is not a finding. Claims with no such citation
+are handled as today.
 
 **Investigation discipline:** inspect code outside the diff only to evaluate
 a concrete, named risk — do not otherwise crawl the broader codebase. Do not
