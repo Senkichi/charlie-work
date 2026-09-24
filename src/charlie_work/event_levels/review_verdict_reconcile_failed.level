@@ -1,0 +1,8 @@
+warning
+# Issue #736: the stranded-verdict reconciliation sweep found an
+# on-disk decision but ``record_review`` refused to ingest it (e.g.
+# the #467/#1072 stale-head guard fired). Warning, not error: the
+# sweep itself is not broken, it correctly declined a verdict it
+# could not safely apply, and the PR is left for a fresh review
+# dispatch. Sibling to the success case ``review_verdict_reconciled``,
+# emitted from the same call site with an explicit ``level="warning"``.

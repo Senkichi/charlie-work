@@ -1,0 +1,6 @@
+issue #1844: local (no-remote) review/merge lane delegate, added when the
+lane was implemented in orchestration/local_lanes.py. Net-new
+OrchestratorApp member added after the Track 2 Phase B surface baseline was
+pinned; declared here so the member-surface conservation check in
+tests/test_workflow_delegation_l00.py subtracts it before comparing moved
+delegates against the pre-campaign total (133).

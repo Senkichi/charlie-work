@@ -1,0 +1,7 @@
+warning
+# Issue #1251: a PR whose diff.patch is empty (zero-file diff vs base)
+# was skipped before claiming a paid reviewer session. Warning, not
+# info: an empty diff is a symptom of an upstream bug (e.g. #1221's
+# vestigial duplicate PRs), not a routine dispatch outcome. A
+# repeating burst on one PR is the signal that a salvage/duplicate
+# path keeps producing zero-delta PRs.

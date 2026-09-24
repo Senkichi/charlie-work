@@ -1,0 +1,4 @@
+warning
+# ci_fleet 0.2.0 runner health sweep: a visible non-console window
+# on the private launch desktop (almost certainly a job blocked on a
+# dialog).
