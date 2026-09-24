@@ -4475,8 +4475,9 @@ class OrchestratorApp:
         # of open issues blocking each other (or an issue listing itself)
         # stalls every member forever while each still looks armed. Reporting
         # only: one warning per reported cycle is logged inside the scan, and
-        # one blocker_cycle event per reported cycle is recorded below (both
-        # bounded by MAX_REPORTED_CYCLES; the intake event carries the
+        # one blocker_cycle event per reported cycle is recorded below (the
+        # report is bounded by MAX_REPORTED_CYCLES total plus per-component
+        # cycle/DFS caps inside the scan; the intake event carries the
         # truncation marker). Runs with the rest of intake's reads, outside
         # the state lock; fail-open.
         blocker_cycle_scan = detect_open_blocker_cycles(self.gh)

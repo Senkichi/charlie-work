@@ -16,8 +16,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from _fakes_github import FakeGitHub
 from charlie_work.blocker_cycles import (
+    MAX_CYCLES_PER_COMPONENT,
     MAX_REPORTED_CYCLES,
     _strongly_connected_components,
     detect_open_blocker_cycles,
@@ -88,30 +91,30 @@ def _run_intake(tmp_path: Path, fake_gh: FakeGitHub, *, dry_run: bool = False):
 
 
 def test_find_blocker_cycles_two_issue_cycle() -> None:
-    assert find_blocker_cycles({11: [12], 12: [11]}) == [[11, 12]]
+    assert find_blocker_cycles({11: [12], 12: [11]}).cycles == [[11, 12]]
 
 
 def test_find_blocker_cycles_three_issue_cycle() -> None:
-    assert find_blocker_cycles({21: [22], 22: [23], 23: [21]}) == [[21, 22, 23]]
+    assert find_blocker_cycles({21: [22], 22: [23], 23: [21]}).cycles == [[21, 22, 23]]
 
 
 def test_find_blocker_cycles_self_reference() -> None:
-    assert find_blocker_cycles({31: [31]}) == [[31]]
+    assert find_blocker_cycles({31: [31]}).cycles == [[31]]
 
 
 def test_find_blocker_cycles_acyclic() -> None:
-    assert find_blocker_cycles({51: [52], 52: [53], 53: []}) == []
+    assert find_blocker_cycles({51: [52], 52: [53], 53: []}).cycles == []
 
 
 def test_find_blocker_cycles_reports_each_distinct_cycle_once() -> None:
     # Two elementary cycles share the 4 -> 1 edge; both must be found.
     edges = {1: [2, 3], 2: [4], 3: [4], 4: [1]}
-    assert find_blocker_cycles(edges) == [[1, 2, 4], [1, 3, 4]]
+    assert find_blocker_cycles(edges).cycles == [[1, 2, 4], [1, 3, 4]]
 
 
 def test_find_blocker_cycles_disjoint_cycles() -> None:
     edges = {61: [62], 62: [61], 63: [64], 64: [63]}
-    assert find_blocker_cycles(edges) == [[61, 62], [63, 64]]
+    assert find_blocker_cycles(edges).cycles == [[61, 62], [63, 64]]
 
 
 def test_find_blocker_cycles_large_layered_dag_returns_empty() -> None:
@@ -133,14 +136,109 @@ def test_find_blocker_cycles_large_layered_dag_returns_empty() -> None:
             edges[number] = (
                 [1000 + (layer + 1) * width + k for k in range(width)] if layer < depth - 1 else []
             )
-    assert find_blocker_cycles(edges) == []
+    assert find_blocker_cycles(edges).cycles == []
 
 
 def test_find_blocker_cycles_limit_stops_enumeration() -> None:
     # A complete digraph has far more than 3 elementary cycles; the limit
-    # bounds the work, and the sorted output stays deterministic.
+    # bounds the reported set, and the truncation is marked on the result.
     edges = {n: [m for m in range(1, 6) if m != n] for n in range(1, 6)}
-    assert len(find_blocker_cycles(edges, limit=3)) == 3
+    result = find_blocker_cycles(edges, limit=3)
+    assert len(result.cycles) == 3
+    assert result.truncated is True
+
+
+@pytest.mark.timeout(30)
+def test_find_blocker_cycles_dead_end_fan_in_bounded_by_step_budget() -> None:
+    """Regression: DFS *work* inside a cyclic SCC must be bounded, not just
+    the cycles found.
+
+    Issues 1<->2 form a genuine cycle; issue 2 is also blocked by every
+    member of a width-5 x depth-10 layered fan-in gadget whose sinks point
+    only back to 2. The whole graph is one SCC, and the search anchored at
+    1 walks ~5**10 dead-end paths that can never close on 1 (the only edge
+    into 1 is 2->1, already taken): ~52 issues took ~2.7s and grew ~5x per
+    added layer before the step budget existed. The budget must stop the
+    search while still reporting the real cycle and marking truncation.
+    """
+    width, depth = 5, 10
+    edges: dict[int, list[int]] = {1: [2], 2: [1]}
+    for layer in range(depth):
+        for pos in range(width):
+            node = 10 + layer * width + pos
+            edges[node] = (
+                [10 + (layer + 1) * width + k for k in range(width)] if layer < depth - 1 else [2]
+            )
+    edges[2] += [10 + k for k in range(width)]
+
+    budget = 10_000
+    result = find_blocker_cycles(edges, component_step_budget=budget)
+    assert result.truncated is True
+    assert result.cycles == [[1, 2]]
+    assert result.steps <= budget
+    # The shipped default bounds the same gadget.
+    default_result = find_blocker_cycles(edges)
+    assert default_result.truncated is True
+    assert [1, 2] in default_result.cycles
+
+
+def test_find_blocker_cycles_per_component_cap_preserves_small_cycle() -> None:
+    """A dense malformed component must not consume the whole report.
+
+    A complete digraph on 6 issues holds 409 elementary cycles -- over the
+    per-component cap on its own. A separate genuine 2-cycle must still be
+    reported, and the reported set must not depend on the order ``edges``
+    listed the issues in: components are enumerated in canonical
+    least-member order, each under its own cap.
+    """
+    all_edges: dict[int, list[int]] = {n: [m for m in range(1, 7) if m != n] for n in range(1, 7)}
+    all_edges[10] = [11]
+    all_edges[11] = [10]
+    orderings = [
+        sorted(all_edges),
+        sorted(all_edges, reverse=True),
+        [10, 11, 3, 1, 6, 2, 5, 4],
+    ]
+    results = [find_blocker_cycles({n: all_edges[n] for n in ordering}) for ordering in orderings]
+    for result in results:
+        assert [10, 11] in result.cycles
+        assert result.truncated is True
+        # The dense component contributes at most the per-component cap.
+        assert len(result.cycles) <= MAX_CYCLES_PER_COMPONENT + 1
+    assert results[0].cycles == results[1].cycles == results[2].cycles
+
+
+def test_find_blocker_cycles_self_loop_hits_limit_and_marks_truncated() -> None:
+    # The global limit can be reached on the singleton (self-loop) branch;
+    # cyclic components still unexamined then mark the report truncated.
+    edges = {n: [n] for n in range(1, 6)}
+    result = find_blocker_cycles(edges, limit=3)
+    assert result.cycles == [[1], [2], [3]]
+    assert result.truncated is True
+    # A limit landing exactly on the last cycle truncates nothing.
+    result = find_blocker_cycles(edges, limit=5)
+    assert result.cycles == [[1], [2], [3], [4], [5]]
+    assert result.truncated is False
+
+
+def test_find_blocker_cycles_exactly_at_limit_is_not_truncated() -> None:
+    """Exactly ``limit`` distinct cycles is a full report, not a truncated
+    one: truncation requires a further cyclic component to exist."""
+    edges: dict[int, list[int]] = {}
+    for pair_index in range(MAX_REPORTED_CYCLES):
+        a, b = 1000 + 2 * pair_index, 1001 + 2 * pair_index
+        edges[a] = [b]
+        edges[b] = [a]
+    result = find_blocker_cycles(edges, limit=MAX_REPORTED_CYCLES)
+    assert len(result.cycles) == MAX_REPORTED_CYCLES
+    assert result.truncated is False
+
+    # One more disjoint cycle pushes the graph over the report cap.
+    edges[9000] = [9001]
+    edges[9001] = [9000]
+    result = find_blocker_cycles(edges, limit=MAX_REPORTED_CYCLES)
+    assert len(result.cycles) == MAX_REPORTED_CYCLES
+    assert result.truncated is True
 
 
 def test_strongly_connected_components_dag_all_singletons() -> None:
@@ -365,10 +463,10 @@ def test_intake_batch_dependency_failure_falls_back_to_per_issue_rest(
 
 def test_intake_dense_component_report_is_capped_and_marked(tmp_path: Path, caplog) -> None:
     """k=9 issues each natively blocked by all the others: 125,664 distinct
-    elementary cycles. The pass must report at most MAX_REPORTED_CYCLES,
-    mark the report truncated on the intake summary event, and log the
-    truncation -- never flood the log or hold the state lock for 125k
-    events."""
+    elementary cycles. The per-component cap bounds the report at
+    MAX_CYCLES_PER_COMPONENT for the component, the pass marks the report
+    truncated on the intake summary event, and logs the truncation -- never
+    flood the log or hold the state lock for 125k events."""
     numbers = list(range(100, 109))
     gh = _CycleGitHub(
         [_issue(n) for n in numbers],
@@ -377,11 +475,11 @@ def test_intake_dense_component_report_is_capped_and_marked(tmp_path: Path, capl
     with caplog.at_level(logging.WARNING):
         result, events = _run_intake(tmp_path, gh)
     assert result.ok is True
-    assert len(result.data["blocker_cycles"]) == MAX_REPORTED_CYCLES
+    assert len(result.data["blocker_cycles"]) == MAX_CYCLES_PER_COMPONENT
     assert result.data["blocker_cycles_truncated"] is True
-    assert len(events) == MAX_REPORTED_CYCLES
+    assert len(events) == MAX_CYCLES_PER_COMPONENT
     cycle_warnings = [r for r in caplog.records if "blocker cycle detected" in r.message]
-    assert len(cycle_warnings) == MAX_REPORTED_CYCLES
+    assert len(cycle_warnings) == MAX_CYCLES_PER_COMPONENT
     assert any("truncated" in r.message for r in caplog.records)
     intake_events = [
         e
@@ -390,8 +488,32 @@ def test_intake_dense_component_report_is_capped_and_marked(tmp_path: Path, capl
         )["events"]
         if e.get("kind") == "intake"
     ]
-    assert intake_events[-1]["payload"]["blocker_cycles_reported"] == MAX_REPORTED_CYCLES
+    assert intake_events[-1]["payload"]["blocker_cycles_reported"] == MAX_CYCLES_PER_COMPONENT
     assert intake_events[-1]["payload"]["blocker_cycles_truncated"] is True
+
+
+def test_intake_dense_component_does_not_starve_genuine_cycle(
+    tmp_path: Path,
+) -> None:
+    """End-to-end fairness: a dense K9 component (125,664 cycles) must not
+    consume the report so a genuine 2-cycle elsewhere still reaches the
+    event log -- regardless of which order ``issue_list`` returns them."""
+    dense = list(range(1, 10))
+    native_deps = {n: [m for m in dense if m != n] for n in dense}
+    native_deps[11] = [12]
+    native_deps[12] = [11]
+    # The pair leads the issue list while the dense component leads the
+    # canonical (least-member) order; either way the pair stays reportable.
+    gh = _CycleGitHub(
+        [_issue(11), _issue(12)] + [_issue(n) for n in dense],
+        native_deps=native_deps,
+    )
+    result, events = _run_intake(tmp_path, gh)
+    assert result.ok is True
+    assert result.data["blocker_cycles_truncated"] is True
+    reported = [e["payload"]["issue_numbers"] for e in events]
+    assert [11, 12] in reported
+    assert len(reported) <= MAX_REPORTED_CYCLES
 
 
 def test_detect_open_blocker_cycles_returns_sorted_cycles(tmp_path: Path) -> None:

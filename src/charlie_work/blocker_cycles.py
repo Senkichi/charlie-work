@@ -12,7 +12,9 @@ ticket sets (``/to-tickets``, plan-to-issues) make such loops more likely.
 This module builds the directed blocker graph over *open* issues only -- an
 edge to a closed issue cannot be part of any loop -- and enumerates distinct
 elementary cycles, including one-member self-references, up to
-``MAX_REPORTED_CYCLES`` per pass. ``OrchestratorApp.intake`` runs the scan
+``MAX_REPORTED_CYCLES`` per pass, with per-component caps on both reported
+cycles and DFS work so one malformed component can neither starve other
+components' cycles nor stall the scan. ``OrchestratorApp.intake`` runs the scan
 once per intake pass, logs one warning per reported cycle (plus one
 truncation warning when the cap bites), and records one ``blocker_cycle``
 event per reported cycle. The scan is reporting-only: it writes no labels or
@@ -44,6 +46,36 @@ logger = logging.getLogger(__name__)
 # explicitly rather than silently dropped.
 MAX_REPORTED_CYCLES = 100
 
+# Per-component bounds applied inside ``find_blocker_cycles``. Capping each
+# non-trivial SCC's reported cycles strictly below the per-pass cap keeps one
+# dense malformed component from consuming the whole report and dropping
+# genuine cycles in other components. The step budget bounds the DFS *work*
+# per component, which the cycle cap alone cannot do: inside a cyclic SCC the
+# search can walk exponentially many dead-end paths between real cycles, so
+# an output-only cap still stalls the synchronous intake pass. On either cap
+# the component's enumeration stops and the scan reports truncation.
+MAX_CYCLES_PER_COMPONENT = 25
+MAX_COMPONENT_DFS_STEPS = 50_000
+
+
+@dataclass(frozen=True)
+class CycleEnumeration:
+    """Outcome of ``find_blocker_cycles``.
+
+    ``cycles`` holds at most ``limit`` entries (when a limit was given), each
+    in cycle order rotated so its least member comes first, sorted. ``truncated``
+    is True when enumeration stopped before the whole graph was searched --
+    the global ``limit`` was reached with cyclic components still unexamined,
+    a component's cycle cap was exceeded, or its DFS step budget ran out --
+    so unreported cycles may exist and no total count is available. ``steps``
+    is the number of DFS edge-expansions performed, the work unit the
+    per-component ``component_step_budget`` bounds.
+    """
+
+    cycles: list[list[int]]
+    truncated: bool
+    steps: int
+
 
 @dataclass(frozen=True)
 class BlockerCycleScan:
@@ -51,8 +83,9 @@ class BlockerCycleScan:
 
     ``cycles`` holds at most ``MAX_REPORTED_CYCLES`` entries, each in cycle
     order rotated so its least member comes first. ``truncated`` is True when
-    more distinct cycles exist than were reported -- the unreported remainder
-    is deliberately never enumerated, so no total count is available.
+    enumeration stopped before the whole graph was searched -- the report
+    cap, a per-component cap, or the per-component DFS step budget -- so
+    unreported cycles may exist; no total count is available.
     """
 
     cycles: list[list[int]]
@@ -175,30 +208,106 @@ def _strongly_connected_components(
     return components
 
 
+def _is_cyclic_component(adjacency: Mapping[int, list[int]], component: list[int]) -> bool:
+    """True when an SCC can yield a cycle: non-trivial, or a self-loop."""
+    return len(component) > 1 or component[0] in adjacency[component[0]]
+
+
+def _component_cycles(
+    adjacency: Mapping[int, list[int]],
+    component: list[int],
+    cycle_limit: int | None,
+    step_budget: int | None,
+) -> tuple[list[list[int]], bool, int]:
+    """Elementary cycles wholly inside one non-trivial SCC.
+
+    Iterative least-member-anchored DFS: a cycle is emitted only by the
+    search rooted at its smallest member, and intermediate members are
+    restricted to nodes greater than the anchor within the component, so
+    each elementary cycle is found exactly once.
+
+    Returns ``(cycles, truncated, steps)`` where ``cycles`` holds at most
+    ``cycle_limit`` entries. Enumeration of the component stops early --
+    reported as ``truncated`` -- when a ``cycle_limit + 1``-th cycle is
+    found or when ``step_budget`` edge-expansions are exhausted, whichever
+    comes first. Both caps are per-component: the cycle cap keeps one dense
+    component from consuming the whole report, and the step cap keeps a
+    component with exponentially many dead-end paths from stalling the
+    scan. ``steps`` counts edge-expansions so callers can observe the work
+    the budget bounds.
+    """
+    members = set(component)
+    found: list[list[int]] = []
+    steps = 0
+    exhausted = False
+    for start in sorted(members):
+        if exhausted:
+            break
+        path = [start]
+        in_path = {start}
+        stack = [iter(adjacency[start])]
+        while stack:
+            advanced = False
+            for nxt in stack[-1]:
+                steps += 1
+                if (step_budget is not None and steps >= step_budget) or (
+                    cycle_limit is not None and len(found) > cycle_limit
+                ):
+                    exhausted = True
+                    break
+                if nxt == start:
+                    found.append(list(path))
+                elif nxt > start and nxt in members and nxt not in in_path:
+                    path.append(nxt)
+                    in_path.add(nxt)
+                    stack.append(iter(adjacency[nxt]))
+                    advanced = True
+                    break
+            if exhausted:
+                break
+            if not advanced:
+                stack.pop()
+                in_path.discard(path.pop())
+    truncated = exhausted or (cycle_limit is not None and len(found) > cycle_limit)
+    if cycle_limit is not None:
+        del found[cycle_limit:]
+    return found, truncated, steps
+
+
 def find_blocker_cycles(
-    edges: Mapping[int, Iterable[int]], limit: int | None = None
-) -> list[list[int]]:
+    edges: Mapping[int, Iterable[int]],
+    limit: int | None = None,
+    *,
+    component_cycle_limit: int | None = MAX_CYCLES_PER_COMPONENT,
+    component_step_budget: int | None = MAX_COMPONENT_DFS_STEPS,
+) -> CycleEnumeration:
     """Distinct elementary cycles in the blocker graph, up to ``limit``.
 
     ``edges`` maps an issue number to the issues it is blocked by. Each cycle
     is returned once, in cycle order (each member is blocked by the next),
     rotated so its least member comes first; a self-loop ``A -> A`` yields
-    ``[A]``. The result list is sorted, so output is deterministic. When
-    ``limit`` is given, enumeration stops as soon as ``limit`` cycles have
-    been found -- callers wanting a truncation signal ask for one more than
-    they intend to report.
+    ``[A]``. The returned ``CycleEnumeration`` carries a sorted cycle list,
+    a ``truncated`` marker set whenever enumeration stopped before the
+    graph was fully searched (the global ``limit`` was reached with cyclic
+    components still unexamined, a component's ``component_cycle_limit``
+    was exceeded, or its ``component_step_budget`` ran out), and the DFS
+    edge-expansion count.
 
-    The cost of the scan is driven by the graph's *cyclic* structure, not by
-    its size or path count: strongly connected components are computed first
-    (linear), and cycle enumeration runs only inside components of two or
-    more members, since every elementary cycle lies wholly inside one SCC.
-    An acyclic graph -- however many distinct paths it contains -- therefore
-    costs one linear pass and returns ``[]``. Inside a non-trivial SCC the
-    enumeration is least-member-anchored DFS: a cycle is emitted only by the
-    search rooted at its smallest member, intermediate members are restricted
-    to nodes greater than the anchor within the component, so each elementary
-    cycle is found exactly once. Singleton components are handled separately
-    by the self-loop check.
+    Strongly connected components are computed first (linear); every
+    elementary cycle lies wholly inside one SCC, so an acyclic graph --
+    however many distinct paths it contains -- costs one pass and returns
+    empty. Cyclic components are enumerated in canonical order (least
+    member first); singleton components contribute only a self-loop.
+
+    Inside a non-trivial SCC the search can still walk exponentially many
+    dead-end paths between real cycles, so work -- not just output -- is
+    bounded: ``component_step_budget`` caps edge-expansions per component
+    and ``component_cycle_limit`` caps cycles reported per component, which
+    also keeps one malformed component from consuming the whole report and
+    starving genuine cycles elsewhere. Because component order, anchor
+    order, and adjacency order are all canonical, the reported set is
+    deterministic and independent of the order ``edges`` (or the underlying
+    issue list) happened to enumerate issues in.
     """
     adjacency: dict[int, list[int]] = {}
     all_targets: set[int] = set()
@@ -209,48 +318,41 @@ def find_blocker_cycles(
     for target in all_targets:
         adjacency.setdefault(target, [])
 
+    # Canonical component order -- least member first -- so which cycles get
+    # reported under the caps never depends on input enumeration order.
+    components = sorted(_strongly_connected_components(adjacency), key=min)
+
     cycles: list[list[int]] = []
-
-    def at_limit() -> bool:
-        return limit is not None and len(cycles) >= limit
-
-    for component in _strongly_connected_components(adjacency):
+    steps = 0
+    truncated = False
+    for index, component in enumerate(components):
         if len(component) == 1:
             # A singleton SCC is cyclic only via a self-reference edge.
             (node,) = component
             if node in adjacency[node]:
                 cycles.append([node])
-                if at_limit():
-                    cycles.sort()
-                    return cycles
-            continue
-        members = set(component)
-        for start in sorted(component):
-            # Iterative DFS rooted at `start`, restricted to intermediate
-            # nodes greater than `start` inside this component. Reaching
-            # `start` again closes a cycle whose least member is `start`.
-            path = [start]
-            in_path = {start}
-            stack = [iter(adjacency[start])]
-            while stack:
-                advanced = False
-                for nxt in stack[-1]:
-                    if nxt == start:
-                        cycles.append(list(path))
-                        if at_limit():
-                            cycles.sort()
-                            return cycles
-                    elif nxt > start and nxt in members and nxt not in in_path:
-                        path.append(nxt)
-                        in_path.add(nxt)
-                        stack.append(iter(adjacency[nxt]))
-                        advanced = True
-                        break
-                if not advanced:
-                    stack.pop()
-                    in_path.discard(path.pop())
+        else:
+            found, component_truncated, component_steps = _component_cycles(
+                adjacency, component, component_cycle_limit, component_step_budget
+            )
+            cycles.extend(found)
+            steps += component_steps
+            truncated = truncated or component_truncated
+        if limit is not None and len(cycles) >= limit:
+            if len(cycles) > limit:
+                # Cycles were found that cannot be reported.
+                truncated = True
+            else:
+                # Exactly at the cap: truncated iff any later component is
+                # still cyclic -- a cheap structural check, not enumeration.
+                truncated = truncated or any(
+                    _is_cyclic_component(adjacency, later) for later in components[index + 1 :]
+                )
+            break
+    if limit is not None:
+        del cycles[limit:]
     cycles.sort()
-    return cycles
+    return CycleEnumeration(cycles, truncated, steps)
 
 
 def detect_open_blocker_cycles(gh: GitHubLike) -> BlockerCycleScan:
@@ -259,33 +361,36 @@ def detect_open_blocker_cycles(gh: GitHubLike) -> BlockerCycleScan:
     Reporting-only (issue #1848): performs only reads, logs one warning per
     reported cycle, and returns a ``BlockerCycleScan`` for the caller to
     record as events. At most ``MAX_REPORTED_CYCLES`` cycles are reported per
-    pass; when more exist, ``truncated`` is set and one truncation warning is
-    logged -- the unreported remainder is never enumerated. Fail-open: a
-    transient ``gh`` failure resolves to an empty scan rather than breaking
-    the intake pass that called it.
+    pass; enumeration also stops early when a component exceeds its cycle cap
+    or DFS step budget. Any early stop sets ``truncated`` and logs one
+    truncation warning -- the unreported remainder is never enumerated.
+    Fail-open: a transient ``gh`` failure resolves to an empty scan rather
+    than breaking the intake pass that called it.
     """
     try:
         open_issues = gh.issue_list(state="open")
-        # Ask for one more than the report cap: a result longer than the cap
-        # is what proves truncation without enumerating the full set.
-        cycles = find_blocker_cycles(
-            open_blocker_edges(gh, open_issues), limit=MAX_REPORTED_CYCLES + 1
+        enumeration = find_blocker_cycles(
+            open_blocker_edges(gh, open_issues), limit=MAX_REPORTED_CYCLES
         )
     except Exception:
         logger.warning("blocker-cycle scan failed; skipping cycle report", exc_info=True)
         return BlockerCycleScan([], False)
-    truncated = len(cycles) > MAX_REPORTED_CYCLES
-    reported = cycles[:MAX_REPORTED_CYCLES]
+    reported = enumeration.cycles
     for cycle in reported:
         logger.warning(
             "blocker cycle detected among open issues: %s",
             " -> ".join(f"#{number}" for number in (*cycle, cycle[0])),
         )
-    if truncated:
+    if enumeration.truncated:
         logger.warning(
-            "blocker-cycle report truncated: more than %d distinct cycles "
-            "detected among open issues; reporting the first %d",
+            "blocker-cycle report truncated: enumeration stopped early after "
+            "%d edge-expansions (per-pass cap %d, per-component cap %d, "
+            "per-component DFS budget %d); reporting %d cycle(s), "
+            "unreported cycles may remain",
+            enumeration.steps,
             MAX_REPORTED_CYCLES,
-            MAX_REPORTED_CYCLES,
+            MAX_CYCLES_PER_COMPONENT,
+            MAX_COMPONENT_DFS_STEPS,
+            len(reported),
         )
-    return BlockerCycleScan(reported, truncated)
+    return BlockerCycleScan(reported, enumeration.truncated)
