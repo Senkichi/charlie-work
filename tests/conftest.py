@@ -242,6 +242,30 @@ def _no_real_pr_create_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pr_create_retry_module, "_default_sleep", lambda seconds: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_host_load_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a governor's host-load probe spawn a real process listing.
+
+    Issue #1843: ``host_load.measure_host_load`` defaults its ``lister`` to
+    ``list_host_processes``, which on this host invokes a real PowerShell
+    ``Get-CimInstance Win32_Process`` enumeration inside every governor call.
+    The feature ships on by default (``dispatch.host_load_max_pytest_processes``
+    defaults to the host's CPU count), so without this stub every test that
+    reaches ``_apply_concurrency_governor`` with a positive limit would pay a
+    subprocess spawn -- and, worse, would clamp or not depending on whatever
+    pytest suites happened to be running on the machine that moment, making
+    unrelated tests order-dependent. An empty snapshot (zero pytest trees)
+    is the correct neutral reading for every test not specifically about
+    host-load behavior. Tests that exercise the clamp re-patch
+    ``charlie_work.host_load.list_host_processes`` inside their own body,
+    which cleanly overrides this default; tests of the lister itself
+    inject ``lister=``/``proc_root=`` seams directly and never consult it.
+    """
+    import charlie_work.host_load as host_load_module
+
+    monkeypatch.setattr(host_load_module, "list_host_processes", lambda: ((), None))
+
+
 def _healthy_preflight(*args: object, **kwargs: object) -> PreflightResult:
     return PreflightResult(checks=())
 
