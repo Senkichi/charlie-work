@@ -17,12 +17,18 @@ stay ``self.`` calls (they resolve on the installed class).
 from __future__ import annotations
 
 import charlie_work.workflow as _wf
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from charlie_work.claude_code import _events_path
 from charlie_work.harnesses import REVIEWER_ADAPTER_KINDS
 from charlie_work.process_utils import find_worker_terminal_status
+from charlie_work.stalled_review_reap import (
+    _detect_and_handle_stalled_reviews,
+    _reap_completed_review_checkouts,
+    _reap_orphaned_review_checkouts,
+)
 from charlie_work.verdict_parsing import (
     REVIEW_MISS_TURN_LIMIT,
     _extract_review_session_summary,
@@ -334,3 +340,81 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
             )
 
     return {"recorded": recorded, "missed": missed}
+
+
+def _run_review_reap_sweeps(self, resolved_now: datetime) -> dict[str, Any]:
+    """Run the review-claim reap block once, shared by ``dispatch_reviews``
+    and the standalone ``reap_reviews`` operator command (issue #1874).
+
+    This is the sweep sequence ``dispatch_reviews`` runs at the top of every
+    pass, ahead of both the reviewer-quota gate and the
+    ``review_dispatch.enabled`` gate (issues #868, #736): dead reviewers are
+    reaped and stale claims freed even when no new reviewer can be launched,
+    because disabling dispatch must not disable the cleanup a previously
+    dispatched claim still needs.
+
+    Extracted as a single helper so the standalone reap command cannot drift
+    from the in-pass sweep set: both call sites run the identical five sweeps
+    in the identical order.
+
+    - ``_reap_review_verdicts``: record verdicts from dead reviewers' logs
+      first, so the stalled sweep below only sees reviewers that produced no
+      usable verdict (its ``decision_already_recorded`` skip, issue #734,
+      then never fires for a PR this reconciliation just ingested).
+    - ``_reconcile_stranded_verdicts``: ingest completed on-disk verdicts
+      never recorded into state (issue #736).
+    - ``_detect_and_handle_stalled_reviews``: free stale claims whose
+      reviewer pid is dead (5-minute ``_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES``,
+      not the 45-minute heartbeat anomaly threshold), tear down the isolated
+      review checkout, reap the sidecar.
+    - ``_reap_completed_review_checkouts`` / ``_reap_orphaned_review_checkouts``:
+      release checkouts for recorded-verdict and merged/closed PRs.
+
+    ``resolved_now`` is the pass's injectable clock (issue #828), forwarded to
+    every ``is_claim_stale`` check so all claims in one sweep evaluate against
+    a single instant. Returns the per-sweep result lists; under ``dry_run``
+    returns the empty summary without touching state, checkouts, or sidecars
+    (``reap_sidecar``/``remove_review_checkout`` deletes are NOT write-gated,
+    so the whole block must stay behind this guard, matching the pre-
+    extraction ``if not self.dry_run:`` gate in ``dispatch_reviews``).
+    """
+    if self.dry_run:
+        return {
+            "verdict_result": {"recorded": [], "missed": []},
+            "reconciled_verdicts": [],
+            "stalled": [],
+            "reaped_checkouts": [],
+            "orphaned_checkouts": [],
+        }
+    reviews_dir = self._layout.reviews_dir
+    verdict_result = self._reap_review_verdicts(reviews_dir)
+    # See the docstring ordering note: stranded-verdict ingestion runs before
+    # the stale-claim sweep so a just-recorded verdict is never mistaken for
+    # an unclaimed packet (issue #734's decision_already_recorded skip).
+    reconciled_verdicts = self._reconcile_stranded_verdicts()
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir,
+        self.paths.state_file,
+        self.config,
+        self.repo_root,
+        write_gate=self.write_gate,
+        now=resolved_now,
+    )
+    reaped_checkouts = _reap_completed_review_checkouts(
+        self.repo_root, reviews_dir, self.paths.state_file
+    )
+    orphaned_checkouts = _reap_orphaned_review_checkouts(
+        self.gh,
+        self.repo_root,
+        reviews_dir,
+        self.paths.state_file,
+        self.config,
+        write_gate=self.write_gate,
+    )
+    return {
+        "verdict_result": verdict_result,
+        "reconciled_verdicts": reconciled_verdicts,
+        "stalled": stalled,
+        "reaped_checkouts": reaped_checkouts,
+        "orphaned_checkouts": orphaned_checkouts,
+    }
