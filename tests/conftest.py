@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 import tempfile as _tempfile_module
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import create_autospec
@@ -51,6 +51,71 @@ def autospec_patch(
 def autospec() -> Callable[..., Any]:
     """Provide the autospec_patch helper to tests."""
     return autospec_patch
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _kill_on_close_job() -> None:
+    """Issue #1851: on Windows, put this pytest process in a Job Object with
+    ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` so every descendant — at any
+    depth — dies with pytest however the session ends.
+
+    Launch-path tests spawn real children that nothing waits on (the
+    adapters are non-blocking by design); a stopped run used to orphan them,
+    and on Windows the orphaned venv launchers busy-spun for hours. Off
+    Windows this is a no-op; a process already inside a job that forbids
+    nesting is logged and tolerated.
+
+    Under pytest-xdist each worker runs this for itself — a child of an
+    xdist worker is contained by that worker's job.
+    """
+    from _process_guard import enter_kill_on_close_job
+
+    enter_kill_on_close_job()
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_child_processes() -> Iterator[None]:
+    """Issue #1851: fail a test that leaves a live descendant behind.
+
+    Snapshots this process's descendants at setup; at teardown gives new
+    children a short grace to exit on their own, kills the survivors, and
+    fails the test naming each survivor's pid and command line.
+    """
+    from _process_guard import descendant_snapshot, reap_leaked_descendants
+
+    before = descendant_snapshot()
+    yield
+    report = reap_leaked_descendants(before)
+    if report:
+        pytest.fail("test left live child process(es) behind:\n  " + "\n  ".join(report))
+
+
+@pytest.fixture(autouse=True)
+def _reap_launched_worker_pids(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Issue #1851: reap every pid a non-blocking launch function returns.
+
+    ``launch_api_worker`` / ``launch_claude_worker`` / ``launch_devin_session``
+    return immediately by design; the record's ``pid`` is the only handle the
+    caller gets back. Wrapping every binding of them reachable in
+    ``sys.modules`` — test-module globals and the production ``from``-import
+    references alike — collects every returned pid so teardown can kill any
+    that are still alive: the "wait on or kill every process handle they get
+    back" hygiene applied uniformly, rather than relying on each call site
+    to remember. Tests that monkeypatch a launcher themselves replace the
+    wrapper and opt out for that call — their fakes return fabricated pids
+    that ``reap_pid`` declines to touch anyway.
+
+    Setup order matters: this fixture is defined after
+    ``_no_leaked_child_processes``, so its teardown runs first and a reaped
+    launch never reaches the guard.
+    """
+    from _process_guard import reap_pid, wrap_launchers
+
+    pids: list[int] = []
+    wrap_launchers(monkeypatch, pids)
+    yield
+    for pid in pids:
+        reap_pid(pid)
 
 
 @pytest.fixture(autouse=True)
