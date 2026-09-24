@@ -68,6 +68,8 @@ $section_no_merge_contract
 
 $section_process_lifetime
 
+$section_session_scratch_dir
+
 $section_mutation_check
 
 $section_test_hygiene
