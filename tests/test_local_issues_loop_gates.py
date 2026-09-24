@@ -19,10 +19,15 @@ pass:
 Each step is now skipped on the existing
 ``local_work_park.publishes_pull_requests`` capability predicate -- the same
 one ``dead_worker_reap`` consults -- rather than surviving its own failure
-per call site. These tests run one ``loop()`` pass per backend and assert
-on the patched callees: never invoked on the non-publishing backend, and
-invoked on the publishing control (proving the skip is conditional on the
-capability, not the lane being deleted outright).
+per call site. The two ``_maybe_*`` lanes live in
+``orchestration/state_pr_capability_lanes.py`` (a delegate leaf extracted
+from ``state_maintenance`` for the file-size ratchet); the dispatch token
+probe reaches the predicate through
+``local_work_park.worker_github_token_findings_if_publishing``. These tests run
+one ``loop()`` pass per backend and assert on the patched callees: never
+invoked on the non-publishing backend, and invoked on the publishing
+control (proving the skip is conditional on the capability, not the lane
+being deleted outright).
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import charlie_work.local_work_park as local_work_park_module
 import charlie_work.workflow as workflow_module
 from _fakes_github import FakeGitHub
 from charlie_work.config import (
@@ -52,20 +58,6 @@ from charlie_work.state import load_state
 from charlie_work.workflow import CommandResult, OrchestratorApp
 
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
-
-# Imported after ``charlie_work.workflow`` deliberately: ``dispatch_state``
-# does ``import charlie_work.workflow as _wf`` at module level, so importing
-# it directly *before* ``charlie_work.workflow`` has been fully imported
-# triggers Python's circular-import partial-module hazard -- ``workflow``'s
-# own module-level ``discover_delegate_modules`` call would then reimport
-# this already-in-progress module and see only the portion defined above
-# the ``import charlie_work.workflow as _wf`` line, silently dropping every
-# delegate defined below it (including ``_dispatch_impl``) from
-# ``OrchestratorApp``. Importing ``charlie_work.workflow`` first (above)
-# guarantees delegate installation has completed by the time this line
-# runs. (Same hazard documented in
-# tests/test_issue_1314_operator_queue_followups.py.)
-import charlie_work.orchestration.dispatch_state as dispatch_state_module  # noqa: E402
 
 
 def _init_repo(repo_root: Path) -> None:
@@ -126,9 +118,11 @@ def _patch_lane_callees(monkeypatch: pytest.MonkeyPatch) -> tuple[Mock, Mock, Mo
     ``_reconcile_locked`` is patched on the class (``_maybe_reconcile_drift``
     calls ``self._reconcile_locked``), ``reclaim_superseded_main_ci_runs`` on
     the ``workflow`` facade (the lane reaches it through ``_wf.``), and
-    ``worker_github_token_findings`` on ``dispatch_state``'s own import
-    binding. The findings spy wraps the real predicate so the positive
-    control still exercises the real escalation path.
+    ``worker_github_token_findings`` on ``local_work_park``'s import binding
+    (``_dispatch_impl`` calls the gated helper
+    ``worker_github_token_findings_if_publishing``, which resolves the probe in
+    that module's namespace). The findings spy wraps the real predicate so
+    the positive control still exercises the real escalation path.
     """
     reconcile_locked = Mock(return_value=CommandResult(True, "reconciled", {}))
     reclaim = Mock(
@@ -139,7 +133,7 @@ def _patch_lane_callees(monkeypatch: pytest.MonkeyPatch) -> tuple[Mock, Mock, Mo
     token_findings = Mock(wraps=worker_github_token_findings)
     monkeypatch.setattr(OrchestratorApp, "_reconcile_locked", reconcile_locked)
     monkeypatch.setattr(workflow_module, "reclaim_superseded_main_ci_runs", reclaim)
-    monkeypatch.setattr(dispatch_state_module, "worker_github_token_findings", token_findings)
+    monkeypatch.setattr(local_work_park_module, "worker_github_token_findings", token_findings)
     return reconcile_locked, reclaim, token_findings
 
 

@@ -75,12 +75,11 @@ from charlie_work.dispatch_selection import (
     _windowed_blocked_environment_at,
     _windowed_foreign_writer_reaps,
 )
-from charlie_work.env_sanitize import worker_github_token_findings
 from charlie_work.escalation import _escalate_issue, _escalation_edge
 from charlie_work.fleet_registry import managed_repo_names, managed_repo_roots
 from charlie_work.github import label_names
 from charlie_work.labels import TransitionOutcome
-from charlie_work.local_work_park import publishes_pull_requests
+from charlie_work.local_work_park import worker_github_token_findings_if_publishing
 from charlie_work.state import (
     arm_dispatch_stale_alert,
     backfill_dispatch_baseline,
@@ -122,15 +121,7 @@ def _dispatch_impl(
     # that also covers dry-run, where the durable marker is never
     # written. The marker is cleared when the condition resolves (all
     # findings ok), so a future regression re-escalates.
-    #
-    # Issue #1810: a backend that cannot publish pull requests never has a
-    # worker push or open a PR, so a missing scoped worker GitHub token is
-    # not a defect there -- skip the findings probe (and the escalation
-    # path it feeds) entirely on the same capability predicate
-    # dead_worker_reap already gates on.
-    token_findings = (
-        worker_github_token_findings(self.config) if publishes_pull_requests(self.gh) else []
-    )
+    token_findings = worker_github_token_findings_if_publishing(self.config, self.gh)
     missing_findings = [f for f in token_findings if not f.ok]
     if missing_findings:
         if not self._worker_token_escalated:
