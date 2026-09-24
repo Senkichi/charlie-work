@@ -1,0 +1,8 @@
+{
+ "boundary": 41.0,
+ "bumps": [],
+ "file": "tests/test_githublike_protocol.py",
+ "identity": "tests/test_githublike_protocol.py::module",
+ "kind": "test_module",
+ "member_count": 42
+}

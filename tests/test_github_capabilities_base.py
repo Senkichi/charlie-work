@@ -4,7 +4,7 @@ round-1 review).
 
 Kept in its own module rather than folded into ``test_githublike_protocol.py``
 so that file's ``test_module`` attachment point stays within its baselined
-member-count ceiling (``.attachment-budgets.json``).
+member-count ceiling (``.attachment-budgets/``).
 """
 
 from __future__ import annotations

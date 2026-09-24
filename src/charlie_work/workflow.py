@@ -3230,7 +3230,7 @@ WORKER_PROMPT_KEYS: frozenset[str] = frozenset(
         # failure.
         "module_map",
         # Issue #1460: the attachment-point placement clause, gated on
-        # `.attachment-budgets.json` presence. Empty string when the marker
+        # `.attachment-budgets/` presence. Empty string when the marker
         # is absent or fails to load (fail-soft: omitted clause + a
         # ``worker_attachment_budget_failed`` warning event), never a
         # dispatch failure. Deliberately NOT added to REWORK_PROMPT_KEYS --
@@ -5885,7 +5885,7 @@ class OrchestratorApp:
         )
 
         # Issue #1460: attachment-budget review-packet section. Cheap gate
-        # first -- most PRs touch neither `.attachment-budgets.json` nor a
+        # first -- most PRs touch neither `.attachment-budgets/` nor a
         # baselined host file, so the reconstruct/build path below is
         # skipped for them entirely (section renders "").
         attachment_budget_section = self._build_attachment_budget_section(diff, pr_number)
