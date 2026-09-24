@@ -4251,16 +4251,6 @@ class OrchestratorApp:
         # landed before this instance's first pass is not "stale since load"
         # for THIS instance, only an edit after.
         self._preflight_config_mtimes: dict[str, float] = {}
-        # Issue #1001: same-instance once-only escalation flag for the
-        # worker-github-token gate. A missing token is a standing condition;
-        # the gate must not emit an event every loop pass. The cross-instance
-        # source of truth is the durable ``worker_token_escalated`` marker in
-        # state.json (fleet_loop rebuilds this app per repo per pass, so an
-        # instance flag alone resets every pass). This in-memory flag is a
-        # same-instance optimization that also suppresses re-entry under
-        # dry-run, where the durable marker is never written. It is cleared
-        # when the condition resolves (all findings ok) alongside the marker.
-        self._worker_token_escalated = False
         # Make the event ring cap config-driven (issue #525).
         _state.EVENT_RING_SIZE = config.runtime.event_ring_size
         prompts_dir = config.runtime.prompts_dir

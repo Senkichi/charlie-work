@@ -286,6 +286,9 @@ class LocalFileGitHub:
     def pr_comment(self, number: int, body_file: Path) -> None:
         raise GitHubError(_NO_REMOTE)
 
+    def pr_edit(self, number: int, body_file: Path) -> None:
+        raise GitHubError(_NO_REMOTE)
+
     # -- owner members -----------------------------------------------------
 
     def run(
