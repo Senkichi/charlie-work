@@ -12,7 +12,10 @@ from typing import Any
 import yaml
 
 from . import CLI_NAME
-from .closing_keyword_gate import find_unexpected_closing_references
+from .closing_keyword_gate import (
+    exclude_base_reachable_commits,
+    find_unexpected_closing_references,
+)
 from .mojibake_gate import find_mojibake_in_diff
 from .ast_equivalence_gate_command import (
     register_ast_equivalence_check_subparser,
@@ -925,6 +928,16 @@ def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult
     on regardless of what this codebase intends, because that GitHub feature
     scans PR body + every commit message with no negation awareness (issue
     #790; PR #788's own commit text is the regression fixture proving this).
+
+    Issue #1872: the ``pulls/{n}/commits`` surface is computed against the
+    PR's *recorded* ``base.sha`` (effectively ``rev-list base.sha..head``),
+    which lags when a push merges a newer ``main`` — a foreign squash-merge
+    commit already on ``main`` then lists as one of this PR's commits and
+    false-positives the gate. The merge base is therefore re-resolved against
+    the *live* base ref (``GitHub.compare``'s ``merge_base_commit``) and every
+    listed commit already reachable from it is excluded before scanning.
+    Like the two fetch legs above, an unresolvable live merge base fails
+    closed rather than falling back to the stale recorded surface.
     """
     ctx = bootstrap_command(args)
 
@@ -937,7 +950,21 @@ def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult
         return CommandResult(
             False, f"closing-keyword-check: could not fetch commits for PR #{args.pr}", {}
         )
-    commit_messages = [str((c.get("commit") or {}).get("message") or "") for c in commits]
+
+    base_ref = pr.get("baseRefName")
+    head_sha = pr.get("headRefOid")
+    comparison = ctx.gh.compare(str(base_ref), str(head_sha)) if base_ref and head_sha else None
+    merge_base_commit = comparison.get("merge_base_commit") if comparison else None
+    merge_base_sha = merge_base_commit.get("sha") if isinstance(merge_base_commit, dict) else None
+    if not isinstance(merge_base_sha, str) or not merge_base_sha:
+        return CommandResult(
+            False,
+            f"closing-keyword-check: could not resolve live merge base for PR #{args.pr} "
+            f"(baseRefName={base_ref!r}, headRefOid={head_sha!r})",
+            {},
+        )
+    scanned_commits = exclude_base_reachable_commits(commits, merge_base_sha=merge_base_sha)
+    commit_messages = [str((c.get("commit") or {}).get("message") or "") for c in scanned_commits]
 
     # Issue #1229 scoping decision: this call site is deliberately NOT
     # threaded through branch_issue_validator. ``intended`` is the single
@@ -967,6 +994,7 @@ def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult
     data = {
         "pr": args.pr,
         "intended_issue_number": intended,
+        "excluded_base_reachable_count": len(commits) - len(scanned_commits),
         "findings": [
             {
                 "issue_number": finding.issue_number,
