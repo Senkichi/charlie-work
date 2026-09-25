@@ -19,7 +19,9 @@ This module implements the local equivalent of the remote lane:
     into the branch worktree, runs the full suite there, then advances the
     base branch (fast-forward or ``--no-ff``) and reaps the worktree ->
     ``_local_dispatch_rework`` re-dispatches a worker on the same branch for
-    ``request_changes``/suite-failure/conflict outcomes.
+    ``request_changes``/suite-failure/conflict outcomes (suspended when the
+    pass carries an explicit dispatch budget of 0 -- the ``fleet stop
+    --drain`` signal, issue #1716).
 
 Every top-level ``def`` here is installed on ``OrchestratorApp`` by
 ``workflow_delegation._install_delegates``; pure git/suite mechanics live in
@@ -82,7 +84,7 @@ _LIVE_DISPATCH_STATUSES = frozenset({"dispatched", "dispatch_pending", "manifest
 _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES = 5
 
 
-def _local_lane(self, *, now: Any = None) -> _wf.CommandResult:
+def _local_lane(self, *, now: Any = None, limit: int | None = None) -> _wf.CommandResult:
     """One pass of the local review/merge/rework lane.
 
     Runs inside ``loop()`` after ``dispatch_reviews``. Read-only no-op on a
@@ -90,6 +92,17 @@ def _local_lane(self, *, now: Any = None) -> _wf.CommandResult:
     ``*_enabled`` kill switch (``review_dispatch.enabled``,
     ``auto_merge.enabled``), matching the remote lane's gating so a config
     flip cannot strand in-flight claims.
+
+    ``limit`` is the caller's explicit dispatch budget, threaded unchanged
+    (pre-governor) from ``_loop_body``: an explicit 0 -- what
+    ``fleet stop --drain`` forces through ``app.loop(0)`` -- suspends the
+    rework launch below (issue #1716). ``_local_dispatch_rework`` is the
+    lane's only ``dispatch_sessions`` caller with no ``*_enabled`` flag of
+    its own, so the forced 0 is its only drain signal; every other launcher
+    (``_local_dispatch_reviewers``) is already suppressed by
+    ``apply_fleet_drain_config`` flipping ``review_dispatch.enabled``.
+    ``None`` and positive limits leave rework dispatch unbudgeted, matching
+    pre-drain behavior -- it only claims verdict-driven candidates.
     """
     if publishes_pull_requests(self.gh):
         return _wf.CommandResult(
@@ -111,7 +124,12 @@ def _local_lane(self, *, now: Any = None) -> _wf.CommandResult:
     merges: list[dict[str, Any]] = []
     if self.config.auto_merge.enabled:
         merges = self._local_merge_approved()
-    rework = self._local_dispatch_rework()
+    launches_suspended = limit is not None and limit <= 0
+    rework = (
+        {"dispatched": [], "failed": [], "skipped": []}
+        if launches_suspended
+        else self._local_dispatch_rework()
+    )
     return _wf.CommandResult(
         True,
         "local lane pass complete",
@@ -122,6 +140,7 @@ def _local_lane(self, *, now: Any = None) -> _wf.CommandResult:
             "reviewers_launched": dispatched.get("launched", []),
             "merges": merges,
             "rework_dispatched": rework.get("dispatched", []),
+            "rework_launches_suspended": launches_suspended,
         },
     )
 

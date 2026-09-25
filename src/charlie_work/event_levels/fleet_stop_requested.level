@@ -1,0 +1,3 @@
+info
+# Issue #1716: `charlie fleet stop [--drain]` recorded its request
+# marker. Operator-initiated and expected -- info, not warning.
