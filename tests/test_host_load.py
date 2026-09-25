@@ -409,10 +409,23 @@ def test_list_processes_posix_reports_missing_procfs(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_app(tmp_path: Path, host_load_max: int, **dispatch_kwargs: Any) -> OrchestratorApp:
+def _build_app(
+    tmp_path: Path,
+    host_load_max: int,
+    host_load_trees_max: int = 0,
+    **dispatch_kwargs: Any,
+) -> OrchestratorApp:
+    """Build an app with both host-load knobs pinned explicitly.
+
+    ``host_load_trees_max`` defaults to 0 so the #1843-era tests below keep
+    exercising the process brake in isolation; issue #1903's tree-headroom
+    governor tests live in ``tests/test_host_load_tree_headroom.py`` (the
+    this-module attachment point is saturated) and pass a real cap.
+    """
     config = OrchestratorConfig(
         dispatch=DispatchConfig(
             host_load_max_pytest_processes=host_load_max,
+            host_load_max_pytest_trees=host_load_trees_max,
             default_limit=5,
             **dispatch_kwargs,
         ),
@@ -512,8 +525,8 @@ def test_host_load_threshold_is_strictly_greater(
 def test_host_load_zero_disables_probe_entirely(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The kill switch: host_load_max_pytest_processes=0 must not even
-    spawn the process listing -- off means off, not 'probe then ignore'."""
+    """The kill switch: both host-load knobs at 0 must not even spawn the
+    process listing -- off means off, not 'probe then ignore'."""
     calls = []
     monkeypatch.setattr(host_load, "list_host_processes", lambda: calls.append(1) or _lister())
     app = _build_app(tmp_path, host_load_max=0)
@@ -639,12 +652,15 @@ def test_host_load_only_term_enabled_surfaces_in_dispatch_result(
 # ---------------------------------------------------------------------------
 
 
-def test_host_load_knob_defaults_to_host_cpu_count() -> None:
-    """On by default per the issue's acceptance criteria: unset, the
-    threshold is this host's logical CPU count ('more runnable test
-    processes than cores' is the built-in saturation line)."""
+def test_host_load_knob_defaults_track_host_cpu_count() -> None:
+    """On by default per #1843's acceptance criteria, recalibrated by
+    #1903: unset, the process brake sits at 3x this host's logical CPU
+    count (raw process count scales with ``-n``, so ~2 ordinary suites
+    must not trip it) and the tree governor sits at half the CPU count
+    (one launch ≈ one suite, so the cap is 'suites the host absorbs')."""
     config = build_config_from_data({})
-    assert config.dispatch.host_load_max_pytest_processes == (os.cpu_count() or 0)
+    assert config.dispatch.host_load_max_pytest_processes == (os.cpu_count() or 0) * 3
+    assert config.dispatch.host_load_max_pytest_trees == (os.cpu_count() or 0) // 2
 
 
 def test_host_load_knob_accepts_int() -> None:

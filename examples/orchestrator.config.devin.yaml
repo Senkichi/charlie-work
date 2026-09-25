@@ -6,11 +6,14 @@ labels:
 
 dispatch:
   default_limit: 3
-  # Issue #1843: host-load backoff -- defers worker launches while live pytest
-  # process-tree count on this host exceeds the threshold (default: logical
-  # CPU count; 0 disables). Mostly relevant when the orchestrator host also
-  # runs CI or local workers.
-  # host_load_max_pytest_processes: 16
+  # Issue #1843/#1903: host-load backoff -- defers worker launches while live
+  # pytest suite load on this host exceeds the caps: host_load_max_pytest_trees
+  # bounds concurrent suites by remaining headroom (default: cpu_count // 2),
+  # host_load_max_pytest_processes brakes on abnormal -n width (default:
+  # cpu_count * 3). Mostly relevant when the orchestrator host also runs CI or
+  # local workers. 0 disables each term; both 0 skips the probe.
+  # host_load_max_pytest_trees: 8
+  # host_load_max_pytest_processes: 48
   # Per-pass cap for merge-finalization of merged-PR-referenced closed issues
   # (stale ready-label cleanup). 0 disables finalization.
   finalize_limit: 25
