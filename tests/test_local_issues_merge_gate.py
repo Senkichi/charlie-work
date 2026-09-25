@@ -42,17 +42,12 @@ def _init_repo(repo_root: Path) -> None:
     repo_root.mkdir(parents=True, exist_ok=True)
     _git(repo_root, "init", "--initial-branch=main")
     _git(repo_root, "config", "core.longpaths", "true")
-    _git(
-        repo_root,
-        "-c",
-        "user.name=t",
-        "-c",
-        "user.email=t@t",
-        "commit",
-        "--allow-empty",
-        "-m",
-        "chore: seed",
-    )
+    # Repo-local identity, matching every other real-git fixture in the
+    # suite: ``git merge -m`` creates a commit and needs a committer, and a
+    # fresh CI runner has no global user.name/user.email to fall back on.
+    _git(repo_root, "config", "user.email", "test@example.test")
+    _git(repo_root, "config", "user.name", "test")
+    _git(repo_root, "commit", "--allow-empty", "-m", "chore: seed")
 
 
 def _write_issue(issues_dir: Path, number: int, *, state: str, body: str = "Body.") -> Path:
@@ -66,7 +61,7 @@ def _commit_on_branch(repo_root: Path, branch: str, filename: str) -> None:
     _git(repo_root, "switch", "-c", branch)
     (repo_root / filename).write_text("x = 1\n", encoding="utf-8")
     _git(repo_root, "add", filename)
-    _git(repo_root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "work")
+    _git(repo_root, "commit", "-m", "work")
     _git(repo_root, "switch", "main")
 
 
