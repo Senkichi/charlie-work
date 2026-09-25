@@ -320,7 +320,8 @@ def _no_real_host_load_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     ``list_host_processes``, which on this host invokes a real PowerShell
     ``Get-CimInstance Win32_Process`` enumeration inside every governor call.
     The feature ships on by default (``dispatch.host_load_max_pytest_processes``
-    defaults to the host's CPU count), so without this stub every test that
+    and ``host_load_max_pytest_trees`` both derive from the host's CPU count),
+    so without this stub every test that
     reaches ``_apply_concurrency_governor`` with a positive limit would pay a
     subprocess spawn -- and, worse, would clamp or not depending on whatever
     pytest suites happened to be running on the machine that moment, making
