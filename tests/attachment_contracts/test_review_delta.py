@@ -8,10 +8,11 @@ behavioral no-LOC corollary test at the bottom).
 
 from __future__ import annotations
 
-from charlie_work.attachment_contracts.baseline import BASELINE_FILENAME, dumps
+from charlie_work.attachment_contracts.baseline import BASELINE_FILENAME
 from charlie_work.attachment_contracts.model import AdvisoryRecord
 from charlie_work.attachment_contracts.review_delta import (
     build_budget_findings,
+    reconstruct_baseline_dir_head,
     reconstruct_baseline_head_text,
 )
 from charlie_work.janitor import iter_diff_files
@@ -133,8 +134,8 @@ def _bump_dict(to: int, actor: str, ack: str, reason: str = "growth") -> dict:
 
 def test_build_budget_findings_no_bump_or_touch_is_empty() -> None:
     section = build_budget_findings(
-        base_baseline_text=None,
-        head_baseline_text=None,
+        base_document=None,
+        head_document=None,
         changed_files=frozenset({"src/other.py"}),
         baseline_touched=False,
         advisories=(),
@@ -150,9 +151,11 @@ def test_worker_bump_with_source_id_ack_is_blocking() -> None:
         [_entry_dict("Foo", "src/foo.py", 10, [_bump_dict(12, "worker", "dispatch:abc123")])]
     )
     section = build_budget_findings(
-        base_baseline_text=dumps(base),
-        head_baseline_text=dumps(head),
-        changed_files=frozenset({BASELINE_FILENAME, "src/foo.py"}),
+        base_document=base,
+        head_document=head,
+        changed_files=frozenset(
+            {".attachment-budgets/entries/src/foo.py/class--Foo.json", "src/foo.py"}
+        ),
         baseline_touched=True,
         advisories=(),
     )
@@ -172,9 +175,11 @@ def test_worker_bump_with_issue_ack_suppresses_saturated_row_and_no_blocking() -
     head = _doc([_entry_dict("Foo", "src/foo.py", 10, [_bump_dict(12, "worker", "#1460")])])
 
     section = build_budget_findings(
-        base_baseline_text=dumps(base),
-        head_baseline_text=dumps(head),
-        changed_files=frozenset({BASELINE_FILENAME, "src/foo.py"}),
+        base_document=base,
+        head_document=head,
+        changed_files=frozenset(
+            {".attachment-budgets/entries/src/foo.py/class--Foo.json", "src/foo.py"}
+        ),
         baseline_touched=True,
         advisories=(),
     )
@@ -188,8 +193,8 @@ def test_saturated_touched_without_any_bump() -> None:
     head = _doc([_entry_dict("Foo", "src/foo.py", 10)])  # unchanged
 
     section = build_budget_findings(
-        base_baseline_text=dumps(base),
-        head_baseline_text=dumps(head),
+        base_document=base,
+        head_document=head,
         changed_files=frozenset({"src/foo.py"}),
         baseline_touched=False,
         advisories=(),
@@ -202,8 +207,8 @@ def test_saturated_touched_without_any_bump() -> None:
 
 def test_advisories_none_sets_unavailable_and_no_redirects() -> None:
     section = build_budget_findings(
-        base_baseline_text=None,
-        head_baseline_text=None,
+        base_document=None,
+        head_document=None,
         changed_files=frozenset(),
         baseline_touched=False,
         advisories=None,
@@ -230,8 +235,8 @@ def test_redirects_not_taken_filters_to_untaken_redirects() -> None:
         ),
     )
     section = build_budget_findings(
-        base_baseline_text=None,
-        head_baseline_text=None,
+        base_document=None,
+        head_document=None,
         changed_files=frozenset({"src/bar_extra.py"}),  # only Bar's redirect taken
         baseline_touched=False,
         advisories=advisories,
@@ -259,10 +264,170 @@ def test_large_comment_only_addition_to_saturated_file_yields_no_blocking() -> N
     changed_files = frozenset({"src/foo.py"})
 
     section = build_budget_findings(
-        base_baseline_text=dumps(base),
-        head_baseline_text=dumps(head),
+        base_document=base,
+        head_document=head,
         changed_files=changed_files,
         baseline_touched=False,
         advisories=(),
     )
     assert section.blocking_bumps == ()
+
+
+# ---------------------------------------------------------------------------
+# reconstruct_baseline_dir_head (issue #1839): per-file map for the
+# .attachment-budgets/ directory layout -- models entry adds, deletes, and
+# renames, which the single-file reconstructor never had to.
+# ---------------------------------------------------------------------------
+
+_DIR = ".attachment-budgets"
+_META = '{\n "floor": 4\n}\n'
+_ENTRY_A = '{\n "kind": "class",\n "identity": "A",\n "file": "src/a.py"\n}\n'
+
+
+def _base_files() -> dict[str, str]:
+    return {
+        "meta.json": _META,
+        "entries/src/a.py/class--A.json": _ENTRY_A,
+    }
+
+
+def test_dir_head_passthrough_when_diff_touches_no_baseline_files() -> None:
+    diff = (
+        "diff --git a/src/other.py b/src/other.py\n"
+        "index 111..222 100644\n"
+        "--- a/src/other.py\n"
+        "+++ b/src/other.py\n"
+        "@@ -1 +1 @@\n"
+        "-x\n"
+        "+y\n"
+    )
+
+    assert reconstruct_baseline_dir_head(_base_files(), diff, dir_prefix=_DIR) == _base_files()
+
+
+def test_dir_head_applies_entry_file_edit() -> None:
+    new_entry = (
+        '{\n "kind": "class",\n "identity": "A",\n "file": "src/a.py",\n "member_count": 9\n}\n'
+    )
+    diff = (
+        "diff --git a/.attachment-budgets/entries/src/a.py/class--A.json "
+        "b/.attachment-budgets/entries/src/a.py/class--A.json\n"
+        "index 111..222 100644\n"
+        "--- a/.attachment-budgets/entries/src/a.py/class--A.json\n"
+        "+++ b/.attachment-budgets/entries/src/a.py/class--A.json\n"
+        "@@ -1,4 +1,5 @@\n"
+        " {\n"
+        '  "kind": "class",\n'
+        '  "identity": "A",\n'
+        '- "file": "src/a.py"\n'
+        '+ "file": "src/a.py",\n'
+        '+ "member_count": 9\n'
+        " }\n"
+    )
+
+    result = reconstruct_baseline_dir_head(_base_files(), diff, dir_prefix=_DIR)
+
+    assert result == {
+        "meta.json": _META,
+        "entries/src/a.py/class--A.json": new_entry,
+    }
+
+
+def test_dir_head_models_new_entry_file() -> None:
+    diff = (
+        "diff --git a/.attachment-budgets/entries/src/b.py/class--B.json "
+        "b/.attachment-budgets/entries/src/b.py/class--B.json\n"
+        "new file mode 100644\n"
+        "index 0000000..1234567\n"
+        "--- /dev/null\n"
+        "+++ b/.attachment-budgets/entries/src/b.py/class--B.json\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+{\n"
+        "+}\n"
+    )
+
+    result = reconstruct_baseline_dir_head(_base_files(), diff, dir_prefix=_DIR)
+
+    assert result is not None
+    assert result["entries/src/b.py/class--B.json"] == "{\n}\n"
+    assert result["entries/src/a.py/class--A.json"] == _ENTRY_A
+
+
+def test_dir_head_models_deleted_entry_file() -> None:
+    diff = (
+        "diff --git a/.attachment-budgets/entries/src/a.py/class--A.json "
+        "b/.attachment-budgets/entries/src/a.py/class--A.json\n"
+        "deleted file mode 100644\n"
+        "index 1234567..0000000\n"
+        "--- a/.attachment-budgets/entries/src/a.py/class--A.json\n"
+        "+++ /dev/null\n"
+        "@@ -1,4 +0,0 @@\n"
+        "-{\n"
+        '- "kind": "class",\n'
+        '- "identity": "A",\n'
+        '- "file": "src/a.py"\n'
+        "-}\n"
+    )
+
+    result = reconstruct_baseline_dir_head(_base_files(), diff, dir_prefix=_DIR)
+
+    assert result == {"meta.json": _META}
+
+
+def test_dir_head_models_entry_rename() -> None:
+    """A host-file rename re-keys the entry (the filename derives from its
+    content key) -- a pure rename section with no hunks moves the file."""
+    diff = (
+        "diff --git a/.attachment-budgets/entries/src/a.py/class--A.json "
+        "b/.attachment-budgets/entries/src/b.py/class--B.json\n"
+        "similarity index 100%\n"
+        "rename from .attachment-budgets/entries/src/a.py/class--A.json\n"
+        "rename to .attachment-budgets/entries/src/b.py/class--B.json\n"
+    )
+
+    result = reconstruct_baseline_dir_head(_base_files(), diff, dir_prefix=_DIR)
+
+    assert result == {
+        "meta.json": _META,
+        "entries/src/b.py/class--B.json": _ENTRY_A,
+    }
+
+
+def test_dir_head_mismatched_hunk_returns_none() -> None:
+    """Context that doesn't match the base file -> None, never a silently
+    wrong reconstruction (same contract as the single-file variant)."""
+    diff = (
+        "diff --git a/.attachment-budgets/entries/src/a.py/class--A.json "
+        "b/.attachment-budgets/entries/src/a.py/class--A.json\n"
+        "--- a/.attachment-budgets/entries/src/a.py/class--A.json\n"
+        "+++ b/.attachment-budgets/entries/src/a.py/class--A.json\n"
+        "@@ -1,4 +1,4 @@\n"
+        " NOT-THE-REAL-CONTENT\n"
+        '- "kind": "class",\n'
+        '+ "kind": "forged",\n'
+        '  "identity": "A",\n'
+        '  "file": "src/a.py"\n'
+        " }\n"
+    )
+
+    assert reconstruct_baseline_dir_head(_base_files(), diff, dir_prefix=_DIR) is None
+
+
+def test_dir_head_modified_member_absent_from_base_returns_none() -> None:
+    """A diff section modifying a baseline member the base snapshot doesn't
+    contain is a stale/mismatched snapshot -- fail closed."""
+    diff = (
+        "diff --git a/.attachment-budgets/entries/src/ghost.py/class--G.json "
+        "b/.attachment-budgets/entries/src/ghost.py/class--G.json\n"
+        "--- a/.attachment-budgets/entries/src/ghost.py/class--G.json\n"
+        "+++ b/.attachment-budgets/entries/src/ghost.py/class--G.json\n"
+        "@@ -1 +1 @@\n"
+        "-x\n"
+        "+y\n"
+    )
+
+    assert reconstruct_baseline_dir_head(_base_files(), diff, dir_prefix=_DIR) is None
+
+
+def test_dir_head_none_base_map_returns_none() -> None:
+    assert reconstruct_baseline_dir_head(None, "diff --git a/x b/x\n", dir_prefix=_DIR) is None

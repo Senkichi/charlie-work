@@ -10,7 +10,7 @@ drives ``OrchestratorApp.review`` end-to-end and reads the rendered
 
 The ratchet remedy tells a worker whose PR shrinks a saturated attachment
 point to run ``python -m charlie_work.attachment_contracts baseline
---ratchet`` and commit the resulting ``.attachment-budgets.json`` tightening
+--ratchet`` and commit the resulting ``.attachment-budgets/`` tightening
 in the same PR. A lowered count is a ratchet, not a bump -- G4 (workers may
 not self-ack bumps) governs raises only; CI re-verifies ``actual <=
 baseline`` deterministically, so there is nothing to launder by
@@ -24,7 +24,8 @@ from pathlib import Path
 
 from _fakes_github import FakeGitHub
 from charlie_work.attachment_budget_prompt import render_attachment_budget_section
-from charlie_work.attachment_contracts.baseline import BASELINE_FILENAME, dumps
+from charlie_work.attachment_contracts import baseline_dir
+from charlie_work.attachment_contracts.baseline import BASELINE_DIRNAME
 from charlie_work.attachment_contracts.review_delta import (
     BudgetSection,
     RatchetablePoint,
@@ -62,8 +63,8 @@ def test_render_section_with_ratchetable_point_emits_remedy() -> None:
     text = render_attachment_budget_section(section)
     # The ratchet command must be named so the worker knows what to run.
     assert "python -m charlie_work.attachment_contracts baseline --ratchet" in text
-    # The baseline file that the command writes must be named.
-    assert ".attachment-budgets.json" in text
+    # The baseline store that the command writes must be named.
+    assert ".attachment-budgets/" in text
     # The instruction must say to commit in the same PR.
     assert "same PR" in text or "this PR" in text
     # A lowered count is a ratchet, not a bump -- the text must say so.
@@ -171,7 +172,7 @@ def test_shrunk_point_in_packet_yields_ratchet_remedy(tmp_path: Path) -> None:
     review packet."""
     # Plant the baseline: Foo is saturated at 10 members in src/foo.py.
     base = _doc([_entry("Foo", "src/foo.py", 10)])
-    (tmp_path / BASELINE_FILENAME).write_text(dumps(base), encoding="utf-8")
+    baseline_dir.dump(base, tmp_path / BASELINE_DIRNAME)
 
     # Plant the BASE source on disk (10 methods) -- the orchestrator's
     # checkout is at base; the diff transforms it to head.
@@ -193,7 +194,7 @@ def test_shrunk_point_in_packet_yields_ratchet_remedy(tmp_path: Path) -> None:
     assert "is below baseline" in packet
     assert "not a bump" in packet.lower()
     assert "python -m charlie_work.attachment_contracts baseline --ratchet" in packet
-    assert ".attachment-budgets.json" in packet
+    assert ".attachment-budgets/" in packet
     assert "$attachment_budget_section" not in packet
 
 

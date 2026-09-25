@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Mapping
 
 from charlie_work.attachment_contracts import baseline as baseline_mod
+from charlie_work.attachment_contracts import baseline_dir
+from charlie_work.attachment_contracts import tamper as tamper_mod
 from charlie_work.attachment_contracts.archetypes import scan_tree
 from charlie_work.attachment_contracts.excludes import load_excludes
 from charlie_work.attachment_contracts.model import Finding, ScanResult
@@ -94,17 +96,19 @@ def check_tree(
 
     findings: list[Finding] = [_parse_failure_finding(pf) for pf in scan.parse_failures]
 
-    baseline_path = root / baseline_mod.BASELINE_FILENAME
-    if baseline_path.is_file():
+    # Issue #1839: the baseline is a directory of per-entry files (with the
+    # legacy single file still honored on un-migrated checkouts).
+    baseline_path = baseline_dir.find_baseline(root)
+    if baseline_path is not None:
         try:
-            document = baseline_mod.load(baseline_path)
+            document = baseline_dir.load(baseline_path)
         except baseline_mod.TamperError as exc:
             findings.append(
                 Finding(
                     severity="error",
-                    file=baseline_mod.BASELINE_FILENAME,
-                    identity=baseline_mod.BASELINE_FILENAME,
-                    message=f"tamper: baseline file is structurally invalid: {exc}",
+                    file=baseline_path.name,
+                    identity=baseline_path.name,
+                    message=f"tamper: baseline store is structurally invalid: {exc}",
                     redirect=None,
                 )
             )
@@ -138,10 +142,17 @@ def check_tree(
                 _enrich_with_redirect(f, scan) if f.severity == "block" else f
                 for f in compare_findings
             )
-            findings.extend(baseline_mod.check_tamper(verdicts, document))
+            findings.extend(tamper_mod.check_tamper(verdicts, document))
             findings.extend(
-                baseline_mod.check_ratchet_tamper(
-                    previous_baseline_document, document, live_verdicts=live_verdicts
+                tamper_mod.check_ratchet_tamper(
+                    previous_baseline_document,
+                    document,
+                    live_verdicts=live_verdicts,
+                    baseline_file=(
+                        f"{baseline_path.name}/{baseline_dir.META_FILENAME}"
+                        if baseline_path.name == baseline_mod.BASELINE_DIRNAME
+                        else baseline_path.name
+                    ),
                 )
             )
 

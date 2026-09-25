@@ -17,7 +17,10 @@ import json
 from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
 from charlie_work.review_decision import record_decision
-from charlie_work.state import PASSIVE_OPEN_STATUS, SINK_STATUSES
+from charlie_work.state import (
+    PASSIVE_OPEN_STATUS,
+    SINK_STATUSES,
+)
 from charlie_work.worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
