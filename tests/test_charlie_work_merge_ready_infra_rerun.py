@@ -42,13 +42,16 @@ _CANCELLED_CHECKS = [
 def _merge_ready_app(
     tmp_path: Path,
     fake_gh: FakeGitHubWithRerunCapture,
+    *,
+    decision_payload: dict | None = None,
 ):
     """Approved-at-live-head PR #456 + configured required checks.
 
     The recorded decision matches FakeGitHub's default PR head
     (``sha-abc123``), so ``merge_ready`` reaches its check-evaluation block
     through the same code path a carried-forward verdict leaves behind --
-    head_moved False, approved True.
+    head_moved False, approved True. ``decision_payload`` overrides the
+    recorded verdict for tests that pin a non-approved gate clause.
     """
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -56,7 +59,9 @@ def _merge_ready_app(
     decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     decision_dir.mkdir(parents=True)
     (decision_dir / "review-decision.json").write_text(
-        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        json.dumps(
+            decision_payload or {"decision": "approved", "reviewed_head_sha": "sha-abc123"}
+        ),
         encoding="utf-8",
     )
     return app, config, paths
@@ -64,6 +69,17 @@ def _merge_ready_app(
 
 def _events(paths, kind: str) -> list[dict]:
     return [e for e in load_state(paths.state_file).get("events", []) if e["kind"] == kind]
+
+
+def _infra_rerun_events(paths) -> list[dict]:
+    """All ``infra_rerun_*`` events emitted this pass -- the gate-clause
+    tests assert this list is empty so a silently-fired rerun, rerun
+    failure, or escalation cannot hide behind an unasserted event kind."""
+    return [
+        e
+        for e in load_state(paths.state_file).get("events", [])
+        if str(e.get("kind") or "").startswith("infra_rerun")
+    ]
 
 
 def test_merge_ready_infra_cancelled_check_triggers_rerun(tmp_path: Path) -> None:
@@ -221,7 +237,11 @@ def test_merge_ready_infra_failed_alongside_pending_check_still_reruns(
 def test_merge_ready_infra_blocked_check_does_not_rerun_or_escalate(tmp_path: Path) -> None:
     """``infra_blocked`` (fleet-wide Actions budget/runner outage, #1383) is a
     distinct condition from per-PR ``infra_failed`` -- it must not enter the
-    per-run rerun/escalation lane."""
+    per-run rerun/escalation lane. The co-occurring CANCELLED check keeps
+    ``summary.infra_failed`` non-empty so the gate actually reaches the
+    ``or summary.infra_blocked`` clause instead of exiting early on
+    ``not summary.infra_failed`` (a lone infra_blocked check could never
+    reach this lane at all)."""
 
     class _InfraBlockedWithRerun(FakeGitHubWithRerunCapture):
         def __init__(self, checks, jobs):
@@ -233,8 +253,12 @@ def test_merge_ready_infra_blocked_check_does_not_rerun_or_escalate(tmp_path: Pa
 
     fake_gh = _InfraBlockedWithRerun(
         checks=[
+            # Enriched to INFRA_BLOCKED by _enrich_checks_infra_blocked
+            # (FAILURE job with zero steps -> fleet-side, not per-PR).
             {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
-            {"name": "Lint & Format", "bucket": "pass"},
+            # Per-PR infra failure: lands in summary.infra_failed and would
+            # rerun run 12345 if the infra_blocked clause did not hold.
+            {"name": "Lint & Format", "state": "CANCELLED", "link": _RUN_LINK},
             {"name": "Pre-commit", "state": "SUCCESS"},
         ],
         jobs={9001: {"conclusion": "FAILURE", "steps": []}},
@@ -245,9 +269,7 @@ def test_merge_ready_infra_blocked_check_does_not_rerun_or_escalate(tmp_path: Pa
 
     assert result.data["can_merge"] is False
     assert fake_gh.rerun_calls == []
-    assert not _events(paths, "infra_rerun_triggered")
-    assert not _events(paths, "infra_rerun_failed")
-    assert not _events(paths, "infra_rerun_escalated")
+    assert _infra_rerun_events(paths) == []
     state = load_state(paths.state_file)
     assert state.get("issues", {}).get("123", {}).get("status") != "escalated"
 
@@ -289,3 +311,96 @@ def test_merge_ready_infra_failed_pass_does_not_double_count_failed_attempts(
 
     state = load_state(paths.state_file)
     assert state["prs"]["456"].get("consecutive_failed_merge_attempts", 0) == 0
+
+
+def test_merge_ready_infra_unapproved_verdict_does_not_rerun(tmp_path: Path) -> None:
+    """Gate clause: ``not approved and require_approved_review``. With the
+    approved-review requirement on (the default), a non-approved verdict
+    must not enter the infra lane -- a rerun would spend the bounded
+    attempt budget on CI for code nobody has approved."""
+    fake_gh = FakeGitHubWithRerunCapture(checks=list(_CANCELLED_CHECKS))
+    app, _config, paths = _merge_ready_app(
+        tmp_path,
+        fake_gh,
+        decision_payload={
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        },
+    )
+
+    result = app.merge_ready(456)
+
+    assert result.data["can_merge"] is False
+    assert fake_gh.rerun_calls == []
+    assert _infra_rerun_events(paths) == []
+
+
+def test_merge_ready_infra_sync_failed_does_not_rerun(tmp_path: Path) -> None:
+    """Gate clause: ``sync_failed``. A merge conflict resolves through lanes
+    that move the head, making a rerun against this head wasted -- the lane
+    must not fire even with a CANCELLED required check present."""
+    fake_gh = FakeGitHubWithRerunCapture(checks=list(_CANCELLED_CHECKS))
+    fake_gh.prs[0]["mergeable"] = "CONFLICTING"
+    app, _config, paths = _merge_ready_app(tmp_path, fake_gh)
+
+    result = app.merge_ready(456)
+
+    assert result.data["can_merge"] is False
+    assert result.data["merge_conflict"] is True
+    assert fake_gh.rerun_calls == []
+    assert _infra_rerun_events(paths) == []
+
+
+def test_merge_ready_infra_draft_pr_does_not_rerun(tmp_path: Path) -> None:
+    """Gate clause: ``pr.get("isDraft")``. The janitor counts a draft as a
+    blocker -- the infra lane must not spend bounded rerun attempts on a PR
+    the author has not marked ready for review."""
+    fake_gh = FakeGitHubWithRerunCapture(checks=list(_CANCELLED_CHECKS))
+    fake_gh.prs[0]["isDraft"] = True
+    app, _config, paths = _merge_ready_app(tmp_path, fake_gh)
+
+    result = app.merge_ready(456)
+
+    assert result.data["can_merge"] is False
+    assert fake_gh.rerun_calls == []
+    assert _infra_rerun_events(paths) == []
+
+
+def test_merge_ready_infra_unlinked_pr_does_not_rerun(tmp_path: Path) -> None:
+    """Gate clause: ``issue_number is None``. The janitor counts a missing
+    linked issue as a blocker, and cap-exhaustion escalation has no target
+    without one -- the lane must not fire."""
+    fake_gh = FakeGitHubWithRerunCapture(checks=list(_CANCELLED_CHECKS))
+    # Strip every binding surface linked_issue_number trusts: the branch
+    # prefix, plus closing keywords in title and body.
+    fake_gh.prs[0]["headRefName"] = "feature/unlinked-cleanup"
+    fake_gh.prs[0]["title"] = "Improve search"
+    fake_gh.prs[0]["body"] = "Routine cleanup."
+    app, _config, paths = _merge_ready_app(tmp_path, fake_gh)
+
+    result = app.merge_ready(456)
+
+    assert result.data["issue"] is None
+    assert result.data["can_merge"] is False
+    assert fake_gh.rerun_calls == []
+    assert _infra_rerun_events(paths) == []
+
+
+def test_merge_ready_infra_missing_required_check_does_not_rerun(tmp_path: Path) -> None:
+    """Gate clause: ``summary.missing``. A missing required check is owned
+    by the readiness-no-CI stall gate, not the infra lane -- its
+    co-occurrence with an infra_failed check must not fire a rerun."""
+    checks = [
+        {"name": "Tests passed", "state": "CANCELLED", "link": _RUN_LINK},
+        # "Lint & Format" absent entirely -> summary.missing.
+        {"name": "Pre-commit", "state": "SUCCESS"},
+    ]
+    fake_gh = FakeGitHubWithRerunCapture(checks=checks)
+    app, _config, paths = _merge_ready_app(tmp_path, fake_gh)
+
+    result = app.merge_ready(456)
+
+    assert result.data["can_merge"] is False
+    assert result.data["checks"]["missing"] == ("Lint & Format",)
+    assert fake_gh.rerun_calls == []
+    assert _infra_rerun_events(paths) == []
