@@ -799,10 +799,13 @@ _ISSUE_MENTION_RE = re.compile(
     r"(?:([\w.-]+(?:/[\w.-]+)?)\s+)?issues?\s*(?:([\w.-]+/[\w.-]+))?#(\d+)\b",
     flags=re.IGNORECASE,
 )
-# Stripped before matching to cut two concrete false-positive classes: a
-# fenced code sample that happens to contain the literal text, and quoted
-# reply text (e.g. an email-style ``> see issue #123`` blockquote).
-_FENCED_CODE_BLOCK_RE = re.compile(r"```.*?```", flags=re.DOTALL)
+# Stripped before matching to cut a concrete false-positive class: quoted
+# reply text (e.g. an email-style ``> see issue #123`` blockquote). Fenced
+# code samples are removed by ``_strip_fenced_blocks`` instead (issue
+# #1819), which shares the line-based fence model ``parse_blockers`` uses
+# rather than pairing the two nearest triple-backtick runs — a block whose
+# own content contains a ``` substring desynced the naive regex and leaked
+# fenced text into the scan.
 _BLOCKQUOTE_LINE_RE = re.compile(r"^[ \t]*>.*$", flags=re.MULTILINE)
 
 
@@ -863,7 +866,10 @@ def issue_numbers_mentioned_by_pr(
 
     Matches the literal phrase ``issue #N`` / ``issues #N`` (case-insensitive,
     with or without a space between the word and the hash), after stripping
-    fenced code blocks and blockquoted lines. This is a strict subset of
+    fenced code blocks and blockquoted lines, and skipping matches inside
+    inline backtick code spans. The fenced-block exclusion runs on
+    ``_fenced_block_ranges`` — the same line-based fence model
+    ``parse_blockers`` uses (issue #1819). This is a strict subset of
     GitHub's issue-reference syntax: it does not treat a bare ``#N`` (which
     could be a PR number) as an issue reference, and it does not treat
     closing keywords like ``Fixes #N`` as any more than a reference.
@@ -888,10 +894,23 @@ def issue_numbers_mentioned_by_pr(
     (same-repo branch-prefix or closing-action verb) may authorize that.
     """
     text = f"{pr.get('title', '')}\n{pr.get('body', '')}"
-    text = _FENCED_CODE_BLOCK_RE.sub("", text)
+    text = _strip_fenced_blocks(text)
     text = _BLOCKQUOTE_LINE_RE.sub("", text)
     found: set[int] = set()
     for match in _ISSUE_MENTION_RE.finditer(text):
+        # A mention inside an inline backtick code span — `` `issue #N` ``,
+        # or an inline `` ```...``` `` run the old nearest-pair regex
+        # happened to strip — is quoted example text, not a reference.
+        # Clause-scoped like ``parse_blockers``' guard 1b so a stray backtick
+        # elsewhere cannot pair across the document and swallow a genuine
+        # mention.
+        clause_start, clause_end = _clause_bounds(text, match.start(), match.end())
+        if _inside_code_span(
+            text[clause_start:clause_end],
+            match.start() - clause_start,
+            match.end() - clause_start,
+        ):
+            continue
         # The post-"issue" slug (group 3) wins over a bare-word qualifier
         # (group 2): it is GitHub's canonical ``owner/repo#N`` reference
         # syntax and sits closest to the number, so in ``see issue
@@ -1126,6 +1145,29 @@ def _inside_fenced_block(text: str, start: int, end: int) -> bool:
         if r_start <= start and end <= r_end:
             return True
     return False
+
+
+def _strip_fenced_blocks(text: str) -> str:
+    """Return ``text`` with every fenced code block removed.
+
+    Single fence model shared by the body scanners (issue #1819): the ranges
+    come from :func:`_fenced_block_ranges` — the same line-based
+    CommonMark-ish scanner :func:`parse_blockers` trusts — so a closing
+    fence must be its own line of the same fence character and at least the
+    same length, and a triple-backtick run inside a block's own content
+    cannot desync the pairing the way a nearest-run regex does. The closing
+    fence line is removed with the block so a fence re-scan of the result
+    (e.g. ``_scan_blocker_sections`` inside ``detect_prose_only_dependencies``)
+    cannot re-interpret an orphaned closer as a new opening fence.
+    """
+    out: list[str] = []
+    prev = 0
+    for start, end in _fenced_block_ranges(text):
+        newline = text.find("\n", end)
+        out.append(text[prev:start])
+        prev = len(text) if newline == -1 else newline + 1
+    out.append(text[prev:])
+    return "".join(out)
 
 
 def _clause_bounds(text: str, match_start: int, match_end: int) -> tuple[int, int]:
@@ -1407,6 +1449,11 @@ def detect_prose_only_dependencies(text: str) -> bool:
     prose) — returns True so the issue is parked for a human instead of
     silently freed.
 
+    Dependency-shaped prose inside a fenced code block is quoted/example
+    code, not the issue author's own declaration: the body is stripped via
+    ``_strip_fenced_blocks`` (the ``_fenced_block_ranges`` model
+    ``parse_blockers`` uses — issue #1819) before any pattern runs.
+
     Args:
         text: The issue body text to check
 
@@ -1415,6 +1462,10 @@ def detect_prose_only_dependencies(text: str) -> bool:
     """
     if not text:
         return False
+
+    # Fenced-code exclusion (issue #1819): a code sample quoting
+    # dependency-shaped prose must not park the issue.
+    text = _strip_fenced_blocks(text)
 
     # Pattern 1: "do not dispatch before" and variants
     if re.search(r"do\s+not\s+dispatch\s+before", text, flags=re.IGNORECASE):

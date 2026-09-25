@@ -49,6 +49,59 @@ def test_issue_numbers_mentioned_by_pr_ignores_blockquoted_lines() -> None:
     assert issue_numbers_mentioned_by_pr(pr) == set()
 
 
+def test_issue_numbers_mentioned_by_pr_desync_fence_with_inner_backticks() -> None:
+    """Issue #1819: a fenced block whose own content contains a triple-
+    backtick run desynced the old nearest-pair regex — it closed the
+    "block" at the first inline ``` and scanned the remaining fenced
+    content as prose, harvesting mentions out of code samples. The fence
+    model is now the same line-based ``_fenced_block_ranges`` that
+    ``parse_blockers`` uses."""
+    pr = {
+        "title": "",
+        "body": (
+            "See the fenced-block helper below.\n\n"
+            "```python\n"
+            'example = "```see issue #42```"  # sample text in a docstring\n'
+            "# NOTE: this comment about issue #555 is CODE, not prose\n"
+            "```\n"
+        ),
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr) == set()
+
+
+def test_issue_numbers_mentioned_by_pr_mention_after_fenced_block_still_counts() -> None:
+    """The shared fence model must not over-suppress: a genuine mention on
+    prose lines outside the fenced block still counts."""
+    pr = {
+        "title": "",
+        "body": "```\nissue #42 lives in a code sample\n```\nReal mention: issue #7.",
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr) == {7}
+
+
+def test_issue_numbers_mentioned_by_pr_ignores_tilde_fenced_block() -> None:
+    """``~~~`` fences are equivalent to triple-backtick fences in CommonMark
+    and are excluded by the shared fence model (the naive regex only knew
+    about ```)."""
+    pr = {"title": "", "body": "~~~\nsee issue #42\n~~~\n"}
+
+    assert issue_numbers_mentioned_by_pr(pr) == set()
+
+
+def test_issue_numbers_mentioned_by_pr_ignores_inline_code_span() -> None:
+    """Issue #1819: the naive regex incidentally stripped inline ```...```
+    runs too; the replacement keeps suppression for inline code spans via
+    the same clause-scoped guard ``parse_blockers`` uses (guard 1b)."""
+    pr = {
+        "title": "",
+        "body": "match `issue #42` or ```issue #43``` in code, not issue #9",
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr) == {9}
+
+
 def test_issue_numbers_mentioned_by_pr_suppresses_visibility_qualified_mentions() -> None:
     """Issue #1803: ``private issue #N`` / ``internal issue #N`` name another
     repo's tracker (the jobcannon docs rewrite that produced the #377/#391
