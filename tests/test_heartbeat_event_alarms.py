@@ -147,16 +147,23 @@ def test_parse_iso_is_byte_identical_to_heartbeat_checks(
     )
 
 
+# The dynamic ``datetime.now()`` params carry explicit ids: without them the
+# param id embeds the per-worker wall clock and pytest-xdist's
+# collection-consistency check aborts the run ("Different tests were
+# collected between gw0 and gw1") -- the CI failure this comment prevents
+# recurring (PR #1908, run 36121055462).
 @pytest.mark.parametrize(
     "value",
     [
-        None,
-        "",
-        "not-a-timestamp",
-        "2026-13-45T99:99:99Z",  # invalid fields -- ValueError path
-        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        datetime.now(timezone.utc).isoformat(),
-        datetime.now().isoformat(),  # naive -- no tzinfo
+        pytest.param(None, id="none"),
+        pytest.param("", id="empty-string"),
+        pytest.param("not-a-timestamp", id="unparseable"),
+        pytest.param("2026-13-45T99:99:99Z", id="invalid-fields"),
+        pytest.param(
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), id="now-utc-z"
+        ),
+        pytest.param(datetime.now(timezone.utc).isoformat(), id="now-utc-offset"),
+        pytest.param(datetime.now().isoformat(), id="now-naive"),  # no tzinfo
     ],
 )
 def test_parse_iso_copies_agree_on_inputs(hb: ModuleType, alarms: ModuleType, value: Any) -> None:
