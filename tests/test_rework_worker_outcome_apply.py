@@ -35,7 +35,9 @@ from charlie_work.config import WORKER_OUTCOME_FILENAME
 from charlie_work.github import GitHubError
 from charlie_work.paths import runtime_paths
 from charlie_work.process_utils import write_worker_terminal_status
+from charlie_work.instrumentation import query_events
 from charlie_work.rework_outcome import (
+    apply_collected_rework_outcomes,
     apply_rework_worker_outcome,
     fresh_completed_worker_outcome,
 )
@@ -595,3 +597,42 @@ def test_missing_outcome_or_missing_anchor_is_not_completed(tmp_path: Path) -> N
         fresh_completed_worker_outcome(worktree_path, live_head_sha=HEAD_SHA, dispatched_at=None)
         is None
     )
+
+
+def test_apply_collected_rework_outcomes_isolates_route_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guard pin: a contract breach in one apply must not starve the rest.
+
+    ``apply_rework_worker_outcome`` is contractually never-raises; if it
+    ever escapes anyway, the post-lock drain must record the failure and
+    keep going -- an unguarded exception would propagate out of
+    ``_detect_and_handle_orphaned_workers`` and skip the ``review_routes``
+    drain that follows it.
+    """
+    calls: list[int] = []
+
+    def _flaky(_gh: Any, *, issue_number: int, **_kwargs: Any) -> None:
+        calls.append(issue_number)
+        if issue_number == 1:
+            raise RuntimeError("contract breach")
+
+    monkeypatch.setattr(rework_outcome, "apply_rework_worker_outcome", _flaky)
+
+    paths = runtime_paths(tmp_path, "state")
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    apply_collected_rework_outcomes(
+        FakeGitHub(repo_root=tmp_path),
+        outcome_apply_routes=[(1, 100), (2, 101), (1, 102)],
+        repo_root=tmp_path,
+        worktrees_dir=tmp_path / "worktrees",
+        sessions_dir=tmp_path / "sessions",
+        state_file=paths.state_file,
+        write_gate=_wg(paths.state_file),
+    )
+
+    assert calls == [1, 2, 1]
+    failures = query_events(paths.state_file, kind="rework_outcome_apply_failed")
+    assert len(failures) == 2
+    assert all(f["level"] == "warning" for f in failures)
+    assert all("contract breach" in f["payload"]["error"] for f in failures)

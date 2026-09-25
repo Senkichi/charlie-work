@@ -179,11 +179,7 @@ from .process_utils import (
     find_worker_terminal_status,
     is_pid_alive,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
 )
-from .rework_outcome import (
-    APPLIED_HEADS_KEY,
-    apply_rework_worker_outcome,
-    fresh_completed_worker_outcome,
-)
+from . import orphaned_worker_sweep, rework_outcome
 from .write_gate import WriteGate, require_write_gate
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -2220,89 +2216,12 @@ def _detect_and_handle_orphaned_workers(
     # fresh, on-target .worker-outcome.json despite no terminal record.
     # Collected in-lock below and applied post-lock through the #1877 seam
     # (apply_rework_worker_outcome does network I/O and takes state_lock
-    # itself, so it cannot run inside this function's lock).
+    # itself, so it cannot run inside this function's lock). The collection
+    # and the in-lock classification live in
+    # ``orphaned_worker_sweep.handle_dead_worker_with_pr`` /
+    # ``handle_dead_worker_completed_outcome`` -- extracted per the file-size
+    # rule during the #1911 rework.
     outcome_apply_routes: list[tuple[int, int]] = []
-
-    def _handle_dead_worker_completed_outcome(
-        *,
-        state: dict[str, Any],
-        sweep_events: list[tuple[str, dict[str, Any]]],
-        entry: dict[str, Any],
-        issue_number: int,
-        pr_number: int,
-        pr_data: dict[str, Any],
-        reviewed_head_sha: str | None,
-        live_head_sha: str | None,
-        terminal_pid: Any,
-        terminal_exit_code: int | None,
-        terminal_duration_seconds: Any,
-        extra_payload: dict[str, Any] | None = None,
-    ) -> bool:
-        """Recover a dead worker that provably completed its handoff (#1911).
-
-        Returns ``True`` only when there is no terminal record
-        (``terminal_exit_code is None``) AND the worktree holds a fresh,
-        on-target ``.worker-outcome.json`` -- written after this dispatch's
-        ``dispatched_at`` (a previous session's leftover does not count),
-        reporting ``push_succeeded``, and pinning ``head_sha`` to the live
-        head. In that case the outcome is queued for the post-lock #1877
-        apply pass (idempotent: ``APPLIED_HEADS_KEY`` dedups on the reported
-        head, so a transient failure retries next pass while an
-        already-applied outcome is never re-queued) and the finding surfaces
-        once via the same fingerprinted drift the clean-exit (#773) branch
-        uses -- no ``worker_death_at`` credit and no ``rework_requested``
-        reset, the two steps that drove the swole#198 0-commit
-        ``no_op_rework_attempts_cap_exceeded`` loop.
-
-        Every negative answer (a recorded exit code -- zero handled by the
-        caller's own branch, non-zero being a confirmed crash -- a missing
-        branch/worktree/timestamp, a stale or off-target outcome) returns
-        ``False`` and leaves the caller's worker-death path untouched.
-        """
-        if terminal_exit_code is not None or not live_head_sha:
-            return False
-        branch = pr_data.get("headRefName") or entry.get("branch_name")
-        if not branch or not isinstance(repo_root, Path) or worktrees_dir is None:
-            return False
-        outcome = fresh_completed_worker_outcome(
-            worktree_path_for_branch(repo_root, branch, worktrees_dir),
-            live_head_sha=live_head_sha,
-            dispatched_at=_parse_iso_timestamp(entry.get("dispatched_at")),
-        )
-        if outcome is None:
-            return False
-        outcome_head_sha = outcome.get("head_sha")
-        applied_heads = state.get(APPLIED_HEADS_KEY, {})
-        if not (
-            isinstance(applied_heads, dict)
-            and applied_heads.get(str(issue_number)) == outcome_head_sha
-        ):
-            outcome_apply_routes.append((issue_number, pr_number))
-        fingerprint = _drift_fingerprint(
-            reason="dead_worker_completed_outcome",
-            reviewed_head_sha=reviewed_head_sha,
-        )
-        if entry.get("orphan_drift_fingerprint") == fingerprint:
-            return True
-        entry["orphan_drift_fingerprint"] = fingerprint
-        entry["orphan_drift_at"] = utc_now()
-        sweep_events.append(
-            (
-                "orphaned_worker_drift",
-                {
-                    "issue_number": issue_number,
-                    "pr_number": pr_number,
-                    "previous_status": "dispatched",
-                    "reason": "dead_worker_completed_outcome",
-                    "pid": terminal_pid,
-                    "exit_code": terminal_exit_code,
-                    "duration_seconds": terminal_duration_seconds,
-                    "worker_outcome_head_sha": outcome_head_sha,
-                    **(extra_payload or {}),
-                },
-            )
-        )
-        return True
 
     with state_lock(state_file):
         state = load_state(state_file)
@@ -2397,412 +2316,24 @@ def _detect_and_handle_orphaned_workers(
             pr_data = pr_by_issue.get(issue_number)
 
             if pr_data:
-                pr_number = int(pr_data["number"])
-                pr_state = state.get("prs", {}).get(str(pr_number), {})
-                live_head_sha = pr_data.get("headRefOid")
-                # Issue #1362 Stage 1: read the last review decision through
-                # the single file-first reader (flat file, falling back to
-                # the highest archived round) instead of state.json's
-                # decision/reviewed_head_sha fields, which can lag a
-                # concurrent record_review/void -- the #1340 divergence
-                # class AC1 exists to eliminate.
-                resolved_decision = review_decision(
-                    state_file.parent / "prs" / f"pr-{pr_number}", None, live_head_sha
+                orphaned_worker_sweep.handle_dead_worker_with_pr(
+                    state=state,
+                    sweep_events=sweep_events,
+                    entry=entry,
+                    issue_number=issue_number,
+                    pr_data=pr_data,
+                    sessions_dir=sessions_dir,
+                    state_file=state_file,
+                    config=config,
+                    gh=gh,
+                    review_callback=review_callback,
+                    repo_root=repo_root,
+                    worktrees_dir=worktrees_dir,
+                    review_routes=review_routes,
+                    outcome_apply_routes=outcome_apply_routes,
+                    pr_orphan_unreviewed_details=pr_orphan_unreviewed_details,
+                    drift_fingerprint=_drift_fingerprint,
                 )
-                last_decision = resolved_decision.decision
-                reviewed_head_sha = resolved_decision.reviewed_head_sha
-
-                # Issue #773: measurement-first payload enrichment. A dead PID
-                # alone cannot distinguish a worker that crashed from one that
-                # exited 0 having pushed nothing -- both present identically
-                # to `_worker_pid_alive`. `find_worker_terminal_status` reads
-                # the durable record `start_terminal_status_watcher`
-                # (process_utils.py) writes at the moment a claude-code worker
-                # actually exits; it returns None for legacy sessions, sessions
-                # from adapters that don't write one (e.g. devin-shell), or
-                # any session whose watcher never got to run (e.g. orchestrator
-                # restart mid-session). `terminal_exit_code` is deliberately
-                # left as None in all of those cases rather than guessed at --
-                # every event below records it as-is so the two populations
-                # (confirmed clean exit vs. everything else) are queryable
-                # retrospectively even before they're fully separable.
-                terminal = find_worker_terminal_status(sessions_dir, issue_number)
-                terminal_pid = entry.get("worker_pid")
-                terminal_exit_code = terminal.get("exit_code") if terminal else None
-                terminal_duration_seconds = terminal.get("duration_seconds") if terminal else None
-
-                if last_decision == "request_changes" and reviewed_head_sha and live_head_sha:
-                    if reviewed_head_sha == live_head_sha:
-                        if terminal_exit_code == 0:
-                            # The worker exited cleanly (exit code 0) rather
-                            # than crashing -- e.g. it was handed an empty
-                            # rework brief with nothing left to act on. Do NOT
-                            # auto-reset to rework_requested: that would spend
-                            # one of max_auto_redispatch's attempts on a
-                            # worker that never had anything to change,
-                            # eventually escalating a benign no-op to
-                            # agent:human-needed (issue #773). Surface it once
-                            # instead, via the same fingerprinted
-                            # surface-once convergence the other drift
-                            # branches below already use, so a human/janitor
-                            # can decide whether the review itself needs
-                            # revisiting -- retrying a dispatch that already
-                            # proved it produces no change on this exact head
-                            # would just repeat the no-op.
-                            fingerprint = _drift_fingerprint(
-                                reason="dead_worker_clean_exit_no_op",
-                                reviewed_head_sha=reviewed_head_sha,
-                            )
-                            if entry.get("orphan_drift_fingerprint") == fingerprint:
-                                state["issues"][str(issue_number)] = entry
-                                continue
-                            entry["orphan_drift_fingerprint"] = fingerprint
-                            entry["orphan_drift_at"] = utc_now()
-                            sweep_events.append(
-                                (
-                                    "orphaned_worker_drift",
-                                    {
-                                        "issue_number": issue_number,
-                                        "pr_number": pr_number,
-                                        "previous_status": "dispatched",
-                                        "reason": "dead_worker_clean_exit_no_op",
-                                        "pid": terminal_pid,
-                                        "exit_code": terminal_exit_code,
-                                        "duration_seconds": terminal_duration_seconds,
-                                    },
-                                )
-                            )
-                        elif not _handle_dead_worker_completed_outcome(
-                            state=state,
-                            sweep_events=sweep_events,
-                            entry=entry,
-                            issue_number=issue_number,
-                            pr_number=pr_number,
-                            pr_data=pr_data,
-                            reviewed_head_sha=reviewed_head_sha,
-                            live_head_sha=live_head_sha,
-                            terminal_pid=terminal_pid,
-                            terminal_exit_code=terminal_exit_code,
-                            terminal_duration_seconds=terminal_duration_seconds,
-                        ):
-                            # No terminal record and no fresh on-target
-                            # outcome file, or a non-zero exit code (a
-                            # recorded crash never counts as a completed
-                            # outcome -- issue #1911): unchanged from
-                            # pre-#773 behavior -- safe to reset
-                            # to rework_requested (PR head unchanged since
-                            # request_changes).
-                            entry["status"] = "rework_requested"
-                            entry["dispatched_at"] = None
-                            # Issue #1134: record this as a worker death, not
-                            # a no-op.  A death redispatch must not count
-                            # against the no-op rework cap — the worker may
-                            # have completed its work but died before pushing
-                            # (salvageable stranded commits).  A separate
-                            # death counter with its own escalation reason
-                            # (worker_death_loop) lets the operator triage
-                            # "check the worktree" vs. "worker is spinning."
-                            death_ts = utc_now()
-                            entry["worker_death_at"] = _credit_worker_death(
-                                entry,
-                                at=death_ts,
-                            )
-                            sweep_events.append(
-                                (
-                                    "orphaned_worker_recovered",
-                                    {
-                                        "issue_number": issue_number,
-                                        "pr_number": pr_number,
-                                        "previous_status": "dispatched",
-                                        "new_status": "rework_requested",
-                                        "reason": "dead_worker_with_request_changes",
-                                        "pid": terminal_pid,
-                                        "exit_code": terminal_exit_code,
-                                        "duration_seconds": terminal_duration_seconds,
-                                        "worker_death_at": death_ts,
-                                    },
-                                )
-                            )
-                    else:
-                        # PR head has changed - route to review if possible,
-                        # otherwise surface as a drift finding (once per fingerprint).
-                        fingerprint = _drift_fingerprint(
-                            reason="dead_worker_with_head_change",
-                            reviewed_head_sha=reviewed_head_sha,
-                            live_head_sha=live_head_sha,
-                        )
-                        if entry.get("orphan_drift_fingerprint") == fingerprint:
-                            # Already handled/failed for this exact head advance;
-                            # don't re-emit or retry.
-                            state["issues"][str(issue_number)] = entry
-                            continue
-                        if review_callback is not None:
-                            review_routes.append(
-                                (
-                                    issue_number,
-                                    pr_number,
-                                    reviewed_head_sha,
-                                    live_head_sha,
-                                    fingerprint,
-                                )
-                            )
-                        else:
-                            entry["orphan_drift_fingerprint"] = fingerprint
-                            entry["orphan_drift_at"] = utc_now()
-                            sweep_events.append(
-                                (
-                                    "orphaned_worker_drift",
-                                    {
-                                        "issue_number": issue_number,
-                                        "pr_number": pr_number,
-                                        "previous_status": "dispatched",
-                                        "last_decision": last_decision,
-                                        "reviewed_head_sha": reviewed_head_sha,
-                                        "live_head_sha": live_head_sha,
-                                        "reason": "dead_worker_with_head_change",
-                                        "pid": terminal_pid,
-                                        "exit_code": terminal_exit_code,
-                                        "duration_seconds": terminal_duration_seconds,
-                                    },
-                                )
-                            )
-                else:
-                    # Not a simple request_changes case.
-                    # Issue #1109: a dead worker on an approved PR is not
-                    # unclassifiable when the post-approval rework lane
-                    # (#674 -> PR #685, plus the merge-conflict and no-op
-                    # rework lanes that share ``_route_to_rework``) dispatched
-                    # it. Those lanes set the PR state status to
-                    # ``rework_requested`` while preserving
-                    # ``decision="approved"``, and the worker is dispatched to
-                    # fix CI/a conflict without re-litigating the review. If
-                    # that worker dies before pushing (head unchanged since
-                    # review), the issue previously wedged in ``dispatched``
-                    # forever because this sweep refused to auto-reset on a
-                    # non-``request_changes`` decision -- no redispatch, no
-                    # cap consumption, invisible to every downstream lane.
-                    # Treat ``decision="approved"`` + PR-state
-                    # ``rework_requested`` + head unchanged as safe to
-                    # auto-reset, mirroring the request_changes branch above
-                    # (including the #773 clean-exit-no-op sub-case so a
-                    # benign exit-0 worker does not burn redispatch attempts).
-                    # ``dead_worker_unsafe_to_auto_reset`` is kept only for
-                    # genuinely unclassifiable decisions -- an approved PR
-                    # whose PR state does not carry ``rework_requested`` has
-                    # no evidence a post-approval rework lane dispatched this
-                    # worker, so auto-resetting would be a guess.
-                    #
-                    # Issue #1128: when the dead worker has an OPEN PR with no
-                    # review verdict yet (``last_decision`` is null/absent),
-                    # the "unsafe to auto-reset" judgment stays -- the PR
-                    # carries the work, so re-dispatching would duplicate it --
-                    # but leaving the issue on ``agent:in-progress`` makes the
-                    # state machine assert a live worker the reconciler just
-                    # confirmed dead, and review dispatch (which keys off
-                    # ``agent:pr-open``) never sees the salvage PR. Transition
-                    # to ``pr-open`` via the same LabelConfig-driven swap the
-                    # ``orphaned_worker_opened_pr`` lane uses. On label write
-                    # failure, fall through to the conservative drift path so
-                    # the next pass re-attempts rather than resetting the
-                    # worker.
-                    pr_state_status = pr_state.get("status")
-                    if (
-                        last_decision == "approved"
-                        and pr_state_status == "rework_requested"
-                        and reviewed_head_sha
-                        and live_head_sha
-                        and reviewed_head_sha == live_head_sha
-                    ):
-                        if terminal_exit_code == 0:
-                            # Clean exit with no push -- same #773 rationale
-                            # as the request_changes branch: do not spend a
-                            # redispatch attempt on a worker that produced no
-                            # change on this exact head.
-                            fingerprint = _drift_fingerprint(
-                                reason="dead_worker_clean_exit_no_op",
-                                reviewed_head_sha=reviewed_head_sha,
-                            )
-                            if entry.get("orphan_drift_fingerprint") == fingerprint:
-                                state["issues"][str(issue_number)] = entry
-                                continue
-                            entry["orphan_drift_fingerprint"] = fingerprint
-                            entry["orphan_drift_at"] = utc_now()
-                            sweep_events.append(
-                                (
-                                    "orphaned_worker_drift",
-                                    {
-                                        "issue_number": issue_number,
-                                        "pr_number": pr_number,
-                                        "previous_status": "dispatched",
-                                        "reason": "dead_worker_clean_exit_no_op",
-                                        "decision": "approved",
-                                        "pr_state_status": pr_state_status,
-                                        "pid": terminal_pid,
-                                        "exit_code": terminal_exit_code,
-                                        "duration_seconds": terminal_duration_seconds,
-                                    },
-                                )
-                            )
-                        elif not _handle_dead_worker_completed_outcome(
-                            state=state,
-                            sweep_events=sweep_events,
-                            entry=entry,
-                            issue_number=issue_number,
-                            pr_number=pr_number,
-                            pr_data=pr_data,
-                            reviewed_head_sha=reviewed_head_sha,
-                            live_head_sha=live_head_sha,
-                            terminal_pid=terminal_pid,
-                            terminal_exit_code=terminal_exit_code,
-                            terminal_duration_seconds=terminal_duration_seconds,
-                            extra_payload={
-                                "decision": "approved",
-                                "pr_state_status": pr_state_status,
-                            },
-                        ):
-                            # No terminal record and no fresh on-target
-                            # outcome file, or a non-zero exit code
-                            # (issue #1911): safe to reset to rework_requested
-                            # (PR head
-                            # unchanged since the approved review, and the
-                            # post-approval rework lane dispatched this
-                            # worker). Records this as a worker death with a
-                            # distinct reason so the death counter (issue
-                            # #1134) and the redispatch cap (issue #165) apply
-                            # exactly as they do for request_changes.
-                            entry["status"] = "rework_requested"
-                            entry["dispatched_at"] = None
-                            death_ts = utc_now()
-                            entry["worker_death_at"] = _credit_worker_death(
-                                entry,
-                                at=death_ts,
-                            )
-                            sweep_events.append(
-                                (
-                                    "orphaned_worker_recovered",
-                                    {
-                                        "issue_number": issue_number,
-                                        "pr_number": pr_number,
-                                        "previous_status": "dispatched",
-                                        "new_status": "rework_requested",
-                                        "reason": "dead_worker_with_approved_rework",
-                                        "decision": "approved",
-                                        "pr_state_status": pr_state_status,
-                                        "pid": terminal_pid,
-                                        "exit_code": terminal_exit_code,
-                                        "duration_seconds": terminal_duration_seconds,
-                                        "worker_death_at": death_ts,
-                                    },
-                                )
-                            )
-                    else:
-                        # Not the #1109 approved+rework_requested classified
-                        # case. This branch covers two populations that share
-                        # one fingerprinted drift fallback below:
-                        #   (a) #1128: ``last_decision`` is None or "pending"
-                        #       (open PR, no terminal review verdict yet) --
-                        #       try advancing to ``pr-open``; on label-write
-                        #       failure or missing details, fall through to
-                        #       the shared drift. Issue #1362 Stage 1: this
-                        #       must match ``_has_no_review_verdict_yet``'s
-                        #       predicate above (``.missing or .decision ==
-                        #       "pending"``) or a pending-packet PR would be
-                        #       precomputed into ``pr_orphan_unreviewed_details``
-                        #       but never consulted here, re-stranding the
-                        #       issue on ``agent:in-progress``.
-                        #   (b) genuinely unclassifiable decisions -- fall
-                        #       through to the shared drift directly.
-                        if last_decision is None or last_decision == "pending":
-                            details = pr_orphan_unreviewed_details.get(issue_number)
-                            if details is not None:
-                                active_labels = details["active_labels"]
-                                issue_labels = details["issue_labels"]
-                                label_write_ok = True
-                                for label in sorted(active_labels):
-                                    if not gh.remove_issue_label(issue_number, label):
-                                        label_write_ok = False
-                                if config.labels.pr_open not in issue_labels:
-                                    if not gh.add_issue_label(issue_number, config.labels.pr_open):
-                                        label_write_ok = False
-                                if label_write_ok:
-                                    entry["status"] = PASSIVE_OPEN_STATUS
-                                    entry["dispatched_at"] = None
-                                    # Clear any prior drift fingerprint so a
-                                    # later regression on this issue re-surfaces.
-                                    entry["orphan_drift_fingerprint"] = None
-                                    entry["orphan_drift_at"] = None
-                                    # Issue #1134's death-crediting invariant
-                                    # applies here too: this worker died just
-                                    # as much as the request_changes/approved
-                                    # branches above, and its issue can still
-                                    # return to ``rework_requested`` once the
-                                    # PR is eventually reviewed (a salvage-
-                                    # opened PR with no verdict yet is exactly
-                                    # this case). Before this fix, this was
-                                    # the one dead-worker branch that never
-                                    # touched ``worker_death_at`` -- a
-                                    # redispatch caused by THIS death read
-                                    # back as an uncredited no-op on every
-                                    # later no-op-rework-cap check.
-                                    death_ts = utc_now()
-                                    entry["worker_death_at"] = _credit_worker_death(
-                                        entry,
-                                        at=death_ts,
-                                    )
-                                    sweep_events.append(
-                                        (
-                                            "orphaned_worker_advanced_to_pr_open",
-                                            {
-                                                "issue_number": issue_number,
-                                                "pr_number": pr_number,
-                                                "previous_status": "dispatched",
-                                                "new_status": PASSIVE_OPEN_STATUS,
-                                                "reason": "dead_worker_unsafe_to_auto_reset_open_unreviewed_pr",
-                                                "removed_labels": sorted(active_labels),
-                                                "pid": terminal_pid,
-                                                "exit_code": terminal_exit_code,
-                                                "duration_seconds": terminal_duration_seconds,
-                                                "label_write_ok": True,
-                                                "worker_death_at": death_ts,
-                                            },
-                                        )
-                                    )
-                                    state["issues"][str(issue_number)] = entry
-                                    continue
-                                # Label write failed -- fall through to the
-                                # fingerprinted drift path so the next pass
-                                # re-attempts the transition (the drift
-                                # fingerprint gates only re-emission of the
-                                # diagnostic, not the transition retry above,
-                                # which runs first on every pass).
-                        # Genuinely unclassifiable decision, or #1128 label-
-                        # write failure -- surface as drift once. One shared
-                        # fingerprinted fallback for both lanes (#1109 keeps
-                        # its own classified branch above; this covers
-                        # everything else).
-                        fingerprint = _drift_fingerprint(
-                            reason="dead_worker_unsafe_to_auto_reset",
-                            last_decision=last_decision or "",
-                            pr_number=pr_number,
-                        )
-                        if entry.get("orphan_drift_fingerprint") != fingerprint:
-                            entry["orphan_drift_fingerprint"] = fingerprint
-                            entry["orphan_drift_at"] = utc_now()
-                            sweep_events.append(
-                                (
-                                    "orphaned_worker_drift",
-                                    {
-                                        "issue_number": issue_number,
-                                        "pr_number": pr_number,
-                                        "previous_status": "dispatched",
-                                        "last_decision": last_decision,
-                                        "reason": "dead_worker_unsafe_to_auto_reset",
-                                        "pid": terminal_pid,
-                                        "exit_code": terminal_exit_code,
-                                        "duration_seconds": terminal_duration_seconds,
-                                    },
-                                )
-                            )
             else:
                 # Issue #935: before reclaim/drift, try to open a PR for a branch
                 # that the worker pushed but could not create a PR for.
@@ -3283,19 +2814,17 @@ def _detect_and_handle_orphaned_workers(
     # state_lock itself). It re-reads the outcome file, re-verifies the live
     # remote head against the reported head_sha, and dedups per applied head
     # -- so an already-applied entry is skipped cheaply and a transient
-    # failure retries on the next pass.
-    if isinstance(repo_root, Path) and worktrees_dir is not None:
-        for apply_issue_number, apply_pr_number in outcome_apply_routes:
-            apply_rework_worker_outcome(
-                gh,
-                repo_root=repo_root,
-                worktrees_dir=worktrees_dir,
-                sessions_dir=sessions_dir,
-                state_file=state_file,
-                write_gate=write_gate,
-                issue_number=apply_issue_number,
-                pr_number=apply_pr_number,
-            )
+    # failure retries on the next pass. Per-route guard inside: an
+    # unexpected exception cannot skip the review_routes drain below.
+    rework_outcome.apply_collected_rework_outcomes(
+        gh,
+        outcome_apply_routes=outcome_apply_routes,
+        repo_root=repo_root,
+        worktrees_dir=worktrees_dir,
+        sessions_dir=sessions_dir,
+        state_file=state_file,
+        write_gate=write_gate,
+    )
 
     # Route head-advanced request_changes findings to the review lane outside
     # the state lock. review() generates the packet, fires the review_started
