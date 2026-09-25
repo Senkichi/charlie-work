@@ -136,14 +136,25 @@ def pytest_tree_load(
 
     excluded = _self_tree(children_by_ppid, ppid_by_pid, root_pids, resolved_self_pid)
 
-    seen: set[int] = set()
-    trees = 0
+    # A nested root's subtree lies inside its outer root's, so overlapping
+    # subtrees are one suite. Merging by overlap -- rather than skipping roots
+    # already ``seen`` -- makes the count independent of visit order (#1918:
+    # a nested root with a lower PID than its outer root was counted twice)
+    # and still counts a ppid cycle joining two roots as one tree.
+    trees: list[set[int]] = []
     for pid in root_pids:
-        if pid in seen or pid in excluded:
+        if pid in excluded:
             continue
-        trees += 1
-        seen |= _subtree_pids(children_by_ppid, pid)
-    return HostLoad(pytest_tree_count=trees, pytest_process_count=len(seen))
+        merged = _subtree_pids(children_by_ppid, pid)
+        disjoint = []
+        for tree in trees:
+            if tree & merged:
+                merged |= tree
+            else:
+                disjoint.append(tree)
+        trees = [*disjoint, merged]
+    seen = set().union(*trees)
+    return HostLoad(pytest_tree_count=len(trees), pytest_process_count=len(seen))
 
 
 def _self_tree(
