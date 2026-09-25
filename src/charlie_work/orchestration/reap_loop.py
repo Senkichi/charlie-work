@@ -41,6 +41,7 @@ from charlie_work.github import (
 from charlie_work.instrumentation import log_event
 from charlie_work.notify import AttentionDigest, AttentionEntry
 from charlie_work.review_decision import review_decision
+from charlie_work.state import SINK_STATUSES
 
 
 def _loop_body(
@@ -578,14 +579,60 @@ def _loop_body(
                         pr_state, issue_state_for_esc
                     )
                     escalated_now = pr_escalated_now or issue_escalated_now
+                    # Issue #1894: the #1338 suppression names only
+                    # "escalated", but the identical non-convergent shape is
+                    # reachable through the other durably-stuck statuses that
+                    # predicate deliberately does not cover (state.py
+                    # documents why _escalation_flags stays narrow -- a real
+                    # policy boundary, not an oversight to "fix" here). A
+                    # "blocked" record (SINK_STATUSES' other member -- a
+                    # judgment verdict parked on agent:human-needed until a
+                    # human moves it, e.g. record_review's "blocked" path)
+                    # is terminal the same way, and a janitor_blocked PR
+                    # whose sole janitor failure is a permanently-missing
+                    # required check (is_missing_checks_only_block) can never
+                    # reach packet regen either: review() short-circuits in
+                    # the deterministic janitor gate before its regen path,
+                    # so packet_template_sha can never catch up to
+                    # current_template_sha and the WARNING below would
+                    # re-emit an identical event every pass, forever.
+                    # SINK_STATUSES already subsumes "escalated"; naming
+                    # escalated_now alongside it keeps the #1338 lineage
+                    # legible at the gate.
+                    #
+                    # self.review() is still called for these statuses too.
+                    # Unlike the escalated early-return branch, the
+                    # janitor-diagnostics refresh for janitor_blocked /
+                    # blocked records lives inside review()'s MAIN janitor
+                    # path (janitor_ok / janitor_failures /
+                    # is_missing_checks_only_block -- the very fields this
+                    # predicate reads -- plus the ci_run_never_created
+                    # detection and the stale-checks-retrigger self-heal
+                    # lane). Skipping the call would freeze the predicate's
+                    # own inputs so the suppression could never lift once the
+                    # check appears -- a permanent wedge, and the same
+                    # frozen-diagnostics failure mode PRs #1397/#1443
+                    # established for the escalated case.
+                    non_convergent_now = (
+                        escalated_now
+                        or pr_state.get("status") in SINK_STATUSES
+                        or (
+                            isinstance(issue_state_for_esc, dict)
+                            and issue_state_for_esc.get("status") in SINK_STATUSES
+                        )
+                        or (
+                            pr_state.get("status") == "janitor_blocked"
+                            and bool(pr_state.get("is_missing_checks_only_block"))
+                        )
+                    )
                     # Emit a distinct event when regeneration fires
                     # because the template changed while the head stayed
                     # put, so a fleet-wide template edit is visible as a
                     # burst rather than unexplained review churn. Suppressed
-                    # while escalated (#1338): the regen is unreachable, so
-                    # the WARNING would fire identically every pass without
-                    # converging.
-                    if head_current and not template_current and not escalated_now:
+                    # while the regen is unreachable (#1338 escalated, #1894
+                    # blocked / janitor_blocked-missing-checks): the WARNING
+                    # would fire identically every pass without converging.
+                    if head_current and not template_current and not non_convergent_now:
                         log_event(
                             self.paths.state_file,
                             "review_packet_template_stale",
