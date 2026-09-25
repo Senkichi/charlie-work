@@ -505,6 +505,29 @@ def test_worker_prompts_name_context_md_in_the_read_step() -> None:
         )
 
 
+def test_worker_prompts_hedge_repo_docs_in_the_read_step() -> None:
+    """Verify every worker template hedges CLAUDE.md's existence (issue #1821).
+
+    The read step already hedges ``CONTEXT.md`` with ``(where present)``;
+    ``CLAUDE.md`` (and ``CONTRIBUTING.md`` where a template names it) must
+    carry the same qualifier so a repo that lacks the file -- the common
+    case for ``local_issues`` targets, which have no GitHub remote -- is an
+    expected skip, not an unconditional read the worker must reconcile.
+    """
+    for template_name in ("worker.md", "worker_claude_code.md", "worker_local.md"):
+        prompt = " ".join(_render_worker_with_sections(template_name).split())
+        assert "`CLAUDE.md` (where present)" in prompt, (
+            f"Rendered {template_name} instructs an unconditional CLAUDE.md read"
+        )
+        assert "Read `CLAUDE.md`," not in prompt
+
+    for template_name in ("worker.md", "worker_local.md"):
+        prompt = " ".join(_render_worker_with_sections(template_name).split())
+        assert "`CONTRIBUTING.md` (where present)" in prompt, (
+            f"Rendered {template_name} instructs an unconditional CONTRIBUTING.md read"
+        )
+
+
 def test_worker_prompts_bind_out_of_scope_records() -> None:
     """Verify the shared scope-contract section binds the issue's Out of scope
     section and any .out-of-scope/ record it cites (issue #1850).
