@@ -194,6 +194,7 @@ from .cross_repo_gate_candidates import (
     _split_whitespace_candidate,
 )
 from .cross_repo_gate_shorthand import _is_dotdot_shorthand, _resolve_list_shorthand
+from .repo_toplevel import _repo_is_toplevel
 from .safe_path import contains
 from .subprocess_runner import run_captured
 
@@ -717,45 +718,6 @@ def _all_repo_files(repo_root: Path) -> list[str]:
     return files
 
 
-def _repo_is_toplevel(repo_root: Path) -> bool:
-    """Return ``True`` when ``repo_root`` is itself the toplevel of a git
-    worktree.
-
-    ``git`` resolves the repository for a cwd by walking UP the directory
-    tree, so any git command run in a plain directory nested inside an
-    enclosing checkout answers with that enclosing repository's data —
-    ``check-ignore`` consults its ignore rules, ``ls-files`` lists its
-    tracked files. The callers of this check (``_is_gitignored``,
-    ``_repo_tracked_files``) cannot detect that substitution from the
-    command's output alone: the foreign answer is well-formed, just about
-    the wrong repository. Both therefore gate on this check so a
-    ``repo_root`` that is not its own repo root — a fixture directory, a
-    removed ``.git``, a nested non-repo subtree — degrades to its
-    documented failure fallback rather than trusting a foreign repo.
-
-    Comparison is against ``rev-parse --show-toplevel`` (not ``--git-dir``
-    or a ``.git`` existence check) so a linked-worktree root — whose git
-    dir lives under the main checkout's ``.git/worktrees/`` — still
-    counts as its own toplevel, and a subdirectory of a repo (whose
-    ``.git`` lives above it) does not. ``normcase``/``normpath`` on both
-    sides keeps the comparison stable across git's forward-slash output,
-    drive-letter case, and symlink/junction resolution.
-    """
-    result = run_captured(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=repo_root,
-        timeout_seconds=_CHECK_IGNORE_TIMEOUT_SECONDS,
-    )
-    if not result.ok:
-        return False
-    try:
-        toplevel = os.path.normcase(os.path.normpath(result.stdout.strip()))
-        root = os.path.normcase(os.path.normpath(str(repo_root.resolve())))
-    except OSError:
-        return False
-    return toplevel == root
-
-
 def _repo_tracked_files(repo_root: Path) -> list[str]:
     """Return every git-tracked file under ``repo_root``, POSIX-separated
     and relative to it.
@@ -772,13 +734,9 @@ def _repo_tracked_files(repo_root: Path) -> list[str]:
     ``.venv`` copy of *something*, so 2+ matches was the norm, not the
     exception).
 
-    Falls back to :func:`_all_repo_files` (a pruned ``os.walk``) when ``git
-    ls-files`` fails — including when ``repo_root`` is not itself a git
-    toplevel (:func:`_repo_is_toplevel`), because ``ls-files`` run in a
-    plain directory nested inside an enclosing checkout would list the
-    ENCLOSING repo's tracked files under that path: a wrong-repository
-    answer that could falsely "find" a candidate. The fallback is
-    strictly noisier, never wrong: see its own docstring.
+    Falls back to :func:`_all_repo_files` (a pruned ``os.walk``; strictly
+    noisier, never wrong — see its docstring) when ``git ls-files`` fails
+    or ``repo_root`` is not a git toplevel (:func:`_repo_is_toplevel`).
     """
     if not _repo_is_toplevel(repo_root):
         return _all_repo_files(repo_root)
@@ -982,22 +940,12 @@ def _is_gitignored(candidate: str, repo_root: Path) -> bool:
     ignored by ``repo_root``'s gitignore rules.
 
     Works on non-existent paths — ``check-ignore`` matches by pathname
-    pattern only, with no filesystem existence check. Any failure
-    (``repo_root`` is not a git repository, the candidate resolves outside
-    the repository, the git binary is missing, a timeout) falls back to
-    ``False`` — "not ignored" — so a broken git invocation degrades to the
-    *narrower* neutral set, not a wider one: a candidate that should
-    escalate keeps escalating rather than being silently suppressed.
-
-    The :func:`_repo_is_toplevel` guard exists because ``git
-    check-ignore`` resolves its repository by walking *up* from the cwd:
-    when ``repo_root`` is not itself a git toplevel — a plain directory
-    inside some enclosing checkout — the verdict comes from that
-    enclosing repository's ignore rules, not ``repo_root``'s (the
-    enclosing repo's own ``.gitignore`` can match the fixture path
-    prefix, answering "ignored" about a repository the gate never asked
-    about). A wrong-repository answer is a failure, so it shares the
-    documented ``False`` fallback.
+    pattern only, with no filesystem existence check. Any failure —
+    ``repo_root`` not a git repository or not its own toplevel (a nested
+    dir consults the enclosing repo's rules; :func:`_repo_is_toplevel`),
+    candidate outside the repository, missing git binary, a timeout —
+    falls back to ``False``, "not ignored": the *narrower* neutral set,
+    never wider — a candidate that should escalate keeps escalating.
     """
     if not _repo_is_toplevel(repo_root):
         return False
