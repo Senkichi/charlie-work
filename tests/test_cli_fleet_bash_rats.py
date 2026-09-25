@@ -12,9 +12,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from charlie_work import cli
+from charlie_work import cli, layout
 from charlie_work.config import NotifyConfig
-from charlie_work.supervise import SelfDeployResult
+from charlie_work.notify import NotifyResult
+from charlie_work.supervise import SelfDeployResult, supervisor_runtime_paths
 from charlie_work.workflow import CommandResult
 
 
@@ -221,6 +222,52 @@ def test_run_fleet_bash_rats_emits_attention_digest_on_venv_repaired(
     assert len(digest["transitions"]) == 1
     assert digest["transitions"][0]["adapter_kind"] == "self-deploy"
     assert digest["transitions"][0]["health"] == "REPAIRED"
+
+
+def test_run_fleet_bash_rats_resolves_notify_sentinel_for_emit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #1899: the self-deploy emit gets the sentinel-resolved notify
+    config -- the raw ``file_path=""`` default would fail every emit with
+    'file_path is empty'."""
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=False,
+            pulled=False,
+            changed=False,
+            synced=False,
+            error="diverged or dirty tree",
+        )
+    )
+    monkeypatch.setattr(cli, "self_deploy", deploy_mock)
+    monkeypatch.setattr(
+        cli,
+        "fleet_loop",
+        MagicMock(return_value=CommandResult(True, "ok", {"repos": {}})),
+    )
+    emit = MagicMock(name="emit_digest", return_value=NotifyResult(ok=True))
+    monkeypatch.setattr(cli, "emit_digest", emit)
+
+    from charlie_work.config import OrchestratorConfig
+
+    monkeypatch.setattr(
+        cli,
+        "load_layered_config",
+        lambda *_a, **_k: OrchestratorConfig(notify=NotifyConfig(enabled=True, sink="file")),
+    )
+
+    args = cli.build_parser().parse_args(["fleet", "bash-rats"])
+    result = cli.run_fleet_bash_rats(args)
+
+    assert result.ok is True
+    emit.assert_called_once()
+    emitted_config = emit.call_args[0][0]
+    assert emitted_config.file_path == str(
+        layout.notify_digest_default(
+            supervisor_runtime_paths(OrchestratorConfig().runtime.state_dir).root
+        )
+    )
 
 
 def test_run_fleet_bash_rats_loud_on_absent_global_layer(

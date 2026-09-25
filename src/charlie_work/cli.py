@@ -66,6 +66,7 @@ from .dirty_tree import check_working_tree_clean
 from .logging_setup import configure_logging
 from .instrumentation import query_events
 from .notify import AttentionDigest, AttentionEntry, emit_digest
+from .notify_freshness import resolve_fleet_notify
 from .paths import RepoNotFoundError, RuntimePaths, find_repo_root, resolved_layout, runtime_paths
 from .quiesce import check_quiescence
 from .state import StateLockBusy, load_state_locked, utc_now
@@ -1302,6 +1303,14 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # The supervisor's own bookkeeping root is resolved via the dedicated
     # helper, which binds the phantom-state-dir opt-out (issue #1754).
     state_root = supervisor_runtime_paths(state_dir).root
+    # Issue #1899: resolve the notify.file_path "" sentinel against the same
+    # bookkeeping root the supervisor uses, so the self-deploy digests below
+    # land at the path the supervisor's notify_resolution event publishes
+    # rather than failing "file_path is empty" under the documented default.
+    notify_config = resolve_fleet_notify(
+        getattr(global_config, "notify", None) if global_config else None,
+        state_root,
+    )
     deploy = self_deploy(
         orchestrator_root(),
         state_root=state_root,
@@ -1320,7 +1329,6 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     )
     if not deploy.ok:
         print(f"self-deploy skipped: {deploy.error}", flush=True)
-        notify_config = getattr(global_config, "notify", None) if global_config else None
         if (
             deploy.alertable
             and notify_config is not None
@@ -1347,7 +1355,6 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         print(f"self-deploy: {deploy.message}", flush=True)
     elif deploy.venv_repaired:
         print(f"self-deploy: {deploy.message}", flush=True)
-        notify_config = getattr(global_config, "notify", None) if global_config else None
         if notify_config is not None and getattr(notify_config, "enabled", False):
             attention_digest = AttentionDigest(
                 generated_at=utc_now(),
