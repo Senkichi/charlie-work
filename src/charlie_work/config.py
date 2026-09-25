@@ -487,16 +487,12 @@ class DispatchConfig:
     # root merely waiting out a slow CI cycle or an overnight review is not
     # paged as stuck.
     dependency_stall_minutes: int = 1440
-    # Issue #1001: when True, dispatch refuses to launch workers if no
-    # sanctioned GitHub token is configured in the active adapter's
-    # ``worker_env`` (the same predicate ``doctor._check_worker_github_token``
-    # uses). Defaults False (warn-only: escalate once, dispatch anyway) so the
-    # gate does not take the fleet down on a config that has not yet been
-    # provisioned with a token — see the issue #1001 sequencing hazard
-    # comment. Flip to True only after an operator has provisioned a scoped
-    # token in ``devin.worker_env`` / ``claude_code.worker_env`` and confirmed
-    # workers reach ``gh pr create`` successfully. Issue #1224 tracks that
-    # staged rollout, including the eventual flip of this default to True.
+    # Issue #1853: DEPRECATED no-op, kept only so existing config files that
+    # set it still parse. The worker-GitHub-token dispatch gate (issue #1001)
+    # was retired when the operator decided workers stay credential-free by
+    # design — PR mutations flow through ``.worker-outcome.json`` and the
+    # authenticated orchestrator applies them (see ``rework_outcome.py``).
+    # The staged-rollout plan this flag served (issue #1224) is superseded.
     require_worker_github_token: bool = False
 
     def __post_init__(self) -> None:
@@ -1811,6 +1807,21 @@ class WatchdogConfig:
     # where 0 means "never redispatch." The default of 2 provides the bound
     # the reviewer requested.
     max_foreign_writer_reaps: int = 2
+    # Issue #1867: PID-independent finalize for a completed worker handoff.
+    # A worker that pushed its branch and wrote ``.worker-outcome.json`` with
+    # ``push_succeeded: true`` / ``pr_created: false`` has finished the
+    # handoff contract -- the orchestrator is meant to open the PR from the
+    # file the moment the session ends, and the file's own contract tells the
+    # worker to stop after writing it. When the outcome file has been sitting
+    # for this many minutes while the recorded ``worker_pid`` is still alive,
+    # ``_detect_and_handle_orphaned_workers`` treats the worker as hung on
+    # exit and opens the PR from the drafted ``pr_title``/``pr_body`` without
+    # waiting for the PID to die (the stall watchdog reaps the process itself
+    # on its own cadence). Without this, a worker whose process fails to exit
+    # leaves the pushed branch and its drafted PR stranded for as long as the
+    # PID lingers (the swole #163 incident: PR unopened ~2h). 0 disables the
+    # PID-independent finalize.
+    worker_outcome_finalize_minutes: int = 15
 
 
 @dataclass(frozen=True)
@@ -3647,6 +3658,21 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'watchdog' key 'pre_review_rework_stale_minutes' must be an int, "
             f"got {type(pre_review_rework_stale_minutes).__name__}"
+        )
+    # Issue #1867: int, >= 0 (0 disables the PID-independent finalize).
+    worker_outcome_finalize_minutes = watchdog_data.get("worker_outcome_finalize_minutes")
+    if worker_outcome_finalize_minutes is not None and (
+        isinstance(worker_outcome_finalize_minutes, bool)
+        or not isinstance(worker_outcome_finalize_minutes, int)
+    ):
+        raise ConfigError(
+            "config section 'watchdog' key 'worker_outcome_finalize_minutes' must be an int, "
+            f"got {type(worker_outcome_finalize_minutes).__name__}"
+        )
+    if worker_outcome_finalize_minutes is not None and worker_outcome_finalize_minutes < 0:
+        raise ConfigError(
+            "config section 'watchdog' key 'worker_outcome_finalize_minutes' must be >= 0, "
+            f"got {worker_outcome_finalize_minutes}"
         )
     # Validate worktree mtime corroboration config (issue #353)
     worktree_mtime_enabled = watchdog_data.get("worktree_mtime_enabled")

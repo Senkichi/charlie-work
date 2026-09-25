@@ -68,7 +68,7 @@ def _write_worker_prompt(self, issue: dict[str, Any], *, dry_run: bool = False) 
             # enforcement for that fail-soft contract.
             "module_map": self._build_module_map_value(issue_number),
             # Issue #1460: the attachment-point placement clause, gated
-            # solely on `.attachment-budgets.json`'s presence. Fail-soft
+            # solely on `.attachment-budgets/`'s presence. Fail-soft
             # like module_map: a malformed baseline yields an empty
             # string (omitted clause) plus a
             # ``worker_attachment_budget_failed`` warning event.

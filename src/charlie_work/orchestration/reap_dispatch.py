@@ -216,13 +216,10 @@ def _apply_concurrency_governor(
             #
             # Dry-run never writes the event: log_event is a durable
             # events.db mutation, and a dry-run preview must not record
-            # instrumentation (the same write-suppression discipline as the
-            # worker_token_escalated marker above -- the escalation event
-            # and durable marker stay behind ``not self.dry_run``). The
-            # clamp itself (dispatch_limit/clamped below) is NOT dry-run
-            # gated: a dry-run preview must report the same clamped
-            # selected_count a live pass would, matching the
-            # worker_token_missing refusal precedent in _dispatch_impl.
+            # instrumentation. The clamp itself (dispatch_limit/clamped
+            # below) is NOT dry-run gated: a dry-run preview must report the
+            # same clamped selected_count a live pass would, matching the
+            # provider_throttled deferral precedent in _dispatch_impl.
             if not self.dry_run:
                 log_event(
                     self.paths.state_file,
