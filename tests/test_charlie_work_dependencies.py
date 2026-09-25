@@ -101,6 +101,49 @@ def test_detect_prose_only_dependencies_descriptive_task_refs_no_match() -> None
     assert detect_prose_only_dependencies(body) is False
 
 
+def test_detect_prose_only_dependencies_ignores_fenced_code_block() -> None:
+    """Issue #1819: dependency-shaped prose inside a fenced code block is
+    quoted/example code, not the issue author's own declaration — the
+    function previously scanned the raw body with no fence awareness at
+    all, so a code sample quoting "wait until the PR merges"-style text
+    parked the issue under ``agent:prose-only-deps``."""
+    from charlie_work.github import detect_prose_only_dependencies
+
+    # Pattern 3 ("wait for ... PR/merge") quoted inside a fenced sample.
+    body = (
+        "This parser parks issues on prose like:\n\n"
+        "```python\n"
+        "# example: wait for this PR to merge before starting\n"
+        "# or 'depends on P2-T2' in a comment\n"
+        "```\n"
+    )
+    assert detect_prose_only_dependencies(body) is False
+
+    body = "```\nDo not dispatch before P2-T2 lands.\n```\n"
+    assert detect_prose_only_dependencies(body) is False
+
+
+def test_detect_prose_only_dependencies_outside_fenced_block_still_fires() -> None:
+    """The fenced-code exclusion must not over-suppress: a genuine
+    dependency declaration in prose still parks the issue."""
+    from charlie_work.github import detect_prose_only_dependencies
+
+    body = "```text\nexample: wait for this PR to merge\n```\n\nDepends on P2-T2 now.\n"
+    assert detect_prose_only_dependencies(body) is True
+
+
+def test_detect_prose_only_dependencies_section_after_fenced_block_still_scanned() -> None:
+    """Issue #1819: ``_scan_blocker_sections`` re-runs the fence scan on the
+    stripped body, so the strip must remove the closing fence line too —
+    an orphaned closer would be re-read as an opening fence and swallow a
+    real 'Blocked by' section after the code block."""
+    from charlie_work.github import detect_prose_only_dependencies, parse_blockers
+
+    body = "```\ncode\n```\n## Blocked by\n- https://example.com/unreadable\n"
+    assert parse_blockers(body) == []
+    assert detect_prose_only_dependencies(body) is True
+
+
 def test_github_dependencies_404_tolerance(tmp_path: Path) -> None:
     """Test that 404 errors from dependencies API are handled gracefully (feature not available)."""
     from charlie_work.github import get_github_issue_dependencies

@@ -399,24 +399,42 @@ class DispatchConfig:
     ci_capacity_headroom_ratio: float = 0.0
     # Issue #1843: host-load backpressure for every dispatch lane that can
     # launch a worker (fresh, rework, and the loop's shared wave budget).
-    # When > 0, the concurrency governor counts the processes inside live
-    # pytest process trees on this host (host_load.py -- a suite's xdist
-    # workers count as members of its tree) and clamps the pass's dispatch
-    # limit to 0 whenever the count exceeds this threshold, deferring the
-    # launch to a later pass instead of oversubscribing the box further.
     # Unlike max_open_agent_prs/ci_capacity_headroom_ratio this term is NOT
     # fresh-dispatch-only: a rework launch spawns a real local suite too,
     # and the host does not care which lane oversubscribed it.
     #
-    # Default: this host's logical CPU count (os.cpu_count()), i.e. "more
-    # runnable test processes than cores" is the built-in saturation line --
-    # the feature ships ON, and this knob is the kill switch/tuning point
-    # per the issue's acceptance criteria. 0 disables the check entirely
-    # (also the effective behavior on hosts where os.cpu_count() returns
+    # The probe (host_load.py) reports two readings per pass and the
+    # governor applies two terms (issue #1903 recalibration):
+    #
+    # * ``host_load_max_pytest_trees`` -- the primary governor. Counts
+    #   distinct live pytest *suites* (a suite's xdist workers fold into
+    #   its tree, so the count does not scale with ``-n``) and clamps the
+    #   pass's dispatch limit to the remaining suite headroom
+    #   ``max(0, cap - live_trees)`` -- a partial grant near the cap
+    #   instead of a hard 0. One dispatch ≈ one new suite, so headroom is
+    #   measured in the same units as the limit it binds.
+    # * ``host_load_max_pytest_processes`` -- the fan-out brake. Counts
+    #   total processes inside those trees and clamps the limit to 0 when
+    #   the count strictly exceeds this threshold. This is the term that
+    #   still catches what a tree cap cannot: ONE suite run at a
+    #   pathological ``-n`` width. Raw process count scales with ``-n``,
+    #   not with real load (the #1903 miscalibration: at ``cpu_count`` the
+    #   brake tripped at ~2 ordinary suites on a 16-core host and
+    #   hard-stopped dispatch while CPU sat at 11-27%), so it is a brake,
+    #   not the governor, and its default is correspondingly higher.
+    #
+    # Defaults: trees = cpu_count() // 2, processes = cpu_count() * 3.
+    # At the fleet's observed suite width (~6-9 processes per suite on the
+    # 16-core host) both lines sit at roughly the same saturation point
+    # (~7-8 concurrent suites ≈ 3x oversubscription), so the tree term
+    # governs ordinary load and the process term only fires on abnormal
+    # width. 0 disables a term individually; 0 on both disables the probe
+    # entirely (also the effective behavior where os.cpu_count() returns
     # None). A failed measurement fails OPEN (dispatch proceeds) and is
     # reported via a rate-limited host_load_unavailable event, never by
     # silently treating the host as idle.
-    host_load_max_pytest_processes: int = field(default_factory=lambda: os.cpu_count() or 0)
+    host_load_max_pytest_processes: int = field(default_factory=lambda: (os.cpu_count() or 0) * 3)
+    host_load_max_pytest_trees: int = field(default_factory=lambda: (os.cpu_count() or 0) // 2)
     # Repo-root-relative paths copied into each worktree after creation
     # (e.g. [".devin"]). Copy-not-link (workers may write marker files);
     # skip-if-tracked (tracked paths are already present). Errors surface as
@@ -2108,6 +2126,16 @@ class SupervisorConfig:
     before a ``supervisor_wedge_loop`` events.db entry fires (default 3,
     mirrors ``self_deploy_failure_alarm``/``zero_pass_alarm``). 0 disables
     the alarm (issue #1832).
+    ``dependency_sync_starvation_seconds``: upper bound on how long a deferred
+    self-deploy ``uv sync`` may stay pending while fleet workers are live
+    before the supervisor stops admitting new dispatches (drain posture:
+    workers in flight are untouched) so the live-worker count can reach zero
+    and the sync can land (issue #1855). Measured wall-clock from the
+    pending-sync marker's ``written_at`` -- the first deferral of the
+    episode -- so it is robust to supervisor restarts. Default 14400 s (4 h):
+    comfortably above observed worker session durations, and far below the
+    multi-hour continuous deferral observed under sustained fleet load.
+    <= 0 disables the bound.
     """
 
     poll_interval_seconds: int = 20
@@ -2119,6 +2147,7 @@ class SupervisorConfig:
     self_deploy_pull_ci_fleet: bool = False
     zero_pass_alarm: int = 3
     wedge_kill_loop_alarm: int = 3
+    dependency_sync_starvation_seconds: int = 14400
 
 
 @dataclass(frozen=True)
@@ -2536,18 +2565,20 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 "config section 'dispatch' key 'ci_capacity_headroom_ratio' must be >= 0, "
                 f"got {_cchr}"
             )
-    # Issue #1843: int validation for host_load_max_pytest_processes.
-    _hlmpp = dispatch_data.get("host_load_max_pytest_processes")
-    if _hlmpp is not None:
-        if isinstance(_hlmpp, bool) or not isinstance(_hlmpp, int):
+    # Issue #1843: int validation for host_load_max_pytest_processes;
+    # issue #1903 adds the sibling tree cap under identical rules.
+    for _hl_key in ("host_load_max_pytest_processes", "host_load_max_pytest_trees"):
+        _hl_val = dispatch_data.get(_hl_key)
+        if _hl_val is None:
+            continue
+        if isinstance(_hl_val, bool) or not isinstance(_hl_val, int):
             raise ConfigError(
-                "config section 'dispatch' key 'host_load_max_pytest_processes' must be "
-                f"an int, got {type(_hlmpp).__name__}"
+                f"config section 'dispatch' key '{_hl_key}' must be "
+                f"an int, got {type(_hl_val).__name__}"
             )
-        if _hlmpp < 0:
+        if _hl_val < 0:
             raise ConfigError(
-                "config section 'dispatch' key 'host_load_max_pytest_processes' must be "
-                f">= 0, got {_hlmpp}"
+                f"config section 'dispatch' key '{_hl_key}' must be >= 0, got {_hl_val}"
             )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review_data = _section(data, "review")
@@ -4027,6 +4058,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         "self_deploy_failure_alarm",
         "zero_pass_alarm",
         "wedge_kill_loop_alarm",
+        "dependency_sync_starvation_seconds",
     ):
         value = supervisor_data.get(int_key)
         if value is not None and not isinstance(value, int):

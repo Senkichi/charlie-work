@@ -918,10 +918,14 @@ class ConcurrencyGovernorResult:
     # fresh dispatch) -- a worker launch adds real host load regardless of
     # lane. ``host_load_pytest_processes``/``host_load_pytest_trees`` are the
     # ``host_load.measure_host_load`` reading for this call: ``None`` when
-    # the knob is 0 (off), when the running limit was already 0 (no launch
+    # both knobs are 0 (off), when the running limit was already 0 (no launch
     # could happen, so no probe), or when the probe itself failed (fail-open
-    # -- see host_load.py), ints otherwise.
+    # -- see host_load.py), ints otherwise. Issue #1903 split the term into
+    # two knobs: ``host_load_max_pytest_trees`` (the governor -- clamps by
+    # suite headroom ``cap - live_trees``) and ``host_load_max_pytest_processes``
+    # (the fan-out brake -- strict ``>`` trip to 0 on abnormal ``-n`` width).
     host_load_max_pytest_processes: int = 0
+    host_load_max_pytest_trees: int = 0
     host_load_pytest_processes: int | None = None
     host_load_pytest_trees: int | None = None
     # Which term actually bound ``dispatch_limit`` this call, e.g.
@@ -956,8 +960,8 @@ class ConcurrencyGovernorResult:
 
     @property
     def host_load_enabled(self) -> bool:
-        """Return True if the host-load clamp is enabled (threshold > 0)."""
-        return self.host_load_max_pytest_processes > 0
+        """Return True if the host-load clamp is enabled (either knob > 0)."""
+        return self.host_load_max_pytest_processes > 0 or self.host_load_max_pytest_trees > 0
 
     @property
     def any_term_enabled(self) -> bool:
@@ -1004,6 +1008,7 @@ class ConcurrencyGovernorResult:
             fields["ci_headroom_ratio"] = self.ci_headroom_ratio
         if self.host_load_enabled:
             fields["host_load_max_pytest_processes"] = self.host_load_max_pytest_processes
+            fields["host_load_max_pytest_trees"] = self.host_load_max_pytest_trees
             fields["host_load_pytest_processes"] = self.host_load_pytest_processes
             fields["host_load_pytest_trees"] = self.host_load_pytest_trees
         if self.clamped_by is not None:
