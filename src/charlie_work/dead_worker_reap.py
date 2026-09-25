@@ -122,12 +122,10 @@ from .instrumentation import log_event
 from .labels import TransitionOutcome
 from .local_work_park import park_unpublishable_work
 from .no_op_checkpoint import _paired_death_count
+from .orphan_sweep import sweep_orphan_processes
 from .paths import resolved_layout
 from .pr_create_retry import create_pr_with_retry
-from .process_utils import (
-    is_pid_alive,
-    sweep_orphan_processes,
-)
+from .process_utils import is_pid_alive
 from .review_decision import review_decision
 from .rework_prompts import _write_rework_prompt
 from .state import (
