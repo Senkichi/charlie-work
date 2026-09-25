@@ -193,6 +193,72 @@ def test_restart_exit_code_is_distinct_from_the_ordinary_ones() -> None:
     assert EXIT_RESTART_REQUESTED not in (0, 1)
 
 
+def test_pending_stop_request_wins_over_a_restart_request() -> None:
+    """Issue #1716: an operator stop marker outranks the child's relaunch ask.
+
+    Without this, `fleet stop` racing a self-deploy exit would resurrect the
+    supervisor the operator just stopped -- the replacement would read the
+    same marker and exit again anyway, so the relaunch buys nothing.
+    """
+    spawn = _ScriptedSpawn([EXIT_RESTART_REQUESTED])
+    messages: list[str] = []
+
+    result = run_supervise_relaunch_loop(
+        spawn,
+        max_relaunches=5,
+        log=messages.append,
+        stop_requested=lambda: True,
+    )
+
+    assert result.launches == 1
+    assert result.relaunches == 0
+    assert result.last_exit_code == EXIT_RESTART_REQUESTED
+    assert result.cap_reached is False
+    assert result.stop_requested is True
+    assert spawn.launch_numbers == [1]
+    # One clean log line naming the cause — a refused relaunch must not be
+    # silent in the launcher log.
+    assert any("stop request" in line for line in messages)
+
+
+def test_no_pending_stop_request_keeps_restart_semantics() -> None:
+    """Control: ``stop_requested`` False leaves the relaunch path untouched."""
+    spawn = _ScriptedSpawn([EXIT_RESTART_REQUESTED, 0])
+
+    result = run_supervise_relaunch_loop(
+        spawn,
+        max_relaunches=5,
+        log=lambda _: None,
+        stop_requested=lambda: False,
+    )
+
+    assert result.launches == 2
+    assert result.relaunches == 1
+    assert result.stop_requested is False
+
+
+def test_stop_request_is_not_consulted_on_a_normal_exit() -> None:
+    """The predicate must only fire where a relaunch would otherwise happen.
+
+    The production predicate does a filesystem read; consulting it on every
+    exit would add I/O to the path that does not need it and, worse, would
+    report ``stop_requested`` on a child that exited 0 before ever seeing
+    the marker.
+    """
+    calls: list[int] = []
+    spawn = _ScriptedSpawn([0])
+
+    result = run_supervise_relaunch_loop(
+        spawn,
+        max_relaunches=5,
+        log=lambda _: None,
+        stop_requested=lambda: calls.append(1) is None,
+    )
+
+    assert result.stop_requested is False
+    assert calls == []
+
+
 class _ClockedSpawn:
     """A restart-requesting supervisor whose children run for scripted durations.
 

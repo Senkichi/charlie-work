@@ -170,3 +170,59 @@ def test_cli_fleet_supervise_loop_forwards_args_after_the_separator(
     assert rc == 0
     assert captured["kwargs"]["max_relaunches"] == 2
     assert captured["kwargs"]["supervise_args"] == ("--max-runtime", "0")
+
+
+def test_cli_fleet_supervise_loop_forwards_fleet_dir_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """#1716: the wrapper's stop-marker check must scope to the same fleet dir.
+
+    If ``--fleet-dir`` were dropped here, the marker check would read the
+    default fleet dir while the child supervises the overridden one — a stop
+    request could then suppress relaunch of the wrong fleet (or miss the
+    right one).
+    """
+    captured: dict[str, Any] = {}
+
+    def _fake_run_fleet_supervise_loop(**kwargs: Any) -> CommandResult:
+        captured["kwargs"] = kwargs
+        return CommandResult(True, "supervise-loop done", {})
+
+    monkeypatch.setattr(cli, "run_fleet_supervise_loop", _fake_run_fleet_supervise_loop)
+
+    rc = cli.main(["--fleet-dir", str(tmp_path), "fleet", "supervise-loop"])
+
+    assert rc == 0
+    assert captured["kwargs"]["fleet_dir_override"] == str(tmp_path)
+
+
+def test_cli_fleet_stop_parser() -> None:
+    """``fleet stop`` parses ``--drain``; default is a plain stop."""
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["fleet", "stop", "--drain"])
+    assert args.command == "fleet"
+    assert args.fleet_command == "stop"
+    assert args.drain is True
+
+    args = parser.parse_args(["fleet", "stop"])
+    assert args.drain is False
+
+
+def test_cli_fleet_stop_dispatches_to_run_fleet_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``charlie fleet stop --drain`` is wired through ``main``."""
+    captured: dict[str, Any] = {}
+
+    def _fake_run_fleet_stop(args: Any) -> CommandResult:
+        captured["args"] = args
+        return CommandResult(True, "stop request recorded", {})
+
+    monkeypatch.setattr(cli, "run_fleet_stop", _fake_run_fleet_stop)
+
+    rc = cli.main(["--fleet-dir", str(tmp_path), "fleet", "stop", "--drain"])
+
+    assert rc == 0
+    assert captured["args"].drain is True
+    assert captured["args"].fleet_dir == str(tmp_path)

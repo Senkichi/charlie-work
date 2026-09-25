@@ -367,6 +367,7 @@ from .backlog_reachability import (  # noqa: F401  (deliberate re-export)
     resolve_dispatch_mention_coverage,
     scan_merged_pr_references,
 )
+from .blocker_cycles import detect_open_blocker_cycles
 
 # Issue #1768: operator-queue impact measurement + edge-detection, extracted
 # to its own module for the same reason ``backlog_reachability`` is (a
@@ -4485,6 +4486,17 @@ class OrchestratorApp:
                     "updated_at": full_issue.get("updatedAt"),
                 }
             )
+        # Issue #1848: scan the open-issue blocker graph for cycles -- a loop
+        # of open issues blocking each other (or an issue listing itself)
+        # stalls every member forever while each still looks armed. Reporting
+        # only: one warning per reported cycle is logged inside the scan, and
+        # one blocker_cycle event per reported cycle is recorded below (the
+        # report is bounded by MAX_REPORTED_CYCLES total plus per-component
+        # cycle/DFS caps inside the scan; the intake event carries the
+        # truncation marker). Runs with the rest of intake's reads, outside
+        # the state lock; fail-open.
+        blocker_cycle_scan = detect_open_blocker_cycles(self.gh)
+        blocker_cycles = blocker_cycle_scan.cycles
         # Single lock for all state updates — skipped in dry-run (issue #618)
         if not self.dry_run:
             with state_lock(self.paths.state_file):
@@ -4514,8 +4526,21 @@ class OrchestratorApp:
                         "intake_prose_only_deps",
                         {"issue_numbers": sorted(prose_only_deps_issues)},
                     )
+                for cycle in blocker_cycles:
+                    state = self._record_event(
+                        state,
+                        "blocker_cycle",
+                        {"issue_numbers": cycle},
+                    )
                 state = self._record_event(
-                    state, "intake", {"issue_count": len(issues), "failed_count": len(failed)}
+                    state,
+                    "intake",
+                    {
+                        "issue_count": len(issues),
+                        "failed_count": len(failed),
+                        "blocker_cycles_reported": len(blocker_cycles),
+                        "blocker_cycles_truncated": blocker_cycle_scan.truncated,
+                    },
                 )
                 save_state(self.paths.state_file, state)
         message = "intake complete"
@@ -4534,6 +4559,8 @@ class OrchestratorApp:
                 "issues": written,
                 "failed": failed,
                 "prose_only_deps_issues": prose_only_deps_issues,
+                "blocker_cycles": blocker_cycles,
+                "blocker_cycles_truncated": blocker_cycle_scan.truncated,
             },
         )
 
