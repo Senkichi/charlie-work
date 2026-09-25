@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-import charlie_work.process_utils as _pu
-from charlie_work.process_utils import sweep_orphan_processes
+import charlie_work.orphan_sweep as _sweep
+from charlie_work.orphan_sweep import sweep_orphan_processes
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only test")
@@ -124,8 +124,8 @@ def test_sweep_orphan_processes_rejects_degenerate_needles(
 
     # Force the Windows code path regardless of host so path validation is
     # the only thing that can prevent the CIM query.
-    monkeypatch.setattr(_pu.os, "name", "nt")
-    monkeypatch.setattr(_pu.shutil, "which", lambda _name: "powershell")
+    monkeypatch.setattr(_sweep.os, "name", "nt")
+    monkeypatch.setattr(_sweep.shutil, "which", lambda _name: "powershell")
 
     run_calls: list[Any] = []
 
@@ -145,7 +145,7 @@ def test_sweep_orphan_processes_rejects_degenerate_needles(
         )
         return subprocess.CompletedProcess(args, 0, payload, "")
 
-    monkeypatch.setattr(_pu.subprocess, "run", fake_run)
+    monkeypatch.setattr(_sweep.subprocess, "run", fake_run)
 
     orphans = sweep_orphan_processes(worktree_path)
 

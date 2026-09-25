@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+import charlie_work.orphan_sweep as _sweep
 import charlie_work.process_utils as _pu
 from charlie_work.process_utils import kill_orphan_pid, kill_process_tree
 from charlie_work.subprocess_runner import RunResult
@@ -229,26 +230,25 @@ def test_self_ancestor_pids_walks_win32_snapshot(monkeypatch: pytest.MonkeyPatch
     including the final ancestor whose own ppid is absent from the snapshot —
     the same boundary ``quiesce.self_process_chain`` tests pin.
     """
-    monkeypatch.setattr(_pu.os, "name", "nt")
+    monkeypatch.setattr(_sweep.os, "name", "nt")
     monkeypatch.setattr(
-        _pu,
+        _sweep,
         "_win32_process_ppid_snapshot",
         lambda: {300: 200, 200: 100, 100: 1, 50: 1},
-        raising=False,
     )
-    monkeypatch.setattr(_pu.os, "getpid", lambda: 300)
+    monkeypatch.setattr(_sweep.os, "getpid", lambda: 300)
 
-    assert _pu._self_ancestor_pids() == frozenset({300, 200, 100, 1})
+    assert _sweep._self_ancestor_pids() == frozenset({300, 200, 100, 1})
 
 
 def test_self_ancestor_pids_terminates_on_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
     """A cyclic ppid map must not spin the walk — it terminates on the
     already-seen ancestor."""
-    monkeypatch.setattr(_pu.os, "name", "nt")
-    monkeypatch.setattr(_pu, "_win32_process_ppid_snapshot", lambda: {5: 7, 7: 5}, raising=False)
-    monkeypatch.setattr(_pu.os, "getpid", lambda: 5)
+    monkeypatch.setattr(_sweep.os, "name", "nt")
+    monkeypatch.setattr(_sweep, "_win32_process_ppid_snapshot", lambda: {5: 7, 7: 5})
+    monkeypatch.setattr(_sweep.os, "getpid", lambda: 5)
 
-    assert _pu._self_ancestor_pids() == frozenset({5, 7})
+    assert _sweep._self_ancestor_pids() == frozenset({5, 7})
 
 
 def test_self_ancestor_pids_degrades_to_self_when_snapshot_fails(
@@ -257,11 +257,11 @@ def test_self_ancestor_pids_degrades_to_self_when_snapshot_fails(
     """A broken snapshot degrades to the pre-#1842 bare self-pid guard rather
     than disabling reaping — or pretending to protect ancestors it cannot see.
     """
-    monkeypatch.setattr(_pu.os, "name", "nt")
-    monkeypatch.setattr(_pu, "_win32_process_ppid_snapshot", lambda: {}, raising=False)
-    monkeypatch.setattr(_pu.os, "getpid", lambda: 424242)
+    monkeypatch.setattr(_sweep.os, "name", "nt")
+    monkeypatch.setattr(_sweep, "_win32_process_ppid_snapshot", lambda: {})
+    monkeypatch.setattr(_sweep.os, "getpid", lambda: 424242)
 
-    assert _pu._self_ancestor_pids() == frozenset({424242})
+    assert _sweep._self_ancestor_pids() == frozenset({424242})
 
 
 def test_posix_process_ppid_snapshot_parses_procfs(tmp_path: Path) -> None:
@@ -276,7 +276,7 @@ def test_posix_process_ppid_snapshot_parses_procfs(tmp_path: Path) -> None:
         (proc_dir / "stat").write_text(f"{pid} ({comm}) S {ppid} 1 2 3", encoding="utf-8")
     (tmp_path / "notapid").mkdir()  # non-numeric entry is skipped
 
-    assert _pu._posix_process_ppid_snapshot(tmp_path) == rows
+    assert _sweep._posix_process_ppid_snapshot(tmp_path) == rows
 
 
 def test_win32_process_ppid_snapshot_normalizes_single_result(
@@ -288,16 +288,16 @@ def test_win32_process_ppid_snapshot_normalizes_single_result(
     """
     import json
 
-    monkeypatch.setattr(_pu.shutil, "which", lambda _name: "powershell")
+    monkeypatch.setattr(_sweep.shutil, "which", lambda _name: "powershell")
     monkeypatch.setattr(
-        _pu.subprocess,
+        _sweep.subprocess,
         "run",
         lambda *a, **k: subprocess.CompletedProcess(
             a, 0, json.dumps({"ProcessId": 7, "ParentProcessId": 3}), ""
         ),
     )
 
-    assert _pu._win32_process_ppid_snapshot() == {7: 3}
+    assert _sweep._win32_process_ppid_snapshot() == {7: 3}
 
 
 def test_win32_process_ppid_snapshot_failure_returns_empty(
@@ -305,5 +305,5 @@ def test_win32_process_ppid_snapshot_failure_returns_empty(
 ) -> None:
     """No PowerShell (or a failed/unparseable query) must yield ``{}`` so the
     ancestor guard degrades rather than raising."""
-    monkeypatch.setattr(_pu.shutil, "which", lambda _name: None)
-    assert _pu._win32_process_ppid_snapshot() == {}
+    monkeypatch.setattr(_sweep.shutil, "which", lambda _name: None)
+    assert _sweep._win32_process_ppid_snapshot() == {}
