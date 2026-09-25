@@ -53,6 +53,7 @@ from .supervise_loop import (
 )
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
+from .fleet_stop import register_fleet_stop_subparser, run_fleet_stop
 from .global_config import load_layered_config
 from .github import (
     GitHub,
@@ -457,6 +458,11 @@ def build_parser() -> argparse.ArgumentParser:
             "wrapper."
         ),
     )
+
+    # Issue #1716: parser wiring lives in fleet_stop.py (cli.py is at its
+    # file-size ratchet mark) — same register_*_subparser convention as the
+    # *_command modules below.
+    register_fleet_stop_subparser(fleet_sub)
 
     runners = subparsers.add_parser("runners")
     runners_sub = runners.add_subparsers(dest="runners_command", required=True)
@@ -2593,7 +2599,10 @@ def main(argv: list[str] | None = None) -> int:
                 result = run_fleet_supervise_loop(
                     supervise_args=tuple(args.supervise_args),
                     max_relaunches=args.max_relaunches,
+                    fleet_dir_override=args.fleet_dir,
                 )
+            elif args.fleet_command == "stop":
+                result = run_fleet_stop(args)
             else:
                 result = CommandResult(False, f"unknown fleet command: {args.fleet_command}", {})
         elif args.command == "runners":

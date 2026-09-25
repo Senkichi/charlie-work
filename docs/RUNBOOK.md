@@ -537,6 +537,14 @@ physical cores.
   `work_only=True`).
 - `charlie fleet bash-rats [--limit N] [--repos …] [--merge/--no-merge]` runs
   the full intake→work→review→merge loop per repo.
+- `charlie fleet supervise` runs the continuous fleet supervisor (delta-polled
+  passes plus a `full_pass_interval_seconds` fallback); `charlie fleet
+  supervise-loop [--max-relaunches N] -- [supervise args]` wraps it and
+  relaunches immediately when the supervisor exits to pick up new code. This
+  pair is what the `charlie-fleet-pass` scheduled task runs hidden.
+- `charlie fleet stop [--drain]` writes a stop-request marker the running
+  supervisor honors between passes — see "Stopping and restarting the
+  scheduled fleet" below.
 
 > **Previewing a fleet pass.** `charlie --dry-run fleet bash-rats` and
 > `charlie --dry-run fleet supervise` gate the self-deploy step, so they do not
@@ -556,6 +564,56 @@ the explicit `--repos` order), enforce both the per-repo
 path, isolate per-repo failures (a broken/moved repo never aborts the sweep),
 and emit a consolidated attention digest at the end of the pass
 (`data.digest`: needs-attention event count + orphan-sweep calls).
+
+### Stopping and restarting the scheduled fleet
+
+The production deployment runs the supervisor hidden — the
+`charlie-fleet-pass` scheduled task launches
+`wscript → powershell → cmd → uv → fleet supervise-loop → fleet supervise`
+(`scripts/fleet-pass-hidden.vbs` / `scripts/fleet-pass.ps1`). There is no
+console attached to the real supervisor, so **Ctrl+C cannot reach it**, and
+`Stop-ScheduledTask` kills the whole process tree, live workers included.
+Use the marker command instead:
+
+- `charlie fleet stop` writes `fleet-stop-request.json` into the fleet dir.
+  The supervisor exits at its next pass boundary (within
+  ~`poll_interval_seconds`) and records `supervisor_exited` with reason
+  `operator_stop`. **Live workers are untouched** — they keep running and
+  are adopted/reaped by the next supervisor.
+- `charlie fleet stop --drain` sets `drain: true` in the marker. The
+  supervisor keeps running passes that reap and finalize in-flight work but
+  dispatches nothing new (fresh workers, rework, and review workers are all
+  suppressed), then exits once the live-worker count reaches zero, recording
+  `supervisor_exited` with reason `operator_stop_drained`. To stop a
+  draining fleet immediately, run `charlie fleet stop` (a plain request
+  overwrites the drain marker).
+
+The marker is consumed by the supervisor that honors it. A request written
+while no supervisor is running stays pending and takes effect on the next
+start — it is not silently dropped. `fleet supervise-loop` also consults the
+marker before honoring a child's restart request, so a stop that races a
+self-deploy cannot bounce the supervisor back up.
+
+**Keeping the fleet stopped**: because the marker is consumed on honor, the
+task's 5-minute trigger relaunches a clean supervisor on its next tick. To
+keep the fleet down (e.g. for `uv cache prune` or host maintenance), disable
+the task *first*, then stop:
+
+```powershell
+Disable-ScheduledTask -TaskName charlie-fleet-pass
+charlie fleet stop --drain   # or: charlie fleet stop
+# ... maintenance ...
+Enable-ScheduledTask -TaskName charlie-fleet-pass
+```
+
+`charlie fleet stop` reports whether the task is armed, so an armed task is
+called out in the command's own output.
+
+**Restarting**: re-enable the task (the next tick relaunches
+`supervise-loop`), or run `uv run charlie fleet supervise-loop` in a visible
+console — Ctrl+C there is handled cleanly: the wrapper logs one line and
+exits without a traceback, leaving its supervisor child (and any workers)
+running; follow with `charlie fleet stop` to stop the child too.
 
 ## Supervisor: worker health & escalation
 
