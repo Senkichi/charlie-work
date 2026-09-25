@@ -21,6 +21,7 @@ unsuppressed or a suppression itself has expired.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -68,6 +69,16 @@ try:
     from charlie_work.event_kinds import EXPECTED_OPERATIONAL_KINDS
 except ImportError:
     EXPECTED_OPERATIONAL_KINDS: frozenset[str] = frozenset()
+
+
+_lr_path = Path(__file__).resolve().parent / "heartbeat_local_repo.py"
+_lr_spec: Any = importlib.util.spec_from_file_location("_heartbeat_local_repo", _lr_path)
+_local_repo = importlib.util.module_from_spec(_lr_spec)
+sys.modules[_lr_spec.name] = _local_repo
+_lr_spec.loader.exec_module(_local_repo)
+FLEET_GLOBAL_CONFIG_FILENAME = _local_repo.FLEET_GLOBAL_CONFIG_FILENAME
+LOCAL_ONLY_SKIP_DETAIL = _local_repo.LOCAL_ONLY_SKIP_DETAIL
+_local_issues_enabled = _local_repo.local_issues_enabled
 
 # --------------------------------------------------------------------------
 # CONSTANTS
@@ -258,6 +269,8 @@ class RepoInfo:
     repo_root: Path
     state_dir: Path
     config_path: Path
+    # Resolved by load_repos via heartbeat_local_repo (#1861); False = GitHub-backed.
+    local_issues_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -504,15 +517,20 @@ def load_repos() -> tuple[list[RepoInfo], str | None]:
         data = json.loads(fleet_json.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return [], f"fleet.json unreadable: {exc}"
+    # local_issues.enabled may live in the fleet layer, not the repo's own config (#1861).
+    fleet_config, _fleet_err = load_orchestrator_config(fleet_dir() / FLEET_GLOBAL_CONFIG_FILENAME)
     repos: list[RepoInfo] = []
     for slug, entry in data.get("repos", {}).items():
         try:
+            config_path = Path(entry.get("config_path", ""))
+            repo_config, _config_err = load_orchestrator_config(config_path)
             repos.append(
                 RepoInfo(
                     slug=slug,
                     repo_root=Path(entry["repo_root"]),
                     state_dir=Path(entry["state_dir"]),
-                    config_path=Path(entry.get("config_path", "")),
+                    config_path=config_path,
+                    local_issues_enabled=_local_issues_enabled(repo_config, fleet_config),
                 )
             )
         except KeyError:
@@ -1175,6 +1193,14 @@ def check_dispatch_coverage(
 ) -> None:
     """``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``."""
     check = f"dispatch-coverage {repo.slug}"
+    if repo.local_issues_enabled:
+        _local_repo.skip_dispatch_coverage(report, check, prev_repo_state, new_repo_state)
+        # Sub-checks below are state-file, not gh -- throttle always prints; staleness self-skips.
+        check_dispatch_throttle(report, repo, now=now)
+        check_in_progress_staleness(
+            report, repo, [], prev_repo_state, new_repo_state, skip_delta, now=now
+        )
+        return
     args = [
         "issue",
         "list",
@@ -1346,6 +1372,9 @@ def check_armable_backlog(
     around.
     """
     check = f"armable-backlog {repo.slug}"
+    if repo.local_issues_enabled:
+        report.ok(check, LOCAL_ONLY_SKIP_DETAIL)
+        return
     args = [
         "issue",
         "list",
@@ -1446,6 +1475,10 @@ def check_in_progress_staleness(
     """
     check = f"in-progress-stale {repo.slug}"
     prev_map: dict[str, str] = prev_repo_state.get("in_progress", {})
+
+    if repo.local_issues_enabled:
+        _local_repo.skip_in_progress_staleness(report, check, prev_map, new_repo_state)
+        return
 
     if skip_delta:
         # Leave the last real beat's snapshot untouched; this is not a real
@@ -1712,6 +1745,10 @@ def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | Non
     prs_dir = repo.state_dir / "prs"
     if not prs_dir.exists():
         report.ok(check, "open_claims=0 (no prs dir)")
+        return
+
+    if repo.local_issues_enabled:
+        _local_repo.skip_review_liveness(report, check)
         return
 
     ok, open_data, err = run_gh_json(
@@ -2500,6 +2537,10 @@ def check_merge_flow(
     skip_delta: bool,
 ) -> None:
     check = f"merge-flow {repo.slug}"
+    if repo.local_issues_enabled:
+        _local_repo.skip_merge_flow(report, check, prev_repo_state, new_repo_state)
+        return
+
     ok_open, open_data, err_open = run_gh_json(
         ["pr", "list", "-R", repo.slug, "--state", "open", "--json", "number,labels"],
         repo.repo_root,
@@ -2643,6 +2684,9 @@ def check_stale_open_issue_mentions(report: Report, repo: RepoInfo) -> None:
     "+K more" suffix) so a large true positive count cannot flood the beat.
     """
     check = f"stale-open-issue-mentions {repo.slug}"
+    if repo.local_issues_enabled:
+        report.ok(check, LOCAL_ONLY_SKIP_DETAIL)
+        return
 
     ok_open, open_data, err_open = run_gh_json(
         [
