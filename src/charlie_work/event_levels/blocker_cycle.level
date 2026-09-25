@@ -1,0 +1,5 @@
+warning
+# Issue #1848: open issues blocking each other in a loop (or an issue listing
+# itself) can never dispatch while every member still looks armed -- a
+# handled-but-notable condition an operator should see, not a lane-ending
+# fault and not routine bookkeeping.

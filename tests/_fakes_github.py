@@ -428,6 +428,12 @@ class FakeGitHub:
                     break
         return open_issues
 
+    def issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]:
+        """Batched blocked-by lookup via the per-issue ``self.run`` path, so
+        ``dependencies_response`` overrides and run-call assertions behave as
+        they do for production clients (GitHubLike contract)."""
+        return {n: github_module.get_github_issue_dependencies(self, n) for n in issue_numbers}
+
     def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
         """Fake run method for GitHub API calls. Returns empty list for dependencies by default."""
         # Handle dependency API calls
