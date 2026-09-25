@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .instrumentation import query_events
+from .pending_sync import SELF_DEPLOY_SYNC_STARVED_KIND
 
 
 _SYNC_STARVATION_LOOKBACK_HOURS = 24
@@ -46,7 +47,7 @@ def _check_sync_starvation(add: Any, self_deploy_state_path: Path) -> None:
         .isoformat()
         .replace("+00:00", "Z")
     )
-    events = query_events(self_deploy_state_path, kind="self_deploy_sync_starved", since=cutoff)
+    events = query_events(self_deploy_state_path, kind=SELF_DEPLOY_SYNC_STARVED_KIND, since=cutoff)
     if not events:
         return
     latest = events[-1]
