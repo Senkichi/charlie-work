@@ -65,7 +65,16 @@ def _log_allocation(targets: list[dict[str, Any]], *, budget: int = 8) -> None:
 
 def _build_app(tmp_path: Path, ratio: float) -> OrchestratorApp:
     config = OrchestratorConfig(
-        dispatch=DispatchConfig(ci_capacity_headroom_ratio=ratio, default_limit=5),
+        # Issue #1903: pin both default-on host-load knobs off -- these tests
+        # exercise the ci_headroom term in isolation, and the tree cap
+        # (cpu_count//2) would otherwise clamp a 5-wide request on small
+        # hosts before ci_headroom's result could be observed.
+        dispatch=DispatchConfig(
+            ci_capacity_headroom_ratio=ratio,
+            default_limit=5,
+            host_load_max_pytest_processes=0,
+            host_load_max_pytest_trees=0,
+        ),
         devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

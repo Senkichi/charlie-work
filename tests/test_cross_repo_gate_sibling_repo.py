@@ -391,6 +391,53 @@ def test_segment_boundary_match_ignores_untracked_worktree_copies(tmp_path: Path
     assert "cross_repo_target" in result.reason
 
 
+def test_ls_files_inside_enclosing_repo_does_not_consult_foreign_index(
+    tmp_path: Path,
+) -> None:
+    """Issue #1854: a managed-roots entry that is a plain directory nested
+    inside an enclosing checkout is not itself a git toplevel, so
+    :func:`_repo_tracked_files` must not answer with the ENCLOSING repo's
+    ``git ls-files`` output — a well-formed but wrong-repository listing
+    that could falsely "find" a missing candidate under the sibling.
+
+    Here the enclosing repo's index still tracks
+    ``nested/not-a-repo/pkg/claimed.py`` after the file was deleted from
+    the worktree (``git add`` then unlink): ``git ls-files`` run with the
+    nested dir as cwd reports ``pkg/claimed.py``, while neither the
+    ``_resolve_within_root`` + ``exists()`` existence check nor the
+    ``os.walk`` fallback (:func:`_all_repo_files`) can see it — so only
+    the foreign index answer can "find" the candidate. Without the
+    ``_repo_is_toplevel`` guard the segment-boundary suffix match reports
+    ``ci_runners`` as the owner and the gate escalates; with it the
+    listing falls back to the walk, finds nothing, and the gate abstains.
+    """
+    this_repo = tmp_path / "charlie-work"
+    this_repo.mkdir()
+    enclosing = tmp_path / "enclosing"
+    enclosing.mkdir()
+    _git(enclosing, "init", "-q")
+    nested = enclosing / "nested" / "not-a-repo"
+    tracked = nested / "pkg" / "claimed.py"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("# claimed", encoding="utf-8")
+    _git(enclosing, "add", "nested/not-a-repo/pkg/claimed.py")
+    tracked.unlink()
+
+    body = "The bug is in `pkg/claimed.py`."
+
+    result = cross_repo_gate(
+        body,
+        this_repo,
+        {"charlie-work": this_repo, "ci_runners": nested},
+        "charlie-work",
+    )
+
+    assert result.passed is True
+    assert result.missing_paths == ("pkg/claimed.py",)
+    assert result.found_in_repo is None
+    assert "abstaining" in result.reason
+
+
 def test_sibling_file_listing_computed_once_per_root_per_gate_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

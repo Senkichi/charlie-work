@@ -39,12 +39,23 @@ from .fleet_health_baseline import (  # noqa: F401  (deliberate re-export)
 )
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .fleet_registry import _load_registry, count_fleet_runners
+from .fleet_stop import (
+    FleetStopState,
+    apply_fleet_drain_config,
+    fleet_stop_pending,
+    supervise_loop_interrupted_result,
+)
 from . import layout
 from .github import GitHub, GitHubError
 from .global_config import describe_config_file, load_layered_config
 from .instrumentation import log_event
 from .local_issues import github_client_for
 from .notify import AttentionDigest, AttentionEntry, emit_digest
+from .notify_freshness import (
+    check_notify_digest_freshness,
+    report_notify_resolution,
+    resolve_fleet_notify,
+)
 from .paths import RepoNotFoundError, runtime_paths
 from .venv_anchor import verify_interpreter_anchored_editables
 from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
@@ -1787,6 +1798,29 @@ def _touch_registry_last_seen(
         logger.exception("Failed to bump fleet registry last_seen for touched repos")
 
 
+def _fleet_notify_config(global_config: Any) -> Any:
+    """Return the fleet supervisor's effective notify config (issue #1899).
+
+    The global layered ``NotifyConfig.file_path`` keeps the "" sentinel
+    ("derive from ``runtime.state_dir``"): only ``paths.resolved_layout``
+    substitutes it, per repo. The fleet supervisor has no repo root, so the
+    raw value reaches ``emit_digest`` -- where every emit fails
+    "file_path is empty" -- and ``report_notify_resolution``, which then
+    flags the documented default as a misconfiguration. Anchoring the
+    sentinel at the supervisor's own bookkeeping root
+    (``supervisor_runtime_paths`` -- the fleet-level equivalent of
+    ``resolved_layout``'s ``repo_root`` anchor) gives the report, the
+    per-pass staleness probe, and every emit one real digest path.
+    ``None``/missing sections pass through as ``None``.
+    """
+    notify_config = getattr(global_config, "notify", None) if global_config else None
+    if notify_config is None:
+        return None
+    state_dir = getattr(getattr(global_config, "runtime", None), "state_dir", "")
+    state_root = supervisor_runtime_paths(state_dir or layout.DEFAULT_STATE_DIR).root
+    return resolve_fleet_notify(notify_config, state_root)
+
+
 def fleet_loop(
     fleet_dir_override: str | None = None,
     global_config: Any = None,  # GlobalConfig from #159, but we don't have the type yet
@@ -1797,6 +1831,7 @@ def fleet_loop(
     dry_run: bool = False,
     work_only: bool = False,
     ensure_labels: bool = False,
+    drain: bool = False,
     now: datetime.datetime | None = None,
     deadline_seconds: int | None = None,
     pass_clock: Callable[[], float] = time.monotonic,
@@ -1823,6 +1858,10 @@ def fleet_loop(
             converges to its label within one startup/pass with no operator
             action. Failures are recorded as events per repo, never raised,
             and never block the lane.
+        drain: If True (issue #1716, ``fleet stop --drain``), suppress all
+            new launches while the reap/review/merge lanes still run —
+            see ``fleet_stop.apply_fleet_drain_config`` and the forced
+            ``limit=0`` at the dispatch call sites below.
         now: Injectable clock (issue #822/#828) used for stale-entry grace
             period computation (issue #1372). Defaults to
             ``datetime.now(UTC)`` when not supplied, so production behavior is
@@ -1888,6 +1927,15 @@ def fleet_loop(
     # fleet log shows no lines for a repo whose lane is merely late.
     resolved_fleet_dir = fleet_dir(override=fleet_dir_override)
     fleet_state_path = layout.state_file_path(resolved_fleet_dir)
+
+    # Issue #1859: dead-man's switch for the notify file sink, checked at the
+    # top of every pass. Cheap (one stat) and edge-latched inside the helper;
+    # skipped entirely when notify is off or the sink is not ``file``.
+    # Issue #1899: the sentinel-resolved config (see _fleet_notify_config) so
+    # the probe and the consolidated emit below share the real digest path.
+    notify_config = _fleet_notify_config(global_config)
+    if notify_config is not None and getattr(notify_config, "enabled", False):
+        check_notify_digest_freshness(notify_config, fleet_state_path)
 
     # Issue #1372: stale registry entries (repo_root no longer exists) are
     # collected during the pass for prune-after-grace processing. They are
@@ -2010,6 +2058,8 @@ def fleet_loop(
             # dispatch()/loop() emission so one health transition doesn't fire
             # both a per-repo and a fleet-level notification.
             config = replace(config, notify=replace(config.notify, enabled=False))
+            if drain:
+                config = apply_fleet_drain_config(config)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
 
             # Non-blocking supervisor lock: fleet passes must be mutually exclusive
@@ -2059,9 +2109,9 @@ def fleet_loop(
                 # Call the appropriate per-repo method
                 if work_only:
                     # Dispatch-only path (worker dispatch + optional review dispatch)
-                    result = app.dispatch(limit)
+                    result = app.dispatch(0 if drain else limit)
                     if config.review_dispatch.enabled:
-                        review_dispatch_result = app.dispatch_reviews(limit)
+                        review_dispatch_result = app.dispatch_reviews(0 if drain else limit)
                         ok = result.ok and review_dispatch_result.ok
                         message = (
                             "work-only dispatch: "
@@ -2072,8 +2122,12 @@ def fleet_loop(
                         combined_data["dispatch_reviews"] = review_dispatch_result.data
                         result = CommandResult(ok, message, combined_data)
                 else:
-                    # Full loop (intake -> dispatch -> review -> merge)
-                    result = app.loop(limit, merge=merge)
+                    # Full loop (intake -> dispatch -> review -> merge). A
+                    # drain pass forces limit=0: dispatch_rework/dispatch
+                    # slice candidates[:0] (0 is not None, so it is never
+                    # replaced by default_limit) while the reap, review, and
+                    # merge lanes below them run normally.
+                    result = app.loop(0 if drain else limit, merge=merge)
 
                 per_repo_results[repo_key] = result
                 attention_events.extend(_extract_attention_events(repo_key, result))
@@ -2219,7 +2273,9 @@ def fleet_loop(
 
     # Call the notifier digest sink exactly once per fleet pass, via the real
     # #166 notify.py implementation (AttentionDigest + emit_digest).
-    notify_config = getattr(global_config, "notify", None) if global_config else None
+    # ``notify_config`` is the sentinel-resolved binding from the pass top
+    # (issue #1899), so the file sink lands rather than failing
+    # "file_path is empty" under the documented default.
     digest: dict[str, Any] = {
         "events": attention_events,
         "count": len(attention_events),
@@ -2739,6 +2795,27 @@ def run_fleet_supervise(
         describe_config_file(global_config_path),
     )
 
+    # Issue #1899: resolve the notify.file_path "" sentinel against the
+    # supervisor's own bookkeeping root (see _fleet_notify_config) before
+    # anything consumes it -- the raw layered value is the "derive from
+    # runtime.state_dir" sentinel, so without this the report below flags
+    # the documented default as misconfigured and every fleet-level emit
+    # fails "file_path is empty".
+    notify_config = _fleet_notify_config(global_config)
+
+    # Issue #1859: publish the resolved notify sink once per supervisor
+    # start, next to the global-layer provenance line -- a lost ``notify:``
+    # section otherwise degrades the whole pipeline to silence with no
+    # error anywhere. The fleet-state path targets the same events.db the
+    # heartbeat consumer reads, so the resolution (including the absolute
+    # digest path this daemon anchored) is a consumed signal, not a
+    # write-only log line.
+    report_notify_resolution(
+        notify_config,
+        global_config_path,
+        layout.state_file_path(fleet_dir(override=fleet_dir_override)),
+    )
+
     overrides: dict[str, int] = {}
     if poll_interval_override is not None:
         overrides["poll_interval_seconds"] = poll_interval_override
@@ -2818,6 +2895,8 @@ def run_fleet_supervise(
     start_time = clock()
     # Set at every route out of the loop below; see RESTART_EXIT_REASONS.
     exit_reason: str | None = None
+    # Issue #1716: operator stop/drain control plane (fleet_stop.FleetStopState).
+    drain_state = FleetStopState()
     full_pass_interval = cfg.full_pass_interval_seconds
     last_full_pass_at = start_time - full_pass_interval
     snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
@@ -2829,7 +2908,8 @@ def run_fleet_supervise(
     # prior supervisor is gone, so a stale heartbeat with no ``exited_at`` here
     # means the prior one was killed — emit a retroactive supervisor_exited and
     # alert on it before this supervisor records its own start.
-    notify_config = getattr(global_config, "notify", None)
+    # ``notify_config`` is the sentinel-resolved binding from startup
+    # (issue #1899), shared by every _emit_fleet_transition site below.
     prior = detect_prior_abnormal_exit(fleet_dir_override)
     if prior is not None:
         record_prior_abnormal_exit(fleet_dir_override, prior)
@@ -2955,9 +3035,19 @@ def run_fleet_supervise(
                 _exit_reason = "max_passes"
                 break
 
+            # Issue #1716: operator stop/drain marker, polled between passes.
+            stop_reason = drain_state.poll_stop_marker(fleet_dir_override)
+            if stop_reason is not None:
+                exit_reason = _exit_reason = stop_reason
+                break
+
             new_snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
             fallback_due = (now - last_full_pass_at) >= full_pass_interval
             run_pass = _has_fleet_delta(snapshot, new_snapshot) or fallback_due
+
+            if drain_state.drain_tick(fleet_dir_override, new_snapshot, pass_due=run_pass):
+                exit_reason = _exit_reason = "operator_stop_drained"
+                break
 
             if not run_pass:
                 snapshot = new_snapshot
@@ -2972,17 +3062,24 @@ def run_fleet_supervise(
             # Self-deploy before running the pass: FF-pull origin/main and sync
             # dependencies when pyproject.toml/uv.lock changed.  Non-fatal on a
             # diverged or dirty tree.
-            deploy = self_deploy(
-                orchestrator_root(),
-                state_root=state_root,
-                fleet_dir_override=fleet_dir_override,
-                dry_run=dry_run,
-                failure_alarm_threshold=cfg.self_deploy_failure_alarm,
-                pull_ci_fleet=cfg.self_deploy_pull_ci_fleet,
+            # Issue #1716: skipped while draining — a head-moved restart exit
+            # here would split the drain across watchdog ticks for no benefit
+            # (the wrapper refuses to relaunch under a pending stop marker).
+            deploy = (
+                self_deploy(
+                    orchestrator_root(),
+                    state_root=state_root,
+                    fleet_dir_override=fleet_dir_override,
+                    dry_run=dry_run,
+                    failure_alarm_threshold=cfg.self_deploy_failure_alarm,
+                    pull_ci_fleet=cfg.self_deploy_pull_ci_fleet,
+                    starvation_seconds=cfg.dependency_sync_starvation_seconds,
+                )
+                if not drain_state.draining
+                else None
             )
-            notify_config = getattr(global_config, "notify", None)
             notify_enabled = notify_config is not None and getattr(notify_config, "enabled", False)
-            if not deploy.ok:
+            if deploy is not None and not deploy.ok:
                 print(
                     f"[{now_str}] self-deploy skipped: {deploy.error}",
                     flush=True,
@@ -2997,9 +3094,9 @@ def run_fleet_supervise(
                         pid=None,
                     )
                     _emit_fleet_transition(notify_config, entry, fleet_dir_override)
-            elif deploy.previewed:
+            elif deploy is not None and deploy.previewed:
                 print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
-            else:
+            elif deploy is not None:
                 # Real (non-previewed) success. Console output is unchanged from
                 # before this fix -- print only on the previously-notable
                 # outcomes -- but the notify digest gets a health-OK entry
@@ -3014,6 +3111,18 @@ def run_fleet_supervise(
                 # (34/34 tracked keys were latched this way).
                 if deploy.synced or deploy.venv_repaired:
                     print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
+                # Issue #1855: a pending sync starved past
+                # ``dependency_sync_starvation_seconds`` takes the drain
+                # posture below -- fleet_loop launches nothing new while the
+                # reap/review/merge lanes keep running -- so live workers can
+                # finish and the deferred ``uv sync`` can finally land.
+                if deploy.starved:
+                    print(
+                        f"[{now_str}] self-deploy: {deploy.message}; starvation "
+                        "bound reached -- suppressing new dispatch until the "
+                        "fleet is idle",
+                        flush=True,
+                    )
                 if notify_enabled:
                     entry = AttentionEntry(
                         issue_number=-1,
@@ -3043,9 +3152,16 @@ def run_fleet_supervise(
             # the next process resumes from exactly where this one left off.
             # Bind the shas to locals so the non-None guard survives into the
             # message below; folding the check into a bool() loses it.
-            from_sha = deploy.from_sha
-            to_sha = deploy.to_sha
-            if deploy.ok and deploy.pulled and from_sha and to_sha and deploy.head_changed:
+            from_sha = deploy.from_sha if deploy is not None else None
+            to_sha = deploy.to_sha if deploy is not None else None
+            if (
+                deploy is not None
+                and deploy.ok
+                and deploy.pulled
+                and from_sha
+                and to_sha
+                and deploy.head_changed
+            ):
                 print(
                     f"[{now_str}] self-deploy: HEAD moved {from_sha[:12]} -> "
                     f"{to_sha[:12]}; exiting for watchdog restart to pick up new code",
@@ -3078,7 +3194,11 @@ def run_fleet_supervise(
             # after an operator pulled origin/main while the daemon was
             # already running — self_deploy saw "already up to date" every
             # pass because HEAD was already at the new commit).
-            current_head = read_head_sha(orchestrator_root())
+            # Issue #1716: skipped while draining — same reasoning as the
+            # self-deploy skip above.
+            current_head = (
+                startup_head if drain_state.draining else read_head_sha(orchestrator_root())
+            )
             if startup_head and current_head and current_head != startup_head:
                 print(
                     f"[{now_str}] HEAD drift detected: startup={startup_head[:12]} "
@@ -3117,6 +3237,12 @@ def run_fleet_supervise(
                 # Issue #1339: ensure LabelConfig-derived labels exist on each
                 # repo on the first pass only (once per supervisor startup).
                 ensure_labels=labels_ensure_pending,
+                # Issue #1716: a drain pass still runs reap/verdict/review/
+                # merge lanes but dispatches nothing new.
+                # Issue #1855: same posture while a pending sync is starved --
+                # derived per-pass from the marker's age (not latched), so it
+                # lifts automatically the pass the sync finally lands.
+                drain=drain_state.draining or (deploy is not None and deploy.starved),
                 # Issue #1832: cooperative in-pass deadline, enforced from the
                 # same SupervisorConfig field the external wedge-kill
                 # watchdog's stale bound derives from (3x this), and the same
@@ -3230,6 +3356,12 @@ def run_fleet_supervise(
             # side-effect writes (new session sidecars, verdict files, etc.)
             # show up as a "delta" on the very next poll.
             snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
+
+            # Issue #1716: drain completion is checked post-pass too — the
+            # due pass above adopted the last worker's outcome.
+            if drain_state.drain_complete_if_empty(fleet_dir_override, snapshot):
+                exit_reason = _exit_reason = "operator_stop_drained"
+                break
 
             sleep(
                 float(
@@ -3482,6 +3614,7 @@ def run_fleet_supervise_loop(
     on_cap_reached: Callable[[SuperviseLoopResult], None] | None = None,
     wedge_watchdog_factory: Callable[[subprocess.Popen[Any]], WedgeWatchdog | None]
     | object = _USE_DEFAULT_WATCHDOG,
+    fleet_dir_override: str | None = None,
 ) -> CommandResult:
     """Run ``fleet supervise``, relaunching immediately on a restart request.
 
@@ -3503,6 +3636,11 @@ def run_fleet_supervise_loop(
     test-controlled heartbeat path. Only consulted when ``spawn`` is also left
     at its default — an injected ``spawn`` owns its own process lifecycle and
     is responsible for its own watchdog (if any).
+
+    ``fleet_dir_override`` scopes the operator stop-marker check (issue
+    #1716): a pending ``fleet-stop-request.json`` outranks a child's
+    restart request. Must match the fleet dir the child uses — production
+    passes the resolved ``--fleet-dir``, tests a tmp path.
     """
     args = tuple(supervise_args)
     watchdog_factory: Callable[[subprocess.Popen[Any]], WedgeWatchdog | None] | None
@@ -3514,14 +3652,18 @@ def run_fleet_supervise_loop(
     def _default_spawn(_launch_number: int) -> int:
         return _spawn_supervise_child(args, wedge_watchdog_factory=watchdog_factory)
 
-    result = run_supervise_relaunch_loop(
-        spawn if spawn is not None else _default_spawn,
-        max_relaunches=max_relaunches,
-        log=lambda message: print(message, flush=True),
-        on_cap_reached=(
-            on_cap_reached if on_cap_reached is not None else _record_supervise_loop_cap_event
-        ),
-    )
+    try:
+        result = run_supervise_relaunch_loop(
+            spawn if spawn is not None else _default_spawn,
+            max_relaunches=max_relaunches,
+            log=lambda message: print(message, flush=True),
+            on_cap_reached=(
+                on_cap_reached if on_cap_reached is not None else _record_supervise_loop_cap_event
+            ),
+            stop_requested=lambda: fleet_stop_pending(fleet_dir_override),
+        )
+    except KeyboardInterrupt:
+        return supervise_loop_interrupted_result()  # issue #1716
 
     # A cap is a *clean handoff*, not a failure: the wrapper deliberately gives
     # restart authority back to the 5-minute trigger rather than spinning. So the
@@ -3547,5 +3689,6 @@ def run_fleet_supervise_loop(
             "last_exit_code": result.last_exit_code,
             "cap_reached": result.cap_reached,
             "cap_cause": result.cap_cause,
+            "stop_requested": result.stop_requested,
         },
     )

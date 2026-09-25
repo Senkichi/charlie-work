@@ -27,6 +27,7 @@ import pytest
 from charlie_work import cli as cli_module
 from charlie_work.closing_keyword_gate import (
     UnexpectedClosingReference,
+    exclude_base_reachable_commits,
     find_unexpected_closing_references,
 )
 from charlie_work.config import OrchestratorConfig
@@ -215,6 +216,70 @@ def test_pr788_commit_message_also_flagged_when_target_is_unresolved() -> None:
     assert [finding.issue_number for finding in findings] == [649]
 
 
+# --- exclude_base_reachable_commits: stale recorded base.sha (issue #1872) ---
+#
+# The pulls/{n}/commits endpoint lists commits against the PR's *recorded*
+# base.sha, which lags live main after the head merges a newer main in. The
+# gate re-resolves the merge base against the live base ref and drops every
+# listed commit already reachable from it -- the foreign squash-merge commit
+# carrying another PR's `Closes #N` is exactly such a commit.
+
+
+def _commit(sha: str, message: str, parents: list[str]) -> dict:
+    return {
+        "sha": sha,
+        "commit": {"message": message},
+        "parents": [{"sha": parent} for parent in parents],
+    }
+
+
+def test_excludes_foreign_main_commits_reachable_from_merge_base() -> None:
+    # Recorded base.sha = m0 (stale); live main tip = m2. The PR head merged
+    # main in, so the endpoint lists [w1, merge, m2, m1] even though m1/m2
+    # contribute no diff to this PR. merge_base(main, head) = m2.
+    commits = [
+        _commit("w1", "fix: do the thing", ["m0"]),
+        _commit("merge", "Merge branch 'main' into agent/issue-x", ["w1", "m2"]),
+        _commit("m2", "feat: foreign pr\n\nCloses #999997", ["m1"]),
+        _commit("m1", "chore: earlier main commit", ["m0"]),
+    ]
+
+    kept = exclude_base_reachable_commits(commits, merge_base_sha="m2")
+
+    assert [c["sha"] for c in kept] == ["w1", "merge"]
+
+
+def test_merge_base_commit_itself_is_excluded_when_listed() -> None:
+    # The merge base is on the live base branch by definition, so a listed
+    # entry equal to it is foreign surface, not PR work.
+    commits = [_commit("w1", "fix: thing", ["mb"]), _commit("mb", "main tip", ["m0"])]
+
+    kept = exclude_base_reachable_commits(commits, merge_base_sha="mb")
+
+    assert [c["sha"] for c in kept] == ["w1"]
+
+
+def test_merge_base_absent_from_list_excludes_nothing() -> None:
+    # Recorded base already current: merge_base == recorded base, which is
+    # not in rev-list(base..head), so no commit is provably on the live base.
+    commits = [_commit("w1", "fix: thing", ["m0"])]
+
+    assert exclude_base_reachable_commits(commits, merge_base_sha="m0") == commits
+
+
+def test_commit_without_sha_or_parents_is_kept() -> None:
+    # Fail closed on unprovable ancestry: an entry whose payload lacks the
+    # fields needed to prove reachability is still scanned.
+    commits = [
+        {"commit": {"message": "wip"}},
+        _commit("m2", "feat: foreign\n\nCloses #999997", ["m1"]),
+    ]
+
+    kept = exclude_base_reachable_commits(commits, merge_base_sha="m2")
+
+    assert kept == [{"commit": {"message": "wip"}}]
+
+
 # --- GitHub.pr_commits: REST wrapper (not gh pr view --json commits) ---
 
 
@@ -258,11 +323,24 @@ class _FakeGitHubForCLI:
             "number": number,
             "body": "Fixes #999999",
             "headRefName": "agent/issue-999999-do-thing",
+            "baseRefName": "main",
+            "headRefOid": "headsha999992",
             "isCrossRepository": False,
         }
 
     def pr_commits(self, number: int):
-        return [{"commit": {"message": "fix: unrelated cleanup\n\nFixes #999997 as well"}}]
+        return [
+            _commit(
+                "c1",
+                "fix: unrelated cleanup\n\nFixes #999997 as well",
+                ["recordedbase"],
+            )
+        ]
+
+    def compare(self, base: str, head: str):
+        # Recorded base is already the live merge base (not a listed
+        # commit), so nothing is excludable -- the unfiltered surface.
+        return {"merge_base_commit": {"sha": "recordedbase"}}
 
 
 def _cli_args(pr: int) -> argparse.Namespace:
@@ -314,6 +392,92 @@ def test_cli_closing_keyword_check_reports_fetch_failure(monkeypatch, tmp_path) 
     assert "commits" in result.message
 
 
+def test_cli_closing_keyword_check_excludes_commits_already_on_live_base(
+    monkeypatch, tmp_path
+) -> None:
+    """Issue #1872 regression: a foreign `Closes #N` on a stale-base surface is not a finding.
+
+    The PR head merged a newer main in, so the recorded base.sha predates
+    main commits the merge carried (m1/m2, including another PR's squash
+    commit "Closes #999997"). The endpoint still lists them, but the merge
+    base against the LIVE base ref is m2, so they are excluded from the scan
+    and the gate is clean.
+    """
+
+    class FakeGitHubStaleBase(_FakeGitHubForCLI):
+        def pr_commits(self, number: int):
+            return [
+                _commit("w1", "fix: do the thing\n\nFixes #999999", ["recordedbase"]),
+                _commit(
+                    "merge", "Merge branch 'main' into agent/issue-999999-do-thing", ["w1", "m2"]
+                ),
+                _commit("m2", "feat: foreign pr (#1234)\n\nCloses #999997", ["m1"]),
+                _commit("m1", "chore: earlier main commit", ["recordedbase"]),
+            ]
+
+        def compare(self, base: str, head: str):
+            assert base == "main"
+            assert head == "headsha999992"
+            return {"merge_base_commit": {"sha": "m2"}, "base_commit": {"sha": "m2"}}
+
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
+    monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
+    monkeypatch.setattr(cli_module, "GitHub", FakeGitHubStaleBase)
+
+    result = cli_module.run_closing_keyword_check_command(_cli_args(999992))
+
+    assert result.ok is True, result.message
+    assert result.data["findings"] == []
+    assert result.data["excluded_base_reachable_count"] == 2
+
+
+def test_cli_closing_keyword_check_still_flags_pr_owned_commit_after_filter(
+    monkeypatch, tmp_path
+) -> None:
+    """The live-base exclusion must not swallow commits that ARE this PR's work."""
+
+    class FakeGitHubStaleBaseOffTarget(_FakeGitHubForCLI):
+        def pr_commits(self, number: int):
+            return [
+                _commit("w1", "fix: thing\n\nFixes #999997 as well", ["m2"]),
+                _commit("m2", "feat: foreign pr\n\nCloses #999998", ["m1"]),
+            ]
+
+        def compare(self, base: str, head: str):
+            return {"merge_base_commit": {"sha": "m2"}}
+
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
+    monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
+    monkeypatch.setattr(cli_module, "GitHub", FakeGitHubStaleBaseOffTarget)
+
+    result = cli_module.run_closing_keyword_check_command(_cli_args(999992))
+
+    # w1 (this PR's own commit) is kept and still flagged; the foreign m2
+    # entry is excluded before scanning, so only the 999997 finding remains.
+    assert result.ok is False
+    assert result.data["findings"] == [
+        {"issue_number": 999997, "source": "commit #1", "matched_text": "Fixes #999997"}
+    ]
+    assert result.data["excluded_base_reachable_count"] == 1
+
+
+def test_cli_closing_keyword_check_fails_closed_when_merge_base_unresolvable(
+    monkeypatch, tmp_path
+) -> None:
+    class FakeGitHubNoCompare(_FakeGitHubForCLI):
+        def compare(self, base: str, head: str):
+            return None
+
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit, **kw: tmp_path)
+    monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
+    monkeypatch.setattr(cli_module, "GitHub", FakeGitHubNoCompare)
+
+    result = cli_module.run_closing_keyword_check_command(_cli_args(999992))
+
+    assert result.ok is False
+    assert "merge base" in result.message
+
+
 # --- Regression: CI failure on run 30609781476 (statusCheckRollup) ---
 #
 # `_FakeGitHubForCLI` above stubs `GitHub.pr_view` entirely and returns every
@@ -338,7 +502,17 @@ def test_closing_keyword_pr_fields_excludes_statuscheckrollup() -> None:
     # this issue is about.
     requested = set(CLOSING_KEYWORD_PR_FIELDS.split(","))
     assert "statusCheckRollup" not in requested
-    assert requested == {"title", "body", "headRefName", "isCrossRepository"}
+    # baseRefName/headRefOid (issue #1872) are scalar fields the gate needs to
+    # re-resolve the merge base against the live base ref -- they carry no
+    # nested-connection scope risk of the statusCheckRollup kind.
+    assert requested == {
+        "title",
+        "body",
+        "headRefName",
+        "baseRefName",
+        "headRefOid",
+        "isCrossRepository",
+    }
 
 
 def test_cli_closing_keyword_check_queries_narrow_pr_view_fields_end_to_end(
@@ -353,7 +527,14 @@ def test_cli_closing_keyword_check_queries_narrow_pr_view_fields_end_to_end(
             # inspects the actual `gh pr view --json <fields>` argv the CLI
             # builds, the same argv `gh` itself would reject the
             # statusCheckRollup portion of under a restricted Actions token.
-            assert fields == {"title", "body", "headRefName", "isCrossRepository"}, (
+            assert fields == {
+                "title",
+                "body",
+                "headRefName",
+                "baseRefName",
+                "headRefOid",
+                "isCrossRepository",
+            }, (
                 "closing-keyword-check must query CLOSING_KEYWORD_PR_FIELDS only -- "
                 f"got {sorted(fields)}, which would re-trigger the statusCheckRollup "
                 "GraphQL failure from run 30609781476"
@@ -362,10 +543,20 @@ def test_cli_closing_keyword_check_queries_narrow_pr_view_fields_end_to_end(
                 "title": "",
                 "body": "Fixes #999999",
                 "headRefName": "agent/issue-999999-do-thing",
+                "baseRefName": "main",
+                "headRefOid": "headsha999992",
                 "isCrossRepository": False,
             }
-        if args[:1] == ["api"]:
-            return [{"commit": {"message": "fix: unrelated cleanup\n\nFixes #999997 as well"}}]
+        if args[:1] == ["api"] and "pulls/999992/commits" in args[1]:
+            return [
+                _commit(
+                    "c1",
+                    "fix: unrelated cleanup\n\nFixes #999997 as well",
+                    ["recordedbase"],
+                )
+            ]
+        if args[:1] == ["api"] and "/compare/" in args[1]:
+            return {"merge_base_commit": {"sha": "recordedbase"}}
         raise AssertionError(f"unexpected gh invocation in this test: {args}")
 
     monkeypatch.setattr(GitHub, "run", fake_run)

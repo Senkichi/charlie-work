@@ -1,0 +1,8 @@
+1
+# Issue #1716: +1 log_event call in write_fleet_stop_request recording the
+# fleet-level fleet_stop_requested audit event for every marker write.
+# fleet_stop.py is fleet-scope plumbing with no OrchestratorApp/WriteGate
+# instance in scope (that is a per-repo concept); fleet-level audit events
+# elsewhere (fleet_dispatch.py's 11) use the same raw
+# log_event(supervisor_heartbeat_path(...), repo="fleet") shape. Same class
+# as the pre-existing out-of-wave sites — the ratchet holds at the new count.

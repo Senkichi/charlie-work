@@ -12,7 +12,10 @@ from typing import Any
 import yaml
 
 from . import CLI_NAME
-from .closing_keyword_gate import find_unexpected_closing_references
+from .closing_keyword_gate_command import (
+    register_closing_keyword_check_subparser,
+    run_closing_keyword_check_command,
+)
 from .mojibake_gate import find_mojibake_in_diff
 from .ast_equivalence_gate_command import (
     register_ast_equivalence_check_subparser,
@@ -50,27 +53,31 @@ from .supervise_loop import (
 )
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
+from .fleet_stop import register_fleet_stop_subparser, run_fleet_stop
 from .global_config import load_layered_config
 from .github import (
-    CLOSING_KEYWORD_PR_FIELDS,
     GitHub,
     GitHubError,
     GitHubLike,
-    defang_closing_keywords,
 )
-from .issue_linking import linked_issue_number
 from .local_issues import github_client_for
 from . import layout
 from .dirty_tree import check_working_tree_clean
 from .logging_setup import configure_logging
 from .instrumentation import query_events
 from .notify import AttentionDigest, AttentionEntry, emit_digest
+from .notify_freshness import resolve_fleet_notify
 from .paths import RepoNotFoundError, RuntimePaths, find_repo_root, resolved_layout, runtime_paths
 from .quiesce import check_quiescence
 from .state import StateLockBusy, load_state_locked, utc_now
 from .subprocess_runner import run_captured
 from .state_migration import apply_state_dir_migration, gather_migration_inputs
-from .supervise import orchestrator_root, self_deploy, supervisor_runtime_paths
+from .supervise import (
+    DEFAULT_SYNC_STARVATION_SECONDS,
+    orchestrator_root,
+    self_deploy,
+    supervisor_runtime_paths,
+)
 from ci_fleet.charlie_work_adapter import (
     CLI_ALLOCATION_SOURCE,
     UNATTENDED_ALLOCATION_SOURCE,
@@ -458,6 +465,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # Issue #1716: parser wiring lives in fleet_stop.py (cli.py is at its
+    # file-size ratchet mark) — same register_*_subparser convention as the
+    # *_command modules below.
+    register_fleet_stop_subparser(fleet_sub)
+
     runners = subparsers.add_parser("runners")
     runners_sub = runners.add_subparsers(dest="runners_command", required=True)
     runners_sub.add_parser("status")
@@ -518,18 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
     worktree_clean_parser = subparsers.add_parser("worktree-clean")
     _add_dry_run(worktree_clean_parser)
 
-    closing_keyword_check = subparsers.add_parser(
-        "closing-keyword-check",
-        help=(
-            "CI gate (issue #790): fail if the PR body or any commit message "
-            "contains an unnegated closing keyword (Closes/Fixes/Resolves #N) "
-            "referencing an issue other than this PR's own declared target. "
-            "GitHub's native auto-close-on-merge scans both surfaces with no "
-            "negation awareness at all; this is a required PR check, not a "
-            "label-transition helper."
-        ),
-    )
-    closing_keyword_check.add_argument("--pr", type=int, required=True)
+    register_closing_keyword_check_subparser(subparsers)
 
     mojibake_check = subparsers.add_parser(
         "mojibake-check",
@@ -925,103 +926,6 @@ def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
     return CommandResult(result.ok, result.message, result.data)
 
 
-def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult:
-    """CI gate (issue #790): fail on any unnegated closing keyword pointing off-target.
-
-    Fetches the PR's title/body/branch (`GitHub.pr_view`, deliberately scoped
-    to `CLOSING_KEYWORD_PR_FIELDS` rather than the general-purpose
-    `PR_VIEW_FIELDS` — this gate never touches CI/review/label state, and
-    `PR_VIEW_FIELDS`'s `statusCheckRollup` triggers a nested GraphQL
-    connection the default Actions `GITHUB_TOKEN` cannot read without
-    additional scope grants; see `CLOSING_KEYWORD_PR_FIELDS`'s docstring for
-    the two live failures this caused) and every commit's raw message
-    (`GitHub.pr_commits` — the REST endpoint, not `gh pr view --json commits`, whose GraphQL fields
-    truncate/corrupt long commit messages; see `GitHub.pr_commits`'s
-    docstring). The PR's own declared target issue is resolved the same way
-    charlie-work's own label-transition binding resolves it
-    (`linked_issue_number`: same-repo branch-prefix first, then an unnegated
-    closing keyword in the PR's own title/body) — that single number is the
-    only exemption `find_unexpected_closing_references` allows. Everything
-    else it finds is a reference GitHub's native auto-close-on-merge will act
-    on regardless of what this codebase intends, because that GitHub feature
-    scans PR body + every commit message with no negation awareness (issue
-    #790; PR #788's own commit text is the regression fixture proving this).
-    """
-    ctx = bootstrap_command(args)
-
-    pr = ctx.gh.pr_view(args.pr, fields=CLOSING_KEYWORD_PR_FIELDS)
-    if not pr:
-        return CommandResult(False, f"closing-keyword-check: could not fetch PR #{args.pr}", {})
-
-    commits = ctx.gh.pr_commits(args.pr)
-    if commits is None:
-        return CommandResult(
-            False, f"closing-keyword-check: could not fetch commits for PR #{args.pr}", {}
-        )
-    commit_messages = [str((c.get("commit") or {}).get("message") or "") for c in commits]
-
-    # Issue #1229 scoping decision: this call site is deliberately NOT
-    # threaded through branch_issue_validator. ``intended`` is the single
-    # issue number ``find_unexpected_closing_references`` exempts from its
-    # unexpected-closing-reference scan; it is a diagnostic/reporting value
-    # (surfaced as ``intended_issue_number`` in the command's JSON output),
-    # not a key for any issue-label transition or state write. A stale
-    # branch-name binding would set ``intended`` to the wrong number, causing
-    # the real intended issue's closing keyword to be flagged as an
-    # unexpected reference -- a conservative false-positive failure direction
-    # (the check blocks rather than corrupts), and one an operator can
-    # resolve by rewording the PR body. Threading the validator would also
-    # add an ``issue_list(state="open")`` call to a one-shot CLI command that
-    # otherwise makes only the two ``pr_view``/``pr_commits`` calls above.
-    intended = linked_issue_number(
-        pr,
-        is_cross_repository=pr.get("isCrossRepository"),
-        branch_prefix=ctx.config.dispatch.branch_prefix,
-    )
-
-    findings = find_unexpected_closing_references(
-        pr_body=str(pr.get("body") or ""),
-        commit_messages=commit_messages,
-        intended_issue_number=intended,
-    )
-
-    data = {
-        "pr": args.pr,
-        "intended_issue_number": intended,
-        "findings": [
-            {
-                "issue_number": finding.issue_number,
-                "source": finding.source,
-                "matched_text": finding.matched_text,
-            }
-            for finding in findings
-        ],
-    }
-
-    if findings:
-        lines = [
-            f"  issue #{finding.issue_number} via {finding.source}: "
-            f"{finding.matched_text!r} -> reword to {defang_closing_keywords(finding.matched_text)!r}"
-            for finding in findings
-        ]
-        message = (
-            f"closing-keyword-check: {len(findings)} unexpected closing reference(s) on "
-            f"PR #{args.pr} (declared target: "
-            f"{'#' + str(intended) if intended is not None else 'none resolved'})\n"
-            + "\n".join(lines)
-            + "\nGitHub will auto-close these issues on merge unless the wording above is "
-            "changed to the suggested rewrite (or the reference is dropped entirely)."
-        )
-        return CommandResult(False, message, data)
-
-    return CommandResult(
-        True,
-        f"closing-keyword-check: clean (PR #{args.pr}, declared target: "
-        f"{'#' + str(intended) if intended is not None else 'none resolved'})",
-        data,
-    )
-
-
 def run_mojibake_check_command(args: argparse.Namespace) -> CommandResult:
     """CI gate (issue #1057): fail if the diff introduces mojibake.
 
@@ -1399,6 +1303,14 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # The supervisor's own bookkeeping root is resolved via the dedicated
     # helper, which binds the phantom-state-dir opt-out (issue #1754).
     state_root = supervisor_runtime_paths(state_dir).root
+    # Issue #1899: resolve the notify.file_path "" sentinel against the same
+    # bookkeeping root the supervisor uses, so the self-deploy digests below
+    # land at the path the supervisor's notify_resolution event publishes
+    # rather than failing "file_path is empty" under the documented default.
+    notify_config = resolve_fleet_notify(
+        getattr(global_config, "notify", None) if global_config else None,
+        state_root,
+    )
     deploy = self_deploy(
         orchestrator_root(),
         state_root=state_root,
@@ -1409,10 +1321,14 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
             if global_config is not None
             else False
         ),
+        starvation_seconds=(
+            global_config.supervisor.dependency_sync_starvation_seconds
+            if global_config is not None
+            else DEFAULT_SYNC_STARVATION_SECONDS
+        ),
     )
     if not deploy.ok:
         print(f"self-deploy skipped: {deploy.error}", flush=True)
-        notify_config = getattr(global_config, "notify", None) if global_config else None
         if (
             deploy.alertable
             and notify_config is not None
@@ -1439,7 +1355,6 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         print(f"self-deploy: {deploy.message}", flush=True)
     elif deploy.venv_repaired:
         print(f"self-deploy: {deploy.message}", flush=True)
-        notify_config = getattr(global_config, "notify", None) if global_config else None
         if notify_config is not None and getattr(notify_config, "enabled", False):
             attention_digest = AttentionDigest(
                 generated_at=utc_now(),
@@ -1456,6 +1371,15 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
                 ),
             )
             emit_digest(notify_config, attention_digest)
+    elif deploy.starved:
+        # Issue #1855: a pending dependency sync starved past its bound —
+        # this pass launches nothing new so live workers can drain to zero
+        # and the sync can land (same posture as `fleet stop --drain`).
+        print(
+            f"self-deploy: {deploy.message} -- starvation bound reached; "
+            "dispatch suppressed this pass",
+            flush=True,
+        )
 
     return fleet_loop(
         fleet_dir_override=args.fleet_dir,
@@ -1465,6 +1389,7 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         merge=args.merge,
         dry_run=args.dry_run,
         work_only=False,
+        drain=deploy.starved,
     )
 
 
@@ -2701,7 +2626,10 @@ def main(argv: list[str] | None = None) -> int:
                 result = run_fleet_supervise_loop(
                     supervise_args=tuple(args.supervise_args),
                     max_relaunches=args.max_relaunches,
+                    fleet_dir_override=args.fleet_dir,
                 )
+            elif args.fleet_command == "stop":
+                result = run_fleet_stop(args)
             else:
                 result = CommandResult(False, f"unknown fleet command: {args.fleet_command}", {})
         elif args.command == "runners":

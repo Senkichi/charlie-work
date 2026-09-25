@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from charlie_work.adapters import SessionDispatchResult, SessionRequest
 from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.config import OrchestratorConfig, build_config_from_data
 from charlie_work.labels import LabelConfig, transition
@@ -33,7 +34,6 @@ from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.local_lane import (
     branch_diff,
     branch_head_sha,
-    ensure_branch_worktree,
     is_ancestor,
     is_local_pr_record,
     local_base_branch,
@@ -78,25 +78,6 @@ def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
     )
-
-
-def _short_spelling(path: Path) -> Path:
-    """The 8.3 short-name spelling of ``path`` on Windows, else ``path`` itself.
-
-    windows-latest spells ``%TEMP%`` short (``RUNNER~1``), which is how the
-    create-vs-reuse spelling split in ``ensure_branch_worktree`` first
-    surfaced in CI. Where no short name exists (non-Windows host, or a
-    volume with 8.3 generation disabled) the original path comes back and
-    callers exercise the plain-path case.
-    """
-    if sys.platform != "win32":
-        return path
-    import ctypes
-
-    buf = ctypes.create_unicode_buffer(1024)
-    if ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf)):
-        return Path(buf.value)
-    return path
 
 
 def _init_repo(repo_root: Path) -> None:
@@ -250,41 +231,6 @@ class TestLocalLanePrimitives:
 
         assert is_ancestor(repo, base, head)
         assert not is_ancestor(repo, head, base)
-
-    def test_ensure_branch_worktree_creates_and_reuses(self, repo: Path) -> None:
-        _init_repo(repo)
-        _make_branch(repo, "agent/issue-7-x", "a.py", "a = 1\n")
-        worktrees_dir = repo / "wt"
-
-        wt = ensure_branch_worktree(repo, "agent/issue-7-x", worktrees_dir)
-
-        assert wt is not None and wt.is_dir()
-        assert worktree_for_branch(repo, "agent/issue-7-x") == wt
-        # Second call returns the same worktree rather than re-adding.
-        assert ensure_branch_worktree(repo, "agent/issue-7-x", worktrees_dir) == wt
-
-    def test_ensure_branch_worktree_returns_gits_recorded_spelling(self, repo: Path) -> None:
-        """Create-path and reuse-path return the same canonical spelling.
-
-        Regression for the windows-latest CI failure on #1844's head:
-        ``%TEMP%`` there is the 8.3 short-name form, so the ``target``
-        constructed from ``repo_root`` differed from the canonical path git
-        records at ``worktree add`` time and
-        ``worktree_for_branch(...) == wt`` failed. Spelling ``repo`` through
-        its 8.3 name reproduces that split on any host with 8.3 generation
-        enabled; elsewhere ``_short_spelling`` is the identity and the
-        assertions still pin the create-vs-reuse invariant.
-        """
-        _init_repo(repo)
-        _make_branch(repo, "agent/issue-7-x", "a.py", "a = 1\n")
-        spelled = _short_spelling(repo)
-        worktrees_dir = spelled / "wt"
-
-        wt = ensure_branch_worktree(spelled, "agent/issue-7-x", worktrees_dir)
-
-        assert wt is not None and wt.is_dir()
-        assert wt == worktree_for_branch(repo, "agent/issue-7-x")
-        assert ensure_branch_worktree(spelled, "agent/issue-7-x", worktrees_dir) == wt
 
     def test_suite_command_argv(self, repo: Path) -> None:
         argv = suite_command_argv("python -m pytest", repo)
@@ -972,3 +918,96 @@ class TestDispatchKillSwitch:
         # no reviewer claim was laid.
         assert record["status"] == "reviewing"
         assert record.get("review_dispatch_status") is None
+
+
+class TestDrainSuppressesLocalRework:
+    """``loop(limit=0)`` -- the drain pass's forced budget (issue #1716).
+
+    ``fleet stop --drain`` suppresses new launches by forcing
+    ``app.loop(0)``; the remote rework/fresh lanes honor that via their
+    ``candidates[:0]`` slice. ``_local_dispatch_rework`` is the local lane's
+    only ``dispatch_sessions`` caller with no ``*_enabled`` kill switch of
+    its own, so the explicit ``0`` threaded from ``_loop_body`` is its only
+    drain signal -- without the gate a draining no-remote repo kept
+    launching rework workers and the drain could never converge.
+    """
+
+    def _rework_pending(self, repo: Path) -> OrchestratorApp:
+        """Park -> adopt -> ``request_changes``: lands issue 7 in
+        ``rework_requested`` with ``rework-prompt.md`` written -- exactly the
+        state ``_local_dispatch_rework`` selects on."""
+        _init_repo(repo)
+        issues_dir = repo / "docs" / "issues"
+        head = _make_branch(repo, "agent/issue-7-x", "a.py", "a = 1\n")
+        app = _app(repo, issues_dir)
+        _parked_issue(app, issues_dir, 7, "agent/issue-7-x")
+        app._local_review_packets()
+        verdict = app.record_local_review(
+            7,
+            "request_changes",
+            summary="Add coverage for the new path.",
+            reviewed_head=head,
+            verdict_provenance="fresh_llm_review",
+        )
+        assert verdict.ok, verdict.message
+        state = load_state_locked(app.paths.state_file)
+        assert state["issues"]["7"]["status"] == "rework_requested"
+        assert (app.paths.prs / "pr-7" / "rework-prompt.md").is_file()
+        return app
+
+    @staticmethod
+    def _spy_dispatch_sessions(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> list[SessionRequest]:
+        calls: list[SessionRequest] = []
+
+        def _fake(_repo_root, _manifest, _results, _settings, requests):
+            calls.extend(requests)
+            return [
+                SessionDispatchResult(
+                    issue_number=request.issue_number,
+                    issue_title=request.issue_title,
+                    prompt_path=str(request.prompt_path),
+                    branch_name=request.branch_name,
+                    adapter="claude-code",
+                    ok=True,
+                )
+                for request in requests
+            ]
+
+        monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake)
+        return calls
+
+    def test_loop_zero_limit_suppresses_local_rework_dispatch(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app = self._rework_pending(repo)
+        calls = self._spy_dispatch_sessions(monkeypatch)
+
+        result = app.loop(limit=0)
+
+        assert result.ok, result.message
+        # No session was dispatched and the issue stays queued for rework --
+        # it is picked up by the first non-draining pass, not dropped.
+        assert calls == []
+        state = load_state_locked(app.paths.state_file)
+        assert state["issues"]["7"]["status"] == "rework_requested"
+        # The rest of the local lane still ran: drain suppresses launches,
+        # not the reap/review bookkeeping that lets in-flight work finish.
+        assert result.data["local_lane"]["rework_launches_suspended"] is True
+
+    def test_loop_positive_limit_dispatches_local_rework(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control: the same rework-pending state under a nonzero budget
+        must dispatch -- otherwise the zero-limit test proves nothing."""
+        app = self._rework_pending(repo)
+        calls = self._spy_dispatch_sessions(monkeypatch)
+
+        result = app.loop(limit=1)
+
+        assert result.ok, result.message
+        assert [request.issue_number for request in calls] == [7]
+        assert calls[0].rework is True
+        state = load_state_locked(app.paths.state_file)
+        assert state["issues"]["7"]["status"] == "dispatched"

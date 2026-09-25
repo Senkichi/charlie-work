@@ -50,7 +50,7 @@ from .subprocess_runner import no_console_window_kwargs
 _MAX_CHAIN_DEPTH = 4096
 
 # Timeout for one PowerShell process-snapshot attempt. Generous relative to
-# `process_utils.sweep_orphan_processes`'s 10s because this queries every
+# `orphan_sweep.sweep_orphan_processes`'s 10s because this queries every
 # process on the host, not a CommandLine-filtered subset. The original 15s
 # budget was empirically too tight: the hosted-CI Tests job on PR #1805
 # timed out under pytest-xdist load. 60s matches `_DEFAULT_TIMEOUT_SECONDS`
@@ -284,7 +284,7 @@ def list_processes() -> tuple[Sequence[ProcessInfo], str | None]:
     """Snapshot every OS process via ``Win32_Process`` (Windows only).
 
     Built on the same PowerShell invocation style as
-    ``process_utils.sweep_orphan_processes``/``_enumerate_child_pids``:
+    ``orphan_sweep.sweep_orphan_processes``/``process_utils._enumerate_child_pids``:
     ``Get-CimInstance Win32_Process`` piped through ``ConvertTo-Json``, no
     ``psutil`` dependency (that module deliberately avoids one; see its
     docstrings). Returns ``(processes, error)`` instead of raising — a
