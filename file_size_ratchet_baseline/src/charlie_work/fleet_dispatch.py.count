@@ -1,1 +1,8 @@
-3600
+3800
+# Issue #1716: merging main's #1836 in-pass-deadline work into the
+# stop/drain branch puts the merged fleet_dispatch.py at 3616 lines --
+# past the 3600 mark (main: 3549; this branch's drain wiring: +67).
+# The extractable control plane already lives in fleet_stop.py per the
+# round-1 review; the remainder is supervisor-loop wiring that cannot
+# move without restructuring the loop. Raised to the next MARK_QUANTUM
+# multiple per the ratchet's hand-raise rule.

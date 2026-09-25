@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from charlie_work.adapters import SessionDispatchResult, SessionRequest
 from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.config import OrchestratorConfig, build_config_from_data
 from charlie_work.labels import LabelConfig, transition
@@ -972,3 +973,96 @@ class TestDispatchKillSwitch:
         # no reviewer claim was laid.
         assert record["status"] == "reviewing"
         assert record.get("review_dispatch_status") is None
+
+
+class TestDrainSuppressesLocalRework:
+    """``loop(limit=0)`` -- the drain pass's forced budget (issue #1716).
+
+    ``fleet stop --drain`` suppresses new launches by forcing
+    ``app.loop(0)``; the remote rework/fresh lanes honor that via their
+    ``candidates[:0]`` slice. ``_local_dispatch_rework`` is the local lane's
+    only ``dispatch_sessions`` caller with no ``*_enabled`` kill switch of
+    its own, so the explicit ``0`` threaded from ``_loop_body`` is its only
+    drain signal -- without the gate a draining no-remote repo kept
+    launching rework workers and the drain could never converge.
+    """
+
+    def _rework_pending(self, repo: Path) -> OrchestratorApp:
+        """Park -> adopt -> ``request_changes``: lands issue 7 in
+        ``rework_requested`` with ``rework-prompt.md`` written -- exactly the
+        state ``_local_dispatch_rework`` selects on."""
+        _init_repo(repo)
+        issues_dir = repo / "docs" / "issues"
+        head = _make_branch(repo, "agent/issue-7-x", "a.py", "a = 1\n")
+        app = _app(repo, issues_dir)
+        _parked_issue(app, issues_dir, 7, "agent/issue-7-x")
+        app._local_review_packets()
+        verdict = app.record_local_review(
+            7,
+            "request_changes",
+            summary="Add coverage for the new path.",
+            reviewed_head=head,
+            verdict_provenance="fresh_llm_review",
+        )
+        assert verdict.ok, verdict.message
+        state = load_state_locked(app.paths.state_file)
+        assert state["issues"]["7"]["status"] == "rework_requested"
+        assert (app.paths.prs / "pr-7" / "rework-prompt.md").is_file()
+        return app
+
+    @staticmethod
+    def _spy_dispatch_sessions(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> list[SessionRequest]:
+        calls: list[SessionRequest] = []
+
+        def _fake(_repo_root, _manifest, _results, _settings, requests):
+            calls.extend(requests)
+            return [
+                SessionDispatchResult(
+                    issue_number=request.issue_number,
+                    issue_title=request.issue_title,
+                    prompt_path=str(request.prompt_path),
+                    branch_name=request.branch_name,
+                    adapter="claude-code",
+                    ok=True,
+                )
+                for request in requests
+            ]
+
+        monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake)
+        return calls
+
+    def test_loop_zero_limit_suppresses_local_rework_dispatch(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app = self._rework_pending(repo)
+        calls = self._spy_dispatch_sessions(monkeypatch)
+
+        result = app.loop(limit=0)
+
+        assert result.ok, result.message
+        # No session was dispatched and the issue stays queued for rework --
+        # it is picked up by the first non-draining pass, not dropped.
+        assert calls == []
+        state = load_state_locked(app.paths.state_file)
+        assert state["issues"]["7"]["status"] == "rework_requested"
+        # The rest of the local lane still ran: drain suppresses launches,
+        # not the reap/review bookkeeping that lets in-flight work finish.
+        assert result.data["local_lane"]["rework_launches_suspended"] is True
+
+    def test_loop_positive_limit_dispatches_local_rework(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control: the same rework-pending state under a nonzero budget
+        must dispatch -- otherwise the zero-limit test proves nothing."""
+        app = self._rework_pending(repo)
+        calls = self._spy_dispatch_sessions(monkeypatch)
+
+        result = app.loop(limit=1)
+
+        assert result.ok, result.message
+        assert [request.issue_number for request in calls] == [7]
+        assert calls[0].rework is True
+        state = load_state_locked(app.paths.state_file)
+        assert state["issues"]["7"]["status"] == "dispatched"
