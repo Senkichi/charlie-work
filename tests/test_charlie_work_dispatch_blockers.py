@@ -21,6 +21,7 @@ from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # no
 from _fakes_github import FakeGitHub
 from charlie_work.config import (
     DevinConfig,
+    DispatchConfig,
     OrchestratorConfig,
 )
 from charlie_work.paths import runtime_paths
@@ -334,7 +335,15 @@ def test_dispatch_handles_cyclic_dependency_declaration(tmp_path: Path) -> None:
 
 def test_dispatch_handles_missing_created_at(tmp_path: Path) -> None:
     """Test that dispatch handles missing createdAt field, sorting last per issue #152."""
-    config = OrchestratorConfig()
+    config = OrchestratorConfig(
+        # Issue #1903: the default-on tree-headroom cap (cpu_count//2) would
+        # clamp this 3-wide dispatch on small hosts -- pin both host-load
+        # knobs to 0 so the createdAt sort order is the only thing tested.
+        dispatch=DispatchConfig(
+            host_load_max_pytest_processes=0,
+            host_load_max_pytest_trees=0,
+        )
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     # Create fake GitHub with issues, some missing createdAt

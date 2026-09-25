@@ -24,13 +24,22 @@ worker processes (``python -u -c ...``, no ``pytest`` token of their own) get
 counted. Nested pytest invocations inside an outer tree count once -- the
 outer tree is the suite.
 
+The governor consumes both numbers (issue #1903): the tree count feeds the
+primary clamp (``dispatch.host_load_max_pytest_trees``, applied as
+remaining-suite headroom, since one launch ≈ one new suite), while the
+process count is the fan-out brake
+(``dispatch.host_load_max_pytest_processes`` -- catches a single suite run
+at pathological ``-n`` width that a tree count cannot see).
+
 The issue offered either signal -- host CPU saturation or live pytest
 process-tree count. This implements the process-tree count: it measures
 exactly the load class dispatch is about to add to (test suites), it is the
 same quantity the incident report counted, and unlike an instantaneous CPU%
 sample it cannot be fooled by a brief compile spike into deferring a launch
-the box could have absorbed. A CPU term can be added beside it later if
-non-test host load ever needs to gate dispatch too.
+the box could have absorbed. (#1903 later confirmed the tree count was the
+right signal: the original raw-process threshold was the part that
+miscalibrated.) A CPU term can be added beside it later if non-test host
+load ever needs to gate dispatch too.
 
 Fail-open discipline
 ---------------------
@@ -91,10 +100,11 @@ class HostLoad:
     """One host-wide measurement of live pytest process-tree load.
 
     ``pytest_tree_count`` is the number of distinct live pytest trees (i.e.
-    how many separate test suites are running); ``pytest_process_count`` is
-    the total number of processes inside those trees (controllers plus xdist
-    workers plus any descendants), which is the number the dispatch governor
-    threshold compares against.
+    how many separate test suites are running) -- the count the dispatch
+    governor's suite-headroom clamp compares against;
+    ``pytest_process_count`` is the total number of processes inside those
+    trees (controllers plus xdist workers plus any descendants), which feeds
+    the governor's fan-out brake.
     """
 
     pytest_tree_count: int

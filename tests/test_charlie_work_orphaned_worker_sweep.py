@@ -7,6 +7,7 @@ wave 5/8).
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from _dead_session_fixtures import _write_flat_review_decision
@@ -121,7 +122,6 @@ def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) 
     assert len(death_at) == 1
     assert isinstance(death_at[0], str)
     # The timestamp must be a valid ISO 8601 string.
-    from datetime import datetime
 
     datetime.fromisoformat(death_at[0].replace("Z", "+00:00"))
 

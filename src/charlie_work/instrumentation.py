@@ -102,6 +102,12 @@ _db_init_lock = threading.Lock()
 # still making unregistered kinds visible in the logs.
 _unknown_kind_warned: set[str] = set()
 
+# Tracks unreadable event-row payloads already warned about this process. The
+# event readers run every loop pass, so a standing corrupt row must not
+# re-warn once per pass forever (the same spam class _unknown_kind_warned
+# exists for).
+_unreadable_payload_warned: set[str] = set()
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS events (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -772,12 +778,51 @@ def record_loop_pass(
         logger.warning("Failed to record loop pass: %s", exc)
 
 
+def _warn_unreadable_payload(kind: Any, ts: Any, raw_payload: Any) -> None:
+    """Log one warning per distinct unreadable ``events.payload`` value.
+
+    Rate-limited via ``_unreadable_payload_warned``: the readers run every
+    loop pass, so a standing corrupt row would otherwise warn once per pass
+    forever.
+    """
+    key = f"{kind}|{raw_payload!r}"
+    if key in _unreadable_payload_warned:
+        return
+    _unreadable_payload_warned.add(key)
+    logger.warning(
+        "events.db event row (kind=%s, ts=%s) has an unreadable payload; coercing to {}: %r",
+        kind,
+        ts,
+        raw_payload if raw_payload is None else str(raw_payload)[:200],
+    )
+
+
 def _row_to_event(row: sqlite3.Row) -> dict[str, Any]:
-    """Convert a database row to an event dict matching the old JSONL format."""
+    """Convert a database row to an event dict matching the old JSONL format.
+
+    Never raises on a malformed ``payload``: ``payload TEXT NOT NULL``
+    constrains only tables this module's schema created — ``CREATE TABLE IF
+    NOT EXISTS`` leaves a pre-existing ``events`` table (older build,
+    foreign tool, restored or corrupted file) untouched, so the column can
+    still hand back ``NULL`` or non-JSON text. ``json.loads`` on either used
+    to raise ``TypeError``/``JSONDecodeError`` straight through the readers'
+    ``sqlite3.Error`` catch and kill the calling lane mid-pass (issue
+    #1883). A malformed or non-dict payload now degrades to ``{}`` — the
+    same coercion the JSONL importer applies to unusable payloads — so the
+    row's ts/kind/level stay visible instead of aborting the whole read.
+    """
+    raw_payload = row["payload"]
+    try:
+        payload: Any = json.loads(raw_payload)
+    except (TypeError, json.JSONDecodeError):
+        payload = None
+    if not isinstance(payload, dict):
+        _warn_unreadable_payload(row["kind"], row["ts"], raw_payload)
+        payload = {}
     return {
         "ts": row["ts"],
         "kind": row["kind"],
-        "payload": json.loads(row["payload"]),
+        "payload": payload,
         "repo": row["repo"],
         "correlation_id": row["correlation_id"],
         "pr_number": row["pr_number"],
@@ -810,7 +855,11 @@ def read_event_log(state_path: Path, *, limit: int | None = None) -> list[dict[s
         else:
             cursor = conn.execute("SELECT * FROM events ORDER BY id ASC")
         return [_row_to_event(row) for row in cursor.fetchall()]
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, IndexError) as exc:
+        # IndexError: ``row[...]`` on a pre-existing ``events`` table whose
+        # schema diverges from _SCHEMA_SQL (an expected column is absent) —
+        # the store is unreadable either way, so degrade to empty rather
+        # than abort the caller (issue #1883).
         logger.warning("Failed to read event log: %s", exc)
         return []
 
@@ -831,7 +880,8 @@ def events_by_correlation_id(state_path: Path, correlation_id: str) -> list[dict
             (correlation_id,),
         )
         return [_row_to_event(row) for row in cursor.fetchall()]
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, IndexError) as exc:
+        # See read_event_log for the IndexError case.
         logger.warning("Failed to query events by correlation ID: %s", exc)
         return []
 
@@ -908,7 +958,8 @@ def query_events(
     try:
         cursor = conn.execute(sql, params)
         return [_row_to_event(row) for row in cursor.fetchall()]
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, IndexError) as exc:
+        # See read_event_log for the IndexError case.
         logger.warning("Failed to query events: %s", exc)
         return []
 

@@ -46,8 +46,8 @@ $section_config_parity
 ## Required implementation loop
 
 1. Confirm you are on the branch above (`git branch --show-current`).
-2. Read `CLAUDE.md`, `CONTRIBUTING.md` (where present), `CONTEXT.md` (where
-   present), the issue, and relevant code.
+2. Read `CLAUDE.md` (where present), `CONTRIBUTING.md` (where present),
+   `CONTEXT.md` (where present), the issue, and relevant code.
 3. Reproduce or precisely explain the defect/requirement.
 4. Implement the smallest correct change.
 

@@ -12,9 +12,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from charlie_work import cli
+from charlie_work import cli, layout
 from charlie_work.config import NotifyConfig
-from charlie_work.supervise import SelfDeployResult
+from charlie_work.notify import NotifyResult
+from charlie_work.supervise import SelfDeployResult, supervisor_runtime_paths
 from charlie_work.workflow import CommandResult
 
 
@@ -85,6 +86,52 @@ def test_run_fleet_bash_rats_self_deploy_failure_is_non_fatal(
     assert fleet_loop_mock.called is True
     out = capsys.readouterr().out
     assert "self-deploy skipped: diverged or dirty tree" in out
+
+
+def test_run_fleet_bash_rats_drains_pass_when_sync_starved(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Issue #1855: a starved deferred sync runs the bash-rats pass in drain
+    mode -- ``drain=True`` suppresses new dispatch for this pass, matching
+    the supervisor's posture -- and the configured bound is plumbed through.
+    """
+    from charlie_work.config import OrchestratorConfig, SupervisorConfig
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=False,
+            head_changed=False,
+            from_sha="abc123",
+            to_sha="def456",
+            message="sync deferred: 2 runners active",
+            deferred=True,
+            starved=True,
+        )
+    )
+    monkeypatch.setattr(cli, "self_deploy", deploy_mock)
+
+    fleet_loop_mock = MagicMock(return_value=CommandResult(True, "pass ok", {"repos": {}}))
+    monkeypatch.setattr(cli, "fleet_loop", fleet_loop_mock)
+    monkeypatch.setattr(
+        cli,
+        "load_layered_config",
+        lambda *_a, **_k: OrchestratorConfig(
+            supervisor=SupervisorConfig(dependency_sync_starvation_seconds=600)
+        ),
+    )
+
+    args = cli.build_parser().parse_args(["fleet", "bash-rats"])
+    result = cli.run_fleet_bash_rats(args)
+
+    assert result.ok is True
+    assert deploy_mock.call_args.kwargs["starvation_seconds"] == 600
+    assert fleet_loop_mock.call_args.kwargs["drain"] is True
+    out = capsys.readouterr().out
+    assert "starvation bound reached" in out
 
 
 def test_run_fleet_bash_rats_emits_attention_digest_on_repair_failure(
@@ -175,6 +222,52 @@ def test_run_fleet_bash_rats_emits_attention_digest_on_venv_repaired(
     assert len(digest["transitions"]) == 1
     assert digest["transitions"][0]["adapter_kind"] == "self-deploy"
     assert digest["transitions"][0]["health"] == "REPAIRED"
+
+
+def test_run_fleet_bash_rats_resolves_notify_sentinel_for_emit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #1899: the self-deploy emit gets the sentinel-resolved notify
+    config -- the raw ``file_path=""`` default would fail every emit with
+    'file_path is empty'."""
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=False,
+            pulled=False,
+            changed=False,
+            synced=False,
+            error="diverged or dirty tree",
+        )
+    )
+    monkeypatch.setattr(cli, "self_deploy", deploy_mock)
+    monkeypatch.setattr(
+        cli,
+        "fleet_loop",
+        MagicMock(return_value=CommandResult(True, "ok", {"repos": {}})),
+    )
+    emit = MagicMock(name="emit_digest", return_value=NotifyResult(ok=True))
+    monkeypatch.setattr(cli, "emit_digest", emit)
+
+    from charlie_work.config import OrchestratorConfig
+
+    monkeypatch.setattr(
+        cli,
+        "load_layered_config",
+        lambda *_a, **_k: OrchestratorConfig(notify=NotifyConfig(enabled=True, sink="file")),
+    )
+
+    args = cli.build_parser().parse_args(["fleet", "bash-rats"])
+    result = cli.run_fleet_bash_rats(args)
+
+    assert result.ok is True
+    emit.assert_called_once()
+    emitted_config = emit.call_args[0][0]
+    assert emitted_config.file_path == str(
+        layout.notify_digest_default(
+            supervisor_runtime_paths(OrchestratorConfig().runtime.state_dir).root
+        )
+    )
 
 
 def test_run_fleet_bash_rats_loud_on_absent_global_layer(

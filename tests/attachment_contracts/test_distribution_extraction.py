@@ -156,7 +156,7 @@ def test_wheel_builds_and_contains_expected_files(tmp_path: Path) -> None:
     """The wheel builds from the single in-tree source and has the right files.
 
     Builds the wheel via the custom PEP 517 backend and verifies:
-    - Exactly 14 .py files (13 original + _windows.py).
+    - Exactly 16 .py files (13 original + _windows.py + baseline_dir.py + tamper.py).
     - No ``charlie_work/__init__.py`` (namespace package).
     - ``_windows.py`` is present.
     """
@@ -174,11 +174,12 @@ def test_wheel_builds_and_contains_expected_files(tmp_path: Path) -> None:
 
         names = zipfile.ZipFile(whl_path).namelist()
         py_files = sorted(n for n in names if n.endswith(".py") and "dist-info" not in n)
-        assert len(py_files) == 14, f"expected 14 .py files, got {len(py_files)}: {py_files}"
+        assert len(py_files) == 16, f"expected 16 .py files, got {len(py_files)}: {py_files}"
         assert "charlie_work/__init__.py" not in names, (
             "wheel must NOT include charlie_work/__init__.py (namespace package)"
         )
         assert "charlie_work/attachment_contracts/_windows.py" in names
+        assert "charlie_work/attachment_contracts/baseline_dir.py" in names
     finally:
         sys.path.remove(str(_PKG_DIR))
         sys.modules.pop("build_backend", None)
@@ -202,13 +203,13 @@ def test_wheel_built_from_sdist_contains_source_files(tmp_path: Path) -> None:
 
     This test exercises the sdist->wheel path: build the sdist from the in-repo
     layout, extract it, import the backend from the extracted prefix, and build
-    a wheel.  The wheel MUST contain the 14 source ``.py`` files -- without the
+    a wheel.  The wheel MUST contain the 16 source ``.py`` files -- without the
     layout detection in ``_SRC_DIR``, it contains none and this test fails.
 
     Mutation control: reverting ``_SRC_DIR`` to
     ``_HERE.parent.parent / "src" / ...`` makes the extracted-prefix backend
     resolve ``<prefix>/../src/...`` (nonexistent), so ``build_wheel`` packages
-    zero ``.py`` files and the ``len(py_files) == 14`` assertion fails.
+    zero ``.py`` files and the ``len(py_files) == 16`` assertion fails.
     """
     import tarfile
     import zipfile
@@ -258,8 +259,8 @@ def test_wheel_built_from_sdist_contains_source_files(tmp_path: Path) -> None:
 
         names = zipfile.ZipFile(whl_path).namelist()
         py_files = sorted(n for n in names if n.endswith(".py") and "dist-info" not in n)
-        assert len(py_files) == 14, (
-            f"wheel built from sdist must contain 14 .py files, got {len(py_files)}: "
+        assert len(py_files) == 16, (
+            f"wheel built from sdist must contain 16 .py files, got {len(py_files)}: "
             f"{py_files} -- sdist layout detection in _SRC_DIR is broken"
         )
         assert "charlie_work/attachment_contracts/_windows.py" in names

@@ -88,6 +88,10 @@ class FakeGitHub:
         self.pr_external_issue_comments: dict[int, list[dict[str, Any]]] = {}
         self.pr_external_reviews: dict[int, list[dict[str, Any]]] = {}
         self.pr_external_review_comments: dict[int, list[dict[str, Any]]] = {}
+        # Issue #1853: record orchestrator-applied PR edits/comments so the
+        # rework-outcome lane's tests can assert exactly-once application.
+        self.pr_edits: list[tuple[int, str]] = []
+        self.pr_comments_posted: list[tuple[int, str]] = []
         # Actions job-log responses keyed by job id (issue #1686): the review
         # packet's collect-gate exemption section reads the gate job's log
         # via `gh api repos/{o}/{r}/actions/jobs/{id}/logs`.
@@ -424,6 +428,12 @@ class FakeGitHub:
                     break
         return open_issues
 
+    def issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]:
+        """Batched blocked-by lookup via the per-issue ``self.run`` path, so
+        ``dependencies_response`` overrides and run-call assertions behave as
+        they do for production clients (GitHubLike contract)."""
+        return {n: github_module.get_github_issue_dependencies(self, n) for n in issue_numbers}
+
     def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
         """Fake run method for GitHub API calls. Returns empty list for dependencies by default."""
         # Handle dependency API calls
@@ -660,7 +670,15 @@ class FakeGitHub:
         return [{"name": name} for name, _color, _desc in self.labels_created]
 
     def pr_comment(self, number: int, body_file: Path) -> None:
-        pass
+        self.pr_comments_posted.append((number, body_file.read_text(encoding="utf-8")))
+
+    def pr_edit(self, number: int, body_file: Path) -> None:
+        body = body_file.read_text(encoding="utf-8")
+        self.pr_edits.append((number, body))
+        for pr in self.prs:
+            if pr["number"] == number:
+                pr["body"] = body
+                break
 
     def remove_pr_label(self, number: int, label: str) -> bool:
         return True
