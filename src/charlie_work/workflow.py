@@ -1667,8 +1667,12 @@ def _detect_and_handle_orphaned_workers(
       (``terminal_exit_code is None`` -- the normal shape for devin-shell
       sessions, which never get a watcher), a fresh on-target
       ``.worker-outcome.json`` in the worktree proves the dispatch completed;
-      its PR edits are applied through the #1877 outcome-apply path and the
-      finding surfaces once as drift instead of crediting a worker death.
+      its PR edits are applied through the #1877 outcome-apply path instead
+      of crediting a worker death. Issue #1915: once that apply lands, the
+      post-lock review_routes drain calls ``review_callback`` -- a fresh
+      packet flips the issue to "reviewing"; a blocked review returns it to
+      "rework_requested" (still without a death credit). With no review
+      callback the finding surfaces once as drift, as before.
     - Otherwise, surface as drift for human triage (once per unchanged finding)
     - Do NOT clear worker_pid from state.json after handling (issue #282: the
       recovery path needs the fingerprint to verify the worktree is safe to reset).
@@ -2208,10 +2212,17 @@ def _detect_and_handle_orphaned_workers(
     # Handle orphaned workers. Head-advanced request_changes findings are
     # collected and routed to the review lane outside the state lock (review()
     # itself acquires the lock and may call transition()).
-    review_routes: list[tuple[int, int, str, str, str]] = []
+    # The last tuple element is the finding's reason string -- the post-lock
+    # drain uses it for event attribution and for the completed-outcome
+    # (#1915) apply gate / rework_requested fallback.
+    review_routes: list[tuple[int, int, str, str, str, str]] = []
     # Issue #654: dead dispatched workers time-escalated inside the lock
     # collected here for the post-lock transition() call (network I/O).
     reap_escalations: list[int] = []
+    # Issue #1915: completed-outcome issues whose post-apply review() could
+    # not produce a fresh packet are returned to ``rework_requested`` inside
+    # the drain below; the matching label edge is applied here post-lock.
+    rework_requested_recoveries: list[int] = []
     # Issue #1911: (issue_number, pr_number) pairs whose dead worker left a
     # fresh, on-target .worker-outcome.json despite no terminal record.
     # Collected in-lock below and applied post-lock through the #1877 seam
@@ -2826,23 +2837,70 @@ def _detect_and_handle_orphaned_workers(
         write_gate=write_gate,
     )
 
-    # Route head-advanced request_changes findings to the review lane outside
-    # the state lock. review() generates the packet, fires the review_started
-    # label transition, and returns ok when a fresh packet is produced. We then
-    # flip the issue status to "reviewing" so it is not re-detected as an orphan
-    # on every subsequent pass. If review() fails, we record a drift fingerprint
-    # so the identical finding is not re-emitted every pass.
+    # Route head-advanced request_changes findings -- and, since issue
+    # #1915, completed-outcome findings whose apply pass landed -- to the
+    # review lane outside the state lock. review() generates the packet,
+    # fires the review_started label transition, and returns ok when a
+    # fresh packet is produced. We then flip the issue status to
+    # "reviewing" so it is not re-detected as an orphan on every
+    # subsequent pass. If review() fails, we record a drift fingerprint
+    # so the identical finding is not re-emitted every pass -- except on
+    # the completed-outcome route, where the issue instead returns to
+    # ``rework_requested`` so the ordinary dispatch loop owns the
+    # still-outstanding rework.
     for (
         issue_number,
         pr_number,
         reviewed_head_sha_before,
         live_head_sha,
         fingerprint,
+        reason,
     ) in review_routes:
         if review_callback is None:
             continue
-        review_result = review_callback(pr_number)
+        if reason == "dead_worker_completed_outcome":
+            # Issue #1915: a completed-outcome route only reviews once its
+            # outcome demonstrably applied -- the outcome-apply drain ran
+            # just above, and review() builds its packet from the live PR
+            # body, so a still-pending apply (transient edit failure or a
+            # live-head move) must defer the review rather than flip the
+            # issue out of "dispatched" before the worker's edits land.
+            # The finding's drift fingerprint stayed unmarked in the
+            # sweep, so a skipped route is re-collected next pass.
+            with state_lock(state_file):
+                _route_state = load_state(state_file)
+                _applied_heads = _route_state.get(rework_outcome.APPLIED_HEADS_KEY, {})
+            if not (
+                isinstance(_applied_heads, dict)
+                and _applied_heads.get(str(issue_number)) == live_head_sha
+            ):
+                continue
+        try:
+            review_result = review_callback(pr_number)
+        except Exception as exc:
+            # Per-route guard mirroring apply_collected_rework_outcomes: one
+            # throwing review() must not starve the remaining routes or the
+            # post-drain transition loops. The finding's drift fingerprint
+            # stays unmarked, so the route re-collects next pass.
+            logging.getLogger(__name__).exception(
+                "review_callback escaped for orphaned issue %s / pr %s",
+                issue_number,
+                pr_number,
+            )
+            log_event(
+                state_file,
+                "orphaned_worker_review_route_failed",
+                {
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": reason,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                level="warning",
+            )
+            continue
         routed = False
+        rework_requested = False
         # See _route_rework_candidate_to_review's matching comment: review()
         # can return ok=True for the janitor-gate conflict/no-op-rework route
         # (no packet, no review_started transition) as well as for a real
@@ -2881,6 +2939,34 @@ def _detect_and_handle_orphaned_workers(
             elif (
                 not review_result.ok
                 and not routed_to_rework
+                and not closed_unmerged_converged
+                and decision_unchanged
+                and reason == "dead_worker_completed_outcome"
+                and isinstance(entry, dict)
+                and entry.get("status") == "dispatched"
+            ):
+                # Issue #1915: the completed outcome applied but review()
+                # cannot produce a fresh packet for its head (e.g. the
+                # janitor's unchanged-head no-op gate for a substantive
+                # request_changes verdict). The worker's recovered edits
+                # are published yet the verdict still stands, so the
+                # rework is still outstanding: hand the issue back to the
+                # ordinary dispatch loop as "rework_requested" WITHOUT
+                # crediting the dead worker's death (no ``worker_death_at``
+                # -- the #1911 invariant) and without burning an immediate
+                # redispatch. dispatch_rework's own head-unchanged
+                # accounting bounds any repeat, and the needs_rework label
+                # edge is applied post-lock below.
+                state["issues"][str(issue_number)] = {
+                    **entry,
+                    "status": "rework_requested",
+                    "dispatched_at": None,
+                }
+                rework_requested = True
+                rework_requested_recoveries.append(issue_number)
+            elif (
+                not review_result.ok
+                and not routed_to_rework
                 and isinstance(entry, dict)
                 and entry.get("status") == "dispatched"
             ):
@@ -2891,22 +2977,59 @@ def _detect_and_handle_orphaned_workers(
                     "orphan_drift_fingerprint": fingerprint,
                     "orphan_drift_at": utc_now(),
                 }
-            state = write_gate.append_event(
-                state,
-                "orphaned_worker_routed_to_review"
-                if review_result.ok
-                else "orphaned_worker_drift",
-                {
-                    "issue_number": issue_number,
-                    "pr_number": pr_number,
-                    "review_ok": review_result.ok,
-                    "routed": routed,
-                    "live_head_sha": live_head_sha,
-                    "reviewed_head_sha": reviewed_head_sha_before,
-                    "reason": "dead_worker_with_head_change",
-                },
-            )
+            if rework_requested:
+                state = write_gate.append_event(
+                    state,
+                    "orphaned_worker_recovered",
+                    {
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                        "previous_status": "dispatched",
+                        "new_status": "rework_requested",
+                        "reason": reason,
+                    },
+                )
+            else:
+                state = write_gate.append_event(
+                    state,
+                    "orphaned_worker_routed_to_review"
+                    if review_result.ok
+                    else "orphaned_worker_drift",
+                    {
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                        "review_ok": review_result.ok,
+                        "routed": routed,
+                        "live_head_sha": live_head_sha,
+                        "reviewed_head_sha": reviewed_head_sha_before,
+                        "reason": reason,
+                    },
+                )
             write_gate.save_state(state)
+
+    # Issue #1915: apply the needs_rework label edge for completed-outcome
+    # issues the drain returned to the rework queue. Same post-lock shape
+    # as the reap_escalations transitions below -- transition() is network
+    # I/O and never runs under the state lock.
+    for issue_number in rework_requested_recoveries:
+        result = write_gate.transition(gh, config.labels, issue_number, "rework_requested")
+        if result.outcome != TransitionOutcome.APPLIED:
+            # Same label_error persistence dead_worker_reap uses: the status
+            # flip already committed, so a failed edge leaves a stale label
+            # that the next sweep's drift/reconcile will still converge --
+            # the marker keeps the failure inspectable meanwhile.
+            with state_lock(state_file):
+                state = load_state(state_file)
+                entry = state["issues"].get(str(issue_number), {})
+                if isinstance(entry, dict):
+                    entry["label_error"] = {
+                        "edge": "rework_requested",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    }
+                    state["issues"][str(issue_number)] = entry
+                    write_gate.save_state(state)
 
     # Issue #654: apply the ``escalated`` label edge for dead dispatched
     # workers that exceeded the reap grace period. The state.json update
