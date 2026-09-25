@@ -25,6 +25,7 @@ from charlie_work.supervise import (
     SelfDeployResult,
     _command_failure_message,
     _log_self_deploy_git_retry,
+    _parse_marker_timestamp,
     _pending_sync_marker_path,
     _self_deploy_state_path,
     orchestrator_root,
@@ -206,7 +207,13 @@ def test_self_deploy_defers_sync_when_fleet_runners_active(
     marker_path = _pending_sync_marker_path(layout.default_state_root(tmp_path))
     assert marker_path.exists()
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    assert marker == {"from_sha": "abc123", "to_sha": "def456"}
+    assert marker["from_sha"] == "abc123"
+    assert marker["to_sha"] == "def456"
+    # Issue #1855: the first deferral of an episode stamps ``written_at`` --
+    # the timestamp the starvation bound measures -- and a fresh episode has
+    # no ``starved_notified`` latch.
+    assert _parse_marker_timestamp(marker["written_at"]) is not None
+    assert "starved_notified" not in marker
 
 
 def test_self_deploy_honors_state_root_override(tmp_path: Path, monkeypatch: Any) -> None:
