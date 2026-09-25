@@ -139,11 +139,41 @@ def pytest_tree_load(
     seen: set[int] = set()
     trees = 0
     for pid in root_pids:
-        if pid in seen or pid in excluded:
+        # Count once per TOPMOST root: a nested root folds into the tree
+        # its furthest root ancestor opens. Folding before counting --
+        # rather than relying on ``seen`` to absorb nested roots after
+        # the fact -- makes the count independent of root_pids' hash
+        # order, which for ints is roughly ascending PID and therefore
+        # arbitrary for a nested root versus its ancestor (issue #1918).
+        top = _topmost_root(ppid_by_pid, root_pids, pid)
+        if top in seen or top in excluded:
             continue
         trees += 1
-        seen |= _subtree_pids(children_by_ppid, pid)
+        seen |= _subtree_pids(children_by_ppid, top)
     return HostLoad(pytest_tree_count=trees, pytest_process_count=len(seen))
+
+
+def _topmost_root(
+    ppid_by_pid: dict[int, int],
+    root_pids: set[int],
+    pid: int,
+) -> int:
+    """The furthest pytest root on ``pid``'s ancestor chain, or ``pid``.
+
+    ``pid`` is itself a root, so the walk always settles on a root:
+    ``pid`` when no ancestor matches, else the highest matching
+    ancestor. The ``chain`` membership guard terminates ppid cycles and
+    reused-PID loops exactly as ``_self_tree``'s identical walk does.
+    """
+    node: int | None = pid
+    chain: set[int] = set()
+    top = pid
+    while node is not None and node not in chain:
+        chain.add(node)
+        if node in root_pids:
+            top = node
+        node = ppid_by_pid.get(node) or None  # ppid 0 / absent: end of chain
+    return top
 
 
 def _self_tree(
