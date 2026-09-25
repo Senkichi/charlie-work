@@ -13,28 +13,19 @@ death, the sweep must route that outcome into the #1877 apply path
 from __future__ import annotations
 
 import json
-import os
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from _dead_session_fixtures import _write_flat_review_decision
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
-from _fakes_github import FakeGitHub
-from _rework_dispatch_fixtures import _wg
-from charlie_work import rework_outcome
-from charlie_work.config import (
-    WORKER_OUTCOME_FILENAME,
-    DevinConfig,
-    OrchestratorConfig,
-    WatchdogConfig,
-    WorkerRoleConfig,
+from _orphan_sweep_fixtures import (
+    _dead_worker_rework_bed,
+    _run_orphan_sweep,
+    _write_outcome,
 )
-from charlie_work.paths import runtime_paths
+from charlie_work import rework_outcome
 from charlie_work.state import (
     load_state,
-    save_state,
 )
-from charlie_work.worktree import worktree_path_for_branch
 
 
 # ---------------------------------------------------------------------------
@@ -44,111 +35,6 @@ from charlie_work.worktree import worktree_path_for_branch
 # wrote a fresh, on-target .worker-outcome.json. Before crediting a worker
 # death, the sweep must route that outcome into the #1877 apply path.
 # ---------------------------------------------------------------------------
-
-
-def _dead_worker_rework_bed(
-    tmp_path: Path,
-    *,
-    decision: str = "request_changes",
-    pr_state_status: str | None = None,
-) -> tuple[Any, Any, Any, str]:
-    """Seed the shared #1911 scenario.
-
-    Returns ``(config, paths, fake_gh, dispatched_at)``: a dead-PID dispatched
-    issue 207 whose open PR 100 carries a ``decision`` verdict on the
-    unchanged live head ``abc123``, with ``gh.repo_root`` pointed at
-    ``tmp_path`` so the sweep resolves a real worktrees dir.
-    ``pr_state_status`` sets the PR state entry's ``status`` field -- the
-    post-approval rework lanes mark it ``rework_requested`` while leaving
-    ``decision="approved"`` (issue #1109).
-    """
-    config = OrchestratorConfig(
-        devin=DevinConfig(),
-        worker=WorkerRoleConfig(harness="devin-shell"),
-        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    dispatched_at = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
-
-    state = load_state(paths.state_file)
-    state["issues"]["207"] = {
-        "status": "dispatched",
-        "worker_pid": 99999,
-        "worker_process_start_time": 1234567890.0,
-        "dispatched_at": dispatched_at,
-        "branch_name": "agent/issue-207",
-    }
-    state["prs"]["100"] = {
-        "decision": decision,
-        "reviewed_head_sha": "abc123",
-    }
-    if pr_state_status is not None:
-        state["prs"]["100"]["status"] = pr_state_status
-    save_state(paths.state_file, state)
-    _write_flat_review_decision(paths, 100, decision, "abc123")
-
-    class FakeGitHubForOrphan(FakeGitHub):
-        def pr_list(self):
-            return [
-                {
-                    "number": 100,
-                    "headRefOid": "abc123",  # Unchanged since request_changes
-                    "isCrossRepository": False,
-                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
-                    "headRefName": "agent/issue-207",
-                }
-            ]
-
-    fake_gh = FakeGitHubForOrphan(repo_root=tmp_path)
-    fake_gh.issues.append(
-        {
-            "number": 207,
-            "title": "Test issue",
-            "url": "https://example.test/issues/207",
-            "body": "",
-            "labels": [],
-            "state": "OPEN",
-        }
-    )
-    return config, paths, fake_gh, dispatched_at
-
-
-def _write_outcome(
-    paths: Any, tmp_path: Path, payload: dict[str, Any], *, mtime: datetime | None = None
-) -> Path:
-    worktree_path = worktree_path_for_branch(tmp_path, "agent/issue-207", paths.worktrees)
-    worktree_path.mkdir(parents=True, exist_ok=True)
-    outcome_path = worktree_path / WORKER_OUTCOME_FILENAME
-    outcome_path.write_text(json.dumps(payload), encoding="utf-8")
-    if mtime is not None:
-        ts = mtime.timestamp()
-        os.utime(outcome_path, (ts, ts))
-    return outcome_path
-
-
-def _run_orphan_sweep(
-    tmp_path: Path,
-    paths: Any,
-    config: Any,
-    fake_gh: Any,
-    *,
-    review_callback: Any = None,
-) -> None:
-    from unittest.mock import patch
-
-    from charlie_work.workflow import _detect_and_handle_orphaned_workers
-
-    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(
-            sessions_dir,
-            paths.state_file,
-            config,
-            fake_gh,
-            review_callback=review_callback,
-            write_gate=_wg(paths.state_file),
-        )
 
 
 def test_orphaned_worker_fresh_outcome_without_terminal_record_is_not_a_death(

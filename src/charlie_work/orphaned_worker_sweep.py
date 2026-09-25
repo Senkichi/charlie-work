@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .dispatch_selection import _credit_worker_death
+from .orphaned_worker_review_drain import OrphanedWorkerReviewRoute
 from .process_utils import find_worker_terminal_status
 from .review_decision import review_decision
 from .rework_outcome import (
@@ -64,7 +65,7 @@ def handle_dead_worker_completed_outcome(
     repo_root: Any,
     worktrees_dir: Path | None,
     outcome_apply_routes: list[tuple[int, int]],
-    review_routes: list[tuple[int, int, str, str, str, str]],
+    review_routes: list[OrphanedWorkerReviewRoute],
     review_callback: Callable[[int], Any] | None,
     drift_fingerprint: Callable[..., str],
     extra_payload: dict[str, Any] | None = None,
@@ -85,8 +86,10 @@ def handle_dead_worker_completed_outcome(
     outcome applied, then calls ``review()`` and flips
     ``dispatched`` -> ``reviewing`` on a fresh packet or, when review
     cannot produce one, returns the issue to ``rework_requested`` -- still
-    without a ``worker_death_at`` credit, the two steps that drove the
-    swole#198 0-commit ``no_op_rework_attempts_cap_exceeded`` loop. The
+    without a ``worker_death_at`` credit. False-crediting a worker death
+    here while the issue sat ``dispatched`` forever was the two-step
+    failure that drove the swole#198 0-commit
+    ``no_op_rework_attempts_cap_exceeded`` loop. The
     drift fingerprint is deliberately NOT marked on the routed path: the
     drain is what resolves the finding, so an unapplied/skipped route must
     re-collect cleanly on the next pass. Without a review callback the
@@ -149,13 +152,13 @@ def handle_dead_worker_completed_outcome(
         if entry.get("orphan_drift_at") is None:
             entry["orphan_drift_at"] = _wf.utc_now()
         review_routes.append(
-            (
-                issue_number,
-                pr_number,
-                reviewed_head_sha,
-                live_head_sha,
-                fingerprint,
-                "dead_worker_completed_outcome",
+            OrphanedWorkerReviewRoute(
+                issue_number=issue_number,
+                pr_number=pr_number,
+                reviewed_head_sha=reviewed_head_sha,
+                live_head_sha=live_head_sha,
+                fingerprint=fingerprint,
+                reason="dead_worker_completed_outcome",
             )
         )
         return True
@@ -194,7 +197,7 @@ def handle_dead_worker_with_pr(
     review_callback: Callable[[int], Any] | None,
     repo_root: Any,
     worktrees_dir: Path | None,
-    review_routes: list[tuple[int, int, str, str, str, str]],
+    review_routes: list[OrphanedWorkerReviewRoute],
     outcome_apply_routes: list[tuple[int, int]],
     pr_orphan_unreviewed_details: dict[int, dict[str, Any]],
     drift_fingerprint: Callable[..., str],
@@ -366,13 +369,13 @@ def handle_dead_worker_with_pr(
                 return
             if review_callback is not None:
                 review_routes.append(
-                    (
-                        issue_number,
-                        pr_number,
-                        reviewed_head_sha,
-                        live_head_sha,
-                        fingerprint,
-                        "dead_worker_with_head_change",
+                    OrphanedWorkerReviewRoute(
+                        issue_number=issue_number,
+                        pr_number=pr_number,
+                        reviewed_head_sha=reviewed_head_sha,
+                        live_head_sha=live_head_sha,
+                        fingerprint=fingerprint,
+                        reason="dead_worker_with_head_change",
                     )
                 )
             else:
