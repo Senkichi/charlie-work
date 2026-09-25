@@ -55,9 +55,22 @@ stdlib-only; see the notes below before "fixing" one.
   which exists solely to be a genuine leaf (no imports beyond stdlib, and
   never `ci_fleet`) that both this script and `charlie_work.instrumentation`
   can import from without either pulling in the other. That module is the
-  only permitted import; anything else needing sharing from inside the
-  package still needs the reimplement-locally treatment `fleet_dir` and the
-  stale-open-issue-mention primitives already get, not a new exception here.
+  only permitted import — since #1895 it physically lives in
+  `heartbeat_event_alarms.py` (which `heartbeat_check` loads and re-exports
+  `EXPECTED_OPERATIONAL_KINDS` from), and anything else needing sharing from
+  inside the package still needs the reimplement-locally treatment
+  `fleet_dir` and the stale-open-issue-mention primitives already get, not a
+  new exception in either file.
+- **`heartbeat_event_alarms.py`** — the five per-repo `events.db` kind/level
+  anomaly checks (`check_error_events`, `check_warning_events`,
+  `check_infra_blocked_events`, `check_draft_pr_blocked_events`,
+  `check_ci_headroom_unavailable`), extracted verbatim out of
+  `heartbeat_check.py` (issue #1895) for file-size-ratchet headroom —
+  relocation only, no behavior change. Loaded by `heartbeat_check.py` via
+  `importlib` from the sibling script path, never run standalone and never a
+  bare `import` (`scripts/` is not a package). Shares the stdlib-only
+  invariant, including the guarded `charlie_work.event_kinds` leaf import
+  documented above.
 - **`backfill_stale_rework_briefs.py`** — one-shot operator tool (F6 of
   `docs/plans/rework-findings-channel.md`) that bumps a `review-decision.json`
   verdict's mtime (`os.utime` only — never rewrites its contents) for PRs

@@ -268,8 +268,8 @@ def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
     #
     # Known gap: ``-AsArray`` is a PowerShell 6+ switch — on Windows
     # PowerShell 5.1 the whole command fails (non-zero exit) and this sweep
-    # silently returns []. Tracked in a follow-up issue filed from the #1842
-    # rework; ``_win32_process_ppid_snapshot`` deliberately omits ``-AsArray``
+    # silently returns [] on every such host (a #1842 follow-up tracks the
+    # fix). ``_win32_process_ppid_snapshot`` deliberately omits ``-AsArray``
     # for exactly this reason.
     result = run_captured(
         [
