@@ -22,13 +22,15 @@ orphan-sweep pipeline:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
-from .subprocess_runner import no_console_window_kwargs
+from .subprocess_runner import run_captured
+
+logger = logging.getLogger(__name__)
 
 
 # Hard backstop on the parent-PID walk in ``_self_ancestor_pids`` — the same
@@ -48,37 +50,37 @@ def _win32_process_ppid_snapshot() -> dict[int, int]:
     once-per-invocation operator gate) could stall an orphan sweep for
     minutes under load.
 
+    Routed through ``subprocess_runner.run_captured`` (the codebase's
+    never-raises runner) rather than raw ``subprocess.run``: a spawn failure
+    such as ``PermissionError`` from a denied ``CreateProcess`` is an
+    ``OSError``, not a ``SubprocessError``, and would have slipped the old
+    narrow ``except`` to propagate through the ancestor guard — aborting
+    ``dead_worker_reap._sweep_orphan_processes_for_dead_sessions`` outright.
+
     Returns ``{}`` on any failure (no PowerShell, timeout, non-zero exit,
-    unparseable output). The caller degrades to the bare self-pid guard
-    rather than disabling process reaping on a host whose process-listing
-    substrate is broken — see ``_self_ancestor_pids``.
+    spawn error, unparseable output). The caller degrades to the bare
+    self-pid guard rather than disabling process reaping on a host whose
+    process-listing substrate is broken — see ``_self_ancestor_pids``.
     """
     ppid_by_pid: dict[int, int] = {}
     if not shutil.which("powershell"):
         return ppid_by_pid
+    result = run_captured(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process | "
+            "Select-Object ProcessId, ParentProcessId | ConvertTo-Json",
+        ],
+        cwd=Path.cwd(),
+        timeout_seconds=10,
+    )
+    if result.returncode != 0:
+        return ppid_by_pid
     try:
-        result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "Get-CimInstance Win32_Process | "
-                "Select-Object ProcessId, ParentProcessId | ConvertTo-Json",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            **no_console_window_kwargs(),
-        )
-        if result.returncode != 0:
-            return ppid_by_pid
         data = json.loads(result.stdout)
-    except (
-        subprocess.TimeoutExpired,
-        subprocess.SubprocessError,
-        FileNotFoundError,
-        json.JSONDecodeError,
-    ):
+    except json.JSONDecodeError:
         return ppid_by_pid
 
     # No ``-AsArray``: that switch is PowerShell 6+ and Windows PowerShell
@@ -151,12 +153,35 @@ def _self_ancestor_pids() -> frozenset[int]:
     collapsing to the pre-#1842 self-pid guard keeps direct
     ``kill_process_tree`` callers (which carry start-time fingerprints)
     working on such a host instead of silently disabling reaping.
+
+    Never raises: the snapshot helpers already collapse their own failures
+    to ``{}``; the ``except Exception`` here is the second line of defense
+    (e.g. ``Path.cwd()`` raising because the caller's cwd was deleted
+    mid-sweep) so nothing on this path can propagate into the kill
+    primitives. Both the raise and the empty-snapshot degrade are logged —
+    whether the #1842 guard ever fires is the only telemetry that can
+    confirm or refute the sweep-needle hypothesis, so a silent degrade would
+    erase the evidence.
     """
-    if os.name == "nt":
-        ppid_by_pid = _win32_process_ppid_snapshot()
-    else:
-        ppid_by_pid = _posix_process_ppid_snapshot()
+    try:
+        if os.name == "nt":
+            ppid_by_pid = _win32_process_ppid_snapshot()
+        else:
+            ppid_by_pid = _posix_process_ppid_snapshot()
+    except Exception:
+        logger.warning(
+            "process ppid snapshot raised; ancestor kill guard degrades to self-pid only",
+            exc_info=True,
+        )
+        ppid_by_pid = {}
     self_pid = os.getpid()
+    if not ppid_by_pid:
+        logger.warning(
+            "process ppid snapshot unavailable or empty; ancestor kill guard "
+            "degrades to self-pid %d only (os.name=%r)",
+            self_pid,
+            os.name,
+        )
     chain: set[int] = {self_pid}
     current = self_pid
     for _ in range(_MAX_ANCESTOR_CHAIN_HOPS):
@@ -230,52 +255,58 @@ def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
         # POSIX: not implemented - process groups handle detachment better
         return orphans
 
+    if not shutil.which("powershell"):
+        return orphans
+
+    # Use PowerShell to query Win32_Process for CommandLine matching the worktree path.
+    # Select-Object + ConvertTo-Json preserves PID, image name, and command line so
+    # callers can log what was killed and identify respawn sources.
+    #
+    # ``run_captured`` never raises, so a spawn-level ``OSError`` (e.g.
+    # ``PermissionError`` from a denied ``CreateProcess``) cannot propagate
+    # out of here and abort the dead-session sweep lane mid-loop.
+    #
+    # Known gap: ``-AsArray`` is a PowerShell 6+ switch — on Windows
+    # PowerShell 5.1 the whole command fails (non-zero exit) and this sweep
+    # silently returns []. Tracked in a follow-up issue filed from the #1842
+    # rework; ``_win32_process_ppid_snapshot`` deliberately omits ``-AsArray``
+    # for exactly this reason.
+    result = run_captured(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            f'Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like "*{needle}*" }} | Select-Object ProcessId, CommandLine, Name | ConvertTo-Json -AsArray',
+        ],
+        cwd=Path.cwd(),
+        timeout_seconds=10,
+    )
+    if result.returncode != 0:
+        return orphans
+
     try:
-        if not shutil.which("powershell"):
-            return orphans
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return orphans
 
-        # Use PowerShell to query Win32_Process for CommandLine matching the worktree path.
-        # Select-Object + ConvertTo-Json preserves PID, image name, and command line so
-        # callers can log what was killed and identify respawn sources.
-        result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                f'Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like "*{needle}*" }} | Select-Object ProcessId, CommandLine, Name | ConvertTo-Json -AsArray',
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            **no_console_window_kwargs(),
-        )
+    if not isinstance(data, list):
+        return orphans
 
+    for proc in data:
+        if not isinstance(proc, dict):
+            continue
         try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return orphans
-
-        if not isinstance(data, list):
-            return orphans
-
-        for proc in data:
-            if not isinstance(proc, dict):
-                continue
-            try:
-                pid = int(proc["ProcessId"])
-            except (KeyError, ValueError, TypeError):
-                continue
-            if pid <= 0:
-                continue
-            orphans.append(
-                {
-                    "pid": pid,
-                    "name": str(proc.get("Name") or ""),
-                    "command_line": str(proc.get("CommandLine") or ""),
-                }
-            )
-    except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
-        # Best-effort sweep - don't fail if PowerShell fails
-        pass
+            pid = int(proc["ProcessId"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if pid <= 0:
+            continue
+        orphans.append(
+            {
+                "pid": pid,
+                "name": str(proc.get("Name") or ""),
+                "command_line": str(proc.get("CommandLine") or ""),
+            }
+        )
 
     return orphans

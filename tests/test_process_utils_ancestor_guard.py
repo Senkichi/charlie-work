@@ -11,7 +11,9 @@ ppid snapshot.
 
 from __future__ import annotations
 
+import logging
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -289,8 +291,10 @@ def test_win32_process_ppid_snapshot_normalizes_single_result(
     import json
 
     monkeypatch.setattr(_sweep.shutil, "which", lambda _name: "powershell")
+    # The snapshot shells out through ``run_captured``, which reaches
+    # ``subprocess.run`` via the shared module — patch it there.
     monkeypatch.setattr(
-        _sweep.subprocess,
+        subprocess,
         "run",
         lambda *a, **k: subprocess.CompletedProcess(
             a, 0, json.dumps({"ProcessId": 7, "ParentProcessId": 3}), ""
@@ -307,3 +311,233 @@ def test_win32_process_ppid_snapshot_failure_returns_empty(
     ancestor guard degrades rather than raising."""
     monkeypatch.setattr(_sweep.shutil, "which", lambda _name: None)
     assert _sweep._win32_process_ppid_snapshot() == {}
+
+
+@pytest.mark.parametrize("bad_pid", [0, -1])
+def test_kill_orphan_pid_refuses_nonpositive_pid(
+    monkeypatch: pytest.MonkeyPatch, bad_pid: int
+) -> None:
+    """``pid <= 0`` is refused before the ancestor lookup and before any
+    platform kill primitive — a degenerate sweep entry must never reach
+    ``taskkill``/``os.kill``."""
+    kill_attempts: list[Any] = []
+    monkeypatch.setattr(
+        _pu,
+        "run_captured",
+        lambda command, **kwargs: (
+            kill_attempts.append(command)
+            or RunResult(returncode=0, stdout="", stderr="", error=None)
+        ),
+    )
+    monkeypatch.setattr(
+        _pu.os,
+        "kill",
+        lambda pid, sig: kill_attempts.append(("os.kill", pid, sig)),
+        raising=False,
+    )
+
+    kill_orphan_pid(bad_pid)
+
+    assert kill_attempts == []
+
+
+def test_kill_process_tree_ancestor_guard_precedes_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ancestor guard fires *before* start-time fingerprinting — a
+    matching fingerprint must not rescue a target that names a caller
+    ancestor (pins guard-before-fingerprint ordering)."""
+    own_pid, ancestor_pid = 424242, 777
+    fingerprint = 1_700_000_000.0
+    monkeypatch.setattr(_pu.os, "getpid", lambda: own_pid)
+    _patch_self_chain(monkeypatch, frozenset({own_pid, ancestor_pid, 1}))
+
+    fingerprint_calls: list[int] = []
+    monkeypatch.setattr(
+        _pu,
+        "get_process_start_time",
+        lambda pid: fingerprint_calls.append(pid) or fingerprint,
+    )
+    monkeypatch.setattr(_pu, "_enumerate_child_pids", lambda _pid: [])
+
+    kill_attempts: list[Any] = []
+    monkeypatch.setattr(
+        _pu,
+        "run_captured",
+        lambda command, **kwargs: (
+            kill_attempts.append(command)
+            or RunResult(returncode=0, stdout="", stderr="", error=None)
+        ),
+    )
+    monkeypatch.setattr(_pu.os, "getpgid", lambda pid: 1000 + pid, raising=False)
+    monkeypatch.setattr(
+        _pu.os,
+        "killpg",
+        lambda pgid, sig: kill_attempts.append(("killpg", pgid, sig)),
+        raising=False,
+    )
+
+    killed = kill_process_tree(ancestor_pid, expected_start_time=fingerprint)
+
+    assert killed == []
+    assert kill_attempts == []
+    assert fingerprint_calls == []  # the guard refused before fingerprinting
+
+
+def test_ancestor_refusal_logs_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Refusals are the only telemetry that can confirm or refute whether the
+    #1842 guard ever fires — both kill primitives must log them, not swallow
+    them."""
+    own_pid, ancestor_pid = 424242, 777
+    monkeypatch.setattr(_pu.os, "getpid", lambda: own_pid)
+    _patch_self_chain(monkeypatch, frozenset({own_pid, ancestor_pid, 1}))
+    monkeypatch.setattr(_pu, "_enumerate_child_pids", lambda _pid: [])
+    monkeypatch.setattr(
+        _pu,
+        "run_captured",
+        lambda *a, **k: RunResult(returncode=0, stdout="", stderr="", error=None),
+    )
+    monkeypatch.setattr(_pu.os, "kill", lambda *a: None, raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.process_utils"):
+        assert kill_process_tree(ancestor_pid) == []
+        kill_orphan_pid(ancestor_pid)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("kill_process_tree" in m and str(ancestor_pid) in m for m in messages)
+    assert any("kill_orphan_pid" in m and str(ancestor_pid) in m for m in messages)
+
+
+@pytest.mark.parametrize("exc_type", [PermissionError, OSError])
+def test_snapshot_spawn_oserror_degrades_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    exc_type: type[OSError],
+) -> None:
+    """A spawn-level ``OSError`` (e.g. ``PermissionError`` from a denied
+    ``CreateProcess``) is not a ``SubprocessError`` — the snapshot must
+    return ``{}``, ``_self_ancestor_pids`` must degrade to ``{os.getpid()}``
+    with a warning, and both kill primitives must return without raising.
+    """
+    monkeypatch.setattr(_sweep.os, "name", "nt")
+    monkeypatch.setattr(shutil, "which", lambda _name: "powershell")
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise exc_type("denied")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+
+    assert _sweep._win32_process_ppid_snapshot() == {}
+
+    monkeypatch.setattr(_sweep.os, "getpid", lambda: 555)
+    with caplog.at_level(logging.WARNING, logger="charlie_work.orphan_sweep"):
+        assert _sweep._self_ancestor_pids() == frozenset({555})
+    assert any("self-pid" in r.getMessage() for r in caplog.records)
+
+    # The kill primitives consult the degraded set and still function.
+    kill_attempts: list[Any] = []
+    monkeypatch.setattr(
+        _pu,
+        "run_captured",
+        lambda command, **kwargs: (
+            kill_attempts.append(command)
+            or RunResult(returncode=0, stdout="", stderr="", error=None)
+        ),
+    )
+    monkeypatch.setattr(
+        _pu.os,
+        "kill",
+        lambda pid, sig: kill_attempts.append(("os.kill", pid, sig)),
+        raising=False,
+    )
+    monkeypatch.setattr(_pu.os, "getpgid", lambda pid: 1000 + pid, raising=False)
+    monkeypatch.setattr(
+        _pu.os,
+        "killpg",
+        lambda pgid, sig: kill_attempts.append(("killpg", pgid, sig)),
+        raising=False,
+    )
+    monkeypatch.setattr(_pu, "_enumerate_child_pids", lambda _pid: [])
+
+    kill_orphan_pid(555)  # degraded guard must still refuse the self-pid
+    assert kill_attempts == []
+    assert kill_process_tree(555) == []
+
+    kill_orphan_pid(31337)
+    killed = kill_process_tree(31337)
+
+    # The degraded guard covers only self-pid — an unrelated target still
+    # reaches the kill primitive (reaping is degraded, not disabled).
+    assert len(kill_attempts) == 2
+    assert 31337 in killed
+
+
+def test_self_ancestor_pids_degrades_when_snapshot_raises(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If the snapshot helper itself raises (e.g. ``Path.cwd()`` on a deleted
+    cwd), ``_self_ancestor_pids`` degrades to ``{os.getpid()}`` with a warning
+    instead of propagating into the kill path."""
+    monkeypatch.setattr(_sweep.os, "name", "nt")
+
+    def boom() -> dict[int, int]:
+        raise PermissionError("cwd gone")
+
+    monkeypatch.setattr(_sweep, "_win32_process_ppid_snapshot", boom)
+    monkeypatch.setattr(_sweep.os, "getpid", lambda: 555)
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.orphan_sweep"):
+        assert _sweep._self_ancestor_pids() == frozenset({555})
+    assert any("self-pid" in r.getMessage() for r in caplog.records)
+
+
+def test_kill_primitives_survive_ancestor_lookup_raise(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If the ancestor lookup itself raises, the kill boundary degrades to
+    the bare self-pid guard (with a warning) instead of propagating —
+    ``kill_orphan_pid`` is documented never-raise, and an escape here would
+    abort ``_sweep_orphan_processes_for_dead_sessions`` mid-pass."""
+    monkeypatch.setattr(_pu.os, "getpid", lambda: 555)
+
+    def boom() -> frozenset[int]:
+        raise OSError("snapshot substrate exploded")
+
+    monkeypatch.setattr(_pu, "_self_ancestor_pids", boom, raising=False)
+
+    kill_attempts: list[Any] = []
+    monkeypatch.setattr(
+        _pu,
+        "run_captured",
+        lambda command, **kwargs: (
+            kill_attempts.append(command)
+            or RunResult(returncode=0, stdout="", stderr="", error=None)
+        ),
+    )
+    monkeypatch.setattr(
+        _pu.os,
+        "kill",
+        lambda pid, sig: kill_attempts.append(("os.kill", pid, sig)),
+        raising=False,
+    )
+    monkeypatch.setattr(_pu.os, "getpgid", lambda pid: 1000 + pid, raising=False)
+    monkeypatch.setattr(
+        _pu.os,
+        "killpg",
+        lambda pgid, sig: kill_attempts.append(("killpg", pgid, sig)),
+        raising=False,
+    )
+    monkeypatch.setattr(_pu, "_enumerate_child_pids", lambda _pid: [])
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.process_utils"):
+        kill_orphan_pid(555)  # degraded guard refuses self
+        kill_orphan_pid(31337)  # unrelated target still killed
+        killed_self = kill_process_tree(555)
+        killed_other = kill_process_tree(31337)
+
+    assert killed_self == []
+    assert 31337 in killed_other
+    assert len(kill_attempts) == 2
+    assert any("degrades to self-pid" in r.getMessage() for r in caplog.records)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -49,6 +50,7 @@ def test_sweep_orphan_processes_windows_parsing() -> None:
         },
     ]
     with patch("subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 0
         mock_run.return_value.stdout = json.dumps(sample)
         orphans = sweep_orphan_processes("/some/worktree/path")
         assert orphans == [
@@ -72,6 +74,7 @@ def test_sweep_orphan_processes_windows_empty_output() -> None:
 
     # Mock subprocess.run to return empty output
     with patch("subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 0
         mock_run.return_value.stdout = ""
         orphans = sweep_orphan_processes("/some/worktree/path")
         assert orphans == []
@@ -85,6 +88,21 @@ def test_sweep_orphan_processes_windows_subprocess_error() -> None:
     # Mock subprocess.run to raise an exception
     with patch("subprocess.run") as mock_run:
         mock_run.side_effect = subprocess.TimeoutExpired("powershell", 10)
+        orphans = sweep_orphan_processes("/some/worktree/path")
+        assert orphans == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+@pytest.mark.parametrize("exc_type", [PermissionError, OSError])
+def test_sweep_orphan_processes_windows_oserror(exc_type: type[OSError]) -> None:
+    """A spawn-level ``OSError`` (e.g. ``PermissionError`` from a denied
+    ``CreateProcess``) is not a ``SubprocessError`` — the sweep must still
+    degrade to ``[]`` via ``run_captured`` rather than propagating and
+    aborting ``_sweep_orphan_processes_for_dead_sessions`` mid-loop."""
+    from unittest.mock import patch
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.side_effect = exc_type("denied")
         orphans = sweep_orphan_processes("/some/worktree/path")
         assert orphans == []
 
@@ -125,7 +143,7 @@ def test_sweep_orphan_processes_rejects_degenerate_needles(
     # Force the Windows code path regardless of host so path validation is
     # the only thing that can prevent the CIM query.
     monkeypatch.setattr(_sweep.os, "name", "nt")
-    monkeypatch.setattr(_sweep.shutil, "which", lambda _name: "powershell")
+    monkeypatch.setattr(shutil, "which", lambda _name: "powershell")
 
     run_calls: list[Any] = []
 
@@ -145,7 +163,9 @@ def test_sweep_orphan_processes_rejects_degenerate_needles(
         )
         return subprocess.CompletedProcess(args, 0, payload, "")
 
-    monkeypatch.setattr(_sweep.subprocess, "run", fake_run)
+    # The sweep shells out through ``run_captured``, which reaches
+    # ``subprocess.run`` via the shared module — patch it there.
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
     orphans = sweep_orphan_processes(worktree_path)
 

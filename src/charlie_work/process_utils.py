@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import signal
@@ -20,6 +21,8 @@ from .orphan_sweep import (  # noqa: F401  (deliberate re-export)
     sweep_orphan_processes,
 )
 from .subprocess_runner import hidden_console_kwargs, no_console_window_kwargs, run_captured
+
+logger = logging.getLogger(__name__)
 
 
 def parse_proc_stat_starttime(stat_text: str) -> int | None:
@@ -175,7 +178,7 @@ def _enumerate_child_pids(pid: int) -> list[int]:
             subprocess.TimeoutExpired,
             subprocess.SubprocessError,
             ValueError,
-            FileNotFoundError,
+            OSError,
         ):
             # Best-effort enumeration - don't fail the kill if enumeration fails
             pass
@@ -529,6 +532,28 @@ def start_terminal_status_watcher(
     return thread
 
 
+def _ancestor_guard_exempt_pids() -> frozenset[int]:
+    """PID set the kill primitives must never terminate; never raises.
+
+    ``orphan_sweep._self_ancestor_pids`` is already best-effort — a failed or
+    empty snapshot degrades to ``{os.getpid()}`` internally. This wrapper is
+    the second line of defense at the kill boundary: even an unforeseen
+    raise there degrades to the bare self-pid guard (pre-#1842 semantics)
+    instead of propagating out of ``kill_process_tree``/``kill_orphan_pid``,
+    which would break the latter's documented never-raises contract and
+    abort ``dead_worker_reap._sweep_orphan_processes_for_dead_sessions``
+    mid-pass.
+    """
+    try:
+        return _self_ancestor_pids()
+    except Exception:
+        logger.warning(
+            "ancestor-pid lookup raised; kill guard degrades to self-pid only",
+            exc_info=True,
+        )
+        return frozenset({os.getpid()})
+
+
 def kill_process_tree(pid: int, expected_start_time: float | None = None) -> list[int]:
     """Kill a process and all its children (process tree).
 
@@ -568,12 +593,20 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
     # ancestor chain: on Windows ``taskkill /T /PID <ancestor>`` fells the
     # ancestor's whole subtree — which contains the caller — so a sweep-hit or
     # bogus ``pid`` naming any ancestor (uv, the pytest controller, the step's
-    # pwsh) terminates this process mid-run too. That is exactly the observed
-    # CI death: pytest controller gone, no traceback, no junit. On POSIX the
+    # pwsh) terminates this process mid-run too — the same signature as the
+    # observed CI death (pytest controller gone, no traceback, no junit),
+    # though #1842's root cause remains unproven. On POSIX the
     # existing ``pgid == os.getpgid(0)`` guard below still covers the
     # process-group shape; this PID-set check covers the direct case on both
     # platforms regardless of group boundaries.
-    if pid in _self_ancestor_pids():
+    if pid in _ancestor_guard_exempt_pids():
+        # Refusals are logged, not silent: whether this guard ever fires is
+        # the only telemetry that can confirm or refute the sweep-needle
+        # hypothesis #1842 tracks.
+        logger.warning(
+            "kill_process_tree refused pid %d: target is this process or a caller ancestor",
+            pid,
+        )
         return killed_pids
 
     # Re-verify process identity via start time if provided
@@ -684,13 +717,20 @@ def kill_orphan_pid(pid: int) -> None:
     ``workflow.py`` is ``write_gate.py``'s only production importer).
 
     Issue #1842: refuses to kill the caller's own ancestor chain
-    (``_self_ancestor_pids``), same as ``kill_process_tree``. Orphan PIDs
-    arrive from ``sweep_orphan_processes``'s CommandLine substring match, and
-    a too-broad worktree needle legitimately matches the pytest/uv/pwsh
-    ancestry above the caller — terminating it is exactly the mid-run
-    controller death that issue tracks.
+    (``_self_ancestor_pids`` via ``_ancestor_guard_exempt_pids``), same as
+    ``kill_process_tree``. Orphan PIDs arrive from
+    ``sweep_orphan_processes``'s CommandLine substring match, and a too-broad
+    worktree needle legitimately matches the pytest/uv/pwsh ancestry above
+    the caller — terminating it produces the mid-run controller death
+    signature that issue tracks (controller gone, no traceback, no junit).
     """
-    if pid <= 0 or pid in _self_ancestor_pids():
+    if pid <= 0:
+        return
+    if pid in _ancestor_guard_exempt_pids():
+        logger.warning(
+            "kill_orphan_pid refused pid %d: target is this process or a caller ancestor",
+            pid,
+        )
         return
     try:
         if os.name == "nt":
