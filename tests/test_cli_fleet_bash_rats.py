@@ -88,6 +88,52 @@ def test_run_fleet_bash_rats_self_deploy_failure_is_non_fatal(
     assert "self-deploy skipped: diverged or dirty tree" in out
 
 
+def test_run_fleet_bash_rats_drains_pass_when_sync_starved(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Issue #1855: a starved deferred sync runs the bash-rats pass in drain
+    mode -- ``drain=True`` suppresses new dispatch for this pass, matching
+    the supervisor's posture -- and the configured bound is plumbed through.
+    """
+    from charlie_work.config import OrchestratorConfig, SupervisorConfig
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=False,
+            head_changed=False,
+            from_sha="abc123",
+            to_sha="def456",
+            message="sync deferred: 2 runners active",
+            deferred=True,
+            starved=True,
+        )
+    )
+    monkeypatch.setattr(cli, "self_deploy", deploy_mock)
+
+    fleet_loop_mock = MagicMock(return_value=CommandResult(True, "pass ok", {"repos": {}}))
+    monkeypatch.setattr(cli, "fleet_loop", fleet_loop_mock)
+    monkeypatch.setattr(
+        cli,
+        "load_layered_config",
+        lambda *_a, **_k: OrchestratorConfig(
+            supervisor=SupervisorConfig(dependency_sync_starvation_seconds=600)
+        ),
+    )
+
+    args = cli.build_parser().parse_args(["fleet", "bash-rats"])
+    result = cli.run_fleet_bash_rats(args)
+
+    assert result.ok is True
+    assert deploy_mock.call_args.kwargs["starvation_seconds"] == 600
+    assert fleet_loop_mock.call_args.kwargs["drain"] is True
+    out = capsys.readouterr().out
+    assert "starvation bound reached" in out
+
+
 def test_run_fleet_bash_rats_emits_attention_digest_on_repair_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

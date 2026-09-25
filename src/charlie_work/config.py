@@ -2108,6 +2108,16 @@ class SupervisorConfig:
     before a ``supervisor_wedge_loop`` events.db entry fires (default 3,
     mirrors ``self_deploy_failure_alarm``/``zero_pass_alarm``). 0 disables
     the alarm (issue #1832).
+    ``dependency_sync_starvation_seconds``: upper bound on how long a deferred
+    self-deploy ``uv sync`` may stay pending while fleet workers are live
+    before the supervisor stops admitting new dispatches (drain posture:
+    workers in flight are untouched) so the live-worker count can reach zero
+    and the sync can land (issue #1855). Measured wall-clock from the
+    pending-sync marker's ``written_at`` -- the first deferral of the
+    episode -- so it is robust to supervisor restarts. Default 14400 s (4 h):
+    comfortably above observed worker session durations, and far below the
+    multi-hour continuous deferral observed under sustained fleet load.
+    <= 0 disables the bound.
     """
 
     poll_interval_seconds: int = 20
@@ -2119,6 +2129,7 @@ class SupervisorConfig:
     self_deploy_pull_ci_fleet: bool = False
     zero_pass_alarm: int = 3
     wedge_kill_loop_alarm: int = 3
+    dependency_sync_starvation_seconds: int = 14400
 
 
 @dataclass(frozen=True)
@@ -4027,6 +4038,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         "self_deploy_failure_alarm",
         "zero_pass_alarm",
         "wedge_kill_loop_alarm",
+        "dependency_sync_starvation_seconds",
     ):
         value = supervisor_data.get(int_key)
         if value is not None and not isinstance(value, int):
