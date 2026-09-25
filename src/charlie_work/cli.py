@@ -72,7 +72,12 @@ from .quiesce import check_quiescence
 from .state import StateLockBusy, load_state_locked, utc_now
 from .subprocess_runner import run_captured
 from .state_migration import apply_state_dir_migration, gather_migration_inputs
-from .supervise import orchestrator_root, self_deploy, supervisor_runtime_paths
+from .supervise import (
+    DEFAULT_SYNC_STARVATION_SECONDS,
+    orchestrator_root,
+    self_deploy,
+    supervisor_runtime_paths,
+)
 from ci_fleet.charlie_work_adapter import (
     CLI_ALLOCATION_SOURCE,
     UNATTENDED_ALLOCATION_SOURCE,
@@ -1316,6 +1321,11 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
             if global_config is not None
             else False
         ),
+        starvation_seconds=(
+            global_config.supervisor.dependency_sync_starvation_seconds
+            if global_config is not None
+            else DEFAULT_SYNC_STARVATION_SECONDS
+        ),
     )
     if not deploy.ok:
         print(f"self-deploy skipped: {deploy.error}", flush=True)
@@ -1361,6 +1371,15 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
                 ),
             )
             emit_digest(notify_config, attention_digest)
+    elif deploy.starved:
+        # Issue #1855: a pending dependency sync starved past its bound —
+        # this pass launches nothing new so live workers can drain to zero
+        # and the sync can land (same posture as `fleet stop --drain`).
+        print(
+            f"self-deploy: {deploy.message} -- starvation bound reached; "
+            "dispatch suppressed this pass",
+            flush=True,
+        )
 
     return fleet_loop(
         fleet_dir_override=args.fleet_dir,
@@ -1370,6 +1389,7 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         merge=args.merge,
         dry_run=args.dry_run,
         work_only=False,
+        drain=deploy.starved,
     )
 
 

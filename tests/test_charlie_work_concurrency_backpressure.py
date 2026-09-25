@@ -25,7 +25,14 @@ from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # no
 def test_apply_concurrency_governor_helper_unlimited(tmp_path: Path) -> None:
     """_apply_concurrency_governor returns unclamped result when max_concurrent is 0."""
     config = OrchestratorConfig(
-        dispatch=DispatchConfig(max_concurrent_sessions=0),
+        # Issue #1903: the tree-headroom term ships ON (default cpu_count//2)
+        # and would clamp a 5-wide request on small hosts -- pin both
+        # host-load knobs to 0 so this test exercises max_concurrent alone.
+        dispatch=DispatchConfig(
+            max_concurrent_sessions=0,
+            host_load_max_pytest_processes=0,
+            host_load_max_pytest_trees=0,
+        ),
         devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -141,7 +148,14 @@ def test_apply_concurrency_governor_open_pr_backpressure_off_when_disabled(tmp_p
     """Issue #1129: max_open_agent_prs=0 preserves current behavior."""
 
     config = OrchestratorConfig(
-        dispatch=DispatchConfig(max_open_agent_prs=0, default_limit=5),
+        # Issue #1903: pin both default-on host-load knobs off so the only
+        # term under test is open_pr_max.
+        dispatch=DispatchConfig(
+            max_open_agent_prs=0,
+            default_limit=5,
+            host_load_max_pytest_processes=0,
+            host_load_max_pytest_trees=0,
+        ),
         devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -161,7 +175,14 @@ def test_apply_concurrency_governor_open_pr_backpressure_exempt_by_default(tmp_p
     """Issue #1129: rework/loop paths (apply_open_pr_backpressure=False) are exempt."""
 
     config = OrchestratorConfig(
-        dispatch=DispatchConfig(max_open_agent_prs=1, default_limit=5),
+        # Issue #1903: pin both default-on host-load knobs off so the only
+        # term under test is the open_pr_max exemption.
+        dispatch=DispatchConfig(
+            max_open_agent_prs=1,
+            default_limit=5,
+            host_load_max_pytest_processes=0,
+            host_load_max_pytest_trees=0,
+        ),
         devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -206,7 +227,15 @@ def test_apply_concurrency_governor_open_pr_backpressure_no_event_when_not_clamp
     """Issue #1129: no event when open PRs are below the cap (no clamping)."""
 
     config = OrchestratorConfig(
-        dispatch=DispatchConfig(max_open_agent_prs=10, default_limit=5),
+        # Issue #1903: pin both default-on host-load knobs off -- an armed
+        # tree cap would clamp and write a dispatch_backpressure event of
+        # its own, breaking the empty-events assertion.
+        dispatch=DispatchConfig(
+            max_open_agent_prs=10,
+            default_limit=5,
+            host_load_max_pytest_processes=0,
+            host_load_max_pytest_trees=0,
+        ),
         devin=DevinConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
