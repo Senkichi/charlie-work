@@ -244,10 +244,8 @@ def _loop_body(
     # branch diff, runs the base-merge + full-suite + merge gate, and
     # re-dispatches rework -- the whole worker->merge lifecycle with no
     # operator gate. It is itself a no-op on a remote backend.
-    # ``limit`` is the caller's explicit dispatch budget (pre-governor): an
-    # explicit 0 -- the value ``fleet stop --drain`` forces via
-    # ``app.loop(0)`` -- suspends the local rework launch, the lane's only
-    # dispatch_sessions caller with no gate of its own (issue #1716).
+    # ``limit`` is the pre-governor dispatch budget: an explicit 0 (drain)
+    # suspends the rework launch -- see the ``_local_lane`` docstring (#1716).
     local_lane_result = self._local_lane(now=now, limit=limit)
 
     reviews: list[dict[str, Any]] = []
