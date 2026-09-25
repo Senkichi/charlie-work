@@ -35,7 +35,7 @@ from .git_retry import RetryOutcome, run_git_with_retry
 from .instrumentation import log_event
 from .paths import RuntimePaths, runtime_paths
 from .safe_path import contains
-from .state import state_lock
+from .state import state_lock, utc_now
 from .subprocess_runner import RunResult, command_failure_message, run_captured
 from .worker import iter_workers
 
@@ -271,21 +271,84 @@ def _pending_sync_marker_path(state_root: Path) -> Path:
     return layout.pending_sync_path(state_root)
 
 
-def _write_marker(path: Path, from_sha: str, to_sha: str) -> None:
-    """Persist the pending-sync marker atomically (temp-file + replace)."""
+def _write_marker(
+    path: Path, from_sha: str, to_sha: str, *, starved_notified: bool = False
+) -> None:
+    """Persist the pending-sync marker atomically (temp-file + replace).
+
+    ``written_at`` records the FIRST deferral of this episode and is carried
+    forward verbatim on every later rewrite (each deferred pass refreshes
+    ``to_sha`` as new pulls land) -- it is what the starvation bound
+    (issue #1855) measures, and it must survive the head-moved supervisor
+    restarts that happen mid-episode. A missing or unparseable prior
+    ``written_at`` re-arms to now (a pre-#1855 marker, or a hand-edit, gets
+    one fresh window rather than an unverifiable age). Same shape for
+    ``starved_notified``: latched true once the ``self_deploy_sync_starved``
+    event fires, preserved across rewrites, so the event fires once per
+    episode rather than once per deferred pass.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"from_sha": from_sha, "to_sha": to_sha}, indent=2) + "\n"
+    prior = _read_marker(path)
+    prior_written = prior.get("written_at")
+    payload: dict[str, Any] = {
+        "from_sha": from_sha,
+        "to_sha": to_sha,
+        "written_at": (
+            prior_written if _parse_marker_timestamp(prior_written) is not None else utc_now()
+        ),
+    }
+    if starved_notified or prior.get("starved_notified"):
+        payload["starved_notified"] = True
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     tmp.replace(path)
 
 
-def _read_marker(path: Path) -> dict[str, str]:
+def _read_marker(path: Path) -> dict[str, Any]:
     """Read the marker, returning an empty dict on any read/parse error."""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+    # A valid-JSON non-mapping marker (hand-edit, torn schema change) reads
+    # as absent rather than crashing the deferral branch on ``marker.get``.
+    return data if isinstance(data, dict) else {}
+
+
+def _parse_marker_timestamp(value: Any) -> datetime.datetime | None:
+    """Parse a marker ``written_at`` ISO-8601 string, or ``None`` on any miss.
+
+    Naive timestamps are read as UTC -- the writer (``utc_now``) always emits
+    ``Z``, so a naive value can only come from a hand-edited marker, and
+    assuming UTC errs toward a *larger* measured age (the starvation-safe
+    direction) when the local convention was UTC anyway.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.UTC)
+    return parsed
+
+
+def _pending_sync_age_seconds(
+    marker: dict[str, Any] | None, *, now: datetime.datetime
+) -> float | None:
+    """Age of the pending-sync episode in seconds, or ``None`` when unknown.
+
+    ``None`` covers an absent marker and a marker with no usable
+    ``written_at`` -- the safe direction is to keep deferring on an
+    unverifiable age rather than drain-dispatch on one.
+    """
+    if not marker:
+        return None
+    start = _parse_marker_timestamp(marker.get("written_at"))
+    if start is None:
+        return None
+    return (now - start).total_seconds()
 
 
 def _clear_marker(path: Path) -> None:
@@ -331,6 +394,13 @@ class SelfDeployResult:
     lesson as ``head_changed`` one field up: callers that need to know about
     a specific event on *this* attempt need a field describing that event,
     not an inference from the shape of other fields.
+
+    ``starved`` is True only on the deferred path when the pending-sync
+    marker's ``written_at`` has aged past the configured starvation bound
+    (issue #1855): the episode has outlived any plausible worker session, so
+    the caller should stop admitting new dispatches until the sync lands.
+    Like ``deferred``, it describes this attempt specifically -- a synced or
+    never-deferred pass reports False even if an earlier deferral starved.
     """
 
     ok: bool
@@ -345,6 +415,7 @@ class SelfDeployResult:
     venv_repaired: bool = False
     previewed: bool = False
     deferred: bool = False
+    starved: bool = False
 
     @property
     def alertable(self) -> bool:
@@ -762,6 +833,13 @@ def _self_deploy_preview(
 #: disables the alarm" convention.
 DEFAULT_SELF_DEPLOY_FAILURE_ALARM = 3
 
+#: Default starvation bound (seconds) for a deferred ``uv sync`` that stays
+#: pending under continuous live fleet workers before the supervisor stops
+#: admitting new dispatches (issue #1855). Mirrors
+#: ``config.SupervisorConfig.dependency_sync_starvation_seconds``'s default;
+#: <= 0 disables the bound.
+DEFAULT_SYNC_STARVATION_SECONDS = 14400
+
 
 def _self_deploy_state_path(repo_root: Path) -> Path:
     """Return the ``state.json`` path used to derive ``events.db`` for self-deploy.
@@ -813,6 +891,8 @@ def _log_self_deploy_outcome(repo_root: Path, result: SelfDeployResult) -> None:
             "to_sha": result.to_sha,
             "changed": result.changed,
             "synced": result.synced,
+            "deferred": result.deferred,
+            "starved": result.starved,
             "venv_repaired": result.venv_repaired,
             "message": result.message,
             "error": result.error,
@@ -1010,6 +1090,7 @@ def self_deploy(
     dry_run: bool = False,
     failure_alarm_threshold: int = DEFAULT_SELF_DEPLOY_FAILURE_ALARM,
     pull_ci_fleet: bool = False,
+    starvation_seconds: int = DEFAULT_SYNC_STARVATION_SECONDS,
 ) -> SelfDeployResult:
     """FF-pull ``origin/main`` and run ``uv sync`` when dependency files changed.
 
@@ -1024,6 +1105,15 @@ def self_deploy(
     sync is deferred and a pending-sync marker is written atomically.  The
     marker is checked on every subsequent pass, so the sync retries even when
     the next ``git pull`` finds no new commits.
+
+    ``starvation_seconds`` bounds how long that deferral may continue (issue
+    #1855): once the marker's ``written_at`` -- the first deferral of the
+    episode -- is older than the bound, the deferred result reports
+    ``starved=True`` and a single ``self_deploy_sync_starved`` event fires
+    per episode. Callers that admit new worker dispatches are expected to
+    stop doing so while ``starved`` holds, so the live-worker count can
+    drain to zero and the sync can land; nothing is killed. <= 0 disables
+    the bound.
 
     All subprocess errors are returned as values (non-fatal); the function
     never raises.
@@ -1063,6 +1153,7 @@ def self_deploy(
         pull_timeout=pull_timeout,
         sync_timeout=sync_timeout,
         pull_ci_fleet=pull_ci_fleet,
+        starvation_seconds=starvation_seconds,
     )
     _log_self_deploy_outcome(repo_root, result)
     _record_self_deploy_failure_streak(repo_root, result, threshold=failure_alarm_threshold)
@@ -1364,6 +1455,7 @@ def _self_deploy_attempt(
     pull_timeout: int,
     sync_timeout: int,
     pull_ci_fleet: bool = False,
+    starvation_seconds: int,
 ) -> SelfDeployResult:
     """Perform the real (non-preview) pull/diff/sync attempt.
 
@@ -1531,12 +1623,48 @@ def _self_deploy_attempt(
 
         live_count, _ = fleet_registry.count_fleet_live_sessions(fleet_dir_override)
         if live_count > 0:
+            # Issue #1855: bound how long a pending sync may starve under
+            # continuous load. The marker's ``written_at`` is the FIRST
+            # deferral of this episode (``_write_marker`` carries it forward),
+            # so the bound measures the whole episode, not the latest pass.
+            # ``starved`` reports the trip to the caller -- which stops
+            # admitting new dispatches -- rather than killing anything live,
+            # the same non-destructive posture as the rest of this module.
+            marker_age = _pending_sync_age_seconds(marker, now=datetime.datetime.now(datetime.UTC))
+            starved = (
+                starvation_seconds > 0
+                and marker_age is not None
+                and marker_age >= starvation_seconds
+            )
             _write_marker(marker_path, from_sha, to_sha)
+            if starved and not (marker or {}).get("starved_notified"):
+                # Emit before latching ``starved_notified`` in the marker: a
+                # crash between the two re-emits on the next pass, which is
+                # the safe direction for a once-per-episode signal.
+                # write-gate-exempt(issue=1855): durable events.db signal, outside state lock
+                log_event(
+                    _self_deploy_state_path(repo_root),
+                    "self_deploy_sync_starved",
+                    {
+                        "pending_seconds": int(marker_age or 0),
+                        "starvation_seconds": starvation_seconds,
+                        "live_count": live_count,
+                        "from_sha": from_sha,
+                        "to_sha": to_sha,
+                    },
+                )
+                _write_marker(marker_path, from_sha, to_sha, starved_notified=True)
             runner_word = "runner" if live_count == 1 else "runners"
             if marker is not None:
+                starved_note = (
+                    f"; starved {int(marker_age or 0)}s >= {starvation_seconds}s "
+                    "bound -- new dispatch suppressed until drained"
+                    if starved
+                    else ""
+                )
                 print(
                     f"WARNING: pending dependency sync still deferred: {live_count} "
-                    f"{runner_word} active (marker {from_sha}..{to_sha})",
+                    f"{runner_word} active (marker {from_sha}..{to_sha}){starved_note}",
                     flush=True,
                 )
             return SelfDeployResult(
@@ -1550,6 +1678,7 @@ def _self_deploy_attempt(
                 venv_repaired=venv_repaired,
                 message=f"sync deferred: {live_count} {runner_word} active",
                 deferred=True,
+                starved=starved,
             )
 
         # Persist marker before attempting sync so a crash between the pull and
