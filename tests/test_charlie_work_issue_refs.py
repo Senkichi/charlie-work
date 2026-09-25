@@ -91,15 +91,33 @@ def test_issue_numbers_mentioned_by_pr_ignores_tilde_fenced_block() -> None:
 
 
 def test_issue_numbers_mentioned_by_pr_ignores_inline_code_span() -> None:
-    """Issue #1819: the naive regex incidentally stripped inline ```...```
-    runs too; the replacement keeps suppression for inline code spans via
-    the same clause-scoped guard ``parse_blockers`` uses (guard 1b)."""
+    """Issue #1819 + PR #1904 review: the naive regex incidentally stripped
+    inline ```...``` runs (3+ backticks); the replacement keeps that
+    suppression via a clause-scoped guard restricted to runs of 3+.
+    Single-backtick code spans are NOT suppressed — suppressing them was out
+    of scope for #1819 and drops genuine mentions, so `` `issue #42` ``
+    counts as a mention."""
     pr = {
         "title": "",
         "body": "match `issue #42` or ```issue #43``` in code, not issue #9",
     }
 
-    assert issue_numbers_mentioned_by_pr(pr) == {9}
+    assert issue_numbers_mentioned_by_pr(pr) == {9, 42}
+
+
+def test_issue_numbers_mentioned_by_pr_dot_in_code_span_keeps_later_mention() -> None:
+    """PR #1904 review regression: a ``.`` inside an earlier single-backtick
+    code span is a clause boundary, so the span's closing backtick lands in
+    the next clause and pairs with a later span's opening backtick —
+    enveloping and suppressing a genuine prose mention between them. A
+    single-backtick guard fails in the unsafe direction for a dispatch
+    gate; single-backtick spans must not suppress."""
+    pr = {
+        "title": "",
+        "body": "`worktree.py` covers it (issue #5) and `foo` too.",
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr) == {5}
 
 
 def test_issue_numbers_mentioned_by_pr_suppresses_visibility_qualified_mentions() -> None:

@@ -140,7 +140,9 @@ def issue_numbers_mentioned_by_pr(
     Matches the literal phrase ``issue #N`` / ``issues #N`` (case-insensitive,
     with or without a space between the word and the hash), after stripping
     fenced code blocks and blockquoted lines, and skipping matches inside
-    inline backtick code spans. The fenced-block exclusion runs on
+    inline runs of 3+ backticks (`` ```...``` `` — the shape the pre-#1819
+    regex incidentally stripped; single-backtick spans are not suppressed).
+    The fenced-block exclusion runs on
     ``_fenced_block_ranges`` — the same line-based fence model
     ``parse_blockers`` uses (issue #1819). This is a strict subset of
     GitHub's issue-reference syntax: it does not treat a bare ``#N`` (which
@@ -171,14 +173,18 @@ def issue_numbers_mentioned_by_pr(
     text = _BLOCKQUOTE_LINE_RE.sub("", text)
     found: set[int] = set()
     for match in _ISSUE_MENTION_RE.finditer(text):
-        # A mention inside an inline backtick code span — `` `issue #N` ``,
-        # or an inline `` ```...``` `` run the old nearest-pair regex
-        # happened to strip — is quoted example text, not a reference.
-        # Clause-scoped like ``parse_blockers``' guard 1b so a stray backtick
-        # elsewhere cannot pair across the document and swallow a genuine
-        # mention.
+        # A mention inside an inline `` ```...``` `` run (3+ backticks) is
+        # quoted example text, not a reference — the incidental suppression
+        # the old nearest-pair regex provided and the only inline shape
+        # issue #1819's scope covers. Single-backtick code spans are NOT
+        # suppressed (PR #1904 review): a ``.`` inside one is a clause
+        # boundary, so the span's closing backtick lands inside a later
+        # clause, pairs with the next span's opener, and envelopes a genuine
+        # mention — 16 of 1,309 real bodies lost one. Clause-scoped like
+        # ``parse_blockers``' guard 1b so a stray run elsewhere cannot pair
+        # across the document and swallow a genuine mention.
         clause_start, clause_end = _clause_bounds(text, match.start(), match.end())
-        if _inside_code_span(
+        if _inside_inline_fence_span(
             text[clause_start:clause_end],
             match.start() - clause_start,
             match.end() - clause_start,
@@ -229,6 +235,14 @@ _ISSUE_REF = re.compile(r"#\d+")
 # Markdown backtick code span: an opening run of backticks, content, and a
 # closing run of the SAME length. Capturing group 2 is the span content.
 _CODE_SPAN_RE = re.compile(r"(`+)(.+?)(\1)", flags=re.DOTALL)
+# Inline run of 3+ backticks (`` ```...``` ``) — the shape the pre-#1819
+# nearest-pair `` ```.*?``` `` regex incidentally stripped along with real
+# fenced blocks. ``issue_numbers_mentioned_by_pr`` keeps suppressing these
+# but deliberately does NOT suppress single-backtick code spans (PR #1904
+# review): a ``.`` inside an ordinary span (`` `worktree.py` ``) is a clause
+# boundary, so the span's closing backtick lands inside the next clause and
+# pairs with a later span's opener, enveloping a genuine prose mention.
+_INLINE_FENCE_SPAN_RE = re.compile(r"(`{3,})(.+?)(\1)", flags=re.DOTALL)
 # Balanced straight-double-quote span. Group 1 is the quoted content.
 _DOUBLE_QUOTE_SPAN_RE = re.compile(r'"([^"]*)"')
 # Opening fence of a fenced code block: a line beginning with a run of 3+
@@ -266,6 +280,19 @@ _BLOCKER_ITEM_REF_RUN_RE = re.compile(
 def _inside_code_span(text: str, start: int, end: int) -> bool:
     """True if the [start, end) range falls inside a Markdown backtick code span."""
     for m in _CODE_SPAN_RE.finditer(text):
+        if m.start(2) <= start and end <= m.end(2):
+            return True
+    return False
+
+
+def _inside_inline_fence_span(text: str, start: int, end: int) -> bool:
+    """True if the [start, end) range falls inside an inline run of 3+ backticks.
+
+    Same shape as :func:`_inside_code_span` but restricted to
+    ``_INLINE_FENCE_SPAN_RE`` (3+ backticks) — the only inline suppression
+    ``issue_numbers_mentioned_by_pr`` keeps from the pre-#1819 regex.
+    """
+    for m in _INLINE_FENCE_SPAN_RE.finditer(text):
         if m.start(2) <= start and end <= m.end(2):
             return True
     return False
