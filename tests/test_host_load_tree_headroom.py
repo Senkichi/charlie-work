@@ -310,6 +310,14 @@ def test_probe_runs_when_only_tree_cap_armed(
 # ---------------------------------------------------------------------------
 
 
+def test_tree_knob_defaults_track_host_cpu_count() -> None:
+    """On by default per #1903: unset, the tree governor sits at half this
+    host's logical CPU count (one launch ≈ one suite, so the cap is 'suites
+    the host absorbs')."""
+    config = build_config_from_data({})
+    assert config.dispatch.host_load_max_pytest_trees == (os.cpu_count() or 0) // 2
+
+
 def test_tree_knob_accepts_int() -> None:
     config = build_config_from_data({"dispatch": {"host_load_max_pytest_trees": 4}})
     assert config.dispatch.host_load_max_pytest_trees == 4
