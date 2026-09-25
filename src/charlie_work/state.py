@@ -970,6 +970,36 @@ def set_throttled_until(
     }
 
 
+def record_dead_worker_failure_kind(
+    data: dict[str, Any], issue_number: int, failure_kind: str
+) -> dict[str, Any]:
+    """Stamp a dead worker's classified ``failure_kind`` onto its issue entry.
+
+    Issue #1917: the state.json-keyed orphan sweep
+    (``workflow._detect_and_handle_orphaned_workers``) runs after the
+    session/worker sidecar has been reaped, so it cannot re-derive the
+    classification from the log tail. Persisting it on the issue entry
+    lets that lane exempt provider-throttle deaths
+    (``is_provider_throttle_failure``) from the
+    ``dead_dispatched_reap_minutes`` timed escalation and the
+    orphan-redispatch cap — the same #1684 semantics the rework lanes
+    already apply. The field is cleared on the next dispatch claim and
+    by ``unescalate`` so a stale classification can never exempt a later,
+    genuinely different death. No-op when the issue has no entry (e.g.
+    an untracked session) so the caller never invents one.
+
+    Returns ``data`` unchanged when there is nothing to stamp.
+    """
+    issues = data.get("issues")
+    if not isinstance(issues, dict):
+        return data
+    entry = issues.get(str(issue_number))
+    if not isinstance(entry, dict):
+        return data
+    issues[str(issue_number)] = {**entry, "dead_worker_failure_kind": failure_kind}
+    return data
+
+
 def _reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
     """Return the reviewer quota sub-dict from ``data``.
 

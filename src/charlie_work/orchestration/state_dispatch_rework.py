@@ -923,6 +923,8 @@ def _dispatch_rework_impl(
             entry.pop("orphan_flagged_at", None)
             entry.pop("orphan_drift_fingerprint", None)
             entry.pop("orphan_drift_at", None)
+            # Issue #1917: and the previous death's classification.
+            entry.pop("dead_worker_failure_kind", None)
             state["issues"][str(issue_number)] = entry
         _wf.save_state(self.paths.state_file, state)
 
@@ -1285,6 +1287,10 @@ def _dispatch_rework_impl(
                 entry.pop("orphan_flagged_at", None)
                 entry.pop("orphan_drift_fingerprint", None)
                 entry.pop("orphan_drift_at", None)
+                # Issue #1917: and the previous death's classification, so a
+                # stale provider-throttle kind cannot exempt a later,
+                # genuinely different death from the orphan-sweep caps.
+                entry.pop("dead_worker_failure_kind", None)
                 # Issue #1106: a new rework dispatch supersedes any
                 # prior startup-death classification — the new session
                 # is the one whose outcome the next janitor pass will
