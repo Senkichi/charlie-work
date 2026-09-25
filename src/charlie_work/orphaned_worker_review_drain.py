@@ -138,8 +138,7 @@ def drain_orphaned_worker_review_routes(
                 issue_number,
                 pr_number,
             )
-            _wf.log_event(
-                state_file,
+            write_gate.log_event(
                 "orphaned_worker_review_route_failed",
                 {
                     "issue_number": issue_number,
