@@ -210,7 +210,10 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
         # an exact dict match, so this config disables the (default-on)
         # host-load term to keep the asserted shape about max_concurrent only.
         dispatch=DispatchConfig(
-            max_concurrent_sessions=2, default_limit=5, host_load_max_pytest_processes=0
+            max_concurrent_sessions=2,
+            default_limit=5,
+            host_load_max_pytest_processes=0,
+            host_load_max_pytest_trees=0,
         ),
         devin=DevinConfig(
             dispatch_command=(
@@ -352,7 +355,10 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
         # an exact dict match, so this config disables the (default-on)
         # host-load term to keep the asserted shape about max_concurrent only.
         dispatch=DispatchConfig(
-            max_concurrent_sessions=1, default_limit=5, host_load_max_pytest_processes=0
+            max_concurrent_sessions=1,
+            default_limit=5,
+            host_load_max_pytest_processes=0,
+            host_load_max_pytest_trees=0,
         ),
         devin=DevinConfig(),
     )
@@ -463,7 +469,10 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
         fleet=FleetConfig(global_max_concurrent_sessions=3),
         # Issue #1843: same pinned-payload rationale as the config above.
         dispatch=DispatchConfig(
-            max_concurrent_sessions=2, default_limit=5, host_load_max_pytest_processes=0
+            max_concurrent_sessions=2,
+            default_limit=5,
+            host_load_max_pytest_processes=0,
+            host_load_max_pytest_trees=0,
         ),
         devin=DevinConfig(),
     )
