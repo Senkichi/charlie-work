@@ -165,8 +165,13 @@ MERGED_PR_REST_ONLY_FIELDS = ("mergeCommitOid",)
 # find the next one, the fix is at the query layer: the gate never needed
 # statusCheckRollup in the first place, so a narrow field list sidesteps the
 # whole class of integration-context permission gaps instead of chasing them
-# field by field.
-CLOSING_KEYWORD_PR_FIELDS = "title,body,headRefName,isCrossRepository"
+# field by field. Issue #1872 added `baseRefName`/`headRefOid`: the gate
+# re-resolves the PR's merge base against the LIVE base ref (compare API)
+# because the recorded `base.sha` can lag behind main after a sync merge,
+# false-positiving foreign commits into the scanned commit surface. Both are
+# scalar fields -- no nested connection, so no statusCheckRollup-style scope
+# risk.
+CLOSING_KEYWORD_PR_FIELDS = "title,body,headRefName,baseRefName,headRefOid,isCrossRepository"
 # Fields for the post-create closing-reference verification (cw#1263): the
 # only field needed is GitHub's own GraphQL resolution of which issues this
 # PR will close on merge -- as opposed to `linked_issue_number`'s regex-based
