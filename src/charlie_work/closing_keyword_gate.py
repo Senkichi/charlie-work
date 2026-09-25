@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from .issue_linking import iter_unnegated_closing_keyword_matches
 
@@ -32,6 +33,69 @@ class UnexpectedClosingReference:
     issue_number: int
     source: str
     matched_text: str
+
+
+def exclude_base_reachable_commits(
+    commits: Sequence[Mapping[str, Any]],
+    *,
+    merge_base_sha: str,
+) -> list[Mapping[str, Any]]:
+    """Drop listed commits already reachable from the live base tip (issue #1872).
+
+    The commit surface this gate scans — ``gh api
+    repos/{owner}/{repo}/pulls/{n}/commits`` — is computed by GitHub against
+    the PR's *recorded* ``base.sha`` (effectively ``rev-list base.sha..head``),
+    and that recorded SHA lags: when a PR head merges a newer ``main``, the
+    recorded ``base.sha`` can still predate main commits the merge brought in.
+    A foreign squash-merge commit already on ``main`` — e.g. another PR's
+    ``Closes #N`` — then appears in the commit list and false-positives this
+    gate until the recorded base re-syncs.
+
+    ``merge_base_sha`` must be the merge base of the PR head against the
+    *live* base ref (``compare``'s ``merge_base_commit.sha``), re-resolved at
+    gate time — never the recorded ``base.sha``. Every commit in ``commits``
+    that is an ancestor-or-self of that merge base is already on the live
+    base and contributes no diff to this PR, so it is excluded from the scan.
+
+    Reachability is derived from each commit object's own ``parents`` array
+    (part of the ``pulls/{n}/commits`` REST response schema), walking parent
+    links from ``merge_base_sha`` across only the listed commits — no extra
+    API calls. The walk stays inside the listed set by construction: any
+    ancestor of the merge base that appears in the list is reachable from the
+    merge base through intermediate list entries (an intermediate node
+    reachable from the recorded base would make the descendant reachable too,
+    contradicting its presence in the list).
+
+    Fail-closed on unprovable ancestry: a commit with no ``sha``/``parents``
+    in its payload is kept (scanned), and when ``merge_base_sha`` is not
+    itself in the list — e.g. the recorded base already equals the live merge
+    base — nothing is excluded at all. Under exclusion, ``find_unexpected_
+    closing_references``'s ``commit #N`` source labels index the filtered
+    list (this PR's own commits), not the raw endpoint ordering.
+    """
+    by_sha: dict[str, Mapping[str, Any]] = {}
+    for commit in commits:
+        sha = commit.get("sha")
+        if isinstance(sha, str) and sha:
+            by_sha[sha] = commit
+
+    reachable_from_base: set[str] = set()
+    stack = [merge_base_sha]
+    while stack:
+        sha = stack.pop()
+        if sha in reachable_from_base:
+            continue
+        commit = by_sha.get(sha)
+        if commit is None:
+            continue
+        reachable_from_base.add(sha)
+        for parent in commit.get("parents") or []:
+            if isinstance(parent, Mapping):
+                parent_sha = parent.get("sha")
+                if isinstance(parent_sha, str) and parent_sha:
+                    stack.append(parent_sha)
+
+    return [c for c in commits if c.get("sha") not in reachable_from_base]
 
 
 def find_unexpected_closing_references(
