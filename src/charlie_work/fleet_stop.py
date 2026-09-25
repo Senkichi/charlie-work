@@ -294,6 +294,44 @@ def supervise_loop_interrupted_result() -> CommandResult:
     )
 
 
+def register_fleet_stop_subparser(
+    subparsers: argparse._SubParsersAction,
+) -> None:
+    """Register the ``fleet stop`` subcommand on the ``fleet`` subparsers.
+
+    Lives here rather than inline in ``cli.build_parser`` for the same
+    reason the ``*_command`` modules own their registration
+    (``register_junit_recorded_check_subparser`` et al.): ``cli.py`` is an
+    over-cap monolith under the file-size ratchet (issue #1442), so new
+    parser wiring lands in the domain module and cli.py keeps a one-line
+    call.
+    """
+    fleet_stop = subparsers.add_parser(
+        "stop",
+        help=(
+            "Ask the running fleet supervisor to stop by writing a "
+            "stop-request marker in the fleet dir (#1716). This is the only "
+            "clean stop for the hidden scheduled-task deployment, which has "
+            "no console to Ctrl+C. A plain stop exits at the next pass "
+            "boundary with live workers untouched; --drain additionally "
+            "suppresses new dispatch and exits once live workers reach zero. "
+            "The marker is consumed when honored, so the charlie-fleet-pass "
+            "trigger can relaunch a clean supervisor on its next tick — "
+            "disable the task first if the fleet must stay down (see "
+            "docs/RUNBOOK.md)."
+        ),
+    )
+    fleet_stop.add_argument(
+        "--drain",
+        action="store_true",
+        help=(
+            "Suppress new dispatch (workers, rework, review workers) and "
+            "exit once live workers reach zero instead of stopping at the "
+            "next pass boundary."
+        ),
+    )
+
+
 def run_fleet_stop(args: argparse.Namespace) -> CommandResult:
     """Write the operator stop/drain request marker for the fleet supervisor.
 

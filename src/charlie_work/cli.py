@@ -50,7 +50,7 @@ from .supervise_loop import (
 )
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
-from .fleet_stop import run_fleet_stop
+from .fleet_stop import register_fleet_stop_subparser, run_fleet_stop
 from .global_config import load_layered_config
 from .github import (
     CLOSING_KEYWORD_PR_FIELDS,
@@ -459,30 +459,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    fleet_stop = fleet_sub.add_parser(
-        "stop",
-        help=(
-            "Ask the running fleet supervisor to stop by writing a "
-            "stop-request marker in the fleet dir (#1716). This is the only "
-            "clean stop for the hidden scheduled-task deployment, which has "
-            "no console to Ctrl+C. A plain stop exits at the next pass "
-            "boundary with live workers untouched; --drain additionally "
-            "suppresses new dispatch and exits once live workers reach zero. "
-            "The marker is consumed when honored, so the charlie-fleet-pass "
-            "trigger can relaunch a clean supervisor on its next tick — "
-            "disable the task first if the fleet must stay down (see "
-            "docs/RUNBOOK.md)."
-        ),
-    )
-    fleet_stop.add_argument(
-        "--drain",
-        action="store_true",
-        help=(
-            "Suppress new dispatch (workers, rework, review workers) and "
-            "exit once live workers reach zero instead of stopping at the "
-            "next pass boundary."
-        ),
-    )
+    # Issue #1716: parser wiring lives in fleet_stop.py (cli.py is at its
+    # file-size ratchet mark) — same register_*_subparser convention as the
+    # *_command modules below.
+    register_fleet_stop_subparser(fleet_sub)
 
     runners = subparsers.add_parser("runners")
     runners_sub = runners.add_subparsers(dest="runners_command", required=True)
