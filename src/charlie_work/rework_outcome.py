@@ -30,10 +30,13 @@ and no PR mutation, so a malformed outcome cannot wedge the dispatch pass.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .config import WORKER_OUTCOME_FILENAME
+from .instrumentation import log_event
 from .process_utils import find_worker_terminal_status
 from .rework_prompts import _write_text_atomic
 from .state import load_state, state_lock
@@ -106,6 +109,50 @@ def _read_rework_outcome(
         worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
         return read_worker_outcome(worktree_path)
     return None
+
+
+def fresh_completed_worker_outcome(
+    worktree_path: Path | None,
+    *,
+    live_head_sha: str | None,
+    dispatched_at: datetime | None,
+) -> dict[str, Any] | None:
+    """Return a worktree ``.worker-outcome.json`` that proves a dead worker
+    completed its handoff despite leaving no terminal-status record
+    (issue #1911).
+
+    The orphan sweep uses this before crediting a worker death: adapters that
+    never write a terminal record (``devin-shell`` — only
+    ``claude_code.launch_claude_worker`` runs ``start_terminal_status_watcher``)
+    and sessions whose watcher died with the orchestrator both surface as
+    ``terminal_exit_code is None``, indistinguishable from a crash by PID
+    alone. The on-disk outcome is the durable signal that separates them, but
+    only when it is *fresh* — written after this dispatch began
+    (``dispatched_at``, the issue entry's dispatch timestamp), so a leftover
+    from a previous session does not count — reports ``push_succeeded``, is
+    not a ``blocked`` declaration, and pins ``head_sha`` to the live remote
+    head.
+
+    Every check fails safe: ``None`` sends the caller back to the existing
+    worker-death path. Never raises.
+    """
+    if worktree_path is None or not live_head_sha or dispatched_at is None:
+        return None
+    try:
+        outcome_mtime = (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime
+    except OSError:
+        return None
+    if outcome_mtime <= dispatched_at.timestamp():
+        return None
+    outcome = read_worker_outcome(worktree_path)
+    if not isinstance(outcome, dict) or outcome.get("outcome") == "blocked":
+        return None
+    if outcome.get("push_succeeded") is not True:
+        return None
+    head_sha = outcome.get("head_sha")
+    if not isinstance(head_sha, str) or head_sha != live_head_sha:
+        return None
+    return outcome
 
 
 def apply_rework_worker_outcome(
@@ -249,7 +296,73 @@ def apply_rework_worker_outcome(
         write_gate.save_state(state)
 
 
+def apply_collected_rework_outcomes(
+    gh: GitHubLike,
+    *,
+    outcome_apply_routes: Iterable[tuple[int, int]],
+    repo_root: Any,
+    worktrees_dir: Path | None,
+    sessions_dir: Path,
+    state_file: Path,
+    write_gate: WriteGate,
+) -> None:
+    """Apply each completed outcome the orphan sweep collected in-lock.
+
+    ``_detect_and_handle_orphaned_workers`` queues ``(issue_number,
+    pr_number)`` routes under its state lock when a dead worker left a
+    fresh, on-target outcome; this runs the post-lock half. Each route goes
+    through :func:`apply_rework_worker_outcome`, which re-reads the outcome
+    file, re-verifies the live remote head against the reported
+    ``head_sha``, and dedups per applied head -- so an already-applied entry
+    is skipped cheaply and a transient failure retries on the next pass.
+
+    The per-route guard is defense-in-depth: ``apply_rework_worker_outcome``
+    is contractually never-raises, but an escaped exception here would
+    propagate out of the sweep and starve every later route *and* the
+    ``review_routes`` drain that follows it in the caller. A breach is
+    recorded (``rework_outcome_apply_failed``, warning) and the loop
+    continues; ``log_event`` is used rather than the state-ring emitter
+    because it never raises and never contends for the state lock.
+    """
+    if not isinstance(repo_root, Path) or worktrees_dir is None:
+        return
+    for issue_number, pr_number in outcome_apply_routes:
+        try:
+            apply_rework_worker_outcome(
+                gh,
+                repo_root=repo_root,
+                worktrees_dir=worktrees_dir,
+                sessions_dir=sessions_dir,
+                state_file=state_file,
+                write_gate=write_gate,
+                issue_number=issue_number,
+                pr_number=pr_number,
+            )
+        except Exception as exc:
+            logger.exception(
+                "apply_rework_worker_outcome escaped for issue %s / pr %s",
+                issue_number,
+                pr_number,
+            )
+            # Breach telemetry must fire inside an except handler where the
+            # gate may be in an unknown state; log_event writes events.db
+            # (SQLite), not gated state.json, and never raises.
+            # write-gate-exempt(issue=1911): deliberate raw breach event; see above
+            log_event(
+                state_file,
+                "rework_outcome_apply_failed",
+                {
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                level="warning",
+            )
+
+
 __all__ = [
     "APPLIED_HEADS_KEY",
+    "apply_collected_rework_outcomes",
     "apply_rework_worker_outcome",
+    "fresh_completed_worker_outcome",
 ]
