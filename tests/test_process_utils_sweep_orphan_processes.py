@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
+import charlie_work.process_utils as _pu
 from charlie_work.process_utils import sweep_orphan_processes
 
 
@@ -84,3 +87,68 @@ def test_sweep_orphan_processes_windows_subprocess_error() -> None:
         mock_run.side_effect = subprocess.TimeoutExpired("powershell", 10)
         orphans = sweep_orphan_processes("/some/worktree/path")
         assert orphans == []
+
+
+@pytest.mark.parametrize(
+    "worktree_path",
+    [
+        "",  # empty needle: ``-like "**"``-equivalent matches every process
+        "   ",  # whitespace-only — same match-everything shape after strip
+        " \t\n ",  # mixed whitespace
+        "C:\\",  # drive root — matches anything under C:\
+        "C:\\a",  # below _MIN_SWEEP_WORKTREE_PATH_LENGTH
+        "a/b",  # below minimum length despite a separator
+        "worktrees",  # bare name, no separator — never a worktree path
+        "D:\\worktrees\\*",  # -like wildcard metachar — matches the whole host
+        "D:\\worktrees\\a?b",  # -like '?' metacharacter
+        'D:\\worktrees\\"x',  # quote breaks out of the -like pattern string
+        "D:\\worktrees\\a[b]",  # -like character-class metacharacters
+    ],
+)
+def test_sweep_orphan_processes_rejects_degenerate_needles(
+    monkeypatch: pytest.MonkeyPatch, worktree_path: str
+) -> None:
+    """Issue #1842: a degenerate ``worktree_path`` must be refused before the
+    ``-like "*<path>*"`` filter is ever built.
+
+    ``""``/whitespace produces a needle that matches *every* CommandLine on
+    the host — including the pytest controller/uv/pwsh ancestry running the
+    sweep itself — and would feed ``os.getpid()``'s own tree to
+    ``kill_orphan_pid``. The refusal must fire before any PowerShell/CIM
+    query runs, so this test forces the Windows branch on every platform and
+    spies on ``subprocess.run``: any query at all is a failure, and the fake
+    answer hands back this process's own PID so a regression is also caught
+    by the result assertions.
+    """
+    import json
+
+    # Force the Windows code path regardless of host so path validation is
+    # the only thing that can prevent the CIM query.
+    monkeypatch.setattr(_pu.os, "name", "nt")
+    monkeypatch.setattr(_pu.shutil, "which", lambda _name: "powershell")
+
+    run_calls: list[Any] = []
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        run_calls.append(args)
+        # If the degenerate needle ever reaches CIM it matches this process
+        # too — return os.getpid() so a regression shows up in the result
+        # assertions, not just in the spy.
+        payload = json.dumps(
+            [
+                {
+                    "ProcessId": os.getpid(),
+                    "Name": "pytest.exe",
+                    "CommandLine": f"pytest.exe {worktree_path}",
+                }
+            ]
+        )
+        return subprocess.CompletedProcess(args, 0, payload, "")
+
+    monkeypatch.setattr(_pu.subprocess, "run", fake_run)
+
+    orphans = sweep_orphan_processes(worktree_path)
+
+    assert run_calls == [], f"degenerate worktree_path {worktree_path!r} reached the CIM query"
+    assert all(orphan["pid"] != os.getpid() for orphan in orphans)
+    assert orphans == []

@@ -525,6 +525,143 @@ def start_terminal_status_watcher(
     return thread
 
 
+# Hard backstop on the parent-PID walk in ``_self_ancestor_pids`` — the same
+# bound ``quiesce.self_process_chain`` carries as ``_MAX_CHAIN_DEPTH``. A
+# malformed or adversarial ppid snapshot (a cycle) must never spin the guard;
+# real chains are a handful of hops.
+_MAX_ANCESTOR_CHAIN_HOPS = 64
+
+
+def _win32_process_ppid_snapshot() -> dict[int, int]:
+    """Snapshot ``pid -> ppid`` for every process via one CIM query.
+
+    Leaner than ``quiesce.list_processes``: it selects only
+    ``ProcessId``/``ParentProcessId``, makes a single attempt, and uses a
+    10s timeout — this runs on the kill path inside ``kill_process_tree`` /
+    ``kill_orphan_pid``, where quiesce's 60s x 2 retry budget (sized for a
+    once-per-invocation operator gate) could stall an orphan sweep for
+    minutes under load.
+
+    Returns ``{}`` on any failure (no PowerShell, timeout, non-zero exit,
+    unparseable output). The caller degrades to the bare self-pid guard
+    rather than disabling process reaping on a host whose process-listing
+    substrate is broken — see ``_self_ancestor_pids``.
+    """
+    ppid_by_pid: dict[int, int] = {}
+    if not shutil.which("powershell"):
+        return ppid_by_pid
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | "
+                "Select-Object ProcessId, ParentProcessId | ConvertTo-Json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            **no_console_window_kwargs(),
+        )
+        if result.returncode != 0:
+            return ppid_by_pid
+        data = json.loads(result.stdout)
+    except (
+        subprocess.TimeoutExpired,
+        subprocess.SubprocessError,
+        FileNotFoundError,
+        json.JSONDecodeError,
+    ):
+        return ppid_by_pid
+
+    # No ``-AsArray``: that switch is PowerShell 6+ and Windows PowerShell
+    # 5.1 fails the whole command on it (see ``quiesce.list_processes``).
+    # ``ConvertTo-Json`` therefore emits a bare object when exactly one
+    # process matches — normalize both shapes.
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return ppid_by_pid
+
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            pid = int(entry["ProcessId"])
+            ppid = int(entry.get("ParentProcessId") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        ppid_by_pid[pid] = ppid
+    return ppid_by_pid
+
+
+def _posix_process_ppid_snapshot(proc_root: Path = Path("/proc")) -> dict[int, int]:
+    """Snapshot ``pid -> ppid`` from procfs (``/proc/<pid>/stat``).
+
+    ``proc_root`` is a parameter — not a constant read at call time — so
+    tests can point it at a fabricated procfs tree without touching the
+    host's (same convention as ``host_load._list_processes_posix``).
+    Processes that exit or become unreadable mid-scan are skipped: a
+    snapshot can never be perfectly atomic, and a vanished entry is not
+    worth failing the walk over. Returns ``{}`` where procfs is absent.
+    """
+    ppid_by_pid: dict[int, int] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return ppid_by_pid
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat_text = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+            # ppid is the first field after ``state`` once comm (which can
+            # contain spaces/parens) is split off on the LAST ')'.
+            fields = stat_text.rpartition(")")[2].split()
+            ppid_by_pid[int(entry.name)] = int(fields[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    return ppid_by_pid
+
+
+def _self_ancestor_pids() -> frozenset[int]:
+    """Return ``os.getpid()`` plus every ancestor PID, best-effort.
+
+    The kill primitives consult this so a caller can never terminate its own
+    ancestry: on Windows ``taskkill /T /PID <ancestor>`` fells the ancestor's
+    whole subtree, which contains the caller — the issue #1842 failure shape
+    (a hosted-CI pytest controller terminated mid-run, no traceback, no
+    junit). The sweep that feeds PIDs to ``kill_orphan_pid`` matches on a
+    CommandLine substring, and a too-broad worktree needle legitimately
+    matches that ancestry's command lines.
+
+    The walk mirrors ``quiesce.self_process_chain``'s termination rules: a
+    parent absent from the snapshot, a cycle, or the hop cap ends it. When
+    the snapshot cannot be taken at all the result degrades to
+    ``{os.getpid()}`` — on Windows the only producer of orphan PIDs
+    (``sweep_orphan_processes``) needs the same CIM substrate, so a broken
+    snapshot mostly means there was no sweep output to act on either;
+    collapsing to the pre-#1842 self-pid guard keeps direct
+    ``kill_process_tree`` callers (which carry start-time fingerprints)
+    working on such a host instead of silently disabling reaping.
+    """
+    if os.name == "nt":
+        ppid_by_pid = _win32_process_ppid_snapshot()
+    else:
+        ppid_by_pid = _posix_process_ppid_snapshot()
+    self_pid = os.getpid()
+    chain: set[int] = {self_pid}
+    current = self_pid
+    for _ in range(_MAX_ANCESTOR_CHAIN_HOPS):
+        parent = ppid_by_pid.get(current)
+        if parent is None or parent <= 0 or parent in chain:
+            break
+        chain.add(parent)
+        current = parent
+    return frozenset(chain)
+
+
 def kill_process_tree(pid: int, expected_start_time: float | None = None) -> list[int]:
     """Kill a process and all its children (process tree).
 
@@ -551,20 +688,25 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
     if pid <= 0:
         return killed_pids
 
-    # Defense-in-depth (issue #627): never kill the calling process. The fleet
-    # supervisor reaps stalled workers from within its own process image, so
-    # ``os.getpid()`` here IS the supervisor. A tree walk or ``killpg`` that
-    # reached the supervisor would terminate it silently (exit=-1, no event, no
-    # alert) — exactly the #627 failure shape. Exempt it explicitly by PID
-    # rather than by name matching: process names are toothpick-brittle (every
-    # binary rename breaks them) and #608 shows child enumeration is
-    # untrustworthy under load. On Windows ``taskkill /T /PID`` only kills
-    # descendants so the supervisor (an ancestor) is already safe, but this
-    # guard also covers a recycled-PID or bogus-caller case where ``pid``
-    # passed in is the supervisor itself. On POSIX the existing
-    # ``pgid == os.getpgid(0)`` guard covers the process-group shape; this PID
-    # guard covers the direct case.
-    if pid == os.getpid():
+    # Defense-in-depth (issues #627, #1842): never kill the calling process
+    # or any of its ancestors. The fleet supervisor reaps stalled workers from
+    # within its own process image, so ``os.getpid()`` here IS the supervisor.
+    # A tree walk or ``killpg`` that reached the supervisor would terminate it
+    # silently (exit=-1, no event, no alert) — exactly the #627 failure shape.
+    # Exempt it explicitly by PID rather than by name matching: process names
+    # are toothpick-brittle (every binary rename breaks them) and #608 shows
+    # child enumeration is untrustworthy under load.
+    #
+    # #1842 widened the exemption from the bare self-PID to the caller's full
+    # ancestor chain: on Windows ``taskkill /T /PID <ancestor>`` fells the
+    # ancestor's whole subtree — which contains the caller — so a sweep-hit or
+    # bogus ``pid`` naming any ancestor (uv, the pytest controller, the step's
+    # pwsh) terminates this process mid-run too. That is exactly the observed
+    # CI death: pytest controller gone, no traceback, no junit. On POSIX the
+    # existing ``pgid == os.getpgid(0)`` guard below still covers the
+    # process-group shape; this PID-set check covers the direct case on both
+    # platforms regardless of group boundaries.
+    if pid in _self_ancestor_pids():
         return killed_pids
 
     # Re-verify process identity via start time if provided
@@ -627,6 +769,22 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
     return killed_pids
 
 
+# Minimum length a ``worktree_path`` needle must reach before
+# ``sweep_orphan_processes`` embeds it in the ``-like "*<path>*"`` filter —
+# long enough to actually name a directory (``C:\a\b``-class), far below every
+# real worktree path this system hands it (``.var/charlie-work/worktrees/...``).
+# Shorter values can only be drive roots, bare drive letters, or fragments —
+# each of which as a CommandLine substring matches far more than one worktree's
+# orphans.
+_MIN_SWEEP_WORKTREE_PATH_LENGTH = 8
+
+# Characters that can never appear in a real Windows worktree path but corrupt
+# the ``-like`` needle: ``*``, ``?``, ``[]`` are -like wildcard metacharacters
+# (a ``*`` needle matches every CommandLine on the host), and ``"`` breaks out
+# of the double-quoted pattern inside the -Command string.
+_SWEEP_PATH_FORBIDDEN_CHARS = '*?[]"'
+
+
 def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
     """Sweep for orphan processes whose CommandLine references a worktree path.
 
@@ -642,6 +800,12 @@ def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
 
     Args:
         worktree_path: The worktree path to search for in process CommandLines.
+            Degenerate values — empty, whitespace-only, below
+            ``_MIN_SWEEP_WORKTREE_PATH_LENGTH``, containing no path separator,
+            or containing ``-like`` wildcard metacharacters — are refused
+            (empty result, no query): as a ``-like "*<path>*"`` needle they
+            match far more than one worktree's processes, including the
+            pytest/uv/pwsh ancestry running the sweep itself (issue #1842).
 
     Returns:
         A list of dicts describing processes whose CommandLine references the
@@ -649,6 +813,19 @@ def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
         ``command_line`` (str). POSIX callers always get an empty list.
     """
     orphans: list[dict[str, Any]] = []
+
+    # Issue #1842: validate the needle *before* it reaches the -like filter.
+    # "" or whitespace produces ``-like "**"``-equivalent matching that returns
+    # every process on the host — including this process and its ancestors —
+    # and ``kill_orphan_pid`` downstream would then taskkill our own tree.
+    # Checked first so the refusal is identical on every platform.
+    needle = worktree_path.strip()
+    if (
+        len(needle) < _MIN_SWEEP_WORKTREE_PATH_LENGTH
+        or ("/" not in needle and "\\" not in needle)
+        or any(ch in needle for ch in _SWEEP_PATH_FORBIDDEN_CHARS)
+    ):
+        return orphans
 
     if os.name != "nt":
         # POSIX: not implemented - process groups handle detachment better
@@ -666,7 +843,7 @@ def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                f'Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like "*{worktree_path}*" }} | Select-Object ProcessId, CommandLine, Name | ConvertTo-Json -AsArray',
+                f'Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like "*{needle}*" }} | Select-Object ProcessId, CommandLine, Name | ConvertTo-Json -AsArray',
             ],
             capture_output=True,
             text=True,
@@ -751,7 +928,16 @@ def kill_orphan_pid(pid: int) -> None:
     ``write_gate.py`` can wrap it as ``WriteGate.kill_process`` without
     importing ``workflow.py`` (that would create an import cycle, since
     ``workflow.py`` is ``write_gate.py``'s only production importer).
+
+    Issue #1842: refuses to kill the caller's own ancestor chain
+    (``_self_ancestor_pids``), same as ``kill_process_tree``. Orphan PIDs
+    arrive from ``sweep_orphan_processes``'s CommandLine substring match, and
+    a too-broad worktree needle legitimately matches the pytest/uv/pwsh
+    ancestry above the caller — terminating it is exactly the mid-run
+    controller death that issue tracks.
     """
+    if pid <= 0 or pid in _self_ancestor_pids():
+        return
     try:
         if os.name == "nt":
             run_captured(
