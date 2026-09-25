@@ -1,0 +1,8 @@
+issue #1912: merge_ready()'s infra-failure remediation lane -- gates on
+the janitor's is_infra_failure_block sole-blocker shape translated to
+merge_ready's blocker vocabulary, runs classify_infra_failures with
+record_attempts=True on the enriched check list, and drives the shared
+_drive_infra_rerun_or_escalate mechanics. Net-new OrchestratorApp member
+declared here so the member-surface conservation check in
+tests/test_workflow_delegation_l00.py subtracts it before comparing moved
+delegates against the pre-campaign total (133).
