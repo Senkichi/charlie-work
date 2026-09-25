@@ -3073,6 +3073,7 @@ def run_fleet_supervise(
                     dry_run=dry_run,
                     failure_alarm_threshold=cfg.self_deploy_failure_alarm,
                     pull_ci_fleet=cfg.self_deploy_pull_ci_fleet,
+                    starvation_seconds=cfg.dependency_sync_starvation_seconds,
                 )
                 if not drain_state.draining
                 else None
@@ -3110,6 +3111,18 @@ def run_fleet_supervise(
                 # (34/34 tracked keys were latched this way).
                 if deploy.synced or deploy.venv_repaired:
                     print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
+                # Issue #1855: a pending sync starved past
+                # ``dependency_sync_starvation_seconds`` takes the drain
+                # posture below -- fleet_loop launches nothing new while the
+                # reap/review/merge lanes keep running -- so live workers can
+                # finish and the deferred ``uv sync`` can finally land.
+                if deploy.starved:
+                    print(
+                        f"[{now_str}] self-deploy: {deploy.message}; starvation "
+                        "bound reached -- suppressing new dispatch until the "
+                        "fleet is idle",
+                        flush=True,
+                    )
                 if notify_enabled:
                     entry = AttentionEntry(
                         issue_number=-1,
@@ -3226,7 +3239,10 @@ def run_fleet_supervise(
                 ensure_labels=labels_ensure_pending,
                 # Issue #1716: a drain pass still runs reap/verdict/review/
                 # merge lanes but dispatches nothing new.
-                drain=drain_state.draining,
+                # Issue #1855: same posture while a pending sync is starved --
+                # derived per-pass from the marker's age (not latched), so it
+                # lifts automatically the pass the sync finally lands.
+                drain=drain_state.draining or (deploy is not None and deploy.starved),
                 # Issue #1832: cooperative in-pass deadline, enforced from the
                 # same SupervisorConfig field the external wedge-kill
                 # watchdog's stale bound derives from (3x this), and the same
