@@ -4936,132 +4936,24 @@ class OrchestratorApp:
             # this retried or escalated it -- classify_check_failures only
             # iterates summary.failed (a code push can't fix an infra kill), so
             # an infra-failed PR sat blocked forever behind only a diagnostic
-            # merge_failed_attempt_alarm event. `gh run rerun RUN_ID` is
-            # dispatched WITHOUT --failed: the job never completed
-            # (cancelled/timed out, not failed), so
-            # --failed's "rerun the failed jobs in this run" semantics do not
-            # apply -- omitting it reruns the whole run, which is the correct
-            # behavior for a run that never produced a completed job to target.
-            if verdict.infra_rerun_run_ids:
-                infra_rerun_errors: list[str] = []
-                infra_triggered_run_ids: list[int] = []
-                for run_id in verdict.infra_rerun_run_ids:
-                    result = self.gh.run(["run", "rerun", str(run_id)], allow_failure=True)
-                    if isinstance(result, GitHubRunResult):
-                        if result.ok:
-                            infra_triggered_run_ids.append(run_id)
-                        else:
-                            infra_rerun_errors.append(
-                                result.error or f"gh run rerun {run_id} exited {result.returncode}"
-                            )
-                    elif isinstance(result, str):
-                        # Dry-run returns a descriptive string; treat as success.
-                        infra_triggered_run_ids.append(run_id)
-                    else:
-                        infra_rerun_errors.append(
-                            f"unexpected result from gh run rerun {run_id}: {result!r}"
-                        )
-
-                if infra_triggered_run_ids and not infra_rerun_errors:
-                    with state_lock(self.paths.state_file):
-                        state = load_state(self.paths.state_file)
-                        state["prs"][str(pr_number)] = {
-                            **state["prs"].get(str(pr_number), {}),
-                            "number": pr_number,
-                            "issue_number": issue_number,
-                            "infra_rerun_attempts": verdict.infra_rerun_attempts,
-                        }
-                        state = append_event(
-                            state,
-                            "infra_rerun_triggered",
-                            {
-                                "pr_number": pr_number,
-                                "run_ids": infra_triggered_run_ids,
-                                "head_sha": pr.get("headRefOid"),
-                            },
-                            state_path=self.paths.state_file,
-                        )
-                        save_state(self.paths.state_file, state)
-                    return CommandResult(
-                        False,
-                        f"infra rerun triggered for PR #{pr_number}: run(s) "
-                        + ", ".join(str(rid) for rid in infra_triggered_run_ids),
-                        {
-                            "pr": pr_number,
-                            "issue": issue_number,
-                            "infra_rerun_run_ids": infra_triggered_run_ids,
-                            "checks_unavailable": checks is None,
-                        },
-                    )
-
-                # Rerun API error: record it, but do not consume the attempt.
-                with state_lock(self.paths.state_file):
-                    state = load_state(self.paths.state_file)
-                    state = append_event(
-                        state,
-                        "infra_rerun_failed",
-                        {
-                            "pr_number": pr_number,
-                            "run_ids": list(verdict.infra_rerun_run_ids),
-                            "errors": infra_rerun_errors,
-                        },
-                        state_path=self.paths.state_file,
-                    )
-                    save_state(self.paths.state_file, state)
-
-            if (
-                issue_number is not None
-                and verdict.is_infra_failure_block
-                and verdict.infra_definitive_failed
-            ):
-                # Attempt cap exhausted (or no parseable run id at all): there
-                # is no code-fix rework path for an infra failure, so escalate
-                # straight to a human instead of looping forever on a PR that
-                # can never clear the gate on its own -- this is the bug
-                # issue #841 fixes (previously: a diagnostic
-                # merge_failed_attempt_alarm event and nothing else).
-                with state_lock(self.paths.state_file):
-                    state = load_state(self.paths.state_file)
-                    state = _escalate_issue(
-                        state,
-                        issue_number,
-                        reason="infra_rerun_cap_exceeded",
-                        reason_class="mechanical",
-                        pr_number=pr_number,
-                        pr_extra={"infra_rerun_attempts": verdict.infra_rerun_attempts},
-                    )
-                    state = append_event(
-                        state,
-                        "infra_rerun_escalated",
-                        {
-                            "pr_number": pr_number,
-                            "issue_number": issue_number,
-                            "checks": list(verdict.infra_definitive_failed),
-                        },
-                        state_path=self.paths.state_file,
-                    )
-                    save_state(self.paths.state_file, state)
-                edge = _escalation_edge("escalated", "mechanical")
-                result = transition(self.gh, self.config.labels, issue_number, edge)
-                label_error = None
-                if result.outcome != TransitionOutcome.APPLIED:
-                    label_error = {
-                        "edge": edge,
-                        "outcome": result.outcome.value,
-                        "add_failures": result.add_failures,
-                        "remove_failures": result.remove_failures,
-                    }
-                return CommandResult(
-                    False,
-                    f"PR #{pr_number} infra-failed check(s) exhausted rerun cap: "
-                    + ", ".join(verdict.infra_definitive_failed),
-                    {
-                        "pr": pr_number,
-                        "issue": issue_number,
-                        "infra_escalated": True,
-                        "label_error": label_error,
-                    },
-                )
+            # merge_failed_attempt_alarm event. The mechanics themselves moved
+            # into _drive_infra_rerun_or_escalate (issue #1912) so
+            # merge_ready()'s carried-forward-verdict lane drives the identical
+            # rerun/escalate sequence -- the two lanes share one
+            # implementation so they cannot drift apart again.
+            infra_remediation = self._drive_infra_rerun_or_escalate(
+                pr_number,
+                issue_number,
+                head_sha=pr.get("headRefOid"),
+                rerun_run_ids=verdict.infra_rerun_run_ids,
+                infra_rerun_attempts=verdict.infra_rerun_attempts,
+                definitive_failed=verdict.infra_definitive_failed,
+                escalate_exhausted=verdict.is_infra_failure_block,
+                ok=False,
+                extra_data={"checks_unavailable": checks is None},
+            )
+            if infra_remediation is not None:
+                return infra_remediation
 
             # Issue #1383: infra_blocked required checks (fleet-wide Actions
             # budget/runner outage) are held without dispatching rework and
@@ -7805,6 +7697,32 @@ class OrchestratorApp:
                             "merge_attempt_warning": None,
                         },
                     )
+
+        # Issue #1912: an infra-failed required check (CANCELLED/
+        # INFRA_FAILURE/TIMED_OUT) on an approved head gets the same bounded
+        # auto-rerun + escalation review() performs (issue #841). A carried-
+        # forward verdict reaches this function via loop()'s
+        # already_approved fast path without ever re-entering review(), so
+        # without this lane a cancelled check on the carried-forward head
+        # looped forever behind merge_failed_attempt_alarm diagnostics alone
+        # (live instance: swole PR #349 / issue #174). Returns a result to
+        # early-return when a rerun was dispatched or the cap escalated;
+        # None (e.g. a rerun API error, which does not consume the attempt)
+        # falls through to the normal bookkeeping below so the pass is still
+        # recorded.
+        infra_remediation = self._merge_ready_infra_remediation(
+            pr_number,
+            pr,
+            issue_number,
+            decision,
+            enriched_checks,
+            summary,
+            approved=approved,
+            sync_failed=sync_failed,
+            merge_conflict=merge_conflict,
+        )
+        if infra_remediation is not None:
+            return infra_remediation
 
         # Issue #1060: derive ``can_merge`` from a single dict of gate inputs
         # and persist that same dict in the ``merge_ready`` event below. The
