@@ -141,10 +141,10 @@ CHARLIE_STATUS_TIMEOUT_SECONDS = 120
 # per-repo refresh gap (the same series LOOP_PASS_STALE_MINUTES cites: median
 # ~10.4m, p90 ~20m) routinely lands served ages in the upper TTL band. The
 # original 600s therefore flagged normal operation on every repo, every tick
-# (observed 881s fleet-wide, 2026-09-24). 1800s = 2x the default TTL = the
-# default ``max_pass_runtime_seconds``: under default config this can only
-# fire when a deployment widened the TTL past 30 minutes and is genuinely
-# serving blocked data that old — the degraded case this warning exists for.
+# (observed 881s fleet-wide, 2026-09-24). 1800s = 2x the default TTL: under
+# default config this can only fire when a deployment widened the TTL past
+# 30 minutes and is genuinely serving blocked data that old — the degraded
+# case this warning exists for.
 STATUS_CACHE_STALE_SECONDS = 1800
 
 # in-progress-stale worktree mtime threshold (issue #1379). The events-based
