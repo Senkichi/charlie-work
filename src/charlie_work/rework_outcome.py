@@ -31,9 +31,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .config import WORKER_OUTCOME_FILENAME
 from .process_utils import find_worker_terminal_status
 from .rework_prompts import _write_text_atomic
 from .state import load_state, state_lock
@@ -106,6 +108,50 @@ def _read_rework_outcome(
         worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
         return read_worker_outcome(worktree_path)
     return None
+
+
+def fresh_completed_worker_outcome(
+    worktree_path: Path | None,
+    *,
+    live_head_sha: str | None,
+    dispatched_at: datetime | None,
+) -> dict[str, Any] | None:
+    """Return a worktree ``.worker-outcome.json`` that proves a dead worker
+    completed its handoff despite leaving no terminal-status record
+    (issue #1911).
+
+    The orphan sweep uses this before crediting a worker death: adapters that
+    never write a terminal record (``devin-shell`` — only
+    ``claude_code.launch_claude_worker`` runs ``start_terminal_status_watcher``)
+    and sessions whose watcher died with the orchestrator both surface as
+    ``terminal_exit_code is None``, indistinguishable from a crash by PID
+    alone. The on-disk outcome is the durable signal that separates them, but
+    only when it is *fresh* — written after this dispatch began
+    (``dispatched_at``, the issue entry's dispatch timestamp), so a leftover
+    from a previous session does not count — reports ``push_succeeded``, is
+    not a ``blocked`` declaration, and pins ``head_sha`` to the live remote
+    head.
+
+    Every check fails safe: ``None`` sends the caller back to the existing
+    worker-death path. Never raises.
+    """
+    if worktree_path is None or not live_head_sha or dispatched_at is None:
+        return None
+    try:
+        outcome_mtime = (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime
+    except OSError:
+        return None
+    if outcome_mtime <= dispatched_at.timestamp():
+        return None
+    outcome = read_worker_outcome(worktree_path)
+    if not isinstance(outcome, dict) or outcome.get("outcome") == "blocked":
+        return None
+    if outcome.get("push_succeeded") is not True:
+        return None
+    head_sha = outcome.get("head_sha")
+    if not isinstance(head_sha, str) or head_sha != live_head_sha:
+        return None
+    return outcome
 
 
 def apply_rework_worker_outcome(
@@ -252,4 +298,5 @@ def apply_rework_worker_outcome(
 __all__ = [
     "APPLIED_HEADS_KEY",
     "apply_rework_worker_outcome",
+    "fresh_completed_worker_outcome",
 ]

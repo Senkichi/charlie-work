@@ -179,6 +179,11 @@ from .process_utils import (
     find_worker_terminal_status,
     is_pid_alive,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
 )
+from .rework_outcome import (
+    APPLIED_HEADS_KEY,
+    apply_rework_worker_outcome,
+    fresh_completed_worker_outcome,
+)
 from .write_gate import WriteGate, require_write_gate
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -1657,6 +1662,12 @@ def _detect_and_handle_orphaned_workers(
       ``status="rework_requested"`` (evidence the post-approval rework lane
       dispatched this worker) and head is unchanged since review, reset to
       "rework_requested" -- same as the request_changes branch (issue #1109)
+    - Issue #1911: before either reset, when no terminal-status record exists
+      (``terminal_exit_code is None`` -- the normal shape for devin-shell
+      sessions, which never get a watcher), a fresh on-target
+      ``.worker-outcome.json`` in the worktree proves the dispatch completed;
+      its PR edits are applied through the #1877 outcome-apply path and the
+      finding surfaces once as drift instead of crediting a worker death.
     - Otherwise, surface as drift for human triage (once per unchanged finding)
     - Do NOT clear worker_pid from state.json after handling (issue #282: the
       recovery path needs the fingerprint to verify the worktree is safe to reset).
@@ -2200,6 +2211,94 @@ def _detect_and_handle_orphaned_workers(
     # Issue #654: dead dispatched workers time-escalated inside the lock
     # collected here for the post-lock transition() call (network I/O).
     reap_escalations: list[int] = []
+    # Issue #1911: (issue_number, pr_number) pairs whose dead worker left a
+    # fresh, on-target .worker-outcome.json despite no terminal record.
+    # Collected in-lock below and applied post-lock through the #1877 seam
+    # (apply_rework_worker_outcome does network I/O and takes state_lock
+    # itself, so it cannot run inside this function's lock).
+    outcome_apply_routes: list[tuple[int, int]] = []
+
+    def _handle_dead_worker_completed_outcome(
+        *,
+        state: dict[str, Any],
+        sweep_events: list[tuple[str, dict[str, Any]]],
+        entry: dict[str, Any],
+        issue_number: int,
+        pr_number: int,
+        pr_data: dict[str, Any],
+        reviewed_head_sha: str | None,
+        live_head_sha: str | None,
+        terminal_pid: Any,
+        terminal_exit_code: int | None,
+        terminal_duration_seconds: Any,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> bool:
+        """Recover a dead worker that provably completed its handoff (#1911).
+
+        Returns ``True`` only when there is no terminal record
+        (``terminal_exit_code is None``) AND the worktree holds a fresh,
+        on-target ``.worker-outcome.json`` -- written after this dispatch's
+        ``dispatched_at`` (a previous session's leftover does not count),
+        reporting ``push_succeeded``, and pinning ``head_sha`` to the live
+        head. In that case the outcome is queued for the post-lock #1877
+        apply pass (idempotent: ``APPLIED_HEADS_KEY`` dedups on the reported
+        head, so a transient failure retries next pass while an
+        already-applied outcome is never re-queued) and the finding surfaces
+        once via the same fingerprinted drift the clean-exit (#773) branch
+        uses -- no ``worker_death_at`` credit and no ``rework_requested``
+        reset, the two steps that drove the swole#198 0-commit
+        ``no_op_rework_attempts_cap_exceeded`` loop.
+
+        Every negative answer (a recorded exit code -- zero handled by the
+        caller's own branch, non-zero being a confirmed crash -- a missing
+        branch/worktree/timestamp, a stale or off-target outcome) returns
+        ``False`` and leaves the caller's worker-death path untouched.
+        """
+        if terminal_exit_code is not None or not live_head_sha:
+            return False
+        branch = pr_data.get("headRefName") or entry.get("branch_name")
+        if not branch or not isinstance(repo_root, Path) or worktrees_dir is None:
+            return False
+        outcome = fresh_completed_worker_outcome(
+            worktree_path_for_branch(repo_root, branch, worktrees_dir),
+            live_head_sha=live_head_sha,
+            dispatched_at=_parse_iso_timestamp(entry.get("dispatched_at")),
+        )
+        if outcome is None:
+            return False
+        outcome_head_sha = outcome.get("head_sha")
+        applied_heads = state.get(APPLIED_HEADS_KEY, {})
+        if not (
+            isinstance(applied_heads, dict)
+            and applied_heads.get(str(issue_number)) == outcome_head_sha
+        ):
+            outcome_apply_routes.append((issue_number, pr_number))
+        fingerprint = _drift_fingerprint(
+            reason="dead_worker_completed_outcome",
+            reviewed_head_sha=reviewed_head_sha,
+        )
+        if entry.get("orphan_drift_fingerprint") == fingerprint:
+            return True
+        entry["orphan_drift_fingerprint"] = fingerprint
+        entry["orphan_drift_at"] = utc_now()
+        sweep_events.append(
+            (
+                "orphaned_worker_drift",
+                {
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "previous_status": "dispatched",
+                    "reason": "dead_worker_completed_outcome",
+                    "pid": terminal_pid,
+                    "exit_code": terminal_exit_code,
+                    "duration_seconds": terminal_duration_seconds,
+                    "worker_outcome_head_sha": outcome_head_sha,
+                    **(extra_payload or {}),
+                },
+            )
+        )
+        return True
+
     with state_lock(state_file):
         state = load_state(state_file)
         sweep_events: list[tuple[str, dict[str, Any]]] = []
@@ -2368,9 +2467,24 @@ def _detect_and_handle_orphaned_workers(
                                     },
                                 )
                             )
-                        else:
-                            # No terminal record, or a non-zero/None exit code:
-                            # unchanged from pre-#773 behavior -- safe to reset
+                        elif not _handle_dead_worker_completed_outcome(
+                            state=state,
+                            sweep_events=sweep_events,
+                            entry=entry,
+                            issue_number=issue_number,
+                            pr_number=pr_number,
+                            pr_data=pr_data,
+                            reviewed_head_sha=reviewed_head_sha,
+                            live_head_sha=live_head_sha,
+                            terminal_pid=terminal_pid,
+                            terminal_exit_code=terminal_exit_code,
+                            terminal_duration_seconds=terminal_duration_seconds,
+                        ):
+                            # No terminal record and no fresh on-target
+                            # outcome file, or a non-zero exit code (a
+                            # recorded crash never counts as a completed
+                            # outcome -- issue #1911): unchanged from
+                            # pre-#773 behavior -- safe to reset
                             # to rework_requested (PR head unchanged since
                             # request_changes).
                             entry["status"] = "rework_requested"
@@ -2524,9 +2638,27 @@ def _detect_and_handle_orphaned_workers(
                                     },
                                 )
                             )
-                        else:
-                            # No terminal record, or a non-zero/None exit
-                            # code: safe to reset to rework_requested (PR head
+                        elif not _handle_dead_worker_completed_outcome(
+                            state=state,
+                            sweep_events=sweep_events,
+                            entry=entry,
+                            issue_number=issue_number,
+                            pr_number=pr_number,
+                            pr_data=pr_data,
+                            reviewed_head_sha=reviewed_head_sha,
+                            live_head_sha=live_head_sha,
+                            terminal_pid=terminal_pid,
+                            terminal_exit_code=terminal_exit_code,
+                            terminal_duration_seconds=terminal_duration_seconds,
+                            extra_payload={
+                                "decision": "approved",
+                                "pr_state_status": pr_state_status,
+                            },
+                        ):
+                            # No terminal record and no fresh on-target
+                            # outcome file, or a non-zero exit code
+                            # (issue #1911): safe to reset to rework_requested
+                            # (PR head
                             # unchanged since the approved review, and the
                             # post-approval rework lane dispatched this
                             # worker). Records this as a worker death with a
@@ -3140,6 +3272,25 @@ def _detect_and_handle_orphaned_workers(
             write_gate=write_gate,
         )
         write_gate.save_state(state)
+
+    # Issue #1911: apply each recovered completed outcome through the #1877
+    # seam, outside the lock (the helper does network I/O and takes
+    # state_lock itself). It re-reads the outcome file, re-verifies the live
+    # remote head against the reported head_sha, and dedups per applied head
+    # -- so an already-applied entry is skipped cheaply and a transient
+    # failure retries on the next pass.
+    if isinstance(repo_root, Path) and worktrees_dir is not None:
+        for apply_issue_number, apply_pr_number in outcome_apply_routes:
+            apply_rework_worker_outcome(
+                gh,
+                repo_root=repo_root,
+                worktrees_dir=worktrees_dir,
+                sessions_dir=sessions_dir,
+                state_file=state_file,
+                write_gate=write_gate,
+                issue_number=apply_issue_number,
+                pr_number=apply_pr_number,
+            )
 
     # Route head-advanced request_changes findings to the review lane outside
     # the state lock. review() generates the packet, fires the review_started
