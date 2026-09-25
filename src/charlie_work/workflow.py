@@ -922,9 +922,8 @@ class ConcurrencyGovernorResult:
     # could happen, so no probe), or when the probe itself failed (fail-open
     # -- see host_load.py), ints otherwise. Issue #1903 split the term into
     # two knobs: ``host_load_max_pytest_trees`` (the governor -- clamps by
-    # suite headroom ``cap - live_trees``) and
-    # ``host_load_max_pytest_processes`` (the fan-out brake -- strict ``>``
-    # trip to 0 on abnormal ``-n`` width).
+    # suite headroom ``cap - live_trees``) and ``host_load_max_pytest_processes``
+    # (the fan-out brake -- strict ``>`` trip to 0 on abnormal ``-n`` width).
     host_load_max_pytest_processes: int = 0
     host_load_max_pytest_trees: int = 0
     host_load_pytest_processes: int | None = None
@@ -961,11 +960,7 @@ class ConcurrencyGovernorResult:
 
     @property
     def host_load_enabled(self) -> bool:
-        """Return True if the host-load clamp is enabled (either knob > 0).
-
-        Issue #1903: the two knobs are independently switchable, so the
-        probe is armed when either is positive.
-        """
+        """Return True if the host-load clamp is enabled (either knob > 0)."""
         return self.host_load_max_pytest_processes > 0 or self.host_load_max_pytest_trees > 0
 
     @property
