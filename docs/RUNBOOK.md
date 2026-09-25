@@ -385,17 +385,27 @@ Mitigations (the fleet is charlie-work's, but the test config is the
 Those are *static* bounds — they shape how much load each worker adds, but a
 worker-count budget alone cannot see load the fleet did not create (CI runs on
 the same box, other repos' fleets, a sibling repo's test suite). Issue #1843 added the
-dynamic counterpart: before launching a worker, the dispatch governor counts
-the processes inside live `pytest` process trees on the host (a suite's xdist
-workers count as members of its tree) and **defers the launch** when the count
-exceeds `dispatch.host_load_max_pytest_processes` — which defaults to the
-host's logical CPU count, so "more runnable test processes than cores" is the
-built-in saturation line and the check is on out of the box. Set it to `0` to
-disable entirely, or raise/lower it to tune. A deferred launch writes a
-`dispatch_backpressure` event (`clamped_by: "host_load"`, with the measured
-process/tree counts) to the repo's `events.db`, and a failed measurement fails
-*open* — dispatch proceeds — with a rate-limited `host_load_unavailable`
-warning instead of a silent missing clamp.
+dynamic counterpart, recalibrated by #1903: before launching a worker, the
+dispatch governor measures live `pytest` process trees on the host and applies
+two clamps:
+
+- `dispatch.host_load_max_pytest_trees` (default: `cpu_count // 2`) — the
+  governor. Each launch adds about one suite, so the pass's dispatch limit
+  clamps to the remaining *suite* headroom `cap − live_trees`: a partial grant
+  near the cap rather than a hard 0.
+- `dispatch.host_load_max_pytest_processes` (default: `cpu_count × 3`) — the
+  fan-out brake. A raw process count scales with `-n`, not with real load
+  (the #1903 miscalibration: the old `cpu_count` default tripped at ~2
+  ordinary suites on the 16-core fleet host), so this term only trips when
+  the total count *strictly exceeds* the threshold — its job is catching a
+  single suite run at pathological width, which a tree count cannot see.
+
+Set either knob to `0` to disable that term, or both to `0` to skip the probe
+entirely. A deferred launch writes a `dispatch_backpressure` event
+(`clamped_by: "host_load"`, with the measured process/tree counts, both caps,
+and `host_load_term` naming the binding term) to the repo's `events.db`, and a
+failed measurement fails *open* — dispatch proceeds — with a rate-limited
+`host_load_unavailable` warning instead of a silent missing clamp.
 
 ## Shared-venv isolation for devin-shell
 
