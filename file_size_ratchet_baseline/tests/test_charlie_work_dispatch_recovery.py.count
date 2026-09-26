@@ -1,0 +1,8 @@
+1000
+# Issue #1917 / PR #1919 rework: the dispatch-epoch regression tests
+# (claim / success / live-worker / phantom-worker clears of
+# dead_worker_failure_kind) put the file at 905 lines -- past the 800
+# cap. Raised to the next MARK_QUANTUM multiple per the ratchet's
+# hand-raise rule; the alternative (a new test module) would duplicate
+# the dispatch/recovery fixture harness since test modules must not
+# import each other.

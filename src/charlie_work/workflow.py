@@ -134,6 +134,7 @@ from .state import (
     clear_quota_throttles,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     clear_reviewer_quota,
     defer_reviewer_probe_after,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
+    clear_dead_worker_failure_kind,  # noqa: F401  (deliberate re-export; used by moved orchestration delegates via _wf.)
     clear_escalation,
     clear_escalation_on_issue_prs,
     disarm_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
@@ -171,6 +172,7 @@ from .preflight import (
     run_preflight,  # noqa: F401  (deliberate re-export; Tier D patch target + used by moved L05 _loop_impl delegate via _wf.)
 )
 from .throttle_signatures import (
+    is_provider_throttle_failure,
     match_quota_tail,
     match_throttle_tail,
     parse_reset_clock_time,
@@ -179,7 +181,7 @@ from .process_utils import (
     find_worker_terminal_status,
     is_pid_alive,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
 )
-from . import orphaned_worker_sweep, rework_outcome
+from . import orphaned_worker_review_drain, orphaned_worker_sweep, rework_outcome
 from .write_gate import WriteGate, require_write_gate
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -1667,8 +1669,12 @@ def _detect_and_handle_orphaned_workers(
       (``terminal_exit_code is None`` -- the normal shape for devin-shell
       sessions, which never get a watcher), a fresh on-target
       ``.worker-outcome.json`` in the worktree proves the dispatch completed;
-      its PR edits are applied through the #1877 outcome-apply path and the
-      finding surfaces once as drift instead of crediting a worker death.
+      its PR edits are applied through the #1877 outcome-apply path instead
+      of crediting a worker death. Issue #1915: once that apply lands, the
+      post-lock review_routes drain calls ``review_callback`` -- a fresh
+      packet flips the issue to "reviewing"; a blocked review returns it to
+      "rework_requested" (still without a death credit). With no review
+      callback the finding surfaces once as drift, as before.
     - Otherwise, surface as drift for human triage (once per unchanged finding)
     - Do NOT clear worker_pid from state.json after handling (issue #282: the
       recovery path needs the fingerprint to verify the worktree is safe to reset).
@@ -2208,7 +2214,7 @@ def _detect_and_handle_orphaned_workers(
     # Handle orphaned workers. Head-advanced request_changes findings are
     # collected and routed to the review lane outside the state lock (review()
     # itself acquires the lock and may call transition()).
-    review_routes: list[tuple[int, int, str, str, str]] = []
+    review_routes: list[orphaned_worker_review_drain.OrphanedWorkerReviewRoute] = []
     # Issue #654: dead dispatched workers time-escalated inside the lock
     # collected here for the post-lock transition() call (network I/O).
     reap_escalations: list[int] = []
@@ -2244,69 +2250,26 @@ def _detect_and_handle_orphaned_workers(
             if entry.get("status") != "dispatched":
                 continue
 
-            # Issue #654: time-based escape for a dead dispatched worker whose
-            # drift was already surfaced on a prior pass (``orphan_drift_at`` is
-            # set) but whose PR state did not qualify for auto-reset -- a clean
-            # exit with no push (issue #773's ``dead_worker_clean_exit_no_op``
-            # branch), a non-request_changes decision, a head change without a
-            # review callback, or a PR-create failure on a pushed branch. In all
-            # of these the specific sub-branch below emits drift once, sets
-            # ``orphan_drift_at``, then on every subsequent pass the fingerprint
-            # match short-circuits to ``continue`` -- so the dispatch label
-            # (``agent:in-progress``) holds indefinitely. The label is the
-            # one-writer-per-branch mutex, so no re-dispatch can proceed on that
-            # branch until a worker that no longer exists reports back. After
-            # ``dead_dispatched_reap_minutes`` since the drift was first
-            # surfaced, escalate to ``agent:human-needed`` so a human can inspect
-            # the worktree for unpushed commits and decide whether to salvage or
-            # re-dispatch. This runs BEFORE the specific sub-branches so it is a
-            # pure backstop: on the first pass ``orphan_drift_at`` is not yet set
-            # and the specific sub-branch runs normally (either resetting
-            # immediately or emitting the first drift). Only issues that already
-            # have drift recorded and have exceeded the grace period are
-            # escalated here. 0 disables the escape (pre-#654 hold-forever).
-            orphan_drift_at = entry.get("orphan_drift_at")
-            if orphan_drift_at is not None and config.watchdog.dead_dispatched_reap_minutes > 0:
-                drift_dt = _parse_iso_timestamp(orphan_drift_at)
-                if (
-                    drift_dt is not None
-                    and (now - drift_dt).total_seconds() / 60
-                    >= config.watchdog.dead_dispatched_reap_minutes
-                ):
-                    pr_data_for_reap = pr_by_issue.get(issue_number)
-                    pr_number_for_reap = (
-                        int(pr_data_for_reap["number"]) if pr_data_for_reap else None
-                    )
-                    terminal = find_worker_terminal_status(sessions_dir, issue_number)
-                    terminal_exit_code = terminal.get("exit_code") if terminal else None
-                    state = _escalate_issue(
-                        state,
-                        issue_number,
-                        reason="dead_dispatched_worker_reap",
-                        reason_class="mechanical",
-                        pr_number=pr_number_for_reap,
-                        issue_extra={
-                            "dispatched_at": None,
-                            "orphan_drift_fingerprint": None,
-                            "orphan_drift_at": None,
-                        },
-                    )
-                    sweep_events.append(
-                        (
-                            "dead_dispatched_worker_reaped",
-                            {
-                                "issue_number": issue_number,
-                                "pr_number": pr_number_for_reap,
-                                "previous_status": "dispatched",
-                                "reason": "dead_dispatched_worker_reap",
-                                "orphan_drift_at": orphan_drift_at,
-                                "reap_minutes": (config.watchdog.dead_dispatched_reap_minutes),
-                                "exit_code": terminal_exit_code,
-                            },
-                        )
-                    )
-                    reap_escalations.append(issue_number)
-                    continue
+            # Issue #654/#1917: timed dead-dispatched escalation backstop,
+            # extracted to ``orphaned_worker_sweep`` -- it escalates only
+            # entries with drift already surfaced on a prior pass that have
+            # exceeded ``dead_dispatched_reap_minutes``, and skips deaths
+            # classified as provider throttling entirely.
+            state, dead_dispatched_reaped = (
+                orphaned_worker_sweep.maybe_reap_dead_dispatched_worker(
+                    state=state,
+                    entry=entry,
+                    issue_number=issue_number,
+                    sessions_dir=sessions_dir,
+                    pr_data=pr_by_issue.get(issue_number),
+                    dead_dispatched_reap_minutes=(config.watchdog.dead_dispatched_reap_minutes),
+                    now=now,
+                    sweep_events=sweep_events,
+                )
+            )
+            if dead_dispatched_reaped:
+                reap_escalations.append(issue_number)
+                continue
 
             # Issue #282: do not clear the liveness fingerprint here. The worker
             # is dead (``_worker_pid_alive`` returned False), but the PID record
@@ -2638,9 +2601,20 @@ def _detect_and_handle_orphaned_workers(
                 orphan_redispatch_at = _windowed_orphan_redispatch_at(
                     entry, window_minutes=config.watchdog.redispatch_window_minutes
                 )
+                # Issue #1917: a provider-throttle-classified death is a
+                # global provider condition, not a worker-quality signal —
+                # it must not count toward the orphan-sweep redispatch cap,
+                # matching the #1684 exemption the rework lanes apply to
+                # ``redispatch_at``. The classification is read from
+                # ``dead_worker_failure_kind``, stamped on the entry by the
+                # stall/dead reap lanes; earlier non-throttle deaths in the
+                # list still count.
+                provider_throttled_death = is_provider_throttle_failure(
+                    entry.get("dead_worker_failure_kind")
+                )
                 if head_changed or first_observation:
-                    orphan_redispatch_at = [now_ts]
-                elif dispatch_identity != prior_dispatch:
+                    orphan_redispatch_at = [] if provider_throttled_death else [now_ts]
+                elif dispatch_identity != prior_dispatch and not provider_throttled_death:
                     orphan_redispatch_at = orphan_redispatch_at + [now_ts]
 
                 redispatch_count = len(orphan_redispatch_at)
@@ -2826,87 +2800,22 @@ def _detect_and_handle_orphaned_workers(
         write_gate=write_gate,
     )
 
-    # Route head-advanced request_changes findings to the review lane outside
-    # the state lock. review() generates the packet, fires the review_started
-    # label transition, and returns ok when a fresh packet is produced. We then
-    # flip the issue status to "reviewing" so it is not re-detected as an orphan
-    # on every subsequent pass. If review() fails, we record a drift fingerprint
-    # so the identical finding is not re-emitted every pass.
-    for (
-        issue_number,
-        pr_number,
-        reviewed_head_sha_before,
-        live_head_sha,
-        fingerprint,
-    ) in review_routes:
-        if review_callback is None:
-            continue
-        review_result = review_callback(pr_number)
-        routed = False
-        # See _route_rework_candidate_to_review's matching comment: review()
-        # can return ok=True for the janitor-gate conflict/no-op-rework route
-        # (no packet, no review_started transition) as well as for a real
-        # packet. Only a real packet should flip this orphaned-but-dispatched
-        # issue to "reviewing".
-        routed_to_rework = bool(review_result.data.get("routed_to_rework"))
-        # Issue #558: review() also returns ok=True when it converges a
-        # CLOSED-unmerged PR's state entry to "closed" at the janitor gate.
-        # That is not a fresh packet -- the PR is dead, not transiently
-        # blocked -- so it must NOT flip this issue to "reviewing" (an
-        # ACTIVE_STATE_STATUS no reconcile rule clears while the GitHub
-        # issue itself stays open: issue_active_label_no_open_pr sees the
-        # closed PR still links to the issue, issue_active_label_with_open_pr
-        # sees no OPEN PR, and the unknown-status recompute sweep skips
-        # "reviewing" because it is a VALID_ISSUE_STATUSES member). The
-        # issue's disposition is left to the existing closed-unmerged
-        # issue-side handling (closed_unmerged_pr_active_labels). Neither
-        # the "reviewing" flip nor the transient-block drift fingerprint
-        # below applies to a permanently-dead PR.
-        closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
-        with state_lock(state_file):
-            state = load_state(state_file)
-            pr_state = state["prs"].get(str(pr_number), {})
-            entry = state["issues"].get(str(issue_number), {})
-            decision_unchanged = pr_state.get("reviewed_head_sha") == reviewed_head_sha_before
-            if (
-                review_result.ok
-                and not routed_to_rework
-                and not closed_unmerged_converged
-                and decision_unchanged
-                and isinstance(entry, dict)
-                and entry.get("status") == "dispatched"
-            ):
-                state["issues"][str(issue_number)] = {**entry, "status": "reviewing"}
-                routed = True
-            elif (
-                not review_result.ok
-                and not routed_to_rework
-                and isinstance(entry, dict)
-                and entry.get("status") == "dispatched"
-            ):
-                # Review failed: mark the drift fingerprint so the next pass
-                # does not retry/re-emit for this unchanged head.
-                state["issues"][str(issue_number)] = {
-                    **entry,
-                    "orphan_drift_fingerprint": fingerprint,
-                    "orphan_drift_at": utc_now(),
-                }
-            state = write_gate.append_event(
-                state,
-                "orphaned_worker_routed_to_review"
-                if review_result.ok
-                else "orphaned_worker_drift",
-                {
-                    "issue_number": issue_number,
-                    "pr_number": pr_number,
-                    "review_ok": review_result.ok,
-                    "routed": routed,
-                    "live_head_sha": live_head_sha,
-                    "reviewed_head_sha": reviewed_head_sha_before,
-                    "reason": "dead_worker_with_head_change",
-                },
-            )
-            write_gate.save_state(state)
+    # Route head-advanced request_changes findings -- and, since issue
+    # #1915, completed-outcome findings whose apply pass landed -- to the
+    # review lane outside the state lock. The drain (per-route exception
+    # guard, the completed-outcome apply gate, the reviewing /
+    # rework_requested / drift-fingerprint dispositions, and the
+    # rework_requested label transitions) lives in
+    # ``orphaned_worker_review_drain`` -- extracted per the file-size rule
+    # during the #1915 rework.
+    orphaned_worker_review_drain.drain_orphaned_worker_review_routes(
+        review_routes,
+        review_callback=review_callback,
+        gh=gh,
+        config=config,
+        state_file=state_file,
+        write_gate=write_gate,
+    )
 
     # Issue #654: apply the ``escalated`` label edge for dead dispatched
     # workers that exceeded the reap grace period. The state.json update
