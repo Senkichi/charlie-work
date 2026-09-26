@@ -1,0 +1,8 @@
+warning
+# Issue #1494: a recorded prior worker for the issue was still running
+# when a replacement rework launch was requested, and was reaped
+# (process-tree killed + orphan sweep) before the replacement dispatched.
+# Warning, not error: the reap is a recovery — the superseded worker is
+# gone and dispatch proceeds. The sibling ``superseded_worker_reap_failed``
+# records a pid that survived the reap attempt (or was live with no
+# start-time fingerprint) and blocked the replacement launch.

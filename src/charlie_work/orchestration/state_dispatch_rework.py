@@ -1189,15 +1189,68 @@ def _dispatch_rework_impl(
 
     manifest_path = self._layout.session_manifest
     results_path = self._layout.session_results
+    # Issue #1494: a rework launch supersedes the issue's previously
+    # dispatched worker, but every producer of ``rework_requested`` —
+    # including the janitor-gate/worktree-rescue stall path this issue
+    # covers — flips the status without checking that worker's liveness,
+    # and ``_check_worktree_writer_marker`` deliberately exempts a marker
+    # owned by one of our own live sessions, so a still-running prior
+    # worker admitted its replacement into the same worktree (#1337 ran
+    # two workers against one worktree this way). The launch trigger is
+    # the enforcement point: reap every still-live recorded worker pid for
+    # the issue first. A pid that survives the reap blocks this launch via
+    # a synthetic pre-launch failure (``prior_worker_still_alive`` →
+    # blocked_environment_at accounting, escalating at the existing cap)
+    # rather than starting a second writer on an occupied worktree.
+    superseded_blocked_results: list[SessionDispatchResult] = []
+    launchable_requests: list[SessionRequest] = []
+    for request in session_requests:
+        superseded_entry = rescue_state_snapshot.get("issues", {}).get(str(request.issue_number))
+        surviving = _wf._reap_superseded_workers(
+            request.issue_number,
+            superseded_entry if isinstance(superseded_entry, dict) else {},
+            sessions_dir,
+            worktree_path=_wf.worktree_path_for_branch(
+                self.repo_root, request.branch_name, self._layout.worktrees
+            ),
+            write_gate=self.write_gate,
+        )
+        if surviving:
+            superseded_blocked_results.append(
+                SessionDispatchResult(
+                    issue_number=request.issue_number,
+                    issue_title=request.issue_title,
+                    prompt_path=str(request.prompt_path),
+                    branch_name=request.branch_name,
+                    adapter=(
+                        "claude-code"
+                        if request.issue_number in rescue_issue_numbers
+                        else self.config.worker.harness
+                    ),
+                    ok=False,
+                    error=(
+                        "prior worker still alive after reap "
+                        f"(pid(s): {surviving}); refusing to launch a "
+                        "second worker into the same worktree"
+                    ),
+                    failure_kind="prior_worker_still_alive",
+                    pid=surviving[0],
+                )
+            )
+            continue
+        launchable_requests.append(request)
+
     # Rescue tier (issue #555): split the batch so rescue-marked issues
     # launch via the claude-code adapter pinned to rescue.worker_model
     # (see _rescue_adapter_settings), while every other candidate
     # dispatches via the pass's single configured worker harness. Reuses
     # the same dispatch_sessions()/launch_claude_worker() path for both;
     # the only difference is which AdapterSettings/config is passed in.
-    normal_requests = [r for r in session_requests if r.issue_number not in rescue_issue_numbers]
-    rescue_requests = [r for r in session_requests if r.issue_number in rescue_issue_numbers]
-    dispatch_results: list[SessionDispatchResult] = []
+    normal_requests = [
+        r for r in launchable_requests if r.issue_number not in rescue_issue_numbers
+    ]
+    rescue_requests = [r for r in launchable_requests if r.issue_number in rescue_issue_numbers]
+    dispatch_results: list[SessionDispatchResult] = list(superseded_blocked_results)
     if normal_requests:
         dispatch_results.extend(
             _wf.dispatch_sessions(
@@ -1236,7 +1289,7 @@ def _dispatch_rework_impl(
         combined_kinds = {self.config.worker.harness}
         combined_kinds.add("claude-code")
         _wf.write_session_manifest(
-            manifest_path, session_requests, adapter=manifest_adapter_label(combined_kinds)
+            manifest_path, launchable_requests, adapter=manifest_adapter_label(combined_kinds)
         )
     write_session_results(results_path, dispatch_results)
 

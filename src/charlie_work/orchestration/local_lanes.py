@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import charlie_work.workflow as _wf
-from charlie_work.adapters import SessionRequest
+from charlie_work.adapters import SessionDispatchResult, SessionRequest
 from charlie_work.claude_code import resolve_review_effort
 from charlie_work.github import GitHubError
 from charlie_work.janitor import check_operator_containment, check_test_adequacy
@@ -1881,13 +1881,57 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
             state["issues"][str(issue_number)] = entry
         self.write_gate.save_state(state)
 
-    dispatch_results = _wf.dispatch_sessions(
-        self.repo_root,
-        self._layout.session_manifest,
-        self._layout.session_results,
-        self._adapter_settings(),
-        requests,
-    )
+    # Issue #1494: the same superseded-worker reap the remote
+    # ``_dispatch_rework_impl`` performs at its launch trigger — a prior
+    # worker still running on the branch's worktree must be reaped before
+    # the replacement launches. A pid that survives blocks the launch and
+    # is recorded as a failed dispatch below so the claim releases back to
+    # ``rework_requested``.
+    launch_requests: list[SessionRequest] = []
+    superseded_failures: list[SessionDispatchResult] = []
+    for request in requests:
+        superseded_entry = (state.get("issues") or {}).get(str(request.issue_number), {})
+        surviving = _wf._reap_superseded_workers(
+            request.issue_number,
+            superseded_entry if isinstance(superseded_entry, dict) else {},
+            self._layout.sessions_dir,
+            worktree_path=_wf.worktree_path_for_branch(
+                self.repo_root, request.branch_name, self._layout.worktrees
+            ),
+            write_gate=self.write_gate,
+        )
+        if surviving:
+            superseded_failures.append(
+                SessionDispatchResult(
+                    issue_number=request.issue_number,
+                    issue_title=request.issue_title,
+                    prompt_path=str(request.prompt_path),
+                    branch_name=request.branch_name,
+                    adapter=self.config.worker.harness,
+                    ok=False,
+                    error=(
+                        "prior worker still alive after reap "
+                        f"(pid(s): {surviving}); refusing to launch a "
+                        "second worker into the same worktree"
+                    ),
+                    failure_kind="prior_worker_still_alive",
+                    pid=surviving[0],
+                )
+            )
+            continue
+        launch_requests.append(request)
+
+    dispatch_results = list(superseded_failures)
+    if launch_requests:
+        dispatch_results.extend(
+            _wf.dispatch_sessions(
+                self.repo_root,
+                self._layout.session_manifest,
+                self._layout.session_results,
+                self._adapter_settings(),
+                launch_requests,
+            )
+        )
     successful = {r.issue_number for r in dispatch_results if r.ok}
     failed_map = {
         r.issue_number: (r.error or "dispatch failed") for r in dispatch_results if not r.ok
