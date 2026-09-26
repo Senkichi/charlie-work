@@ -138,7 +138,12 @@ def test_dispatch_drift_comment_failure_does_not_abort_dispatch(
     fake_gh.issue_comment = _boom  # type: ignore[method-assign]
     app = _make_app(tmp_path, fake_gh)
 
-    with caplog.at_level(logging.WARNING, logger="charlie_work.workflow"):
+    # Scope to the package logger, never ``charlie_work.workflow``: Phase B
+    # delegate moves change the emitting ``__name__`` (the warning now comes
+    # from ``orchestration.misc_citation``), which leaves a module-level
+    # scope inert rather than failed -- see issue #1670 and the
+    # ``test_caplog_workflow_logger_scope.py`` guard.
+    with caplog.at_level(logging.WARNING, logger="charlie_work"):
         result = app.dispatch(limit=1)
 
     # Dispatch still succeeded and selected the worker despite the comment failure.

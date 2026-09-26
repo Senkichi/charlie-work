@@ -227,6 +227,42 @@ def check_ratchet_tamper(
                     redirect=None,
                 )
             )
+
+    # Issue #1620: a pinned row is a sub-saturation contract that no write
+    # path in this package ever drops -- compare() carries it through every
+    # ratchet (ratchet-down preserves the flag, de-saturation keeps the row),
+    # and a verified generation event (a full `baseline` regen re-derives
+    # entries from saturated verdicts alone) is the only sanctioned clean
+    # slate. Outside that event, a pinned entry that vanished or lost its
+    # flag is a hand-edit: deleting the row silently re-opens the regrowth
+    # window the pin exists to close, and -- unlike removing an ordinary
+    # entry, which finding #13 re-blocks the moment the point re-saturates --
+    # an un-saturated point produces no finding to catch it.
+    if not regenerated:
+        current_entries = {
+            baseline._entry_key(e): e for e in baseline.entries_of(current_document)
+        }
+        for prev in previous_entries.values():
+            if not prev.pinned:
+                continue
+            current_entry = current_entries.get(baseline._entry_key(prev))
+            if current_entry is not None and current_entry.pinned:
+                continue
+            findings.append(
+                Finding(
+                    severity="error",
+                    file=prev.file,
+                    identity=prev.identity,
+                    message=(
+                        f"tamper: pinned baseline entry for {prev.identity} was "
+                        "removed or unpinned since the previous committed "
+                        "baseline. Tooling never drops a pinned row; retire it "
+                        "through a full `baseline` regeneration or restore the "
+                        "entry."
+                    ),
+                    redirect=None,
+                )
+            )
     return findings
 
 
@@ -240,7 +276,9 @@ def check_tamper(
     on-disk baseline's member_count for a point is HIGHER than what the point
     itself currently reports, and no bump on that entry accounts for the
     difference, that is tamper (someone hand-edited the JSON to raise a
-    ceiling) -> Finding(error).
+    ceiling) -> Finding(error). Pinned entries (issue #1620) are exempt from
+    that specific check: their member_count is an operator-authored ceiling
+    that legitimately sits above the live count by design.
     """
     current_by_key = {baseline._verdict_key(v): v for v in current}
     findings: list[Finding] = []
@@ -263,10 +301,14 @@ def check_tamper(
                     )
                 )
 
-        if actual_count is not None and entry.member_count > actual_count:
+        if actual_count is not None and entry.member_count > actual_count and not entry.pinned:
             # Baseline claims more members than the point actually has, and
             # there is no bump whose `to` matches the inflated member_count —
-            # the entry itself was hand-raised.
+            # the entry itself was hand-raised. Pinned rows (issue #1620) are
+            # exempt: their member_count is an operator-authored ceiling that
+            # legitimately sits ABOVE the live count -- the headroom IS the
+            # contract -- and a cross-commit rise is still caught by
+            # check_ratchet_tamper's diff guard.
             covered = any(b.to == entry.member_count for b in entry.bumps)
             if not covered:
                 findings.append(
