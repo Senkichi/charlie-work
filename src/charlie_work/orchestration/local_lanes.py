@@ -59,6 +59,7 @@ from charlie_work.review_decision import (
     record_decision,
     reclassify_human_call_verdict,
 )
+from charlie_work.safe_path import contains
 from charlie_work.state import is_claim_stale, without_review_dispatch_claim
 from charlie_work.worker import iter_workers
 from charlie_work.worktree import (
@@ -1678,12 +1679,18 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
         # leak a worktree per merged issue. ``branch`` also deletes the
         # merged branch ref when auto_merge.delete_branch is configured,
         # matching the remote lane's post-merge cleanup.
-        remove_worktree(
-            self.repo_root,
-            worktree_path,
-            force=True,
-            branch=(branch if self.config.auto_merge.delete_branch else None),
-        )
+        # Issue #1476: a worktree outside the managed dir is a foreign
+        # checkout (``ensure_branch_worktree`` returns the registered path
+        # wherever the branch happens to live) — it belongs to whoever
+        # created it and is never removed; the branch ref can't be deleted
+        # while checked out anyway.
+        if contains(worktrees_dir, worktree_path):
+            remove_worktree(
+                self.repo_root,
+                worktree_path,
+                force=True,
+                branch=(branch if self.config.auto_merge.delete_branch else None),
+            )
         remove_review_checkout(self.repo_root, pr_number, reviews_dir=self._layout.reviews_dir)
         with _wf.state_lock(self.paths.state_file):
             state = _wf.load_state(self.paths.state_file)

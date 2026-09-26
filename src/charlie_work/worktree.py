@@ -32,7 +32,6 @@ from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
 from .config import (
     OrchestratorConfig,
     WORKER_OUTCOME_FILENAME,
-    WRITER_MARKER_FILENAME,
 )
 from . import git_pull_blockers
 from .git_retry import run_git_with_retry
@@ -61,6 +60,17 @@ from .non_worker_product import (  # noqa: F401  (deliberate re-export)
     _launcher_owned_file_matcher,
     _launcher_owned_matcher,
     _non_worker_product_matcher,
+)
+from .foreign_worktree import (  # noqa: F401  (deliberate re-export)
+    OPERATOR_MARKER_KIND,
+    OPERATOR_MARKER_SESSION_ID,
+    WorktreeForeignWriterError,
+    check_foreign_adoption,
+    find_branch_worktree,
+    log_foreign_adopted,
+    read_worktree_marker,
+    remove_worktree_marker,
+    write_worktree_marker,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,13 +121,6 @@ def _run_remote_captured(
     if result.timed_out:
         result = _invoke(command, cwd=cwd, timeout_seconds=_REMOTE_TIMEOUT_SECONDS)
     return result
-
-
-# Sentinel values for operator claim markers. The operator marker intentionally
-# does not encode the CLI invocation's transient PID; liveness is derived from
-# the ``operator_claimed_at`` field in state.json.
-OPERATOR_MARKER_SESSION_ID = "operator-claim"
-OPERATOR_MARKER_KIND = "operator"
 
 
 # Issue #807: ``worktree_unsafe`` is split at detection time into two
@@ -272,40 +275,6 @@ class LiveWorkerRedispatchError(RuntimeError):
         super().__init__(probe_result)
 
 
-class WorktreeForeignWriterError(RuntimeError):
-    """Raised when ``create_worktree`` is about to use a worktree that has a
-    live writer marker belonging to a session the orchestrator does not own
-    (e.g. an operator's editor or an out-of-band agent), OR when the target
-    branch is already checked out in a worktree at a foreign path the
-    orchestrator did not create (issue #1118). The launch shim surfaces this
-    as ``failure_kind="worktree_foreign_writer"`` so the issue stays queued
-    and the dispatch event log records the conflict.
-    """
-
-    def __init__(
-        self,
-        *,
-        worktree_path: Path,
-        pid: int | None,
-        session_id: str | None,
-    ) -> None:
-        self.worktree_path = worktree_path
-        self.pid = pid
-        self.session_id = session_id
-        if pid is None and session_id is None:
-            # Issue #1118: the branch is checked out in a worktree at a path
-            # the orchestrator did not create — no writer marker to inspect.
-            super().__init__(
-                f"worktree {worktree_path} is a foreign checkout the "
-                f"orchestrator did not create; refusing to adopt it"
-            )
-        else:
-            super().__init__(
-                f"worktree {worktree_path} has a live foreign writer "
-                f"(pid={pid}, session_id={session_id})"
-            )
-
-
 # How many lines of git's stderr to carry into a pre-merge failure message.
 # Enough for git's "untracked working tree files would be overwritten" header
 # plus the first few offending paths, without pasting a 200-line list into an
@@ -431,6 +400,12 @@ class WorktreeInfo:
     # needed (the worktree was safe to reset) or when capture failed (the
     # reset was refused and WorktreeUnsafeError was raised instead).
     rescue_capture: RescueCapture | None = None
+    # Issue #1476: True when this worktree is a foreign checkout the
+    # orchestrator adopted for a rework session — it belongs to whoever
+    # created it, so every teardown path (launch-failure cleanup, post-merge
+    # removal, janitor sweeps) must leave it on disk. Writer-marker cleanup
+    # still applies to markers this session wrote.
+    foreign_adopted: bool = False
 
 
 class WorktreeState(str, Enum):
@@ -482,18 +457,22 @@ def _default_worktrees_dir(repo_root: Path) -> Path:
 def worktree_path_for_branch(
     repo_root: Path, branch: str, worktrees_dir: Path | None = None
 ) -> Path:
-    """Return the filesystem path for the worktree that serves ``branch``."""
+    """Return the filesystem path for the worktree that serves ``branch``.
+
+    A branch already checked out in a registered worktree wins over the
+    managed-path computation: git allows only one checkout per branch, so
+    every "locate the worktree" caller (stranded-commit salvage, outcome
+    reads, operator-claim markers, de-escalation probes, stalled-death
+    inspection) must see where it actually lives — including a foreign
+    checkout adopted under issue #1476. When nothing is registered the
+    managed destination is returned, unchanged; a git error degrades to the
+    managed path too (``list_worktrees`` fails closed to ``[]``).
+    """
+    registered = find_branch_worktree(list_worktrees(repo_root), branch)
+    if registered is not None:
+        return Path(registered["worktree"])
     target_dir = worktrees_dir or _default_worktrees_dir(repo_root)
     return target_dir / _slugify(branch)
-
-
-def _write_json_atomic(path: Path, value: Any) -> None:
-    """Write JSON atomically using a temp file + rename (issue #400)."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp.replace(path)
 
 
 def read_worker_outcome(worktree_path: Path) -> dict[str, Any] | None:
@@ -525,77 +504,6 @@ def read_worker_outcome(worktree_path: Path) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         return None
     return data
-
-
-def write_worktree_marker(
-    worktree_path: Path,
-    pid: int,
-    session_id: str,
-    kind: str = "worker",
-    *,
-    process_start_time: float | None = None,
-) -> None:
-    """Write a ``.charlie-writer.json`` marker into the worktree root.
-
-    Records the process id and a session identifier so the orchestrator can
-    detect a live foreign writer before dispatching a second one into the
-    same worktree. ``kind`` distinguishes long-lived operator claim markers
-    (``pid`` is a sentinel) from ordinary worker session markers.
-
-    Issue #1423: ``process_start_time`` is the OS process creation timestamp
-    captured immediately after spawn (same fingerprint the session sidecars
-    store). It is read back by ``_reap_idle_foreign_writer`` and passed to
-    ``kill_process_tree`` so the kill path re-verifies process identity
-    immediately before terminating — the same PID-recycling defense every
-    other ``kill_process_tree`` call site in this codebase uses. A marker
-    without it (legacy marker written before this field existed, or an
-    operator sentinel marker with ``pid == 0``) cannot be safely reaped and
-    falls back to the block/escalate path instead.
-    """
-    marker_path = worktree_path / WRITER_MARKER_FILENAME
-    marker: dict[str, Any] = {
-        "pid": pid,
-        "session_id": session_id,
-        "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        "kind": kind,
-    }
-    if process_start_time is not None:
-        marker["process_start_time"] = process_start_time
-    _write_json_atomic(marker_path, marker)
-
-
-def read_worktree_marker(worktree_path: Path) -> dict[str, Any] | None:
-    """Read the writer marker for ``worktree_path``, if any."""
-    marker_path = worktree_path / WRITER_MARKER_FILENAME
-    if not marker_path.exists():
-        return None
-    try:
-        with marker_path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def remove_worktree_marker(worktree_path: Path, session_id: str | None = None) -> bool:
-    """Remove the writer marker for ``worktree_path``.
-
-    If ``session_id`` is provided, only removes the marker when its
-    ``session_id`` matches, preventing an operator-claim marker from being
-    wiped by a worker reap.
-    """
-    marker_path = worktree_path / WRITER_MARKER_FILENAME
-    if not marker_path.exists():
-        return False
-    if session_id is not None:
-        marker = read_worktree_marker(worktree_path)
-        if marker is None or marker.get("session_id") != session_id:
-            return False
-    try:
-        marker_path.unlink()
-        return True
-    except OSError:
-        return False
 
 
 def _own_live_session_pids(sessions_dir: Path) -> dict[str, int]:
@@ -1470,6 +1378,7 @@ def _merge_update_rework_branch(
     base_ref: str,
     injected_paths: tuple[str, ...] = (),
     materialize_dirs: tuple[str, ...] = (),
+    allow_scaffolding_repair: bool = True,
 ) -> ReworkMergeConflict | None:
     """Merge-update a checked-out rework branch onto the current base.
 
@@ -1494,6 +1403,11 @@ def _merge_update_rework_branch(
     collision (see below); nothing outside them — plus the launcher-owned
     root-level PR-body file family, which is likewise launcher-regenerable
     residue — is ever removed.
+
+    ``allow_scaffolding_repair=False`` disables that repair entirely: in a
+    borrowed foreign checkout (issue #1476) even a scaffolding-named file is
+    the owner's, so a pre-merge blocker simply escalates as a ``pre_merge``
+    conflict rather than being deleted.
 
     Raises:
         ReworkBranchConflictError: in two distinct situations, distinguished by
@@ -1585,6 +1499,11 @@ def _merge_update_rework_branch(
             injected_paths, materialize_dirs, include_launcher_dirs=False
         )
         unrepairable = tuple(path for path in blocking if not is_repairable(path))
+        if not allow_scaffolding_repair:
+            # Issue #1476: in a borrowed foreign checkout even a
+            # scaffolding-named file belongs to the checkout's owner — the
+            # pre-merge repair never runs there, so every blocker escalates.
+            unrepairable = blocking
         # The repairable/unrepairable verdict is taken over the *union*: a
         # single unrepairable blocker in either class means nothing is
         # repaired at all, because a partial repair that still fails the
@@ -3161,6 +3080,16 @@ def create_worktree(
       origin (e.g. the PR was rebased), hard-reset the worktree and branch
       to ``origin/{branch}`` instead of failing; the old tip is snapshotted
       first if ``issue_number`` is provided.
+    - If the worktree for the branch is a FOREIGN checkout — a path the
+      orchestrator did not create — it is adopted only when safe (issue
+      #1476): never the repo's main checkout, directory present, no live
+      foreign writer/operator claim, clean working tree, and no non-FF
+      divergence requiring a reset (a reset is permitted only in recovery
+      mode, where a writer marker must also prove a prior orchestrator
+      session ran there). An adopted worktree is returned with
+      ``foreign_adopted=True`` so every teardown path knows it is borrowed
+      and must never be removed. Anything unsafe still raises
+      ``WorktreeForeignWriterError``.
     - Otherwise, use ``git worktree add <path> <branch>`` (no ``-b``) to
       attach to the existing branch at the origin tip. On non-FF divergence
       the local branch ref is reset to ``origin/{branch}`` before the
@@ -3248,6 +3177,11 @@ def create_worktree(
     attempt_snapshot: AttemptSnapshot | None = None
     rework_conflict: ReworkMergeConflict | None = None
     rescue_capture: RescueCapture | None = None
+    # Recovery's ls-remote probe result (True = exists on origin, False =
+    # provably absent, None = no origin or probe not run). Only ``False``
+    # suppresses the rework fetch below — a killed-before-push branch has
+    # no origin ref to fetch.
+    remote_exists: bool | None = None
 
     def _snapshot_before_delete(target_branch: str) -> None:
         """Best-effort attempt-tip snapshot immediately before a branch reset.
@@ -3421,6 +3355,38 @@ def create_worktree(
         # downgrade the safety property.
         _capture_or_raise(check_path, reason, injected_paths)
 
+    def _adopt_foreign_checkout(foreign_path: Path, registered: list[dict]) -> bool:
+        """Issue #1476 gate — see ``foreign_worktree.check_foreign_adoption``.
+
+        Adapts the module-level gate to this call's context: the managed
+        target path distinguishes "foreign" from "registered via a
+        non-canonical spelling of our own path", and the ordinary
+        writer-marker guard (live foreign writer / operator claim / stale
+        cleanup / idle-fleet reap) is injected so the gate stays
+        import-cycle-free. ``marker_guard`` is ``None`` when ``sessions_dir``
+        is — the managed path skips the same check then.
+        """
+        return check_foreign_adoption(
+            foreign_path,
+            managed_path=worktree_path,
+            repo_root=repo_root,
+            registered=registered,
+            recovery=recovery is not None,
+            marker_guard=(
+                (
+                    lambda path: _check_worktree_writer_marker(
+                        path,
+                        sessions_dir,
+                        issue_number=issue_number,
+                        state_file=state_file,
+                        config=config,
+                    )
+                )
+                if sessions_dir is not None
+                else None
+            ),
+        )
+
     if recovery is not None:
         # Validate that the recovery record matches the requested branch
         recovery_branch = recovery.get("branch_name")
@@ -3475,31 +3441,44 @@ def create_worktree(
                         raise RuntimeError(
                             f"Failed to remove leftover worktree {wt_path} for recovery"
                         )
-            # Delete the local branch if it exists
-            branch_result = run_captured(
-                ["git", "branch", "--list", branch],
-                cwd=repo_root,
-                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-            )
-            if branch_result.ok and branch_result.stdout.strip():
-                # fetch-fallback: refuse to reset if the branch holds local work.
-                _raise_if_unsafe_to_reset(worktree_path)
-                # The branch never made it to origin, so any commits here are
-                # local-only. If the guard allowed the reset, the worktree is
-                # clean and the branch has no local commits, so we can safely
-                # remove the branch. Snapshot the tip before deleting it, best-
-                # effort, as a defensive artifact for post-mortem.
-                _snapshot_before_delete(branch)
-                branch_delete_result = run_captured(
-                    ["git", "branch", "-D", branch],
+                    # Refresh so the branch-checkout lookup below does not see
+                    # the just-removed managed entry.
+                    existing_worktrees = list_worktrees(repo_root)
+            if find_branch_worktree(existing_worktrees, branch) is not None:
+                # Issue #1476: the branch is checked out in a worktree the
+                # orchestrator did not create — it cannot be deleted, so the
+                # clean-restart path is unreachable (`git branch -D` on a
+                # checked-out branch fails, surfacing a bare RuntimeError).
+                # Route to the rework block, whose adoption gate applies
+                # recovery's ownership rule: a writer marker must prove a
+                # prior orchestrator session ran there.
+                rework = True
+            else:
+                # Delete the local branch if it exists
+                branch_result = run_captured(
+                    ["git", "branch", "--list", branch],
                     cwd=repo_root,
                     timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                 )
-                if not branch_delete_result.ok:
-                    raise RuntimeError(
-                        f"Failed to delete branch {branch!r} for recovery: "
-                        f"{branch_delete_result.error or branch_delete_result.stderr}"
+                if branch_result.ok and branch_result.stdout.strip():
+                    # fetch-fallback: refuse to reset if the branch holds local work.
+                    _raise_if_unsafe_to_reset(worktree_path)
+                    # The branch never made it to origin, so any commits here are
+                    # local-only. If the guard allowed the reset, the worktree is
+                    # clean and the branch has no local commits, so we can safely
+                    # remove the branch. Snapshot the tip before deleting it, best-
+                    # effort, as a defensive artifact for post-mortem.
+                    _snapshot_before_delete(branch)
+                    branch_delete_result = run_captured(
+                        ["git", "branch", "-D", branch],
+                        cwd=repo_root,
+                        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                     )
+                    if not branch_delete_result.ok:
+                        raise RuntimeError(
+                            f"Failed to delete branch {branch!r} for recovery: "
+                            f"{branch_delete_result.error or branch_delete_result.stderr}"
+                        )
             # Fall through to fresh dispatch below (rework=False)
         else:
             # Branch exists on origin or no origin - proceed with normal recovery logic
@@ -3582,52 +3561,62 @@ def create_worktree(
                     reclaimed = "pruned"
                     # Fall through to fresh dispatch below (rework=False)
             else:
-                # No worktree exists, but branch might exist
-                # Check if branch exists
-                branch_result = run_captured(
-                    ["git", "branch", "--list", branch],
-                    cwd=repo_root,
-                    timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-                )
-                if branch_result.ok and branch_result.stdout.strip():
-                    # Branch exists without worktree: check commits and reuse or delete
-                    merge_base_result = run_captured(
-                        ["git", "merge-base", resolved_base_ref, branch],
+                # No worktree exists at the managed path — but the branch may
+                # still be checked out in a worktree the orchestrator did not
+                # create (issue #1476). Route to the rework block, whose
+                # adoption gate applies recovery's ownership rule (a writer
+                # marker must prove a prior orchestrator session ran there),
+                # instead of deleting a branch we cannot prove is ours —
+                # `git branch -D` on a checked-out branch fails anyway and
+                # would surface a bare RuntimeError.
+                if find_branch_worktree(existing_worktrees, branch) is not None:
+                    rework = True
+                else:
+                    # Check if branch exists
+                    branch_result = run_captured(
+                        ["git", "branch", "--list", branch],
                         cwd=repo_root,
                         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                     )
-                    if merge_base_result.ok:
-                        merge_base = merge_base_result.stdout.strip()
-                        rev_list_result = run_captured(
-                            ["git", "rev-list", "--count", f"{merge_base}..{branch}"],
+                    if branch_result.ok and branch_result.stdout.strip():
+                        # Branch exists without worktree: check commits and reuse or delete
+                        merge_base_result = run_captured(
+                            ["git", "merge-base", resolved_base_ref, branch],
                             cwd=repo_root,
                             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                         )
-                        has_commits = (
-                            rev_list_result.ok and int(rev_list_result.stdout.strip()) > 0
-                        )
-                    else:
-                        has_commits = True
-
-                    if has_commits:
-                        # Has commits: reuse via rework-style attach
-                        rework = True
-                    else:
-                        # Clean: delete branch and create fresh
-                        _raise_if_unsafe_to_reset(worktree_path)
-                        _snapshot_before_delete(branch)
-                        branch_delete_result = run_captured(
-                            ["git", "branch", "-D", branch],
-                            cwd=repo_root,
-                            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-                        )
-                        if not branch_delete_result.ok:
-                            raise RuntimeError(
-                                f"Failed to delete branch {branch!r} for recovery: "
-                                f"{branch_delete_result.error or branch_delete_result.stderr}"
+                        if merge_base_result.ok:
+                            merge_base = merge_base_result.stdout.strip()
+                            rev_list_result = run_captured(
+                                ["git", "rev-list", "--count", f"{merge_base}..{branch}"],
+                                cwd=repo_root,
+                                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                             )
-                        reclaimed = "pruned"
-                        # Fall through to fresh dispatch below (rework=False)
+                            has_commits = (
+                                rev_list_result.ok and int(rev_list_result.stdout.strip()) > 0
+                            )
+                        else:
+                            has_commits = True
+
+                        if has_commits:
+                            # Has commits: reuse via rework-style attach
+                            rework = True
+                        else:
+                            # Clean: delete branch and create fresh
+                            _raise_if_unsafe_to_reset(worktree_path)
+                            _snapshot_before_delete(branch)
+                            branch_delete_result = run_captured(
+                                ["git", "branch", "-D", branch],
+                                cwd=repo_root,
+                                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+                            )
+                            if not branch_delete_result.ok:
+                                raise RuntimeError(
+                                    f"Failed to delete branch {branch!r} for recovery: "
+                                    f"{branch_delete_result.error or branch_delete_result.stderr}"
+                                )
+                            reclaimed = "pruned"
+                            # Fall through to fresh dispatch below (rework=False)
 
     if rework:
         # Rework mode: branch already exists, reuse or attach to it
@@ -3668,30 +3657,24 @@ def create_worktree(
                 existing_worktrees = list_worktrees(repo_root)
 
         # Branch names in git worktree list may have refs/heads/ prefix
-        existing_wt = next(
-            (
-                wt
-                for wt in existing_worktrees
-                if wt.get("branch", "").endswith(f"/{branch}") or wt.get("branch") == branch
-            ),
-            None,
-        )
+        existing_wt = find_branch_worktree(existing_worktrees, branch)
 
         if existing_wt:
-            # Issue #1118: refuse to adopt a worktree at a foreign path. The
-            # branch-name lookup above spans ALL registered worktrees, so a
-            # branch checked out by the operator in a different directory
-            # (e.g. .claude/worktrees/<name>) would be silently adopted,
-            # committing the operator's uncommitted edits as worker output.
-            # Only a worktree at the orchestrator's expected path is one we
-            # could have created; anything else is a foreign checkout.
+            # Issue #1118 refused every worktree at a foreign path; issue
+            # #1476 reworks that into a checked adoption. The branch-name
+            # lookup above spans ALL registered worktrees, so a branch
+            # checked out by the operator in a different directory (e.g.
+            # .claude/worktrees/<name>) previously produced
+            # worktree_foreign_writer on every dispatch pass — git refuses a
+            # second checkout of the same branch, so nothing could ever clear
+            # the block and the issue escalated dispatch_blocked_environment
+            # on a live checkout holding real PR commits. A safe foreign
+            # checkout is adopted for the rework session; anything unsafe
+            # still raises WorktreeForeignWriterError.
             existing_wt_path = Path(existing_wt["worktree"])
+            foreign_adopted = False
             if existing_wt_path != worktree_path:
-                raise WorktreeForeignWriterError(
-                    worktree_path=existing_wt_path,
-                    pid=None,
-                    session_id=None,
-                )
+                foreign_adopted = _adopt_foreign_checkout(existing_wt_path, existing_worktrees)
             # Reuse existing worktree: fetch and fast-forward to origin tip
             worktree_path = existing_wt_path
             # Issue #1118: a dirty worktree at adoption time is an independent
@@ -3713,9 +3696,25 @@ def create_worktree(
                     worktree_path, dirty_injected, materialize_dirs
                 )
                 if dirty_reason:
+                    if foreign_adopted:
+                        # Issue #1476: uncommitted work in a foreign checkout
+                        # is never adopted, rescue-captured, or cleaned — it
+                        # belongs to whoever owns the checkout, and rescue
+                        # capture must not write refs for work we refuse to
+                        # touch.
+                        raise WorktreeForeignWriterError(
+                            worktree_path=worktree_path,
+                            pid=None,
+                            session_id=None,
+                            detail=f"uncommitted changes present ({dirty_reason})",
+                        )
                     _capture_or_raise(worktree_path, dirty_reason, dirty_injected)
-            # Only fetch if origin remote exists (deterministic check)
-            if _has_origin_remote(repo_root):
+            # Only fetch if origin remote exists (deterministic check) —
+            # and only when the branch is not provably absent from origin
+            # (recovery's ls-remote probe). A killed-before-push branch has
+            # no ``origin/<branch>`` to fetch; fetching it hard-fails and
+            # would re-create the #1476 retry loop for an adopted checkout.
+            if _has_origin_remote(repo_root) and remote_exists is not False:
                 # Fetch the remote-tracking ref only (branch:<branch> fails when branch is checked out)
                 fetch_result = _run_remote_captured(
                     ["git", "fetch", "origin", branch],
@@ -3729,6 +3728,21 @@ def create_worktree(
                         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
                     )
                     if not ff_result.ok:
+                        if foreign_adopted and recovery is None:
+                            # Issue #1476: catching a diverged branch up to
+                            # origin requires ``git reset --hard``, which the
+                            # orchestrator may only run on worktrees it owns.
+                            # Refuse — the foreign checkout and its commits
+                            # stay exactly as found.
+                            raise WorktreeForeignWriterError(
+                                worktree_path=worktree_path,
+                                pid=None,
+                                session_id=None,
+                                detail=(
+                                    f"branch {branch!r} diverged from origin tip; "
+                                    "refusing to reset a foreign checkout"
+                                ),
+                            )
                         # Non-fast-forward: the PR branch was rebased or force-pushed
                         # on origin. For an open PR, origin is authoritative; snapshot
                         # the old tip (best-effort), compare patch-ids, and reset.
@@ -3776,10 +3790,21 @@ def create_worktree(
                     resolved_base_ref,
                     injected_paths,
                     materialize_dirs,
+                    # A borrowed checkout's scaffolding-named files are the
+                    # owner's — never repaired (deleted) for them.
+                    allow_scaffolding_repair=not foreign_adopted,
                 )
             venv_link = worktree_path / ".venv"
             venv_junction: Path | None = None
-            if venv_source is not None:
+            if foreign_adopted:
+                # Issue #1476: never write scaffolding into a borrowed
+                # checkout — no junction creation — and never remove the
+                # owner's junction here. The shared-venv write-through hazard
+                # is enforced at launch instead: ``sanitize_env`` unlinks any
+                # ``.venv`` reparse point inside a git worktree before the
+                # worker's ``uv sync`` can follow it.
+                pass
+            elif venv_source is not None:
                 if venv_link.exists() or is_junction(venv_link):
                     venv_junction = venv_link
                 else:
@@ -3796,6 +3821,17 @@ def create_worktree(
                 # .venv instead of writing through the reparse point.
                 if is_junction(venv_link):
                     _unlink_reparse_point(venv_link)
+            if foreign_adopted and state_file is not None:
+                # Issue #1476: adoption is a borrowed-checkout dispatch — the
+                # teardown/ownership semantics differ from a managed worktree,
+                # so make it observable (best-effort inside the helper).
+                log_foreign_adopted(
+                    state_file,
+                    issue_number=issue_number,
+                    worktree_path=worktree_path,
+                    branch=branch,
+                    recovery=recovery is not None,
+                )
             return WorktreeInfo(
                 path=worktree_path,
                 branch=branch,
@@ -3804,6 +3840,7 @@ def create_worktree(
                 attempt_snapshot=attempt_snapshot,
                 rework_conflict=rework_conflict,
                 rescue_capture=rescue_capture,
+                foreign_adopted=foreign_adopted,
             )
         else:
             # No existing worktree: attach to existing branch (no -b flag)

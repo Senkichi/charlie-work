@@ -590,6 +590,13 @@ def launch_devin_session(
     def _teardown_worktree() -> None:
         if review:
             remove_review_checkout(repo_root, issue_number, reviews_dir=sessions_dir)
+        elif worktree.foreign_adopted:
+            # Issue #1476: the checkout belongs to whoever created it — a
+            # launch failure must never delete a borrowed worktree. No
+            # orchestrator artifacts exist in it to clean up — the writer
+            # marker is only written after a successful Popen, and the devin
+            # adapter's prompt lives outside the worktree.
+            return
         else:
             remove_worktree(
                 repo_root, worktree.path, force=True, branch=None if rework else branch
