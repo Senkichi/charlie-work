@@ -9,3 +9,6 @@
 # log_event call is best-effort (wrapped in try/except), and
 # kill_orphan_pid is a process-kill primitive, not a state write. The
 # ratchet holds at the new count until worktree.py's conversion wave.
+# The third primitive at this baseline is issue #849's log_event in the
+# dirty-worktree rescue-capture path — same out-of-wave reasoning, also
+# best-effort instrumentation rather than a state write.

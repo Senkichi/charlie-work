@@ -7557,12 +7557,15 @@ def test_create_review_checkout_rejects_non_hex_head_sha(tmp_path: Path) -> None
         create_review_checkout(repo_root, 1, "not-a-sha!", reviews_dir=tmp_path / "reviews")
 
 
-def test_rework_refuses_foreign_worktree_at_unexpected_path(tmp_path: Path) -> None:
-    """Issue #1118: a rework dispatch must refuse to adopt a worktree at a path
-    the orchestrator did not create. The branch-name lookup spans ALL registered
-    worktrees, so a branch checked out by the operator in a different directory
-    (e.g. .claude/worktrees/<name>) must be rejected with
-    WorktreeForeignWriterError rather than silently adopted.
+def test_rework_refuses_dirty_foreign_worktree_at_unexpected_path(
+    tmp_path: Path,
+) -> None:
+    """Issue #1118: a rework dispatch must never adopt an operator's foreign
+    checkout with uncommitted edits in it — the operator's uncommitted work
+    must not be committed as worker output. Issue #1476 reworked the blanket
+    foreign-path refusal into a checked adoption: a CLEAN foreign checkout is
+    now adopted (see tests/test_worktree_foreign_adoption.py), while a dirty
+    one stays refused with WorktreeForeignWriterError.
     """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
@@ -7572,6 +7575,7 @@ def test_rework_refuses_foreign_worktree_at_unexpected_path(tmp_path: Path) -> N
     # operator's interactive checkout at a different directory).
     foreign_wt = tmp_path / "operator-worktree"
     _git(repo_root, "worktree", "add", str(foreign_wt), "-b", branch_name)
+    (foreign_wt / "README.md").write_text("operator's uncommitted edit\n", encoding="utf-8")
 
     # The orchestrator's expected worktrees dir is different from the foreign
     # worktree's location.
@@ -7583,6 +7587,10 @@ def test_rework_refuses_foreign_worktree_at_unexpected_path(tmp_path: Path) -> N
     assert exc_info.value.worktree_path == foreign_wt
     assert exc_info.value.pid is None
     assert exc_info.value.session_id is None
+    # The operator's edits are untouched — never captured, cleaned, or reset.
+    assert (foreign_wt / "README.md").read_text(encoding="utf-8") == (
+        "operator's uncommitted edit\n"
+    )
 
     # Clean up the foreign worktree.
     _git(repo_root, "worktree", "remove", str(foreign_wt), "--force")

@@ -1285,6 +1285,14 @@ def launch_claude_worker(
         # to remove_worktree would look for the wrong registered worktree path.
         if review:
             remove_review_checkout(repo_root, issue_number, reviews_dir=sessions_dir)
+        elif worktree.foreign_adopted:
+            # Issue #1476: the checkout belongs to whoever created it — a
+            # launch failure must never delete a borrowed worktree. The only
+            # artifact a late failure can leave behind is the injected prompt
+            # file, which is injected_paths-excluded and harmless to the
+            # next adoption attempt; the writer marker is only written after
+            # a successful Popen.
+            return
         else:
             remove_worktree(
                 repo_root, worktree.path, force=True, branch=None if rework else branch

@@ -1,0 +1,8 @@
+1
+# Issue #1476: +1 raw log_event for the worktree_foreign_adopted
+# instrumentation event emitted by log_foreign_adopted() when
+# create_worktree adopts a foreign checkout. Same out-of-wave reasoning
+# as the worktree.py baseline entries: log_foreign_adopted is a
+# standalone module function with no write_gate receiver, and the call
+# is best-effort (wrapped in try/except) — adoption must never fail
+# because event emission did.
