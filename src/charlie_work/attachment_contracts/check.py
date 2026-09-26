@@ -89,7 +89,9 @@ def check_tree(
     Returns an empty list when the tree is clean. Absence of a committed
     baseline is not itself a Finding (freeze-on-adopt has not happened yet in
     this repo) — only parse failures and, once a baseline exists, block/tamper
-    conditions produce Findings.
+    conditions produce Findings. Pinned baseline entries (issue #1620) are
+    enforced even while their point is unsaturated — a deliberately
+    de-godded class cannot silently regrow below the fence.
     """
     excludes = load_excludes(root)
     scan = scan_tree(root, excludes, content_overrides=content_overrides)

@@ -110,7 +110,17 @@ class Bump:
 
 @dataclass(frozen=True)
 class BaselineEntry:
-    """One frozen saturated point in the ``.attachment-budgets/`` store."""
+    """One frozen attachment-point budget row in the ``.attachment-budgets/`` store.
+
+    ``pinned`` (issue #1620) marks an operator-authored sub-saturation
+    contract: a row for a point that was deliberately de-godded BELOW the
+    Tukey fence, whose ``member_count`` records a ceiling (last measured
+    count plus a small delta) rather than a saturated freeze. ``compare()``
+    enforces a pinned row whether or not the point is saturated, caps its
+    effective ceiling at the kind's boundary (a pin can only tighten the
+    contract, never loosen it past the fence), ratchets it down on shrink
+    like any other row, and never drops it by omission on de-saturation.
+    """
 
     kind: Kind
     identity: str
@@ -118,6 +128,7 @@ class BaselineEntry:
     member_count: int
     boundary: float
     bumps: tuple[Bump, ...] = field(default_factory=tuple)
+    pinned: bool = False
 
 
 @dataclass(frozen=True)
