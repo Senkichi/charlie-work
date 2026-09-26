@@ -26,6 +26,7 @@ from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
 from charlie_work.state import StateLockBusy
 from charlie_work.worktree import worktree_ahead_of_sha
+import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
 
 
@@ -1189,15 +1190,43 @@ def _dispatch_rework_impl(
 
     manifest_path = self._layout.session_manifest
     results_path = self._layout.session_results
+    # Issue #1494: a rework launch supersedes the issue's previously
+    # dispatched worker, and every producer of ``rework_requested`` —
+    # including the janitor-gate/worktree-rescue stall path this issue
+    # covers — flips the status without checking that worker's liveness.
+    # The launch trigger is the enforcement point: the shared helper reaps
+    # every still-live recorded worker pid first; a pid that survives the
+    # reap blocks this launch via a synthetic pre-launch failure
+    # (PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND → blocked_environment_at
+    # accounting, escalating at the existing cap) rather than starting a
+    # second writer on an occupied worktree.
+    launchable_requests, superseded_blocked_results = (
+        superseded_worker_reap._reap_superseded_workers_for_launch(
+            session_requests,
+            rescue_state_snapshot.get("issues", {}),
+            sessions_dir,
+            repo_root=self.repo_root,
+            worktrees_dir=self._layout.worktrees,
+            adapter_label=lambda request: (
+                "claude-code"
+                if request.issue_number in rescue_issue_numbers
+                else self.config.worker.harness
+            ),
+            write_gate=self.write_gate,
+        )
+    )
+
     # Rescue tier (issue #555): split the batch so rescue-marked issues
     # launch via the claude-code adapter pinned to rescue.worker_model
     # (see _rescue_adapter_settings), while every other candidate
     # dispatches via the pass's single configured worker harness. Reuses
     # the same dispatch_sessions()/launch_claude_worker() path for both;
     # the only difference is which AdapterSettings/config is passed in.
-    normal_requests = [r for r in session_requests if r.issue_number not in rescue_issue_numbers]
-    rescue_requests = [r for r in session_requests if r.issue_number in rescue_issue_numbers]
-    dispatch_results: list[SessionDispatchResult] = []
+    normal_requests = [
+        r for r in launchable_requests if r.issue_number not in rescue_issue_numbers
+    ]
+    rescue_requests = [r for r in launchable_requests if r.issue_number in rescue_issue_numbers]
+    dispatch_results: list[SessionDispatchResult] = list(superseded_blocked_results)
     if normal_requests:
         dispatch_results.extend(
             _wf.dispatch_sessions(
@@ -1236,7 +1265,7 @@ def _dispatch_rework_impl(
         combined_kinds = {self.config.worker.harness}
         combined_kinds.add("claude-code")
         _wf.write_session_manifest(
-            manifest_path, session_requests, adapter=manifest_adapter_label(combined_kinds)
+            manifest_path, launchable_requests, adapter=manifest_adapter_label(combined_kinds)
         )
     write_session_results(results_path, dispatch_results)
 

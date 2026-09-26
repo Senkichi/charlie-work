@@ -156,8 +156,12 @@ DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
 # operator hygiene (remove the stale checkout), so it gets the same retry
 # budget as an ordinary redispatch before escalating — just with the
 # correct reason and the blocking path in the message.
+#
+# Issue #1494: the superseded worker survived its reap (or was live with
+# no fingerprint to kill against) — the launch is refused.
+PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND = "prior_worker_still_alive"
 PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"worktree_foreign_writer"}
+    {"worktree_foreign_writer", PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND}
 )
 
 
