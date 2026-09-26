@@ -1877,7 +1877,7 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
             # Issue #1917: a new dispatch epoch supersedes the previous
             # death's classification, so a stale provider-throttle kind
             # cannot exempt a later, genuinely different death.
-            entry.pop("dead_worker_failure_kind", None)
+            _wf.clear_dead_worker_failure_kind(entry)
             state["issues"][str(issue_number)] = entry
         self.write_gate.save_state(state)
 

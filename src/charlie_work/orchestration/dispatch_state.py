@@ -986,7 +986,7 @@ def _dispatch_impl(
             # Issue #1917: and the previous death's classification, so a
             # stale provider-throttle kind cannot exempt a later,
             # genuinely different death from the orphan-sweep caps.
-            entry.pop("dead_worker_failure_kind", None)
+            _wf.clear_dead_worker_failure_kind(entry)
             state["issues"][str(issue_number)] = entry
         _wf.save_state(self.paths.state_file, state)
     # Do all network calls, file writes, and worker launches outside the lock
@@ -1179,7 +1179,7 @@ def _dispatch_impl(
                 entry.pop("orphan_drift_fingerprint", None)
                 entry.pop("orphan_drift_at", None)
                 entry.pop("dispatch_failed_at", None)
-                entry.pop("dead_worker_failure_kind", None)
+                _wf.clear_dead_worker_failure_kind(entry)
                 clear_escalation(entry)
                 clear_escalation_on_issue_prs(state, request.issue_number)
             elif is_live_worker:
@@ -1190,7 +1190,7 @@ def _dispatch_impl(
                 entry.pop("orphan_drift_fingerprint", None)
                 entry.pop("orphan_drift_at", None)
                 entry.pop("dispatch_failed_at", None)
-                entry.pop("dead_worker_failure_kind", None)
+                _wf.clear_dead_worker_failure_kind(entry)
                 clear_escalation(entry)
                 clear_escalation_on_issue_prs(state, request.issue_number)
             elif is_phantom_live_worker:
@@ -1218,7 +1218,7 @@ def _dispatch_impl(
                 entry.pop("orphan_drift_fingerprint", None)
                 entry.pop("orphan_drift_at", None)
                 entry.pop("dispatch_failed_at", None)
-                entry.pop("dead_worker_failure_kind", None)
+                _wf.clear_dead_worker_failure_kind(entry)
                 clear_escalation(entry)
                 clear_escalation_on_issue_prs(state, request.issue_number)
                 entry.pop("worker_pid", None)

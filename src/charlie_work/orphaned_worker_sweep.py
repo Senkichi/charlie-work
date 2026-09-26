@@ -85,14 +85,25 @@ def maybe_reap_dead_dispatched_worker(
     escape (pre-#654 hold-forever).
 
     Issue #1917: a death classified as a provider throttle is a fleet-wide
-    condition, not a worker-quality signal, so it never escalates through
-    this timed backstop -- the same #1684 exemption the rework lanes apply
-    to their caps. The entry falls through to the caller's normal handling,
-    which returns the issue to the dispatchable pool; the dispatch
-    governor's provider_throttled deferral holds the actual re-dispatch
-    until ``throttled_until`` passes. The classification is read from
-    ``dead_worker_failure_kind``, stamped on the entry by the stall/dead
-    reap lanes before the sidecar is reaped.
+    condition, not a worker-quality signal, so while the provider cooldown
+    the classifier armed is still active (``throttled_until`` in the
+    future) it never escalates through this timed backstop -- the same
+    #1684 exemption the rework lanes apply to their caps. The entry falls
+    through to the caller's normal handling, which returns the issue to
+    the dispatchable pool; the dispatch governor's provider_throttled
+    deferral holds the actual re-dispatch until ``throttled_until`` passes.
+    The classification is read from ``dead_worker_failure_kind``, stamped
+    on the entry by the stall/dead reap lanes before the sidecar is
+    reaped.
+
+    The exemption is bounded by the throttle window it exists to ride
+    out. Once ``throttled_until`` has passed -- or no window was ever
+    stamped -- the #654 backstop resumes: in the PR-linked case the
+    sub-branches only emit drift once and then short-circuit on the
+    fingerprint (a no-op clean exit, a non-request_changes decision, a
+    head change without a review callback), so a stamp that held forever
+    would reintroduce exactly the wedge this backstop fixes. An expired
+    or unparseable window fails closed to the normal reap timer.
 
     Returns the (possibly replaced) ``state`` mapping -- the escalation
     helpers rebuild it -- and ``True`` when the entry was escalated, so the
@@ -108,7 +119,9 @@ def maybe_reap_dead_dispatched_worker(
     if orphan_drift_at is None or dead_dispatched_reap_minutes <= 0:
         return state, False
     if is_provider_throttle_failure(entry.get("dead_worker_failure_kind")):
-        return state, False
+        throttled_until_dt = _wf._parse_iso_timestamp(state.get("throttled_until"))
+        if throttled_until_dt is not None and throttled_until_dt > now:
+            return state, False
     drift_dt = _wf._parse_iso_timestamp(orphan_drift_at)
     if drift_dt is None or (now - drift_dt).total_seconds() / 60 < dead_dispatched_reap_minutes:
         return state, False

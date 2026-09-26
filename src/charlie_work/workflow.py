@@ -134,6 +134,7 @@ from .state import (
     clear_quota_throttles,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     clear_reviewer_quota,
     defer_reviewer_probe_after,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
+    clear_dead_worker_failure_kind,  # noqa: F401  (deliberate re-export; used by moved orchestration delegates via _wf.)
     clear_escalation,
     clear_escalation_on_issue_prs,
     disarm_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)

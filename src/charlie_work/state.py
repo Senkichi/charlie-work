@@ -988,16 +988,44 @@ def record_dead_worker_failure_kind(
     genuinely different death. No-op when the issue has no entry (e.g.
     an untracked session) so the caller never invents one.
 
-    Returns ``data`` unchanged when there is nothing to stamp.
+    Returns ``data`` unchanged when there is nothing to stamp. Like the
+    rest of this module's value helpers, this is a pure update: it returns
+    a new top-level mapping (with new ``issues``/entry mappings) and never
+    mutates the caller's ``data``.
     """
     issues = data.get("issues")
     if not isinstance(issues, dict):
         return data
-    entry = issues.get(str(issue_number))
+    issue_key = str(issue_number)
+    entry = issues.get(issue_key)
     if not isinstance(entry, dict):
         return data
-    issues[str(issue_number)] = {**entry, "dead_worker_failure_kind": failure_kind}
-    return data
+    return {
+        **data,
+        "issues": {
+            **issues,
+            issue_key: {**entry, "dead_worker_failure_kind": failure_kind},
+        },
+    }
+
+
+def clear_dead_worker_failure_kind(entry: dict[str, Any]) -> None:
+    """Drop the stamped ``dead_worker_failure_kind`` at a dispatch epoch.
+
+    Issue #1917: a new dispatch epoch supersedes the previous death's
+    classification. Every lane that claims or upgrades an issue into a new
+    dispatch -- fresh-dispatch claim and success, live/phantom recovery,
+    remote and local rework claim and success -- routes the previous
+    classification through this single helper: a stale provider-throttle
+    kind that survives the epoch boundary would exempt a later, genuinely
+    different death from the orphan sweep's timed reap and redispatch cap.
+    The unescalate path clears it via ``UNESCALATE_ISSUE_RESET_FIELDS``
+    instead.
+
+    Mutates ``entry`` in place; every call site has already spread the
+    stored issue entry into a fresh mapping it owns before calling.
+    """
+    entry.pop("dead_worker_failure_kind", None)
 
 
 def _reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:

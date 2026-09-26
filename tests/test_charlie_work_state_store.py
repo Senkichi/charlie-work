@@ -201,3 +201,80 @@ def test_state_lock_guard_returns_skip_when_lock_held(
     assert result.data.get("pass_skipped") is True or result.data.get("state_lock_busy") is True
     assert state_path.stat().st_mtime == initial_mtime
     assert state_path.read_text(encoding="utf-8") == initial_content
+
+
+def test_record_dead_worker_failure_kind_returns_new_state() -> None:
+    """Issue #1917: ``record_dead_worker_failure_kind`` is a value-style
+    update — it returns a new top-level mapping with copied ``issues`` and
+    a copied issue entry, and never mutates the caller's ``data``."""
+    from charlie_work.state import record_dead_worker_failure_kind
+
+    data = {
+        "version": 1,
+        "issues": {
+            "42": {"status": "dispatched"},
+            "43": {"status": "rework_requested"},
+        },
+        "prs": {},
+        "events": [],
+    }
+    issues_before = data["issues"]
+    entry_before = data["issues"]["42"]
+
+    new_state = record_dead_worker_failure_kind(data, 42, "rate_limited")
+
+    assert new_state is not data
+    assert new_state["issues"] is not issues_before
+    assert new_state["issues"]["42"]["dead_worker_failure_kind"] == "rate_limited"
+    # Untouched sibling entries are shared, not deep-copied.
+    assert new_state["issues"]["43"] is data["issues"]["43"]
+    # The caller's mapping, issues dict, and entry are all unmutated.
+    assert "dead_worker_failure_kind" not in data["issues"]["42"]
+    assert data["issues"] is issues_before
+    assert data["issues"]["42"] is entry_before
+
+
+def test_record_dead_worker_failure_kind_noop_for_missing_entry() -> None:
+    """The no-op contract: an untracked issue returns the input object
+    unchanged — the caller never invents an issue entry."""
+    from charlie_work.state import record_dead_worker_failure_kind
+
+    data = {"version": 1, "issues": {}, "prs": {}, "events": []}
+
+    assert record_dead_worker_failure_kind(data, 42, "stalled") is data
+    assert "42" not in data["issues"]
+
+
+def test_record_dead_worker_failure_kind_noop_for_non_dict_entry() -> None:
+    """Same no-op for a non-dict entry (corrupt/legacy shape) — the helper
+    must not stamp onto a scalar."""
+    from charlie_work.state import record_dead_worker_failure_kind
+
+    data = {"version": 1, "issues": {"42": "dispatched"}, "prs": {}, "events": []}
+
+    assert record_dead_worker_failure_kind(data, 42, "stalled") is data
+    assert data["issues"]["42"] == "dispatched"
+
+
+def test_record_dead_worker_failure_kind_noop_for_non_dict_issues() -> None:
+    """And for a non-dict ``issues`` mapping itself."""
+    from charlie_work.state import record_dead_worker_failure_kind
+
+    data = {"version": 1, "issues": "corrupt", "prs": {}, "events": []}
+
+    assert record_dead_worker_failure_kind(data, 42, "stalled") is data
+
+
+def test_clear_dead_worker_failure_kind_drops_stamp() -> None:
+    """Issue #1917: ``clear_dead_worker_failure_kind`` removes the field in
+    place and tolerates its absence — the single point of enforcement
+    every dispatch-epoch site calls."""
+    from charlie_work.state import clear_dead_worker_failure_kind
+
+    entry = {"status": "dispatched", "dead_worker_failure_kind": "rate_limited"}
+    clear_dead_worker_failure_kind(entry)
+    assert entry == {"status": "dispatched"}
+
+    # Absent-field tolerance: clearing twice (or an unstamped entry) is a no-op.
+    clear_dead_worker_failure_kind(entry)
+    assert entry == {"status": "dispatched"}
