@@ -153,6 +153,17 @@ Entries = saturated points only, sorted (kind, file, identity) for stable diffs.
   Finding(error). Interactive bumps self-ack.
 - Tamper guard: `check-tree` recomputes what the baseline SHOULD contain for unchanged
   points; a baseline entry raised without a bump record -> Finding(error).
+- **Pinned rows (issue #1620):** an entry may carry `"pinned": true` — an
+  operator-authored sub-saturation contract for a point deliberately de-godded
+  BELOW the fence. `member_count` records the ceiling (last measured count plus a
+  small delta). `compare()` enforces a pin whether or not the point is saturated:
+  growth past `min(member_count/bumps, boundary)` -> Finding(block); a shrink
+  ratchets the pin down like any other row; the row is never dropped on
+  de-saturation. Tooling never creates a pin — the operator authors the entry
+  file explicitly — and `--ratchet`/`--refreeze` never delete one; only a full
+  `baseline` regen retires pins (entries are re-derived from saturated verdicts
+  alone). Removing or unpinning a row outside a verified regeneration is
+  flagged as tamper.
 
 ## Redirect + scaffold (redirect.py) — G2
 
