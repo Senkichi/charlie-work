@@ -88,7 +88,7 @@ from .janitor import (
 )
 from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
 from .labels import TransitionOutcome, transition
-from .local_work_park import park_salvageable_local_orphan
+from .local_work_park import park_or_reclaim_local_orphan
 from .paths import RuntimePaths, resolved_layout
 from .prompt_sections import section_variant_names
 from .prompts import (
@@ -1785,12 +1785,6 @@ def _detect_and_handle_orphaned_workers(
     # worker's ``reason_kind`` / ``detail`` so the operator queue entry is
     # actionable without reading the worktree.
     worker_declared_blocked_escalations: dict[int, dict[str, Any]] = {}
-    # Issue #1923: local-backend salvage-park failures, recorded so the
-    # ``session_failed_relabeled`` event carries *why* an issue with
-    # committed work still fell through to the normal reclaim (the park's
-    # label transition failed). Mirrors the sibling lane's
-    # ``salvage_failed``/``salvage_error`` payload fields.
-    salvage_park_failures: dict[int, str | None] = {}
     # Issue #1453: pre-computed worker outcomes for all no-PR orphans, read
     # once before the first pre-lock loop so the blocked-outcome check can
     # fire before reclaim adds ``automated-ready``.  Reused by the second
@@ -1944,25 +1938,11 @@ def _detect_and_handle_orphaned_workers(
                 }
                 continue
 
-            # Issue #1923: on a no-PR backend the dead worker's branch IS
-            # the deliverable, so the reclaim below (strip active labels,
-            # re-add ``ready``) is not "requeue the issue" -- it discards a
-            # finished work product: the redispatch dies on the worker's own
-            # commits (``worktree_unsafe``) and the issue escalates to the
-            # operator queue as if the worker had failed. The sidecar-based
-            # dead-worker lane already gates on ``ahead_count > 0`` and
-            # routes through ``_attempt_salvage`` -> ``park_unpublishable_work``;
-            # this is the state/PID sweep's half of that gate. It sits AFTER
-            # the three escalation gates above on purpose: a worker-declared
-            # blocked outcome, a zero-artifact loop, or a cross-repo scope
-            # mismatch keeps the branch preserved for the operator rather
-            # than auto-merging work the worker disavowed. A successful park
-            # applies ``agent:review-ready`` and advances the entry off
-            # ``dispatched`` (under the park's own lock), so the in-lock pass
-            # below skips it via the status re-check. A failed park falls
-            # through to the normal reclaim -- the loud outcome, matching the
-            # sibling lane's salvage-failure contract.
-            park_result = park_salvageable_local_orphan(
+            # Issue #1923: on a no-PR backend park the dead worker's
+            # committed branch for review instead of reclaiming it -- the
+            # gate contract lives in park_or_reclaim_local_orphan's
+            # docstring (local_work_park.py).
+            if park_or_reclaim_local_orphan(
                 gh=gh,
                 config=config,
                 repo_root=repo_root,
@@ -1975,34 +1955,9 @@ def _detect_and_handle_orphaned_workers(
                 state_file=state_file,
                 worker_outcome=worker_outcome,
                 write_gate=write_gate,
-            )
-            if park_result is not None:
-                salvaged, salvage_error = park_result
-                if salvaged:
-                    continue
-                salvage_park_failures[issue_number] = salvage_error
-
-            needs_ready = config.labels.ready not in issue_labels
-            label_write_ok = True
-            for label in sorted(active_labels):
-                if not gh.remove_issue_label(issue_number, label):
-                    label_write_ok = False
-            if needs_ready:
-                if not gh.add_issue_label(issue_number, config.labels.ready):
-                    label_write_ok = False
-            reclaim_results[issue_number] = {
-                "removed_labels": sorted(active_labels),
-                "added_ready": needs_ready,
-                "label_write_ok": label_write_ok,
-            }
-            if issue_number in salvage_park_failures:
-                # Issue #1923: carry the park failure onto the relabel event
-                # so the event stream shows this issue had salvageable
-                # commits that could not be parked.
-                reclaim_results[issue_number]["salvage_failed"] = True
-                reclaim_results[issue_number]["salvage_error"] = salvage_park_failures[
-                    issue_number
-                ]
+                reclaim_results=reclaim_results,
+            ):
+                continue
 
     # Issue #935: for the no-open-PR orphans, determine whether the worker
     # pushed a branch and reported push-succeeded-but-PR-failed. This is done

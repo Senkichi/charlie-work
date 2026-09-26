@@ -291,3 +291,75 @@ def park_salvageable_local_orphan(
         write_gate=write_gate,
     )
     return salvaged, salvage_error
+
+
+def park_or_reclaim_local_orphan(
+    *,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    repo_root: Path | None,
+    worktrees_dir: Path | None,
+    state: dict[str, Any],
+    issue_number: int,
+    issue: dict[str, Any],
+    active_labels: set[str],
+    issue_labels: set[str],
+    state_file: Path,
+    worker_outcome: dict[str, Any] | None,
+    write_gate: WriteGate,
+    reclaim_results: dict[int, dict[str, Any]],
+) -> bool:
+    """Issue #1923: the no-open-PR sweep tail -- park salvageable work, else reclaim.
+
+    Runs :func:`park_salvageable_local_orphan` (whose docstring carries the
+    full gate contract). Returns ``True`` when the issue was parked -- the
+    caller ``continue``s without reclaiming. On any other outcome -- a
+    PR-capable backend, no salvageable commits, or a failed park -- the
+    sweep's normal reclaim runs here instead: strip the active labels,
+    re-add ``ready``, record the outcome in ``reclaim_results``. A failed
+    park additionally stamps ``salvage_failed``/``salvage_error`` onto the
+    recorded reclaim so the ``session_failed_relabeled`` event carries *why*
+    an issue with committed work fell through -- the loud outcome, matching
+    the sibling lane's salvage-failure contract.
+
+    Lives here rather than inline in ``_detect_and_handle_orphaned_workers``
+    because ``workflow.py`` sits over its file-size ratchet mark -- the same
+    reason ``orphaned_worker_sweep.py`` exists (#1911).
+    """
+    park_result = park_salvageable_local_orphan(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        worktrees_dir=worktrees_dir,
+        state=state,
+        issue_number=issue_number,
+        issue=issue,
+        active_labels=active_labels,
+        issue_labels=issue_labels,
+        state_file=state_file,
+        worker_outcome=worker_outcome,
+        write_gate=write_gate,
+    )
+    if park_result is not None and park_result[0]:
+        return True
+
+    needs_ready = config.labels.ready not in issue_labels
+    label_write_ok = True
+    for label in sorted(active_labels):
+        if not gh.remove_issue_label(issue_number, label):
+            label_write_ok = False
+    if needs_ready:
+        if not gh.add_issue_label(issue_number, config.labels.ready):
+            label_write_ok = False
+    reclaim_results[issue_number] = {
+        "removed_labels": sorted(active_labels),
+        "added_ready": needs_ready,
+        "label_write_ok": label_write_ok,
+    }
+    if park_result is not None:
+        # Issue #1923: carry the park failure onto the relabel event so the
+        # event stream shows this issue had salvageable commits that could
+        # not be parked.
+        reclaim_results[issue_number]["salvage_failed"] = True
+        reclaim_results[issue_number]["salvage_error"] = park_result[1]
+    return False
