@@ -88,6 +88,7 @@ from .janitor import (
 )
 from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
 from .labels import TransitionOutcome, transition
+from .local_work_park import park_or_reclaim_local_orphan
 from .paths import RuntimePaths, resolved_layout
 from .prompt_sections import section_variant_names
 from .prompts import (
@@ -1937,19 +1938,26 @@ def _detect_and_handle_orphaned_workers(
                 }
                 continue
 
-            needs_ready = config.labels.ready not in issue_labels
-            label_write_ok = True
-            for label in sorted(active_labels):
-                if not gh.remove_issue_label(issue_number, label):
-                    label_write_ok = False
-            if needs_ready:
-                if not gh.add_issue_label(issue_number, config.labels.ready):
-                    label_write_ok = False
-            reclaim_results[issue_number] = {
-                "removed_labels": sorted(active_labels),
-                "added_ready": needs_ready,
-                "label_write_ok": label_write_ok,
-            }
+            # Issue #1923: on a no-PR backend park the dead worker's
+            # committed branch for review instead of reclaiming it -- the
+            # gate contract lives in park_or_reclaim_local_orphan's
+            # docstring (local_work_park.py).
+            if park_or_reclaim_local_orphan(
+                gh=gh,
+                config=config,
+                repo_root=repo_root,
+                worktrees_dir=worktrees_dir,
+                state=state,
+                issue_number=issue_number,
+                issue=issue,
+                active_labels=active_labels,
+                issue_labels=issue_labels,
+                state_file=state_file,
+                worker_outcome=worker_outcome,
+                write_gate=write_gate,
+                reclaim_results=reclaim_results,
+            ):
+                continue
 
     # Issue #935: for the no-open-PR orphans, determine whether the worker
     # pushed a branch and reported push-succeeded-but-PR-failed. This is done

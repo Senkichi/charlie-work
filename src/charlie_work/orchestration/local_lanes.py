@@ -262,11 +262,12 @@ def _local_review_packets(self) -> dict[str, Any]:
 
     # --- packet build/refresh for lane records ---
     state = _wf.load_state_locked(self.paths.state_file)
-    # Liveness by sidecar, not by issue status: a freshly parked issue keeps
-    # its dead worker's ``status="dispatched"`` (the salvage lane never
-    # rewrites it), so keying liveness off the status string alone would
-    # defer packet builds forever. ``dispatch_pending`` is live by
-    # definition -- the worker launch is mid-flight and has no sidecar yet.
+    # Liveness by sidecar, not by issue status: a parked issue's status is
+    # whatever its lane last wrote (``dispatched`` before issue #1923's park
+    # flip, ``open_passive`` after), so keying liveness off the status
+    # string alone would defer packet builds forever. ``dispatch_pending``
+    # is live by definition -- the worker launch is mid-flight and has no
+    # sidecar yet.
     live_sidecar_issues = {
         w.issue_number for w in iter_workers(self._layout.sessions_dir) if w.is_alive()
     }
