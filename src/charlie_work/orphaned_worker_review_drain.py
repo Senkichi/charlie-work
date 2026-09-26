@@ -138,9 +138,13 @@ def drain_orphaned_worker_review_routes(
                 issue_number,
                 pr_number,
             )
+            # ``kind=`` by keyword: the event-kind scanner reads positional
+            # arg 1 as the kind (the ``log_event(state_path, kind, ...)``
+            # shape), so a positional kind here would leave the payload
+            # dict unresolved.
             write_gate.log_event(
-                "orphaned_worker_review_route_failed",
-                {
+                kind="orphaned_worker_review_route_failed",
+                payload={
                     "issue_number": issue_number,
                     "pr_number": pr_number,
                     "reason": reason,
