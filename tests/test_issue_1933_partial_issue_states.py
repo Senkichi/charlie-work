@@ -263,15 +263,20 @@ def test_are_issues_open_emits_telemetry_for_partial_batch_fallback(
     """A partial-batch fallback must be observable: the degraded condition is
     exactly what the incident needed telemetry for -- which numbers were bad
     and how large the requested set was. Whole-batch failures (the pre-#1933
-    path) keep their existing log-line-only behavior."""
+    path) keep their existing log-line-only behavior.
+
+    Edge-triggered (rework): the event fires once per *distinct* unresolved
+    set, not once per batch observation. A persistent stale blocker would
+    otherwise write a warning row every orchestrator pass (the pass-scoped
+    ``_list_cache`` is cleared but the signature state is not), flooding
+    ``check_warning_events``' flat per-event listing -- the every-pass
+    warning flood shape #1271/#1768 already burned once. A *changed*
+    unresolved set is a new edge and still fires.
+    """
     from charlie_work.github_capabilities import issues as issues_module
 
     gh = GitHub(tmp_path)
-    gh._list_cache[("_repo_owner_name",)] = ("o", "r")
-    body = _partial_body(
-        resolved={"s_1": {"number": 1, "state": "OPEN"}},
-        unresolved=[361],
-    )
+    unresolved_numbers = [361]
     events: list[tuple[str, dict]] = []
 
     def fake_log_event(state_path, kind, payload, **kwargs):
@@ -279,24 +284,51 @@ def test_are_issues_open_emits_telemetry_for_partial_batch_fallback(
 
     def fake_run(self, args, *, json_output=False, allow_failure=False, long_call=False):
         if args[:2] == ["api", "graphql"]:
+            body = _partial_body(
+                resolved={"s_1": {"number": 1, "state": "OPEN"}},
+                unresolved=unresolved_numbers,
+            )
             return GitHubRunResult(
                 ok=False,
                 returncode=1,
                 stdout=json.dumps(body),
-                stderr="GraphQL: Could not resolve to an Issue with the number of 361. "
-                "(repository.s_361)",
+                stderr="GraphQL: Could not resolve to an Issue.",
                 value=body,
-                error="GraphQL: Could not resolve to an Issue with the number of 361. "
-                "(repository.s_361)",
+                error="GraphQL: Could not resolve to an Issue.",
             )
         return {"number": int(args[2]), "state": "CLOSED"}
+
+    def new_pass() -> None:
+        # Simulate an orchestrator pass boundary: the pass-scoped list cache
+        # is cleared (repo_meta.invalidate_list_cache) while the same
+        # GitHub/Issues pair -- and its edge-trigger signature -- survives.
+        gh._list_cache.clear()
+        gh._list_cache[("_repo_owner_name",)] = ("o", "r")
 
     monkeypatch.setattr(GitHub, "run", fake_run)
     monkeypatch.setattr(issues_module, "log_event", fake_log_event)
 
+    new_pass()
     assert gh.are_issues_open([1, 361]) == {1}
     partial = [p for k, p in events if k == "github_issue_state_partial_fallback"]
     assert partial == [{"unresolved": [361], "requested": 2}]
+
+    # The incident shape: the same stale blocker still unresolved on the
+    # next pass must NOT refire -- that repeat carries no new information.
+    new_pass()
+    assert gh.are_issues_open([1, 361]) == {1}
+    partial = [p for k, p in events if k == "github_issue_state_partial_fallback"]
+    assert partial == [{"unresolved": [361], "requested": 2}]
+
+    # A changed unresolved set is a new edge: it fires again.
+    new_pass()
+    unresolved_numbers.append(400)
+    assert gh.are_issues_open([1, 361, 400]) == {1}
+    partial = [p for k, p in events if k == "github_issue_state_partial_fallback"]
+    assert partial == [
+        {"unresolved": [361], "requested": 2},
+        {"unresolved": [361, 400], "requested": 3},
+    ]
 
 
 def test_are_issues_open_end_to_end_over_http_transport(

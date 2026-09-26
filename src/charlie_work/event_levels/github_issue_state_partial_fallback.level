@@ -6,3 +6,9 @@ warning
 # the call still completes correctly, but a high rate means stale issue
 # references are degrading `fleet status --json`'s fast path. The payload
 # names the unresolved numbers (the telemetry the incident lacked).
+# Edge-triggered (rework review): `are_issues_open` emits this only when
+# the set of unresolved numbers differs from the last batch observation --
+# a persistent stale blocker produces one row per emitter lifetime instead
+# of one per loop pass, which is the every-pass warning flood shape
+# #1271/#1768 already burned once for check_warning_events. A NEW stale
+# blocker (a changed unresolved set) still surfaces as a fresh warning.

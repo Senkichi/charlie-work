@@ -55,7 +55,10 @@ if TYPE_CHECKING:
     # GitHubLike union); ``get_github_issue_dependencies``'s ``gh: GitHubLike``
     # annotation is a bare string under ``from __future__ import annotations``
     # and is never evaluated, so the TYPE_CHECKING-only import is all it needs.
-    from charlie_work.github import GitHubLike
+    # ``GitHub`` is needed only for ``Issues.__init__``'s ``owner`` annotation
+    # (mirroring ``_base.py``'s own TYPE_CHECKING-only import) and is equally
+    # unevaluated.
+    from charlie_work.github import GitHub, GitHubLike
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +253,24 @@ class Issues(CapabilityCollaborator):
     recurs identically in L04/L05/L06.
     """
 
+    def __init__(self, owner: GitHub) -> None:
+        super().__init__(owner)
+        # Issue #1933 rework: edge-trigger baseline for the
+        # ``github_issue_state_partial_fallback`` telemetry event -- the
+        # frozenset of issue numbers the most recent batch observation left
+        # unresolved (empty when no partial batch has been observed yet, or
+        # the last one resolved every number). Lives on the collaborator
+        # instance, NOT in ``_list_cache``: one GitHub/Issues pair lives for
+        # a whole supervisor process while ``_list_cache`` is cleared every
+        # pass (``repo_meta.invalidate_list_cache``), so cache-resident
+        # state could never dedupe the event across passes -- which is
+        # exactly the every-pass warning flood (a persistent stale blocker
+        # emitting one warning row per pass into ``check_warning_events``)
+        # the edge-trigger exists to close. A dunder like this one is
+        # excluded from ``github_delegation._routable_members``, so adding
+        # it changes neither ``_ROUTES`` nor ``GitHub``'s surface.
+        self._partial_fallback_signature: frozenset[int] = frozenset()
+
     def issue_list(self, labels=None, state=None) -> list[dict[str, Any]]:
         # Normalize labels for caching and arg building; support legacy str signature.
         if isinstance(labels, str):
@@ -364,7 +385,14 @@ class Issues(CapabilityCollaborator):
                     open_issues.add(number)
 
             unresolved = [number for number in uncached if number not in states]
-            if unresolved:
+            if not unresolved:
+                if not batch_failed:
+                    # The batch resolved every uncached number this call, so
+                    # clear the edge baseline: a later recurrence of the same
+                    # unresolved set is a fresh edge, not a suppressed
+                    # repeat.
+                    self._partial_fallback_signature = frozenset()
+            else:
                 if not batch_failed:
                     logger.warning(
                         "Batched issue state query did not resolve %d issue "
@@ -373,12 +401,15 @@ class Issues(CapabilityCollaborator):
                         len(unresolved),
                         unresolved,
                     )
-                    # write-gate-exempt(issue=1933): GitHub client layer has no WriteGate; lock-free telemetry
-                    log_event(
-                        circuit_breaker_state_path(self.runtime, self.repo_root),
-                        "github_issue_state_partial_fallback",
-                        {"unresolved": unresolved, "requested": len(uncached)},
-                    )
+                    signature = frozenset(unresolved)
+                    if signature != self._partial_fallback_signature:
+                        # write-gate-exempt(issue=1933): GitHub client layer has no WriteGate; lock-free telemetry
+                        log_event(
+                            circuit_breaker_state_path(self.runtime, self.repo_root),
+                            "github_issue_state_partial_fallback",
+                            {"unresolved": unresolved, "requested": len(uncached)},
+                        )
+                    self._partial_fallback_signature = signature
 
                 # Fallback to the previous parallel per-issue view fetch.
                 def _fetch_state(number: int) -> tuple[int, bool]:
