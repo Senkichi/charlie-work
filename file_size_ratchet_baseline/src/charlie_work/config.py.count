@@ -1,1 +1,9 @@
-4200
+4400
+# Issue #1477 / PR #1925 rework: the new
+# `deescalation.identical_reason_recurrence_window_minutes` knob added its
+# DeescalationConfig field plus scoped-extraction validation to config.py
+# (4227 lines vs the 4200 mark; main was already at 4196). The addition is
+# config-schema surface -- a dataclass field and its build_config_from_data
+# parse rules -- which cannot be extracted into a domain module without
+# abandoning config.py's single-schema-module structure. Raised to the next
+# MARK_QUANTUM multiple per the ratchet's hand-raise rule.
