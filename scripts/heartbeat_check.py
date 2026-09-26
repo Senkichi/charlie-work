@@ -133,7 +133,19 @@ CHARLIE_STATUS_TIMEOUT_SECONDS = 120
 # by default. A cache older than this threshold means the blocked set may not
 # reflect the current state — surface a staleness warning so downstream checks
 # annotate their output as degraded rather than silently trusting stale data.
-STATUS_CACHE_STALE_SECONDS = 600
+#
+# The threshold must sit ABOVE the producer's serving ceiling, not inside it
+# (issue #1886). ``read_status_snapshot`` only serves a snapshot younger than
+# ``runtime.status_snapshot_ttl_seconds`` (default 900s), so every served
+# ``cache_age_seconds`` is already <= that TTL — while the measured healthy
+# per-repo refresh gap (the same series LOOP_PASS_STALE_MINUTES cites: median
+# ~10.4m, p90 ~20m) routinely lands served ages in the upper TTL band. The
+# original 600s therefore flagged normal operation on every repo, every tick
+# (observed 881s fleet-wide, 2026-09-24). 1800s = 2x the default TTL: under
+# default config this can only fire when a deployment widened the TTL past
+# 30 minutes and is genuinely serving blocked data that old — the degraded
+# case this warning exists for.
+STATUS_CACHE_STALE_SECONDS = 1800
 
 # in-progress-stale worktree mtime threshold (issue #1379). The events-based
 # check flags an issue when its GitHub updatedAt hasn't moved across 2 beats,
@@ -584,10 +596,19 @@ def get_blocked_issue_numbers(any_repo_root: Path) -> tuple[dict[str, set[int]],
     # means the blocked set may not reflect the current state. The blocked
     # data is still returned (it is the best available), but a staleness
     # warning is returned so downstream checks annotate their output.
-    ages = [a for r in repos.values() if isinstance(a := r.get("cache_age_seconds"), (int, float))]
-    if ages and max(ages) > STATUS_CACHE_STALE_SECONDS:
+    ages = {
+        slug: a
+        for slug, r in repos.items()
+        if isinstance(a := r.get("cache_age_seconds"), (int, float))
+    }
+    stale = {slug: a for slug, a in ages.items() if a > STATUS_CACHE_STALE_SECONDS}
+    if stale:
+        # blocked_err is one fleet-wide string threaded into every repo's
+        # check lines; name the worst offender so the caveat identifies which
+        # repo's snapshot actually drove it.
+        slug, age = max(stale.items(), key=lambda item: item[1])
         return blocked_by_repo, (
-            f"status snapshot cache {max(ages):.0f}s old "
+            f"status snapshot cache {age:.0f}s old for {slug} "
             f"(>{STATUS_CACHE_STALE_SECONDS}s); blocked set may be stale"
         )
     return blocked_by_repo, ""
