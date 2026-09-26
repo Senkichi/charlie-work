@@ -777,11 +777,22 @@ class FakeGitHubWithRerunCapture(FakeGitHubWithChecks):
         *,
         rerun_ok: bool = True,
         rerun_error: str = "This workflow run cannot be retried",
+        workflow_runs: list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(checks)
         self.rerun_ok = rerun_ok
         self.rerun_error = rerun_error
         self.rerun_calls: list[list[str]] = []
+        # Issue #1936: configurable workflow_runs_for_head payload so tests
+        # can flip the containing run between in-progress and terminal.
+        # None means "probe not configured" -> returns None (probe failure),
+        # which the driver fails open on.
+        self.workflow_runs = workflow_runs
+        self.workflow_runs_calls: list[str] = []
+
+    def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None:
+        self.workflow_runs_calls.append(head_sha)
+        return self.workflow_runs
 
     def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):  # noqa: ANN202
         if len(args) >= 2 and args[0] == "run" and args[1] == "rerun":

@@ -238,16 +238,24 @@ def test_stale_checks_grace_minutes_never_referenced_inside_the_detector() -> No
     assert referencing_functions == {"_attempt_stale_checks_retrigger"}
 
 
-def test_exactly_one_workflow_runs_for_head_call_site_and_it_is_inside_the_detector() -> None:
-    """The one gh API call that can answer "did Actions ever create a run
-    for this head" (``workflow_runs_for_head``) must have exactly one call
-    site in ``src/``, and it must live inside
-    ``_detect_ci_run_never_created``. A second, independently-gated call
-    site anywhere else (even under a different name for the same query
-    shape) would be exactly the second-detector-predicate binding comment
-    item 1 forbids and this fence exists to catch. Call-site COUNT, not a
-    text-pattern match for "grace" nearby -- a differently-phrased second
-    window still shows up here as a second ``ast.Call`` node.
+def test_workflow_runs_for_head_call_sites_are_the_registered_ones() -> None:
+    """``workflow_runs_for_head`` (the one gh API call answering "did
+    Actions ever create a run for this head" / "is this run terminal")
+    has a deliberately small call-site set -- every site named here.
+
+    ``_detect_ci_run_never_created`` (reap_dispatch.py) is the original
+    consumer: the stale-checks detector. A second, independently-gated
+    "did CI ever create a run" predicate anywhere else would be exactly
+    the second-detector-predicate binding comment item 1 forbids and
+    this fence exists to catch.
+
+    Issue #1936 adds ``_drive_infra_rerun_or_escalate`` (misc_checks.py):
+    a deferred infra-rerun follow-up probes the CONTAINING run's
+    terminal status before re-calling ``gh run rerun`` -- a different
+    question (per-run status, not run existence), deliberately registered
+    rather than smuggled in. Call-site SET, not a text-pattern match for
+    "grace" nearby -- a differently-phrased second window still shows up
+    here as another ``ast.Call`` node.
 
     Verified by mutation during implementation: temporarily adding
     ``self.gh.workflow_runs_for_head(head_sha)`` inside
@@ -268,7 +276,7 @@ def test_exactly_one_workflow_runs_for_head_call_site_and_it_is_inside_the_detec
                 enclosing = _enclosing_function_name(node, parents)
                 call_sites.append((py_file.name, enclosing))
 
-    assert call_sites == [("reap_dispatch.py", "_detect_ci_run_never_created")], (
-        f"expected exactly one workflow_runs_for_head call site, inside "
-        f"_detect_ci_run_never_created; found {call_sites!r}"
-    )
+    assert call_sites == [
+        ("misc_checks.py", "_drive_infra_rerun_or_escalate"),
+        ("reap_dispatch.py", "_detect_ci_run_never_created"),
+    ], f"unexpected workflow_runs_for_head call site(s); found {call_sites!r}"

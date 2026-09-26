@@ -25,6 +25,7 @@ from charlie_work.checks import (
     classify_infra_failures,
     is_infra_blocked_check,
     summarize_checks,
+    workflow_run_terminal_by_id,
 )
 from charlie_work.janitor import (
     DiffContentSignature,
@@ -395,27 +396,88 @@ def _drive_infra_rerun_or_escalate(
     ``definitive_failed`` names checks that were deliberately not retried
     this pass because other blockers co-occur, which must not escalate.
 
+    Issue #1936: a ``gh run rerun`` refusal whose error reports the target
+    run "already running" is a retry-later race, not a terminal failure --
+    the workflow is still in progress and will land a terminal state on
+    its own. The refused run id is persisted under the PR's
+    ``infra_rerun_deferred`` marker (per-head, like ``infra_rerun_
+    attempts``) and on later passes is probed via
+    ``workflow_runs_for_head`` instead of re-called: a guaranteed-refusal
+    ``gh run rerun`` every pass is API and event churn for zero
+    information. Once the containing run reads terminal the driver fires
+    exactly one follow-up rerun, which succeeds (consuming the attempt)
+    or re-defers/fails like a fresh call. While anything is deferred and
+    nothing else dispatched, the driver returns a deferral ``CommandResult``
+    so the pass does not bookkeep a blocked/escalated episode it cannot
+    yet resolve -- mirroring the #992 flake-lane deferral. The normal
+    attempt is not consumed by the refusal itself.
+
     Returns the ``CommandResult`` the caller should return early when a
-    rerun was dispatched or the cap was escalated, else ``None`` -- a
-    rerun API error records ``infra_rerun_failed`` without consuming the
-    attempt and falls through so the caller's own bookkeeping can record
-    the still-blocked pass. ``ok`` and ``extra_data`` preserve each
-    caller's result shape: ``review()`` returns ``ok=False`` (no review
-    produced this pass) while ``merge_ready()`` returns ``ok=True`` (a
-    healthy, still-unmergeable pass).
+    rerun was dispatched, the pass deferred on a still-running workflow,
+    or the cap was escalated, else ``None`` -- a genuine rerun API error
+    records ``infra_rerun_failed`` without consuming the attempt and
+    falls through so the caller's own bookkeeping can record the
+    still-blocked pass. ``ok`` and ``extra_data`` preserve each caller's
+    result shape: ``review()`` returns ``ok=False`` (no review produced
+    this pass) while ``merge_ready()`` returns ``ok=True`` (a healthy,
+    still-unmergeable pass).
     """
+    infra_rerun_errors: list[str] = []
+    infra_triggered_run_ids: list[int] = []
+    still_deferred: set[int] = set()
+    newly_deferred: set[int] = set()
+    new_deferred: set[int] = set()
+    deferred_for_head: set[int] = set()
+    head_key = str(head_sha or "")
     if rerun_run_ids:
-        infra_rerun_errors: list[str] = []
-        infra_triggered_run_ids: list[int] = []
+        # Issue #1936: run ids refused "already running" on an earlier
+        # pass live in this head's ``infra_rerun_deferred`` set. They are
+        # probed via ``workflow_runs_for_head`` -- still in progress means
+        # the follow-up waits for a later pass; terminal (or unknown: the
+        # probe failed, or the run id is absent from the response) lets
+        # ``gh run rerun`` itself arbitrate, which re-defers on a refusal.
+        if head_key:
+            raw_deferred = (
+                _wf.load_state_locked(self.paths.state_file)
+                .get("prs", {})
+                .get(str(pr_number), {})
+                .get("infra_rerun_deferred")
+                or {}
+            )
+            if isinstance(raw_deferred, dict):
+                for raw_id in raw_deferred.get(head_key) or []:
+                    try:
+                        deferred_for_head.add(int(raw_id))
+                    except (TypeError, ValueError):
+                        continue
+
+        attempt_run_ids: list[int] = []
+        terminal_by_id: dict[int, bool] | None = None
         for run_id in rerun_run_ids:
+            if run_id in deferred_for_head:
+                if terminal_by_id is None:
+                    terminal_by_id = workflow_run_terminal_by_id(
+                        self.gh.workflow_runs_for_head(head_key)
+                    )
+                # Only a present, non-terminal run defers the follow-up;
+                # absent-from-response or a failed probe fails open to
+                # the rerun call so a permanently-undetectable run cannot
+                # strand the PR.
+                if terminal_by_id is not None and terminal_by_id.get(run_id) is False:
+                    still_deferred.add(run_id)
+                    continue
+            attempt_run_ids.append(run_id)
+
+        for run_id in attempt_run_ids:
             result = self.gh.run(["run", "rerun", str(run_id)], allow_failure=True)
             if isinstance(result, _wf.GitHubRunResult):
                 if result.ok:
                     infra_triggered_run_ids.append(run_id)
                 else:
-                    infra_rerun_errors.append(
-                        result.error or f"gh run rerun {run_id} exited {result.returncode}"
-                    )
+                    error = result.error or f"gh run rerun {run_id} exited {result.returncode}"
+                    infra_rerun_errors.append(error)
+                    if _wf._is_rerun_already_running_error(error):
+                        newly_deferred.add(run_id)
             elif isinstance(result, str):
                 # Dry-run returns a descriptive string; treat as success.
                 infra_triggered_run_ids.append(run_id)
@@ -423,6 +485,7 @@ def _drive_infra_rerun_or_escalate(
                 infra_rerun_errors.append(
                     f"unexpected result from gh run rerun {run_id}: {result!r}"
                 )
+        new_deferred = still_deferred | newly_deferred
 
         if infra_triggered_run_ids and not infra_rerun_errors:
             with _wf.state_lock(self.paths.state_file):
@@ -432,6 +495,9 @@ def _drive_infra_rerun_or_escalate(
                     "number": pr_number,
                     "issue_number": issue_number,
                     "infra_rerun_attempts": infra_rerun_attempts,
+                    "infra_rerun_deferred": (
+                        {head_key: sorted(new_deferred)} if new_deferred else {}
+                    ),
                 }
                 state = self._record_event(
                     state,
@@ -455,19 +521,33 @@ def _drive_infra_rerun_or_escalate(
                 },
             )
 
-        # Rerun API error: record it, but do not consume the attempt.
-        with _wf.state_lock(self.paths.state_file):
-            state = _wf.load_state(self.paths.state_file)
-            state = self._record_event(
-                state,
-                "infra_rerun_failed",
-                {
-                    "pr_number": pr_number,
-                    "run_ids": list(rerun_run_ids),
-                    "errors": infra_rerun_errors,
-                },
-            )
-            self.write_gate.save_state(state)
+        if infra_rerun_errors:
+            # Rerun API error: record it, but do not consume the attempt.
+            # Refused "already running" ids are additionally persisted to
+            # the deferred set so later passes wait on the containing
+            # run's terminal state instead of re-calling a guaranteed
+            # refusal (issue #1936).
+            with _wf.state_lock(self.paths.state_file):
+                state = _wf.load_state(self.paths.state_file)
+                state["prs"][str(pr_number)] = {
+                    **state["prs"].get(str(pr_number), {}),
+                    "number": pr_number,
+                    "issue_number": issue_number,
+                    "infra_rerun_deferred": (
+                        {head_key: sorted(new_deferred)} if new_deferred else {}
+                    ),
+                }
+                state = self._record_event(
+                    state,
+                    "infra_rerun_failed",
+                    {
+                        "pr_number": pr_number,
+                        "run_ids": list(rerun_run_ids),
+                        "errors": infra_rerun_errors,
+                        "deferred_run_ids": sorted(newly_deferred),
+                    },
+                )
+                self.write_gate.save_state(state)
 
     if escalate_exhausted and issue_number is not None and definitive_failed:
         # Attempt cap exhausted (or no parseable run id at all): there is no
@@ -518,6 +598,49 @@ def _drive_infra_rerun_or_escalate(
                 **(extra_data or {}),
                 "infra_escalated": True,
                 "label_error": label_error,
+            },
+        )
+
+    if (
+        not infra_triggered_run_ids
+        and (still_deferred or newly_deferred)
+        and all(_wf._is_rerun_already_running_error(e) for e in infra_rerun_errors)
+    ):
+        # The only eligible work this pass is a deferred follow-up: the
+        # containing run is still in progress (a refusal pass lands here
+        # too, once the event above has recorded it). Defer the pass the
+        # way the #992 flake lane does -- no rerun dispatched, no attempt
+        # consumed, no blocked bookkeeping -- and surface the marker so
+        # the next pass's probe can fire the follow-up the moment the
+        # run lands a terminal state. The error block above already
+        # persisted the deferred set on a refusal pass; the write here
+        # only fires on a quiet wait pass to prune deferred ids that left
+        # eligibility since the marker was written (check healed or head
+        # moved), keeping the persisted set exactly the live wait list.
+        if new_deferred != deferred_for_head and head_key and not infra_rerun_errors:
+            with _wf.state_lock(self.paths.state_file):
+                state = _wf.load_state(self.paths.state_file)
+                state["prs"][str(pr_number)] = {
+                    **state["prs"].get(str(pr_number), {}),
+                    "number": pr_number,
+                    "issue_number": issue_number,
+                    "infra_rerun_deferred": (
+                        {head_key: sorted(new_deferred)} if new_deferred else {}
+                    ),
+                }
+                self.write_gate.save_state(state)
+        return _wf.CommandResult(
+            ok,
+            f"PR #{pr_number} infra rerun deferred: workflow run(s) "
+            + ", ".join(str(rid) for rid in sorted(new_deferred))
+            + " still in progress",
+            {
+                "pr": pr_number,
+                "issue": issue_number,
+                **(extra_data or {}),
+                "infra_rerun_run_ids": list(rerun_run_ids),
+                "infra_rerun_deferred_run_ids": sorted(new_deferred),
+                "already_running": True,
             },
         )
 
