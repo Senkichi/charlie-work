@@ -567,6 +567,24 @@ def unescalate(
             updated.pop("status", None)
         for field_name in self._UNESCALATE_ISSUE_RESET_FIELDS:
             updated.pop(field_name, None)
+        # Issue #1477 (Option A): this reset also zeroes
+        # ``auto_deescalation_count`` (via the tuple above), which is correct
+        # only when the re-arm actually changed the underlying cause. Record
+        # WHICH escalation_reason was cleared and when, so the de-escalation
+        # sweep can recognize the identical reason re-firing shortly after
+        # the re-arm as "the human just cleared the label" and promote that
+        # recurrence to ``reason_class="judgment"`` instead of restarting
+        # the auto-clear budget (the #1306/PR #1409 infinite no_op_rework
+        # loop). The markers are deliberately NOT in the reset tuple: they
+        # describe this re-arm, not the episode it ended. A reset that
+        # cleared no reason pops any stale marker left by an earlier
+        # unescalate rather than letting it mis-fire on a later episode.
+        cleared_reason = entry.get("escalation_reason")
+        updated.pop("unescalate_cleared_reason", None)
+        updated.pop("unescalate_cleared_at", None)
+        if isinstance(cleared_reason, str) and cleared_reason:
+            updated["unescalate_cleared_reason"] = cleared_reason
+            updated["unescalate_cleared_at"] = _wf.utc_now()
         return updated
 
     if pr_number is not None and pr_stuck:
@@ -620,6 +638,7 @@ def unescalate(
 
     verdict_voided = False
     mention_rearmed = False
+    cleared_escalation_reason: str | None = None
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
         if pr_number is not None and pr_stuck:
@@ -686,6 +705,8 @@ def unescalate(
                 verdict_voided = True
         if issue_number is not None:
             fresh_issue = state["issues"].get(str(issue_number), {})
+            if isinstance(fresh_issue, dict):
+                cleared_escalation_reason = fresh_issue.get("escalation_reason")
             state["issues"][str(issue_number)] = {
                 **_apply_issue_reset(fresh_issue if isinstance(fresh_issue, dict) else {}),
                 "number": issue_number,
@@ -722,6 +743,11 @@ def unescalate(
                 "blocked_environment_at_reset": prior_blocked_environment_count > 0,
                 "blocked_environment_at_prior_count": prior_blocked_environment_count,
                 "verdict_voided": verdict_voided,
+                # Issue #1477: which escalation_reason this re-arm cleared
+                # (also stamped on the issue entry as
+                # ``unescalate_cleared_reason``), so the recurrence-promotion
+                # audit trail names the cause, not just the reset.
+                "cleared_escalation_reason": cleared_escalation_reason,
             },
         )
         _wf.save_state(self.paths.state_file, state)
@@ -765,6 +791,7 @@ def unescalate(
             "label_error": label_error,
             "mention_rearmed": mention_rearmed,
             "verdict_voided": verdict_voided,
+            "cleared_escalation_reason": cleared_escalation_reason,
             "changed": True,
         },
     )
