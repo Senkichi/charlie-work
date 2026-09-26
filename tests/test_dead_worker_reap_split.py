@@ -5,11 +5,9 @@ verbatim-move lineage as ``dispatch_selection.py``, ``escalation.py``,
 ``backlog_reachability.py``, and ``stalled_review_reap.py`` (#1320)).
 
 ``dead_worker_reap.py`` holds the dead-worker/session-reap free-function
-family -- 25 moved functions plus two threshold constants
+family -- 25 functions plus two threshold constants
 (``STARTUP_DEATH_THRESHOLD_SECONDS``, ``_ZERO_ARTIFACT_ESCALATION_THRESHOLD``),
-verbatim-moved out of ``workflow.py``, plus one later addition:
-``_reap_superseded_workers`` (issue #1494), a new function written directly
-into this module rather than extracted. ``workflow.py`` re-exports every moved
+verbatim-moved out of ``workflow.py``. ``workflow.py`` re-exports every moved
 name through a facade import block (the same pattern the six prior Phase-A
 extractions plus ``stalled_review_reap.py`` use) so every existing
 ``charlie_work.workflow.<name>`` import path and monkeypatch target keeps
@@ -52,8 +50,7 @@ byte-identity discipline over the cap. In place of the 800-line gate, this
 file asserts two things, mirroring ``test_stalled_review_reap_split.py``:
 
 * An AST-derived name-set equality on the module's top-level definitions:
-  must be exactly the 28 known names (27 moved + ``_reap_superseded_workers``),
-  no more, no fewer.
+  must be exactly the 27 known moved names, no more, no fewer.
 * A BAND on the new module's total line count (docstring + imports + body),
   derived live from this PR's own measured total (2667 lines) with headroom
   margin on both sides for legitimate future per-function growth (e.g. a
@@ -116,17 +113,6 @@ _MOVED_NAMES = (
     "_issues_with_live_workers",
 )
 
-# Names written directly into this module AFTER the #1317 extraction --
-# not verbatim-moved out of workflow.py. Kept as a separate tuple so
-# _MOVED_NAMES stays exactly the 27 moved names and the test leaf
-# ``test_module_defines_exactly_the_27_moved_symbols`` keeps its original
-# spelling: the collect-only gate (#1538) treats a renamed leaf as a
-# removal plus an addition and fails the run on the removal, so the leaf
-# name is pinned and later additions are tracked here instead.
-_LATER_ADDED_NAMES = (
-    "_reap_superseded_workers",  # issue #1494
-)
-
 # Band derived live from this PR's own measured total (2667 lines): +/- 150
 # lines of headroom on either side, enough to absorb a future write_gate
 # threading pass (the same class of legitimate growth #1264 W6 PR2 applied
@@ -138,11 +124,8 @@ _LATER_ADDED_NAMES = (
 # pre-review-rework, and no-open-PR lanes) grew the module to 2830 lines —
 # the band is re-centered on the new measured total with the same +/-150
 # headroom, per the assertion's own re-derivation instruction.
-# Re-derived again under issue #1494: ``_reap_superseded_workers`` grew the
-# module to 3155 lines — the band is re-centered on the new measured total
-# with the same +/-150 headroom.
-_CAP_BAND_MIN = 3005
-_CAP_BAND_MAX = 3305
+_CAP_BAND_MIN = 2680
+_CAP_BAND_MAX = 2980
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +308,7 @@ def test_dead_worker_reap_module_actually_imports_cleanly() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Facade-completeness identity checks -- all 28 names importable from BOTH
+# Facade-completeness identity checks -- all 27 names importable from BOTH
 # charlie_work.workflow and charlie_work.dead_worker_reap, and `is`-identical
 # (not merely equal), for every name.
 # ---------------------------------------------------------------------------
@@ -343,14 +326,11 @@ def test_all_moved_names_are_reexported_by_identity() -> None:
     import charlie_work.workflow as workflow
 
     names = _module_level_defined_names(_MODULE_PATH)
-    expected = set(_MOVED_NAMES) | set(_LATER_ADDED_NAMES)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == len(expected), (
-        f"expected {len(expected)} units (27 moved + {len(_LATER_ADDED_NAMES)} "
-        f"later-added), found {len(names)}: {sorted(names)}"
-    )
-    assert set(names) == expected, (
-        f"AST-derived names {sorted(names)} do not match the expected set {sorted(expected)}"
+    assert len(names) == 27, f"expected 27 moved units, found {len(names)}: {sorted(names)}"
+    assert set(names) == set(_MOVED_NAMES), (
+        f"AST-derived names {sorted(names)} do not match the expected moved set "
+        f"{sorted(_MOVED_NAMES)}"
     )
 
     missing_from_facade = [n for n in names if not hasattr(workflow, n)]
@@ -403,14 +383,12 @@ def test_facade_reexported_names_match_the_moved_set() -> None:
     """The facade block's own AST-derived import list (not just attribute
     presence on the ``workflow`` module object, which could also be
     satisfied by an unrelated same-named attribute elsewhere in the file)
-    contains exactly the 28 expected names (the 27 moved names plus every
-    ``_LATER_ADDED_NAMES`` member), no more, no fewer.
+    contains exactly the 27 expected names, no more, no fewer.
     """
     facade_names = _facade_reexported_names(_WORKFLOW_PATH)
-    expected = set(_MOVED_NAMES) | set(_LATER_ADDED_NAMES)
-    assert facade_names == expected, (
+    assert facade_names == set(_MOVED_NAMES), (
         f"workflow.py's `.dead_worker_reap` facade block re-exports "
-        f"{sorted(facade_names)}, expected exactly {sorted(expected)}"
+        f"{sorted(facade_names)}, expected exactly {sorted(_MOVED_NAMES)}"
     )
 
 
@@ -423,31 +401,23 @@ def test_facade_reexported_names_match_the_moved_set() -> None:
 
 def test_module_defines_exactly_the_27_moved_symbols() -> None:
     """Every top-level definition in dead_worker_reap.py must be one of the
-    27 moved names plus every declared later addition
-    (``_LATER_ADDED_NAMES``), no more, no fewer -- catches content silently
+    27 known moved names, no more, no fewer -- catches content silently
     lost, duplicated, or a top-level unit added/dropped/renamed during a
     mechanical edit.
-
-    The leaf name predates issue #1494's ``_reap_superseded_workers`` and
-    is pinned verbatim: the collect-only gate (#1538) reads a renamed test
-    leaf as a removal and fails. The name stays accurate -- the moved set
-    is still exactly 27 names; later additions are tracked in
-    ``_LATER_ADDED_NAMES``.
     """
     names = _module_level_defined_names(_MODULE_PATH)
-    expected = set(_MOVED_NAMES) | set(_LATER_ADDED_NAMES)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert set(names) == expected, (
+    assert set(names) == set(_MOVED_NAMES), (
         f"dead_worker_reap.py's top-level definitions are {sorted(names)}, expected "
-        f"exactly the 27 moved names plus later additions {sorted(expected)}"
+        f"exactly the 27 moved names {sorted(_MOVED_NAMES)}"
     )
 
 
 def test_module_total_line_count_is_within_the_recorded_cap_band() -> None:
     """BAND gate: the new module's total (docstring + imports + body) must
-    fall within [3005, 3305] -- re-derived under issue #1494 from this PR's
-    measured total (3155 lines, grown by ``_reap_superseded_workers``) with
-    +/-150 lines of headroom on either side. This is
+    fall within [2680, 2980] -- re-derived under issue #1684 from this PR's
+    measured total (2830 lines, grown by the provider-throttle cap-exemption
+    gates) with +/-150 lines of headroom on either side. This is
     NOT the repo's normal 800-line cap (explicitly waived for this
     extraction under the same #1283 operator exemption
     ``stalled_review_reap.py`` used).

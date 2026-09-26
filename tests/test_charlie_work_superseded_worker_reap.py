@@ -9,7 +9,7 @@ therefore admitted its replacement into the same worktree (#1337 ran two
 workers against one worktree this way).
 
 The fix enforces at the launch trigger: ``_reap_superseded_workers``
-(dead_worker_reap.py) kills every recorded prior-worker pid for the issue
+(superseded_worker_reap.py) kills every recorded prior-worker pid for the issue
 via the fingerprinted ``write_gate.kill_process_tree`` before
 ``_dispatch_rework_impl`` / ``_local_dispatch_rework`` call
 ``dispatch_sessions``. A pid that survives (or is live with no
@@ -33,7 +33,7 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
-from charlie_work.dead_worker_reap import _reap_superseded_workers
+from charlie_work.superseded_worker_reap import _reap_superseded_workers
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.worker import WorkerView
@@ -100,7 +100,7 @@ def _patch_reap_internals(
     )
     monkeypatch.setattr("charlie_work.worker.iter_workers", lambda _sessions_dir: list(workers))
     monkeypatch.setattr(
-        "charlie_work.dead_worker_reap.is_pid_alive",
+        "charlie_work.superseded_worker_reap.is_pid_alive",
         lambda pid, _st=None: alive.get(pid, False),
     )
 
@@ -117,7 +117,7 @@ def _patch_reap_internals(
         lambda _state_path, kind, payload, **_kw: events.append((kind, payload)),
     )
     monkeypatch.setattr(
-        "charlie_work.dead_worker_reap.sweep_orphan_processes",
+        "charlie_work.superseded_worker_reap.sweep_orphan_processes",
         lambda _wt: list(orphans or []),
     )
     monkeypatch.setattr(
@@ -747,3 +747,39 @@ def test_local_dispatch_rework_blocks_when_prior_worker_survives(
     assert "prior worker still alive" in result["failed"][0]["error"]
     state = load_state(paths.state_file)
     assert state["issues"]["7"]["status"] == "rework_requested"
+
+
+# ---------------------------------------------------------------------------
+# Single-enforcement-point guard — the two lanes must not drift apart
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).parents[1]
+_LANE_PATHS = (
+    _REPO_ROOT / "src" / "charlie_work" / "orchestration" / "state_dispatch_rework.py",
+    _REPO_ROOT / "src" / "charlie_work" / "orchestration" / "local_lanes.py",
+)
+
+
+def test_lanes_share_the_single_reap_helper_and_named_kind() -> None:
+    """PR #1926 review: the reap-then-synthetic-failure block was duplicated
+    across the remote and local rework lanes. Both lanes must delegate to
+    ``_reap_superseded_workers_for_launch`` and neither may carry the
+    failure-kind literal — the kind is spelled once, as
+    ``PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND`` in config.py."""
+    from charlie_work.config import (
+        PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS,
+        PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND,
+    )
+
+    for lane_path in _LANE_PATHS:
+        source = lane_path.read_text(encoding="utf-8")
+        assert "prior_worker_still_alive" not in source, (
+            f"{lane_path.name} spells the failure kind literally — use "
+            "PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND via the shared helper"
+        )
+        assert "_reap_superseded_workers_for_launch" in source, (
+            f"{lane_path.name} does not call the shared reap helper — the "
+            "two lanes must share the single enforcement point"
+        )
+
+    assert PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND in PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS

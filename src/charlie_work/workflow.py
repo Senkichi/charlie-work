@@ -453,7 +453,6 @@ from .dead_worker_reap import (  # noqa: F401  (deliberate re-export)
     _ZERO_ARTIFACT_ESCALATION_THRESHOLD,
     _is_zero_artifact_dispatch_loop,
     _sweep_orphan_processes_for_dead_sessions,
-    _reap_superseded_workers,
     _log_worker_census,
     _rework_pr_for_worker,
     _reap_restore_rework_requested,

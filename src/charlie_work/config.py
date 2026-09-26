@@ -157,14 +157,11 @@ DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
 # budget as an ordinary redispatch before escalating — just with the
 # correct reason and the blocking path in the message.
 #
-# Issue #1494: ``prior_worker_still_alive`` joins the set — a rework launch
-# refused because the superseded worker's process survived its reap
-# attempt (or was alive with no start-time fingerprint to kill against).
-# The replacement worker never started, so it must not consume the
-# redispatch cap; the retry budget exists because the surviving process
-# may exit (or be reaped successfully) on a later pass.
+# Issue #1494: the superseded worker survived its reap (or was live with
+# no fingerprint to kill against) — the launch is refused.
+PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND = "prior_worker_still_alive"
 PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"worktree_foreign_writer", "prior_worker_still_alive"}
+    {"worktree_foreign_writer", PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND}
 )
 
 

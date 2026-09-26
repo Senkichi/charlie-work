@@ -26,6 +26,7 @@ from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
 from charlie_work.state import StateLockBusy
 from charlie_work.worktree import worktree_ahead_of_sha
+import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
 
 
@@ -1190,55 +1191,30 @@ def _dispatch_rework_impl(
     manifest_path = self._layout.session_manifest
     results_path = self._layout.session_results
     # Issue #1494: a rework launch supersedes the issue's previously
-    # dispatched worker, but every producer of ``rework_requested`` —
+    # dispatched worker, and every producer of ``rework_requested`` —
     # including the janitor-gate/worktree-rescue stall path this issue
-    # covers — flips the status without checking that worker's liveness,
-    # and ``_check_worktree_writer_marker`` deliberately exempts a marker
-    # owned by one of our own live sessions, so a still-running prior
-    # worker admitted its replacement into the same worktree (#1337 ran
-    # two workers against one worktree this way). The launch trigger is
-    # the enforcement point: reap every still-live recorded worker pid for
-    # the issue first. A pid that survives the reap blocks this launch via
-    # a synthetic pre-launch failure (``prior_worker_still_alive`` →
-    # blocked_environment_at accounting, escalating at the existing cap)
-    # rather than starting a second writer on an occupied worktree.
-    superseded_blocked_results: list[SessionDispatchResult] = []
-    launchable_requests: list[SessionRequest] = []
-    for request in session_requests:
-        superseded_entry = rescue_state_snapshot.get("issues", {}).get(str(request.issue_number))
-        surviving = _wf._reap_superseded_workers(
-            request.issue_number,
-            superseded_entry if isinstance(superseded_entry, dict) else {},
+    # covers — flips the status without checking that worker's liveness.
+    # The launch trigger is the enforcement point: the shared helper reaps
+    # every still-live recorded worker pid first; a pid that survives the
+    # reap blocks this launch via a synthetic pre-launch failure
+    # (PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND → blocked_environment_at
+    # accounting, escalating at the existing cap) rather than starting a
+    # second writer on an occupied worktree.
+    launchable_requests, superseded_blocked_results = (
+        superseded_worker_reap._reap_superseded_workers_for_launch(
+            session_requests,
+            rescue_state_snapshot.get("issues", {}),
             sessions_dir,
-            worktree_path=_wf.worktree_path_for_branch(
-                self.repo_root, request.branch_name, self._layout.worktrees
+            repo_root=self.repo_root,
+            worktrees_dir=self._layout.worktrees,
+            adapter_label=lambda request: (
+                "claude-code"
+                if request.issue_number in rescue_issue_numbers
+                else self.config.worker.harness
             ),
             write_gate=self.write_gate,
         )
-        if surviving:
-            superseded_blocked_results.append(
-                SessionDispatchResult(
-                    issue_number=request.issue_number,
-                    issue_title=request.issue_title,
-                    prompt_path=str(request.prompt_path),
-                    branch_name=request.branch_name,
-                    adapter=(
-                        "claude-code"
-                        if request.issue_number in rescue_issue_numbers
-                        else self.config.worker.harness
-                    ),
-                    ok=False,
-                    error=(
-                        "prior worker still alive after reap "
-                        f"(pid(s): {surviving}); refusing to launch a "
-                        "second worker into the same worktree"
-                    ),
-                    failure_kind="prior_worker_still_alive",
-                    pid=surviving[0],
-                )
-            )
-            continue
-        launchable_requests.append(request)
+    )
 
     # Rescue tier (issue #555): split the batch so rescue-marked issues
     # launch via the claude-code adapter pinned to rescue.worker_model
