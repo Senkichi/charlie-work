@@ -7557,15 +7557,17 @@ def test_create_review_checkout_rejects_non_hex_head_sha(tmp_path: Path) -> None
         create_review_checkout(repo_root, 1, "not-a-sha!", reviews_dir=tmp_path / "reviews")
 
 
-def test_rework_refuses_dirty_foreign_worktree_at_unexpected_path(
-    tmp_path: Path,
-) -> None:
+def test_rework_refuses_foreign_worktree_at_unexpected_path(tmp_path: Path) -> None:
     """Issue #1118: a rework dispatch must never adopt an operator's foreign
     checkout with uncommitted edits in it — the operator's uncommitted work
     must not be committed as worker output. Issue #1476 reworked the blanket
     foreign-path refusal into a checked adoption: a CLEAN foreign checkout is
     now adopted (see tests/test_worktree_foreign_adoption.py), while a dirty
     one stays refused with WorktreeForeignWriterError.
+
+    The test name is pinned: the collect-only gate (#1538) fails a PR on any
+    leaf name removed from base, so renaming this test requires the
+    operator-applied exemption label.
     """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
