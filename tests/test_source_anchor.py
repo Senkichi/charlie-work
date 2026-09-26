@@ -191,7 +191,16 @@ def test_conftest_sessionstart_enforces_the_anchor(
         conftest.pytest_sessionstart(None)
 
 
+@pytest.mark.skipif(
+    bool(os.environ.get(SOURCE_ANCHOR_OPT_OUT_VAR)),
+    reason=(
+        f"{SOURCE_ANCHOR_OPT_OUT_VAR} is set -- this session deliberately "
+        "resolves charlie_work outside the checkout, so there is no anchor to assert"
+    ),
+)
 def test_this_session_itself_is_anchored() -> None:
     """The hook ran for this very run; asserting the real import location is
-    under this repo root is the live positive control."""
+    under this repo root is the live positive control. Sessions that export
+    the opt-out marker legitimately resolve the package elsewhere, so this
+    control stands down with them rather than going red."""
     assert source_anchor_violation(REPO_ROOT, charlie_work.__file__) is None
