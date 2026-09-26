@@ -25,15 +25,22 @@ from pathlib import Path
 import pytest
 
 from _fakes_github import FakeGitHub
-from _rework_dispatch_fixtures import _blocked_env_timestamps
-from charlie_work.adapters import SessionDispatchResult
+from _rework_dispatch_fixtures import (
+    _blocked_env_timestamps,
+    _seed_two_rework_issues,
+    _TwoReworkIssuesGitHub,
+)
+from charlie_work.adapters import SessionDispatchResult, SessionRequest
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
     WatchdogConfig,
     WorkerRoleConfig,
 )
-from charlie_work.superseded_worker_reap import _reap_superseded_workers
+from charlie_work.superseded_worker_reap import (
+    _reap_superseded_workers,
+    _reap_superseded_workers_for_launch,
+)
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.worker import WorkerView
@@ -273,6 +280,41 @@ def test_reap_superseded_workers_live_unfingerprinted_blocks(
     assert "no process_start_time" in events[0][1]["reason"]
 
 
+def test_reap_superseded_workers_merges_state_fingerprint_onto_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sidecar/state fingerprint merge (the ``if pid in candidates``
+    branch): a sidecar recorded before ``process_start_time`` capture
+    carries no fingerprint, but the state entry for the same pid does.
+    The merge must prefer the recorded fingerprint so a reaper-eligible
+    worker is killed instead of failing closed as live-and-unfingerprinted
+    the way the test above does. Removing the merge leaves the candidate
+    unfingerprinted -> blocked, so this fails if the merge ``if`` is
+    dropped."""
+    alive = {PRIOR_PID: True}
+    kill_calls: list[tuple[int, float | None]] = []
+    events: list[tuple[str, dict]] = []
+    _patch_reap_internals(
+        monkeypatch,
+        workers=[_worker_view(123, PRIOR_PID, process_start_time=None)],
+        alive=alive,
+        kill_calls=kill_calls,
+        events=events,
+    )
+
+    survivors = _reap_superseded_workers(
+        123,
+        {"worker_pid": PRIOR_PID, "worker_process_start_time": PRIOR_START},
+        tmp_path / "sessions",
+        write_gate=_gate(tmp_path),
+    )
+
+    assert survivors == []
+    # The kill ran against the STATE fingerprint, which the sidecar lacked.
+    assert kill_calls == [(PRIOR_PID, PRIOR_START)]
+    assert [kind for kind, _p in events] == ["superseded_worker_reaped"]
+
+
 def test_reap_superseded_workers_surviving_kill_blocks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -393,6 +435,72 @@ def test_reap_superseded_workers_requires_gate(tmp_path: Path) -> None:
     a silent ungated kill."""
     with pytest.raises(TypeError):
         _reap_superseded_workers(123, {}, tmp_path / "sessions", write_gate=None)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# _reap_superseded_workers_for_launch — batch partitioning
+# ---------------------------------------------------------------------------
+
+
+def test_reap_superseded_workers_for_launch_mixed_batch_partitions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR #1926 review: the launch-lane wrapper must partition per request —
+    a request whose prior worker survives the reap is blocked while a clean
+    request in the SAME batch still launches. A ``continue`` turned into
+    ``break`` would strand every request after the blocked one, so the
+    launchable assertion is what pins the loop's per-request semantics."""
+    alive = {PRIOR_PID: True}
+    kill_calls: list[tuple[int, float | None]] = []
+    events: list[tuple[str, dict]] = []
+    _patch_reap_internals(
+        monkeypatch,
+        workers=[_worker_view(123, PRIOR_PID, process_start_time=None)],
+        alive=alive,
+        kill_calls=kill_calls,
+        events=events,
+    )
+
+    blocked_request = SessionRequest(
+        issue_number=123,
+        issue_title="Blocked rework",
+        prompt_path=tmp_path / "rework-123.md",
+        branch_name="agent/issue-123-blocked",
+        rework=True,
+    )
+    clean_request = SessionRequest(
+        issue_number=7,
+        issue_title="Clean rework",
+        prompt_path=tmp_path / "rework-7.md",
+        branch_name="agent/issue-7-clean",
+        rework=True,
+    )
+
+    # Rescue-style branch mirrors _dispatch_rework_impl's adapter_label:
+    # rescue-marked issues report "claude-code", the rest the configured
+    # harness — here the BLOCKED request is the rescue one, so the label on
+    # the synthetic result proves the callback was consulted.
+    rescue_issue_numbers = {123}
+    launchable, blocked = _reap_superseded_workers_for_launch(
+        [blocked_request, clean_request],
+        {},
+        tmp_path / "sessions",
+        repo_root=tmp_path,
+        worktrees_dir=tmp_path / "worktrees",
+        adapter_label=lambda request: (
+            "claude-code" if request.issue_number in rescue_issue_numbers else "command"
+        ),
+        write_gate=_gate(tmp_path),
+    )
+
+    assert launchable == [clean_request]
+    assert len(blocked) == 1
+    result = blocked[0]
+    assert result.issue_number == 123
+    assert result.ok is False
+    assert result.failure_kind == "prior_worker_still_alive"
+    assert result.pid == PRIOR_PID
+    assert result.adapter == "claude-code"
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +797,78 @@ def test_dispatch_rework_prior_worker_block_escalates_at_cap(
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "dispatch_blocked_environment"
     assert (123, config.labels.operator_queue) in fake_gh.labels_added
+
+
+def test_dispatch_rework_mixed_batch_launches_clean_and_blocks_survivor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR #1926 review, impl level: in one pass with two rework candidates,
+    the issue whose prior worker survives its reap is refused BEFORE launch
+    while the clean issue still reaches dispatch_sessions — the wrapper's
+    blocked result must flow through the same blocked-environment
+    accounting as any pre-launch failure (claim released to
+    ``rework_requested``, ``blocked_environment_at`` accrued, redispatch_at
+    untouched)."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)")),
+        worker=WorkerRoleConfig(harness="command"),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    _seed_two_rework_issues(paths, config, rescue_issue_numbers=set())
+    app = OrchestratorApp(tmp_path, paths, config, _TwoReworkIssuesGitHub())
+
+    # Issue 123's prior worker is live but carries no fingerprint — the
+    # unfingerprinted-survivor shape. Issue 124 has no recorded worker.
+    alive = {PRIOR_PID: True}
+    kill_calls: list[tuple[int, float | None]] = []
+    events: list[tuple[str, dict]] = []
+    _patch_reap_internals(
+        monkeypatch,
+        workers=[_worker_view(123, PRIOR_PID, process_start_time=None)],
+        alive=alive,
+        kill_calls=kill_calls,
+        events=events,
+    )
+
+    dispatch_calls: list[list[int]] = []
+
+    def _recording_dispatch(_repo_root, _manifest, _results, settings, requests):
+        dispatch_calls.append([r.issue_number for r in requests])
+        return [
+            SessionDispatchResult(
+                issue_number=r.issue_number,
+                issue_title=r.issue_title,
+                prompt_path=str(r.prompt_path),
+                branch_name=r.branch_name,
+                adapter=settings.adapter,
+                ok=True,
+                pid=99999,
+                process_start_time=2.0,
+            )
+            for r in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _recording_dispatch)
+
+    result = app.dispatch_rework()
+
+    # Only the clean request reached the launch path.
+    assert dispatch_calls == [[124]]
+    assert result.ok is False  # issue 123's synthetic failure failed the pass
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["124"]["status"] == "dispatched"
+    entry123 = state["issues"]["123"]
+    assert entry123["status"] == "rework_requested"
+    assert len(entry123.get("blocked_environment_at", [])) == 1
+    assert entry123.get("redispatch_at") is None
+    assert any(
+        e["kind"] == "rework_dispatch_blocked_environment"
+        and e["payload"].get("issue_number") == 123
+        and e["payload"].get("failure_kind") == "prior_worker_still_alive"
+        for e in state["events"]
+    )
 
 
 # ---------------------------------------------------------------------------
