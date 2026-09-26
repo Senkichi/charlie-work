@@ -117,7 +117,9 @@ class DriftItem:
     # "dead_session_no_open_pr"); ``failure_kind`` is the classifier's
     # optional refinement (may be None when classification was inconclusive).
     # Both are threaded into the ``reconcile`` event payload by apply_fixes.
-    # Unused by every other kind.
+    # ``failure_kind`` is also the payload a ``dead_worker_failure_kind``
+    # item (#1917) stamps onto the issue entry. ``reason`` stays unused by
+    # every other kind.
     reason: str | None = None
     failure_kind: str | None = None
     # Issue #1402: structured "why" for ``mergequeue_revoked`` drift items, so
@@ -1809,6 +1811,29 @@ def detect_drift(
                         else:
                             failure_kind, throttled_until = None, None
 
+                    if failure_kind:
+                        # Issue #1917: persist the classification on the
+                        # issue entry so workflow.py's state.json-keyed
+                        # orphan sweep — which runs after the sidecar is
+                        # reaped just below — can exempt provider-throttle
+                        # deaths (is_provider_throttle_failure) from its
+                        # dead_dispatched_reap_minutes escalation and the
+                        # orphan-redispatch cap, matching the #1684
+                        # exemption the rework lanes already apply.
+                        drift.append(
+                            DriftItem(
+                                kind="dead_worker_failure_kind",
+                                issue_number=w.issue_number,
+                                pr_number=None,
+                                detail=(
+                                    f"issue #{w.issue_number} dead worker classified "
+                                    f"failure_kind={failure_kind}"
+                                ),
+                                fix_actions=(f"stamp dead_worker_failure_kind={failure_kind}",),
+                                failure_kind=failure_kind,
+                            )
+                        )
+
                     if failure_kind and throttled_until:
                         # Update state with throttle window
                         # This is a no-op drift item that just signals state update
@@ -3191,6 +3216,21 @@ def apply_fixes(
                         adapter_kind=item.throttle_adapter_kind,
                     )
                     break
+
+        elif item.kind == "dead_worker_failure_kind":
+            # Issue #1917: persist the dead worker's classification on the
+            # issue entry so the state.json-keyed orphan sweep can exempt
+            # provider-throttle deaths from its timed reap and
+            # orphan-redispatch cap. Never invents an issue entry — an
+            # untracked session has no orphan-sweep bookkeeping to exempt.
+            if item.issue_number is not None and item.failure_kind is not None:
+                issue_key = str(item.issue_number)
+                existing_issue = new_issues.get(issue_key)
+                if isinstance(existing_issue, dict):
+                    new_issues[issue_key] = {
+                        **existing_issue,
+                        "dead_worker_failure_kind": item.failure_kind,
+                    }
 
         elif item.kind == "session_failed_escalated":
             # Issue #261: worker was killed by a push-gate hook — escalate

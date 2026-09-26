@@ -134,6 +134,7 @@ from .state import (
     clear_quota_throttles,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     clear_reviewer_quota,
     defer_reviewer_probe_after,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
+    clear_dead_worker_failure_kind,  # noqa: F401  (deliberate re-export; used by moved orchestration delegates via _wf.)
     clear_escalation,
     clear_escalation_on_issue_prs,
     disarm_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
@@ -171,6 +172,7 @@ from .preflight import (
     run_preflight,  # noqa: F401  (deliberate re-export; Tier D patch target + used by moved L05 _loop_impl delegate via _wf.)
 )
 from .throttle_signatures import (
+    is_provider_throttle_failure,
     match_quota_tail,
     match_throttle_tail,
     parse_reset_clock_time,
@@ -2244,69 +2246,26 @@ def _detect_and_handle_orphaned_workers(
             if entry.get("status") != "dispatched":
                 continue
 
-            # Issue #654: time-based escape for a dead dispatched worker whose
-            # drift was already surfaced on a prior pass (``orphan_drift_at`` is
-            # set) but whose PR state did not qualify for auto-reset -- a clean
-            # exit with no push (issue #773's ``dead_worker_clean_exit_no_op``
-            # branch), a non-request_changes decision, a head change without a
-            # review callback, or a PR-create failure on a pushed branch. In all
-            # of these the specific sub-branch below emits drift once, sets
-            # ``orphan_drift_at``, then on every subsequent pass the fingerprint
-            # match short-circuits to ``continue`` -- so the dispatch label
-            # (``agent:in-progress``) holds indefinitely. The label is the
-            # one-writer-per-branch mutex, so no re-dispatch can proceed on that
-            # branch until a worker that no longer exists reports back. After
-            # ``dead_dispatched_reap_minutes`` since the drift was first
-            # surfaced, escalate to ``agent:human-needed`` so a human can inspect
-            # the worktree for unpushed commits and decide whether to salvage or
-            # re-dispatch. This runs BEFORE the specific sub-branches so it is a
-            # pure backstop: on the first pass ``orphan_drift_at`` is not yet set
-            # and the specific sub-branch runs normally (either resetting
-            # immediately or emitting the first drift). Only issues that already
-            # have drift recorded and have exceeded the grace period are
-            # escalated here. 0 disables the escape (pre-#654 hold-forever).
-            orphan_drift_at = entry.get("orphan_drift_at")
-            if orphan_drift_at is not None and config.watchdog.dead_dispatched_reap_minutes > 0:
-                drift_dt = _parse_iso_timestamp(orphan_drift_at)
-                if (
-                    drift_dt is not None
-                    and (now - drift_dt).total_seconds() / 60
-                    >= config.watchdog.dead_dispatched_reap_minutes
-                ):
-                    pr_data_for_reap = pr_by_issue.get(issue_number)
-                    pr_number_for_reap = (
-                        int(pr_data_for_reap["number"]) if pr_data_for_reap else None
-                    )
-                    terminal = find_worker_terminal_status(sessions_dir, issue_number)
-                    terminal_exit_code = terminal.get("exit_code") if terminal else None
-                    state = _escalate_issue(
-                        state,
-                        issue_number,
-                        reason="dead_dispatched_worker_reap",
-                        reason_class="mechanical",
-                        pr_number=pr_number_for_reap,
-                        issue_extra={
-                            "dispatched_at": None,
-                            "orphan_drift_fingerprint": None,
-                            "orphan_drift_at": None,
-                        },
-                    )
-                    sweep_events.append(
-                        (
-                            "dead_dispatched_worker_reaped",
-                            {
-                                "issue_number": issue_number,
-                                "pr_number": pr_number_for_reap,
-                                "previous_status": "dispatched",
-                                "reason": "dead_dispatched_worker_reap",
-                                "orphan_drift_at": orphan_drift_at,
-                                "reap_minutes": (config.watchdog.dead_dispatched_reap_minutes),
-                                "exit_code": terminal_exit_code,
-                            },
-                        )
-                    )
-                    reap_escalations.append(issue_number)
-                    continue
+            # Issue #654/#1917: timed dead-dispatched escalation backstop,
+            # extracted to ``orphaned_worker_sweep`` -- it escalates only
+            # entries with drift already surfaced on a prior pass that have
+            # exceeded ``dead_dispatched_reap_minutes``, and skips deaths
+            # classified as provider throttling entirely.
+            state, dead_dispatched_reaped = (
+                orphaned_worker_sweep.maybe_reap_dead_dispatched_worker(
+                    state=state,
+                    entry=entry,
+                    issue_number=issue_number,
+                    sessions_dir=sessions_dir,
+                    pr_data=pr_by_issue.get(issue_number),
+                    dead_dispatched_reap_minutes=(config.watchdog.dead_dispatched_reap_minutes),
+                    now=now,
+                    sweep_events=sweep_events,
+                )
+            )
+            if dead_dispatched_reaped:
+                reap_escalations.append(issue_number)
+                continue
 
             # Issue #282: do not clear the liveness fingerprint here. The worker
             # is dead (``_worker_pid_alive`` returned False), but the PID record
@@ -2638,9 +2597,20 @@ def _detect_and_handle_orphaned_workers(
                 orphan_redispatch_at = _windowed_orphan_redispatch_at(
                     entry, window_minutes=config.watchdog.redispatch_window_minutes
                 )
+                # Issue #1917: a provider-throttle-classified death is a
+                # global provider condition, not a worker-quality signal —
+                # it must not count toward the orphan-sweep redispatch cap,
+                # matching the #1684 exemption the rework lanes apply to
+                # ``redispatch_at``. The classification is read from
+                # ``dead_worker_failure_kind``, stamped on the entry by the
+                # stall/dead reap lanes; earlier non-throttle deaths in the
+                # list still count.
+                provider_throttled_death = is_provider_throttle_failure(
+                    entry.get("dead_worker_failure_kind")
+                )
                 if head_changed or first_observation:
-                    orphan_redispatch_at = [now_ts]
-                elif dispatch_identity != prior_dispatch:
+                    orphan_redispatch_at = [] if provider_throttled_death else [now_ts]
+                elif dispatch_identity != prior_dispatch and not provider_throttled_death:
                     orphan_redispatch_at = orphan_redispatch_at + [now_ts]
 
                 redispatch_count = len(orphan_redispatch_at)

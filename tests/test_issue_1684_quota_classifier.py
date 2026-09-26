@@ -35,7 +35,11 @@ from charlie_work.config import (
     build_config_from_data,
 )
 from charlie_work.state import load_state, save_state, state_lock
-from charlie_work.throttle_signatures import match_quota_tail, match_throttle_tail
+from charlie_work.throttle_signatures import (
+    is_provider_throttle_failure,
+    match_quota_tail,
+    match_throttle_tail,
+)
 from charlie_work.workflow import (
     _classify_dead_sessions_and_update_throttle_state,
     _detect_and_handle_stalled_reviews,
@@ -811,3 +815,27 @@ def test_quota_error_markers_rejects_non_list() -> None:
 def test_quota_error_markers_rejects_non_string_element() -> None:
     with pytest.raises(ConfigError):
         build_config_from_data({"runtime": {"quota_error_markers": [42]}})
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected"),
+    [
+        ("rate_limited", True),
+        ("quota_exhausted", True),
+        ("provider_auth", True),
+        # Terminal, not a cooldown: escalates on first occurrence via
+        # DETERMINISTIC_ESCALATION_FAILURE_KINDS — deliberately absent
+        # from PROVIDER_THROTTLE_FAILURE_KINDS.
+        ("provider_suspended", False),
+        ("stalled", False),
+        ("launch_failed", False),
+        ("worker_blocked", False),
+        (None, False),
+    ],
+)
+def test_is_provider_throttle_failure(failure_kind: str | None, expected: bool) -> None:
+    """The single-point-of-enforcement predicate every death-credit lane
+    and the #1917 timed-reap exemption share — provider-throttle kinds
+    True, ``provider_suspended`` (terminal, not a cooldown) False, and
+    ``None`` (unclassified death) never a throttle kind."""
+    assert is_provider_throttle_failure(failure_kind) is expected
