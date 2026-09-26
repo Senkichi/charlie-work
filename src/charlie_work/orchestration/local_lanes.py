@@ -1875,12 +1875,17 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
         for pr_number in candidates:
             issue_number = request_issues[pr_number]
             issue_entry = state["issues"].get(str(issue_number), {})
-            state["issues"][str(issue_number)] = {
+            entry = {
                 **issue_entry,
                 "number": issue_number,
                 "status": "dispatch_pending",
                 "dispatch_pending_at": claim_stamp,
             }
+            # Issue #1917: a new dispatch epoch supersedes the previous
+            # death's classification, so a stale provider-throttle kind
+            # cannot exempt a later, genuinely different death.
+            _wf.clear_dead_worker_failure_kind(entry)
+            state["issues"][str(issue_number)] = entry
         self.write_gate.save_state(state)
 
     dispatch_results = _wf.dispatch_sessions(

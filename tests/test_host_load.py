@@ -22,6 +22,7 @@ call time).
 
 from __future__ import annotations
 
+import itertools
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -129,6 +130,66 @@ def test_pytest_tree_load_nested_pytest_counts_once() -> None:
         self_pid=999,
     )
     assert load == host_load.HostLoad(pytest_tree_count=1, pytest_process_count=4)
+
+
+def test_pytest_tree_load_nested_root_with_lower_pid_counts_once() -> None:
+    """Issue #1918: a nested root whose PID is LOWER than its outer root's
+    was counted as its own tree, then the outer root again. Real Windows
+    PIDs are effectively random, so this ordering is routine."""
+    load = host_load.pytest_tree_load(
+        _procs(
+            _proc(500, 1, "pytest -q"),
+            _proc(501, 500, "python -u -c worker"),
+            _proc(100, 501, "python -m pytest inner/"),
+            _proc(111, 100, "python -u -c inner_worker"),
+        ),
+        self_pid=999,
+    )
+    assert load == host_load.HostLoad(pytest_tree_count=1, pytest_process_count=4)
+
+
+def test_pytest_tree_load_wrapper_chain_in_descending_pid_order_counts_once() -> None:
+    """The live shape behind #1918: every layer of a wrapped suite names
+    pytest, and PIDs descend down the chain."""
+    load = host_load.pytest_tree_load(
+        _procs(
+            _proc(400, 1, 'bash -c "source snap.sh && timeout 1500 uv run pytest -q"'),
+            _proc(300, 400, "timeout 1500 uv run pytest -q"),
+            _proc(200, 300, "uv run pytest -q"),
+            _proc(100, 200, "python.exe -m pytest -q"),
+            _proc(50, 100, "python -u -c worker"),
+        ),
+        self_pid=999,
+    )
+    assert load == host_load.HostLoad(pytest_tree_count=1, pytest_process_count=5)
+
+
+def test_pytest_tree_load_is_independent_of_snapshot_order() -> None:
+    """The count must not depend on which root the reducer visits first."""
+    procs = [
+        _proc(400, 1, "uv run pytest -q"),
+        _proc(100, 400, "python -m pytest -q"),
+        _proc(90, 100, "python -u -c worker"),
+        _proc(300, 1, "pytest other/"),
+        _proc(20, 300, "python -m pytest nested/"),
+        _proc(700, 1, "pytest third/"),
+    ]
+    expected = host_load.HostLoad(pytest_tree_count=3, pytest_process_count=6)
+    for perm in itertools.permutations(procs):
+        assert host_load.pytest_tree_load(perm, self_pid=999) == expected
+
+
+def test_pytest_tree_load_cycle_between_two_roots_counts_once() -> None:
+    """A ppid cycle joining two pytest roots (PID reuse mid-scan) is one
+    tree, not zero (neither root is 'topmost') and not two."""
+    load = host_load.pytest_tree_load(
+        _procs(
+            _proc(100, 200, "pytest -q"),
+            _proc(200, 100, "python -m pytest inner/"),
+        ),
+        self_pid=999,
+    )
+    assert load == host_load.HostLoad(pytest_tree_count=1, pytest_process_count=2)
 
 
 def test_pytest_tree_load_recognizes_invocation_spellings() -> None:

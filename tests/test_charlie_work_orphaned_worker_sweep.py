@@ -10,6 +10,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import pytest
 from _dead_session_fixtures import _write_flat_review_decision
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
@@ -581,3 +582,197 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
     # is the branch-issue validator's own open-issue fetch (issue #1229), not
     # the bulk reclaim sweep.
     assert fake_gh.issue_list_calls == 1
+
+
+def _dead_worker_with_pr_sweep(
+    tmp_path: Path,
+    *,
+    decision: str | None,
+    pr_state_status: str | None,
+    issue_labels: list[dict[str, str]],
+    failure_kind: str | None,
+) -> tuple[dict[str, Any], FakeGitHub, OrchestratorConfig, Path]:
+    """One orphan-sweep pass over a dead dispatched worker with an open PR.
+
+    ``decision``/``pr_state_status`` select which ``handle_dead_worker_with_pr``
+    recovery branch runs (request_changes / approved+rework_requested /
+    unreviewed). Returns the post-sweep state dict, the fake, the config,
+    and the paths object so each credit-gate test can assert on its own
+    lane.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    entry: dict[str, Any] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    if failure_kind is not None:
+        entry["dead_worker_failure_kind"] = failure_kind
+    pr_state: dict[str, Any] = {"reviewed_head_sha": "abc123"}
+    if decision is not None:
+        pr_state["decision"] = decision
+    if pr_state_status is not None:
+        pr_state["status"] = pr_state_status
+
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = entry
+    state["prs"]["100"] = pr_state
+    save_state(paths.state_file, state)
+    if decision is not None:
+        _write_flat_review_decision(paths, 100, decision, "abc123")
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 207,
+            "title": "Test issue",
+            "url": "https://example.test/issues/207",
+            "body": "",
+            "labels": issue_labels,
+            "state": "OPEN",
+        }
+    )
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    (sessions_dir / "issue-207.claude.terminal.json").write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "exit_code": 1,
+                "started_at": "2024-01-01T00:00:00Z",
+                "ended_at": "2024-01-01T00:00:05Z",
+                "duration_seconds": 5.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+
+    return load_state(paths.state_file), fake_gh, config, paths
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expect_credit"),
+    [("rate_limited", False), ("stalled", True), (None, True)],
+)
+def test_dead_worker_request_changes_lane_death_credit_gated_by_failure_kind(
+    tmp_path: Path, failure_kind: str | None, expect_credit: bool
+) -> None:
+    """Issue #1917: the ``_credit_worker_death`` gate in the
+    request_changes restore branch of ``handle_dead_worker_with_pr`` skips
+    the death credit for a provider-throttle classification (a global
+    provider condition, not a worker-quality signal) and still credits a
+    non-throttle or unclassified death."""
+    state, _fake_gh, _config, _paths = _dead_worker_with_pr_sweep(
+        tmp_path,
+        decision="request_changes",
+        pr_state_status=None,
+        issue_labels=[],
+        failure_kind=failure_kind,
+    )
+
+    # The recovery itself still runs either way.
+    entry = state["issues"]["207"]
+    assert entry.get("status") == "rework_requested"
+    if expect_credit:
+        assert len(entry.get("worker_death_at") or []) == 1
+    else:
+        assert not entry.get("worker_death_at")
+    recovered = [
+        e
+        for e in state.get("events", [])
+        if e.get("kind") == "orphaned_worker_recovered"
+        and e.get("payload", {}).get("issue_number") == 207
+    ]
+    assert len(recovered) == 1
+    assert recovered[0]["payload"]["reason"] == "dead_worker_with_request_changes"
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expect_credit"),
+    [("rate_limited", False), ("stalled", True), (None, True)],
+)
+def test_dead_worker_approved_rework_lane_death_credit_gated_by_failure_kind(
+    tmp_path: Path, failure_kind: str | None, expect_credit: bool
+) -> None:
+    """Issue #1917: same ``_credit_worker_death`` gate in the
+    approved+``rework_requested`` restore branch."""
+    state, _fake_gh, _config, _paths = _dead_worker_with_pr_sweep(
+        tmp_path,
+        decision="approved",
+        pr_state_status="rework_requested",
+        issue_labels=[],
+        failure_kind=failure_kind,
+    )
+
+    entry = state["issues"]["207"]
+    assert entry.get("status") == "rework_requested"
+    if expect_credit:
+        assert len(entry.get("worker_death_at") or []) == 1
+    else:
+        assert not entry.get("worker_death_at")
+    recovered = [
+        e
+        for e in state.get("events", [])
+        if e.get("kind") == "orphaned_worker_recovered"
+        and e.get("payload", {}).get("issue_number") == 207
+    ]
+    assert len(recovered) == 1
+    assert recovered[0]["payload"]["reason"] == "dead_worker_with_approved_rework"
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expect_credit"),
+    [("rate_limited", False), ("stalled", True), (None, True)],
+)
+def test_dead_worker_unreviewed_pr_lane_death_credit_gated_by_failure_kind(
+    tmp_path: Path, failure_kind: str | None, expect_credit: bool
+) -> None:
+    """Issue #1917: same ``_credit_worker_death`` gate in the
+    unreviewed-open-PR advance branch (the #1128 lane)."""
+    from charlie_work.state import PASSIVE_OPEN_STATUS
+
+    config = OrchestratorConfig()
+    state, fake_gh, _config, _paths = _dead_worker_with_pr_sweep(
+        tmp_path,
+        decision=None,
+        pr_state_status=None,
+        issue_labels=[{"name": config.labels.in_progress}],
+        failure_kind=failure_kind,
+    )
+
+    entry = state["issues"]["207"]
+    assert entry.get("status") == PASSIVE_OPEN_STATUS
+    if expect_credit:
+        assert len(entry.get("worker_death_at") or []) == 1
+    else:
+        assert not entry.get("worker_death_at")
+    assert (207, config.labels.pr_open) in fake_gh.labels_added

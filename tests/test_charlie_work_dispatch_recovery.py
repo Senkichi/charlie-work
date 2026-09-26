@@ -700,3 +700,206 @@ def test_dispatch_proceeds_when_throttle_window_expired(tmp_path: Path) -> None:
     assert result.ok is True
     assert result.data["selected_count"] == 1  # One ready issue
     assert "deferred_reason" not in result.data
+
+
+def _stamp_dead_worker_failure_kind_mid_dispatch(state_file: Path, issue_number: int) -> None:
+    """Re-stamp ``dead_worker_failure_kind`` between the dispatch claim and
+    the outcome bookkeeping — the classifier race the arm-site clear guards
+    against (issue #1917). Runs inside the ``dispatch_sessions`` seam, which
+    the dispatch implementation calls outside the state lock."""
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["issues"][str(issue_number)]["dead_worker_failure_kind"] = "rate_limited"
+        save_state(state_file, state)
+
+
+def _seed_dead_dispatched_entry(state_file: Path, *, failure_kind: str | None) -> None:
+    """The entry shape a dead dispatched worker leaves behind — the
+    recovery-candidate seed every epoch-clear test below shares."""
+    seed = load_state(state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": "agent/issue-123-fix-search",
+        "worker_pid": 4242,
+        "worker_process_start_time": 1_234_567.0,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+        **({"dead_worker_failure_kind": failure_kind} if failure_kind is not None else {}),
+    }
+    save_state(state_file, seed)
+
+
+def test_dispatch_claim_clears_dead_worker_failure_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1917: a fresh dispatch claim drops the previous death's
+    classification — a stale provider-throttle stamp must not survive into
+    the new dispatch epoch and exempt a later, genuinely different death.
+    The failed-dispatch arm does not clear the field itself, so this
+    isolates the claim-site clear."""
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+
+    _seed_dead_dispatched_entry(paths.state_file, failure_kind="rate_limited")
+    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+
+    def _fail(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="claude-code",
+                ok=False,
+                error="adapter boom",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fail)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.dispatch(limit=1)
+
+    entry = load_state(paths.state_file)["issues"]["123"]
+    assert entry["status"] == "dispatch_failed"
+    assert "dead_worker_failure_kind" not in entry
+
+
+def test_dispatch_success_arm_clears_dead_worker_failure_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1917: the successful-dispatch arm drops a classification
+    stamped between the claim and the upgrade — the new session owns the
+    epoch, and a stamp that survived would exempt a later, genuinely
+    different death."""
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+
+    _seed_dead_dispatched_entry(paths.state_file, failure_kind=None)
+    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+
+    def _ok_then_stamp(_repo_root, _manifest, _results, _settings, requests):
+        _stamp_dead_worker_failure_kind_mid_dispatch(paths.state_file, 123)
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="claude-code",
+                ok=True,
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _ok_then_stamp)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.dispatch(limit=1)
+
+    entry = load_state(paths.state_file)["issues"]["123"]
+    assert entry["status"] == "dispatched"
+    assert "dead_worker_failure_kind" not in entry
+
+
+def test_dispatch_live_worker_arm_clears_dead_worker_failure_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1917: the live-worker recovery arm drops a mid-dispatch
+    classification — the averted launch proves a live session owns the
+    branch, a new epoch that supersedes the dead worker's stamp."""
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+
+    _seed_dead_dispatched_entry(paths.state_file, failure_kind=None)
+    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+    # The averted launch's recorded PID reads alive -> live-worker arm.
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
+
+    def _averted_then_stamp(_repo_root, _manifest, _results, _settings, requests):
+        _stamp_dead_worker_failure_kind_mid_dispatch(paths.state_file, 123)
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="claude-code",
+                ok=False,
+                error="pid_alive",
+                failure_kind="live_worker_redispatch_averted",
+                pid=4242,
+                process_start_time=1_234_567.0,
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _averted_then_stamp)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.dispatch(limit=1)
+
+    entry = load_state(paths.state_file)["issues"]["123"]
+    assert entry["status"] == "dispatched"
+    assert "dead_worker_failure_kind" not in entry
+
+
+def test_dispatch_phantom_worker_arm_clears_dead_worker_failure_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1917: the phantom-worker arm (averted launch whose recorded
+    PID is dead) drops a mid-dispatch classification — the pass frees the
+    slot and starts a new epoch."""
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+
+    _seed_dead_dispatched_entry(paths.state_file, failure_kind=None)
+    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+    # The averted launch's recorded PID reads dead -> phantom arm.
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+
+    def _averted_then_stamp(_repo_root, _manifest, _results, _settings, requests):
+        _stamp_dead_worker_failure_kind_mid_dispatch(paths.state_file, 123)
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="claude-code",
+                ok=False,
+                error="pid_dead",
+                failure_kind="live_worker_redispatch_averted",
+                pid=4242,
+                process_start_time=1_234_567.0,
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _averted_then_stamp)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.dispatch(limit=1)
+
+    entry = load_state(paths.state_file)["issues"]["123"]
+    assert entry["status"] == "dispatch_failed"
+    assert "dead_worker_failure_kind" not in entry

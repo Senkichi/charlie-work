@@ -1044,3 +1044,26 @@ class TestDrainSuppressesLocalRework:
         assert calls[0].rework is True
         state = load_state_locked(app.paths.state_file)
         assert state["issues"]["7"]["status"] == "dispatched"
+
+    def test_local_rework_claim_clears_dead_worker_failure_kind(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Issue #1917: the local rework claim drops the previous death's
+        classification -- a stale provider-throttle stamp must not survive
+        into the new dispatch epoch and exempt a later, genuinely
+        different death."""
+        app = self._rework_pending(repo)
+        with state_lock(app.paths.state_file):
+            state = load_state(app.paths.state_file)
+            state["issues"]["7"]["dead_worker_failure_kind"] = "rate_limited"
+            save_state(app.paths.state_file, state)
+        calls = self._spy_dispatch_sessions(monkeypatch)
+
+        result = app.loop(limit=1)
+
+        assert result.ok, result.message
+        assert [request.issue_number for request in calls] == [7]
+        state = load_state_locked(app.paths.state_file)
+        entry = state["issues"]["7"]
+        assert entry["status"] == "dispatched"
+        assert "dead_worker_failure_kind" not in entry
