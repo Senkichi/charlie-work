@@ -24,14 +24,21 @@ import pytest
 from _worktree_fixtures import _clone_repo, _git, _init_repo
 
 from charlie_work import claude_code, devin_shell
+from charlie_work import worktree as worktree_mod
 from charlie_work.claude_code import launch_claude_worker
 from charlie_work.config import OrchestratorConfig
 from charlie_work.devin_shell import launch_devin_session
+from charlie_work.subprocess_runner import RunResult
 from charlie_work.worktree import (
     RESCUE_REF_PREFIX,
+    ReworkBranchConflictError,
     WorktreeForeignWriterError,
     WorktreeInfo,
+    _create_junction_or_symlink,
+    _merge_update_rework_branch,
     create_worktree,
+    is_junction,
+    read_worktree_marker,
     worktree_path_for_branch,
     write_worktree_marker,
 )
@@ -507,3 +514,311 @@ def test_devin_launch_failure_still_removes_managed_worktree(
 
     assert record.error is not None
     assert removed == [managed_wt]
+
+
+def test_recovery_adoption_keeps_marker_after_post_gate_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dead worker's writer marker is the only proof a foreign checkout is
+    ours, so it must survive a post-gate failure. The marker guard cleans a
+    dead-pid marker at gate time; if a later step then fails — the rework
+    fetch here, or a launch failure whose teardown skips borrowed checkouts —
+    a markerless retry is refused as "cannot prove prior orchestrator
+    ownership" and the #1476 stuck loop returns. Cleanup is deferred to the
+    post-launch marker overwrite, so the second recovery call still adopts."""
+    branch = "agent/issue-1476-marker-durable"
+    _remote, repo_root = _clone_with_pushed_branch(tmp_path, branch)
+    foreign_wt = tmp_path / "operator-worktree"
+    _git(repo_root, "worktree", "add", str(foreign_wt), branch)
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    # Dead worker's leftover marker — proof of prior orchestrator occupancy.
+    write_worktree_marker(foreign_wt, 99999999, "dead-session")
+
+    # Fail only the rework fetch — a post-gate failure AFTER the marker guard
+    # has already run. ls-remote still works so the branch resolves on origin.
+    fetch_fails = {"enabled": True}
+    real_run_remote = worktree_mod._run_remote_captured
+
+    def flaky_remote(command: list[str], cwd: Path, **kwargs: object) -> RunResult:
+        if fetch_fails["enabled"] and command[:3] == ["git", "fetch", "origin"]:
+            return RunResult(
+                returncode=128,
+                stdout="",
+                stderr="fatal: simulated fetch outage",
+                error="command exited 128",
+            )
+        return real_run_remote(command, cwd, **kwargs)
+
+    monkeypatch.setattr(worktree_mod, "_run_remote_captured", flaky_remote)
+
+    with pytest.raises(RuntimeError, match="Fetch failed"):
+        create_worktree(
+            repo_root,
+            branch,
+            rework=False,
+            recovery={"branch_name": branch},
+            worktrees_dir=tmp_path / "managed",
+            sessions_dir=sessions_dir,
+        )
+
+    # The ownership proof survived the failed pass.
+    assert read_worktree_marker(foreign_wt) is not None
+
+    fetch_fails["enabled"] = False
+    info = create_worktree(
+        repo_root,
+        branch,
+        rework=False,
+        recovery={"branch_name": branch},
+        worktrees_dir=tmp_path / "managed",
+        sessions_dir=sessions_dir,
+    )
+
+    assert info.path == foreign_wt
+    assert info.foreign_adopted is True
+
+    _git(repo_root, "worktree", "remove", str(foreign_wt), "--force")
+
+
+def test_recovery_routes_unpushed_branch_at_foreign_path_to_rework(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recovery with an origin remote where the branch is ABSENT from origin
+    (killed before first push) but checked out at a foreign path is routed to
+    the rework adoption gate — and the rework fetch is skipped because the
+    branch provably has no origin ref to fetch."""
+    remote = tmp_path / "remote.git"
+    _init_repo(remote, bare=True)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote, repo_root)
+    branch = "agent/issue-1476-unpushed"
+    _git(repo_root, "branch", branch)  # local-only: never pushed to origin
+    foreign_wt = tmp_path / "operator-worktree"
+    _git(repo_root, "worktree", "add", str(foreign_wt), branch)
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    write_worktree_marker(foreign_wt, 99999999, "dead-session")
+
+    remote_calls: list[list[str]] = []
+    real_run_remote = worktree_mod._run_remote_captured
+
+    def recording_remote(command: list[str], cwd: Path, **kwargs: object) -> RunResult:
+        remote_calls.append(list(command))
+        return real_run_remote(command, cwd, **kwargs)
+
+    monkeypatch.setattr(worktree_mod, "_run_remote_captured", recording_remote)
+
+    info = create_worktree(
+        repo_root,
+        branch,
+        rework=False,
+        recovery={"branch_name": branch},
+        worktrees_dir=tmp_path / "managed",
+        sessions_dir=sessions_dir,
+    )
+
+    assert info.path == foreign_wt
+    assert info.foreign_adopted is True
+    assert info.reclaimed == "fetch-fallback"
+    # The ls-remote probe ran (that is how remote_exists became False) but no
+    # fetch was attempted — fetching a branch absent from origin hard-fails
+    # and would re-create the #1476 retry loop for an adopted checkout.
+    assert ["git", "ls-remote", "origin", f"refs/heads/{branch}"] in remote_calls
+    assert ["git", "fetch", "origin", branch] not in remote_calls
+
+    _git(repo_root, "worktree", "remove", str(foreign_wt), "--force")
+
+
+def test_recovery_unpushed_branch_at_foreign_path_refused_unmarked(
+    tmp_path: Path,
+) -> None:
+    """Same routing as the marked case, opposite verdict: with no worker
+    marker the foreign checkout cannot be proven ours, so the remote-absent
+    recovery route refuses instead of falling through to `git branch -D`
+    (which fails on a checked-out branch)."""
+    remote = tmp_path / "remote.git"
+    _init_repo(remote, bare=True)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote, repo_root)
+    branch = "agent/issue-1476-unpushed-refuse"
+    _git(repo_root, "branch", branch)  # local-only: never pushed to origin
+    foreign_wt = tmp_path / "operator-worktree"
+    _git(repo_root, "worktree", "add", str(foreign_wt), branch)
+
+    with pytest.raises(WorktreeForeignWriterError) as exc_info:
+        create_worktree(
+            repo_root,
+            branch,
+            rework=False,
+            recovery={"branch_name": branch},
+            worktrees_dir=tmp_path / "managed",
+        )
+
+    assert exc_info.value.worktree_path == foreign_wt
+    assert "ownership" in str(exc_info.value)
+
+    _git(repo_root, "worktree", "remove", str(foreign_wt), "--force")
+
+
+def test_recovery_resets_diverged_marked_foreign_checkout(tmp_path: Path) -> None:
+    """The one path where a foreign checkout is hard-reset: recovery adoption
+    of a marked checkout whose branch diverged non-FF from origin. Recovery
+    treats the checkout as ours (the worker marker is the ownership proof),
+    snapshots the pre-reset tip, and resets to origin — where the same
+    divergence in a non-recovery adoption refuses
+    (``test_rework_refuses_diverged_foreign_worktree``)."""
+    branch = "agent/issue-1476-recovery-diverged"
+    remote, repo_root = _clone_with_pushed_branch(tmp_path, branch)
+    foreign_wt = tmp_path / "operator-worktree"
+    _git(repo_root, "worktree", "add", str(foreign_wt), branch)
+
+    # Diverge: a local commit in the foreign checkout plus a different commit
+    # pushed to the same branch from a second clone.
+    (foreign_wt / "local.txt").write_text("dead worker commit\n", encoding="utf-8")
+    _git(foreign_wt, "add", "local.txt")
+    _git(foreign_wt, "commit", "-m", "dead worker local commit")
+    local_sha = _git(foreign_wt, "rev-parse", "HEAD").stdout.strip()
+    remote_tip = _push_sibling_commit(remote, tmp_path, branch, "remote.txt")
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    write_worktree_marker(foreign_wt, 99999999, "dead-session")
+
+    info = create_worktree(
+        repo_root,
+        branch,
+        rework=False,
+        recovery={"branch_name": branch},
+        worktrees_dir=tmp_path / "managed",
+        sessions_dir=sessions_dir,
+        issue_number=1476,
+        config=OrchestratorConfig(),
+    )
+
+    assert info.path == foreign_wt
+    assert info.foreign_adopted is True
+    assert _git(foreign_wt, "rev-parse", "HEAD").stdout.strip() == remote_tip
+    assert info.reclaimed is not None
+    assert info.reclaimed.startswith("reset-origin:")
+    # The attempt snapshot preserved the diverged local tip before the reset.
+    assert info.attempt_snapshot is not None
+    assert info.attempt_snapshot.old_tip == local_sha
+    assert info.attempt_snapshot.ref_name is not None
+    assert _git(repo_root, "rev-parse", info.attempt_snapshot.ref_name).stdout.strip() == local_sha
+
+    _git(repo_root, "worktree", "remove", str(foreign_wt), "--force")
+
+
+def test_merge_update_rework_branch_without_scaffolding_repair_escalates(
+    tmp_path: Path,
+) -> None:
+    """``allow_scaffolding_repair=False`` — the value ``create_worktree``
+    passes for an adopted foreign checkout — escalates even a
+    scaffolding-named pre-merge blocker instead of deleting it: in a borrowed
+    checkout the file belongs to the owner. The default repair path still
+    clears the same fixture."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    _git(repo_root, "checkout", "-b", "feature")
+    (repo_root / "work.txt").write_text("worker output\n", encoding="utf-8")
+    _git(repo_root, "add", "work.txt")
+    _git(repo_root, "commit", "-m", "feature work")
+
+    _git(repo_root, "checkout", "main")
+    (repo_root / ".orchestrator-prompt.md").write_text("base prompt v1\n", encoding="utf-8")
+    _git(repo_root, "add", ".orchestrator-prompt.md")
+    _git(repo_root, "commit", "-m", "base adds tracked prompt file")
+
+    _git(repo_root, "checkout", "feature")
+    # An untracked scaffolding-named file shadows the path the base now
+    # tracks — normally repairable residue, but never in a borrowed checkout.
+    (repo_root / ".orchestrator-prompt.md").write_text("owner's local copy\n", encoding="utf-8")
+
+    injected = (".orchestrator-prompt.md",)
+    with pytest.raises(ReworkBranchConflictError) as exc_info:
+        _merge_update_rework_branch(
+            repo_root,
+            repo_root,
+            "feature",
+            "main",
+            injected_paths=injected,
+            allow_scaffolding_repair=False,
+        )
+
+    assert exc_info.value.stage == "pre_merge"
+    assert ".orchestrator-prompt.md" in exc_info.value.conflicted_paths
+    # Nothing was deleted — the owner's file is untouched.
+    assert (repo_root / ".orchestrator-prompt.md").read_text(encoding="utf-8") == (
+        "owner's local copy\n"
+    )
+
+    # Control on the same fixture: the managed-path default still repairs.
+    result = _merge_update_rework_branch(
+        repo_root, repo_root, "feature", "main", injected_paths=injected
+    )
+    assert result is None
+    assert (repo_root / ".orchestrator-prompt.md").read_text(encoding="utf-8") == (
+        "base prompt v1\n"
+    )
+
+
+def test_rework_adoption_creates_no_venv_junction(tmp_path: Path) -> None:
+    """A borrowed checkout gets no scaffolding written into it: with
+    ``venv_source`` set, a managed worktree would get a ``.venv`` junction —
+    an adopted foreign checkout must not."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch = "agent/issue-1476-no-junction"
+    foreign_wt = tmp_path / "operator-worktree"
+    _git(repo_root, "worktree", "add", str(foreign_wt), "-b", branch)
+    venv_source = tmp_path / "shared-venv"
+    venv_source.mkdir()
+
+    info = create_worktree(
+        repo_root,
+        branch,
+        rework=True,
+        worktrees_dir=tmp_path / "managed",
+        venv_source=venv_source,
+    )
+
+    assert info.foreign_adopted is True
+    assert info.venv_junction is None
+    assert not (foreign_wt / ".venv").exists()
+    assert not is_junction(foreign_wt / ".venv")
+
+    _git(repo_root, "worktree", "remove", str(foreign_wt), "--force")
+
+
+def test_rework_adoption_preserves_owner_venv_junction(tmp_path: Path) -> None:
+    """Nor is the owner's own ``.venv`` junction removed: the managed path
+    unlinks a leftover junction when ``venv_source`` is None, but a borrowed
+    checkout's junction belongs to whoever created the checkout."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch = "agent/issue-1476-keep-junction"
+    foreign_wt = tmp_path / "operator-worktree"
+    _git(repo_root, "worktree", "add", str(foreign_wt), "-b", branch)
+    owner_venv = tmp_path / "owner-venv"
+    owner_venv.mkdir()
+    _create_junction_or_symlink(foreign_wt / ".venv", owner_venv)
+
+    info = create_worktree(
+        repo_root,
+        branch,
+        rework=True,
+        worktrees_dir=tmp_path / "managed",
+        venv_source=None,
+    )
+
+    assert info.foreign_adopted is True
+    assert info.venv_junction is None
+    assert is_junction(foreign_wt / ".venv")
+
+    _git(repo_root, "worktree", "remove", str(foreign_wt), "--force")

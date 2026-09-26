@@ -203,9 +203,16 @@ def check_foreign_adoption(
     ``_check_worktree_writer_marker`` family in ``worktree.py``), injected so
     this module stays import-cycle-free; ``None`` disables the live-writer /
     operator-claim check exactly as a missing ``sessions_dir`` does on the
-    managed path. ``registered`` is the porcelain worktree list — its first
-    entry is always the repo's main worktree, the anchor for the "never
-    dispatch into the checkout hosting the orchestrator" refusal.
+    managed path. In ``recovery`` mode the guard's stale-marker cleanup is
+    deferred, not skipped: the marker is the adoption's proof of prior
+    orchestrator ownership, so it is restored when the guard removes it and
+    only the post-launch ``write_worktree_marker`` overwrite replaces it —
+    otherwise any post-gate failure (a failed fetch, a failed launch whose
+    teardown skips borrowed checkouts) strands the next recovery dispatch
+    markerless and refused, re-creating the #1476 loop. ``registered`` is the
+    porcelain worktree list — its first entry is always the repo's main
+    worktree, the anchor for the "never dispatch into the checkout hosting
+    the orchestrator" refusal.
 
     The dispatching-into-it checks live here; the shared rework flow adds the
     touching-its-contents checks (dirt, non-FF divergence), so nothing about a
@@ -260,6 +267,18 @@ def check_foreign_adoption(
         # marker is cleaned; an idle fleet writer may be reaped exactly as on
         # the managed path.
         marker_guard(foreign_path)
+        if recovery and marker is not None and read_worktree_marker(foreign_path) is None:
+            # The guard's stale-marker cleanup (or an idle-writer reap) just
+            # deleted the worker marker that IS the recovery ownership proof.
+            # Every post-gate step can still fail — the rework fetch, the
+            # non-FF reset, or the launch itself, whose teardown skips
+            # borrowed checkouts — and a markerless retry is refused above as
+            # "cannot prove prior orchestrator ownership": the #1476 stuck
+            # loop again. Cleanup is deferred, not skipped: the worker's
+            # post-spawn ``write_worktree_marker`` overwrites this file on a
+            # successful launch, so restoring the proof here leaves nothing
+            # stale behind.
+            _write_json_atomic(foreign_path / WRITER_MARKER_FILENAME, marker)
     return True
 
 
