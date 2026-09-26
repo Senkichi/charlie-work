@@ -1064,3 +1064,37 @@ def test_unescalate_rearms_mention_flagged_issue(tmp_path: Path) -> None:
     assert "nothing to unescalate" in result2.message
     state = load_state(app.paths.state_file)
     assert len(_events(state, "dispatch_merged_pr_mention_rearmed")) == 1
+
+
+def test_unescalate_clears_dead_worker_failure_kind(tmp_path: Path) -> None:
+    """Issue #1917: re-arming an escalated issue clears the stamped death
+    classification — a stale provider-throttle kind must not exempt a
+    later, genuinely different death once the issue re-enters dispatch.
+    Membership in ``UNESCALATE_ISSUE_RESET_FIELDS`` is the reset-field
+    enforcement; the assertion below is the behavioral proof."""
+    from charlie_work.unescalate_reset_fields import UNESCALATE_ISSUE_RESET_FIELDS
+
+    assert "dead_worker_failure_kind" in UNESCALATE_ISSUE_RESET_FIELDS
+
+    app = _app(tmp_path)
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "dead_dispatched_worker_reap",
+            "dead_worker_failure_kind": "rate_limited",
+        }
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(pr_number=456)
+
+    assert result.ok is True
+    assert result.data["changed"] is True
+    issue_entry = load_state(app.paths.state_file)["issues"]["123"]
+    assert "dead_worker_failure_kind" not in issue_entry

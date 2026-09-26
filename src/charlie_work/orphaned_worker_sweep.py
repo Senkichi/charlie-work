@@ -7,7 +7,9 @@ reviewer asked to move. The whole "dead dispatched worker that still has an
 open PR" classification moved here -- verbatim except that loop-level
 ``continue`` statements are early ``return``s and the sweep's closed-over
 locals are explicit parameters -- so the sweep's ``for`` loop shell and the
-no-open-PR salvage branch stay in ``workflow.py``.
+no-open-PR salvage branch stay in ``workflow.py``. Issue #1917 later moved
+the #654 timed ``dead_dispatched_reap_minutes`` escalation backstop here
+too (``maybe_reap_dead_dispatched_worker``) for the same ratchet reason.
 
 Called once per dead-PID ``dispatched`` issue that still has a linked open
 PR, inside the sweep's ``state_lock`` (the same lock window the code ran
@@ -30,6 +32,7 @@ other free name is imported directly from its defining module.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -42,11 +45,119 @@ from .rework_outcome import (
     fresh_completed_worker_outcome,
 )
 from .state import PASSIVE_OPEN_STATUS
+from .throttle_signatures import is_provider_throttle_failure
 from .worktree import worktree_path_for_branch
 
 if TYPE_CHECKING:
     from .config import OrchestratorConfig
     from .github import GitHubLike
+
+
+def maybe_reap_dead_dispatched_worker(
+    *,
+    state: dict[str, Any],
+    entry: dict[str, Any],
+    issue_number: int,
+    sessions_dir: Path,
+    pr_data: dict[str, Any] | None,
+    dead_dispatched_reap_minutes: float,
+    now: datetime,
+    sweep_events: list[tuple[str, dict[str, Any]]],
+) -> tuple[dict[str, Any], bool]:
+    """Timed dead-dispatched backstop (issue #654), run per dead-PID entry.
+
+    Issue #654: time-based escape for a dead dispatched worker whose drift
+    was already surfaced on a prior pass (``orphan_drift_at`` is set) but
+    whose PR state did not qualify for auto-reset -- a clean exit with no
+    push (issue #773's ``dead_worker_clean_exit_no_op`` branch), a
+    non-request_changes decision, a head change without a review callback,
+    or a PR-create failure on a pushed branch. In all of these the specific
+    sub-branches in the caller emit drift once, set ``orphan_drift_at``,
+    then on every subsequent pass the fingerprint match short-circuits --
+    so the dispatch label (``agent:in-progress``) holds indefinitely. The
+    label is the one-writer-per-branch mutex, so no re-dispatch can proceed
+    on that branch until a worker that no longer exists reports back.
+    After ``dead_dispatched_reap_minutes`` since the drift was first
+    surfaced, escalate to ``agent:human-needed`` so a human can inspect the
+    worktree for unpushed commits and decide whether to salvage or
+    re-dispatch. This runs BEFORE the specific sub-branches so it is a pure
+    backstop: on the first pass ``orphan_drift_at`` is not yet set and the
+    specific sub-branch runs normally (either resetting immediately or
+    emitting the first drift). Only issues that already have drift recorded
+    and have exceeded the grace period are escalated here. 0 disables the
+    escape (pre-#654 hold-forever).
+
+    Issue #1917: a death classified as a provider throttle is a fleet-wide
+    condition, not a worker-quality signal, so while the provider cooldown
+    the classifier armed is still active (``throttled_until`` in the
+    future) it never escalates through this timed backstop -- the same
+    #1684 exemption the rework lanes apply to their caps. The entry falls
+    through to the caller's normal handling, which returns the issue to
+    the dispatchable pool; the dispatch governor's provider_throttled
+    deferral holds the actual re-dispatch until ``throttled_until`` passes.
+    The classification is read from ``dead_worker_failure_kind``, stamped
+    on the entry by the stall/dead reap lanes before the sidecar is
+    reaped.
+
+    The exemption is bounded by the throttle window it exists to ride
+    out. Once ``throttled_until`` has passed -- or no window was ever
+    stamped -- the #654 backstop resumes: in the PR-linked case the
+    sub-branches only emit drift once and then short-circuit on the
+    fingerprint (a no-op clean exit, a non-request_changes decision, a
+    head change without a review callback), so a stamp that held forever
+    would reintroduce exactly the wedge this backstop fixes. An expired
+    or unparseable window fails closed to the normal reap timer.
+
+    Returns the (possibly replaced) ``state`` mapping -- the escalation
+    helpers rebuild it -- and ``True`` when the entry was escalated, so the
+    caller appends to ``reap_escalations`` and moves to the next issue.
+    """
+
+    # Deferred: workflow.py imports this module top-level, so a top-level
+    # import here would cycle. Attribute access through the module object
+    # also keeps suite patches on ``charlie_work.workflow.<name>`` live.
+    import charlie_work.workflow as _wf
+
+    orphan_drift_at = entry.get("orphan_drift_at")
+    if orphan_drift_at is None or dead_dispatched_reap_minutes <= 0:
+        return state, False
+    if is_provider_throttle_failure(entry.get("dead_worker_failure_kind")):
+        throttled_until_dt = _wf._parse_iso_timestamp(state.get("throttled_until"))
+        if throttled_until_dt is not None and throttled_until_dt > now:
+            return state, False
+    drift_dt = _wf._parse_iso_timestamp(orphan_drift_at)
+    if drift_dt is None or (now - drift_dt).total_seconds() / 60 < dead_dispatched_reap_minutes:
+        return state, False
+    pr_number = int(pr_data["number"]) if pr_data else None
+    terminal = find_worker_terminal_status(sessions_dir, issue_number)
+    terminal_exit_code = terminal.get("exit_code") if terminal else None
+    state = _wf._escalate_issue(
+        state,
+        issue_number,
+        reason="dead_dispatched_worker_reap",
+        reason_class="mechanical",
+        pr_number=pr_number,
+        issue_extra={
+            "dispatched_at": None,
+            "orphan_drift_fingerprint": None,
+            "orphan_drift_at": None,
+        },
+    )
+    sweep_events.append(
+        (
+            "dead_dispatched_worker_reaped",
+            {
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+                "previous_status": "dispatched",
+                "reason": "dead_dispatched_worker_reap",
+                "orphan_drift_at": orphan_drift_at,
+                "reap_minutes": dead_dispatched_reap_minutes,
+                "exit_code": terminal_exit_code,
+            },
+        )
+    )
+    return state, True
 
 
 def handle_dead_worker_completed_outcome(
@@ -333,11 +444,17 @@ def handle_dead_worker_with_pr(
                 # death counter with its own escalation reason
                 # (worker_death_loop) lets the operator triage
                 # "check the worktree" vs. "worker is spinning."
+                # Issue #1917: skip the credit entirely for a
+                # provider-throttle-classified death — the same
+                # #1684 exemption the rework lanes apply, so the
+                # death can never inflate ``worker_death_at`` for a
+                # later, genuinely different death's cap check.
                 death_ts = _wf.utc_now()
-                entry["worker_death_at"] = _credit_worker_death(
-                    entry,
-                    at=death_ts,
-                )
+                if not is_provider_throttle_failure(entry.get("dead_worker_failure_kind")):
+                    entry["worker_death_at"] = _credit_worker_death(
+                        entry,
+                        at=death_ts,
+                    )
                 sweep_events.append(
                     (
                         "orphaned_worker_recovered",
@@ -511,10 +628,13 @@ def handle_dead_worker_with_pr(
                 entry["status"] = "rework_requested"
                 entry["dispatched_at"] = None
                 death_ts = _wf.utc_now()
-                entry["worker_death_at"] = _credit_worker_death(
-                    entry,
-                    at=death_ts,
-                )
+                # Issue #1917: provider-throttle deaths are not credited —
+                # same #1684 exemption as the request_changes branch above.
+                if not is_provider_throttle_failure(entry.get("dead_worker_failure_kind")):
+                    entry["worker_death_at"] = _credit_worker_death(
+                        entry,
+                        at=death_ts,
+                    )
                 sweep_events.append(
                     (
                         "orphaned_worker_recovered",
@@ -582,11 +702,15 @@ def handle_dead_worker_with_pr(
                         # redispatch caused by THIS death read
                         # back as an uncredited no-op on every
                         # later no-op-rework-cap check.
+                        # Issue #1917: provider-throttle deaths are
+                        # not credited — same #1684 exemption as the
+                        # branches above.
                         death_ts = _wf.utc_now()
-                        entry["worker_death_at"] = _credit_worker_death(
-                            entry,
-                            at=death_ts,
-                        )
+                        if not is_provider_throttle_failure(entry.get("dead_worker_failure_kind")):
+                            entry["worker_death_at"] = _credit_worker_death(
+                                entry,
+                                at=death_ts,
+                            )
                         sweep_events.append(
                             (
                                 "orphaned_worker_advanced_to_pr_open",

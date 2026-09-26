@@ -131,10 +131,11 @@ from .rework_prompts import _write_rework_prompt
 from .state import (
     load_state,
     load_state_locked,
+    record_dead_worker_failure_kind,
     set_throttled_until,
     state_lock,
 )
-from .throttle_signatures import PROVIDER_THROTTLE_FAILURE_KINDS
+from .throttle_signatures import is_provider_throttle_failure
 from .worker import WorkerHealth, WorkerView
 from .worktree import (
     WORKTREE_UNSAFE_KINDS,
@@ -861,6 +862,14 @@ def _detect_and_handle_stalled_sessions(
 
             with state_lock(state_file):
                 state = load_state(state_file)
+                # Issue #1917: persist the classification on the issue
+                # entry so the state.json-keyed orphan sweep — which runs
+                # after this sidecar is gone — can exempt provider-throttle
+                # deaths from its timed reap and redispatch cap.
+                if resolved_failure_kind is not None:
+                    state = record_dead_worker_failure_kind(
+                        state, w.issue_number, resolved_failure_kind
+                    )
                 state = write_gate.append_event(
                     state,
                     event_kind,
@@ -1314,7 +1323,7 @@ def _reap_restore_rework_requested(
         # signal, so it must not consume either cap below. The fleet-wide
         # cooldown is already armed by the classifier; the rework is
         # restored below and re-dispatches once the window opens.
-        provider_throttled = failure_kind in PROVIDER_THROTTLE_FAILURE_KINDS
+        provider_throttled = is_provider_throttle_failure(failure_kind)
 
         # Issue #315 finding 2: same window-filtered redispatch_at bookkeeping
         # the sibling lanes use (~line 950-961, ~4186-4194), so the cap below
@@ -1610,7 +1619,7 @@ def _route_dead_worker_to_pre_review_rework(
         # Issue #1684: a provider-throttle-classified death (the kinds that
         # arm ``throttled_until``) is a global provider condition, not a
         # worker-quality signal — it must not consume the redispatch cap.
-        if failure_kind not in PROVIDER_THROTTLE_FAILURE_KINDS:
+        if not is_provider_throttle_failure(failure_kind):
             redispatch_at = redispatch_at + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
@@ -1859,18 +1868,26 @@ def _classify_dead_sessions_and_update_throttle_state(
                     adapter_kind="api",
                     now=now_for_health,
                 )
-            if failure_kind and throttled_until:
-                # A throttle-caused launch failure must persist its window just
-                # like the dead-session branch below — otherwise the governor
-                # relaunches straight into the same throttled provider.
+            if failure_kind:
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    state = set_throttled_until(
-                        state,
-                        throttled_until,
-                        reason=failure_kind,
-                        adapter_kind=w.adapter_kind,
-                    )
+                    if throttled_until:
+                        # A throttle-caused launch failure must persist its
+                        # window just like the dead-session branch below —
+                        # otherwise the governor relaunches straight into
+                        # the same throttled provider.
+                        state = set_throttled_until(
+                            state,
+                            throttled_until,
+                            reason=failure_kind,
+                            adapter_kind=w.adapter_kind,
+                        )
+                    # Issue #1917: persist the classification on the issue
+                    # entry — same stamp the dead-session branch writes —
+                    # so the state.json-keyed orphan sweep can exempt
+                    # provider-throttle outcomes from its timed reap and
+                    # orphan-redispatch cap after the sidecar is reaped.
+                    state = record_dead_worker_failure_kind(state, w.issue_number, failure_kind)
                     write_gate.save_state(state)
 
             if (
@@ -2133,16 +2150,23 @@ def _classify_dead_sessions_and_update_throttle_state(
                 else:
                     failure_kind, throttled_until = None, None
 
-            if failure_kind and throttled_until:
-                # Update state with throttle window
+            if failure_kind:
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    state = set_throttled_until(
-                        state,
-                        throttled_until,
-                        reason=failure_kind,
-                        adapter_kind=w.adapter_kind,
-                    )
+                    if throttled_until:
+                        # Update state with throttle window
+                        state = set_throttled_until(
+                            state,
+                            throttled_until,
+                            reason=failure_kind,
+                            adapter_kind=w.adapter_kind,
+                        )
+                    # Issue #1917: persist the classification on the issue
+                    # entry so the state.json-keyed orphan sweep — which
+                    # runs after the sidecar is reaped just below — can
+                    # exempt provider-throttle deaths from its timed reap
+                    # and orphan-redispatch cap.
+                    state = record_dead_worker_failure_kind(state, w.issue_number, failure_kind)
                     write_gate.save_state(state)
 
             # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
@@ -2298,7 +2322,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                     # condition, not a worker-quality signal — it must not
                     # consume the redispatch cap. The issue still relabels to
                     # ready below and re-dispatches once the window opens.
-                    if failure_kind not in PROVIDER_THROTTLE_FAILURE_KINDS:
+                    if not is_provider_throttle_failure(failure_kind):
                         redispatch_at = redispatch_at + [now.isoformat().replace("+00:00", "Z")]
                     # issue #261: a worker_blocked verdict (extracted from the
                     # Devin CLI's session store — see post_mortem.classify_and_record)
