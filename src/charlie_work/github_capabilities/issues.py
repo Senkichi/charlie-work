@@ -47,6 +47,8 @@ from ci_fleet.github import GitHubError
 # with ``GitHub.issue_list``). ``issue_list`` (moved below) references it as a
 # bare global.
 from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
+from .circuit_breaker_transport import circuit_breaker_state_path
+from ..instrumentation import log_event
 
 if TYPE_CHECKING:
     # Runtime import would cycle (github.py imports this module to build the
@@ -319,9 +321,12 @@ class Issues(CapabilityCollaborator):
 
         Per-issue-number results are cached in the pass-scoped ``_list_cache``
         (keyed ``("issue_open", number)``). Cache misses are first resolved in
-        a single batched GraphQL query (one subprocess for the whole set); only
-        if the batch fails do we fall back to the previous parallel
-        per-``issue_view`` fetch.
+        a single batched GraphQL query (one subprocess for the whole set). The
+        batch tolerates per-node failures (issue #1933): numbers the batch
+        could not resolve come back absent from its result, and the parallel
+        per-``issue_view`` fallback runs over exactly those numbers rather
+        than the whole set. Only a whole-query failure still falls back for
+        every uncached number.
 
         Args:
             issue_numbers: List of issue numbers to check
@@ -342,17 +347,38 @@ class Issues(CapabilityCollaborator):
                 open_issues.add(number)
 
         if uncached:
+            states: dict[int, bool] = {}
+            batch_failed = False
             try:
                 states = self._graphql_issue_states(uncached)
-                for number, is_open in states.items():
-                    self._list_cache[("issue_open", number)] = is_open
-                    if is_open:
-                        open_issues.add(number)
             except (GitHubError, OSError, ValueError, TypeError):
+                batch_failed = True
                 logger.warning(
                     "Batched issue state query failed, falling back to per-issue view",
                     exc_info=True,
                 )
+
+            for number, is_open in states.items():
+                self._list_cache[("issue_open", number)] = is_open
+                if is_open:
+                    open_issues.add(number)
+
+            unresolved = [number for number in uncached if number not in states]
+            if unresolved:
+                if not batch_failed:
+                    logger.warning(
+                        "Batched issue state query did not resolve %d issue "
+                        "number(s) (%s); falling back to per-issue view for "
+                        "just those",
+                        len(unresolved),
+                        unresolved,
+                    )
+                    # write-gate-exempt(issue=1933): GitHub client layer has no WriteGate; lock-free telemetry
+                    log_event(
+                        circuit_breaker_state_path(self.runtime, self.repo_root),
+                        "github_issue_state_partial_fallback",
+                        {"unresolved": unresolved, "requested": len(uncached)},
+                    )
 
                 # Fallback to the previous parallel per-issue view fetch.
                 def _fetch_state(number: int) -> tuple[int, bool]:
@@ -363,9 +389,9 @@ class Issues(CapabilityCollaborator):
                         is_open = False
                     return number, is_open
 
-                max_workers = min(_MAX_ISSUE_STATE_WORKERS, len(uncached))
+                max_workers = min(_MAX_ISSUE_STATE_WORKERS, len(unresolved))
                 with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                    for number, is_open in pool.map(_fetch_state, uncached):
+                    for number, is_open in pool.map(_fetch_state, unresolved):
                         self._list_cache[("issue_open", number)] = is_open
                         if is_open:
                             open_issues.add(number)

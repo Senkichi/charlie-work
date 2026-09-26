@@ -537,10 +537,19 @@ def _execute_graphql(
 
     errors = parsed.get("errors")
     if isinstance(errors, list) and errors:
+        # Keep the response body on stdout even though the call "failed":
+        # that is what real `gh api graphql` does -- `processResponse` in
+        # cli/cli's `pkg/cmd/api/api.go` tees the body and io.Copy's it to
+        # the output writer *before* emitting the error to stderr. The body
+        # carries partial `data` (resolved aliases alongside nulls for the
+        # nodes `errors` names), which `GitHub.run(allow_failure=True)`
+        # parses into `GitHubRunResult.value` -- `_graphql_issue_states`
+        # consumes it to scope its per-issue fallback to just the
+        # unresolvable numbers (issue #1933).
         return subprocess.CompletedProcess(
             args=["gh", "api", "graphql"],
             returncode=1,
-            stdout="",
+            stdout=response.body,
             stderr=_translate_graphql_errors(errors),
         )
     return subprocess.CompletedProcess(

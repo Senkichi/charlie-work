@@ -56,6 +56,7 @@ from .circuit_breaker_transport import (
     circuit_breaker_state_path,
     note_circuit_breaker_result,
 )
+from .graphql_issue_states import graphql_issue_states
 from .issues import ISSUE_LIST_FIELDS, ISSUE_VIEW_FIELDS
 from .labels import LABEL_LIST_FIELDS
 from .pull_requests import MERGED_PR_LIST_FIELDS, PR_LIST_FIELDS, PR_VIEW_FIELDS
@@ -680,43 +681,19 @@ class Transport(CapabilityCollaborator):
     def _graphql_issue_states(self, issue_numbers: list[int]) -> dict[int, bool]:
         """Fetch open/closed state for many issue numbers in one GraphQL query.
 
-        Returns a mapping ``issue_number -> is_open`` for the requested numbers.
-        Missing or errored issues are treated as not open, matching the
-        contract of ``are_issues_open``.
+        Returns a mapping ``issue_number -> is_open`` covering the requested
+        numbers that resolved. A number absent from the mapping failed to
+        resolve inside the batch (a per-node ``Could not resolve`` error):
+        ``are_issues_open`` per-issue-fetches exactly those numbers instead
+        of demoting the whole batch (issue #1933). Whole-query failures still
+        raise ``GitHubError``.
+
+        The implementation lives in ``graphql_issue_states.py`` as a free
+        function -- the same split ``circuit_breaker_transport.py`` made for
+        this module's other helpers (file-size ratchet #1442, attachment-point
+        ceiling on ``Transport``).
         """
-        if not issue_numbers:
-            return {}
-
-        owner, name = self._repo_owner_name()
-        states: dict[int, bool] = {}
-
-        for i in range(0, len(issue_numbers), _GRAPHQL_BATCH_SIZE):
-            chunk = issue_numbers[i : i + _GRAPHQL_BATCH_SIZE]
-            fields = " ".join(f"s_{n}: issue(number: {n}) {{ number state }}" for n in chunk)
-            query = (
-                f"query($owner: String!, $name: String!) {{ "
-                f"repository(owner: $owner, name: $name) {{ {fields} }} "
-                f"}}"
-            )
-
-            data = self._graphql_query(query).get("data", {})
-            repo = data.get("repository", {})
-            if not isinstance(repo, dict):
-                raise GitHubError("GraphQL response missing repository")
-
-            for number in chunk:
-                alias = f"s_{number}"
-                issue = repo.get(alias)
-                if not isinstance(issue, dict):
-                    states[number] = False
-                    continue
-                returned_number = issue.get("number")
-                if returned_number is not None:
-                    number = int(returned_number)
-                is_open = str(issue.get("state") or "").upper() == "OPEN"
-                states[number] = is_open
-
-        return states
+        return graphql_issue_states(self, issue_numbers, _GRAPHQL_BATCH_SIZE)
 
     def _graphql_issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]:
         """Fetch GitHub-native ``blockedBy`` dependencies for many issues at once.

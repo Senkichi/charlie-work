@@ -1,0 +1,8 @@
+warning
+# Issue #1933: the batched GraphQL issue-state query (are_issues_open)
+# partially failed -- a per-node `Could not resolve` error left some issue
+# numbers unresolved, and the parallel per-issue `issue_view` fallback ran
+# for exactly those numbers instead of the whole batch. Warning, not error:
+# the call still completes correctly, but a high rate means stale issue
+# references are degrading `fleet status --json`'s fast path. The payload
+# names the unresolved numbers (the telemetry the incident lacked).
