@@ -578,6 +578,271 @@ def test_review_queue_includes_pending_packet_when_template_matches(tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------
+# Issue #1894: the #1338 stale-template suppression names only "escalated",
+# but the identical non-convergent shape is reachable through the other
+# durably-stuck statuses -- a "blocked" record on the PR or its linked
+# issue (SINK_STATUSES' other member), and a "janitor_blocked" PR whose
+# sole janitor failure is a permanently-missing required check
+# (is_missing_checks_only_block; review()'s deterministic janitor gate
+# short-circuits before packet regen, so packet_template_sha can never
+# catch up). review() is still called for these statuses: the
+# janitor-diagnostics refresh, ci_run_never_created detection, and the
+# stale-checks-retrigger self-heal lane all live inside review()'s main
+# janitor-gate path, so skipping the call would freeze the predicate's own
+# inputs -- the same #1397/#1443 frozen-diagnostics failure mode.
+# ---------------------------------------------------------------------------
+
+
+def _seed_pr_janitor_blocked_missing_checks(
+    app: OrchestratorApp, pr_number: int, issue_number: int
+) -> None:
+    """Mark a PR janitor_blocked on a missing-checks-only janitor failure --
+    the shape review()'s janitor-gate bookkeeping persists each pass."""
+    from charlie_work.state import load_state, save_state, state_lock
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"][str(pr_number)] = {
+            "number": pr_number,
+            "issue_number": issue_number,
+            "status": "janitor_blocked",
+            "janitor_ok": False,
+            "janitor_failures": ["Required check(s) missing: Tests passed"],
+            "is_missing_checks_only_block": True,
+        }
+        save_state(app.paths.state_file, state)
+
+
+def _seed_blocked(app: OrchestratorApp, pr_number: int, issue_number: int) -> None:
+    """Mark a PR and its linked issue as "blocked" in state.json -- the
+    shape record_review's blocked path persists (the other SINK_STATUSES
+    member, a judgment verdict parked on agent:human-needed)."""
+    from charlie_work.state import load_state, save_state, state_lock
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"][str(pr_number)] = {
+            "number": pr_number,
+            "issue_number": issue_number,
+            "status": "blocked",
+        }
+        state["issues"][str(issue_number)] = {
+            "number": issue_number,
+            "status": "blocked",
+        }
+        save_state(app.paths.state_file, state)
+
+
+def _seed_issue_blocked(app: OrchestratorApp, issue_number: int) -> None:
+    """Mark only the linked issue as "blocked" (PR status left untouched)."""
+    from charlie_work.state import load_state, save_state, state_lock
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["issues"][str(issue_number)] = {
+            "number": issue_number,
+            "status": "blocked",
+        }
+        save_state(app.paths.state_file, state)
+
+
+def test_loop_skips_template_stale_warning_for_janitor_blocked_missing_checks(
+    tmp_path: Path,
+) -> None:
+    """A janitor_blocked PR whose sole janitor failure is a permanently-
+    missing required check (is_missing_checks_only_block=True) can never
+    reach packet regen -- review() short-circuits in the deterministic
+    janitor gate -- so the stale-template WARNING must not re-fire every
+    pass (issue #1894; the swole PR #298 shape). review() is still called
+    each pass -- the janitor-diagnostics refresh and the
+    ci_run_never_created / stale-checks-retrigger lanes live inside it."""
+    pr = _pr456("sha-same")
+    app, fake_gh = _make_loop_app_with_required_checks(
+        tmp_path, prs=[pr], required_checks=("Tests passed",)
+    )
+    current_sha = app._review_template_sha()
+
+    # The required check never reports -> the janitor keeps failing
+    # missing-checks-only and refresh-stamps is_missing_checks_only_block.
+    fake_gh.pr_checks = lambda _number: []  # type: ignore[method-assign]
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    _seed_pr_janitor_blocked_missing_checks(app, pr_number=456, issue_number=123)
+    assert "stale-digest" != current_sha
+
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+
+    # Run two passes -- the bug fired the WARNING every pass.
+    app.loop(limit=0)
+    app.loop(limit=0)
+
+    # review() WAS invoked each pass -- it re-runs the janitor gate (which
+    # refreshes janitor_ok/janitor_failures/is_missing_checks_only_block
+    # and owns the stale-checks retrigger lane), then short-circuits before
+    # packet regen.
+    assert review_calls.count(456) == 2
+    # No staleness WARNING -- the regen is unreachable while the check stays
+    # missing, so the WARNING would spam identically without converging.
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert not any(e.get("pr_number") == 456 for e in events)
+
+
+def test_loop_skips_template_stale_warning_for_blocked_pr(tmp_path: Path) -> None:
+    """status="blocked" is the other SINK_STATUSES member -- a terminal
+    judgment verdict parked on agent:human-needed (issue #1894's second
+    half). The same non-convergent suppression applies: nothing on the loop
+    side can move a blocked record, so a stale-template WARNING would fire
+    identically every pass until a human acts."""
+    pr = _pr456("sha-same")
+    app, _ = _make_loop_app(tmp_path, prs=[pr])
+    current_sha = app._review_template_sha()
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    _seed_blocked(app, pr_number=456, issue_number=123)
+    assert "stale-digest" != current_sha
+
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+
+    app.loop(limit=0)
+    app.loop(limit=0)
+
+    assert review_calls.count(456) == 2
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert not any(e.get("pr_number") == 456 for e in events)
+
+
+def test_loop_skips_template_stale_warning_for_blocked_issue(tmp_path: Path) -> None:
+    """The swole evidence shape: the linked ISSUE carries status="blocked"
+    while the PR record is janitor_blocked on missing checks. Either
+    record's sink status suffices for suppression -- a human owns the
+    record either way."""
+    pr = _pr456("sha-same")
+    app, fake_gh = _make_loop_app_with_required_checks(
+        tmp_path, prs=[pr], required_checks=("Tests passed",)
+    )
+
+    fake_gh.pr_checks = lambda _number: []  # type: ignore[method-assign]
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    _seed_pr_janitor_blocked_missing_checks(app, pr_number=456, issue_number=123)
+    _seed_issue_blocked(app, issue_number=123)
+
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+
+    app.loop(limit=0)
+    app.loop(limit=0)
+
+    assert review_calls.count(456) == 2
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert not any(e.get("pr_number") == 456 for e in events)
+
+
+def test_loop_fires_template_stale_warning_for_janitor_blocked_without_flag(
+    tmp_path: Path,
+) -> None:
+    """janitor_blocked alone is NOT enough for suppression -- a record that
+    lacks is_missing_checks_only_block (a different janitor failure class,
+    or a record persisted before the flag existed) still has live
+    remediation lanes, so the WARNING keeps firing. The suppression is
+    scoped to the non-convergent missing-checks-only shape only."""
+    pr = _pr456("sha-same")
+    app, fake_gh = _make_loop_app_with_required_checks(
+        tmp_path, prs=[pr], required_checks=("Tests passed",)
+    )
+    current_sha = app._review_template_sha()
+
+    fake_gh.pr_checks = lambda _number: []  # type: ignore[method-assign]
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+
+    # Seed janitor_blocked WITHOUT the flag (e.g. a record persisted by an
+    # older version): pass 1 must still fire the WARNING. review() then
+    # refreshes the real missing-checks shape, so pass 2 is suppressed --
+    # the flag flip across passes is itself the refresh staying live.
+    from charlie_work.state import load_state, save_state, state_lock
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "janitor_blocked",
+            "janitor_ok": False,
+            "janitor_failures": ["PR is marked as draft"],
+        }
+        save_state(app.paths.state_file, state)
+    assert "stale-digest" != current_sha
+
+    app.loop(limit=0)
+    app.loop(limit=0)
+
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert sum(1 for e in events if e.get("pr_number") == 456) == 1
+
+
+def test_loop_janitor_blocked_missing_checks_heals_when_check_appears(
+    tmp_path: Path,
+) -> None:
+    """Keeping review() on the call path is what lets the suppression lift:
+    once the missing check reports, the janitor gate passes and the packet
+    regenerates with the current template -- the PR converges instead of
+    wedging inside its own suppressed state. This is the property the
+    issue's "keep the janitor-diagnostics-refresh behavior" clause pins."""
+    pr = _pr456("sha-same")
+    app, fake_gh = _make_loop_app_with_required_checks(
+        tmp_path, prs=[pr], required_checks=("Tests passed",)
+    )
+    current_sha = app._review_template_sha()
+
+    checks_sequence: list[list[dict]] = [
+        [],  # pass 1: required check still missing
+        [{"name": "Tests passed", "state": "SUCCESS"}],  # pass 2: it reports
+    ]
+    checks_calls: list[int] = []
+
+    def fake_pr_checks(number: int) -> list[dict]:
+        checks_calls.append(number)
+        return checks_sequence[min(len(checks_calls) - 1, len(checks_sequence) - 1)]
+
+    fake_gh.pr_checks = fake_pr_checks  # type: ignore[method-assign]
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    _seed_pr_janitor_blocked_missing_checks(app, pr_number=456, issue_number=123)
+
+    app.loop(limit=0)
+    app.loop(limit=0)
+
+    # review() regenerated the packet with the current template digest --
+    # the suppressed state converged instead of spamming.
+    pr_json_path = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "pr.json"
+    pr_json = json.loads(pr_json_path.read_text(encoding="utf-8"))
+    assert pr_json["prompt_template_sha"] == current_sha
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert not any(e.get("pr_number") == 456 for e in events)
+
+
+# ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
