@@ -181,7 +181,7 @@ from .process_utils import (
     find_worker_terminal_status,
     is_pid_alive,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
 )
-from . import orphaned_worker_sweep, rework_outcome
+from . import orphaned_worker_review_drain, orphaned_worker_sweep, rework_outcome
 from .write_gate import WriteGate, require_write_gate
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -1669,8 +1669,12 @@ def _detect_and_handle_orphaned_workers(
       (``terminal_exit_code is None`` -- the normal shape for devin-shell
       sessions, which never get a watcher), a fresh on-target
       ``.worker-outcome.json`` in the worktree proves the dispatch completed;
-      its PR edits are applied through the #1877 outcome-apply path and the
-      finding surfaces once as drift instead of crediting a worker death.
+      its PR edits are applied through the #1877 outcome-apply path instead
+      of crediting a worker death. Issue #1915: once that apply lands, the
+      post-lock review_routes drain calls ``review_callback`` -- a fresh
+      packet flips the issue to "reviewing"; a blocked review returns it to
+      "rework_requested" (still without a death credit). With no review
+      callback the finding surfaces once as drift, as before.
     - Otherwise, surface as drift for human triage (once per unchanged finding)
     - Do NOT clear worker_pid from state.json after handling (issue #282: the
       recovery path needs the fingerprint to verify the worktree is safe to reset).
@@ -2210,7 +2214,7 @@ def _detect_and_handle_orphaned_workers(
     # Handle orphaned workers. Head-advanced request_changes findings are
     # collected and routed to the review lane outside the state lock (review()
     # itself acquires the lock and may call transition()).
-    review_routes: list[tuple[int, int, str, str, str]] = []
+    review_routes: list[orphaned_worker_review_drain.OrphanedWorkerReviewRoute] = []
     # Issue #654: dead dispatched workers time-escalated inside the lock
     # collected here for the post-lock transition() call (network I/O).
     reap_escalations: list[int] = []
@@ -2796,87 +2800,22 @@ def _detect_and_handle_orphaned_workers(
         write_gate=write_gate,
     )
 
-    # Route head-advanced request_changes findings to the review lane outside
-    # the state lock. review() generates the packet, fires the review_started
-    # label transition, and returns ok when a fresh packet is produced. We then
-    # flip the issue status to "reviewing" so it is not re-detected as an orphan
-    # on every subsequent pass. If review() fails, we record a drift fingerprint
-    # so the identical finding is not re-emitted every pass.
-    for (
-        issue_number,
-        pr_number,
-        reviewed_head_sha_before,
-        live_head_sha,
-        fingerprint,
-    ) in review_routes:
-        if review_callback is None:
-            continue
-        review_result = review_callback(pr_number)
-        routed = False
-        # See _route_rework_candidate_to_review's matching comment: review()
-        # can return ok=True for the janitor-gate conflict/no-op-rework route
-        # (no packet, no review_started transition) as well as for a real
-        # packet. Only a real packet should flip this orphaned-but-dispatched
-        # issue to "reviewing".
-        routed_to_rework = bool(review_result.data.get("routed_to_rework"))
-        # Issue #558: review() also returns ok=True when it converges a
-        # CLOSED-unmerged PR's state entry to "closed" at the janitor gate.
-        # That is not a fresh packet -- the PR is dead, not transiently
-        # blocked -- so it must NOT flip this issue to "reviewing" (an
-        # ACTIVE_STATE_STATUS no reconcile rule clears while the GitHub
-        # issue itself stays open: issue_active_label_no_open_pr sees the
-        # closed PR still links to the issue, issue_active_label_with_open_pr
-        # sees no OPEN PR, and the unknown-status recompute sweep skips
-        # "reviewing" because it is a VALID_ISSUE_STATUSES member). The
-        # issue's disposition is left to the existing closed-unmerged
-        # issue-side handling (closed_unmerged_pr_active_labels). Neither
-        # the "reviewing" flip nor the transient-block drift fingerprint
-        # below applies to a permanently-dead PR.
-        closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
-        with state_lock(state_file):
-            state = load_state(state_file)
-            pr_state = state["prs"].get(str(pr_number), {})
-            entry = state["issues"].get(str(issue_number), {})
-            decision_unchanged = pr_state.get("reviewed_head_sha") == reviewed_head_sha_before
-            if (
-                review_result.ok
-                and not routed_to_rework
-                and not closed_unmerged_converged
-                and decision_unchanged
-                and isinstance(entry, dict)
-                and entry.get("status") == "dispatched"
-            ):
-                state["issues"][str(issue_number)] = {**entry, "status": "reviewing"}
-                routed = True
-            elif (
-                not review_result.ok
-                and not routed_to_rework
-                and isinstance(entry, dict)
-                and entry.get("status") == "dispatched"
-            ):
-                # Review failed: mark the drift fingerprint so the next pass
-                # does not retry/re-emit for this unchanged head.
-                state["issues"][str(issue_number)] = {
-                    **entry,
-                    "orphan_drift_fingerprint": fingerprint,
-                    "orphan_drift_at": utc_now(),
-                }
-            state = write_gate.append_event(
-                state,
-                "orphaned_worker_routed_to_review"
-                if review_result.ok
-                else "orphaned_worker_drift",
-                {
-                    "issue_number": issue_number,
-                    "pr_number": pr_number,
-                    "review_ok": review_result.ok,
-                    "routed": routed,
-                    "live_head_sha": live_head_sha,
-                    "reviewed_head_sha": reviewed_head_sha_before,
-                    "reason": "dead_worker_with_head_change",
-                },
-            )
-            write_gate.save_state(state)
+    # Route head-advanced request_changes findings -- and, since issue
+    # #1915, completed-outcome findings whose apply pass landed -- to the
+    # review lane outside the state lock. The drain (per-route exception
+    # guard, the completed-outcome apply gate, the reviewing /
+    # rework_requested / drift-fingerprint dispositions, and the
+    # rework_requested label transitions) lives in
+    # ``orphaned_worker_review_drain`` -- extracted per the file-size rule
+    # during the #1915 rework.
+    orphaned_worker_review_drain.drain_orphaned_worker_review_routes(
+        review_routes,
+        review_callback=review_callback,
+        gh=gh,
+        config=config,
+        state_file=state_file,
+        write_gate=write_gate,
+    )
 
     # Issue #654: apply the ``escalated`` label edge for dead dispatched
     # workers that exceeded the reap grace period. The state.json update

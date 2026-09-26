@@ -15,9 +15,11 @@ Called once per dead-PID ``dispatched`` issue that still has a linked open
 PR, inside the sweep's ``state_lock`` (the same lock window the code ran
 under before the move). Every finding either mutates ``entry`` and appends
 to ``sweep_events`` or collects a post-lock route -- ``review_routes`` for a
-head-advanced verdict re-review, ``outcome_apply_routes`` for a fresh,
-on-target ``.worker-outcome.json`` whose PR edits the orchestrator applies
-through the #1877 seam in ``rework_outcome.apply_collected_rework_outcomes``.
+head-advanced verdict re-review (and, since issue #1915, for a completed
+worker outcome once its apply pass has landed), ``outcome_apply_routes`` for
+a fresh, on-target ``.worker-outcome.json`` whose PR edits the orchestrator
+applies through the #1877 seam in
+``rework_outcome.apply_collected_rework_outcomes``.
 
 Workflow-module names the moved code resolved through ``workflow``'s module
 namespace (``utc_now``, ``_parse_iso_timestamp``) are reached through a
@@ -35,6 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .dispatch_selection import _credit_worker_death
+from .orphaned_worker_review_drain import OrphanedWorkerReviewRoute
 from .process_utils import find_worker_terminal_status
 from .review_decision import review_decision
 from .rework_outcome import (
@@ -173,6 +176,8 @@ def handle_dead_worker_completed_outcome(
     repo_root: Any,
     worktrees_dir: Path | None,
     outcome_apply_routes: list[tuple[int, int]],
+    review_routes: list[OrphanedWorkerReviewRoute],
+    review_callback: Callable[[int], Any] | None,
     drift_fingerprint: Callable[..., str],
     extra_payload: dict[str, Any] | None = None,
 ) -> bool:
@@ -186,11 +191,23 @@ def handle_dead_worker_completed_outcome(
     head. In that case the outcome is queued for the post-lock #1877
     apply pass (idempotent: ``APPLIED_HEADS_KEY`` dedups on the reported
     head, so a transient failure retries next pass while an
-    already-applied outcome is never re-queued) and the finding surfaces
-    once via the same fingerprinted drift the clean-exit (#773) branch
-    uses -- no ``worker_death_at`` credit and no ``rework_requested``
-    reset, the two steps that drove the swole#198 0-commit
-    ``no_op_rework_attempts_cap_exceeded`` loop.
+    already-applied outcome is never re-queued) and -- when a review
+    callback is available -- the issue is also queued for the post-lock
+    ``review_routes`` drain (issue #1915): the drain re-checks that the
+    outcome applied, then calls ``review()`` and flips
+    ``dispatched`` -> ``reviewing`` on a fresh packet or, when review
+    cannot produce one, returns the issue to ``rework_requested`` -- still
+    without a ``worker_death_at`` credit. False-crediting a worker death
+    here while the issue sat ``dispatched`` forever was the two-step
+    failure that drove the swole#198 0-commit
+    ``no_op_rework_attempts_cap_exceeded`` loop. The
+    drift fingerprint is deliberately NOT marked on the routed path: the
+    drain is what resolves the finding, so an unapplied/skipped route must
+    re-collect cleanly on the next pass. Without a review callback the
+    finding surfaces once via the same fingerprinted drift the clean-exit
+    (#773) branch uses, and ``orphan_drift_at`` arms the #654 time-based
+    reap backstop either way so a route that never resolves still
+    converges.
 
     Every negative answer (a recorded exit code -- zero handled by the
     caller's own branch, non-zero being a confirmed crash -- a missing
@@ -228,6 +245,34 @@ def handle_dead_worker_completed_outcome(
     )
     if entry.get("orphan_drift_fingerprint") == fingerprint:
         return True
+    if review_callback is not None:
+        # Issue #1915: applying the outcome is only half the recovery -- the
+        # issue must also leave ``dispatched`` or it dead-ends until the
+        # 60-minute ``dead_dispatched_worker_reap`` backstop escalates it
+        # (swole#198/PR#348). Queue a review route like the head-advanced
+        # branch below: post-lock, once the outcome-apply drain has run,
+        # ``review()`` either produces a fresh packet (the drain flips the
+        # issue to ``reviewing``) or cannot (the drain returns it to
+        # ``rework_requested``, still without a death credit, so the
+        # ordinary dispatch loop owns the still-outstanding rework). The
+        # drift fingerprint is deliberately NOT marked here -- the drain is
+        # what resolves the finding, so a route whose apply has not landed
+        # yet must re-collect cleanly next pass -- but ``orphan_drift_at``
+        # still arms so the #654 backstop stays the terminal for a route
+        # that never resolves (e.g. an apply that can never succeed).
+        if entry.get("orphan_drift_at") is None:
+            entry["orphan_drift_at"] = _wf.utc_now()
+        review_routes.append(
+            OrphanedWorkerReviewRoute(
+                issue_number=issue_number,
+                pr_number=pr_number,
+                reviewed_head_sha=reviewed_head_sha,
+                live_head_sha=live_head_sha,
+                fingerprint=fingerprint,
+                reason="dead_worker_completed_outcome",
+            )
+        )
+        return True
     entry["orphan_drift_fingerprint"] = fingerprint
     entry["orphan_drift_at"] = _wf.utc_now()
     sweep_events.append(
@@ -263,7 +308,7 @@ def handle_dead_worker_with_pr(
     review_callback: Callable[[int], Any] | None,
     repo_root: Any,
     worktrees_dir: Path | None,
-    review_routes: list[tuple[int, int, str, str, str]],
+    review_routes: list[OrphanedWorkerReviewRoute],
     outcome_apply_routes: list[tuple[int, int]],
     pr_orphan_unreviewed_details: dict[int, dict[str, Any]],
     drift_fingerprint: Callable[..., str],
@@ -378,6 +423,8 @@ def handle_dead_worker_with_pr(
                 repo_root=repo_root,
                 worktrees_dir=worktrees_dir,
                 outcome_apply_routes=outcome_apply_routes,
+                review_routes=review_routes,
+                review_callback=review_callback,
                 drift_fingerprint=drift_fingerprint,
             ):
                 # No terminal record and no fresh on-target
@@ -439,12 +486,13 @@ def handle_dead_worker_with_pr(
                 return
             if review_callback is not None:
                 review_routes.append(
-                    (
-                        issue_number,
-                        pr_number,
-                        reviewed_head_sha,
-                        live_head_sha,
-                        fingerprint,
+                    OrphanedWorkerReviewRoute(
+                        issue_number=issue_number,
+                        pr_number=pr_number,
+                        reviewed_head_sha=reviewed_head_sha,
+                        live_head_sha=live_head_sha,
+                        fingerprint=fingerprint,
+                        reason="dead_worker_with_head_change",
                     )
                 )
             else:
@@ -559,6 +607,8 @@ def handle_dead_worker_with_pr(
                 repo_root=repo_root,
                 worktrees_dir=worktrees_dir,
                 outcome_apply_routes=outcome_apply_routes,
+                review_routes=review_routes,
+                review_callback=review_callback,
                 drift_fingerprint=drift_fingerprint,
                 extra_payload={
                     "decision": "approved",
