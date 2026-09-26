@@ -799,6 +799,18 @@ class DeescalationConfig:
     # a distinct one-time event (deescalation_cap_exhausted) makes the
     # terminal state diagnosable rather than a silently renamed one-way door.
     max_auto_deescalations: int = 2
+    # Issue #1477 (Option A): ``auto_deescalation_count`` is reset only by a
+    # manual ``charlie unescalate``, which also stamps
+    # ``unescalate_cleared_reason``/``unescalate_cleared_at`` on the issue
+    # entry. When the IDENTICAL escalation reason re-fires within this many
+    # minutes of that reset, the sweep promotes the recurrence to
+    # ``reason_class="judgment"`` (never auto-cleared) instead of letting the
+    # reset budget re-arm a failure the human did not actually fix. 0
+    # disables the promotion entirely (kill switch). 24h covers at least one
+    # full dispatch -> worker -> janitor -> re-escalate cycle even on a
+    # degraded-cadence fleet (the observed #1306 loop re-escalated ~17h and
+    # ~41h after successive clears).
+    identical_reason_recurrence_window_minutes: int = 1440
     # Issue #1314 item 2 (retained by #1768's rewrite): dedicated cadence
     # knob for the operator-queue-impact check. The check currently rides
     # the loop pass cadence (every pass); this knob lets operators slow it
@@ -2878,11 +2890,30 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "(blocked-ready-issue count, not root-issue count -- see issue #1768) "
             f"must be >= 0, got {oq_threshold}"
         )
+    # Issue #1477: same scoped-extraction pattern for the recurrence window —
+    # a new key, parsed explicitly, unknown keys still silently ignored.
+    irr_window = deescalation_data.get("identical_reason_recurrence_window_minutes")
+    if irr_window is not None and (
+        isinstance(irr_window, bool) or not isinstance(irr_window, int)
+    ):
+        raise ConfigError(
+            "config section 'deescalation' key "
+            "'identical_reason_recurrence_window_minutes' "
+            f"must be an int, got {type(irr_window).__name__}"
+        )
+    if irr_window is not None and irr_window < 0:
+        raise ConfigError(
+            "config section 'deescalation' key "
+            "'identical_reason_recurrence_window_minutes' "
+            f"must be >= 0, got {irr_window}"
+        )
     deescalation_overrides: dict[str, Any] = {}
     if oqr_interval is not None:
         deescalation_overrides["operator_queue_review_interval_minutes"] = oqr_interval
     if oq_threshold is not None:
         deescalation_overrides["operator_queue_depth_threshold"] = oq_threshold
+    if irr_window is not None:
+        deescalation_overrides["identical_reason_recurrence_window_minutes"] = irr_window
     deescalation = DeescalationConfig(**deescalation_overrides)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")

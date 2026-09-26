@@ -136,6 +136,15 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     # budget reset must clear alongside the escalation it tracks, so a
     # manual re-arm gives the next sweep clear a clean slate.
     "rework_budget_reset_for_terminal_since",
+    # Issue #1477 markers ``unescalate_cleared_reason`` /
+    # ``unescalate_cleared_at`` are deliberately ABSENT from this tuple:
+    # they are written BY the reset (recording which escalation_reason the
+    # re-arm cleared, so an identical reason re-firing within
+    # ``deescalation.identical_reason_recurrence_window_minutes`` is
+    # promoted to ``reason_class="judgment"`` by the de-escalation sweep),
+    # not leftover bookkeeping from the episode it ended. Listing them
+    # here would only re-pop what ``unescalate()`` re-stamps immediately
+    # after; it manages the pair itself.
     "label_error",
     "worker_pid",
     "worker_process_start_time",

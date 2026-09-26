@@ -44,6 +44,14 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
     ``auto_deescalation_count`` has already reached
     ``config.deescalation.max_auto_deescalations``. Returns
     ``{"cleared": True, ...}`` after a successful auto-de-escalation.
+    Returns ``{"promoted_to_judgment": True, ...}`` when the issue's
+    ``escalation_reason`` identically matches the reason a recent manual
+    ``charlie unescalate`` cleared (the ``unescalate_cleared_reason`` /
+    ``unescalate_cleared_at`` markers, issue #1477): the recurrence is
+    re-classified ``reason_class="judgment"`` so it is never auto-cleared,
+    closing the manual-unescalate reset loophole that let an identical
+    mechanical failure spin the escalate -> cleared -> re-escalate loop
+    forever.
 
     Issue #783 hazard (a) -- oscillation guard: ``auto_deescalation_count``
     is incremented here on every clear and is NEVER reset by this
@@ -111,6 +119,92 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
     if issue_entry.get("reason_class") != "mechanical":
         # fail closed: judgment (or re-classified) since the snapshot
         return _wf._deescalation_skip("not_mechanical", issue_number)
+
+    # Issue #1477 (Option A -- identical-cause recurrence is sticky). A
+    # manual ``charlie unescalate`` resets ``auto_deescalation_count`` and
+    # stamps ``unescalate_cleared_reason``/``unescalate_cleared_at`` on the
+    # issue entry. If the IDENTICAL ``escalation_reason`` re-fires within
+    # ``deescalation.identical_reason_recurrence_window_minutes`` of that
+    # reset, the re-arm did not change the underlying cause -- a human (or
+    # an automated requeue) merely cleared the label -- so the reset budget
+    # was not earned. Promote the recurrence to ``reason_class="judgment"``
+    # (never auto-cleared, lands agent:human-needed) instead of re-entering
+    # the auto-clear accounting that produced the #1306/PR #1409 infinite
+    # no_op_rework loop. This runs BEFORE the cap/liveness/PR checks: the
+    # promotion decides WHAT the escalation is, not whether it is safe to
+    # clear, so it needs no GitHub calls, and it must preempt a sweep that
+    # would otherwise burn a fresh ``auto_deescalation_count`` slot on an
+    # already-doomed clear.
+    cleared_reason = issue_entry.get("unescalate_cleared_reason")
+    cleared_at = _wf._parse_iso_timestamp(issue_entry.get("unescalate_cleared_at"))
+    recurrence_window_minutes = self.config.deescalation.identical_reason_recurrence_window_minutes
+    if (
+        recurrence_window_minutes > 0
+        and isinstance(cleared_reason, str)
+        and cleared_reason
+        and cleared_reason == issue_entry.get("escalation_reason")
+        and cleared_at is not None
+        and datetime.now(UTC) - cleared_at <= timedelta(minutes=recurrence_window_minutes)
+    ):
+        with _wf.state_lock(self.paths.state_file):
+            fresh_state = _wf.load_state(self.paths.state_file)
+            fresh_entry = fresh_state["issues"].get(issue_key, {})
+            if not isinstance(fresh_entry, dict) or (
+                fresh_entry.get("status") not in SINK_STATUSES
+                or fresh_entry.get("reason_class") != "mechanical"
+                or fresh_entry.get("escalation_reason") != cleared_reason
+                or fresh_entry.get("unescalate_cleared_reason") != cleared_reason
+            ):
+                # Changed concurrently since the snapshot (human
+                # unescalate, a different re-escalation, etc.) -- do not
+                # act on stale intent. A distinct reason from the later
+                # ``changed_concurrently`` guard: skip-reason vocabulary is
+                # one-name-per-branch (test_skip_reason_vocabulary_...).
+                return _wf._deescalation_skip("promotion_raced", issue_number)
+            fresh_state["issues"][issue_key] = {
+                **fresh_entry,
+                "number": issue_number,
+                "reason_class": "judgment",
+            }
+            fresh_state = self.write_gate.record_event(
+                fresh_state,
+                "deescalation_recurrence_promoted",
+                {
+                    "issue_number": issue_number,
+                    "escalation_reason": cleared_reason,
+                    "unescalate_cleared_at": issue_entry.get("unescalate_cleared_at"),
+                    "window_minutes": recurrence_window_minutes,
+                },
+            )
+            self.write_gate.save_state(fresh_state)
+        # The stored class is now "judgment"; the escalation-time label
+        # edge landed operator_queue (the caller picked it from the
+        # mechanical class the write carried then). Move the issue to
+        # human_needed with the same "escalated" edge the cap-exhaustion
+        # branch uses -- best-effort outside the lock, with the identical
+        # label_error fallback so a failed write stays diagnosable and is
+        # backstopped by the _repair_escalated_labels self-heal sweep.
+        result = self.write_gate.transition(self.gh, self.config.labels, issue_number, "escalated")
+        if result.outcome != TransitionOutcome.APPLIED:
+            with _wf.state_lock(self.paths.state_file):
+                fresh_state = _wf.load_state(self.paths.state_file)
+                entry = fresh_state["issues"].get(issue_key, {})
+                fresh_state["issues"][issue_key] = {
+                    **(entry if isinstance(entry, dict) else {}),
+                    "number": issue_number,
+                    "label_error": {
+                        "edge": "escalated",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    },
+                }
+                self.write_gate.save_state(fresh_state)
+        return {
+            "promoted_to_judgment": True,
+            "issue_number": issue_number,
+            "escalation_reason": cleared_reason,
+        }
 
     max_auto = self.config.deescalation.max_auto_deescalations
     auto_count = int(issue_entry.get("auto_deescalation_count", 0) or 0)
@@ -443,6 +537,7 @@ def _maybe_deescalate_mechanical(self) -> None:
 
     cleared: list[dict[str, Any]] = []
     cap_exhausted: list[int] = []
+    promoted: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     skipped: Counter[str] = Counter()
     for issue_number in candidates:
@@ -453,6 +548,8 @@ def _maybe_deescalate_mechanical(self) -> None:
             continue
         if outcome.get("cap_exhausted"):
             cap_exhausted.append(issue_number)
+        elif outcome.get("promoted_to_judgment"):
+            promoted.append(outcome)
         elif outcome.get("cleared"):
             cleared.append(outcome)
         else:
@@ -472,6 +569,11 @@ def _maybe_deescalate_mechanical(self) -> None:
                 "candidates": len(candidates),
                 "cleared": cleared,
                 "cap_exhausted": cap_exhausted,
+                # Issue #1477: recurrences promoted to reason_class
+                # "judgment" this pass -- distinct from ``cleared`` (no
+                # auto-de-escalation happened; the issue stays parked, now
+                # permanently) and from ``cap_exhausted`` (no cap was hit).
+                "promoted_to_judgment": promoted,
                 # Attribution for the difference between ``candidates`` and
                 # everything else in this payload. Before issue #1090 that
                 # difference was silent: a sweep that considered 29 issues
