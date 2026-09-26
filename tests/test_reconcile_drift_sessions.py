@@ -717,3 +717,113 @@ def test_detect_drift_launch_stalled_api_session_settles_budget_ledger(
     assert entry.issue == 55
     assert entry.provider == "example"
     assert entry.usd == pytest.approx(6.15)
+
+
+# ---------------------------------------------------------------------------
+# Issue #1917: dead_worker_failure_kind drift items — detect + apply
+# ---------------------------------------------------------------------------
+
+
+def test_detect_drift_dead_session_emits_dead_worker_failure_kind_item(
+    tmp_path: Path,
+) -> None:
+    """Issue #1917: a dead session's log-tail classification must reach
+    ``detect_drift`` as a ``dead_worker_failure_kind`` DriftItem carrying
+    the resolved ``failure_kind`` — the stamp the state.json-keyed orphan
+    sweep reads after the sidecar is reaped."""
+    from charlie_work.devin_shell import SessionRecord
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a session log with a rate-limit signature so classification
+    # resolves a provider-throttle kind.
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Some work done...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Dead session
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    claude_sidecar = sessions_dir / "issue-42.claude.json"
+    if claude_sidecar.exists():
+        claude_sidecar.unlink()
+
+    drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    kind_drift = [d for d in drift if d.kind == "dead_worker_failure_kind"]
+    assert len(kind_drift) == 1
+    assert kind_drift[0].issue_number == 42
+    assert kind_drift[0].failure_kind == "rate_limited"
+    assert kind_drift[0].fix_actions == ("stamp dead_worker_failure_kind=rate_limited",)
+
+
+def test_apply_fixes_dead_worker_failure_kind_stamps_issue_entry() -> None:
+    """Issue #1917: ``apply_fixes`` must stamp the carried ``failure_kind``
+    onto the tracked issue entry — immutably, so the caller's state and
+    nested entry are untouched."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    state["issues"]["42"] = {"status": "dispatched"}
+
+    drift = [
+        DriftItem(
+            kind="dead_worker_failure_kind",
+            issue_number=42,
+            pr_number=None,
+            detail="issue #42 dead worker classified failure_kind=rate_limited",
+            fix_actions=("stamp dead_worker_failure_kind=rate_limited",),
+            failure_kind="rate_limited",
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert new_state["issues"]["42"]["dead_worker_failure_kind"] == "rate_limited"
+    # The input mapping and its nested entry were not mutated.
+    assert "dead_worker_failure_kind" not in state["issues"]["42"]
+
+
+def test_apply_fixes_dead_worker_failure_kind_noop_for_untracked_issue() -> None:
+    """Issue #1917: a ``dead_worker_failure_kind`` item for an issue with
+    no state entry must not invent one — an untracked session has no
+    orphan-sweep bookkeeping to exempt."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    drift = [
+        DriftItem(
+            kind="dead_worker_failure_kind",
+            issue_number=99,
+            pr_number=None,
+            detail="issue #99 dead worker classified failure_kind=stalled",
+            fix_actions=("stamp dead_worker_failure_kind=stalled",),
+            failure_kind="stalled",
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert "99" not in new_state["issues"]

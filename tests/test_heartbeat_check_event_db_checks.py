@@ -342,23 +342,29 @@ def test_check_warning_events_deterministic_across_runs(hb: ModuleType, tmp_path
 
 
 def test_heartbeat_check_source_has_no_hardcoded_expected_operational_kind_literals() -> None:
-    """AC3 (#1271): heartbeat_check.py must reach every
+    """AC3 (#1271): heartbeat_check.py -- and, since the issue #1895
+    extraction, heartbeat_event_alarms.py, where the bucketing code that
+    consumes the frozenset now physically lives -- must reach every
     EXPECTED_OPERATIONAL_KINDS member only via the imported frozenset --
-    never as a hardcoded literal anywhere in the file (code, comments, or
+    never as a hardcoded literal anywhere in either file (code, comments, or
     docstrings alike). Source-derived from the live frozenset, not a
     maintained list here, so adding a member later needs no change to this
-    test or to heartbeat_check.py."""
+    test or to either script."""
     from charlie_work.instrumentation import EXPECTED_OPERATIONAL_KINDS
 
-    source_path = Path(__file__).parent.parent / "scripts" / "heartbeat_check.py"
-    source = source_path.read_text(encoding="utf-8")
+    scripts_dir = Path(__file__).parent.parent / "scripts"
+    sources = {
+        name: (scripts_dir / name).read_text(encoding="utf-8")
+        for name in ("heartbeat_check.py", "heartbeat_event_alarms.py")
+    }
 
     assert EXPECTED_OPERATIONAL_KINDS, "the set must not be empty for this test to mean anything"
-    for kind in EXPECTED_OPERATIONAL_KINDS:
-        assert kind not in source, (
-            f"{kind!r} appears as a literal in heartbeat_check.py -- it must be "
-            "reached only via the imported EXPECTED_OPERATIONAL_KINDS frozenset"
-        )
+    for name, source in sources.items():
+        for kind in EXPECTED_OPERATIONAL_KINDS:
+            assert kind not in source, (
+                f"{kind!r} appears as a literal in {name} -- it must be "
+                "reached only via the imported EXPECTED_OPERATIONAL_KINDS frozenset"
+            )
 
 
 def test_check_warning_events_excludes_old_row(hb: ModuleType, tmp_path: Path) -> None:

@@ -20,7 +20,12 @@ from dataclasses import asdict
 from typing import Any
 
 import charlie_work.workflow as _wf
-from charlie_work.checks import is_infra_blocked_check, summarize_checks
+from charlie_work.checks import (
+    CheckSummary,
+    classify_infra_failures,
+    is_infra_blocked_check,
+    summarize_checks,
+)
 from charlie_work.janitor import (
     DiffContentSignature,
     _diff_content_signature,
@@ -338,5 +343,305 @@ def _merge_not_ready_result(
             "merge_attempt_alarm": False,
             "merge_attempt_warning": None,
             "merge_conflict": False,
+        },
+    )
+
+
+def _drive_infra_rerun_or_escalate(
+    self,
+    pr_number: int,
+    issue_number: int | None,
+    *,
+    head_sha: Any,
+    rerun_run_ids: tuple[int, ...],
+    infra_rerun_attempts: dict[str, Any],
+    definitive_failed: tuple[str, ...],
+    escalate_exhausted: bool,
+    ok: bool,
+    extra_data: dict[str, Any] | None = None,
+) -> _wf.CommandResult | None:
+    """Drive the #841 infra-failure remediation mechanics: bounded
+    ``gh run rerun`` per eligible run id, then operator-queue escalation
+    once a check's run ids are exhausted (or none was parseable).
+
+    Extracted out of ``review()`` for issue #1912 so ``merge_ready()`` can
+    run the identical mechanics on carried-forward approved verdicts --
+    previously this block was review()-only, so an approved PR whose
+    verdict carried forward to the live head (the loop() already_approved
+    fast path routes it straight to ``merge_ready``) got no rerun and no
+    escalation for a cancelled required check, looping forever behind only
+    a diagnostic ``merge_failed_attempt_alarm`` event (live instance:
+    swole PR #349 / issue #174). A single shared driver keeps the two
+    lanes from drifting apart again.
+
+    A job-level ``timeout-minutes`` kill is an infra failure (CANCELLED on
+    the self-hosted-era runners, possibly TIMED_OUT on hosted runners),
+    which ``summarize_checks`` buckets into ``infra_failed`` via
+    ``_classify_check_run`` -- both conclusions route to the infra bucket,
+    so the rerun path matches regardless of which runner reports. There is
+    no code-fix rework path for an infra kill.
+
+    ``gh run rerun RUN_ID`` is dispatched WITHOUT ``--failed``: the job
+    never completed (cancelled/timed out, not failed), so ``--failed``'s
+    "rerun the failed jobs in this run" semantics do not apply -- omitting
+    it reruns the whole run, which is the correct behavior for a run that
+    never produced a completed job to target.
+
+    ``rerun_run_ids`` / ``infra_rerun_attempts`` / ``definitive_failed``
+    are the caller's ``classify_infra_failures`` output (``review()`` reads
+    them off the ``JanitorVerdict``; ``merge_ready()`` classifies itself).
+    ``escalate_exhausted`` is the caller's sole-blocker flag
+    (``verdict.is_infra_failure_block`` in ``review()``) -- when False,
+    ``definitive_failed`` names checks that were deliberately not retried
+    this pass because other blockers co-occur, which must not escalate.
+
+    Returns the ``CommandResult`` the caller should return early when a
+    rerun was dispatched or the cap was escalated, else ``None`` -- a
+    rerun API error records ``infra_rerun_failed`` without consuming the
+    attempt and falls through so the caller's own bookkeeping can record
+    the still-blocked pass. ``ok`` and ``extra_data`` preserve each
+    caller's result shape: ``review()`` returns ``ok=False`` (no review
+    produced this pass) while ``merge_ready()`` returns ``ok=True`` (a
+    healthy, still-unmergeable pass).
+    """
+    if rerun_run_ids:
+        infra_rerun_errors: list[str] = []
+        infra_triggered_run_ids: list[int] = []
+        for run_id in rerun_run_ids:
+            result = self.gh.run(["run", "rerun", str(run_id)], allow_failure=True)
+            if isinstance(result, _wf.GitHubRunResult):
+                if result.ok:
+                    infra_triggered_run_ids.append(run_id)
+                else:
+                    infra_rerun_errors.append(
+                        result.error or f"gh run rerun {run_id} exited {result.returncode}"
+                    )
+            elif isinstance(result, str):
+                # Dry-run returns a descriptive string; treat as success.
+                infra_triggered_run_ids.append(run_id)
+            else:
+                infra_rerun_errors.append(
+                    f"unexpected result from gh run rerun {run_id}: {result!r}"
+                )
+
+        if infra_triggered_run_ids and not infra_rerun_errors:
+            with _wf.state_lock(self.paths.state_file):
+                state = _wf.load_state(self.paths.state_file)
+                state["prs"][str(pr_number)] = {
+                    **state["prs"].get(str(pr_number), {}),
+                    "number": pr_number,
+                    "issue_number": issue_number,
+                    "infra_rerun_attempts": infra_rerun_attempts,
+                }
+                state = self._record_event(
+                    state,
+                    "infra_rerun_triggered",
+                    {
+                        "pr_number": pr_number,
+                        "run_ids": infra_triggered_run_ids,
+                        "head_sha": head_sha,
+                    },
+                )
+                self.write_gate.save_state(state)
+            return _wf.CommandResult(
+                ok,
+                f"infra rerun triggered for PR #{pr_number}: run(s) "
+                + ", ".join(str(rid) for rid in infra_triggered_run_ids),
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    **(extra_data or {}),
+                    "infra_rerun_run_ids": infra_triggered_run_ids,
+                },
+            )
+
+        # Rerun API error: record it, but do not consume the attempt.
+        with _wf.state_lock(self.paths.state_file):
+            state = _wf.load_state(self.paths.state_file)
+            state = self._record_event(
+                state,
+                "infra_rerun_failed",
+                {
+                    "pr_number": pr_number,
+                    "run_ids": list(rerun_run_ids),
+                    "errors": infra_rerun_errors,
+                },
+            )
+            self.write_gate.save_state(state)
+
+    if escalate_exhausted and issue_number is not None and definitive_failed:
+        # Attempt cap exhausted (or no parseable run id at all): there is no
+        # code-fix rework path for an infra failure, so escalate straight to
+        # a human instead of looping forever on a PR that can never clear
+        # the gate on its own -- this is the bug issue #841 fixes
+        # (previously: a diagnostic merge_failed_attempt_alarm event and
+        # nothing else).
+        with _wf.state_lock(self.paths.state_file):
+            state = _wf.load_state(self.paths.state_file)
+            state = _wf._escalate_issue(
+                state,
+                issue_number,
+                reason="infra_rerun_cap_exceeded",
+                reason_class="mechanical",
+                pr_number=pr_number,
+                pr_extra={"infra_rerun_attempts": infra_rerun_attempts},
+            )
+            state = self._record_event(
+                state,
+                "infra_rerun_escalated",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "checks": list(definitive_failed),
+                },
+            )
+            self.write_gate.save_state(state)
+        edge = _wf._escalation_edge("escalated", "mechanical")
+        transition_result = self.write_gate.transition(
+            self.gh, self.config.labels, issue_number, edge
+        )
+        label_error = None
+        if transition_result.outcome != _wf.TransitionOutcome.APPLIED:
+            label_error = {
+                "edge": edge,
+                "outcome": transition_result.outcome.value,
+                "add_failures": transition_result.add_failures,
+                "remove_failures": transition_result.remove_failures,
+            }
+        return _wf.CommandResult(
+            ok,
+            f"PR #{pr_number} infra-failed check(s) exhausted rerun cap: "
+            + ", ".join(definitive_failed),
+            {
+                "pr": pr_number,
+                "issue": issue_number,
+                **(extra_data or {}),
+                "infra_escalated": True,
+                "label_error": label_error,
+            },
+        )
+
+    return None
+
+
+def _merge_ready_infra_remediation(
+    self,
+    pr_number: int,
+    pr: dict[str, Any],
+    issue_number: int | None,
+    decision: dict[str, Any],
+    enriched_checks: list[dict[str, Any]],
+    summary: CheckSummary,
+    *,
+    approved: bool,
+    sync_failed: bool,
+    merge_conflict: bool,
+) -> _wf.CommandResult | None:
+    """Infra-failure remediation for the merge lane (issue #1912).
+
+    The #841 rerun/escalate mechanics lived only in ``review()`` -- fed by
+    ``run_janitor``'s ``classify_infra_failures`` call -- but an approved
+    PR whose verdict carries forward to the live head never re-enters
+    ``review()`` (``loop()``'s already_approved fast path calls
+    ``merge_ready`` directly), so a CANCELLED/TIMED_OUT required check on
+    that head was retried by nothing and escalated to nobody; the PR
+    looped forever behind only a diagnostic ``merge_failed_attempt_alarm``
+    (live instance: swole PR #349 / issue #174). This lane gives
+    ``merge_ready()`` the identical behavior: classify the live head's
+    checks the same way the janitor does, then drive the shared
+    ``_drive_infra_rerun_or_escalate`` mechanics.
+
+    The gate mirrors the janitor's ``is_infra_failure_block`` sole-blocker
+    predicate, translated to merge_ready's own blocker vocabulary:
+
+    - ``summary.infra_failed`` non-empty (a CANCELLED/INFRA_FAILURE/
+      TIMED_OUT required check on the live head);
+    - no co-occurring ``summary.failed`` (a genuine code failure is owned
+      by the check-failure rework lane), ``summary.missing`` (owned by the
+      readiness-no-CI stall gate), ``summary.unavailable`` (covers a
+      ``gh pr checks`` fetch failure -- every required check lands there),
+      or ``summary.infra_blocked`` (fleet-wide Actions budget/runner
+      outage, #1383 -- held by its own lane, never per-run rerun);
+    - pending checks are deliberately NOT excluded, matching the janitor
+      predicate -- rerunning a cancelled check while a sibling is still
+      in flight heals it sooner, and the merge gate stays closed either
+      way;
+    - the janitor's non-check blockers map to merge_ready's own:
+      approval (``approved``, or approval not required), ``sync_failed``
+      (merge conflict, failed branch sync, and cross-PR revert all resolve
+      through lanes that move the head, making a rerun against this one
+      wasted), draft (the janitor counts draft as a blocker), and a linked
+      issue (the janitor counts its absence as a blocker -- and escalation
+      needs the target);
+    - neither the PR nor the linked issue already escalated -- review()'s
+      entry gate treats escalation as terminal for automated remediation
+      (the pass_skipped early return), and without the same exclusion here
+      a cap-exhausted check would re-fire ``infra_rerun_escalated`` plus
+      its label transition every pass after this lane's own escalation.
+
+    ``classify_infra_failures`` is called with ``record_attempts=True`` --
+    the gate above is exactly the condition under which the janitor passes
+    ``record_attempts=is_infra_failure_block`` -- and is fed
+    ``enriched_checks`` (post-#1383 data-boundary checks, the same input
+    the janitor sees in ``review()``); the enrichment only rewrites
+    FAILURE conclusions, never the CANCELLED/INFRA_FAILURE/TIMED_OUT
+    conclusions this lane consumes.
+
+    Returns the ``CommandResult`` ``merge_ready()`` should return early
+    when a rerun was dispatched or the cap escalated, else ``None`` -- a
+    rerun API error already recorded ``infra_rerun_failed`` without
+    consuming the attempt, so the caller's normal bookkeeping records the
+    still-blocked pass (counter/alarm path unchanged).
+    """
+    if (
+        (not approved and self.config.auto_merge.require_approved_review)
+        or sync_failed
+        or issue_number is None
+        or bool(pr.get("isDraft"))
+        or not summary.infra_failed
+        or summary.failed
+        or summary.missing
+        or summary.unavailable
+        or summary.infra_blocked
+    ):
+        return None
+    snap = _wf.load_state_locked(self.paths.state_file)
+    pr_escalated, issue_escalated = _wf._escalation_flags(
+        snap.get("prs", {}).get(str(pr_number), {}),
+        snap.get("issues", {}).get(str(issue_number), {}),
+    )
+    if pr_escalated or issue_escalated:
+        return None
+    pr_state = snap.get("prs", {}).get(str(pr_number), {})
+    debounce = classify_infra_failures(
+        enriched_checks,
+        self.config.auto_merge.required_checks,
+        pr_state,
+        str(pr.get("headRefOid") or "") or None,
+        record_attempts=True,
+        attempt_cap=self.config.auto_merge.infra_rerun_attempt_cap,
+    )
+    return self._drive_infra_rerun_or_escalate(
+        pr_number,
+        issue_number,
+        head_sha=pr.get("headRefOid"),
+        rerun_run_ids=debounce.rerun_run_ids,
+        infra_rerun_attempts=debounce.infra_rerun_attempts,
+        definitive_failed=debounce.definitive_failed,
+        escalate_exhausted=True,
+        ok=True,
+        extra_data={
+            "can_merge": False,
+            "merged": False,
+            "review_decision": decision,
+            "checks": asdict(summary),
+            "checks_unavailable": False,
+            "consecutive_failed_merge_attempts": int(
+                pr_state.get("consecutive_failed_merge_attempts", 0)
+            ),
+            "merge_attempt_alarm": False,
+            "merge_attempt_warning": None,
+            "merge_conflict": merge_conflict,
+            "label_error": None,
         },
     )

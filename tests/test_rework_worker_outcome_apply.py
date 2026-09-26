@@ -21,6 +21,8 @@ Contract under test:
 from __future__ import annotations
 
 import json
+import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +35,12 @@ from charlie_work.config import WORKER_OUTCOME_FILENAME
 from charlie_work.github import GitHubError
 from charlie_work.paths import runtime_paths
 from charlie_work.process_utils import write_worker_terminal_status
-from charlie_work.rework_outcome import apply_rework_worker_outcome
+from charlie_work.instrumentation import query_events
+from charlie_work.rework_outcome import (
+    apply_collected_rework_outcomes,
+    apply_rework_worker_outcome,
+    fresh_completed_worker_outcome,
+)
 from charlie_work.state import load_state, save_state
 from charlie_work.worktree import worktree_path_for_branch
 
@@ -458,3 +465,174 @@ def test_rework_md_template_source_has_no_gh_command() -> None:
     text = template.read_text(encoding="utf-8")
     assert not re.search(r"\bgh\s", text), "rework.md must not reference a gh command"
     assert "gh pr" not in text
+
+
+# ---------------------------------------------------------------------------
+# fresh_completed_worker_outcome (issue #1911): the orphan sweep's "did this
+# dead worker actually finish?" probe for sessions with no terminal record
+# ---------------------------------------------------------------------------
+
+
+def _fresh_outcome_bed(tmp_path: Path) -> tuple[Path, datetime]:
+    worktrees_dir = tmp_path / "worktrees"
+    dispatched_at = datetime.now(UTC) - timedelta(hours=1)
+    return worktrees_dir, dispatched_at
+
+
+def _set_mtime(path: Path, when: datetime) -> None:
+    ts = when.timestamp()
+    os.utime(path, (ts, ts))
+
+
+def test_fresh_completed_outcome_is_returned(tmp_path: Path) -> None:
+    """A well-formed outcome written after dispatch started, pinned to the
+    live head, is proof of a completed handoff."""
+    worktrees_dir, dispatched_at = _fresh_outcome_bed(tmp_path)
+    worktree_path = _write_worktree_outcome(tmp_path, worktrees_dir, BRANCH, _outcome())
+
+    result = fresh_completed_worker_outcome(
+        worktree_path, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
+    )
+
+    assert result is not None
+    assert result["head_sha"] == HEAD_SHA
+    assert result["push_succeeded"] is True
+
+
+def test_stale_outcome_is_not_completed(tmp_path: Path) -> None:
+    """An outcome older than the dispatch belongs to a previous session."""
+    worktrees_dir, dispatched_at = _fresh_outcome_bed(tmp_path)
+    worktree_path = _write_worktree_outcome(tmp_path, worktrees_dir, BRANCH, _outcome())
+    _set_mtime(worktree_path / WORKER_OUTCOME_FILENAME, dispatched_at - timedelta(minutes=5))
+
+    assert (
+        fresh_completed_worker_outcome(
+            worktree_path, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
+        )
+        is None
+    )
+
+
+def test_outcome_at_other_head_is_not_completed(tmp_path: Path) -> None:
+    """A head_sha that does not match the live head describes a different
+    remote state."""
+    worktrees_dir, dispatched_at = _fresh_outcome_bed(tmp_path)
+    worktree_path = _write_worktree_outcome(
+        tmp_path, worktrees_dir, BRANCH, _outcome(head_sha="sha-other")
+    )
+
+    assert (
+        fresh_completed_worker_outcome(
+            worktree_path, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
+        )
+        is None
+    )
+
+
+def test_unpushed_outcome_is_not_completed(tmp_path: Path) -> None:
+    """``push_succeeded`` false/missing means the handoff never happened."""
+    worktrees_dir, dispatched_at = _fresh_outcome_bed(tmp_path)
+    worktree_path = _write_worktree_outcome(
+        tmp_path, worktrees_dir, BRANCH, _outcome(push_succeeded=False)
+    )
+
+    assert (
+        fresh_completed_worker_outcome(
+            worktree_path, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
+        )
+        is None
+    )
+
+
+def test_blocked_outcome_is_not_completed(tmp_path: Path) -> None:
+    """The ``blocked`` declaration shape is a scope-escalation channel, never
+    proof of a completed handoff — even if malformed enough to also carry
+    push fields."""
+    worktrees_dir, dispatched_at = _fresh_outcome_bed(tmp_path)
+    worktree_path = _write_worktree_outcome(
+        tmp_path,
+        worktrees_dir,
+        BRANCH,
+        {
+            "outcome": "blocked",
+            "reason_kind": "ambiguous_scope",
+            "push_succeeded": True,
+            "head_sha": HEAD_SHA,
+        },
+    )
+
+    assert (
+        fresh_completed_worker_outcome(
+            worktree_path, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
+        )
+        is None
+    )
+
+
+def test_missing_outcome_or_missing_anchor_is_not_completed(tmp_path: Path) -> None:
+    """No file, no worktree, no live head, or no dispatch timestamp all fail
+    safe to ``None`` — the caller falls back to the worker-death path."""
+    worktrees_dir, dispatched_at = _fresh_outcome_bed(tmp_path)
+    worktree_path = worktree_path_for_branch(tmp_path, BRANCH, worktrees_dir)
+
+    assert (
+        fresh_completed_worker_outcome(
+            worktree_path, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
+        )
+        is None
+    )
+    assert (
+        fresh_completed_worker_outcome(None, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at)
+        is None
+    )
+
+    _write_worktree_outcome(tmp_path, worktrees_dir, BRANCH, _outcome())
+    assert (
+        fresh_completed_worker_outcome(
+            worktree_path, live_head_sha=None, dispatched_at=dispatched_at
+        )
+        is None
+    )
+    assert (
+        fresh_completed_worker_outcome(worktree_path, live_head_sha=HEAD_SHA, dispatched_at=None)
+        is None
+    )
+
+
+def test_apply_collected_rework_outcomes_isolates_route_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guard pin: a contract breach in one apply must not starve the rest.
+
+    ``apply_rework_worker_outcome`` is contractually never-raises; if it
+    ever escapes anyway, the post-lock drain must record the failure and
+    keep going -- an unguarded exception would propagate out of
+    ``_detect_and_handle_orphaned_workers`` and skip the ``review_routes``
+    drain that follows it.
+    """
+    calls: list[int] = []
+
+    def _flaky(_gh: Any, *, issue_number: int, **_kwargs: Any) -> None:
+        calls.append(issue_number)
+        if issue_number == 1:
+            raise RuntimeError("contract breach")
+
+    monkeypatch.setattr(rework_outcome, "apply_rework_worker_outcome", _flaky)
+
+    paths = runtime_paths(tmp_path, "state")
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    apply_collected_rework_outcomes(
+        FakeGitHub(repo_root=tmp_path),
+        outcome_apply_routes=[(1, 100), (2, 101), (1, 102)],
+        repo_root=tmp_path,
+        worktrees_dir=tmp_path / "worktrees",
+        sessions_dir=tmp_path / "sessions",
+        state_file=paths.state_file,
+        write_gate=_wg(paths.state_file),
+    )
+
+    assert calls == [1, 2, 1]
+    failures = query_events(paths.state_file, kind="rework_outcome_apply_failed")
+    assert len(failures) == 2
+    assert all(f["level"] == "warning" for f in failures)
+    assert all("contract breach" in f["payload"]["error"] for f in failures)

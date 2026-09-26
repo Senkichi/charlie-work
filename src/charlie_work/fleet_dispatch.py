@@ -51,7 +51,11 @@ from .global_config import describe_config_file, load_layered_config
 from .instrumentation import log_event
 from .local_issues import github_client_for
 from .notify import AttentionDigest, AttentionEntry, emit_digest
-from .notify_freshness import check_notify_digest_freshness, report_notify_resolution
+from .notify_freshness import (
+    check_notify_digest_freshness,
+    report_notify_resolution,
+    resolve_fleet_notify,
+)
 from .paths import RepoNotFoundError, runtime_paths
 from .venv_anchor import verify_interpreter_anchored_editables
 from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
@@ -1794,6 +1798,29 @@ def _touch_registry_last_seen(
         logger.exception("Failed to bump fleet registry last_seen for touched repos")
 
 
+def _fleet_notify_config(global_config: Any) -> Any:
+    """Return the fleet supervisor's effective notify config (issue #1899).
+
+    The global layered ``NotifyConfig.file_path`` keeps the "" sentinel
+    ("derive from ``runtime.state_dir``"): only ``paths.resolved_layout``
+    substitutes it, per repo. The fleet supervisor has no repo root, so the
+    raw value reaches ``emit_digest`` -- where every emit fails
+    "file_path is empty" -- and ``report_notify_resolution``, which then
+    flags the documented default as a misconfiguration. Anchoring the
+    sentinel at the supervisor's own bookkeeping root
+    (``supervisor_runtime_paths`` -- the fleet-level equivalent of
+    ``resolved_layout``'s ``repo_root`` anchor) gives the report, the
+    per-pass staleness probe, and every emit one real digest path.
+    ``None``/missing sections pass through as ``None``.
+    """
+    notify_config = getattr(global_config, "notify", None) if global_config else None
+    if notify_config is None:
+        return None
+    state_dir = getattr(getattr(global_config, "runtime", None), "state_dir", "")
+    state_root = supervisor_runtime_paths(state_dir or layout.DEFAULT_STATE_DIR).root
+    return resolve_fleet_notify(notify_config, state_root)
+
+
 def fleet_loop(
     fleet_dir_override: str | None = None,
     global_config: Any = None,  # GlobalConfig from #159, but we don't have the type yet
@@ -1904,9 +1931,11 @@ def fleet_loop(
     # Issue #1859: dead-man's switch for the notify file sink, checked at the
     # top of every pass. Cheap (one stat) and edge-latched inside the helper;
     # skipped entirely when notify is off or the sink is not ``file``.
-    _notify_cfg = getattr(global_config, "notify", None) if global_config else None
-    if _notify_cfg is not None and getattr(_notify_cfg, "enabled", False):
-        check_notify_digest_freshness(_notify_cfg, fleet_state_path)
+    # Issue #1899: the sentinel-resolved config (see _fleet_notify_config) so
+    # the probe and the consolidated emit below share the real digest path.
+    notify_config = _fleet_notify_config(global_config)
+    if notify_config is not None and getattr(notify_config, "enabled", False):
+        check_notify_digest_freshness(notify_config, fleet_state_path)
 
     # Issue #1372: stale registry entries (repo_root no longer exists) are
     # collected during the pass for prune-after-grace processing. They are
@@ -2244,7 +2273,9 @@ def fleet_loop(
 
     # Call the notifier digest sink exactly once per fleet pass, via the real
     # #166 notify.py implementation (AttentionDigest + emit_digest).
-    notify_config = getattr(global_config, "notify", None) if global_config else None
+    # ``notify_config`` is the sentinel-resolved binding from the pass top
+    # (issue #1899), so the file sink lands rather than failing
+    # "file_path is empty" under the documented default.
     digest: dict[str, Any] = {
         "events": attention_events,
         "count": len(attention_events),
@@ -2764,6 +2795,14 @@ def run_fleet_supervise(
         describe_config_file(global_config_path),
     )
 
+    # Issue #1899: resolve the notify.file_path "" sentinel against the
+    # supervisor's own bookkeeping root (see _fleet_notify_config) before
+    # anything consumes it -- the raw layered value is the "derive from
+    # runtime.state_dir" sentinel, so without this the report below flags
+    # the documented default as misconfigured and every fleet-level emit
+    # fails "file_path is empty".
+    notify_config = _fleet_notify_config(global_config)
+
     # Issue #1859: publish the resolved notify sink once per supervisor
     # start, next to the global-layer provenance line -- a lost ``notify:``
     # section otherwise degrades the whole pipeline to silence with no
@@ -2772,7 +2811,7 @@ def run_fleet_supervise(
     # digest path this daemon anchored) is a consumed signal, not a
     # write-only log line.
     report_notify_resolution(
-        getattr(global_config, "notify", None),
+        notify_config,
         global_config_path,
         layout.state_file_path(fleet_dir(override=fleet_dir_override)),
     )
@@ -2869,7 +2908,8 @@ def run_fleet_supervise(
     # prior supervisor is gone, so a stale heartbeat with no ``exited_at`` here
     # means the prior one was killed — emit a retroactive supervisor_exited and
     # alert on it before this supervisor records its own start.
-    notify_config = getattr(global_config, "notify", None)
+    # ``notify_config`` is the sentinel-resolved binding from startup
+    # (issue #1899), shared by every _emit_fleet_transition site below.
     prior = detect_prior_abnormal_exit(fleet_dir_override)
     if prior is not None:
         record_prior_abnormal_exit(fleet_dir_override, prior)
@@ -3033,11 +3073,11 @@ def run_fleet_supervise(
                     dry_run=dry_run,
                     failure_alarm_threshold=cfg.self_deploy_failure_alarm,
                     pull_ci_fleet=cfg.self_deploy_pull_ci_fleet,
+                    starvation_seconds=cfg.dependency_sync_starvation_seconds,
                 )
                 if not drain_state.draining
                 else None
             )
-            notify_config = getattr(global_config, "notify", None)
             notify_enabled = notify_config is not None and getattr(notify_config, "enabled", False)
             if deploy is not None and not deploy.ok:
                 print(
@@ -3071,6 +3111,18 @@ def run_fleet_supervise(
                 # (34/34 tracked keys were latched this way).
                 if deploy.synced or deploy.venv_repaired:
                     print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
+                # Issue #1855: a pending sync starved past
+                # ``dependency_sync_starvation_seconds`` takes the drain
+                # posture below -- fleet_loop launches nothing new while the
+                # reap/review/merge lanes keep running -- so live workers can
+                # finish and the deferred ``uv sync`` can finally land.
+                if deploy.starved:
+                    print(
+                        f"[{now_str}] self-deploy: {deploy.message}; starvation "
+                        "bound reached -- suppressing new dispatch until the "
+                        "fleet is idle",
+                        flush=True,
+                    )
                 if notify_enabled:
                     entry = AttentionEntry(
                         issue_number=-1,
@@ -3187,7 +3239,10 @@ def run_fleet_supervise(
                 ensure_labels=labels_ensure_pending,
                 # Issue #1716: a drain pass still runs reap/verdict/review/
                 # merge lanes but dispatches nothing new.
-                drain=drain_state.draining,
+                # Issue #1855: same posture while a pending sync is starved --
+                # derived per-pass from the marker's age (not latched), so it
+                # lifts automatically the pass the sync finally lands.
+                drain=drain_state.draining or (deploy is not None and deploy.starved),
                 # Issue #1832: cooperative in-pass deadline, enforced from the
                 # same SupervisorConfig field the external wedge-kill
                 # watchdog's stale bound derives from (3x this), and the same
