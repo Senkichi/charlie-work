@@ -1,6 +1,0 @@
-1000
-# Issue #1494 / PR #1926 rework: the launch-lane mixed-batch and
-# sidecar/state fingerprint-merge regression tests grew the file past the
-# 800 cap. Raised to the next MARK_QUANTUM multiple per the ratchet's
-# hand-raise rule; the alternative (a new test module) would duplicate the
-# reap lane fixture harness since test modules must not import each other.
