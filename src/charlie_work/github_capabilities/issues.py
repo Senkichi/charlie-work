@@ -255,21 +255,28 @@ class Issues(CapabilityCollaborator):
 
     def __init__(self, owner: GitHub) -> None:
         super().__init__(owner)
-        # Issue #1933 rework: edge-trigger baseline for the
+        # Issue #1933 rework: per-number edge baseline for the
         # ``github_issue_state_partial_fallback`` telemetry event -- the
-        # frozenset of issue numbers the most recent batch observation left
-        # unresolved (empty when no partial batch has been observed yet, or
-        # the last one resolved every number). Lives on the collaborator
-        # instance, NOT in ``_list_cache``: one GitHub/Issues pair lives for
-        # a whole supervisor process while ``_list_cache`` is cleared every
-        # pass (``repo_meta.invalidate_list_cache``), so cache-resident
-        # state could never dedupe the event across passes -- which is
-        # exactly the every-pass warning flood (a persistent stale blocker
-        # emitting one warning row per pass into ``check_warning_events``)
-        # the edge-trigger exists to close. A dunder like this one is
-        # excluded from ``github_delegation._routable_members``, so adding
-        # it changes neither ``_ROUTES`` nor ``GitHub``'s surface.
-        self._partial_fallback_signature: frozenset[int] = frozenset()
+        # set of issue numbers already reported as unresolved by a batch
+        # observation. A number leaves the set only when a later batch
+        # positively resolves it; an unrelated clean batch (one that never
+        # named the stale number) leaves the set untouched, so a persistent
+        # stale blocker fires once per GitHub-instance lifetime instead of
+        # once per pass. The earlier single-frozenset signature did reset on
+        # any unrelated clean batch, and with multiple are_issues_open
+        # calls per pass (github_ops_blockers prefetch, backlog_reachability
+        # per-issue, blocker_cycles) the same stale blocker refired every
+        # pass -- the every-pass warning flood (one row per pass into
+        # ``check_warning_events``) the edge-trigger exists to close.
+        # Lives on the collaborator instance, NOT in ``_list_cache``: one
+        # GitHub/Issues pair lives for a whole supervisor process while
+        # ``_list_cache`` is cleared every pass
+        # (``repo_meta.invalidate_list_cache``), so cache-resident state
+        # could never dedupe the event across passes. An instance attribute
+        # never lands in ``vars(Issues)`` -- ``github_delegation._routable_members``
+        # only yields class-level callables -- so adding it changes neither
+        # ``_ROUTES`` nor ``GitHub``'s surface.
+        self._partial_fallback_reported: set[int] = set()
 
     def issue_list(self, labels=None, state=None) -> list[dict[str, Any]]:
         # Normalize labels for caching and arg building; support legacy str signature.
@@ -385,14 +392,18 @@ class Issues(CapabilityCollaborator):
                     open_issues.add(number)
 
             unresolved = [number for number in uncached if number not in states]
-            if not unresolved:
-                if not batch_failed:
-                    # The batch resolved every uncached number this call, so
-                    # clear the edge baseline: a later recurrence of the same
-                    # unresolved set is a fresh edge, not a suppressed
-                    # repeat.
-                    self._partial_fallback_signature = frozenset()
-            else:
+            if not batch_failed:
+                # Per-number edge tracking: a number this batch positively
+                # resolved leaves the reported set, so a later re-stale of
+                # that number is a fresh edge. Numbers this batch never
+                # named leave the set untouched -- an unrelated clean batch
+                # must NOT reset the baseline (the round-1 review finding:
+                # with multiple are_issues_open calls per pass, clearing on
+                # any clean batch refired the same stale blocker every
+                # pass). Whole-batch failures neither emit nor disturb the
+                # set.
+                self._partial_fallback_reported.difference_update(states)
+            if unresolved:
                 if not batch_failed:
                     logger.warning(
                         "Batched issue state query did not resolve %d issue "
@@ -401,15 +412,14 @@ class Issues(CapabilityCollaborator):
                         len(unresolved),
                         unresolved,
                     )
-                    signature = frozenset(unresolved)
-                    if signature != self._partial_fallback_signature:
+                    if set(unresolved) - self._partial_fallback_reported:
                         # write-gate-exempt(issue=1933): GitHub client layer has no WriteGate; lock-free telemetry
                         log_event(
                             circuit_breaker_state_path(self.runtime, self.repo_root),
                             "github_issue_state_partial_fallback",
                             {"unresolved": unresolved, "requested": len(uncached)},
                         )
-                    self._partial_fallback_signature = signature
+                    self._partial_fallback_reported.update(unresolved)
 
                 # Fallback to the previous parallel per-issue view fetch.
                 def _fetch_state(number: int) -> tuple[int, bool]:

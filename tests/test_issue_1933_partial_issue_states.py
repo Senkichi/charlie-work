@@ -22,7 +22,11 @@ The fix has three seams, each covered below:
   resolved aliases map normally; aliases with a null node are absent from
   the result.
 * ``Issues.are_issues_open`` runs its per-issue ``issue_view`` fallback only
-  over numbers absent from the batched result.
+  over numbers absent from the batched result, and emits
+  ``github_issue_state_partial_fallback`` once per newly-unresolved number
+  per GitHub-instance lifetime: a number leaves the tracked set only when a
+  later batch positively resolves it, so an unrelated clean batch cannot
+  reset the baseline and whole-batch failures neither emit nor disturb it.
 
 No live network anywhere: the HTTP transport's ``HTTPSConnection`` is faked
 (the same stand-in shape as ``tests/test_http_transport.py``) and the ``gh``
@@ -265,13 +269,21 @@ def test_are_issues_open_emits_telemetry_for_partial_batch_fallback(
     and how large the requested set was. Whole-batch failures (the pre-#1933
     path) keep their existing log-line-only behavior.
 
-    Edge-triggered (rework): the event fires once per *distinct* unresolved
-    set, not once per batch observation. A persistent stale blocker would
-    otherwise write a warning row every orchestrator pass (the pass-scoped
-    ``_list_cache`` is cleared but the signature state is not), flooding
-    ``check_warning_events``' flat per-event listing -- the every-pass
-    warning flood shape #1271/#1768 already burned once. A *changed*
-    unresolved set is a new edge and still fires.
+    Edge-triggered per number (rework): the event fires once per
+    *newly-unresolved* issue number per GitHub-instance lifetime, not once
+    per batch observation. The emitter tracks numbers already reported; a
+    reported number leaves the tracked set only when a later batch
+    positively resolves it -- an unrelated clean batch must NOT reset the
+    baseline (the multi-call-per-pass flood the round-1 review caught). A
+    persistent stale blocker would otherwise write a warning row every
+    orchestrator pass (the pass-scoped ``_list_cache`` is cleared but the
+    tracked set is not), flooding ``check_warning_events``' flat per-event
+    listing -- the every-pass warning flood shape #1271/#1768 already
+    burned once. A newly-stale number joining an already-reported set is a
+    new edge and still fires. Short-lived processes such as
+    ``fleet status --json`` still emit once per invocation: their GitHub
+    instance does not outlive the run, so there is nothing to dedupe
+    against.
     """
     from charlie_work.github_capabilities import issues as issues_module
 
@@ -329,6 +341,149 @@ def test_are_issues_open_emits_telemetry_for_partial_batch_fallback(
         {"unresolved": [361], "requested": 2},
         {"unresolved": [361, 400], "requested": 3},
     ]
+
+
+def _telemetry_harness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Shared seam for the multi-call edge-trigger tests: a controllable
+    ``_graphql_issue_states`` (``resolvable`` is the set of numbers the
+    batch can resolve; ``batch_broken`` simulates a whole-query failure),
+    a ``run`` that answers ``issue view`` with a state per number, and a
+    captured ``log_event``. Returns (gh, knobs, issue_view_calls,
+    events, new_pass)."""
+    from charlie_work.github_capabilities import issues as issues_module
+
+    gh = GitHub(tmp_path)
+    knobs = {
+        "resolvable": {1: True, 7: True, 8: True, 9: True},
+        "batch_broken": False,
+        "view_states": {1: "OPEN"},
+    }
+    issue_view_calls: list[int] = []
+    events: list[tuple[str, dict]] = []
+
+    def fake_log_event(state_path, kind, payload, **kwargs):
+        events.append((kind, payload))
+
+    def fake_states(self, issue_numbers):
+        if knobs["batch_broken"]:
+            raise GitHubError("batched state query failed")
+        resolvable: dict[int, bool] = knobs["resolvable"]
+        return {n: resolvable[n] for n in issue_numbers if n in resolvable}
+
+    def fake_run(self, args, *, json_output=False, allow_failure=False, long_call=False):
+        assert args[:2] == ["issue", "view"]
+        number = int(args[2])
+        issue_view_calls.append(number)
+        return {"number": number, "state": knobs["view_states"].get(number, "CLOSED")}
+
+    def new_pass() -> None:
+        # Orchestrator pass boundary: the pass-scoped list cache is
+        # cleared (repo_meta.invalidate_list_cache) while the same
+        # GitHub/Issues pair -- and its reported-numbers set -- survives.
+        gh._list_cache.clear()
+        gh._list_cache[("_repo_owner_name",)] = ("o", "r")
+
+    monkeypatch.setattr(GitHub, "_graphql_issue_states", fake_states)
+    monkeypatch.setattr(GitHub, "run", fake_run)
+    monkeypatch.setattr(issues_module, "log_event", fake_log_event)
+    new_pass()
+    return gh, knobs, issue_view_calls, events, new_pass
+
+
+def _partial_events(events: list[tuple[str, dict]]) -> list[dict]:
+    return [p for k, p in events if k == "github_issue_state_partial_fallback"]
+
+
+def test_unrelated_clean_batch_cannot_clear_reported_numbers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The round-1 blocker shape: multiple are_issues_open calls per pass.
+    A second call over OTHER uncached numbers that all resolve must not
+    reset the baseline -- the retired single-frozenset signature cleared
+    here and refired the same stale blocker every pass."""
+    gh, knobs, _calls, events, new_pass = _telemetry_harness(monkeypatch, tmp_path)
+
+    for _ in range(4):
+        new_pass()
+        assert gh.are_issues_open([1, 361]) == {1}
+        assert gh.are_issues_open([7, 8, 9]) == {7, 8, 9}
+
+    assert _partial_events(events) == [{"unresolved": [361], "requested": 2}]
+
+
+def test_cached_stale_number_plus_new_number_keeps_single_edge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A same-pass second call re-including the stale number (now cached by
+    the per-issue fallback) plus one new resolvable number produces a clean
+    batch for the uncached remainder -- still not a baseline reset."""
+    gh, knobs, _calls, events, new_pass = _telemetry_harness(monkeypatch, tmp_path)
+
+    for _ in range(4):
+        new_pass()
+        assert gh.are_issues_open([1, 361]) == {1}
+        # 361 is cached (closed, per the fallback's issue_view); 8 joins
+        # the batch and resolves cleanly.
+        assert gh.are_issues_open([361, 8]) == {8}
+
+    assert _partial_events(events) == [{"unresolved": [361], "requested": 2}]
+
+
+def test_resolved_then_restale_number_fires_fresh_edge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A reported number that a later batch positively resolves leaves the
+    tracked set; if it goes stale again afterwards that is a new edge and
+    the event refires."""
+    gh, knobs, _calls, events, new_pass = _telemetry_harness(monkeypatch, tmp_path)
+    resolvable: dict[int, bool] = knobs["resolvable"]
+
+    assert gh.are_issues_open([1, 361]) == {1}
+    assert _partial_events(events) == [{"unresolved": [361], "requested": 2}]
+
+    # A later pass resolves 361 in the batch itself: it drops out of the
+    # tracked set (and this batch emits nothing).
+    resolvable[361] = True
+    new_pass()
+    assert gh.are_issues_open([1, 361]) == {1, 361}
+    assert _partial_events(events) == [{"unresolved": [361], "requested": 2}]
+
+    # 361 goes stale again: a fresh edge, so it fires a second time.
+    del resolvable[361]
+    new_pass()
+    assert gh.are_issues_open([1, 361]) == {1}
+    assert _partial_events(events) == [
+        {"unresolved": [361], "requested": 2},
+        {"unresolved": [361], "requested": 2},
+    ]
+
+
+def test_whole_batch_failure_neither_emits_nor_disturbs_tracked_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A batch failure with no usable data emits no telemetry event and
+    leaves the reported-numbers set alone: afterwards the already-reported
+    stale number is still deduped, not refired."""
+    gh, knobs, issue_view_calls, events, new_pass = _telemetry_harness(monkeypatch, tmp_path)
+
+    assert gh.are_issues_open([1, 361]) == {1}
+    assert _partial_events(events) == [{"unresolved": [361], "requested": 2}]
+    assert issue_view_calls == [361]
+
+    # Whole-batch failure pass: no event, per-issue fallback covers every
+    # uncached number (the pre-#1933 whole-set fallback contract).
+    knobs["batch_broken"] = True
+    new_pass()
+    assert gh.are_issues_open([1, 361]) == {1}
+    assert sorted(issue_view_calls[1:]) == [1, 361]
+    assert _partial_events(events) == [{"unresolved": [361], "requested": 2}]
+
+    # Recovery pass: the same stale number was already reported and the
+    # failure did not disturb that, so still no new event.
+    knobs["batch_broken"] = False
+    new_pass()
+    assert gh.are_issues_open([1, 361]) == {1}
+    assert _partial_events(events) == [{"unresolved": [361], "requested": 2}]
 
 
 def test_are_issues_open_end_to_end_over_http_transport(
