@@ -250,7 +250,12 @@ def test_dispatch_survives_worker_census_failure(
 
     monkeypatch.setattr("charlie_work.workflow._log_worker_census", _boom)
 
-    with caplog.at_level(logging.WARNING, logger="charlie_work.workflow"):
+    # Scope to the package logger, never ``charlie_work.workflow``: Phase B
+    # delegate moves change the emitting ``__name__`` (the warning now comes
+    # from ``orchestration.reap_dispatch``), which leaves a module-level
+    # scope inert rather than failed -- see issue #1670 and the
+    # ``test_caplog_workflow_logger_scope.py`` guard.
+    with caplog.at_level(logging.WARNING, logger="charlie_work"):
         result = app.dispatch(limit=1)
 
     # dispatch() must not have raised: it returns a normal ok result and, more
