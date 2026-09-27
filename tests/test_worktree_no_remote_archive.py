@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from _worktree_fixtures import _clone_repo, _git, _init_repo
+from _worktree_fixtures import _wt_scratch as _register_wt_scratch  # noqa: F401 -- registers the wt_scratch fixture: worker sandboxes redirect TEMP/TMPDIR deep inside the checkout, where tmp_path-derived repo roots overrun git's internal worktree-path buffer (``git worktree add`` exits 128)
 from charlie_work.config import DispatchConfig, OrchestratorConfig
 from charlie_work.instrumentation import query_events
 from charlie_work.worktree import WorktreeUnsafeError, create_worktree, remove_worktree
@@ -60,7 +61,7 @@ def _today() -> str:
     return datetime.now(UTC).strftime("%Y%m%d")
 
 
-def test_no_remote_diverged_branch_is_archived_and_recreated(tmp_path: Path) -> None:
+def test_no_remote_diverged_branch_is_archived_and_recreated(wt_scratch: Path) -> None:
     """Spec AC 1: a no-remote repo with a diverged agent branch gets an
     archive ref at the old tip plus a fresh branch — no escalation.
 
@@ -68,7 +69,7 @@ def test_no_remote_diverged_branch_is_archived_and_recreated(tmp_path: Path) -> 
     worktree is gone, only the diverged branch remains, and the requeued
     issue hits fresh dispatch.
     """
-    repo_root = tmp_path / "repo"
+    repo_root = wt_scratch / "repo"
     _init_repo(repo_root)  # no origin remote
     branch = "agent/issue-144-example"
     main_tip = _git(repo_root, "rev-parse", "main").stdout.strip()
@@ -93,12 +94,12 @@ def test_no_remote_diverged_branch_is_archived_and_recreated(tmp_path: Path) -> 
 
 
 def test_no_remote_diverged_worktree_present_is_archived_and_pruned(
-    tmp_path: Path,
+    wt_scratch: Path,
 ) -> None:
     """Same as above but the worker's worktree directory is still present
     (clean tree, diverged commits): reclaim archives the tip, removes the
     stale worktree, and recreates at the base."""
-    repo_root = tmp_path / "repo"
+    repo_root = wt_scratch / "repo"
     _init_repo(repo_root)
     branch = "agent/issue-200-live-worktree"
     main_tip = _git(repo_root, "rev-parse", "main").stdout.strip()
@@ -115,10 +116,10 @@ def test_no_remote_diverged_worktree_present_is_archived_and_pruned(
     assert info2.path.exists()
 
 
-def test_no_remote_existing_identical_archive_ref_is_reused(tmp_path: Path) -> None:
+def test_no_remote_existing_identical_archive_ref_is_reused(wt_scratch: Path) -> None:
     """Spec: skip creating the archive ref when an identical one already
     exists — a second probe over the same tip must not mint a ``-2`` name."""
-    repo_root = tmp_path / "repo"
+    repo_root = wt_scratch / "repo"
     _init_repo(repo_root)
     branch = "agent/issue-201-idempotent"
     main_tip = _git(repo_root, "rev-parse", "main").stdout.strip()
@@ -140,10 +141,10 @@ def test_no_remote_existing_identical_archive_ref_is_reused(tmp_path: Path) -> N
     assert info2.path.exists()
 
 
-def test_no_remote_archive_name_collision_gets_suffix(tmp_path: Path) -> None:
+def test_no_remote_archive_name_collision_gets_suffix(wt_scratch: Path) -> None:
     """A same-named archive ref at a DIFFERENT tip must not be overwritten —
     the new archive takes a ``-2`` suffix instead."""
-    repo_root = tmp_path / "repo"
+    repo_root = wt_scratch / "repo"
     _init_repo(repo_root)
     branch = "agent/issue-202-collision"
     main_tip = _git(repo_root, "rev-parse", "main").stdout.strip()
@@ -164,9 +165,9 @@ def test_no_remote_archive_name_collision_gets_suffix(tmp_path: Path) -> None:
     }
 
 
-def test_no_remote_archive_kill_switch_off_still_refuses(tmp_path: Path) -> None:
+def test_no_remote_archive_kill_switch_off_still_refuses(wt_scratch: Path) -> None:
     """The config kill switch restores refuse-and-escalate when set false."""
-    repo_root = tmp_path / "repo"
+    repo_root = wt_scratch / "repo"
     _init_repo(repo_root)
     branch = "agent/issue-203-kill-switch"
 
@@ -186,12 +187,12 @@ def test_no_remote_archive_kill_switch_off_still_refuses(tmp_path: Path) -> None
     )
 
 
-def test_with_remote_unpushed_commits_still_refuses(tmp_path: Path) -> None:
+def test_with_remote_unpushed_commits_still_refuses(wt_scratch: Path) -> None:
     """Spec AC 2: a repo WITH an origin remote keeps refusing — unpushed
     commits there can be salvaged by a real push, so no archive shortcut."""
-    remote_repo = tmp_path / "remote"
+    remote_repo = wt_scratch / "remote"
     _init_repo(remote_repo)
-    repo_root = tmp_path / "repo"
+    repo_root = wt_scratch / "repo"
     _clone_repo(remote_repo, repo_root)
     branch = "agent/issue-204-remote"
     main_tip = _git(repo_root, "rev-parse", "main").stdout.strip()
@@ -209,10 +210,10 @@ def test_with_remote_unpushed_commits_still_refuses(tmp_path: Path) -> None:
     assert old_tip != main_tip
 
 
-def test_no_remote_archive_emits_event(tmp_path: Path) -> None:
+def test_no_remote_archive_emits_event(wt_scratch: Path) -> None:
     """The archive decision is recorded as ``worktree_local_commits_archived``
     with the branch, archive ref, and tip sha."""
-    repo_root = tmp_path / "repo"
+    repo_root = wt_scratch / "repo"
     _init_repo(repo_root)
     branch = "agent/issue-205-event"
 

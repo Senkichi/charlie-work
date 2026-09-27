@@ -31,15 +31,58 @@ byte-identical ``_git`` for the same reason as ``test_reconcile.py``.
 cross-test-module import guard (``tests/test_zero_cross_test_import_guard.py``,
 issue #1284) forbids a ``test_*.py -> test_*.py`` import, so the fake lives
 here where both test modules can reach it.
+
+``wt_scratch`` joined under #1944: worker sandboxes redirect
+``TEMP``/``TMPDIR`` deep inside the checkout, where pytest's ``tmp_path``
+overruns git's internal worktree-path buffer and ``git worktree add``
+exits 128. Tests that create real linked worktrees use this fixture
+instead of ``tmp_path`` for their repo roots.
 """
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
+
+import pytest
 
 from charlie_work.github import GitHubRunResult
 from charlie_work.worktree import WorktreeCleanGH, create_worktree
+
+
+# Explicit fixture name: importing modules bring the (private) symbol into
+# their namespace so pytest registers ``wt_scratch`` there — a public
+# function name would collide with the fixture parameter in test
+# signatures (ruff F811).
+@pytest.fixture(name="wt_scratch")
+def _wt_scratch() -> Iterator[Path]:
+    """Per-test scratch dir shallow enough for real ``git worktree`` ops.
+
+    Worker sandboxes redirect ``TEMP``/``TMPDIR`` deep inside the checkout
+    (``.var/worker-tmp`` under the worktree), and pytest's ``tmp_path``
+    inherits that depth — past ~225 chars ``git worktree add`` exits 128
+    with a ``$GIT_DIR``-sized buffer failure even with ``core.longpaths``
+    on. ``%LOCALAPPDATA%\\Temp`` is not redirected, so anchoring there
+    stays shallow on Windows; on POSIX ``tempfile.gettempdir()`` is
+    already short, and ``min()`` by path length picks the shallowest
+    either way.
+    """
+    roots = []
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        roots.append(Path(local_appdata) / "Temp")
+    roots.append(Path(tempfile.gettempdir()))
+    root = min(roots, key=lambda p: len(str(p))) / "charlie-wt-scratch"
+    root.mkdir(parents=True, exist_ok=True)
+    scratch = Path(tempfile.mkdtemp(prefix="wt-", dir=root))
+    try:
+        yield scratch
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
