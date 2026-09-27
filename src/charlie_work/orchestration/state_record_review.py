@@ -313,6 +313,25 @@ def record_review(
         if diff:
             reviewed_signature = _wf._diff_content_signature(diff)
 
+    # Issue #1939: stamp a hash of the PR body the reviewer read alongside
+    # reviewed_patch_id. A request_changes finding whose required fix lives
+    # in the PR description produces no code delta, so the janitor's
+    # no-op-rework gate compares the live body against this baseline to
+    # tell a body-only rework apart from a genuine no-op. Same source rule
+    # as reviewed_head_sha/reviewed_patch_id above: the packet's pr.json
+    # when the verdict is pinned to the packet, the live PR body otherwise
+    # (a body edit landing between packet generation and verdict recording
+    # is content the reviewer has not seen and must NOT be stamped as
+    # reviewed). "" when neither source yields a body -- the gate fails
+    # closed on a missing baseline, preserving the pre-#1939 behavior.
+    packet_body = self._read_packet_body(pr_number) if reviewed_head_source == "packet" else None
+    if packet_body is not None:
+        reviewed_body_sha256 = _wf._body_content_sha256(packet_body)
+    elif isinstance(pr, dict) and "body" in pr:
+        reviewed_body_sha256 = _wf._body_content_sha256(pr.get("body"))
+    else:
+        reviewed_body_sha256 = ""
+
     # Issue #950 / #998: fold non-bot findings from the PR's own external
     # review surfaces into the verdict at write time. This is a live fetch
     # at record_review time, not at render time, so _render_rework_prompt
@@ -403,6 +422,7 @@ def record_review(
         "reviewed_head_sha": reviewed_head_sha,
         "reviewed_head_source": reviewed_head_source,
         "reviewed_patch_id": reviewed_patch_id,
+        "reviewed_body_sha256": reviewed_body_sha256,
         "reviewed_changed_lines": list(reviewed_signature.changed_lines),
         "reviewed_changed_files": sorted(reviewed_signature.changed_files),
         "reviewed_has_binary": reviewed_signature.has_binary,
@@ -623,6 +643,7 @@ def record_review(
             "decision_path": str(decision_path),
             "reviewed_head_sha": reviewed_head_sha,
             "reviewed_patch_id": reviewed_patch_id,
+            "reviewed_body_sha256": reviewed_body_sha256,
             "carried_forward_from": [],
             "request_changes_count": request_changes_count,
             "status": "escalated" if escalated else decision,

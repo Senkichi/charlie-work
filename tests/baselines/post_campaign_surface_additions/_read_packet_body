@@ -1,0 +1,7 @@
+issue #1939: reads the body stored in the review packet's pr.json so
+record_review can stamp reviewed_body_sha256 -- the baseline the janitor's
+no-op-rework gate compares the live PR body against to recognise a
+body-only rework. Net-new OrchestratorApp member added after the Track 2
+Phase B surface baseline was pinned; declared here so the member-surface
+conservation check in tests/test_workflow_delegation_l00.py subtracts it
+before comparing moved delegates against the pre-campaign total (133).
