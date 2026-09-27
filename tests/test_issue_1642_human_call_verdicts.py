@@ -432,7 +432,7 @@ def test_example_configs_load_with_default_markers() -> None:
         "orchestrator.config.claude-code.yaml",
     ):
         cfg = load_config(_EXAMPLES_DIR / name)
-        assert "operator" in cfg.review.human_decision_markers
+        assert "human call" in cfg.review.human_decision_markers
         assert "not automated rework" in cfg.review.human_decision_markers
 
 
