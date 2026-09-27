@@ -40,7 +40,6 @@ from .experiment_report_command import (
 from .config import ConfigError, OrchestratorConfig, find_config_path
 from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import (
-    compute_api_worker_fleet_report,
     fleet_loop,
     run_allocation_pass_with_ci_fleet_guard,
     run_fleet_supervise,
@@ -53,6 +52,10 @@ from .supervise_loop import (
 )
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
+from .fleet_status import (  # noqa: F401  (deliberate re-export)
+    FLEET_STATUS_REPO_TIMEOUT_SECONDS,
+    run_fleet_status,
+)
 from .fleet_stop import register_fleet_stop_subparser, run_fleet_stop
 from .global_config import load_layered_config
 from .github import (
@@ -1412,63 +1415,6 @@ def run_fleet_supervise_command(args: argparse.Namespace) -> CommandResult:
         dry_run=args.dry_run,
         poll_interval_override=args.poll_interval,
         max_runtime_override=args.max_runtime,
-    )
-
-
-def run_fleet_status(args: argparse.Namespace) -> CommandResult:
-    """Run fleet status aggregation across all registered repos.
-
-    This is a read-only command that:
-    - Loads the fleet registry from fleet.json
-    - For each registered repo, calls OrchestratorApp.status() with dry_run=True
-    - Aggregates results keyed by repo_key (nameWithOwner)
-    - Isolates per-repo errors (missing/broken repos) without aborting the whole aggregation
-
-    Note: This command does not include per-worker health fields yet. That will be added
-    in a follow-up issue (#167) once the worker health abstraction lands.
-    """
-    fleet_json_path = layout.fleet_registry_path()
-    registry = _load_registry(fleet_json_path)
-    per_repo: dict[str, Any] = {}
-    errors: list[dict[str, str]] = []
-    # Issue #1372: stale entries (repo_root no longer exists) are reported in a
-    # separate "stale" list that does NOT flip ok/exit-code, so one corpse
-    # cannot degrade fleet-wide tooling (e.g. the heartbeat's blocked-issue
-    # enrichment that treats any nonzero exit as degraded).
-    stale: list[dict[str, str]] = []
-
-    for repo_key, entry in sorted(registry.get("repos", {}).items()):
-        try:
-            repo_root = Path(entry.get("repo_root") or "")
-            if not repo_root.exists():
-                # Issue #1372: a stale entry is not a live failing lane —
-                # report it separately so it does not affect the exit code.
-                stale.append({"repo_key": repo_key, "repo_root": str(repo_root)})
-                continue
-
-            config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
-            paths = runtime_paths(repo_root, config.runtime.state_dir)
-            gh = github_client_for(repo_root, config, github=GitHub, dry_run=True)
-            app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
-            result = app.status(use_cache=not getattr(args, "no_cache", False))
-            per_repo[repo_key] = result.data
-        except (RepoNotFoundError, ConfigError, GitHubError, OSError) as exc:
-            errors.append({"repo_key": repo_key, "error": str(exc)})
-
-    # api-worker fleet report line (issue #483): read-only, never raises.
-    api_worker_report = compute_api_worker_fleet_report(fleet_dir_override=args.fleet_dir)
-
-    return CommandResult(
-        ok=not errors,
-        message=f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s), {len(stale)} stale(s)",
-        data={
-            "repos": per_repo,
-            "errors": errors,
-            "stale": stale,
-            "api_worker_report": api_worker_report.to_dict()
-            if api_worker_report is not None
-            else None,
-        },
     )
 
 

@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from charlie_work import cli
+from charlie_work import cli, fleet_status
 from charlie_work.fleet_dispatch import ApiWorkerFleetReport
 from charlie_work.workflow import CommandResult
 
@@ -94,7 +94,7 @@ def test_run_fleet_status_threads_api_worker_report_into_data(
     function isolates the threading from the standalone-function coverage.
     """
     report = _sample_api_worker_report()
-    monkeypatch.setattr(cli, "compute_api_worker_fleet_report", lambda **_k: report)
+    monkeypatch.setattr(fleet_status, "compute_api_worker_fleet_report", lambda **_k: report)
 
     args = cli.build_parser().parse_args(["fleet", "status"])
     result = cli.run_fleet_status(args)
@@ -109,7 +109,7 @@ def test_run_fleet_status_api_worker_report_none_when_unconfigured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When no repo configures the section, api_worker_report is None (line omitted)."""
-    monkeypatch.setattr(cli, "compute_api_worker_fleet_report", lambda **_k: None)
+    monkeypatch.setattr(fleet_status, "compute_api_worker_fleet_report", lambda **_k: None)
 
     args = cli.build_parser().parse_args(["fleet", "status"])
     result = cli.run_fleet_status(args)
@@ -129,7 +129,7 @@ def test_cli_fleet_status_main_renders_api_worker_line(
     per-repo status lines are printed, so the api-worker line is isolated.
     """
     report = _sample_api_worker_report()
-    monkeypatch.setattr(cli, "compute_api_worker_fleet_report", lambda **_k: report)
+    monkeypatch.setattr(fleet_status, "compute_api_worker_fleet_report", lambda **_k: report)
 
     rc = cli.main(["fleet", "status"])
     assert rc == 0
@@ -144,7 +144,7 @@ def test_cli_fleet_status_main_omits_line_when_unconfigured(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """End-to-end: `charlie fleet status` prints no api-worker line when unconfigured."""
-    monkeypatch.setattr(cli, "compute_api_worker_fleet_report", lambda **_k: None)
+    monkeypatch.setattr(fleet_status, "compute_api_worker_fleet_report", lambda **_k: None)
 
     rc = cli.main(["fleet", "status"])
     assert rc == 0
