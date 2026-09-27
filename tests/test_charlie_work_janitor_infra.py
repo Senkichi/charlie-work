@@ -10,11 +10,11 @@ import json
 from pathlib import Path
 
 from _review_fixtures import _required_checks_config
-from charlie_work.paths import runtime_paths
-from charlie_work.state import load_state
+from charlie_work.paths import RuntimePaths, runtime_paths
+from charlie_work.state import load_state, save_state
 from charlie_work.workflow import OrchestratorApp
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
-from _fakes_github import FakeGitHubWithRerunCapture
+from _fakes_github_rerun import FakeGitHubWithRerunCapture
 
 
 def test_janitor_required_check_rerun_api_error_falls_through_to_rework(tmp_path: Path) -> None:
@@ -271,6 +271,14 @@ def _already_running_error() -> str:
     return json.loads(fixture.read_text(encoding="utf-8"))["error"]
 
 
+def _deferred_marker(paths: RuntimePaths) -> dict:
+    """PR #456's persisted ``infra_rerun_deferred`` map (empty when absent)."""
+    return (
+        load_state(paths.state_file).get("prs", {}).get("456", {}).get("infra_rerun_deferred")
+        or {}
+    )
+
+
 def test_janitor_infra_rerun_refused_already_running_defers_then_follows_up_on_terminal(
     tmp_path: Path,
 ) -> None:
@@ -458,3 +466,189 @@ def test_janitor_infra_rerun_deferred_probe_failure_fails_open_to_rerun(
     assert len(fake_gh.workflow_runs_calls) == 1
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["infra_rerun_deferred"] == {"sha-abc123": [12345]}
+
+
+def test_janitor_infra_rerun_mixed_defer_and_dispatch_unwinds_skipped_attempt(
+    tmp_path: Path,
+) -> None:
+    """Issue #1936 review follow-up: on a mixed pass -- one eligible run id
+    still deferred (probe: in progress) and a second dispatched -- the
+    deferred run's pre-incremented counter must be unwound before
+    ``infra_rerun_attempts`` is persisted. The attempt is spent only when
+    ``gh run rerun`` is actually called; persisting the classifier's map
+    unmodified would burn an attempt the skipped run never used and pull
+    its cap-escalation one dispatch early."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithRerunCapture(
+        checks=[
+            {
+                "name": "Tests passed",
+                "state": "CANCELLED",
+                "link": "https://github.com/owner/repo/actions/runs/12345/job/67890",
+            },
+            {
+                "name": "Lint & Format",
+                "state": "CANCELLED",
+                "link": "https://github.com/owner/repo/actions/runs/67890/job/11111",
+            },
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        workflow_runs=[{"id": 12345, "status": "in_progress", "conclusion": None}],
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {
+        # Run 12345 was refused "already running" on an earlier pass and
+        # has one genuinely-dispatched rerun already spent.
+        "infra_rerun_deferred": {"sha-abc123": [12345]},
+        "infra_rerun_attempts": {"sha-abc123": {"Tests passed": {"12345": 1}}},
+    }
+    save_state(paths.state_file, state)
+
+    # Pass 1: 12345 stays deferred (probe: in progress); 67890 dispatches.
+    result = app.review(456)
+
+    assert result.ok is False
+    assert fake_gh.rerun_calls == [["run", "rerun", "67890"]]
+    assert fake_gh.workflow_runs_calls == ["sha-abc123"]
+    state = load_state(paths.state_file)
+    # The skipped run's counter is unchanged -- exactly where its last real
+    # dispatch left it -- while the dispatched run consumed its attempt.
+    assert state["prs"]["456"]["infra_rerun_attempts"] == {
+        "sha-abc123": {
+            "Tests passed": {"12345": 1},
+            "Lint & Format": {"67890": 1},
+        }
+    }
+    assert state["prs"]["456"]["infra_rerun_deferred"] == {"sha-abc123": [12345]}
+
+    # Pass 2: 12345 terminal -> the follow-up fires (attempt 2 of 2);
+    # 67890 is still eligible and dispatches its second (capped) attempt.
+    fake_gh.workflow_runs = [{"id": 12345, "status": "completed", "conclusion": "cancelled"}]
+    result = app.review(456)
+
+    assert result.data.get("infra_rerun_run_ids") == [12345, 67890]
+    assert result.data.get("infra_escalated") is not True
+    assert fake_gh.rerun_calls[-2:] == [
+        ["run", "rerun", "12345"],
+        ["run", "rerun", "67890"],
+    ]
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["infra_rerun_attempts"] == {
+        "sha-abc123": {
+            "Tests passed": {"12345": 2},
+            "Lint & Format": {"67890": 2},
+        }
+    }
+
+    # Pass 3: cap now genuinely exhausted on both runs -> escalate.
+    result = app.review(456)
+    assert result.data.get("infra_escalated") is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["escalation_reason"] == "infra_rerun_cap_exceeded"
+
+
+def test_janitor_infra_rerun_deferred_absent_from_probe_fails_open(
+    tmp_path: Path,
+) -> None:
+    """A ``workflow_runs_for_head`` response that omits the deferred run id
+    (paging, a stale listing, an eventual-consistency gap) must fail open
+    to the ``gh run rerun`` call rather than waiting forever -- the call
+    re-defers on a live "already running" refusal."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithRerunCapture(
+        checks=list(_CANCELLED_CHECKS),
+        rerun_ok=False,
+        rerun_error=_already_running_error(),
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pass 1: refused -> deferred.
+    app.review(456)
+    assert _deferred_marker(paths) == {"sha-abc123": [12345]}
+
+    # Pass 2: the probe answers but does not list run 12345 -> fail open ->
+    # the rerun call fires and is refused again -> stays deferred.
+    fake_gh.workflow_runs = [{"id": 99999, "status": "in_progress", "conclusion": None}]
+    result = app.review(456)
+
+    assert result.ok is False
+    assert fake_gh.rerun_calls == [["run", "rerun", "12345"]] * 2
+    assert fake_gh.workflow_runs_calls == ["sha-abc123"]
+    assert _deferred_marker(paths) == {"sha-abc123": [12345]}
+
+
+def test_janitor_infra_rerun_deferred_marker_for_old_head_does_not_defer(
+    tmp_path: Path,
+) -> None:
+    """The deferred marker is per-head: a run id parked under a superseded
+    head SHA must not defer the rerun on the live head -- the marker is
+    only consulted for the current head's id set, and the pass dispatches
+    directly without probing."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithRerunCapture(checks=list(_CANCELLED_CHECKS))
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {
+        "infra_rerun_deferred": {"sha-superseded": [12345]},
+    }
+    save_state(paths.state_file, state)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    assert result.data.get("infra_rerun_run_ids") == [12345]
+    assert fake_gh.rerun_calls == [["run", "rerun", "12345"]]
+    # No probe: nothing is deferred under the live head.
+    assert fake_gh.workflow_runs_calls == []
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["infra_rerun_attempts"] == {
+        "sha-abc123": {"Tests passed": {"12345": 1}}
+    }
+    # The stale old-head entry is replaced wholesale on the next write.
+    assert state["prs"]["456"]["infra_rerun_deferred"] == {}
+
+
+def test_janitor_infra_rerun_quiet_pass_prunes_stale_deferred_ids(
+    tmp_path: Path,
+) -> None:
+    """A quiet wait pass prunes deferred ids that left eligibility since
+    the marker was written (their check healed): the persisted
+    ``infra_rerun_deferred`` set is exactly the live wait list, so a
+    stale id cannot linger in state after its check recovered."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithRerunCapture(
+        checks=[
+            {
+                "name": "Tests passed",
+                "state": "CANCELLED",
+                "link": "https://github.com/owner/repo/actions/runs/12345/job/67890",
+            },
+            # Lint & Format healed between passes -- run 67890 is no
+            # longer infra-failed, so it is not eligible this pass.
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        workflow_runs=[{"id": 12345, "status": "in_progress", "conclusion": None}],
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {
+        "infra_rerun_deferred": {"sha-abc123": [12345, 67890]},
+    }
+    save_state(paths.state_file, state)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    assert result.data.get("already_running") is True
+    assert result.data.get("infra_rerun_deferred_run_ids") == [12345]
+    assert fake_gh.rerun_calls == []
+    state = load_state(paths.state_file)
+    # Run 67890's check healed -- the quiet pass pruned it from the marker.
+    assert state["prs"]["456"]["infra_rerun_deferred"] == {"sha-abc123": [12345]}
+    assert not [e for e in state.get("events", []) if e["kind"] == "infra_rerun_failed"]

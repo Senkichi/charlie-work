@@ -30,6 +30,7 @@ from charlie_work.checks import (
 from charlie_work.janitor import (
     DiffContentSignature,
     _diff_content_signature,
+    _unwind_skipped_rerun_attempts,
     is_stale_ci_verdict,
     required_check_citation_names,
 )
@@ -410,7 +411,11 @@ def _drive_infra_rerun_or_escalate(
     nothing else dispatched, the driver returns a deferral ``CommandResult``
     so the pass does not bookkeep a blocked/escalated episode it cannot
     yet resolve -- mirroring the #992 flake-lane deferral. The normal
-    attempt is not consumed by the refusal itself.
+    attempt is not consumed by the refusal itself, and because
+    ``classify_infra_failures`` pre-increments every eligible run id, a
+    still-deferred id's increment is unwound before the attempts map is
+    persisted -- the bounded attempt is spent only by an actual
+    ``gh run rerun`` call.
 
     Returns the ``CommandResult`` the caller should return early when a
     rerun was dispatched, the pass deferred on a still-running workflow,
@@ -429,6 +434,7 @@ def _drive_infra_rerun_or_escalate(
     new_deferred: set[int] = set()
     deferred_for_head: set[int] = set()
     head_key = str(head_sha or "")
+    persisted_attempts = infra_rerun_attempts
     if rerun_run_ids:
         # Issue #1936: run ids refused "already running" on an earlier
         # pass live in this head's ``infra_rerun_deferred`` set. They are
@@ -486,6 +492,14 @@ def _drive_infra_rerun_or_escalate(
                     f"unexpected result from gh run rerun {run_id}: {result!r}"
                 )
         new_deferred = still_deferred | newly_deferred
+        # Issue #1936: classify_infra_failures pre-incremented every
+        # eligible run id, including any this pass deferred without
+        # dispatching. Persist the map with those unwound so a skipped
+        # run's counter stays exactly where its last real dispatch left
+        # it -- the attempt is spent only when `gh run rerun` is called.
+        persisted_attempts = _unwind_skipped_rerun_attempts(
+            infra_rerun_attempts, head_key, still_deferred
+        )
 
         if infra_triggered_run_ids and not infra_rerun_errors:
             with _wf.state_lock(self.paths.state_file):
@@ -494,7 +508,7 @@ def _drive_infra_rerun_or_escalate(
                     **state["prs"].get(str(pr_number), {}),
                     "number": pr_number,
                     "issue_number": issue_number,
-                    "infra_rerun_attempts": infra_rerun_attempts,
+                    "infra_rerun_attempts": persisted_attempts,
                     "infra_rerun_deferred": (
                         {head_key: sorted(new_deferred)} if new_deferred else {}
                     ),
@@ -564,7 +578,7 @@ def _drive_infra_rerun_or_escalate(
                 reason="infra_rerun_cap_exceeded",
                 reason_class="mechanical",
                 pr_number=pr_number,
-                pr_extra={"infra_rerun_attempts": infra_rerun_attempts},
+                pr_extra={"infra_rerun_attempts": persisted_attempts},
             )
             state = self._record_event(
                 state,

@@ -24,7 +24,7 @@ import json
 from pathlib import Path
 
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
-from _fakes_github import FakeGitHubWithRerunCapture
+from _fakes_github_rerun import FakeGitHubWithRerunCapture
 from _review_fixtures import _required_checks_config
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
