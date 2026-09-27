@@ -783,6 +783,12 @@ def detect_mergequeue_not_approved(
             continue
         if mergequeue_label not in label_names(pr):
             continue
+        # Fleet-owned PRs only: a non-prefix branch never gets a fleet
+        # review-decision.json, so the operator's own ``mergequeue`` label
+        # there IS the approval -- revoking it only ever undid operator
+        # queueing (and closed the Aviator draft batching it).
+        if not str(pr.get("headRefName") or "").startswith(config.dispatch.branch_prefix):
+            continue
         pr_number = pr.get("number")
         head_sha = pr.get("headRefOid")
         if pr_number is None or not head_sha:
