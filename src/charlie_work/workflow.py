@@ -217,6 +217,7 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
     _select_review_dispatch_candidates,
 )
 from .no_op_checkpoint import _paired_death_count  # noqa: F401  (deliberate re-export)
+from .no_op_rework_body import _body_content_sha256  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/state_record_review.py)
 from . import orchestration as _orchestration
 from .workflow_delegation import _install_delegates, discover_delegate_modules
 
