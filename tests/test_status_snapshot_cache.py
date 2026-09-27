@@ -459,20 +459,23 @@ def _write_fleet_registry_with_one_repo(tmp_path: Path) -> Path:
 
 @contextmanager
 def _mock_fleet_status_deps():
-    """Patch the cli-module deps ``run_fleet_status`` uses so it never touches
-    the filesystem or GitHub, and yield the mock ``OrchestratorApp`` instance
-    so the caller can inspect ``status.call_args``.
+    """Patch the fleet_status-module deps ``run_fleet_status`` uses so it
+    never touches the filesystem or GitHub, and yield the mock
+    ``OrchestratorApp`` instance so the caller can inspect
+    ``status.call_args``.
 
     Mirrors the patch surface in ``test_issue_1372_fleet_registry_stale.py``'s
     ``run_fleet_status`` test: ``load_layered_config``, ``runtime_paths``,
     ``GitHub``, ``OrchestratorApp``, ``compute_api_worker_fleet_report``.
+    The seam moved from ``cli`` to ``fleet_status`` when the fan-out was
+    extracted (#1941 rework); ``cli.run_fleet_status`` is a re-export.
     """
     with (
-        patch("charlie_work.cli.load_layered_config") as mock_cfg,
-        patch("charlie_work.cli.runtime_paths") as mock_paths,
-        patch("charlie_work.cli.GitHub") as mock_gh,
-        patch("charlie_work.cli.OrchestratorApp") as mock_app,
-        patch("charlie_work.cli.compute_api_worker_fleet_report") as mock_report,
+        patch("charlie_work.fleet_status.load_layered_config") as mock_cfg,
+        patch("charlie_work.fleet_status.runtime_paths") as mock_paths,
+        patch("charlie_work.fleet_status.GitHub") as mock_gh,
+        patch("charlie_work.fleet_status.OrchestratorApp") as mock_app,
+        patch("charlie_work.fleet_status.compute_api_worker_fleet_report") as mock_report,
     ):
         mock_cfg.return_value = OrchestratorConfig()
         mock_p = MagicMock()

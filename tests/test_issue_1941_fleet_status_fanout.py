@@ -28,7 +28,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from charlie_work import cli
+from charlie_work import cli, fleet_status
 from charlie_work.config import OrchestratorConfig
 from charlie_work.github import GitHubError
 from charlie_work.workflow import CommandResult
@@ -39,7 +39,7 @@ def _fleet_env(
     monkeypatch: pytest.MonkeyPatch,
     status_by_repo: dict[str, Callable[[], CommandResult]],
 ) -> None:
-    """Register repos in a fleet dir and stub the cli-module seams
+    """Register repos in a fleet dir and stub the fleet_status-module seams
     ``run_fleet_status`` uses so each repo's ``app.status()`` runs the
     supplied callable.
 
@@ -69,9 +69,9 @@ def _fleet_env(
 
     key_by_root = {entry["repo_root"]: key for key, entry in entries.items()}
 
-    monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: OrchestratorConfig())
-    monkeypatch.setattr(cli, "runtime_paths", lambda *a, **k: MagicMock())
-    monkeypatch.setattr(cli, "github_client_for", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(fleet_status, "load_layered_config", lambda *a, **k: OrchestratorConfig())
+    monkeypatch.setattr(fleet_status, "runtime_paths", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(fleet_status, "github_client_for", lambda *a, **k: MagicMock())
 
     def _app(repo_root: Path, *_args: object, **_kwargs: object) -> MagicMock:
         app = MagicMock()
@@ -79,8 +79,8 @@ def _fleet_env(
         app.status.side_effect = lambda **_kw: behavior()
         return app
 
-    monkeypatch.setattr(cli, "OrchestratorApp", _app)
-    monkeypatch.setattr(cli, "compute_api_worker_fleet_report", lambda *a, **k: None)
+    monkeypatch.setattr(fleet_status, "OrchestratorApp", _app)
+    monkeypatch.setattr(fleet_status, "compute_api_worker_fleet_report", lambda *a, **k: None)
 
 
 def _args() -> argparse.Namespace:
@@ -151,7 +151,7 @@ def test_fleet_status_repo_timeout_lands_in_stale_not_errors(
             "owner/wedged": _wedged,
         },
     )
-    monkeypatch.setattr(cli, "FLEET_STATUS_REPO_TIMEOUT_SECONDS", 0.5, raising=False)
+    monkeypatch.setattr(fleet_status, "FLEET_STATUS_REPO_TIMEOUT_SECONDS", 0.5)
 
     start = time.monotonic()
     result = cli.run_fleet_status(_args())
@@ -191,7 +191,7 @@ def test_fleet_status_timeout_does_not_starve_completed_repo(
             "owner/z-fast": lambda: CommandResult(True, "ok", {"repo": "owner/z-fast"}),
         },
     )
-    monkeypatch.setattr(cli, "FLEET_STATUS_REPO_TIMEOUT_SECONDS", 0.5, raising=False)
+    monkeypatch.setattr(fleet_status, "FLEET_STATUS_REPO_TIMEOUT_SECONDS", 0.5)
 
     result = cli.run_fleet_status(_args())
 
@@ -228,3 +228,51 @@ def test_fleet_status_worker_exception_routes_to_errors(
     errors_by_key = {e["repo_key"]: e for e in result.data["errors"]}
     assert errors_by_key["owner/bad"]["error"] == "gh exploded"
     assert result.data["stale"] == []
+
+
+def test_fleet_status_worker_timeout_error_routes_to_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker exception that is itself TimeoutError-shaped must land in
+    ``errors`` (flipping ok), not be misread as the collection deadline
+    expiring into ``stale``.
+
+    ``Future.result(timeout=...)`` raises ``TimeoutError`` for BOTH an
+    expired wait and a worker whose stored exception is ``TimeoutError``
+    (an ``OSError`` — the type a wedged ``gh`` subprocess surfaces), so the
+    collector decides budget expiry from ``wait()``'s return, not from
+    exception identity. A budget is patched in anyway so that a regression
+    to exception-identity classification could not hide behind the two
+    branches agreeing.
+    """
+
+    def _timeout() -> CommandResult:
+        raise TimeoutError("gh timed out")
+
+    _fleet_env(
+        tmp_path,
+        monkeypatch,
+        {
+            "owner/bad": _timeout,
+            "owner/good": lambda: CommandResult(True, "ok", {"repo": "owner/good"}),
+        },
+    )
+    monkeypatch.setattr(fleet_status, "FLEET_STATUS_REPO_TIMEOUT_SECONDS", 0.5)
+
+    result = cli.run_fleet_status(_args())
+
+    assert result.ok is False
+    assert "owner/good" in result.data["repos"]
+    errors_by_key = {e["repo_key"]: e for e in result.data["errors"]}
+    assert errors_by_key["owner/bad"]["error"] == "gh timed out"
+    assert result.data["stale"] == []
+
+
+def test_fleet_status_reexported_from_cli() -> None:
+    """cli.py stays the command surface: ``run_fleet_status`` and the
+    per-repo budget constant are re-exported from the ``fleet_status``
+    domain module (the ``run_fleet_stop`` precedent)."""
+    assert cli.run_fleet_status is fleet_status.run_fleet_status
+    assert cli.FLEET_STATUS_REPO_TIMEOUT_SECONDS is (
+        fleet_status.FLEET_STATUS_REPO_TIMEOUT_SECONDS
+    )
