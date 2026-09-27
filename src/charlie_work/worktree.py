@@ -2397,6 +2397,78 @@ def _worktree_refuse_to_reset_reason(
     )
 
 
+def _resolve_reset_target_tip(
+    repo_root: Path, branch: str, worktree_path: Path | None
+) -> str | None:
+    """Resolve the commit the refuse-to-reset probe measured (issue #1944).
+
+    Mirrors ``_worktree_refuse_to_reset_reason``'s own tip resolution: the
+    worktree's ``HEAD`` when the directory exists, else the ``branch`` tip.
+    Returns None when the ref does not resolve — the caller keeps the refusal.
+    """
+    if worktree_path is not None and worktree_path.is_dir():
+        result = run_captured(
+            ["git", "rev-parse", "--verify", "-q", "HEAD"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+    else:
+        result = run_captured(
+            ["git", "rev-parse", "--verify", "-q", branch],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+    if result.ok and result.stdout.strip():
+        return result.stdout.strip()
+    return None
+
+
+# Local-only archive namespace for diverged branch tips on repos with no
+# remote (issue #1944). A plain branch — never pushed, there is nowhere to
+# push to — distinct from the refs/charlie/* namespaces, which stay out of
+# ``git branch`` listings on purpose; an archive the operator must be able
+# to find and merge by hand is deliberately a first-class branch.
+_ARCHIVE_BRANCH_PREFIX = "archive"
+_ARCHIVE_NAME_ATTEMPTS = 100
+
+
+def _archive_unreachable_branch_tip(repo_root: Path, branch: str, tip_sha: str) -> str | None:
+    """Preserve ``tip_sha`` on branch ``archive/<branch>-<utc-date>``.
+
+    Returns the archive branch name, or None when no archive could be
+    created or verified — the caller keeps the refusal in that case, so a
+    failed archive never downgrades the safety property. When a ref with the
+    same name already points at the same tip, the existing ref is reused
+    (the second refuse-to-reset probe of one dispatch sees the archive the
+    first created). A same-named ref at a different tip gets a ``-2``,
+    ``-3``, … suffix so two diverged tips on one day never overwrite.
+    """
+    date = datetime.now(UTC).strftime("%Y%m%d")
+    base_name = f"{_ARCHIVE_BRANCH_PREFIX}/{branch}-{date}"
+    for suffix in range(1, _ARCHIVE_NAME_ATTEMPTS + 1):
+        name = base_name if suffix == 1 else f"{base_name}-{suffix}"
+        existing = run_captured(
+            ["git", "rev-parse", "--verify", "-q", f"refs/heads/{name}"],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if existing.ok and existing.stdout.strip():
+            if existing.stdout.strip() == tip_sha:
+                return name
+            continue
+        if not _is_confirmed_missing_ref(existing):
+            # Not a clean "ref absent" verdict — a probe failure or a
+            # verify that printed nothing. Refuse rather than guess.
+            return None
+        create = run_captured(
+            ["git", "branch", name, tip_sha],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        return name if create.ok else None
+    return None
+
+
 def _worktree_dirty_reason(
     worktree_path: Path,
     injected_paths: tuple[str, ...] = (),
@@ -3248,6 +3320,7 @@ def create_worktree(
     attempt_snapshot: AttemptSnapshot | None = None
     rework_conflict: ReworkMergeConflict | None = None
     rescue_capture: RescueCapture | None = None
+    _archive_events_emitted: set[str] = set()
 
     def _snapshot_before_delete(target_branch: str) -> None:
         """Best-effort attempt-tip snapshot immediately before a branch reset.
@@ -3285,6 +3358,43 @@ def create_worktree(
                     "commit_sha": capture.commit_sha,
                     "worktree_path": str(wt_path),
                     "reason": unsafe_reason,
+                },
+            )
+        except Exception:  # noqa: BLE001 — instrumentation is best-effort
+            pass
+
+    def _emit_local_commits_archived_event(
+        archived_branch: str, archive_ref: str, tip_sha: str
+    ) -> None:
+        """Best-effort: record a ``worktree_local_commits_archived`` event.
+
+        Same contract as ``_emit_rescue_event``: no state file (no config) or
+        an instrumentation I/O error is silently skipped — the archive branch
+        itself is the durable artifact, not the event. Deduped on
+        ``archive_ref`` because one dispatch can run the refuse-to-reset probe
+        twice (once for the worktree, once for the branch) against the same
+        tip — the archive already exists the second time, and a duplicate
+        event would double-count one archival.
+        """
+        if state_file is None or archive_ref in _archive_events_emitted:
+            return
+        _archive_events_emitted.add(archive_ref)
+        try:
+            from .instrumentation import log_event
+
+            # standalone closure, not an OrchestratorApp method -- no
+            # write_gate receiver exists to convert to; event is
+            # best-effort (the archive branch is the durable artifact),
+            # same out-of-wave pattern as the #1423 site baselined above.
+            # write-gate-exempt(issue=1944): no write_gate receiver; best-effort event
+            log_event(
+                state_file,
+                "worktree_local_commits_archived",
+                {
+                    "issue_number": issue_number,
+                    "branch": archived_branch,
+                    "archive_ref": archive_ref,
+                    "tip_sha": tip_sha,
                 },
             )
         except Exception:  # noqa: BLE001 — instrumentation is best-effort
@@ -3414,6 +3524,31 @@ def create_worktree(
                     probe_result="live_writer_at_unsafe_evaluation",
                     inconclusive_probe_deferred_count=0,
                 )
+        # Issue #1944: on a repo with no origin remote the "local commits not
+        # on remote branch" verdict can never resolve — there is nowhere to
+        # push, so every requeue of a diverged agent branch escalates to
+        # human-needed forever (mdls #144). Archive the unreachable tip to a
+        # local archive/<branch>-<utc-date> branch and permit the reset, which
+        # recreates the branch from the default branch below. Repos WITH a
+        # remote keep the refusal: unpushed work there can still be salvaged
+        # by a real push. The live-writer recheck above runs first — a live
+        # worker's branch is deferred, never archived under it.
+        if (
+            (config is None or config.dispatch.archive_unreachable_local_commits)
+            and _worktree_unsafe_kind_from_reason(reason) == WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+            and not _has_origin_remote(repo_root)
+        ):
+            tip_sha = _resolve_reset_target_tip(repo_root, branch, check_path)
+            archive_ref = (
+                _archive_unreachable_branch_tip(repo_root, branch, tip_sha)
+                if tip_sha is not None
+                else None
+            )
+            if archive_ref is not None:
+                _emit_local_commits_archived_event(branch, archive_ref, tip_sha)
+                return
+            # Archival failed — fall through to capture-or-refuse so the
+            # reset still refuses loudly rather than discarding the tip.
         # Issue #849: before refusing, attempt to capture the work durably
         # onto a rescue ref. If capture succeeds, the reset is permitted
         # (the work is preserved on a ref, so resetting destroys nothing).
