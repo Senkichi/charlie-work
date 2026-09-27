@@ -144,6 +144,177 @@ def test_detect_prose_only_dependencies_section_after_fenced_block_still_scanned
     assert detect_prose_only_dependencies(body) is True
 
 
+# --- Issue #1949: issue-number ordering prose -------------------------------
+
+
+def test_detect_prose_only_dependencies_issue_ref_ordering() -> None:
+    """Issue #1949: ordering prose next to a same-repo issue number is a
+    prose-only dependency — ``parse_blockers`` reads no blocker from these
+    shapes, so the issue used to dispatch immediately, out of order."""
+    from charlie_work.github import detect_prose_only_dependencies, parse_blockers
+
+    body = "Do this after #12 lands."
+    assert parse_blockers(body) == []
+    assert detect_prose_only_dependencies(body) is True
+
+    body = "Wait for #12 to merge first."
+    assert parse_blockers(body) == []
+    assert detect_prose_only_dependencies(body) is True
+
+
+def test_detect_prose_only_dependencies_issue_ref_ordering_variants() -> None:
+    """Issue #1949: the ordering-phrase family — 'wait for'/'requires' + ref
+    (no completion verb required) and 'before/until/after' + ref + verb. A
+    multi-ref run contributes every ref it names."""
+    from charlie_work.github import detect_prose_only_dependencies
+
+    assert detect_prose_only_dependencies("Wait for #12.") is True
+    assert detect_prose_only_dependencies("This requires #12.") is True
+    assert detect_prose_only_dependencies("Start only after #12 and #13 land.") is True
+    assert detect_prose_only_dependencies("Hold until the fix in #12 is done.") is True
+    assert detect_prose_only_dependencies("Land this before #12 ships.") is True
+    # "Depends on #N" is a structured declaration that parse_blockers reads —
+    # it only counts as prose-only when the parser's own guards void it (a
+    # foreign ref in the clause makes the clause describe other issues;
+    # parking for a human is the fail-safe).
+    assert detect_prose_only_dependencies("Depends on #5, see #6 for context") is True
+
+
+def test_detect_prose_only_dependencies_issue_ref_declared_edge_not_flagged() -> None:
+    """Issue #1949 acceptance: the same prose whose ref is already declared
+    as a blocker is not prose-only — the blocker-set comparison is what keeps
+    legitimate bodies passing."""
+    from charlie_work.github import detect_prose_only_dependencies
+
+    assert (
+        detect_prose_only_dependencies("Do this after #12 lands.\n\n## Blocked by\n- #12\n")
+        is False
+    )
+    # An inline "Blocked by #N" declaration covers the prose mention too.
+    assert detect_prose_only_dependencies("Wait for #12 to merge first. Blocked by #12") is False
+    # "Depends on #N" is itself a structured declaration — it reads cleanly,
+    # so it is never prose-only.
+    assert detect_prose_only_dependencies("This depends on #12.") is False
+    # A *different* declared blocker does not cover the prose edge on #12.
+    assert (
+        detect_prose_only_dependencies("Wait for #12 to merge first.\n\n## Blocked by\n- #34\n")
+        is True
+    )
+    # A multi-ref run with one undeclared member still flags.
+    assert (
+        detect_prose_only_dependencies("Wait for #12 and #13 to merge.\n\n## Blocked by\n- #12\n")
+        is True
+    )
+
+
+def test_detect_prose_only_dependencies_issue_ref_ordering_quoted() -> None:
+    """Issue #1949: the quoting guards ``parse_blockers`` applies — fenced
+    code block, inline code span, double-quote span, blockquote line — apply
+    to the new issue-ref ordering patterns too."""
+    from charlie_work.github import detect_prose_only_dependencies
+
+    # Mutation anchor: unquoted, the same ordering prose flags.
+    assert detect_prose_only_dependencies("Wait for #12 to merge first.") is True
+    assert (
+        detect_prose_only_dependencies(
+            "Example prose that parks an issue:\n\n```\nWait for #12 to merge first.\n```\n"
+        )
+        is False
+    )
+    assert (
+        detect_prose_only_dependencies("The lint phrase is `wait for #12 to merge first`.")
+        is False
+    )
+    assert (
+        detect_prose_only_dependencies(
+            'Authors write "wait for #12 to merge first" to park a ticket.'
+        )
+        is False
+    )
+    assert (
+        detect_prose_only_dependencies("> Wait for #12 to merge first.\nNormal body line.")
+        is False
+    )
+    # A match that STARTS inside a quoted span is quoted prose even when a
+    # second ref outside the span extends the match (stale-comment shape from
+    # the rollout corpus: the comment says "Ignored until #575 lands").
+    assert (
+        detect_prose_only_dependencies(
+            'The comment says "Ignored until #575 lands" — #575 has landed. Update it.'
+        )
+        is False
+    )
+
+
+def test_detect_prose_only_dependencies_existing_patterns_quoted() -> None:
+    """Issue #1949: the pre-existing patterns get the same quoting guards —
+    an issue that quotes the do-not-dispatch phrase to describe the detector
+    must not park itself (drafting the issue body tripped this)."""
+    from charlie_work.github import detect_prose_only_dependencies
+
+    assert (
+        detect_prose_only_dependencies('The detector fires on "do not dispatch before" in a body.')
+        is False
+    )
+    assert (
+        detect_prose_only_dependencies("The detector fires on `do not dispatch before` in a body.")
+        is False
+    )
+    assert (
+        detect_prose_only_dependencies("> do not dispatch before P2-T2 lands.\nNotes below.")
+        is False
+    )
+
+
+def test_detect_prose_only_dependencies_quoted_match_skipped_not_fatal() -> None:
+    """A quoted ordering match is skipped, not terminal for the scan: a later
+    genuine declaration in the same body still flags."""
+    from charlie_work.github import detect_prose_only_dependencies
+
+    body = "The lint watches for `wait for #12 to merge`.\n\nWait for #34 to merge first."
+    assert detect_prose_only_dependencies(body) is True
+
+
+def test_detect_prose_only_dependencies_ordering_tightening() -> None:
+    """Issue #1949 rollout tightening — each case below was a real false
+    positive in the fleet's open-issue corpus:
+
+    - an ``owner/repo#N`` reference is not a *same-repo* issue reference;
+    - bare past-tense narration ("after PR #920 merged") reports history, it
+      does not order this issue;
+    - a long/comma-separated gap between "requires"/"depends on" and the ref
+      is incidental mention;
+    - "does not wait for" is an explicit non-dependency;
+    - "incomplete" contains "complete" but is not a completion verb.
+    """
+    from charlie_work.github import detect_prose_only_dependencies
+
+    # Cross-repo ordering — spec scopes the detector to same-repo refs.
+    assert (
+        detect_prose_only_dependencies("Install only after Senkichi/charlie-work#1540 has landed.")
+        is False
+    )
+    # Past-tense narration (all observed as FPs in the fleet corpus).
+    assert detect_prose_only_dependencies("Observed after PR #920 merged.") is False
+    assert detect_prose_only_dependencies("The bug was forked before #312 merged.") is False
+    # Auxiliary + participle still reads as ordering, not narration.
+    assert detect_prose_only_dependencies("Do not start until #12 is merged.") is True
+    assert detect_prose_only_dependencies("Do not start until #12 has landed.") is True
+    # Incidental requires/depends-on separated by a comma clause.
+    assert (
+        detect_prose_only_dependencies(
+            "This requires a clean tree, careful sequencing, and review (#357)."
+        )
+        is False
+    )
+    # Explicit negation.
+    assert detect_prose_only_dependencies("This issue does not wait for #207.") is False
+    # "incomplete" is not the verb "complete".
+    assert (
+        detect_prose_only_dependencies("Check after #9 whether the result is incomplete") is False
+    )
+
+
 def test_github_dependencies_404_tolerance(tmp_path: Path) -> None:
     """Test that 404 errors from dependencies API are handled gracefully (feature not available)."""
     from charlie_work.github import get_github_issue_dependencies
