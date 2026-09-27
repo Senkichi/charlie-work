@@ -123,8 +123,10 @@ def test_doctor_passes_on_healthy_local_file_repo(tmp_path: Path) -> None:
     assert by_name["gh auth"].ok is True
     assert by_name["github labels"].ok is True
     assert "not applicable" in by_name["github labels"].detail
-    assert by_name["worker GitHub token"].ok is True
-    assert "not applicable" in by_name["worker GitHub token"].detail
+    # Issue #1853: the worker-GitHub-token check is retired — workers stay
+    # credential-free by design, so no "worker GitHub token" finding exists
+    # on any backend.
+    assert "worker GitHub token" not in by_name
     # And the local-specific checks ran and passed.
     assert by_name["local issues dir"].ok is True
     assert "2 issue file(s)" in by_name["local issues dir"].detail

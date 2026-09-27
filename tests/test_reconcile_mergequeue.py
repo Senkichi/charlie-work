@@ -761,3 +761,28 @@ def test_apply_fixes_mergequeue_revoked_without_reason_does_not_write_field(
     new_state = apply_fixes(gh, state, drift, config)
 
     assert "mergequeue_revoked_reason" not in new_state["prs"].get("695", {})
+
+
+def test_detect_mergequeue_not_approved_leaves_operator_branch_alone(tmp_path: Path) -> None:
+    """An operator PR (non-fleet branch) never gets a fleet review decision,
+    so its ``mergequeue`` label is the operator's own merge decision. The
+    2026-09-27 regression: reconcile stripped it from charlie-work #1952/#1953
+    minutes after queueing, dequeuing both and closing Aviator's draft."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    operator_pr = {
+        **_pr(1952, "OPEN", head_ref="fix/human-decision-marker-precision"),
+        "headRefOid": "sha-1952",
+        "labels": [{"name": mergequeue_label}],
+    }
+    fleet_pr = {
+        **_pr(695, "OPEN"),
+        "headRefOid": "sha-695",
+        "labels": [{"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[operator_pr, fleet_pr], issues=[])
+
+    drift = detect_mergequeue_not_approved(gh, config, repo_root=tmp_path)
+
+    # Positive control: the fleet PR with no decision is still revoked.
+    assert [item.pr_number for item in drift] == [695]

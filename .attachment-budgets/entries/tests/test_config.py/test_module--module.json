@@ -1,0 +1,8 @@
+{
+ "boundary": 41.0,
+ "bumps": [],
+ "file": "tests/test_config.py",
+ "identity": "tests/test_config.py::module",
+ "kind": "test_module",
+ "member_count": 114
+}

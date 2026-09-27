@@ -21,7 +21,7 @@ from __future__ import annotations
 from .attachment_contracts.review_delta import BudgetSection
 
 # Issue #1460: the static dispatch-clause prose emitted by
-# ``_build_attachment_budget_value`` when `.attachment-budgets.json` is
+# ``_build_attachment_budget_value`` when `.attachment-budgets/` is
 # present and structurally valid. A module-level constant (not inlined in
 # the method) so it renders identically regardless of call site and stays
 # trivially diffable against the plan's exact prose.
@@ -69,7 +69,7 @@ def render_attachment_budget_section(section: BudgetSection | None) -> str:
     """Render the ``$attachment_budget_section`` packet block (issue #1460).
 
     Returns ``""`` when ``section`` is ``None`` (the review() cheap gate
-    decided this PR neither touches `.attachment-budgets.json` nor a
+    decided this PR neither touches `.attachment-budgets/` nor a
     baselined host file, or the marker is absent), mirroring
     ``render_over_cap_section``'s disabled contract. When gated in, this
     ALWAYS renders visible text -- even with zero findings -- rather than
@@ -121,7 +121,7 @@ def render_attachment_budget_section(section: BudgetSection | None) -> str:
             f"- {point.identity} ({point.file}): live member count "
             f"{point.live_count} is below baseline {point.baseline_members} -- "
             "a ratchet, not a bump. Run `python -m charlie_work.attachment_contracts "
-            "baseline --ratchet` and commit the resulting `.attachment-budgets.json` "
+            "baseline --ratchet` and commit the resulting `.attachment-budgets/` "
             "tightening in this PR -- the command is lower-only (it never raises a "
             "baseline entry), so it is safe to run mid-PR. A lowered count is a "
             "ratchet, not tamper: G4 (workers may not self-ack bumps) governs raises "
@@ -132,7 +132,7 @@ def render_attachment_budget_section(section: BudgetSection | None) -> str:
 
     if section.head_unreadable:
         lines.append(
-            "- NOTE: could not evaluate .attachment-budgets.json at PR head; "
+            "- NOTE: could not evaluate .attachment-budgets/ at PR head; "
             "bump and G4 checks skipped"
         )
     if section.advisories_unavailable:

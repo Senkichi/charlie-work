@@ -128,9 +128,14 @@ Deterministic nearest-rank quartiles (no interpolation ambiguity across platform
 FLOOR is a named module constant with the rationale in a docstring — it is a
 statistical-validity floor (outlier tests are meaningless at n<4), not a size threshold.
 
-## Baseline (baseline.py) — freeze-on-adopt + ratchet + tamper guard
+## Baseline (baseline.py + baseline_dir.py) — freeze-on-adopt + ratchet + tamper guard
 
-`.attachment-budgets.json` at repo root, GENERATED only (`baseline` CLI cmd), schema:
+`.attachment-budgets/` at repo root, GENERATED only (`baseline` CLI cmd). Per-entry
+layout (issue #1839): `meta.json` carries the top-level keys (everything except
+`entries`); each saturated point is one self-describing file at
+`entries/<file>/<kind>--<leaf>.json` where the leaf is the identity minus its
+redundant `<file>::` prefix, percent-escaped. The document-level schema the
+layout reassembles:
 ```json
 {"version": 1, "generated_by": "charlie_work.attachment_contracts <pkg-version>",
  "generated_at": "<iso8601>", "floor": 4,
@@ -148,6 +153,17 @@ Entries = saturated points only, sorted (kind, file, identity) for stable diffs.
   Finding(error). Interactive bumps self-ack.
 - Tamper guard: `check-tree` recomputes what the baseline SHOULD contain for unchanged
   points; a baseline entry raised without a bump record -> Finding(error).
+- **Pinned rows (issue #1620):** an entry may carry `"pinned": true` — an
+  operator-authored sub-saturation contract for a point deliberately de-godded
+  BELOW the fence. `member_count` records the ceiling (last measured count plus a
+  small delta). `compare()` enforces a pin whether or not the point is saturated:
+  growth past `min(member_count/bumps, boundary)` -> Finding(block); a shrink
+  ratchets the pin down like any other row; the row is never dropped on
+  de-saturation. Tooling never creates a pin — the operator authors the entry
+  file explicitly — and `--ratchet`/`--refreeze` never delete one; only a full
+  `baseline` regen retires pins (entries are re-derived from saturated verdicts
+  alone). Removing or unpinning a row outside a verified regeneration is
+  flagged as tamper.
 
 ## Redirect + scaffold (redirect.py) — G2
 
@@ -181,7 +197,8 @@ report when `--report-only` (Week-1 shadow mode).
 ## hook_entry.py — PreToolUse protocol
 
 stdin JSON: `{"tool_name": "Write|Edit|MultiEdit", "tool_input": {"file_path": ...}}`.
-- No `.attachment-budgets.json` found walking up from target -> exit 0 silently (fast
+- No `.attachment-budgets/` (or legacy `.attachment-budgets.json`) found walking up
+  from target -> exit 0 silently (fast
   no-op outside piloted repos).
 - Unattended detection: env `CHARLIE_FLEET_WORKER=1` (the fleet dispatch env) OR
   `CLAUDE_CODE_UNATTENDED=1` -> ALWAYS advisory (never exit 2) — print redirect JSON

@@ -1,4 +1,4 @@
-"""Review-packet delta computation for `.attachment-budgets.json` (issue #1460).
+"""Review-packet delta computation for `.attachment-budgets/` (issue #1460).
 
 Pure text/data functions only -- no I/O, no subprocess, no AST, no line-count
 arithmetic of any kind (this package's binding operator constraint: see
@@ -11,13 +11,12 @@ everything here is given already-fetched text and returns structured data for
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from charlie_work.attachment_contracts.baseline import (
-    TamperError,
     bump_ack_is_external,
     entries_of,
-    loads,
     new_bumps,
 )
 from charlie_work.attachment_contracts.model import (
@@ -33,7 +32,10 @@ _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 def reconstruct_baseline_head_text(base_text: str | None, file_diff: str) -> str | None:
     """Apply ``file_diff``'s unified-diff hunks to ``base_text``, returning the
-    resulting PR-head text of `.attachment-budgets.json`.
+    resulting PR-head text of one baseline-store file (the legacy
+    ``.attachment-budgets.json``, or one entry file / ``meta.json`` under
+    ``.attachment-budgets/`` -- ``reconstruct_baseline_dir_head`` drives this
+    per member).
 
     ``file_diff`` is the hunk-header-and-body text for a single file (an
     ``@@ ... @@`` header followed by ` `/`+`/`-`-prefixed body lines, as
@@ -104,6 +106,133 @@ def reconstruct_baseline_head_text(base_text: str | None, file_diff: str) -> str
     return "\n".join(result) + "\n"
 
 
+def _split_diff_sections(diff_text: str) -> list[list[str]]:
+    """Split a unified diff into per-file sections (each starting at its
+    ``diff --git`` line). Unlike ``janitor.iter_diff_files`` this keeps the
+    file-level headers (``new file mode`` / ``deleted file mode`` /
+    ``rename`` lines) that a per-entry baseline directory needs to model
+    adds, deletes, and renames -- not just content hunks."""
+    sections: list[list[str]] = []
+    current: list[str] = []
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git ") and current:
+            sections.append(current)
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        sections.append(current)
+    return sections
+
+
+def _section_path(line_value: str) -> str | None:
+    """Decode a ``--- a/<path>`` / ``+++ b/<path>`` operand."""
+    if line_value == "/dev/null":
+        return None
+    if line_value.startswith(("a/", "b/")):
+        return line_value[2:]
+    return line_value
+
+
+def reconstruct_baseline_dir_head(
+    base_files: Mapping[str, str] | None,
+    diff_text: str,
+    *,
+    dir_prefix: str,
+) -> dict[str, str] | None:
+    """Apply a diff's hunks to the per-file map of a baseline directory.
+
+    ``base_files`` maps paths relative to the baseline directory to base
+    content (``baseline_dir.read_files`` output); ``dir_prefix`` is the
+    directory's repo-relative name (``".attachment-budgets"``). Returns the
+    head-side map in the same shape -- every file the directory holds after
+    the diff -- or ``None`` on ANY structural inconsistency (a hunk whose
+    context doesn't match base content, a section touching a file absent
+    from the base snapshot, an unparseable header): the caller renders a
+    "could not evaluate" NOTE rather than trusting a corrupted
+    reconstruction, same contract as ``reconstruct_baseline_head_text``.
+
+    Handles the file-level events a directory can produce that a single
+    file never could: new entry files (``new file mode``), deleted ones
+    (``deleted file mode``), and renames (``rename from``/``rename to`` --
+    e.g. a host file move that re-keys its entry). Sections entirely
+    outside ``dir_prefix`` are skipped.
+    """
+    if base_files is None:
+        return None
+    files = dict(base_files)
+    prefix = dir_prefix.rstrip("/") + "/"
+
+    for section in _split_diff_sections(diff_text):
+        old_path: str | None = None
+        new_path: str | None = None
+        is_new = is_deleted = False
+        saw_destination = False  # a "+++ b/..." or "rename to" line
+        hunk_start: int | None = None
+        for i, line in enumerate(section):
+            if line.startswith("new file mode"):
+                is_new = True
+            elif line.startswith("deleted file mode"):
+                is_deleted = True
+            elif line.startswith("rename from "):
+                old_path = line[len("rename from ") :]
+            elif line.startswith("rename to "):
+                saw_destination = True
+                new_path = line[len("rename to ") :]
+            elif line.startswith("--- "):
+                old_path = _section_path(line[4:])
+            elif line.startswith("+++ "):
+                saw_destination = True
+                new_path = _section_path(line[4:])
+            elif line.startswith("@@"):
+                hunk_start = i
+                break
+        hunks = "\n".join(section[hunk_start:]) if hunk_start is not None else ""
+
+        old_rel = (
+            old_path[len(prefix) :]
+            if old_path is not None and old_path.startswith(prefix)
+            else None
+        )
+        new_rel = (
+            new_path[len(prefix) :]
+            if new_path is not None and new_path.startswith(prefix)
+            else None
+        )
+        if old_rel is None and new_rel is None:
+            continue  # section touches no baseline-directory member
+        if is_deleted:
+            if old_rel is not None:
+                files.pop(old_rel, None)
+            continue
+        if not saw_destination:
+            # A mode-only section (no ---/+++ or rename lines): content is
+            # unchanged, so the member carries over untouched.
+            continue
+        if new_rel is None:
+            # Moved out of the baseline directory: the member leaves the
+            # head map.
+            if old_rel is not None:
+                files.pop(old_rel, None)
+            continue
+        if is_new:
+            base_text: str | None = None
+        else:
+            source_rel = old_rel if old_rel is not None else new_rel
+            base_text = files.get(source_rel)
+            if base_text is None:
+                # A modified/renamed member absent from the base snapshot --
+                # the map is stale or the diff mismatched; fail closed.
+                return None
+            if old_rel is not None and old_rel != new_rel:
+                files.pop(old_rel)
+        head_text = reconstruct_baseline_head_text(base_text, hunks)
+        if head_text is None:
+            return None
+        files[new_rel] = head_text
+    return files
+
+
 @dataclass(frozen=True)
 class RatchetablePoint:
     """A baselined attachment point whose live member count is strictly below
@@ -111,7 +240,7 @@ class RatchetablePoint:
 
     The review packet renders a ratchet-remedy row for each such point,
     instructing the worker to run ``baseline --ratchet`` and commit the
-    resulting ``.attachment-budgets.json`` tightening in the same PR. A
+    resulting ``.attachment-budgets/`` tightening in the same PR. A
     lowered count is a ratchet, not a bump -- G4 (workers may not self-ack
     bumps) governs raises only; CI re-verifies ``actual <= baseline``
     deterministically from the scan, so there is nothing for a worker to
@@ -140,8 +269,8 @@ class BudgetSection:
 
 def build_budget_findings(
     *,
-    base_baseline_text: str | None,
-    head_baseline_text: str | None,
+    base_document: dict[str, object] | None,
+    head_document: dict[str, object] | None,
     changed_files: frozenset[str],
     baseline_touched: bool,
     advisories: tuple[AdvisoryRecord, ...] | None = None,
@@ -149,13 +278,14 @@ def build_budget_findings(
 ) -> BudgetSection:
     """Build the structured findings for the review packet's budget section.
 
-    ``base_baseline_text``/``head_baseline_text`` are the base-commit and
-    PR-head text of `.attachment-budgets.json`, or ``None`` when the file
-    doesn't exist on that side (no baseline yet, or unreadable). Either side
-    failing to parse (``TamperError`` via ``baseline.loads``) is treated the
-    same as it being absent for that side's entries -- the caller is
-    responsible for setting ``head_unreadable`` when ``head_baseline_text``
-    could not even be reconstructed (that's a NOTE, not silently swallowed).
+    ``base_document``/``head_document`` are the base-commit and PR-head
+    baseline documents (already loaded -- ``baseline_dir.load``/``load_files``
+    for the per-entry directory layout, ``baseline.loads`` for the legacy
+    single file), or ``None`` when that side's baseline doesn't exist or
+    failed to parse -- treated the same as an empty document. The caller is
+    responsible for setting ``head_unreadable`` when the head baseline
+    could not even be reconstructed (that's a NOTE, not silently
+    swallowed).
 
     ``advisories is None`` means the advisories log was unavailable for this
     PR -- ``advisories_unavailable`` is set and redirects-not-taken is left
@@ -168,16 +298,11 @@ def build_budget_findings(
     no scan) and just passes the tuple through to the ``BudgetSection``.
     """
 
-    def _load(text: str | None) -> dict[str, object]:
-        if text is None:
-            return {"version": 1, "entries": []}
-        try:
-            return loads(text)
-        except TamperError:
-            return {"version": 1, "entries": []}
+    def _document_or_empty(document: dict[str, object] | None) -> dict[str, object]:
+        return document if document is not None else {"version": 1, "entries": []}
 
-    base_document = _load(base_baseline_text)
-    head_document = _load(head_baseline_text)
+    base_document = _document_or_empty(base_document)
+    head_document = _document_or_empty(head_document)
 
     bumps = new_bumps(base_document, head_document)
     blocking_bumps = tuple(

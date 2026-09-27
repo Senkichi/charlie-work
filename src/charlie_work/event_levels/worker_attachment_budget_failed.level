@@ -1,6 +1,6 @@
 warning
 # Issue #1460: the attachment-budget dispatch clause could not be
-# built (`.attachment-budgets.json` present but fails structural
+# built (`.attachment-budgets/` present but fails structural
 # validation via `baseline.load`). Warning, not error: fail-soft
 # mirrors `worker_module_map_failed` -- the dispatch proceeds with an
 # omitted clause, never a dispatch failure.

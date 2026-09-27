@@ -3,7 +3,7 @@
 Both hatchling and setuptools reject ``..`` in package paths (paths must be
 relative to the project root and cannot escape it).  This backend builds the
 wheel and sdist directly from the single in-tree source at
-``src/charlie_work/attachment_contracts/`` -- no second copy of the 13 modules
+``src/charlie_work/attachment_contracts/`` -- no second copy of the modules
 exists anywhere in this repo (issue #1544 Stage 1).
 
 The backend implements just enough of PEP 517 (``build_wheel`` and

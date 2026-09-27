@@ -22,6 +22,7 @@ call time).
 
 from __future__ import annotations
 
+import itertools
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -129,6 +130,66 @@ def test_pytest_tree_load_nested_pytest_counts_once() -> None:
         self_pid=999,
     )
     assert load == host_load.HostLoad(pytest_tree_count=1, pytest_process_count=4)
+
+
+def test_pytest_tree_load_nested_root_with_lower_pid_counts_once() -> None:
+    """Issue #1918: a nested root whose PID is LOWER than its outer root's
+    was counted as its own tree, then the outer root again. Real Windows
+    PIDs are effectively random, so this ordering is routine."""
+    load = host_load.pytest_tree_load(
+        _procs(
+            _proc(500, 1, "pytest -q"),
+            _proc(501, 500, "python -u -c worker"),
+            _proc(100, 501, "python -m pytest inner/"),
+            _proc(111, 100, "python -u -c inner_worker"),
+        ),
+        self_pid=999,
+    )
+    assert load == host_load.HostLoad(pytest_tree_count=1, pytest_process_count=4)
+
+
+def test_pytest_tree_load_wrapper_chain_in_descending_pid_order_counts_once() -> None:
+    """The live shape behind #1918: every layer of a wrapped suite names
+    pytest, and PIDs descend down the chain."""
+    load = host_load.pytest_tree_load(
+        _procs(
+            _proc(400, 1, 'bash -c "source snap.sh && timeout 1500 uv run pytest -q"'),
+            _proc(300, 400, "timeout 1500 uv run pytest -q"),
+            _proc(200, 300, "uv run pytest -q"),
+            _proc(100, 200, "python.exe -m pytest -q"),
+            _proc(50, 100, "python -u -c worker"),
+        ),
+        self_pid=999,
+    )
+    assert load == host_load.HostLoad(pytest_tree_count=1, pytest_process_count=5)
+
+
+def test_pytest_tree_load_is_independent_of_snapshot_order() -> None:
+    """The count must not depend on which root the reducer visits first."""
+    procs = [
+        _proc(400, 1, "uv run pytest -q"),
+        _proc(100, 400, "python -m pytest -q"),
+        _proc(90, 100, "python -u -c worker"),
+        _proc(300, 1, "pytest other/"),
+        _proc(20, 300, "python -m pytest nested/"),
+        _proc(700, 1, "pytest third/"),
+    ]
+    expected = host_load.HostLoad(pytest_tree_count=3, pytest_process_count=6)
+    for perm in itertools.permutations(procs):
+        assert host_load.pytest_tree_load(perm, self_pid=999) == expected
+
+
+def test_pytest_tree_load_cycle_between_two_roots_counts_once() -> None:
+    """A ppid cycle joining two pytest roots (PID reuse mid-scan) is one
+    tree, not zero (neither root is 'topmost') and not two."""
+    load = host_load.pytest_tree_load(
+        _procs(
+            _proc(100, 200, "pytest -q"),
+            _proc(200, 100, "python -m pytest inner/"),
+        ),
+        self_pid=999,
+    )
+    assert load == host_load.HostLoad(pytest_tree_count=1, pytest_process_count=2)
 
 
 def test_pytest_tree_load_recognizes_invocation_spellings() -> None:
@@ -243,8 +304,13 @@ def test_pytest_tree_load_tolerates_blank_command_lines() -> None:
 
 
 def test_measure_host_load_returns_reading(tmp_path: Path) -> None:
+    # Issue #1943: measurement is scoped to orchestrator-attributable trees,
+    # so the fixture root names a managed worktree's venv interpreter (the
+    # .var/charlie-work state-dir marker) rather than a bare "pytest".
     reading = host_load.measure_host_load(
-        lister=lambda: _lister(_proc(100, 1, "pytest -q")),
+        lister=lambda: _lister(
+            _proc(100, 1, r"C:\repo\.var\charlie-work\worktrees\wt\.venv\Scripts\pytest.exe -q")
+        ),
         self_pid=999,
         diagnostic_state_path=tmp_path / "state.json",
         diagnostic_repo="repo",
@@ -342,7 +408,9 @@ def test_measure_host_load_uses_module_lister_by_default(
     monkeypatch.setattr(
         host_load,
         "list_host_processes",
-        lambda: _lister(_proc(100, 1, "pytest -q")),
+        lambda: _lister(
+            _proc(100, 1, r"C:\repo\.var\charlie-work\worktrees\wt\.venv\Scripts\pytest.exe -q")
+        ),
     )
     reading = host_load.measure_host_load(self_pid=999)
     assert reading == host_load.HostLoad(pytest_tree_count=1, pytest_process_count=1)
@@ -409,10 +477,23 @@ def test_list_processes_posix_reports_missing_procfs(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_app(tmp_path: Path, host_load_max: int, **dispatch_kwargs: Any) -> OrchestratorApp:
+def _build_app(
+    tmp_path: Path,
+    host_load_max: int,
+    host_load_trees_max: int = 0,
+    **dispatch_kwargs: Any,
+) -> OrchestratorApp:
+    """Build an app with both host-load knobs pinned explicitly.
+
+    ``host_load_trees_max`` defaults to 0 so the #1843-era tests below keep
+    exercising the process brake in isolation; issue #1903's tree-headroom
+    governor tests live in ``tests/test_host_load_tree_headroom.py`` (the
+    this-module attachment point is saturated) and pass a real cap.
+    """
     config = OrchestratorConfig(
         dispatch=DispatchConfig(
             host_load_max_pytest_processes=host_load_max,
+            host_load_max_pytest_trees=host_load_trees_max,
             default_limit=5,
             **dispatch_kwargs,
         ),
@@ -427,11 +508,26 @@ def _patch_procs(monkeypatch: pytest.MonkeyPatch, *procs: quiesce.ProcessInfo) -
 
 
 def _saturated_snapshot() -> list[quiesce.ProcessInfo]:
-    """The incident shape from #1843: ~18 pytest processes across several
-    trees (two CI suites at -n 8 fan-out, plus worktree suites)."""
-    procs = [_proc(100, 1, "uv run --extra dev pytest -n auto -q --tb=short")]
+    """The incident shape from #1843: ~18 pytest processes across two
+    managed worktree suites at ``-n 8`` fan-out.
+
+    Issue #1943: ``measure_host_load`` scopes to orchestrator-attributable
+    trees, so the roots name a managed worktree's venv interpreter rather
+    than a bare ``pytest``/``uv run`` -- a pathless cmdline no longer
+    counts (the pathless shapes' attribution through a launcher ancestor is
+    covered in tests/test_host_load_scope.py).
+    """
+    procs = [
+        _proc(
+            100,
+            1,
+            r"C:\repo\.var\charlie-work\worktrees\wt-a\.venv\Scripts\pytest.exe -n auto -q --tb=short",
+        )
+    ]
     procs += [_proc(110 + i, 100, "python -u -c xdist") for i in range(8)]
-    procs.append(_proc(200, 1, "pytest -n auto"))
+    procs.append(
+        _proc(200, 1, r"C:\repo\.var\charlie-work\worktrees\wt-b\.venv\Scripts\pytest.exe -n auto")
+    )
     procs += [_proc(210 + i, 200, "python -u -c xdist") for i in range(8)]
     return procs
 
@@ -471,11 +567,11 @@ def test_host_load_applies_to_fresh_dispatch_lane_too(
 def test_host_load_does_not_clamp_under_threshold(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A single CI suite running alone is normal fleet activity -- the
-    clamp exists for oversubscription, not for any nonzero load."""
+    """A single managed suite running alone is normal fleet activity --
+    the clamp exists for oversubscription, not for any nonzero load."""
     _patch_procs(
         monkeypatch,
-        _proc(100, 1, "pytest -n 2"),
+        _proc(100, 1, r"C:\repo\.var\charlie-work\worktrees\wt\.venv\Scripts\pytest.exe -n 2"),
         _proc(101, 100, "python -u -c w1"),
         _proc(102, 100, "python -u -c w2"),
     )
@@ -498,8 +594,8 @@ def test_host_load_threshold_is_strictly_greater(
     permits a launch."""
     _patch_procs(
         monkeypatch,
-        _proc(100, 1, "pytest -q"),
-        _proc(200, 1, "pytest -q"),
+        _proc(100, 1, r"C:\repo\.var\charlie-work\worktrees\wt-a\.venv\Scripts\pytest.exe -q"),
+        _proc(200, 1, r"C:\repo\.var\charlie-work\worktrees\wt-b\.venv\Scripts\pytest.exe -q"),
     )
     app = _build_app(tmp_path, host_load_max=2)
 
@@ -512,8 +608,8 @@ def test_host_load_threshold_is_strictly_greater(
 def test_host_load_zero_disables_probe_entirely(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The kill switch: host_load_max_pytest_processes=0 must not even
-    spawn the process listing -- off means off, not 'probe then ignore'."""
+    """The kill switch: both host-load knobs at 0 must not even spawn the
+    process listing -- off means off, not 'probe then ignore'."""
     calls = []
     monkeypatch.setattr(host_load, "list_host_processes", lambda: calls.append(1) or _lister())
     app = _build_app(tmp_path, host_load_max=0)
@@ -640,11 +736,13 @@ def test_host_load_only_term_enabled_surfaces_in_dispatch_result(
 
 
 def test_host_load_knob_defaults_to_host_cpu_count() -> None:
-    """On by default per the issue's acceptance criteria: unset, the
-    threshold is this host's logical CPU count ('more runnable test
-    processes than cores' is the built-in saturation line)."""
+    """On by default per #1843's acceptance criteria, recalibrated by
+    #1903: unset, the process brake sits at 3x this host's logical CPU
+    count (raw process count scales with ``-n``, so ~2 ordinary suites
+    must not trip it). The tree governor's own default is pinned in
+    tests/test_host_load_tree_headroom.py."""
     config = build_config_from_data({})
-    assert config.dispatch.host_load_max_pytest_processes == (os.cpu_count() or 0)
+    assert config.dispatch.host_load_max_pytest_processes == (os.cpu_count() or 0) * 3
 
 
 def test_host_load_knob_accepts_int() -> None:

@@ -11,11 +11,13 @@ from __future__ import annotations
 
 from charlie_work.attachment_budget_prompt import render_attachment_budget_section
 from charlie_work.attachment_contracts import baseline as attachment_baseline
+from charlie_work.attachment_contracts import baseline_dir as attachment_baseline_dir
 from charlie_work.attachment_contracts import hook_entry as attachment_hook_entry
 from charlie_work.attachment_contracts.model import AdvisoryRecord
 from charlie_work.attachment_contracts.review_delta import (
     BudgetSection,
     build_budget_findings,
+    reconstruct_baseline_dir_head,
     reconstruct_baseline_head_text,
 )
 from charlie_work.checks import compute_ratchetable_points
@@ -25,19 +27,27 @@ from charlie_work.janitor import _diff_content_signature, iter_diff_files
 def _build_attachment_budget_section(self, diff: str, pr_number: int) -> str:
     """Build ``$attachment_budget_section`` for the review packet (#1460).
 
-    Cheap gate first: if `.attachment-budgets.json` is absent, or this
-    diff touches neither the baseline file itself nor any file that
+    Cheap gate first: if the checkout has no committed baseline, or this
+    diff touches neither the baseline store itself nor any file that
     currently hosts a baselined attachment point, the section renders
     ``""`` -- the vast majority of PRs never approach this feature at
     all, so nothing past the gate (diff-hunk reconstruction, advisories
     read) runs for them.
 
-    Once gated in: the base-commit baseline text is read best-effort
-    (a ``TamperError``/``OSError`` degrades to "no entries", same as a
-    missing file -- this section is advisory-only and must never raise);
-    the PR-head text is reconstructed from the diff (or read straight off
-    disk when the baseline file itself isn't part of this diff); a
-    reconstruction failure sets ``head_unreadable`` rather than guessing.
+    The baseline store is the per-entry ``.attachment-budgets/`` directory
+    (issue #1839 -- one file per ``(kind, file, identity)`` entry, so PRs
+    touching different attachment points merge cleanly), with the legacy
+    ``.attachment-budgets.json`` file still honored on un-migrated
+    checkouts.
+
+    Once gated in: the base-commit baseline is read best-effort (a
+    ``TamperError``/``OSError`` degrades to "no entries", same as a
+    missing baseline -- this section is advisory-only and must never
+    raise); the PR-head document is reconstructed from the diff (per-file
+    for the directory layout, so entry adds/deletes/renames are modeled;
+    or read straight off disk when the baseline itself isn't part of this
+    diff); a reconstruction failure sets ``head_unreadable`` rather than
+    guessing.
 
     Advisories are read best-effort, with "log file doesn't exist"
     (``advisory_log_exists`` False) distinguished from "log exists but
@@ -57,29 +67,39 @@ def _build_attachment_budget_section(self, diff: str, pr_number: int) -> str:
     file; and only when NEITHER channel is available does
     ``advisories_unavailable`` fire the "log not available" NOTE.
     """
-    marker_path = self.repo_root / attachment_baseline.BASELINE_FILENAME
-    if not marker_path.is_file():
-        return ""
 
-    changed_files = _diff_content_signature(diff).changed_files
-    baseline_touched = attachment_baseline.BASELINE_FILENAME in changed_files
+    # Helpers are nested, not module-level: every top-level def in an
+    # orchestration module is installed onto OrchestratorApp by
+    # workflow_delegation._install_delegates, so a module-level helper
+    # would silently grow the class's conserved member surface.
+    def _head_document_for_dir_baseline(
+        base_files: dict[str, str] | None,
+    ) -> tuple[dict[str, object] | None, bool]:
+        """Reconstruct the PR-head baseline document for a directory
+        baseline: ``(document, head_unreadable)``. ``head_unreadable`` is
+        True only when the diff can't be applied to the base snapshot at
+        all (the caller renders a "could not evaluate" NOTE); a
+        reconstructed map that merely fails schema validation degrades to
+        ``None`` -- treated as an empty document downstream, same as an
+        absent baseline.
+        """
+        if base_files is None:
+            return None, True
+        head_files = reconstruct_baseline_dir_head(
+            base_files, diff, dir_prefix=attachment_baseline.BASELINE_DIRNAME
+        )
+        if head_files is None:
+            return None, True
+        try:
+            return attachment_baseline_dir.load_files(head_files), False
+        except attachment_baseline.TamperError:
+            return None, False
 
-    try:
-        base_document = attachment_baseline.load(marker_path)
-        base_entries = attachment_baseline.entries_of(base_document)
-    except (attachment_baseline.TamperError, OSError):
-        base_entries = ()
-    hosts_baselined = changed_files & {entry.file for entry in base_entries}
-
-    if not (baseline_touched or hosts_baselined):
-        return ""
-
-    try:
-        base_baseline_text: str | None = marker_path.read_text(encoding="utf-8")
-    except OSError:
-        base_baseline_text = None
-
-    if baseline_touched:
+    def _head_document_for_file_baseline(
+        base_text: str | None,
+    ) -> tuple[dict[str, object] | None, bool]:
+        """Reconstruct the PR-head baseline document for the legacy single
+        file -- same ``(document, head_unreadable)`` contract as above."""
         file_diff_lines: list[str] = []
         is_new_baseline_file = False
         for name, is_new, hunks in iter_diff_files(diff):
@@ -87,16 +107,59 @@ def _build_attachment_budget_section(self, diff: str, pr_number: int) -> str:
                 file_diff_lines = hunks
                 is_new_baseline_file = is_new
                 break
-        head_baseline_text = reconstruct_baseline_head_text(
-            None if is_new_baseline_file else base_baseline_text,
+        head_text = reconstruct_baseline_head_text(
+            None if is_new_baseline_file else base_text,
             "\n".join(file_diff_lines),
         )
-    else:
-        # Baseline file itself untouched by this diff: its head content
-        # is its base content.
-        head_baseline_text = base_baseline_text
+        if head_text is None:
+            return None, True
+        try:
+            return attachment_baseline.loads(head_text), False
+        except attachment_baseline.TamperError:
+            return None, False
 
-    if baseline_touched and head_baseline_text is None:
+    marker_path = attachment_baseline_dir.find_baseline(self.repo_root)
+    if marker_path is None:
+        return ""
+    is_dir_baseline = marker_path.name == attachment_baseline.BASELINE_DIRNAME
+
+    changed_files = _diff_content_signature(diff).changed_files
+    if is_dir_baseline:
+        dir_prefix = attachment_baseline.BASELINE_DIRNAME + "/"
+        baseline_touched = any(path.startswith(dir_prefix) for path in changed_files)
+    else:
+        baseline_touched = attachment_baseline.BASELINE_FILENAME in changed_files
+
+    try:
+        base_document: dict[str, object] | None = attachment_baseline_dir.load(marker_path)
+        base_entries = attachment_baseline.entries_of(base_document)
+    except (attachment_baseline.TamperError, OSError):
+        base_document = None
+        base_entries = ()
+    hosts_baselined = changed_files & {entry.file for entry in base_entries}
+
+    if not (baseline_touched or hosts_baselined):
+        return ""
+
+    head_unreadable = False
+    if not baseline_touched:
+        # Baseline itself untouched by this diff: its head content is its
+        # base content.
+        head_document = base_document
+    elif is_dir_baseline:
+        try:
+            base_files: dict[str, str] | None = attachment_baseline_dir.read_files(marker_path)
+        except (attachment_baseline.TamperError, OSError):
+            base_files = None
+        head_document, head_unreadable = _head_document_for_dir_baseline(base_files)
+    else:
+        try:
+            base_text: str | None = marker_path.read_text(encoding="utf-8")
+        except OSError:
+            base_text = None
+        head_document, head_unreadable = _head_document_for_file_baseline(base_text)
+
+    if head_unreadable:
         section = BudgetSection(
             bumps=(),
             blocking_bumps=(),
@@ -130,11 +193,11 @@ def _build_attachment_budget_section(self, diff: str, pr_number: int) -> str:
         # contracts tool's redirect destination) to keep
         # ``OrchestratorApp`` at its baselined member-count ceiling.
         ratchetable = compute_ratchetable_points(
-            self.repo_root, diff, head_baseline_text, hosts_baselined, changed_files
+            self.repo_root, diff, head_document, hosts_baselined, changed_files
         )
         section = build_budget_findings(
-            base_baseline_text=base_baseline_text,
-            head_baseline_text=head_baseline_text,
+            base_document=base_document,
+            head_document=head_document,
             changed_files=changed_files,
             baseline_touched=baseline_touched,
             advisories=advisories,

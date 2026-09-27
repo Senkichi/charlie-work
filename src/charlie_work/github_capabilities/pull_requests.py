@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 # ``ci_fleet.github.GitHubError`` is imported directly here, not re-derived
@@ -79,7 +80,11 @@ from ._base import CapabilityCollaborator, GitHubRunResult, _is_mutating, _LIST_
 # edit history, so refusal is the only safe failure. ``outbound_body_guard``
 # imports only layout/instrumentation (deferred) -- no ``charlie_work.github``
 # dependency, so this adds no cycle.
-from ..outbound_body_guard import OutboundBodyGuardError, check_outbound_write
+from ..outbound_body_guard import (
+    OutboundBodyGuardError,
+    check_outbound_write,
+    refusal_summary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +207,8 @@ class PullRequestsLike(Protocol):
     """Structural interface for pull-request read/create operations."""
 
     def pr_create(self, head: str, base: str, title: str, body: str) -> int | None: ...
+
+    def pr_edit(self, number: int, body_file: Path) -> None: ...
 
     def pr_view(self, number: int, *, fields: str = ...) -> dict[str, Any]: ...
 
@@ -348,6 +355,39 @@ class PullRequests(CapabilityCollaborator):
                 str(result.value or "")[:500],
             )
         return number
+
+    def pr_edit(self, number: int, body_file: Path) -> None:
+        """Replace a PR's body from ``body_file`` (issue #1853).
+
+        Used by the rework-outcome lane: a credential-free worker drafts the
+        body update in ``.worker-outcome.json`` and the orchestrator applies
+        it here. Same fail-closed secret guard as ``pr_comment`` — a
+        credential in a PR body survives deletion via edit history, so the
+        scan runs on the file before ``gh`` is invoked, and refusal raises
+        ``GitHubError`` (the caller-visible failure vocabulary). The body
+        file must be readable; an unreadable file refuses rather than letting
+        gh discover it. Guard skipped under ``dry_run`` -- nothing is
+        written, so there is nothing to guard (``run`` itself short-circuits
+        the mutating ``gh pr edit`` under dry-run via ``_is_mutating``).
+        """
+        if not self.dry_run:
+            try:
+                body = body_file.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise GitHubError(f"pr_edit #{number}: cannot read body file: {exc}") from exc
+            try:
+                matches = check_outbound_write(
+                    surface="pr_edit",
+                    parts=(("body", body),),
+                    repo_root=self.repo_root,
+                    state_dir=getattr(self.runtime, "state_dir", None),
+                    pr_number=number,
+                )
+            except OutboundBodyGuardError as exc:
+                raise GitHubError(f"pr_edit #{number}: {exc}") from exc
+            if matches:
+                raise GitHubError(refusal_summary("pr_edit", matches))
+        self.run(["pr", "edit", str(number), "--body-file", str(body_file)])
 
     def pr_list(self) -> list[dict[str, Any]]:
         cache_key = ("pr_list",)

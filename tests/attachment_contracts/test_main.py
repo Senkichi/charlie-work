@@ -15,13 +15,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from charlie_work.attachment_contracts import baseline_dir
 from charlie_work.attachment_contracts.__main__ import main
-from charlie_work.attachment_contracts.baseline import (
-    BASELINE_FILENAME,
-    dump,
-    generate,
-    load,
-)
+from charlie_work.attachment_contracts.baseline import BASELINE_DIRNAME, generate
 from charlie_work.attachment_contracts.check import check_tree
 from charlie_work.attachment_contracts.excludes import load_excludes
 from charlie_work.attachment_contracts.archetypes import scan_tree
@@ -64,7 +60,11 @@ def _freeze_baseline(root: Path, generated_at: str = "t1") -> None:
     kinds = sorted({p.kind for p in scan.points})
     verdicts = saturate_all(scan.points, kinds)
     document = generate(verdicts, generated_by="test", generated_at=generated_at, floor=4)
-    dump(document, root / BASELINE_FILENAME)
+    baseline_dir.dump(document, root / BASELINE_DIRNAME)
+
+
+def _load_baseline(root: Path) -> dict:
+    return baseline_dir.load(root / BASELINE_DIRNAME)
 
 
 def test_baseline_refreeze_recomputes_kind_stats_and_passes_check_tree(
@@ -78,7 +78,7 @@ def test_baseline_refreeze_recomputes_kind_stats_and_passes_check_tree(
 
     # The committed baseline at the base ref -- what CI hands check_tree via
     # ``check-tree --base-ref``.
-    previous = load(tmp_path / BASELINE_FILENAME)
+    previous = _load_baseline(tmp_path)
     assert previous["kind_stats"]["class"]["boundary"] == 17.0
 
     # Grow the tree so the live fence rises while every frozen entry stays
@@ -95,7 +95,7 @@ def test_baseline_refreeze_recomputes_kind_stats_and_passes_check_tree(
     assert rc == 0
     assert "refrozen baseline written" in capsys.readouterr().out
 
-    refrozen = load(tmp_path / BASELINE_FILENAME)
+    refrozen = _load_baseline(tmp_path)
     # A generation event re-stamps generated_at and recomputes the frozen
     # fence from the LIVE population.
     assert refrozen["generated_at"] != "t1"
@@ -126,4 +126,4 @@ def test_baseline_refreeze_without_existing_baseline_fails(tmp_path: Path, capsy
 
     assert rc == 1
     assert "no baseline" in capsys.readouterr().err
-    assert not (tmp_path / BASELINE_FILENAME).exists()
+    assert baseline_dir.find_baseline(tmp_path) is None

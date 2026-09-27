@@ -1,7 +1,7 @@
 """Issue #1810: per-pass ``loop()`` lanes gated on ``publishes_pull_requests``.
 
 On a ``local_issues`` repo (``LocalFileGitHub`` --
-``publishes_pull_requests = False``), three per-pass steps assumed a
+``publishes_pull_requests = False``), two per-pass steps assumed a
 GitHub/PR-capable backend and fired a failure/warning event every single
 pass:
 
@@ -11,23 +11,23 @@ pass:
 * ``_maybe_reclaim_superseded_main_ci`` ->
   ``reclaim_superseded_main_ci_runs`` -> ``git fetch origin`` fails (no
   origin remote exists) -- recorded as ``main_ci_reclaim_failed`` (WARNING).
-* ``_dispatch_impl``'s worker-GitHub-token gate ->
-  ``worker_github_token_findings`` emits ``worker_token_missing`` (WARNING,
-  once) -- meaningless on a backend where no worker can ever push or open a
-  PR.
 
 Each step is now skipped on the existing
 ``local_work_park.publishes_pull_requests`` capability predicate -- the same
 one ``dead_worker_reap`` consults -- rather than surviving its own failure
 per call site. The two ``_maybe_*`` lanes live in
 ``orchestration/state_pr_capability_lanes.py`` (a delegate leaf extracted
-from ``state_maintenance`` for the file-size ratchet); the dispatch token
-probe reaches the predicate through
-``local_work_park.worker_github_token_findings_if_publishing``. These tests run
+from ``state_maintenance`` for the file-size ratchet). These tests run
 one ``loop()`` pass per backend and assert on the patched callees: never
 invoked on the non-publishing backend, and invoked on the publishing
 control (proving the skip is conditional on the capability, not the lane
 being deleted outright).
+
+(A third lane used to live here: the #1001 worker-GitHub-token dispatch
+probe. Issue #1853 retired it outright -- workers are credential-free by
+design, so a missing ``worker_env`` token is not a defect on ANY backend.
+The publishing-backend control below now asserts the event is never
+emitted even with ``require_worker_github_token=True`` still set.)
 """
 
 from __future__ import annotations
@@ -39,7 +39,6 @@ from unittest.mock import Mock
 
 import pytest
 
-import charlie_work.local_work_park as local_work_park_module
 import charlie_work.workflow as workflow_module
 from _fakes_github import FakeGitHub
 from charlie_work.config import (
@@ -50,7 +49,6 @@ from charlie_work.config import (
     ReconcilePassConfig,
     WorkerRoleConfig,
 )
-from charlie_work.env_sanitize import worker_github_token_findings
 from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.main_ci_reclaim import MainCiReclaimResult
 from charlie_work.paths import runtime_paths
@@ -100,9 +98,10 @@ def _init_repo(repo_root: Path) -> None:
 
 def _config(*, local_enabled: bool) -> OrchestratorConfig:
     """Arms every lane this issue gates: ``reconcile_pass`` and
-    ``main_ci_reclaim`` on their production-enabled settings, and a live
-    worker-token gate (``devin-shell`` harness with no ``worker_env`` token,
-    hard-refusal on) so a publishing backend WOULD escalate and defer."""
+    ``main_ci_reclaim`` on their production-enabled settings. The retired
+    ``require_worker_github_token`` flag is deliberately left set -- issue
+    #1853 made it a no-op, so even a config that still carries it must
+    dispatch normally with no ``worker_token_missing`` event."""
     return OrchestratorConfig(
         reconcile_pass=ReconcilePassConfig(enabled=True, interval_minutes=30),
         main_ci_reclaim=MainCiReclaimConfig(enabled=True, workflow_filename="ci.yml"),
@@ -112,17 +111,12 @@ def _config(*, local_enabled: bool) -> OrchestratorConfig:
     )
 
 
-def _patch_lane_callees(monkeypatch: pytest.MonkeyPatch) -> tuple[Mock, Mock, Mock]:
-    """Spy on the three callees each gate must skip or reach.
+def _patch_lane_callees(monkeypatch: pytest.MonkeyPatch) -> tuple[Mock, Mock]:
+    """Spy on the two callees each gate must skip or reach.
 
     ``_reconcile_locked`` is patched on the class (``_maybe_reconcile_drift``
     calls ``self._reconcile_locked``), ``reclaim_superseded_main_ci_runs`` on
-    the ``workflow`` facade (the lane reaches it through ``_wf.``), and
-    ``worker_github_token_findings`` on ``local_work_park``'s import binding
-    (``_dispatch_impl`` calls the gated helper
-    ``worker_github_token_findings_if_publishing``, which resolves the probe in
-    that module's namespace). The findings spy wraps the real predicate so
-    the positive control still exercises the real escalation path.
+    the ``workflow`` facade (the lane reaches it through ``_wf.``).
     """
     reconcile_locked = Mock(return_value=CommandResult(True, "reconciled", {}))
     reclaim = Mock(
@@ -130,21 +124,19 @@ def _patch_lane_callees(monkeypatch: pytest.MonkeyPatch) -> tuple[Mock, Mock, Mo
             ok=True, tip_sha="tip", candidates_checked=0, cancelled=()
         )
     )
-    token_findings = Mock(wraps=worker_github_token_findings)
     monkeypatch.setattr(OrchestratorApp, "_reconcile_locked", reconcile_locked)
     monkeypatch.setattr(workflow_module, "reclaim_superseded_main_ci_runs", reclaim)
-    monkeypatch.setattr(local_work_park_module, "worker_github_token_findings", token_findings)
-    return reconcile_locked, reclaim, token_findings
+    return reconcile_locked, reclaim
 
 
 def test_loop_pass_skips_pr_shaped_lanes_on_non_publishing_backend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """On a ``LocalFileGitHub`` (``publishes_pull_requests = False``), one
-    ``loop()`` pass must not reach ``_reconcile_locked``,
-    ``reclaim_superseded_main_ci_runs``, or ``worker_github_token_findings``
-    at all -- and must emit none of the three noise events -- even with
-    every lane's own enable knob armed as production runs them."""
+    ``loop()`` pass must not reach ``_reconcile_locked`` or
+    ``reclaim_superseded_main_ci_runs`` at all -- and must emit none of the
+    noise events -- even with every lane's own enable knob armed as
+    production runs them."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
     config = _config(local_enabled=True)
@@ -157,13 +149,12 @@ def test_loop_pass_skips_pr_shaped_lanes_on_non_publishing_backend(
     )
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     app = OrchestratorApp(repo_root, paths, config, gh)
-    reconcile_locked, reclaim, token_findings = _patch_lane_callees(monkeypatch)
+    reconcile_locked, reclaim = _patch_lane_callees(monkeypatch)
 
     result = app.loop()
 
     reconcile_locked.assert_not_called()
     reclaim.assert_not_called()
-    token_findings.assert_not_called()
 
     assert result.ok is True
     state = load_state(paths.state_file)
@@ -178,9 +169,14 @@ def test_loop_pass_runs_pr_shaped_lanes_on_publishing_backend(
 ) -> None:
     """Positive control: a backend that publishes PRs (``FakeGitHub`` -- no
     ``publishes_pull_requests`` attribute, so the predicate defaults True)
-    must still run all three lanes under the same armed config, or the skip
-    would be unconditional. Empty issues/PRs keep the pass cheap; all three
-    gates sit ahead of any candidate fetch."""
+    must still run both lanes under the same armed config, or the skip
+    would be unconditional. Empty issues/PRs keep the pass cheap; both
+    gates sit ahead of any candidate fetch.
+
+    Issue #1853 addendum: the retired ``require_worker_github_token=True``
+    in ``_config`` must NOT produce a ``worker_token_missing`` event or a
+    dispatch deferral -- the gate is gone on every backend, publishing or
+    not."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
     config = _config(local_enabled=False)
@@ -189,17 +185,14 @@ def test_loop_pass_runs_pr_shaped_lanes_on_publishing_backend(
     gh.prs = []
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     app = OrchestratorApp(repo_root, paths, config, gh)
-    reconcile_locked, reclaim, token_findings = _patch_lane_callees(monkeypatch)
+    reconcile_locked, reclaim = _patch_lane_callees(monkeypatch)
 
     app.loop()
 
     reconcile_locked.assert_called_once()
     reclaim.assert_called_once()
-    token_findings.assert_called_once()
 
     state = load_state(paths.state_file)
     kinds = {e.get("kind") for e in state.get("events", [])}
     assert "reconcile_pass_completed" in kinds
-    # The wrapped real predicate still fires the escalation on a backend
-    # where workers do push/open PRs.
-    assert "worker_token_missing" in kinds
+    assert "worker_token_missing" not in kinds

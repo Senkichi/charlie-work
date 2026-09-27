@@ -1,0 +1,10 @@
+warning
+# Issue #1859: dead-man's switch for the notify file sink. Fires at most
+# once per staleness-bound interval while the digest stays stale (bound:
+# NOTIFY_DIGEST_STALE_HOURS = 72h, sized from the daemon digest's measured
+# healthy-gap max of 47.1h) -- the writer-dead shape the daemon hid for
+# three weeks. The interval re-fire keeps a fresh event inside the
+# heartbeat consumer's lookback window for the whole episode. Warning, not
+# error: a quiet-but-healthy fleet can legitimately emit no attention
+# transitions for days, so this is a tripwire for an operator to
+# investigate, not a proven outage.

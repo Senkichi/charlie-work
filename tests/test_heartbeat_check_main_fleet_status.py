@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from _heartbeat_check_fixtures import _load_heartbeat_check
+from charlie_work.config import RuntimeConfig
 
 
 @pytest.fixture(scope="module")
@@ -216,6 +217,40 @@ def _fleet_status_payload(*, cache_age_seconds: float | None) -> str:
     )
 
 
+def _fleet_status_payload_multi(*, repo_ages: dict[str, float]) -> str:
+    """Build a ``charlie fleet status --json`` payload with several repos.
+
+    ``repo_ages`` maps slug -> served ``cache_age_seconds``; dict insertion
+    order is preserved in the JSON, so a test controls which stale repo the
+    payload lists first.
+    """
+    repos = {
+        slug: {
+            "ready_issue_count": 1,
+            "blocked": [{"issue": 42, "blockers": []}],
+            "cache_age_seconds": age,
+        }
+        for slug, age in repo_ages.items()
+    }
+    return json.dumps({"ok": True, "message": "fleet status", "data": {"repos": repos}})
+
+
+def test_status_cache_stale_seconds_exceeds_default_serving_ttl(hb: ModuleType) -> None:
+    """Issue #1886: ``STATUS_CACHE_STALE_SECONDS`` must sit strictly above
+    the producer's default serving TTL. ``read_status_snapshot`` only
+    serves a snapshot whose age is <=
+    ``runtime.status_snapshot_ttl_seconds``, so a threshold at or below
+    that default flags routine healthy refresh cadence on every repo —
+    exactly the pairing #1464 shipped (600s inside the 900s ceiling).
+    Pinning the ordering here makes CI, not a code comment, stop the two
+    numbers from being re-paired in the wrong order again."""
+    ttl = RuntimeConfig().status_snapshot_ttl_seconds
+    assert hb.STATUS_CACHE_STALE_SECONDS > ttl, (
+        f"STATUS_CACHE_STALE_SECONDS={hb.STATUS_CACHE_STALE_SECONDS}s must exceed "
+        f"the default status_snapshot_ttl_seconds={ttl}s"
+    )
+
+
 def test_get_blocked_issue_numbers_warns_on_stale_cache(
     hb: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -223,15 +258,66 @@ def test_get_blocked_issue_numbers_warns_on_stale_cache(
     ``cache_age_seconds`` and return a staleness warning when the cache is
     older than ``STATUS_CACHE_STALE_SECONDS``. The blocked data is still
     returned (it is the best available) — only the error string signals
-    degradation so downstream checks annotate their output."""
-    payload = _fleet_status_payload(cache_age_seconds=900.0)
+    degradation so downstream checks annotate their output.
+
+    Issue #1886 note: a 1900s served age is only reachable when a
+    deployment widens ``runtime.status_snapshot_ttl_seconds`` past the
+    900s default — under default config ``read_status_snapshot`` falls
+    back to a live compute (``cache_age_seconds=None``) long before
+    serving anything this old."""
+    payload = _fleet_status_payload(cache_age_seconds=1900.0)
     monkeypatch.setattr(hb.subprocess, "run", lambda *a, **k: _FakeStatusProc(stdout=payload))
 
     blocked, err = hb.get_blocked_issue_numbers(tmp_path)
 
     assert blocked == {"owner/repo": {42}}, "blocked data must still be returned"
     assert "stale" in err.lower(), f"expected staleness warning in err; got: {err!r}"
-    assert "900" in err, f"expected cache age in warning; got: {err!r}"
+    assert "1900" in err, f"expected cache age in warning; got: {err!r}"
+    # Issue #1886: the warning names the repo whose snapshot drove it.
+    assert "owner/repo" in err, f"expected offending repo slug in warning; got: {err!r}"
+
+
+def test_get_blocked_issue_numbers_no_warning_within_serving_ttl(
+    hb: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1886: a served snapshot's age is bounded by the producer's own
+    freshness contract — ``read_status_snapshot`` only serves a snapshot
+    whose age is <= ``runtime.status_snapshot_ttl_seconds`` — so an age at
+    the very top of that band is routine healthy refresh cadence, not
+    degradation. The 881s age this issue observed firing on every repo,
+    every tick sits in that band (default TTL 900s); the age is derived
+    from the TTL itself so the test still pins the strongest servable bound
+    if the default moves."""
+    served_age = float(RuntimeConfig().status_snapshot_ttl_seconds)
+    payload = _fleet_status_payload(cache_age_seconds=served_age)
+    monkeypatch.setattr(hb.subprocess, "run", lambda *a, **k: _FakeStatusProc(stdout=payload))
+
+    blocked, err = hb.get_blocked_issue_numbers(tmp_path)
+
+    assert blocked == {"owner/repo": {42}}
+    assert err == "", f"served age inside the producer's serving TTL must not warn; got: {err!r}"
+
+
+def test_get_blocked_issue_numbers_warns_names_worst_offender_repo(
+    hb: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1886: when several repos serve over-threshold snapshots, the
+    warning names the worst offender — the repo with the largest
+    ``cache_age_seconds`` — not whichever stale repo the payload lists
+    first. ``owner/repo-a`` (1900s) precedes ``owner/repo-b`` (2500s) in the
+    payload, so a regression to 'first stale repo' picks repo-a and fails
+    here."""
+    payload = _fleet_status_payload_multi(
+        repo_ages={"owner/repo-a": 1900.0, "owner/repo-b": 2500.0}
+    )
+    monkeypatch.setattr(hb.subprocess, "run", lambda *a, **k: _FakeStatusProc(stdout=payload))
+
+    blocked, err = hb.get_blocked_issue_numbers(tmp_path)
+
+    assert blocked == {"owner/repo-a": {42}, "owner/repo-b": {42}}
+    assert "2500" in err, f"expected worst-offender age in warning; got: {err!r}"
+    assert "owner/repo-b" in err, f"expected worst-offender slug in warning; got: {err!r}"
+    assert "owner/repo-a" not in err, f"warning must name only the worst offender; got: {err!r}"
 
 
 def test_get_blocked_issue_numbers_no_warning_on_fresh_cache(

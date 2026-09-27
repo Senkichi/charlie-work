@@ -109,6 +109,11 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     "orphan_redispatch_head_sha",
     "orphan_redispatch_at",
     "orphan_redispatch_counted_dispatch",
+    # Issue #1917: the dead worker's failure classification must not
+    # survive a re-arm — a stale provider-throttle kind would otherwise
+    # exempt a later, genuinely different death from the orphan-sweep
+    # timed reap and redispatch cap.
+    "dead_worker_failure_kind",
     "escalation_reason",
     # Issue #1461: clear the append-only escalation history so a re-arm
     # gives every lane a genuinely fresh dedup slate.

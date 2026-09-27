@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work import rework_outcome as _rework_outcome
 
 
 def _route_rework_candidate_to_review(
@@ -51,6 +52,24 @@ def _route_rework_candidate_to_review(
     retries — the block is often transient (e.g. a merge-train branch
     sync resolving a conflict).
     """
+    # Issue #1853: a credential-free rework worker cannot run ``gh`` itself,
+    # so any PR body/comment update it wants is drafted in
+    # ``.worker-outcome.json``. Apply it here -- after the head-advance
+    # checks upstream already proved the worker pushed, and before review()
+    # regenerates the packet -- so the packet sees the post-edit PR state
+    # and a janitor-blocked (retried) route still lands the edits. The
+    # helper verifies the reported head against the live remote head and
+    # dedups per head, so a retried pass never double-posts.
+    _rework_outcome.apply_rework_worker_outcome(
+        self.gh,
+        repo_root=self.repo_root,
+        worktrees_dir=self._layout.worktrees,
+        sessions_dir=self._layout.sessions_dir,
+        state_file=self.paths.state_file,
+        write_gate=self.write_gate,
+        issue_number=issue_number,
+        pr_number=pr_number,
+    )
     review_result = self.review(pr_number)
     routed = False
     # review() can now return ok=True for a reason OTHER than "a fresh

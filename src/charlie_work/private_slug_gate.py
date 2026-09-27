@@ -16,7 +16,7 @@ concurrent PRs into merge conflicts).  There is no stored ``total``: the
 check derives it from the diff, and a PR that adds a net-new mention MUST
 raise the matching ``.count`` entries by at least the net-new count -- that
 bump is tamper-evident in diff review, the same way
-``.attachment-budgets.json`` bumps are.  Without the bump, the gate fails;
+``.attachment-budgets/`` entry bumps are.  Without the bump, the gate fails;
 with it, a reviewer sees both the new mention and the baseline increase in
 the same diff and can ask why.
 

@@ -1,0 +1,7 @@
+issue #1912: shared infra-failure remediation driver (bounded gh run rerun
+plus cap-exhaustion escalation), extracted from review()'s issue-#841 block
+so merge_ready()'s carried-forward-verdict lane drives the identical
+mechanics. Net-new OrchestratorApp member declared here so the
+member-surface conservation check in tests/test_workflow_delegation_l00.py
+subtracts it before comparing moved delegates against the pre-campaign
+total (133).

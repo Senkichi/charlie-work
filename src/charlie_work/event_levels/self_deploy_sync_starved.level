@@ -1,0 +1,7 @@
+warning
+# Issue #1855: a deferred self-deploy `uv sync` stayed pending past
+# supervisor.dependency_sync_starvation_seconds because fleet workers were
+# continuously live; the supervisor now suppresses new dispatch until the
+# fleet drains to zero and the sync can land. Operator-visible -- the
+# checked-out code and the venv disagree for the whole episode -- but a
+# warning, not an error: the drain is the system working as designed.

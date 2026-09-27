@@ -2,11 +2,12 @@
 
 Mirrors ``tests/test_module_map.py``'s fail-soft pattern:
 
-* Marker file absent -> empty clause, no warning event (this feature is
-  opt-in per repo, gated purely on `.attachment-budgets.json` presence).
-* Marker file present and structurally valid -> the static placement clause,
+* Baseline absent -> empty clause, no warning event (this feature is
+  opt-in per repo, gated purely on `.attachment-budgets/` presence, with
+  the legacy `.attachment-budgets.json` still honored).
+* Baseline present and structurally valid -> the static placement clause,
   containing the ``check-file`` command a worker is told to run.
-* Marker file present but malformed -> empty clause plus a
+* Baseline present but malformed -> empty clause plus a
   ``worker_attachment_budget_failed`` warning event in events.db.
 """
 
@@ -15,7 +16,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from charlie_work.attachment_contracts.baseline import BASELINE_FILENAME, dumps, generate
+from charlie_work.attachment_contracts import baseline_dir
+from charlie_work.attachment_contracts.baseline import BASELINE_DIRNAME, dumps, generate
 from charlie_work.config import OrchestratorConfig
 from charlie_work.instrumentation import _LEVEL_BY_KIND
 from charlie_work.paths import runtime_paths
@@ -53,7 +55,7 @@ def test_marker_absent_yields_empty_clause_no_event(tmp_path: Path) -> None:
 
 def test_marker_valid_yields_nonempty_clause_with_check_file(tmp_path: Path) -> None:
     baseline_doc = generate((), generated_by="test", generated_at="2026-08-25T00:00:00Z", floor=1)
-    (tmp_path / BASELINE_FILENAME).write_text(dumps(baseline_doc), encoding="utf-8")
+    baseline_dir.dump(baseline_doc, tmp_path / BASELINE_DIRNAME)
     app = _app(tmp_path)
 
     value = app._build_attachment_budget_value(issue_number=2)
@@ -74,7 +76,7 @@ def test_marker_valid_clause_instructs_worker_to_post_advisories_comment(
     from charlie_work.attachment_contracts.hook_entry import ADVISORY_COMMENT_MARKER
 
     baseline_doc = generate((), generated_by="test", generated_at="2026-08-25T00:00:00Z", floor=1)
-    (tmp_path / BASELINE_FILENAME).write_text(dumps(baseline_doc), encoding="utf-8")
+    baseline_dir.dump(baseline_doc, tmp_path / BASELINE_DIRNAME)
     app = _app(tmp_path)
 
     value = app._build_attachment_budget_value(issue_number=2)
@@ -90,7 +92,9 @@ def test_marker_valid_clause_instructs_worker_to_post_advisories_comment(
 
 
 def test_marker_malformed_yields_empty_clause_and_warning_event(tmp_path: Path) -> None:
-    (tmp_path / BASELINE_FILENAME).write_text("not valid json {{{", encoding="utf-8")
+    meta_path = tmp_path / BASELINE_DIRNAME / "meta.json"
+    meta_path.parent.mkdir(parents=True)
+    meta_path.write_text("not valid json {{{", encoding="utf-8")
     app = _app(tmp_path)
 
     value = app._build_attachment_budget_value(issue_number=3)
@@ -104,13 +108,13 @@ def test_marker_malformed_yields_empty_clause_and_warning_event(tmp_path: Path) 
 
 
 def test_marker_wrong_schema_version_yields_empty_clause_and_warning(tmp_path: Path) -> None:
-    """A structurally-valid JSON object that fails baseline.load's own
-    version check (TamperError) must also be treated as malformed."""
+    """A structurally-valid meta.json that fails the loader's own version
+    check (TamperError) must also be treated as malformed."""
     import json
 
-    (tmp_path / BASELINE_FILENAME).write_text(
-        json.dumps({"version": 999, "entries": []}), encoding="utf-8"
-    )
+    meta_path = tmp_path / BASELINE_DIRNAME / "meta.json"
+    meta_path.parent.mkdir(parents=True)
+    meta_path.write_text(json.dumps({"version": 999}), encoding="utf-8")
     app = _app(tmp_path)
 
     value = app._build_attachment_budget_value(issue_number=4)
@@ -118,6 +122,19 @@ def test_marker_wrong_schema_version_yields_empty_clause_and_warning(tmp_path: P
     assert value == ""
     rows = _events_with_kind(app.paths, "worker_attachment_budget_failed")
     assert len(rows) == 1
+
+
+def test_legacy_file_marker_still_activates_clause(tmp_path: Path) -> None:
+    """Pre-#1839 checkouts carry only `.attachment-budgets.json`; the
+    marker gate must still find and validate it."""
+    baseline_doc = generate((), generated_by="test", generated_at="2026-08-25T00:00:00Z", floor=1)
+    (tmp_path / ".attachment-budgets.json").write_text(dumps(baseline_doc), encoding="utf-8")
+    app = _app(tmp_path)
+
+    value = app._build_attachment_budget_value(issue_number=5)
+
+    assert value != ""
+    assert "check-file" in value
 
 
 def test_worker_attachment_budget_failed_registered_as_warning() -> None:

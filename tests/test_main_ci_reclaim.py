@@ -24,9 +24,11 @@ from charlie_work.github import GitHubRunResult
 from charlie_work.main_ci_reclaim import (
     _is_strict_ancestor,
     _object_exists,
+    _origin_https_rewrite_args,
+    _ssh_remote_url_to_https,
     reclaim_superseded_main_ci_runs,
 )
-from charlie_work.subprocess_runner import run_captured
+from charlie_work.subprocess_runner import RunResult, run_captured
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -331,6 +333,144 @@ def test_reclaim_fetch_attempts_defaults_to_one_without_retry(
     result = reclaim_superseded_main_ci_runs(gh, repo_root)
     assert result.ok is True
     assert result.fetch_attempts == 1
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # scp-like SSH form -- the shape issue #1885's events show failing.
+        ("git@github.com:owner/repo.git", "https://github.com/owner/repo.git"),
+        ("git@github.com:owner/repo", "https://github.com/owner/repo"),
+        ("github.com:owner/repo.git", "https://github.com/owner/repo.git"),
+        ("git@ghe.corp.internal:owner/repo.git", "https://ghe.corp.internal/owner/repo.git"),
+        # Explicit ssh:// scheme, with and without user/port.
+        ("ssh://git@github.com/owner/repo.git", "https://github.com/owner/repo.git"),
+        ("ssh://git@github.com:2222/owner/repo.git", "https://github.com/owner/repo.git"),
+        ("ssh://github.com/owner/repo.git", "https://github.com/owner/repo.git"),
+        # Non-SSH forms pass through untouched.
+        ("https://github.com/owner/repo.git", None),
+        ("http://github.com/owner/repo.git", None),
+        ("git://github.com/owner/repo.git", None),
+        ("file:///srv/repos/repo.git", None),
+        ("/srv/repos/repo", None),
+        ("C:\\srv\\repos\\repo", None),
+        # SSH-shaped but not a dotted DNS name -- ssh-config alias or
+        # single-label host: rewriting could break a working setup, so the
+        # original SSH fetch is kept.
+        ("git@myhost:owner/repo.git", None),
+        ("myhost:owner/repo.git", None),
+        # Degenerate inputs.
+        ("git@github.com:", None),
+        ("ssh://git@github.com/", None),
+        ("ssh://git@github.com", None),
+        ("", None),
+    ],
+)
+def test_ssh_remote_url_to_https(url: str, expected: str | None) -> None:
+    assert _ssh_remote_url_to_https(url) == expected
+
+
+def test_origin_https_rewrite_args_rewrites_ssh_origin(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    _git(repo_root, "remote", "add", "origin", "git@github.com:owner/repo.git")
+    assert _origin_https_rewrite_args(repo_root) == [
+        "-c",
+        "url.https://github.com/owner/repo.git.insteadOf=git@github.com:owner/repo.git",
+    ]
+
+
+def test_origin_https_rewrite_args_leaves_https_origin_alone(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    _git(repo_root, "remote", "add", "origin", "https://github.com/owner/repo.git")
+    assert _origin_https_rewrite_args(repo_root) == []
+
+
+def test_origin_https_rewrite_args_no_origin(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    assert _origin_https_rewrite_args(repo_root) == []
+
+
+def test_origin_https_rewrite_args_local_path_origin(
+    repo_with_history: tuple[Path, str, str, str, str],
+) -> None:
+    """A cloned-from-local-path origin is not SSH-shaped -- no rewrite."""
+    repo_root, _c1, _c2, _c3, _d1 = repo_with_history
+    assert _origin_https_rewrite_args(repo_root) == []
+
+
+def test_reclaim_fetch_rewrites_ssh_origin_to_https(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1885: with an SSH-shaped ``origin`` URL the fetch must run over
+    HTTPS (the same credential-helper path every other orchestrator GitHub
+    operation uses) instead of requiring an ssh-agent -- while still naming
+    the ``origin`` remote so its configured refspec keeps updating
+    ``refs/remotes/origin/<branch>``.
+
+    The fake does NOT execute the command: the rewritten fetch would really
+    try to reach github.com, which a unit test must never do.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    tip_sha = _commit(repo_root, "tip")
+    _git(repo_root, "remote", "add", "origin", "git@github.com:owner/repo.git")
+
+    calls: list[list[str]] = []
+
+    def fake_run_git_with_retry(
+        command: list[str], *, cwd: Path, timeout_seconds: int, **_kwargs: Any
+    ) -> RunResult:
+        calls.append(command)
+        return RunResult(returncode=0, stdout="", stderr="", error=None)
+
+    monkeypatch.setattr(main_ci_reclaim_module, "run_git_with_retry", fake_run_git_with_retry)
+    gh = FakeGh(tip_commits={"main": {"sha": tip_sha}})
+    result = reclaim_superseded_main_ci_runs(gh, repo_root)
+
+    assert result.ok is True
+    assert calls == [
+        [
+            "git",
+            "-c",
+            "url.https://github.com/owner/repo.git.insteadOf=git@github.com:owner/repo.git",
+            "fetch",
+            "origin",
+            "main",
+        ]
+    ]
+
+
+def test_reclaim_fetch_disables_terminal_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The fetch must run with ``GIT_TERMINAL_PROMPT=0`` so a credential-less
+    HTTPS remote can never block a fleet pass on a username/password prompt
+    -- it must fail fast into the existing ``ok=False`` error path instead."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    tip_sha = _commit(repo_root, "tip")
+
+    seen_run_command: list[Any] = []
+
+    def fake_run_git_with_retry(
+        command: list[str], *, cwd: Path, timeout_seconds: int, **kwargs: Any
+    ) -> RunResult:
+        seen_run_command.append(kwargs.get("run_command"))
+        return RunResult(returncode=0, stdout="", stderr="", error=None)
+
+    monkeypatch.setattr(main_ci_reclaim_module, "run_git_with_retry", fake_run_git_with_retry)
+    gh = FakeGh(tip_commits={"main": {"sha": tip_sha}})
+    result = reclaim_superseded_main_ci_runs(gh, repo_root)
+
+    assert result.ok is True
+    assert len(seen_run_command) == 1
+    run_command = seen_run_command[0]
+    assert run_command is not None
+    assert run_command.func is run_captured
+    assert run_command.keywords == {"extra_env": {"GIT_TERMINAL_PROMPT": "0"}}
 
 
 def test_reclaim_wires_fetch_through_run_git_with_retry(

@@ -1,0 +1,8 @@
+{
+ "boundary": 34.5,
+ "bumps": [],
+ "file": "tests/test_citation_check.py",
+ "identity": "tests/test_citation_check.py::module",
+ "kind": "test_module",
+ "member_count": 37
+}

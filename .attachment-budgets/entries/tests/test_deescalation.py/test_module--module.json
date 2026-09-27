@@ -1,0 +1,8 @@
+{
+ "boundary": 28.5,
+ "bumps": [],
+ "file": "tests/test_deescalation.py",
+ "identity": "tests/test_deescalation.py::module",
+ "kind": "test_module",
+ "member_count": 29
+}

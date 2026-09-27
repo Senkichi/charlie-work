@@ -12,15 +12,17 @@ proposed content can't be determined (unrecognized tool, malformed payload,
 on-disk file, same as before -- so this is best-effort pre-edit feedback, not
 a guarantee; CI's full-tree check remains the real, authoritative gate.
 
-- No `.attachment-budgets.json` found walking up from the target file -> exit 0
-  silently (fast no-op outside piloted repos).
+- No `.attachment-budgets/` directory (or legacy `.attachment-budgets.json`)
+  found walking up from the target file -> exit 0 silently (fast no-op
+  outside piloted repos).
 - Unattended (`CHARLIE_FLEET_WORKER=1` or `CLAUDE_CODE_UNATTENDED=1`) -> ALWAYS
   advisory, never exit 2: print `{"hookSpecificOutput": {"additionalContext": ...}}`
   to stdout and best-effort append a marker line to
   `.var/attachment-contracts/advisories.jsonl`.
 - Interactive + mode=enforce -> exit 2 with the redirect message on stderr.
-- Mode source: `ATTACHMENT_CONTRACTS_MODE` env, else the baseline file's `mode`
-  key, else `"advise"`.
+- Mode source: `ATTACHMENT_CONTRACTS_MODE` env, else the baseline's `mode`
+  key (meta.json under the directory layout, the document itself for the
+  legacy file), else `"advise"`.
 """
 
 from __future__ import annotations
@@ -32,8 +34,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Mapping
 
-from charlie_work.attachment_contracts.baseline import BASELINE_FILENAME, TamperError
-from charlie_work.attachment_contracts.baseline import load as load_baseline
+from charlie_work.attachment_contracts import baseline_dir
+from charlie_work.attachment_contracts.baseline import TamperError
 from charlie_work.attachment_contracts.check import check_file
 from charlie_work.attachment_contracts.model import AdvisoryRecord, Finding
 
@@ -88,11 +90,16 @@ def _advisory_record_from_raw(raw: object) -> AdvisoryRecord | None:
 
 
 def _find_baseline_root(target: Path) -> Path | None:
-    """Walk upward from `target` looking for `.attachment-budgets.json`."""
+    """Walk upward from `target` looking for a committed baseline.
+
+    Either on-disk layout counts (issue #1839): the per-entry
+    ``.attachment-budgets/`` directory or the legacy
+    ``.attachment-budgets.json`` file.
+    """
     start = target if target.is_dir() else target.parent
     current = start.resolve()
     while True:
-        if (current / BASELINE_FILENAME).is_file():
+        if baseline_dir.find_baseline(current) is not None:
             return current
         parent = current.parent
         if parent == current:
@@ -108,8 +115,11 @@ def _resolve_mode(root: Path, env: Mapping[str, str]) -> str:
     override = env.get("ATTACHMENT_CONTRACTS_MODE")
     if override:
         return override
+    baseline_path = baseline_dir.find_baseline(root)
+    if baseline_path is None:
+        return "advise"
     try:
-        document = load_baseline(root / BASELINE_FILENAME)
+        document = baseline_dir.load(baseline_path)
     except (TamperError, OSError, ValueError):
         return "advise"
     mode = document.get("mode", "advise")

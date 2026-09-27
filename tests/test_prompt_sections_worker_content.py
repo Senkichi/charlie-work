@@ -148,7 +148,7 @@ def test_rework_prompt_includes_push_then_verify_final_step() -> None:
         prompt = rework_path.read_text(encoding="utf-8")
 
         # Verify the FINAL STEP section exists
-        assert "## FINAL STEP — push and verify" in prompt
+        assert "## FINAL STEP — push, verify, and report" in prompt
         # Verify the key instruction about local commits not being done
         assert "Committing locally is NOT done" in prompt
         # Verify the canonical targeted test command (operator directive
@@ -157,11 +157,18 @@ def test_rework_prompt_includes_push_then_verify_final_step() -> None:
         assert "test_<touched_module>" not in prompt
         # Verify the push instruction with RESOLVED branch name (from headRefName)
         assert "git push origin agent/issue-123-fix-search" in prompt
-        # Verify the PR head verification with RESOLVED PR number
-        assert "gh pr view 456 --json headRefOid" in prompt
-        # Verify the comparison instruction
-        assert "headRefOid" in prompt
+        # Issue #1853: no gh invocation — the worker verifies the push with
+        # git ls-remote and reports via .worker-outcome.json instead. Scoped
+        # to the FINAL STEP block: earlier sections legitimately PROHIBIT gh
+        # subcommands (the no-merge contract names `gh pr edit` for labels).
+        final_step = prompt.split("## FINAL STEP", 1)[-1]
+        assert "gh pr view" not in final_step
+        assert "gh pr edit" not in final_step
+        assert "gh pr comment" not in final_step
+        assert "git ls-remote origin agent/issue-123-fix-search" in prompt
         assert "git rev-parse HEAD" in prompt
+        assert '"head_sha"' in prompt
+        assert ".worker-outcome.json" in prompt
         # CRITICAL: assert NO unresolved $ placeholders remain anywhere. This is
         # narrower than a bare `"$" not in prompt` check: worker_sections
         # partials may legitimately contain a literal `$` that isn't a
@@ -347,16 +354,29 @@ def test_worker_and_rework_templates_contain_body_reconciliation_requirement() -
 
     This prevents silent drift where workers don't reconcile PR body claims with the final pushed head
     (issue #99). The mutation gate: removing the clause from any one template must fail this test.
+
+    Issue #1853: the rework worker cannot ``gh pr view`` to re-read the PR
+    body (credential-free by design), so rework.md's clause is phrased as
+    re-deriving the body for the outcome file rather than re-reading it —
+    the literal-truth requirement is identical.
     """
     prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
     body_reconciliation_text = "After verifying the push, re-read your PR body and make every claim literally true at the pushed head"
+    rework_reconciliation_text = (
+        "re-derive your PR body and make every claim literally true at the pushed head"
+    )
 
-    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+    for template_name in ("worker.md", "worker_claude_code.md"):
         text = (prompts_dir / template_name).read_text(encoding="utf-8")
         assert body_reconciliation_text in text, (
             f"Template {template_name} does not contain the body-reconciliation requirement. "
             f"Expected to find: {body_reconciliation_text}"
         )
+    rework_text = (prompts_dir / "rework.md").read_text(encoding="utf-8")
+    assert rework_reconciliation_text in rework_text, (
+        "Template rework.md does not contain the body-reconciliation requirement. "
+        f"Expected to find: {rework_reconciliation_text}"
+    )
 
 
 def test_worker_prompts_require_git_ls_remote_push_verification() -> None:
@@ -482,6 +502,29 @@ def test_worker_prompts_name_context_md_in_the_read_step() -> None:
         prompt = " ".join(_render_worker_with_sections(template_name).split())
         assert "`CONTEXT.md` (where present)" in prompt, (
             f"Rendered {template_name} does not name CONTEXT.md in its read step"
+        )
+
+
+def test_worker_prompts_hedge_repo_docs_in_the_read_step() -> None:
+    """Verify every worker template hedges CLAUDE.md's existence (issue #1821).
+
+    The read step already hedges ``CONTEXT.md`` with ``(where present)``;
+    ``CLAUDE.md`` (and ``CONTRIBUTING.md`` where a template names it) must
+    carry the same qualifier so a repo that lacks the file -- the common
+    case for ``local_issues`` targets, which have no GitHub remote -- is an
+    expected skip, not an unconditional read the worker must reconcile.
+    """
+    for template_name in ("worker.md", "worker_claude_code.md", "worker_local.md"):
+        prompt = " ".join(_render_worker_with_sections(template_name).split())
+        assert "`CLAUDE.md` (where present)" in prompt, (
+            f"Rendered {template_name} instructs an unconditional CLAUDE.md read"
+        )
+        assert "Read `CLAUDE.md`," not in prompt
+
+    for template_name in ("worker.md", "worker_local.md"):
+        prompt = " ".join(_render_worker_with_sections(template_name).split())
+        assert "`CONTRIBUTING.md` (where present)" in prompt, (
+            f"Rendered {template_name} instructs an unconditional CONTRIBUTING.md read"
         )
 
 

@@ -133,16 +133,34 @@ issues are dispatched.
 
 Add any of these patterns to your issue body to declare blockers:
 
-- `Blocked by #N` — case-insensitive, supports comma-separated lists
+- `Blocked by #N` — case-insensitive, supports comma-separated lists; an
+  optional colon is accepted (`Blocked by: #N`)
 - `Depends on #N` — case-insensitive, supports comma-separated lists
 - `Blocked-by: #N` — case-insensitive, supports comma-separated lists
+- A **`Blocked by`** or **`Depends on`** heading section — a Markdown heading
+  of any level (`#`–`######`, optional trailing colon) followed by a list
+  whose items each start with `#N`. An item may lead with several refs joined
+  by `,` or `and` (`- #123, #124` counts both); refs after other prose in the
+  item are ignored. The section runs to the next heading or fenced code
+  block. An item or line starting with `None`/`n/a` declares no blockers; an
+  item the parser cannot read (a URL, an `owner/repo` reference, free prose)
+  flags the issue for human review rather than being silently ignored.
 
 Examples:
 ```
 Blocked by #123, #124
+Blocked by: #150
 Depends on #150
 Blocked-by: #200, #201, #202
+
+## Blocked by
+- #123 (schema migration)
+- #124
 ```
+
+Declarations inside Markdown blockquotes (lines starting with `>`), fenced
+code blocks, inline code spans, or double-quoted spans are ignored — they
+quote another issue's blocker declaration rather than declaring this one.
 
 ### GitHub native dependencies
 

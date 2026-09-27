@@ -68,10 +68,11 @@ Two further disclosed limitations, kept as-is per operator decision: (a)
 independently gate anything -- the persisted per-session block counter is
 the robust bound against a retry loop, not this stdin flag; (b) the
 ``.claude/settings.json`` command line has no fallback if the worker's
-``.venv`` is missing -- a missing interpreter is treated as fail-OPEN (the
-Stop hook simply cannot launch), which is the intentionally safe direction
+``.venv`` is missing -- ``scripts/hook-python.sh`` (which picks
+``.venv/Scripts/python.exe`` on Windows, ``.venv/bin/python`` elsewhere)
+skips the hook with exit 0, i.e. a missing interpreter is fail-OPEN, which is the intentionally safe direction
 for an environment-setup failure that is not this gate's job to diagnose.
-That command line anchors both the interpreter and this script to
+That command line anchors both the launcher and this script to
 ``$CLAUDE_PROJECT_DIR`` (the harness-exported project root) rather than
 the hook process's cwd: Claude Code runs hooks from the session's
 *current* directory, which drifts whenever a compound command ``cd``s

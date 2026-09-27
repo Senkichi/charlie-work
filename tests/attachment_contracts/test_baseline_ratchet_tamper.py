@@ -18,12 +18,12 @@ from __future__ import annotations
 
 from charlie_work.attachment_contracts.baseline import (
     KIND_STATS_KEY,
-    check_ratchet_tamper,
     compare,
     generate,
     kind_stats_of,
     with_kind_stats,
 )
+from charlie_work.attachment_contracts.tamper import check_ratchet_tamper
 from charlie_work.attachment_contracts.model import (
     AttachmentPoint,
     BaselineEntry,

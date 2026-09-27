@@ -301,6 +301,12 @@ def test_supervisor_config_defaults() -> None:
     assert config.supervisor.max_pass_runtime_seconds == 1800
     assert config.supervisor.self_deploy_failure_alarm == 3
     assert config.supervisor.zero_pass_alarm == 3
+    # Issue #1855: the deferred-sync starvation bound defaults to 4h --
+    # comfortably above observed worker session durations.
+    assert config.supervisor.dependency_sync_starvation_seconds == 14400
+    # Issue #1934: bounded lane pool and the out-of-band reap cadence.
+    assert config.supervisor.fleet_lane_concurrency == 8
+    assert config.supervisor.reap_sweep_interval_seconds == 300
 
 
 def test_supervisor_config_parses_custom_values(tmp_path: Path) -> None:
@@ -316,6 +322,9 @@ supervisor:
   max_pass_runtime_seconds: 900
   self_deploy_failure_alarm: 5
   zero_pass_alarm: 7
+  dependency_sync_starvation_seconds: 600
+  fleet_lane_concurrency: 4
+  reap_sweep_interval_seconds: 90
 """
     )
     config = load_config(config_file)
@@ -326,6 +335,9 @@ supervisor:
     assert config.supervisor.max_pass_runtime_seconds == 900
     assert config.supervisor.self_deploy_failure_alarm == 5
     assert config.supervisor.zero_pass_alarm == 7
+    assert config.supervisor.dependency_sync_starvation_seconds == 600
+    assert config.supervisor.fleet_lane_concurrency == 4
+    assert config.supervisor.reap_sweep_interval_seconds == 90
 
 
 def test_supervisor_config_unknown_key_raises(tmp_path: Path) -> None:
@@ -399,6 +411,66 @@ def test_supervisor_config_zero_pass_alarm_wrong_type_raises(tmp_path: Path) -> 
         """
 supervisor:
   zero_pass_alarm: "not-an-int"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be an int"):
+        load_config(config_file)
+
+
+def test_supervisor_config_dependency_sync_starvation_wrong_type_raises(
+    tmp_path: Path,
+) -> None:
+    """Wrong type for dependency_sync_starvation_seconds raises ConfigError.
+
+    Issue #1855 added this field alongside the existing supervisor int
+    fields; the supervisor section has its own manual int-type-validation
+    tuple in config.py (separate from the generic _build_section machinery),
+    which needed the new key added explicitly -- mirrors
+    test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises.
+    Locks that in so a future refactor of the tuple can't silently drop
+    validation for this field.
+    """
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+supervisor:
+  dependency_sync_starvation_seconds: "not-an-int"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be an int"):
+        load_config(config_file)
+
+
+def test_supervisor_config_fleet_lane_concurrency_wrong_type_raises(
+    tmp_path: Path,
+) -> None:
+    """Wrong type for fleet_lane_concurrency raises ConfigError (issue #1934)."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+supervisor:
+  fleet_lane_concurrency: "not-an-int"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be an int"):
+        load_config(config_file)
+
+
+def test_supervisor_config_reap_sweep_interval_wrong_type_raises(
+    tmp_path: Path,
+) -> None:
+    """Wrong type for reap_sweep_interval_seconds raises ConfigError (issue #1934)."""
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+supervisor:
+  reap_sweep_interval_seconds: "not-an-int"
 """
     )
     with pytest.raises(ConfigError, match="must be an int"):

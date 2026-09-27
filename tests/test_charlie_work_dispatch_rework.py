@@ -511,3 +511,115 @@ def test_dispatch_rework_clears_startup_death_flag_on_new_dispatch(
     # The new dispatch must have cleared the stale startup-death flags.
     assert pr_state["last_rework_was_startup_death"] is False
     assert pr_state["last_rework_failure_kind"] is None
+
+
+def _rework_pending_state(paths, *, failure_kind: str | None) -> None:
+    """The ``rework_requested`` entry shape ``dispatch_rework`` selects on,
+    optionally stamped with a previous death's classification (#1917)."""
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            **({"dead_worker_failure_kind": failure_kind} if failure_kind is not None else {}),
+        }
+        save_state(paths.state_file, state)
+
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "rework-prompt.md").write_text("Fix the issues", encoding="utf-8")
+
+
+def _rework_pending_gh() -> FakeGitHub:
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+    return fake_gh
+
+
+def test_dispatch_rework_claim_clears_dead_worker_failure_kind(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #1917: a rework dispatch claim drops the previous death's
+    classification — a stale provider-throttle stamp must not survive into
+    the new dispatch epoch. The failure arm does not clear the field
+    itself, so this isolates the claim-site clear."""
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="command"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    _rework_pending_state(paths, failure_kind="rate_limited")
+
+    def _fail(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="adapter boom",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fail)
+
+    app = OrchestratorApp(tmp_path, paths, config, _rework_pending_gh())
+    result = app.dispatch_rework()
+
+    assert result.ok is False
+    assert result.data["attempted_count"] == 1
+    entry = load_state(paths.state_file)["issues"]["123"]
+    # The claim is released back to rework_requested for the next pass...
+    assert entry["status"] == "rework_requested"
+    # ...but the previous epoch's death classification stays cleared.
+    assert "dead_worker_failure_kind" not in entry
+
+
+def test_dispatch_rework_success_arm_clears_dead_worker_failure_kind(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #1917: the successful rework-dispatch arm drops a
+    classification stamped between the claim and the upgrade — the new
+    session owns the epoch, and a stamp that survived would exempt a
+    later, genuinely different death."""
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="command"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    _rework_pending_state(paths, failure_kind=None)
+
+    def _ok_then_stamp(_repo_root, _manifest, _results, _settings, requests):
+        # Simulate the death classifier stamping the issue between the
+        # claim write and the success bookkeeping (dispatch_sessions runs
+        # outside the state lock).
+        with state_lock(paths.state_file):
+            state = load_state(paths.state_file)
+            state["issues"]["123"]["dead_worker_failure_kind"] = "rate_limited"
+            save_state(paths.state_file, state)
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=True,
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _ok_then_stamp)
+
+    app = OrchestratorApp(tmp_path, paths, config, _rework_pending_gh())
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    entry = load_state(paths.state_file)["issues"]["123"]
+    assert entry["status"] == "dispatched"
+    assert "dead_worker_failure_kind" not in entry

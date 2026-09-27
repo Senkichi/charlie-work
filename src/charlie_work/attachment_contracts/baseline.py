@@ -1,10 +1,21 @@
 """Baseline: freeze-on-adopt, ratchet-down, bump validation, tamper guard.
 
-`.attachment-budgets.json` is GENERATED only (via the `baseline` CLI command).
-Entries are saturated points only, sorted by (kind, file, identity) for stable
-diffs. Serialization is fully deterministic: sorted entries, indent=1, sorted
-keys, trailing newline — so two runs against the same scan produce byte-
-identical output.
+The committed baseline lives in the per-entry ``.attachment-budgets/``
+directory (issue #1839 -- the single ``.attachment-budgets.json`` document
+was a shared append point; see ``baseline_dir.py`` for the on-disk layout).
+This module owns the layout-independent DOCUMENT contract: the dict shape
+(version/generated_by/generated_at/floor/entries[/kind_stats]), generation,
+comparison, ratcheting, bump validation, and the tamper guards. An entry may
+carry ``"pinned": true`` (issue #1620): an operator-authored sub-saturation
+contract on a de-godded point -- enforced below the fence, never dropped by
+the ratchet (see ``BaselineEntry`` and ``compare()``). ``dumps``/
+``loads``/``dump``/``load`` remain the legacy single-file codec -- used for
+pre-#1839 checkouts via ``baseline_dir``'s layout dispatch, and for any
+caller that needs a document serialized as one JSON text.
+
+Serialization is fully deterministic: sorted entries, indent=1, sorted keys,
+trailing newline — so two runs against the same scan produce byte-identical
+output.
 """
 
 from __future__ import annotations
@@ -24,6 +35,10 @@ from charlie_work.attachment_contracts.model import (
 
 SCHEMA_VERSION = 1
 BASELINE_FILENAME = ".attachment-budgets.json"
+# Issue #1839: the committed baseline's current on-disk layout. The constant
+# lives here (next to the legacy filename it replaces) so both the document
+# layer and ``baseline_dir`` can name it without an import cycle.
+BASELINE_DIRNAME = ".attachment-budgets"
 # Top-level key under which frozen per-kind Tukey fences are persisted
 # (issue #1614). Optional: baselines written before #1614 lack it and load
 # fine (callers fall back to live recomputation), so SCHEMA_VERSION stays 1.
@@ -56,7 +71,7 @@ def _bump_from_dict(raw: dict[str, object]) -> Bump:
 
 
 def _entry_to_dict(entry: BaselineEntry) -> dict[str, object]:
-    return {
+    data: dict[str, object] = {
         "kind": entry.kind,
         "identity": entry.identity,
         "file": entry.file,
@@ -64,12 +79,21 @@ def _entry_to_dict(entry: BaselineEntry) -> dict[str, object]:
         "boundary": entry.boundary,
         "bumps": [_bump_to_dict(b) for b in entry.bumps],
     }
+    # Issue #1620: emitted only when True -- every pre-#1620 entry file lacks
+    # the key, and a routine --ratchet must not churn all of their bytes just
+    # to write ``"pinned": false`` into each one.
+    if entry.pinned:
+        data["pinned"] = True
+    return data
 
 
 def _entry_from_dict(raw: dict[str, object]) -> BaselineEntry:
     bumps_raw = raw.get("bumps", [])
     if not isinstance(bumps_raw, list):
         raise TamperError(f"entries[].bumps must be a list, got {type(bumps_raw)!r}")
+    pinned = raw.get("pinned", False)
+    if not isinstance(pinned, bool):
+        raise TamperError(f"entries[].pinned must be a bool, got {type(pinned)!r}")
     try:
         return BaselineEntry(
             kind=str(raw["kind"]),  # type: ignore[arg-type]
@@ -78,6 +102,7 @@ def _entry_from_dict(raw: dict[str, object]) -> BaselineEntry:
             member_count=int(raw["member_count"]),  # type: ignore[arg-type]
             boundary=float(raw["boundary"]),  # type: ignore[arg-type]
             bumps=tuple(_bump_from_dict(b) for b in bumps_raw),
+            pinned=pinned,
         )
     except (KeyError, ValueError, TypeError) as exc:
         # Finding #12: same rationale as _bump_from_dict -- a missing key or a
@@ -250,11 +275,33 @@ def with_kind_stats(
 
 
 def dump(document: dict[str, object], path: Path) -> None:
-    path.write_text(dumps(document), encoding="utf-8")
+    # Temp-file + replace(): the baseline is read by other processes (the
+    # PreToolUse hook, review-packet builder) and must never be observed
+    # half-written.
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(dumps(document), encoding="utf-8")
+    tmp.replace(path)
 
 
 def loads(text: str) -> dict[str, object]:
-    document = json.loads(text)
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError as exc:
+        # Same finding-#12 contract as _entry_from_dict: a corrupt baseline
+        # must surface as TamperError so check_tree's `except TamperError`
+        # turns it into a structured Finding instead of crashing the
+        # report-only CI step.
+        raise TamperError(f"baseline is not valid JSON: {exc}") from exc
+    return _validate_document(document)
+
+
+def _validate_document(document: object) -> dict[str, object]:
+    """Validate a decoded baseline document, returning it unchanged.
+
+    Shared by ``loads`` (the single-file codec) and ``baseline_dir`` (the
+    per-entry directory layout reassembles the same document dict before
+    validation), so both on-disk forms enforce an identical schema.
+    """
     if not isinstance(document, dict):
         raise TamperError("baseline root must be a JSON object")
     if document.get("version") != SCHEMA_VERSION:
@@ -283,7 +330,7 @@ def loads(text: str) -> dict[str, object]:
     # valid -- baselines written before #1614 have no kind_stats and callers
     # fall back to live recomputation. Present-but-malformed is tamper.
     kind_stats_of(document)
-    return document  # type: ignore[return-value]
+    return document
 
 
 def load(path: Path) -> dict[str, object]:
@@ -322,7 +369,7 @@ def validate_bump(bump: Bump) -> str | None:
     claiming "interactive". The `actor` field itself is kept (the spec's
     baseline schema pins it, and it remains useful provenance/audit data,
     plus the real backstop for `actor` truthfulness is out-of-band review of
-    the baseline diff, e.g. CODEOWNERS on `.attachment-budgets.json` -- no
+    the baseline diff, e.g. CODEOWNERS on `.attachment-budgets/` -- no
     comparison-only validator can bind a self-declared field to the actual
     execution context from the JSON alone); "interactive bumps self-ack"
     now means an interactive actor's own handle satisfies the same shape
@@ -446,10 +493,21 @@ def compare(
       entered completely unchecked). It IS still added to the ratcheted
       document so the baseline stays a complete snapshot of the tree's
       current state -- the enforcement is the Finding, not the omission.
+    - A ``pinned`` entry (issue #1620 -- an operator-authored sub-saturation
+      contract on a deliberately de-godded point) is enforced whether or not
+      its point is saturated: growth past ``min(effective_ceiling,
+      boundary)`` blocks exactly like over-ceiling saturation, a strict
+      shrink ratchets the pin down like any other row, and the row is never
+      dropped by omission on de-saturation. Capping the ceiling at the fence
+      means a pin can only tighten a point's budget -- a hand-authored pin
+      with a member_count above the boundary cannot act as a blanket
+      exemption. `--ratchet` therefore never deletes a pinned row, and never
+      creates one either: the operator authors it explicitly.
     The input document is never mutated; a new document dict is returned.
     """
     baseline_entries = {_entry_key(e): e for e in entries_of(baseline_document)}
     current_by_key = {_verdict_key(v): v for v in current if v.saturated}
+    all_verdicts = {_verdict_key(v): v for v in current}
 
     findings: list[Finding] = []
     new_entries: list[BaselineEntry] = []
@@ -489,7 +547,13 @@ def compare(
             continue
 
         ceiling = effective_ceiling(baseline_entry)
+        if baseline_entry.pinned:
+            # A pin can only TIGHTEN the contract (issue #1620): cap the
+            # ceiling at the fence so a pin row whose member_count sits above
+            # the boundary cannot silently exempt its point from saturation.
+            ceiling = min(ceiling, verdict.boundary)
         if point.member_count > ceiling:
+            qualifier = "pinned ceiling" if baseline_entry.pinned else "baselined ceiling"
             findings.append(
                 Finding(
                     severity="block",
@@ -497,7 +561,7 @@ def compare(
                     identity=point.identity,
                     message=(
                         f"{point.identity} ({point.kind}) has {point.member_count} "
-                        f"members, exceeding baselined ceiling {ceiling}. Add a bump "
+                        f"members, exceeding {qualifier} {ceiling}. Add a bump "
                         "or move new members to a redirect destination."
                     ),
                     redirect=None,
@@ -513,6 +577,7 @@ def compare(
                     file=point.file,
                     member_count=point.member_count,
                     boundary=verdict.boundary,
+                    pinned=baseline_entry.pinned,
                 )
             )
         else:
@@ -521,7 +586,57 @@ def compare(
     # Points baselined before but no longer saturated at all are simply absent
     # from `new_entries` (the loop above only ever visits currently-saturated
     # points) — that is the "ratchet down to not tracked" case, handled by
-    # omission rather than an explicit branch.
+    # omission rather than an explicit branch. Pinned rows are the exception
+    # (issue #1620): their point is deliberately BELOW the fence, so the
+    # saturation loop never visits them — evaluate them separately and keep
+    # the row even when nothing about it changes.
+    for key, entry in baseline_entries.items():
+        if not entry.pinned or key in current_by_key:
+            continue
+        verdict = all_verdicts.get(key)
+        if verdict is None:
+            # The point left the eligible population entirely (class deleted,
+            # renamed, ledger/trivial, or zero members): the pin can neither
+            # block nor ratchet, so the row is carried verbatim -- dropping
+            # it would silently end the contract, and a re-eligible point is
+            # checked against it again on the next pass.
+            new_entries.append(entry)
+            continue
+        point = verdict.point
+        ceiling = min(effective_ceiling(entry), verdict.boundary)
+        if point.member_count > ceiling:
+            findings.append(
+                Finding(
+                    severity="block",
+                    file=point.file,
+                    identity=point.identity,
+                    message=(
+                        f"{point.identity} ({point.kind}) has {point.member_count} "
+                        f"members, exceeding pinned ceiling {ceiling} below the "
+                        "saturation fence. The row is an explicit sub-saturation "
+                        "contract on a de-godded point (issue #1620) -- add a "
+                        "bump or move new members to a redirect destination."
+                    ),
+                    redirect=None,
+                )
+            )
+            new_entries.append(entry)
+        elif point.member_count < entry.member_count:
+            # The pin ratchets down with the class like any other row: a
+            # shrink tightens the contract (stale bumps are dropped the same
+            # way -- a raise on a now-lower ceiling no longer applies).
+            new_entries.append(
+                BaselineEntry(
+                    kind=point.kind,
+                    identity=point.identity,
+                    file=point.file,
+                    member_count=point.member_count,
+                    boundary=verdict.boundary,
+                    pinned=True,
+                )
+            )
+        else:
+            new_entries.append(entry)
     sorted_entries = sorted(new_entries, key=_entry_sort_key)
     # Finding #11: preserve every top-level key already in the document
     # (e.g. an operator-set "mode": "enforce") instead of rebuilding from a
@@ -542,257 +657,3 @@ def compare(
     # check_ratchet_tamper, which diffs the frozen fence against the previous
     # committed baseline.
     return findings, ratcheted
-
-
-def _kind_stats_delta(prev: KindStats, current: KindStats) -> str:
-    """One-line summary of how a frozen kind's stats changed, for tamper messages."""
-    if current.boundary != prev.boundary:
-        direction = "rose" if current.boundary > prev.boundary else "lowered"
-        return f"boundary {direction} {prev.boundary} -> {current.boundary}"
-    return (
-        "boundary unchanged but stats modified "
-        f"(q3 {prev.q3} -> {current.q3}, iqr {prev.iqr} -> {current.iqr}, "
-        f"population {prev.population} -> {current.population})"
-    )
-
-
-def check_ratchet_tamper(
-    previous_document: dict[str, object] | None,
-    current_document: dict[str, object],
-    *,
-    live_verdicts: tuple[SaturationVerdict, ...] | None,
-) -> list[Finding]:
-    """Diff-based tamper guard: closes the raise-to-match laundering gap.
-
-    `check_tamper` (below) compares the baseline against the CURRENT actual
-    scan only. It is blind when an attacker raises a frozen entry's
-    `member_count` in lockstep with real growth: both numbers end up equal,
-    so nothing looks anomalous within a single snapshot. Detecting that
-    requires an independent reference point -- the previous commit's
-    baseline -- which is why this is a separate function taking it
-    explicitly, rather than something `check_tamper` could re-derive from
-    `current_document` alone.
-
-    Under every legitimate write path (`generate()` for a fresh entry,
-    `compare()`'s ratchet), an EXISTING entry's `member_count` field is only
-    ever left unchanged or lowered -- raising the effective ceiling for real
-    growth is expressed purely through `bumps`, never by rewriting
-    `member_count` itself (see `compare()`'s ratchet branches). So for any
-    identity present in both documents, ANY rise in `member_count` did not
-    come from this package's own tooling -- it is tamper, full stop.
-
-    Issue #1614 extends the same logic to the frozen per-kind Tukey fence:
-    under every legitimate write path a ratchet preserves ``kind_stats``
-    verbatim (``compare`` spreads ``baseline_document`` without rewriting
-    ``KIND_STATS_KEY``), and an explicit re-baseline / ``--refreeze`` is the
-    only path that recomputes it. A generation event is recognized by TWO
-    conditions that must BOTH hold: a fresh ``generated_at`` (``generate()``
-    and ``with_kind_stats()`` always re-stamp) AND ``kind_stats`` equal to
-    a live recompute of the tree under check. Neither half suffices alone:
-    ``generated_at`` is a self-declared field in the same document an
-    attacker is hand-editing, so a bare timestamp difference cannot be the
-    discriminator -- a one-line forgery that bumps it alongside a raised
-    boundary would read as a sanctioned regen and skip every per-kind check
-    (round-4 review). The live-recompute half is the part that cannot be
-    forged: the only way to write statistics equal to the honest recompute
-    is to produce exactly what ``generate()`` / ``with_kind_stats()`` would
-    emit, i.e. the sanctioned output itself. On a transition that is not a
-    verified generation event ANY difference in ``kind_stats`` is tamper:
-    a raised or lowered boundary, a tweaked q3/iqr/population (``iqr: 0`` or
-    ``population < FLOOR`` disables a kind's fence outright inside
-    ``saturate_with_fence``), a removed kind (a kind with no frozen fence
-    gets no verdicts at all -- the whole kind is silently exempted), or an
-    added kind. Removing the ``kind_stats`` key outright is flagged
-    unconditionally: every baseline writer emits the key (``compare``
-    preserves it; ``generate()`` / ``with_kind_stats()`` always emit it), so
-    its absence can only be a hand-deletion silently reverting to the
-    pre-#1614 live-recomputation fallback.
-
-    ``live_verdicts`` is the checked tree's LIVE ``saturate_all`` output --
-    the same verdict stream ``generate()`` / ``--refreeze`` consume, NOT
-    the frozen-fence verdicts ``compare()`` uses for entry ratcheting.
-    ``None`` means the caller had no scan context and fails the guard
-    closed: no ``kind_stats`` change is excused. ``check_tree`` passes the
-    live verdicts whenever it passes ``previous_baseline_document``.
-
-    `previous_document` is None when there is nothing to diff against yet
-    (e.g. the very first committed baseline) -- no findings are possible.
-    """
-    if previous_document is None:
-        return []
-    previous_entries = {_entry_key(e): e for e in entries_of(previous_document)}
-    findings: list[Finding] = []
-    for entry in entries_of(current_document):
-        prev = previous_entries.get(_entry_key(entry))
-        if prev is None or entry.member_count <= prev.member_count:
-            continue
-        findings.append(
-            Finding(
-                severity="error",
-                file=entry.file,
-                identity=entry.identity,
-                message=(
-                    f"tamper: baseline member_count for {entry.identity} rose "
-                    f"{prev.member_count} -> {entry.member_count} since the previous "
-                    "committed baseline. member_count is immutable-once-frozen except "
-                    "via a strictly-lower ratchet; a rise can only be a hand-edit "
-                    "(raise legitimate growth via a validly-acked bump instead)."
-                ),
-                redirect=None,
-            )
-        )
-    # Issue #1614: a ratchet preserves ``kind_stats`` verbatim, so on a
-    # ratchet-to-ratchet transition ANY difference in the frozen fence is a
-    # hand-edit. The sanctioned exception is a VERIFIED generation event: a
-    # fresh ``generated_at`` AND statistics equal to a live recompute of the
-    # tree under check. The stamp alone is forgeable by the same hand-edit
-    # it is meant to distinguish (round-4 review) -- the live-recompute
-    # equality is the binding a forgery cannot satisfy without writing the
-    # honest values. Malformed kind_stats already raised at loads() time,
-    # so kind_stats_of here cannot raise on a document that passed loads().
-    previous_stats = kind_stats_of(previous_document)
-    current_stats = kind_stats_of(current_document)
-    regenerated = (
-        current_document.get("generated_at") is not None
-        and current_document.get("generated_at") != previous_document.get("generated_at")
-        and live_verdicts is not None
-        and current_stats == _kind_stats_from_verdicts(live_verdicts)
-    )
-
-    if KIND_STATS_KEY in previous_document and KIND_STATS_KEY not in current_document:
-        # No sanctioned writer ever drops the key, so its absence can only be
-        # a hand-deletion -- silently reverting check_tree / --ratchet to the
-        # pre-#1614 live-recomputation fallback this issue exists to close.
-        # Flag it even when ``generated_at`` changed: a real regen /
-        # --refreeze still writes the key.
-        findings.append(
-            Finding(
-                severity="error",
-                file=BASELINE_FILENAME,
-                identity=KIND_STATS_KEY,
-                message=(
-                    f"tamper: baseline {KIND_STATS_KEY!r} was removed since the "
-                    "previous committed baseline. Removing the frozen per-kind "
-                    "fence silently reverts saturation to live recomputation; "
-                    "restore it via `baseline --refreeze` or a full `baseline` "
-                    "run."
-                ),
-                redirect=None,
-            )
-        )
-    elif not regenerated:
-        for kind, prev in previous_stats.items():
-            current = current_stats.get(kind)
-            if current is None:
-                findings.append(
-                    Finding(
-                        severity="error",
-                        file=BASELINE_FILENAME,
-                        identity=f"kind_stats:{kind}",
-                        message=(
-                            f"tamper: frozen {kind} fence was removed since the "
-                            "previous committed baseline. A kind with no frozen "
-                            "fence gets no verdicts at all, silently exempting "
-                            "the whole kind; restore it via `baseline --refreeze` "
-                            "or a full `baseline` run."
-                        ),
-                        redirect=None,
-                    )
-                )
-            elif current != prev:
-                findings.append(
-                    Finding(
-                        severity="error",
-                        file=BASELINE_FILENAME,
-                        identity=f"kind_stats:{kind}",
-                        message=(
-                            f"tamper: frozen {kind} fence was modified since the "
-                            "previous committed baseline "
-                            f"({_kind_stats_delta(prev, current)}) with no "
-                            "verifiable re-baseline. A ratchet preserves "
-                            "kind_stats verbatim; it may only change through a "
-                            "generation event (`baseline --refreeze` or a full "
-                            "`baseline` run) that re-stamps generated_at AND "
-                            "writes the exact statistics a live recompute of "
-                            "the current tree produces."
-                        ),
-                        redirect=None,
-                    )
-                )
-        for kind in current_stats:
-            if kind in previous_stats:
-                continue
-            findings.append(
-                Finding(
-                    severity="error",
-                    file=BASELINE_FILENAME,
-                    identity=f"kind_stats:{kind}",
-                    message=(
-                        f"tamper: frozen {kind} fence appeared since the "
-                        "previous committed baseline with no verifiable "
-                        "re-baseline. kind_stats may only change through a "
-                        "generation event (`baseline --refreeze` or a full "
-                        "`baseline` run) that re-stamps generated_at AND "
-                        "writes the exact statistics a live recompute of "
-                        "the current tree produces."
-                    ),
-                    redirect=None,
-                )
-            )
-    return findings
-
-
-def check_tamper(
-    current: tuple[SaturationVerdict, ...],
-    baseline_document: dict[str, object],
-) -> list[Finding]:
-    """Tamper guard: a baseline entry raised without a covering bump record.
-
-    Recomputes what each unchanged point's baseline SHOULD show. If the
-    on-disk baseline's member_count for a point is HIGHER than what the point
-    itself currently reports, and no bump on that entry accounts for the
-    difference, that is tamper (someone hand-edited the JSON to raise a
-    ceiling) -> Finding(error).
-    """
-    current_by_key = {_verdict_key(v): v for v in current}
-    findings: list[Finding] = []
-
-    for entry in entries_of(baseline_document):
-        key = (entry.kind, entry.file, entry.identity)
-        verdict = current_by_key.get(key)
-        actual_count = verdict.point.member_count if verdict is not None else None
-
-        for bump in entry.bumps:
-            error = validate_bump(bump)
-            if error is not None:
-                findings.append(
-                    Finding(
-                        severity="error",
-                        file=entry.file,
-                        identity=entry.identity,
-                        message=f"invalid bump on {entry.identity}: {error}",
-                        redirect=None,
-                    )
-                )
-
-        if actual_count is not None and entry.member_count > actual_count:
-            # Baseline claims more members than the point actually has, and
-            # there is no bump whose `to` matches the inflated member_count —
-            # the entry itself was hand-raised.
-            covered = any(b.to == entry.member_count for b in entry.bumps)
-            if not covered:
-                findings.append(
-                    Finding(
-                        severity="error",
-                        file=entry.file,
-                        identity=entry.identity,
-                        message=(
-                            f"tamper: baseline member_count {entry.member_count} for "
-                            f"{entry.identity} exceeds actual {actual_count} with no "
-                            "covering bump"
-                        ),
-                        redirect=None,
-                    )
-                )
-
-    return findings

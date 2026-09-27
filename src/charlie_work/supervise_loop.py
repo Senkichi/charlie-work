@@ -130,6 +130,10 @@ class SuperviseLoopResult:
     last_exit_code: int
     cap_reached: bool
     cap_cause: str | None = None
+    #: True when a restart request was refused because an operator stop
+    #: marker was pending (issue #1716) -- distinct from ``cap_reached``:
+    #: nothing is wrong, the operator asked the fleet to stay down.
+    stop_requested: bool = False
 
 
 def run_supervise_relaunch_loop(
@@ -140,6 +144,7 @@ def run_supervise_relaunch_loop(
     on_cap_reached: Callable[[SuperviseLoopResult], None] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     sustained_run_seconds: float = SUSTAINED_RUN_SECONDS,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> SuperviseLoopResult:
     """Run the supervisor, relaunching while it requests a restart.
 
@@ -155,6 +160,14 @@ def run_supervise_relaunch_loop(
     testable without real elapsed time. It must be a monotonic source, not a wall
     clock -- a clock step during a long-lived wrapper run would otherwise
     misclassify the cause reported at the cap.
+
+    ``stop_requested`` (issue #1716) is consulted only when a child exits with
+    ``EXIT_RESTART_REQUESTED``: a pending operator stop wins over the relaunch,
+    so ``charlie fleet stop`` cannot be undone by a self-deploy exit that lands
+    between the marker write and the supervisor's next pass boundary. The
+    predicate reads the marker fresh on each call, so a request written while
+    a child is running is still honored. When None (tests, non-fleet callers)
+    the wrapper's behavior is unchanged.
     """
     if max_relaunches < 0:
         raise ValueError(f"max_relaunches must be >= 0, got {max_relaunches}")
@@ -180,6 +193,21 @@ def run_supervise_relaunch_loop(
                 relaunches=relaunches,
                 last_exit_code=exit_code,
                 cap_reached=False,
+            )
+
+        if stop_requested is not None and stop_requested():
+            # Issue #1716: the child asked to be replaced, but the operator
+            # asked the fleet to stop. The marker outranks the restart
+            # request — relaunching here would resurrect a supervisor the
+            # operator just stopped, and the replacement would read the same
+            # marker and exit again anyway.
+            log("supervise-loop: operator stop request pending; not relaunching")
+            return SuperviseLoopResult(
+                launches=launches,
+                relaunches=relaunches,
+                last_exit_code=exit_code,
+                cap_reached=False,
+                stop_requested=True,
             )
 
         sustained = child_ran_for >= sustained_run_seconds

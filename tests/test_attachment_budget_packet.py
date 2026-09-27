@@ -12,7 +12,8 @@ import json
 from pathlib import Path
 
 from _fakes_github import FakeGitHub
-from charlie_work.attachment_contracts.baseline import BASELINE_FILENAME, dumps
+from charlie_work.attachment_contracts import baseline_dir
+from charlie_work.attachment_contracts.baseline import BASELINE_DIRNAME
 from charlie_work.config import OrchestratorConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
@@ -43,23 +44,43 @@ def _bump(to: int, actor: str, ack: str, reason: str = "growth") -> dict:
     return {"to": to, "reason": reason, "actor": actor, "ack": ack}
 
 
-def _git_diff_for_baseline(base_text: str, head_text: str) -> str:
-    """Build a real ``diff --git`` section for `.attachment-budgets.json`
-    from base/head text using ``difflib``, so the diff is guaranteed
-    consistent with what ``reconstruct_baseline_head_text`` can re-derive."""
-    diff_lines = list(
-        difflib.unified_diff(
-            base_text.splitlines(keepends=True),
-            head_text.splitlines(keepends=True),
-            fromfile=f"a/{BASELINE_FILENAME}",
-            tofile=f"b/{BASELINE_FILENAME}",
-            n=3,
+def _plant_baseline(root: Path, document: dict) -> None:
+    """Commit-equivalent: write the per-entry `.attachment-budgets/` dir."""
+    baseline_dir.dump(document, root / BASELINE_DIRNAME)
+
+
+def _git_diff_for_baseline(base_doc: dict, head_doc: dict) -> str:
+    """Build real ``diff --git`` sections for the `.attachment-budgets/`
+    files that differ between two documents -- one section per entry file
+    (or meta.json), via ``difflib``, so the diff is guaranteed consistent
+    with what ``reconstruct_baseline_dir_head`` can re-derive."""
+    base_files = baseline_dir.document_files(base_doc)
+    head_files = baseline_dir.document_files(head_doc)
+    sections: list[str] = []
+    for rel in sorted(set(base_files) | set(head_files)):
+        old = base_files.get(rel)
+        new = head_files.get(rel)
+        if old == new:
+            continue
+        repo_path = f"{BASELINE_DIRNAME}/{rel}"
+        header = f"diff --git a/{repo_path} b/{repo_path}\n"
+        if old is None:
+            header += "new file mode 100644\nindex 0000000..1234567\n"
+        elif new is None:
+            header += "deleted file mode 100644\nindex 1234567..0000000\n"
+        else:
+            header += "index 111..222 100644\n"
+        body = "".join(
+            difflib.unified_diff(
+                old.splitlines(keepends=True) if old is not None else [],
+                new.splitlines(keepends=True) if new is not None else [],
+                fromfile=f"a/{repo_path}" if old is not None else "/dev/null",
+                tofile=f"b/{repo_path}" if new is not None else "/dev/null",
+                n=3,
+            )
         )
-    )
-    body = "".join(diff_lines)
-    return (
-        f"diff --git a/{BASELINE_FILENAME} b/{BASELINE_FILENAME}\nindex 111..222 100644\n" + body
-    )
+        sections.append(header + body)
+    return "".join(sections)
 
 
 def _src_file_diff(path: str, extra_content: str = "line 200\n") -> str:
@@ -110,7 +131,7 @@ def _advisories_comment(records: list[dict]) -> dict:
 
 
 def test_no_baselined_touch_section_absent(tmp_path: Path) -> None:
-    """No `.attachment-budgets.json` at all -> cheap gate fires immediately,
+    """No `.attachment-budgets/` at all -> cheap gate fires immediately,
     section renders empty."""
     diff = _src_file_diff("src/unrelated.py")
     packet = _build_packet(tmp_path, diff)
@@ -121,7 +142,7 @@ def test_no_baselined_touch_section_absent(tmp_path: Path) -> None:
 
 def test_touches_baselined_host_file_yields_saturated_row(tmp_path: Path) -> None:
     base = _doc([_entry("Foo", "src/foo.py", 10)])
-    (tmp_path / BASELINE_FILENAME).write_text(dumps(base), encoding="utf-8")
+    _plant_baseline(tmp_path, base)
 
     diff = _src_file_diff("src/foo.py")
     packet = _build_packet(tmp_path, diff)
@@ -135,10 +156,9 @@ def test_touches_baselined_host_file_yields_saturated_row(tmp_path: Path) -> Non
 def test_worker_bump_with_source_id_ack_is_blocking(tmp_path: Path) -> None:
     base = _doc([_entry("Foo", "src/foo.py", 10)])
     head = _doc([_entry("Foo", "src/foo.py", 10, [_bump(12, "worker", "dispatch:abc123")])])
-    base_text = dumps(base)
-    (tmp_path / BASELINE_FILENAME).write_text(base_text, encoding="utf-8")
+    _plant_baseline(tmp_path, base)
 
-    diff = _git_diff_for_baseline(base_text, dumps(head))
+    diff = _git_diff_for_baseline(base, head)
     packet = _build_packet(tmp_path, diff)
 
     assert "## Attachment-budget diff" in packet
@@ -150,10 +170,9 @@ def test_worker_bump_with_source_id_ack_is_blocking(tmp_path: Path) -> None:
 def test_worker_bump_with_issue_ack_no_blocking_and_suppressed(tmp_path: Path) -> None:
     base = _doc([_entry("Foo", "src/foo.py", 10)])
     head = _doc([_entry("Foo", "src/foo.py", 10, [_bump(12, "worker", "#123")])])
-    base_text = dumps(base)
-    (tmp_path / BASELINE_FILENAME).write_text(base_text, encoding="utf-8")
+    _plant_baseline(tmp_path, base)
 
-    diff = _git_diff_for_baseline(base_text, dumps(head))
+    diff = _git_diff_for_baseline(base, head)
     packet = _build_packet(tmp_path, diff)
 
     assert "## Attachment-budget diff" in packet
@@ -166,16 +185,16 @@ def test_worker_bump_with_issue_ack_no_blocking_and_suppressed(tmp_path: Path) -
 
 def test_head_reconstruction_failure_yields_could_not_evaluate_note(tmp_path: Path) -> None:
     base = _doc([_entry("Foo", "src/foo.py", 10)])
-    base_text = dumps(base)
-    (tmp_path / BASELINE_FILENAME).write_text(base_text, encoding="utf-8")
+    _plant_baseline(tmp_path, base)
 
-    # A hunk whose context does not match base_text at all -> reconstruction
-    # fails structurally.
+    # A hunk whose context does not match the entry file's base content at
+    # all -> the per-file reconstruction fails structurally.
+    entry_rel = ".attachment-budgets/entries/src/foo.py/class--Foo.json"
     bogus_diff = (
-        f"diff --git a/{BASELINE_FILENAME} b/{BASELINE_FILENAME}\n"
+        f"diff --git a/{entry_rel} b/{entry_rel}\n"
         "index 111..222 100644\n"
-        f"--- a/{BASELINE_FILENAME}\n"
-        f"+++ b/{BASELINE_FILENAME}\n"
+        f"--- a/{entry_rel}\n"
+        f"+++ b/{entry_rel}\n"
         "@@ -1,3 +1,3 @@\n"
         " THIS CONTEXT DOES NOT MATCH ANYTHING\n"
         "-old\n"
@@ -199,7 +218,7 @@ def test_pr_comment_advisories_yield_redirects_not_taken(tmp_path: Path) -> None
     NOT touch surfaces as a "redirect not taken" row, sourced from the PR-
     comment channel (no local advisories log present)."""
     base = _doc([_entry("Foo", "src/foo.py", 10)])
-    (tmp_path / BASELINE_FILENAME).write_text(dumps(base), encoding="utf-8")
+    _plant_baseline(tmp_path, base)
 
     diff = _src_file_diff("src/foo.py")
     comment = _advisories_comment(
@@ -232,7 +251,7 @@ def test_pr_comment_present_empty_suppresses_log_not_available_note(
     (clean pass) -- the "log not available" NOTE must NOT render, and the
     builder must NOT fall back to the (absent) local log."""
     base = _doc([_entry("Foo", "src/foo.py", 10)])
-    (tmp_path / BASELINE_FILENAME).write_text(dumps(base), encoding="utf-8")
+    _plant_baseline(tmp_path, base)
 
     diff = _src_file_diff("src/foo.py")
     comment = _advisories_comment([])
@@ -250,7 +269,7 @@ def test_no_pr_comment_no_local_log_yields_log_not_available_note(
     """Neither channel present -> the "log not available" NOTE renders (the
     pre-#1466 vacuous case, now the fallback of last resort)."""
     base = _doc([_entry("Foo", "src/foo.py", 10)])
-    (tmp_path / BASELINE_FILENAME).write_text(dumps(base), encoding="utf-8")
+    _plant_baseline(tmp_path, base)
 
     diff = _src_file_diff("src/foo.py")
     # No PR comments seeded, no local advisories log.
@@ -267,7 +286,7 @@ def test_no_pr_comment_falls_back_to_local_log(tmp_path: Path) -> None:
     from charlie_work.attachment_contracts.hook_entry import _ADVISORY_LOG_REL
 
     base = _doc([_entry("Foo", "src/foo.py", 10)])
-    (tmp_path / BASELINE_FILENAME).write_text(dumps(base), encoding="utf-8")
+    _plant_baseline(tmp_path, base)
 
     # Plant a local advisories log with one redirect-not-taken record.
     log_path = tmp_path / _ADVISORY_LOG_REL
@@ -305,7 +324,7 @@ def test_pr_comment_wins_over_local_log(tmp_path: Path) -> None:
     from charlie_work.attachment_contracts.hook_entry import _ADVISORY_LOG_REL
 
     base = _doc([_entry("Foo", "src/foo.py", 10)])
-    (tmp_path / BASELINE_FILENAME).write_text(dumps(base), encoding="utf-8")
+    _plant_baseline(tmp_path, base)
 
     # Local log with a distinct redirect.
     log_path = tmp_path / _ADVISORY_LOG_REL
@@ -351,7 +370,7 @@ def test_non_marker_comment_does_not_count_as_channel(tmp_path: Path) -> None:
     comment -- the builder falls back to the local-log / not-available path,
     never parsing an unrelated comment as advisories."""
     base = _doc([_entry("Foo", "src/foo.py", 10)])
-    (tmp_path / BASELINE_FILENAME).write_text(dumps(base), encoding="utf-8")
+    _plant_baseline(tmp_path, base)
 
     diff = _src_file_diff("src/foo.py")
     # A regular review comment, no marker.
@@ -368,7 +387,7 @@ def test_most_recent_marker_comment_wins(tmp_path: Path) -> None:
     push), the most recent one's records surface -- the builder scans in
     chronological order and keeps the last match."""
     base = _doc([_entry("Foo", "src/foo.py", 10)])
-    (tmp_path / BASELINE_FILENAME).write_text(dumps(base), encoding="utf-8")
+    _plant_baseline(tmp_path, base)
 
     diff = _src_file_diff("src/foo.py")
     old_comment = _advisories_comment(

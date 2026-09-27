@@ -1,0 +1,8 @@
+{
+ "boundary": 34.5,
+ "bumps": [],
+ "file": "tests/test_cross_repo_gate.py",
+ "identity": "tests/test_cross_repo_gate.py::module",
+ "kind": "test_module",
+ "member_count": 35
+}

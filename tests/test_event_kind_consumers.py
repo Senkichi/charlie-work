@@ -24,8 +24,10 @@ exactly how a kind escapes the registry unnoticed.
 **Consumed kinds** -- a kind counts as consumed if its literal string turns
 up in a read position: a ``query_events(kind=...)`` call, an equality/
 membership comparison against an event's ``kind`` field (including via a
-dict/frozenset classification table), anywhere in ``scripts/heartbeat_check.py``,
-or anywhere under ``tests/`` (a weak, test-only consumer, reported separately
+dict/frozenset classification table), anywhere in the heartbeat scripts --
+``scripts/heartbeat_check.py`` plus ``scripts/heartbeat_event_alarms.py``,
+the module #1895 extracted the events.db anomaly checks into -- or anywhere
+under ``tests/`` (a weak, test-only consumer, reported separately
 so it can be upgraded deliberately).
 
 **The escape hatch** is declared at the emission site, never in a
@@ -44,22 +46,32 @@ kind is the actionable one). The two kinds that originally looked like they
 should have a real consumer -- ``draft_pr_blocked`` and
 ``venv_editable_anchor_violation`` -- carried ``pending #1366`` markers until
 issue #1366 added real heartbeat consumers for each
-(``check_draft_pr_blocked_events`` / ``check_supervisor_venv_refusal`` in
-``scripts/heartbeat_check.py``); the markers were dropped at the emission
-sites and the pending backlog is now empty.
+(``check_draft_pr_blocked_events`` -- since #1895 in
+``scripts/heartbeat_event_alarms.py`` -- and
+``check_supervisor_venv_refusal`` in ``scripts/heartbeat_check.py``); the
+markers were dropped at the emission sites and the pending backlog is now
+empty.
 """
 
 from __future__ import annotations
 
 import ast
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src" / "charlie_work"
 TESTS_DIR = REPO_ROOT / "tests"
-HEARTBEAT = REPO_ROOT / "scripts" / "heartbeat_check.py"
+# The heartbeat consumers are physically split across the entry script and
+# the sibling module #1895 extracted the events.db anomaly checks into --
+# scanning only heartbeat_check.py would silently reclassify the moved
+# kinds' literal strings as test-only consumption.
+HEARTBEAT = (
+    REPO_ROOT / "scripts" / "heartbeat_check.py",
+    REPO_ROOT / "scripts" / "heartbeat_event_alarms.py",
+)
 _THIS_FILE_NAME = Path(__file__).name
 
 
@@ -787,9 +799,14 @@ class Report:
     invalid_markers: tuple[tuple[str, int, str], ...]  # (path, lineno, error)
     pending: tuple[PendingEntry, ...]
     test_only_consumed: frozenset[str]
+    heartbeat_literals: frozenset[str]
 
 
-def _analyze(src_root: Path, tests_root: Path | None, heartbeat_path: Path | None) -> Report:
+def _analyze(
+    src_root: Path,
+    tests_root: Path | None,
+    heartbeat_paths: Path | Sequence[Path] | None,
+) -> Report:
     emit_sites: list[EmitSite] = []
     file_markers: dict[str, FileMarkers] = {}
     file_sites: dict[str, list[EmitSite]] = {}
@@ -827,10 +844,18 @@ def _analyze(src_root: Path, tests_root: Path | None, heartbeat_path: Path | Non
             continue
         consumer_sites.extend(_collect_src_consumer_sites(tree, rel_path))
 
+    if heartbeat_paths is None:
+        hb_paths: tuple[Path, ...] = ()
+    elif isinstance(heartbeat_paths, Path):
+        hb_paths = (heartbeat_paths,)
+    else:
+        hb_paths = tuple(heartbeat_paths)
+
     heartbeat_literals: set[str] = set()
-    if heartbeat_path is not None and heartbeat_path.is_file():
-        hb_tree = ast.parse(heartbeat_path.read_text(encoding="utf-8"))
-        heartbeat_literals = _collect_literal_strings(hb_tree)
+    for hb_path in hb_paths:
+        if hb_path.is_file():
+            hb_tree = ast.parse(hb_path.read_text(encoding="utf-8"))
+            heartbeat_literals |= _collect_literal_strings(hb_tree)
 
     test_literals: set[str] = set()
     if tests_root is not None and tests_root.is_dir():
@@ -915,6 +940,7 @@ def _analyze(src_root: Path, tests_root: Path | None, heartbeat_path: Path | Non
         invalid_markers=tuple(invalid_markers),
         pending=tuple(pending),
         test_only_consumed=frozenset(test_only_consumed),
+        heartbeat_literals=frozenset(heartbeat_literals),
     )
 
 
@@ -971,7 +997,7 @@ def test_every_emitted_kind_is_consumed_or_declared(request: object) -> None:
             lines.append(f"  {entry.kind} (emitted at {where})")
         assert False, (
             "event kind(s) emitted with no consumer and no marker -- add a consumer "
-            "(query_events/heartbeat_check.py/a test), or mark the emission site "
+            "(query_events/the heartbeat scripts/a test), or mark the emission site "
             "`# event-consumer: audit-only <reason>` or `# event-consumer: pending #NNNN`:\n"
             + "\n".join(lines)
         )
@@ -999,14 +1025,54 @@ def test_every_emitted_kind_is_consumed_or_declared(request: object) -> None:
 
     # Issue #1366 resolved the entire pending backlog: ``draft_pr_blocked``
     # and ``venv_editable_anchor_violation`` now have real heartbeat consumers
-    # (``check_draft_pr_blocked_events`` / ``check_supervisor_venv_refusal``),
-    # so no emitted kind should carry a ``pending #NNNN`` marker. A kind
-    # regressing back to pending means a consumer was removed or a marker was
-    # re-added -- investigate rather than silently accepting it.
+    # (``check_draft_pr_blocked_events`` in scripts/heartbeat_event_alarms.py
+    # since #1895 / ``check_supervisor_venv_refusal`` in
+    # scripts/heartbeat_check.py), so no emitted kind should carry a
+    # ``pending #NNNN`` marker. A kind regressing back to pending means a
+    # consumer was removed or a marker was re-added -- investigate rather
+    # than silently accepting it.
     assert not report.pending, (
         "event kind(s) carry a `pending #NNNN` marker -- resolve the tracking "
         "issue by adding a real consumer instead of leaving the marker: "
         f"{[(p.kind, p.issue) for p in report.pending]}"
+    )
+
+
+def test_extracted_alarms_module_consumers_are_scanned() -> None:
+    """Regression pin for the #1895 extraction blind spot (PR #1908 review).
+
+    The events.db anomaly checks physically moved out of
+    ``scripts/heartbeat_check.py`` into ``scripts/heartbeat_event_alarms.py``,
+    taking the ``draft_pr_blocked`` / ``ci_headroom_unavailable`` /
+    ``infra_blocked_escalated`` literal strings with them. All three kinds
+    also appear in ``tests/`` -- so a heartbeat scan covering only
+    ``heartbeat_check.py`` would not leave them unaccounted (the test
+    literals still satisfy ``is_consumed``); it would silently demote them
+    to *test-only* consumers, the exact weak signal ``test_only_consumed``
+    exists to flag. Pin that each kind is found in the scanned heartbeat
+    literals and absent from ``report.test_only_consumed``.
+    """
+    report = _analyze(SRC, TESTS_DIR, HEARTBEAT)
+    moved_kinds = {
+        "ci_headroom_unavailable",
+        "draft_pr_blocked",
+        "infra_blocked_escalated",
+    }
+    unemitted = moved_kinds - set(report.emitted_kinds)
+    assert not unemitted, (
+        f"kind(s) expected to be emitted from src/ were not extracted: {sorted(unemitted)}"
+    )
+    missing_literals = moved_kinds - set(report.heartbeat_literals)
+    assert not missing_literals, (
+        "kind(s) whose heartbeat consumer moved to heartbeat_event_alarms.py are absent "
+        "from the scanned heartbeat literals -- the scan is not covering both files: "
+        f"{sorted(missing_literals)}"
+    )
+    demoted = moved_kinds & set(report.test_only_consumed)
+    assert not demoted, (
+        "kind(s) with a real heartbeat consumer were classified as test-only consumed "
+        "-- the heartbeat scan is missing heartbeat_event_alarms.py: "
+        f"{sorted(demoted)}"
     )
 
 
@@ -1023,7 +1089,7 @@ def test_new_unconsumed_kind_without_marker_fails(tmp_path: Path) -> None:
         '    log_event(path, "totally_new_kind", payload)\n',
         encoding="utf-8",
     )
-    report = _analyze(module, tests_root=None, heartbeat_path=None)
+    report = _analyze(module, tests_root=None, heartbeat_paths=None)
     assert "totally_new_kind" in report.emitted_kinds
     offending = {u.kind: u for u in report.unaccounted}
     assert "totally_new_kind" in offending, (
@@ -1045,7 +1111,7 @@ def test_new_unconsumed_kind_with_marker_is_accepted(tmp_path: Path) -> None:
         "    )\n",
         encoding="utf-8",
     )
-    report = _analyze(module, tests_root=None, heartbeat_path=None)
+    report = _analyze(module, tests_root=None, heartbeat_paths=None)
     assert not report.unaccounted
     assert not report.unmarked_dynamic
     assert not report.orphan_markers
@@ -1061,7 +1127,7 @@ def test_non_literal_kind_argument_without_marker_fails(tmp_path: Path) -> None:
         "    log_event(path, some_dynamic_kind, payload)\n",
         encoding="utf-8",
     )
-    report = _analyze(module, tests_root=None, heartbeat_path=None)
+    report = _analyze(module, tests_root=None, heartbeat_paths=None)
     assert len(report.unmarked_dynamic) == 1
     assert report.unmarked_dynamic[0].site.path == "injected.py"
     assert report.unmarked_dynamic[0].site.lineno == 4
@@ -1078,7 +1144,7 @@ def test_non_literal_kind_argument_with_marker_is_accepted(tmp_path: Path) -> No
         "    )\n",
         encoding="utf-8",
     )
-    report = _analyze(module, tests_root=None, heartbeat_path=None)
+    report = _analyze(module, tests_root=None, heartbeat_paths=None)
     assert not report.unmarked_dynamic
 
 
@@ -1130,7 +1196,7 @@ def test_orphan_marker_on_non_emitting_line_fails(tmp_path: Path) -> None:
         "x = 1  # event-consumer: audit-only nothing emits here\n",
         encoding="utf-8",
     )
-    report = _analyze(module, tests_root=None, heartbeat_path=None)
+    report = _analyze(module, tests_root=None, heartbeat_paths=None)
     assert ("injected.py", 1) in report.orphan_markers
 
 
@@ -1150,7 +1216,7 @@ def test_self_match_is_not_a_consumer(tmp_path: Path) -> None:
         "        pass\n",
         encoding="utf-8",
     )
-    report = _analyze(module, tests_root=None, heartbeat_path=None)
+    report = _analyze(module, tests_root=None, heartbeat_paths=None)
     offending = {u.kind for u in report.unaccounted}
     assert "self_matching_kind" in offending, (
         "a same-function 'consumer' occurrence must not exempt a kind from the unaccounted list"
@@ -1171,7 +1237,7 @@ def test_genuine_downstream_consumer_in_a_different_scope_counts(tmp_path: Path)
         '    return [e for e in events if e["kind"] == "genuinely_consumed_kind"]\n',
         encoding="utf-8",
     )
-    report = _analyze(module, tests_root=None, heartbeat_path=None)
+    report = _analyze(module, tests_root=None, heartbeat_paths=None)
     offending = {u.kind for u in report.unaccounted}
     assert "genuinely_consumed_kind" not in offending
 
@@ -1196,7 +1262,7 @@ def test_subpackage_emit_site_is_seen_without_a_declared_list(tmp_path: Path) ->
         '    log_event(path, "subpkg_emitted_kind", payload)\n',
         encoding="utf-8",
     )
-    report = _analyze(module, tests_root=None, heartbeat_path=None)
+    report = _analyze(module, tests_root=None, heartbeat_paths=None)
     assert "subpkg_emitted_kind" in report.emitted_kinds
     offending = {u.kind: u for u in report.unaccounted}
     assert "subpkg_emitted_kind" in offending
@@ -1227,7 +1293,7 @@ def test_same_basename_in_two_subpackages_attributes_by_relative_path(
             f'    log_event(path, "{kind}", payload){marker}\n',
             encoding="utf-8",
         )
-    report = _analyze(module, tests_root=None, heartbeat_path=None)
+    report = _analyze(module, tests_root=None, heartbeat_paths=None)
     unaccounted = {u.kind: u for u in report.unaccounted}
     assert "kind_from_pkg_a" not in unaccounted, (
         "pkg_a's own audit-only marker was not honored -- file_markers keyed by "

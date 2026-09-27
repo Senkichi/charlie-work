@@ -14,6 +14,11 @@ orchestrator suite, not a per-file copy that can drift out of payload sync.
 minimal reconcile-pass double, not this fake) -- see
 ``tests/_reconcile_fixtures.py``. The two are not related and must never be
 merged or made to subclass one another.
+
+``FakeGitHubWithRerunCapture`` (the ``gh run rerun``-capturing variant)
+lives in the sibling module ``tests/_fakes_github_rerun.py`` -- split out
+in the issue #1936 rework to keep this file under the repo's 800-line
+file-size cap.
 """
 
 from __future__ import annotations
@@ -88,6 +93,10 @@ class FakeGitHub:
         self.pr_external_issue_comments: dict[int, list[dict[str, Any]]] = {}
         self.pr_external_reviews: dict[int, list[dict[str, Any]]] = {}
         self.pr_external_review_comments: dict[int, list[dict[str, Any]]] = {}
+        # Issue #1853: record orchestrator-applied PR edits/comments so the
+        # rework-outcome lane's tests can assert exactly-once application.
+        self.pr_edits: list[tuple[int, str]] = []
+        self.pr_comments_posted: list[tuple[int, str]] = []
         # Actions job-log responses keyed by job id (issue #1686): the review
         # packet's collect-gate exemption section reads the gate job's log
         # via `gh api repos/{o}/{r}/actions/jobs/{id}/logs`.
@@ -424,6 +433,12 @@ class FakeGitHub:
                     break
         return open_issues
 
+    def issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]:
+        """Batched blocked-by lookup via the per-issue ``self.run`` path, so
+        ``dependencies_response`` overrides and run-call assertions behave as
+        they do for production clients (GitHubLike contract)."""
+        return {n: github_module.get_github_issue_dependencies(self, n) for n in issue_numbers}
+
     def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
         """Fake run method for GitHub API calls. Returns empty list for dependencies by default."""
         # Handle dependency API calls
@@ -660,7 +675,15 @@ class FakeGitHub:
         return [{"name": name} for name, _color, _desc in self.labels_created]
 
     def pr_comment(self, number: int, body_file: Path) -> None:
-        pass
+        self.pr_comments_posted.append((number, body_file.read_text(encoding="utf-8")))
+
+    def pr_edit(self, number: int, body_file: Path) -> None:
+        body = body_file.read_text(encoding="utf-8")
+        self.pr_edits.append((number, body))
+        for pr in self.prs:
+            if pr["number"] == number:
+                pr["body"] = body
+                break
 
     def remove_pr_label(self, number: int, label: str) -> bool:
         return True
@@ -748,34 +771,3 @@ class _IssueViewCountingGitHub(FakeGitHub):
     def issue_view(self, number: int):
         self.issue_view_calls.append(number)
         return super().issue_view(number)
-
-
-class FakeGitHubWithRerunCapture(FakeGitHubWithChecks):
-    """FakeGitHub that captures gh run rerun calls and can simulate failures."""
-
-    def __init__(
-        self,
-        checks: list[dict[str, Any]] | None = None,
-        *,
-        rerun_ok: bool = True,
-        rerun_error: str = "This workflow run cannot be retried",
-    ) -> None:
-        super().__init__(checks)
-        self.rerun_ok = rerun_ok
-        self.rerun_error = rerun_error
-        self.rerun_calls: list[list[str]] = []
-
-    def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):  # noqa: ANN202
-        if len(args) >= 2 and args[0] == "run" and args[1] == "rerun":
-            self.rerun_calls.append(list(args))
-            if self.rerun_ok:
-                return "DRY-RUN: gh run rerun " + " ".join(args[2:])
-            return github_module.GitHubRunResult(
-                ok=False,
-                returncode=1,
-                stdout="",
-                stderr=self.rerun_error,
-                value=None,
-                error=self.rerun_error,
-            )
-        return super().run(args, json_output=json_output, allow_failure=allow_failure)

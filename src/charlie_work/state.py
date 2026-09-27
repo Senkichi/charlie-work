@@ -777,16 +777,6 @@ def empty_state() -> dict[str, Any]:
         "prs": {},
         "events": [],
         "throttled_until": None,  # ISO timestamp when provider throttle cooldown ends
-        # Issue #1001: durable once-only escalation marker for the worker
-        # GitHub token gate. A missing token is a standing condition; the gate
-        # must not emit a worker_token_missing event every loop pass.
-        # fleet_dispatch.fleet_loop constructs a fresh OrchestratorApp per repo
-        # per pass, so an instance-level flag alone resets every pass and
-        # re-escalates indefinitely. This marker persists across reconstruction
-        # and is cleared when the condition resolves (token added), so a future
-        # regression re-escalates. Lives in state.json per the "state lives in
-        # GitHub labels + state.json" invariant.
-        "worker_token_escalated": False,
     }
 
 
@@ -847,7 +837,6 @@ def load_state(path: Path) -> dict[str, Any]:
     data.setdefault("prs", {})
     data.setdefault("events", [])
     data.setdefault("throttled_until", None)  # Backward compatibility
-    data.setdefault("worker_token_escalated", False)  # Issue #1001
     return data
 
 
@@ -979,6 +968,64 @@ def set_throttled_until(
         "throttle_reason": reason,
         "throttle_adapter_kind": adapter_kind,
     }
+
+
+def record_dead_worker_failure_kind(
+    data: dict[str, Any], issue_number: int, failure_kind: str
+) -> dict[str, Any]:
+    """Stamp a dead worker's classified ``failure_kind`` onto its issue entry.
+
+    Issue #1917: the state.json-keyed orphan sweep
+    (``workflow._detect_and_handle_orphaned_workers``) runs after the
+    session/worker sidecar has been reaped, so it cannot re-derive the
+    classification from the log tail. Persisting it on the issue entry
+    lets that lane exempt provider-throttle deaths
+    (``is_provider_throttle_failure``) from the
+    ``dead_dispatched_reap_minutes`` timed escalation and the
+    orphan-redispatch cap — the same #1684 semantics the rework lanes
+    already apply. The field is cleared on the next dispatch claim and
+    by ``unescalate`` so a stale classification can never exempt a later,
+    genuinely different death. No-op when the issue has no entry (e.g.
+    an untracked session) so the caller never invents one.
+
+    Returns ``data`` unchanged when there is nothing to stamp. Like the
+    rest of this module's value helpers, this is a pure update: it returns
+    a new top-level mapping (with new ``issues``/entry mappings) and never
+    mutates the caller's ``data``.
+    """
+    issues = data.get("issues")
+    if not isinstance(issues, dict):
+        return data
+    issue_key = str(issue_number)
+    entry = issues.get(issue_key)
+    if not isinstance(entry, dict):
+        return data
+    return {
+        **data,
+        "issues": {
+            **issues,
+            issue_key: {**entry, "dead_worker_failure_kind": failure_kind},
+        },
+    }
+
+
+def clear_dead_worker_failure_kind(entry: dict[str, Any]) -> None:
+    """Drop the stamped ``dead_worker_failure_kind`` at a dispatch epoch.
+
+    Issue #1917: a new dispatch epoch supersedes the previous death's
+    classification. Every lane that claims or upgrades an issue into a new
+    dispatch -- fresh-dispatch claim and success, live/phantom recovery,
+    remote and local rework claim and success -- routes the previous
+    classification through this single helper: a stale provider-throttle
+    kind that survives the epoch boundary would exempt a later, genuinely
+    different death from the orphan sweep's timed reap and redispatch cap.
+    The unescalate path clears it via ``UNESCALATE_ISSUE_RESET_FIELDS``
+    instead.
+
+    Mutates ``entry`` in place; every call site has already spread the
+    stored issue entry into a fresh mapping it owns before calling.
+    """
+    entry.pop("dead_worker_failure_kind", None)
 
 
 def _reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:

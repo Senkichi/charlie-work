@@ -50,7 +50,7 @@ from .subprocess_runner import no_console_window_kwargs
 _MAX_CHAIN_DEPTH = 4096
 
 # Timeout for one PowerShell process-snapshot attempt. Generous relative to
-# `process_utils.sweep_orphan_processes`'s 10s because this queries every
+# `orphan_sweep.sweep_orphan_processes`'s 10s because this queries every
 # process on the host, not a CommandLine-filtered subset. The original 15s
 # budget was empirically too tight: the hosted-CI Tests job on PR #1805
 # timed out under pytest-xdist load. 60s matches `_DEFAULT_TIMEOUT_SECONDS`
@@ -284,7 +284,7 @@ def list_processes() -> tuple[Sequence[ProcessInfo], str | None]:
     """Snapshot every OS process via ``Win32_Process`` (Windows only).
 
     Built on the same PowerShell invocation style as
-    ``process_utils.sweep_orphan_processes``/``_enumerate_child_pids``:
+    ``orphan_sweep.sweep_orphan_processes``/``process_utils._enumerate_child_pids``:
     ``Get-CimInstance Win32_Process`` piped through ``ConvertTo-Json``, no
     ``psutil`` dependency (that module deliberately avoids one; see its
     docstrings). Returns ``(processes, error)`` instead of raising — a
@@ -315,12 +315,28 @@ def list_processes() -> tuple[Sequence[ProcessInfo], str | None]:
                     # and report "not quiescent" regardless of what was
                     # actually running. The single-result normalization
                     # below is what makes dropping it safe.
+                    #
+                    # The `OutputEncoding` pin pairs with `encoding="utf-8"`
+                    # below (issue #1930): powershell.exe writes redirected
+                    # stdout in the host's OEM codepage (cp437 on this host),
+                    # under which a CommandLine character like U+2665 is
+                    # emitted as the raw byte 0x03. Any ASCII-compatible
+                    # decode -- the ANSI-codepage `text=True` default, or
+                    # even UTF-8 alone -- turns that byte back into U+0003
+                    # inside a JSON string and `json.loads` fails with
+                    # "Invalid control character". Pinning the child's
+                    # output encoding to no-BOM UTF-8 and decoding UTF-8
+                    # makes both sides of the pipe agree regardless of the
+                    # host's ANSI/OEM codepages.
+                    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
                     "Get-CimInstance Win32_Process | "
                     "Select-Object ProcessId, ParentProcessId, Name, CommandLine | "
                     "ConvertTo-Json",
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=_LIST_PROCESSES_TIMEOUT_SECONDS,
                 **no_console_window_kwargs(),
             )

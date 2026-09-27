@@ -1,1 +1,7 @@
-1000
+1200
+# Issue #1716 / PR #1818 round-7 review: the drain-suppression regression
+# tests (TestDrainSuppressesLocalRework) put the file at 1068 lines -- past
+# the 1000 mark. Raised to the next MARK_QUANTUM multiple per the ratchet's
+# hand-raise rule; the reviewer-sanctioned alternative (a new test module)
+# would duplicate ~100 lines of repo/app/parked-issue helpers since test
+# modules must not import each other.

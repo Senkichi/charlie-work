@@ -255,6 +255,39 @@ def test_check_ignore_fallback_when_repo_root_is_not_a_git_repo(tmp_path: Path) 
     assert "abstaining" in result.reason
 
 
+def test_check_ignore_inside_enclosing_repo_does_not_consult_foreign_rules(
+    tmp_path: Path,
+) -> None:
+    """A ``repo_root`` that is a plain directory nested inside an enclosing
+    git repository -- under a path the ENCLOSING repo's ``.gitignore``
+    ignores -- must not inherit that foreign repo's ignore verdict.
+    ``git check-ignore`` resolves its repository by walking up from the
+    cwd, so without the ``--show-toplevel`` guard it would answer
+    "ignored" using rules belonging to a repository the gate never asked
+    about, silently suppressing a dispatch target into ``neutral_paths``
+    (issue #1854). This is the shape pytest fixtures take when the
+    worker's tmp dir lives inside an agent worktree's gitignored ``.var/``
+    directory -- which is what makes it a real hazard and not only a test
+    concern: any ``repo_root`` that is not itself a git toplevel gets a
+    wrong-repo answer, and the documented failure fallback is "not
+    ignored"."""
+    enclosing = tmp_path / "enclosing"
+    enclosing.mkdir()
+    _git(enclosing, "init")
+    (enclosing / ".gitignore").write_text("fixture/\n", encoding="utf-8")
+    repo = enclosing / "fixture" / "repo"
+    repo.mkdir(parents=True)  # plain dir -- deliberately not `git init`-ed.
+    body = "The bug is in `src/foo.py`."
+
+    result = cross_repo_gate(body, repo)
+
+    assert result.passed is True
+    assert result.referenced_paths == ("src/foo.py",)
+    assert result.missing_paths == ("src/foo.py",)
+    assert result.neutral_paths == ()
+    assert "abstaining" in result.reason
+
+
 # --- (f): citation-section headings (issue #1583) ------------------------
 #
 # A bullet list under a ``## Provenance`` heading is this fleet's house

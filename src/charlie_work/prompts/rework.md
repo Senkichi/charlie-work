@@ -55,8 +55,11 @@ not make it for them.
 - Preserve the original issue scope.
 - Add or update tests for the review findings.
 $section_rework_preflight
-- Re-run verification and update the PR body or comment with results.
-- If you disagree with a finding, explain with evidence in the PR instead of ignoring it.
+- Re-run verification and report the results through `.worker-outcome.json`
+  (a corrected `pr_body`, a `pr_comment`, or both) — the orchestrator applies
+  them to the PR for you; you have no `gh` access.
+- If you disagree with a finding, explain with evidence in the outcome
+  file's `pr_comment` instead of ignoring it.
 
 $section_scope_contract
 
@@ -91,9 +94,14 @@ pre-approved; it never touches `main` directly. Ending the session with
 committed-but-unpushed work is a task FAILURE — the reviewer cannot see
 unpushed commits.
 
-## FINAL STEP — push and verify
+## FINAL STEP — push, verify, and report
 
 **Committing locally is NOT done.** The PR head must advance to reflect your work.
+
+You have NO GitHub credentials — `gh` is unavailable in this environment by
+design, and you must not invoke it. The orchestrator (which is
+authenticated) applies any PR body update or comment you request through
+`.worker-outcome.json`.
 
 After your final commit:
 
@@ -114,11 +122,33 @@ After your final commit:
    git ls-remote origin $branch_name
    ```
    The first column of the output must equal `git rev-parse HEAD`. If the SHAs do not match, retry the push until they do; do not report success.
-4. Verify the PR head advanced:
-   ```bash
-   gh pr view $pr_number --json headRefOid
+4. Write `.worker-outcome.json` in the repository root:
+   ```json
+   {
+     "push_succeeded": true,
+     "pr_created": false,
+     "head_sha": "<exact output of git rev-parse HEAD>",
+     "pr_body": "<full replacement PR body — omit to leave it unchanged>",
+     "pr_comment": "<comment to post on the PR — omit to post nothing>"
+   }
    ```
-   Confirm the returned `headRefOid` equals `git rev-parse HEAD`.
-5. After verifying the push, re-read your PR body and make every claim literally true at the pushed head, including the checklist: the suite count must come from your final local run on the pushed tree, file/occurrence lists must match the final diff exactly, and any carve-outs or partial applications must be disclosed as such. Update the body with `gh pr edit` if anything is stale. A PR body with a false or stale claim fails review.
+   - `head_sha` is REQUIRED. The orchestrator applies your `pr_body` /
+     `pr_comment` only after verifying it equals the live remote head —
+     use the exact `git rev-parse HEAD` output verified in step 3.
+   - `pr_body`: re-derive your PR body and make every claim literally true at the pushed head,
+     including the checklist: the suite count must come from your final
+     local run on the pushed tree, file/occurrence lists must match the
+     final diff exactly, and any carve-outs or partial applications must be
+     disclosed as such. Write the FULL corrected body here — the
+     orchestrator replaces the existing body with it verbatim. You cannot
+     read the PR body yourself (no `gh` access), so write this from
+     scratch rather than editing. Omit `pr_body` only when nothing in the
+     body is stale. A PR body with a false or stale claim fails review.
+   - `pr_comment`: a follow-up note for the reviewer — verification
+     results, or your evidence when you disagree with a finding.
+5. Stop. Do not wait for the PR to reflect your updates and do not push
+   again after writing the outcome file — the orchestrator applies them
+   after your session exits.
 
-Only when the PR head points at your pushed commit is the rework complete.
+Only when the remote branch head points at your pushed commit and the
+outcome file is written is the rework complete.

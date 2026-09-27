@@ -1,0 +1,8 @@
+{
+ "boundary": 31.0,
+ "bumps": [],
+ "file": "tests/test_human_merge_labels_1598.py",
+ "identity": "tests/test_human_merge_labels_1598.py::module",
+ "kind": "test_module",
+ "member_count": 32
+}

@@ -39,6 +39,21 @@ from .state import state_lock
 from .subprocess_runner import RunResult, command_failure_message, run_captured
 from .worker import iter_workers
 
+# Issue #1855's pending-sync marker + starvation-bound domain lives in
+# .pending_sync (file-size ratchet: this module is over the 800-line cap).
+# Re-exported here so pre-extraction imports (tests, cli.py) keep working.
+from .pending_sync import (  # noqa: F401  (deliberate re-export)
+    DEFAULT_SYNC_STARVATION_SECONDS,
+    SyncDeferral,
+    _clear_marker,
+    _parse_marker_timestamp,
+    _pending_sync_age_seconds,
+    _pending_sync_marker_path,
+    _read_marker,
+    _write_marker,
+    record_sync_deferral,
+)
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -266,33 +281,6 @@ def read_head_sha(
     return res.stdout.strip() or None
 
 
-def _pending_sync_marker_path(state_root: Path) -> Path:
-    """Return the path to the deferred-``uv sync`` marker under ``state_root``."""
-    return layout.pending_sync_path(state_root)
-
-
-def _write_marker(path: Path, from_sha: str, to_sha: str) -> None:
-    """Persist the pending-sync marker atomically (temp-file + replace)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"from_sha": from_sha, "to_sha": to_sha}, indent=2) + "\n"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(path)
-
-
-def _read_marker(path: Path) -> dict[str, str]:
-    """Read the marker, returning an empty dict on any read/parse error."""
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _clear_marker(path: Path) -> None:
-    """Remove the pending-sync marker, if it exists."""
-    path.unlink(missing_ok=True)
-
-
 @dataclass(frozen=True)
 class SelfDeployResult:
     """Result of a self-deploy attempt.
@@ -331,6 +319,13 @@ class SelfDeployResult:
     lesson as ``head_changed`` one field up: callers that need to know about
     a specific event on *this* attempt need a field describing that event,
     not an inference from the shape of other fields.
+
+    ``starved`` is True only on the deferred path when the pending-sync
+    marker's ``written_at`` has aged past the configured starvation bound
+    (issue #1855): the episode has outlived any plausible worker session, so
+    the caller should stop admitting new dispatches until the sync lands.
+    Like ``deferred``, it describes this attempt specifically -- a synced or
+    never-deferred pass reports False even if an earlier deferral starved.
     """
 
     ok: bool
@@ -345,6 +340,7 @@ class SelfDeployResult:
     venv_repaired: bool = False
     previewed: bool = False
     deferred: bool = False
+    starved: bool = False
 
     @property
     def alertable(self) -> bool:
@@ -813,6 +809,8 @@ def _log_self_deploy_outcome(repo_root: Path, result: SelfDeployResult) -> None:
             "to_sha": result.to_sha,
             "changed": result.changed,
             "synced": result.synced,
+            "deferred": result.deferred,
+            "starved": result.starved,
             "venv_repaired": result.venv_repaired,
             "message": result.message,
             "error": result.error,
@@ -1010,6 +1008,7 @@ def self_deploy(
     dry_run: bool = False,
     failure_alarm_threshold: int = DEFAULT_SELF_DEPLOY_FAILURE_ALARM,
     pull_ci_fleet: bool = False,
+    starvation_seconds: int = DEFAULT_SYNC_STARVATION_SECONDS,
 ) -> SelfDeployResult:
     """FF-pull ``origin/main`` and run ``uv sync`` when dependency files changed.
 
@@ -1024,6 +1023,15 @@ def self_deploy(
     sync is deferred and a pending-sync marker is written atomically.  The
     marker is checked on every subsequent pass, so the sync retries even when
     the next ``git pull`` finds no new commits.
+
+    ``starvation_seconds`` bounds how long that deferral may continue (issue
+    #1855): once the marker's ``written_at`` -- the first deferral of the
+    episode -- is older than the bound, the deferred result reports
+    ``starved=True`` and a single ``self_deploy_sync_starved`` event fires
+    per episode. Callers that admit new worker dispatches are expected to
+    stop doing so while ``starved`` holds, so the live-worker count can
+    drain to zero and the sync can land; nothing is killed. <= 0 disables
+    the bound.
 
     All subprocess errors are returned as values (non-fatal); the function
     never raises.
@@ -1063,6 +1071,7 @@ def self_deploy(
         pull_timeout=pull_timeout,
         sync_timeout=sync_timeout,
         pull_ci_fleet=pull_ci_fleet,
+        starvation_seconds=starvation_seconds,
     )
     _log_self_deploy_outcome(repo_root, result)
     _record_self_deploy_failure_streak(repo_root, result, threshold=failure_alarm_threshold)
@@ -1364,6 +1373,7 @@ def _self_deploy_attempt(
     pull_timeout: int,
     sync_timeout: int,
     pull_ci_fleet: bool = False,
+    starvation_seconds: int,
 ) -> SelfDeployResult:
     """Perform the real (non-preview) pull/diff/sync attempt.
 
@@ -1531,12 +1541,34 @@ def _self_deploy_attempt(
 
         live_count, _ = fleet_registry.count_fleet_live_sessions(fleet_dir_override)
         if live_count > 0:
-            _write_marker(marker_path, from_sha, to_sha)
+            # Issue #1855: bound how long a pending sync may starve under
+            # continuous load. ``record_sync_deferral`` rewrites the marker
+            # (carrying the episode's first-deferral ``written_at`` forward),
+            # measures the episode age against the bound, and emits the
+            # once-per-episode ``self_deploy_sync_starved`` event; ``starved``
+            # reports the trip to the caller -- which stops admitting new
+            # dispatches -- rather than killing anything live.
+            deferral = record_sync_deferral(
+                marker_path,
+                marker,
+                from_sha=from_sha,
+                to_sha=to_sha,
+                live_count=live_count,
+                starvation_seconds=starvation_seconds,
+                state_path=_self_deploy_state_path(repo_root),
+            )
+            starved = deferral.starved
             runner_word = "runner" if live_count == 1 else "runners"
             if marker is not None:
+                starved_note = (
+                    f"; starved {int(deferral.marker_age_seconds or 0)}s >= {starvation_seconds}s "
+                    "bound -- new dispatch suppressed until drained"
+                    if starved
+                    else ""
+                )
                 print(
                     f"WARNING: pending dependency sync still deferred: {live_count} "
-                    f"{runner_word} active (marker {from_sha}..{to_sha})",
+                    f"{runner_word} active (marker {from_sha}..{to_sha}){starved_note}",
                     flush=True,
                 )
             return SelfDeployResult(
@@ -1550,6 +1582,7 @@ def _self_deploy_attempt(
                 venv_repaired=venv_repaired,
                 message=f"sync deferred: {live_count} {runner_word} active",
                 deferred=True,
+                starved=starved,
             )
 
         # Persist marker before attempting sync so a crash between the pull and

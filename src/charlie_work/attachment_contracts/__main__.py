@@ -23,13 +23,13 @@ from pathlib import Path
 
 from charlie_work.attachment_contracts.archetypes import scan_tree
 from charlie_work.attachment_contracts.backtest import ANCHOR_SHAS, run_backtest, write_report
+from charlie_work.attachment_contracts import baseline_dir
 from charlie_work.attachment_contracts.baseline import (
+    BASELINE_DIRNAME,
     BASELINE_FILENAME,
     TamperError,
     compare,
-    dump,
     kind_stats_of,
-    load,
     with_kind_stats,
 )
 from charlie_work.attachment_contracts.baseline import (
@@ -100,7 +100,10 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
     root = Path(args.root).resolve()
     excludes = load_excludes(root)
     scan = scan_tree(root, excludes)
-    baseline_path = root / BASELINE_FILENAME
+    # Issue #1839: find_baseline returns whichever layout exists -- the
+    # per-entry directory or the legacy single file -- so a ratchet always
+    # writes back in the committed layout.
+    baseline_path = baseline_dir.find_baseline(root)
 
     # ``--refreeze`` (issue #1614): ratchet the entries against a LIVE fence
     # AND recompute the frozen per-kind statistics. It is the only ratchet-
@@ -109,10 +112,10 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
     # preserves kind_stats verbatim -- it may lower entries and may not raise
     # the frozen boundary.
     if args.refreeze:
-        if not baseline_path.is_file():
-            print(f"error: no baseline at {baseline_path} to refreeze", file=sys.stderr)
+        if baseline_path is None:
+            print(f"error: no baseline at {root} to refreeze", file=sys.stderr)
             return 1
-        document = load(baseline_path)
+        document = baseline_dir.load(baseline_path)
         kinds = sorted({p.kind for p in scan.points})
         verdicts = saturate_all(scan.points, kinds)
         _findings, ratcheted = compare(verdicts, document)
@@ -121,15 +124,15 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
             verdicts,
             generated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
         )
-        dump(ratcheted, baseline_path)
+        baseline_dir.dump(ratcheted, baseline_path)
         print(f"refrozen baseline written: {baseline_path} ({len(ratcheted['entries'])} entries)")
         return 0
 
     if args.ratchet:
-        if not baseline_path.is_file():
-            print(f"error: no baseline at {baseline_path} to ratchet", file=sys.stderr)
+        if baseline_path is None:
+            print(f"error: no baseline at {root} to ratchet", file=sys.stderr)
             return 1
-        document = load(baseline_path)
+        document = baseline_dir.load(baseline_path)
         # Issue #1614: saturate against the frozen fence when present so a
         # ratchet cannot churn entries for files the PR never touched. Fall
         # back to live recomputation for pre-#1614 baselines (no kind_stats).
@@ -140,7 +143,7 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
             kinds = sorted({p.kind for p in scan.points})
             verdicts = saturate_all(scan.points, kinds)
         _findings, ratcheted = compare(verdicts, document)
-        dump(ratcheted, baseline_path)
+        baseline_dir.dump(ratcheted, baseline_path)
         print(f"ratcheted baseline written: {baseline_path} ({len(ratcheted['entries'])} entries)")
         return 0
 
@@ -153,7 +156,11 @@ def _cmd_baseline(args: argparse.Namespace) -> int:
         generated_at=generated_at,
         floor=FLOOR,
     )
-    dump(document, baseline_path)
+    # A fresh generation writes the current (per-entry directory) layout
+    # unless a legacy single file is what this checkout already commits --
+    # then the write stays in the layout the reader expects to find.
+    baseline_path = baseline_path or (root / BASELINE_DIRNAME)
+    baseline_dir.dump(document, baseline_path)
     print(f"baseline written: {baseline_path} ({len(document['entries'])} entries)")
     return 0
 
@@ -165,18 +172,10 @@ def _cmd_check_file(args: argparse.Namespace) -> int:
     return 1 if _is_blocking(findings) else 0
 
 
-def _load_previous_baseline_document(root: Path, base_ref: str) -> dict[str, object] | None:
-    """Fetch `.attachment-budgets.json` as it read at `base_ref`, for the G4
-    diff-based ratchet-tamper guard (finding #1). Returns None -- meaning
-    "nothing to diff against, skip that check for this run" -- whenever it
-    genuinely can't be resolved: the ref doesn't exist, the file didn't exist
-    yet at that ref (freeze-on-adopt's first commit), or this isn't a git
-    checkout at all. Never raises: the base-ref lookup is a bonus check, not
-    a precondition for `check-tree` to run at all.
-    """
+def _git_show(root: Path, spec: str) -> str | None:
     try:
         result = subprocess.run(
-            ["git", "show", f"{base_ref}:{BASELINE_FILENAME}"],
+            ["git", "show", spec],
             cwd=str(root),
             capture_output=True,
             text=True,
@@ -184,10 +183,66 @@ def _load_previous_baseline_document(root: Path, base_ref: str) -> dict[str, obj
         )
     except OSError:
         return None
-    if result.returncode != 0:
+    return result.stdout if result.returncode == 0 else None
+
+
+def _load_previous_baseline_document(root: Path, base_ref: str) -> dict[str, object] | None:
+    """Fetch the committed baseline as it read at `base_ref`, for the G4
+    diff-based ratchet-tamper guard (finding #1). Returns None -- meaning
+    "nothing to diff against, skip that check for this run" -- whenever it
+    genuinely can't be resolved: the ref doesn't exist, the baseline didn't
+    exist yet at that ref (freeze-on-adopt's first commit), the stored
+    content is malformed, or this isn't a git checkout at all. Never raises:
+    the base-ref lookup is a bonus check, not a precondition for
+    `check-tree` to run at all.
+
+    Issue #1839: tries the per-entry ``.attachment-budgets/`` directory at
+    the ref first (``git ls-tree`` + one ``git show`` per member), then
+    falls back to the legacy ``.attachment-budgets.json`` file so the guard
+    still diffs across the layout migration commit itself.
+    """
+    try:
+        listing = subprocess.run(
+            [
+                "git",
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "--full-tree",
+                "-z",
+                base_ref,
+                "--",
+                BASELINE_DIRNAME,
+            ],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            **no_console_window_kwargs(),
+        )
+    except OSError:
+        listing = None
+    if listing is not None and listing.returncode == 0 and listing.stdout.strip():
+        files: dict[str, str] = {}
+        prefix = BASELINE_DIRNAME + "/"
+        for repo_path in listing.stdout.split("\0"):
+            if not repo_path.startswith(prefix):
+                continue
+            text = _git_show(root, f"{base_ref}:{repo_path}")
+            if text is None:
+                # A listed path that won't read back is a corrupt snapshot;
+                # the same fail-closed stance as a TamperError below.
+                return None
+            files[repo_path[len(prefix) :]] = text
+        if files:
+            try:
+                return baseline_dir.load_files(files)
+            except TamperError:
+                return None
+    legacy_text = _git_show(root, f"{base_ref}:{BASELINE_FILENAME}")
+    if legacy_text is None:
         return None
     try:
-        return load_baseline_text(result.stdout)
+        return load_baseline_text(legacy_text)
     except TamperError:
         return None
 
@@ -226,7 +281,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--root", default=".")
     p_scan.set_defaults(func=_cmd_scan)
 
-    p_baseline = sub.add_parser("baseline", help="Generate or ratchet .attachment-budgets.json.")
+    p_baseline = sub.add_parser("baseline", help="Generate or ratchet .attachment-budgets/")
     p_baseline.add_argument("--root", default=".")
     p_baseline.add_argument("--ratchet", action="store_true")
     p_baseline.add_argument(

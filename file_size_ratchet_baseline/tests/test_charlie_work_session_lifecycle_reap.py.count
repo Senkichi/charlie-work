@@ -1,0 +1,7 @@
+1200
+# Issue #1917 / PR #1919 rework: the bounded provider-throttle
+# exemption, launch-failure stamping, and orphan-redispatch seeding
+# regression tests put the file at 1180 lines -- past the 800 cap.
+# Raised to the next MARK_QUANTUM multiple per the ratchet's hand-raise
+# rule; the alternative (a new test module) would duplicate the reap
+# lane fixture harness since test modules must not import each other.

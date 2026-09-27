@@ -118,6 +118,37 @@ def is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
     ).ok
 
 
+def worker_branch_heads(repo_root: Path, branch_prefix: str, issue_number: int) -> dict[str, str]:
+    """Live ``{branch_prefix}-<issue_number>[-*]`` local branches -> tip SHAs.
+
+    The worker branch convention is ``{branch_prefix}-<n>-<slug>`` (the bare
+    ``-{n}`` ref is included for pre-slug names). Only resolvable tips are
+    returned: a branch deleted after its merge is indistinguishable at the
+    ref level from "never dispatched", which is exactly what a caller gating
+    on unmerged work wants -- demanding the ref would report unlanded work
+    for the default lane's own merged-and-cleaned-up end state.
+    """
+    result = run_captured(
+        [
+            "git",
+            "for-each-ref",
+            "--format=%(objectname) %(refname:short)",
+            f"refs/heads/{branch_prefix}-{issue_number}",
+            f"refs/heads/{branch_prefix}-{issue_number}-*",
+        ],
+        cwd=repo_root,
+        timeout_seconds=GIT_OP_TIMEOUT_SECONDS,
+    )
+    if not result.ok:
+        return {}
+    heads: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        sha, _, name = line.partition(" ")
+        if sha.strip() and name.strip():
+            heads[name.strip()] = sha.strip()
+    return heads
+
+
 def worktree_for_branch(repo_root: Path, branch: str) -> Path | None:
     """The worktree path that has ``branch`` checked out, if any."""
     want = f"refs/heads/{branch}"

@@ -43,6 +43,7 @@ from charlie_work.attachment_budget_prompt import (
     ATTACHMENT_BUDGET_CLAUSE as _ATTACHMENT_BUDGET_CLAUSE,
 )
 from charlie_work.attachment_contracts import baseline as attachment_baseline
+from charlie_work.attachment_contracts import baseline_dir as attachment_baseline_dir
 from charlie_work.instrumentation import (
     correlation_context,
     log_event,
@@ -169,13 +170,14 @@ def _build_module_map_value(self, issue_number: int) -> str:
 def _build_attachment_budget_value(self, issue_number: int) -> str:
     """Derive the attachment-budget dispatch clause (issue #1460).
 
-    Marker-file presence is the ONLY activation switch: a repo that has
-    never run `attachment_contracts baseline` (no `.attachment-budgets.json`
-    at the repo root) gets an empty clause, silently -- this feature is
-    opt-in per repo, not a default every worker prompt must carry.
+    Marker presence is the ONLY activation switch: a repo that has
+    never run `attachment_contracts baseline` (no `.attachment-budgets/`
+    directory -- or legacy `.attachment-budgets.json` -- at the repo
+    root) gets an empty clause, silently -- this feature is opt-in per
+    repo, not a default every worker prompt must carry.
 
-    When the marker file IS present, its structural validity is checked
-    via `baseline.load` (not just existence) before the clause is
+    When a baseline IS present, its structural validity is checked via
+    `baseline_dir.load` (not just existence) before the clause is
     emitted, so a hand-corrupted or tampered baseline never ships
     placement instructions that reference a broken `check-file` command.
     Fail-soft, mirroring `_build_module_map_value`'s contract exactly: a
@@ -188,20 +190,19 @@ def _build_attachment_budget_value(self, issue_number: int) -> str:
     outside a state-lock context, so the module-level, lock-free
     primitive is the only one available here.
     """
-    marker_path = self.repo_root / attachment_baseline.BASELINE_FILENAME
-    if not marker_path.is_file():
+    marker_path = attachment_baseline_dir.find_baseline(self.repo_root)
+    if marker_path is None:
         return ""
     try:
-        attachment_baseline.load(marker_path)
+        attachment_baseline_dir.load(marker_path)
     except (attachment_baseline.TamperError, OSError, ValueError) as exc:
-        # ``TamperError`` covers baseline's own structural checks
-        # (schema version, entry shape, duplicate keys); ``ValueError``
-        # additionally covers a bare ``json.JSONDecodeError`` (a subclass
-        # of ``ValueError``) from genuinely malformed JSON, which
-        # ``baseline.loads`` does not wrap into a ``TamperError`` itself.
-        # ``OSError`` guards a read race between the ``is_file()`` check
-        # above and this read. Mirrors ``hook_entry._resolve_mode``'s
-        # except clause for the same reason.
+        # ``TamperError`` covers the loader's own structural checks
+        # (schema version, entry shape, duplicate keys, malformed JSON --
+        # ``baseline.loads``/``load_files`` wrap decode errors into it).
+        # ``ValueError`` guards any residual decode-path case and
+        # ``OSError`` a read race between ``find_baseline`` and this read.
+        # Mirrors ``hook_entry._resolve_mode``'s except clause for the
+        # same reason.
         log_event(
             self.paths.state_file,
             "worker_attachment_budget_failed",
