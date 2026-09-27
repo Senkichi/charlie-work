@@ -22,7 +22,6 @@ from __future__ import annotations
 import ast
 import builtins
 import fnmatch
-import hashlib
 import logging
 import re
 from collections.abc import Iterator, Mapping, Sequence
@@ -37,6 +36,7 @@ from charlie_work.checks import (
     summarize_checks,
 )
 from charlie_work.issue_linking import linked_issue_number
+from charlie_work.no_op_rework_body import _body_rework_escape_warning
 from charlie_work.safe_ref import require_valid_ref_name, require_valid_sha
 from charlie_work.subprocess_runner import run_captured
 
@@ -251,24 +251,6 @@ def _calculate_patch_id(diff: str) -> str:
         if line:
             return line.split()[0]
     return ""
-
-
-def _body_content_sha256(body: object) -> str:
-    """Content hash of a PR body for no-op-rework comparison (issue #1939).
-
-    ``record_review`` stamps the result into the verdict as
-    ``reviewed_body_sha256``; ``_check_no_op_rework`` rehashes the live
-    ``pr["body"]`` and compares. Line endings are normalized before
-    hashing so a transport-level CRLF/LF flip (e.g. ``gh pr edit
-    --body-file`` vs. the value the API echoes back) never counts as a
-    content change -- the escape hatch must open only on a real body
-    edit, never on a serialization artifact. ``None`` (a PR with no
-    body, or a JSON ``null``) hashes as the empty string so verdict-time
-    and live reads agree.
-    """
-    text = body if isinstance(body, str) else ""
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -917,33 +899,13 @@ def _check_no_op_rework(
     if decision != "request_changes":
         return False
 
-    # Issue #1939: a request_changes finding whose required fix lives in the
-    # PR body/description produces no code delta by construction -- the
-    # rework's only artifact is a ``gh pr edit`` body update (applied on the
-    # worker's behalf through the rework-outcome ``pr_body`` channel, since
-    # workers hold no gh credential). Without this signal such a rework is
-    # indistinguishable from a genuine no-op and the PR pins in a permanent
-    # janitor_gate block (swole #198 / PR #348). A live body whose hash
-    # differs from the verdict's ``reviewed_body_sha256`` baseline -- stamped
-    # from the body the reviewer actually read -- is therefore satisfied as
-    # real rework, skipping every diff/head comparison below (patch-id,
-    # head-SHA, merge-only): all are blind to body edits. A verdict that
-    # predates the field, or a PR payload without a ``body`` key, yields no
-    # comparison and fails closed -- the gate behaves exactly as before.
-    reviewed_body_sha256 = (review_decision or {}).get("reviewed_body_sha256")
-    if not isinstance(reviewed_body_sha256, str) or not reviewed_body_sha256:
-        reviewed_body_sha256 = pr_state.get("reviewed_body_sha256")
-    if (
-        isinstance(reviewed_body_sha256, str)
-        and reviewed_body_sha256
-        and "body" in pr
-        and _body_content_sha256(pr.get("body")) != reviewed_body_sha256
-    ):
-        warnings.append(
-            "No-op rework check satisfied: PR body changed since the "
-            "request_changes verdict — a body-only rework produces no code "
-            "delta but is not a no-op (issue #1939)"
-        )
+    # Issue #1939: a body-only rework produces no code delta, so a changed
+    # PR body satisfies the gate; the comparison lives in
+    # no_op_rework_body._body_rework_escape_warning (extracted per the
+    # file-size ratchet). No baseline or no ``body`` key fails closed.
+    body_escape_warning = _body_rework_escape_warning(pr, pr_state, review_decision)
+    if body_escape_warning is not None:
+        warnings.append(body_escape_warning)
         return False
 
     # Primary check: compare patch-ids when both are available
