@@ -58,6 +58,7 @@ def _route_to_rework(
             "decision": pr_entry.get("decision"),
             "reviewed_head_sha": pr_entry.get("reviewed_head_sha"),
             "reviewed_patch_id": pr_entry.get("reviewed_patch_id"),
+            "reviewed_body_sha256": pr_entry.get("reviewed_body_sha256"),
             **(extra_state or {}),
         }
         payload = {
