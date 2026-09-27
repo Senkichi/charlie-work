@@ -2015,12 +2015,47 @@ def fleet_loop(
     # (_run_fleet_repo_lane) to a bounded pool and keeps every shared
     # aggregate (per_repo_results, attention_events, loaded_configs,
     # observed/touched/deferred lists) single-threaded in selection order.
-    # Phase 2 collects futures in selection order so result ordering and
-    # instrumentation are identical to the serial loop. The supervisor lock
-    # a lane acquires in phase 1 stays held until its lane body returns,
-    # exactly as before.
+    # Futures are resolved strictly in selection order -- either while
+    # throttling a full pool mid-submission or in the post-loop drain -- so
+    # result ordering and instrumentation are identical to the serial loop.
+    # The supervisor lock a lane acquires in phase 1 stays held until its
+    # lane body returns, exactly as before.
     lane_concurrency = max(1, min(len(selected), _resolve_fleet_lane_concurrency(global_config)))
     pending_lanes: list[tuple[str, dict[str, Any], Path, float, Any]] = []
+    collected_lane_count = 0
+
+    def _collect_next_pending_lane() -> None:
+        """Resolve the oldest uncollected lane future, in selection order.
+
+        Runs on the calling thread both when the submission loop throttles
+        on a full pool and in the post-loop drain, so per-repo results,
+        attention events, and the lane-elapsed log line keep serial ordering
+        no matter when a lane actually finishes.
+        """
+        nonlocal collected_lane_count, orphan_sweep_calls
+        repo_key, entry, repo_root, repo_lane_start, future = pending_lanes[collected_lane_count]
+        collected_lane_count += 1
+        try:
+            result = future.result()
+        except Exception as exc:
+            _record_repo_lane_error(repo_key, repo_root, entry, exc)
+        else:
+            per_repo_results[repo_key] = result
+            attention_events.extend(_extract_attention_events(repo_key, result))
+            observed_repo_keys.add(repo_key)
+
+            # Count orphan sweep calls (B6a interaction)
+            # Each loop() call internally triggers orphan sweep via
+            # _sweep_orphan_processes_for_dead_sessions
+            # We count this as a metric for the follow-up optimization
+            if not work_only:
+                orphan_sweep_calls += 1
+        logger.info(
+            "fleet pass lane elapsed: lane=%s elapsed_seconds=%.1f",
+            repo_key,
+            pass_clock() - repo_lane_start,
+        )
+
     with ThreadPoolExecutor(
         max_workers=lane_concurrency, thread_name_prefix="fleet-lane"
     ) as lane_pool:
@@ -2031,6 +2066,30 @@ def fleet_loop(
                 # deferred (not failed) -- they sort first next pass via the
                 # last_seen rotation below instead of never getting a turn
                 # behind a slow repo.
+                deferred_repo_keys.append(repo_key)
+                continue
+
+            # Issue #1832 under #1934: never let more than lane_concurrency
+            # lanes stay outstanding. Without this throttle the submission
+            # loop outruns the pool -- prep is fast, so every selected repo
+            # is submitted before the check above can trip, and lanes queued
+            # beyond the pool's width then run to completion past
+            # max_pass_runtime_seconds on the executor's unconditional
+            # shutdown join. Resolving the oldest outstanding lane first
+            # reproduces the serial loop's bound: a repo whose turn arrives
+            # after the deadline is deferred before its prep ever runs
+            # (re-check below), while lanes already in flight finish
+            # cooperatively.
+            waited_for_slot = False
+            while len(pending_lanes) - collected_lane_count >= lane_concurrency:
+                _collect_next_pending_lane()
+                waited_for_slot = True
+            # The wait for a pool slot can consume the rest of the budget, so
+            # re-check before prep -- but only when a wait actually happened:
+            # the top-of-loop check is otherwise still fresh, and an
+            # unconditional re-read would break callers (tests) that budget
+            # one pass_clock read per repo.
+            if waited_for_slot and _deadline_exceeded():
                 deferred_repo_keys.append(repo_key)
                 continue
 
@@ -2165,30 +2224,13 @@ def fleet_loop(
                         pass_clock() - repo_lane_start,
                     )
 
-        # Collect lane results in selection order (not completion order) so
-        # result/attention-event ordering is identical to the serial loop.
-        # ``with`` above already joined every worker before this loop runs.
-        for repo_key, entry, repo_root, repo_lane_start, future in pending_lanes:
-            try:
-                result = future.result()
-            except Exception as exc:
-                _record_repo_lane_error(repo_key, repo_root, entry, exc)
-            else:
-                per_repo_results[repo_key] = result
-                attention_events.extend(_extract_attention_events(repo_key, result))
-                observed_repo_keys.add(repo_key)
-
-                # Count orphan sweep calls (B6a interaction)
-                # Each loop() call internally triggers orphan sweep via
-                # _sweep_orphan_processes_for_dead_sessions
-                # We count this as a metric for the follow-up optimization
-                if not work_only:
-                    orphan_sweep_calls += 1
-            logger.info(
-                "fleet pass lane elapsed: lane=%s elapsed_seconds=%.1f",
-                repo_key,
-                pass_clock() - repo_lane_start,
-            )
+        # Drain the lanes still outstanding, in selection order (not
+        # completion order) so result/attention-event ordering is identical
+        # to the serial loop. ``future.result()`` blocks until each lane
+        # finishes; the ``with`` exit then joins the pool with nothing left
+        # to wait on.
+        while collected_lane_count < len(pending_lanes):
+            _collect_next_pending_lane()
 
     # Results were recorded from two interleaved sources -- skips/prep errors
     # during submission and lane completions during collection -- so restore

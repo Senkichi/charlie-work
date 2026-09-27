@@ -64,6 +64,28 @@ class _FakeClock:
         self._now += self._auto_advance if self._auto_advance else seconds
 
 
+class _StepClock:
+    """A deterministic fake monotonic clock for deadline tests.
+
+    Returns ``steps`` in order, then repeats ``after`` forever once
+    exhausted. Deliberately NOT tied to the exact number of ``pass_clock()``
+    calls a given code path makes internally (e.g. a per-repo lane's own
+    elapsed-time logging) -- only the calls a test cares about need an
+    explicit, distinct step; everything past that reads a constant, so an
+    unrelated extra/missing call elsewhere cannot flip the outcome.
+    """
+
+    def __init__(self, steps: list[float], after: float) -> None:
+        self._steps = list(steps)
+        self._after = after
+        self._n = 0
+
+    def __call__(self) -> float:
+        value = self._steps[self._n] if self._n < len(self._steps) else self._after
+        self._n += 1
+        return value
+
+
 @pytest.fixture(autouse=True)
 def _patch_self_deploy_for_fleet_tests(monkeypatch: Any, tmp_path: Path) -> dict[str, MagicMock]:
     """Self-deploy hits the real git/uv CLI; keep fleet supervisor unit tests hermetic.

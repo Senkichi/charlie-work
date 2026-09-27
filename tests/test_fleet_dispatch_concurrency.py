@@ -26,6 +26,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from _fleet_dispatch_fixtures import (
+    _StepClock,
     _drained_fleet_result,
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
@@ -185,6 +186,89 @@ def test_fleet_loop_lane_concurrency_is_bounded(
     assert len(result.data["repos"]) == 4
     for name in names:
         assert result.data["repos"][f"owner/{name}"]["ok"] is True
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_deadline_defers_lanes_waiting_on_a_full_pool(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """#1832 under #1934: a lane whose turn arrives past the deadline is
+    deferred before its prep runs -- it is never queued on a full pool.
+
+    ``fleet_lane_concurrency=2`` across 4 selected repos. The step clock
+    keeps repo1/repo2/repo3's top-of-loop deadline checks under budget, then
+    jumps past it for the re-check repo3 makes after the throttle collects
+    repo1's finished lane -- waiting for a pool slot consumed the rest of
+    the budget. repo3 and repo4 must land in ``deferred`` with no app built
+    for either (a third OrchestratorApp construction would mean a lane was
+    submitted), while the two in-flight lanes finish cooperatively. On the
+    unthrottled submit-all-upfront shape this replaces, every repo's prep
+    ran before the first deadline check could trip, so all four lanes
+    executed to completion past ``max_pass_runtime_seconds``.
+    """
+    names = ("repo1", "repo2", "repo3", "repo4")
+    mock_load_registry.return_value = _registry(*names, root=tmp_path)
+    for name in names:
+        (tmp_path / name).mkdir()
+    mock_load_layered_config.return_value = OrchestratorConfig()
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
+    mock_gh_class.return_value = MagicMock()
+
+    apps = []
+    for name in ("repo1", "repo2"):
+        app = MagicMock()
+        app.dispatch.return_value = CommandResult(True, f"{name} dispatch complete", {})
+        apps.append(app)
+    mock_app_class.side_effect = apps
+
+    # pass_clock reads (work_only skips the prologue deadline checks):
+    #   1. pass_started_at                         -> 0
+    #   2. repo1 deadline check                    -> 0   (under the 100s budget)
+    #   3. repo1 repo_lane_start                   -> 0
+    #   4. repo2 deadline check                    -> 0
+    #   5. repo2 repo_lane_start                   -> 0
+    #   6. repo3 deadline check                    -> 50  (still under -- proceed)
+    #   7. throttle collects repo1's lane; its elapsed log reads -> 60
+    #   8. repo3's post-wait re-check              -> 10000 (blown -> defer)
+    #   9. repo4 deadline check                    -> 10000 (defer)
+    #   10+. drain elapsed / deferred-event reads  -> 10000
+    clock = _StepClock(steps=[0.0, 0.0, 0.0, 0.0, 0.0, 50.0, 60.0], after=10000.0)
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=OrchestratorConfig(supervisor=SupervisorConfig(fleet_lane_concurrency=2)),
+        repos=("owner/repo1", "owner/repo2", "owner/repo3", "owner/repo4"),
+        limit=3,
+        work_only=True,
+        deadline_seconds=100,
+        pass_clock=clock,
+    )
+
+    assert result.ok is True
+    assert set(result.data["repos"]) == {"owner/repo1", "owner/repo2"}
+    assert result.data["deferred"] == ["owner/repo3", "owner/repo4"]
+    assert mock_app_class.call_count == 2
+    for app in apps:
+        app.dispatch.assert_called_once_with(3)
+
+    from charlie_work.fleet_paths import fleet_dir
+
+    fleet_state_path = layout.state_file_path(fleet_dir(override=str(tmp_path / "fleet")))
+    deferred_events = query_events(fleet_state_path, kind="fleet_pass_deadline_deferred")
+    assert len(deferred_events) == 1
+    assert deferred_events[0]["payload"]["deferred_repo_keys"] == [
+        "owner/repo3",
+        "owner/repo4",
+    ]
 
 
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
