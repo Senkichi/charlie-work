@@ -47,13 +47,18 @@ from ci_fleet.github import GitHubError
 # with ``GitHub.issue_list``). ``issue_list`` (moved below) references it as a
 # bare global.
 from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
+from .circuit_breaker_transport import circuit_breaker_state_path
+from ..instrumentation import log_event
 
 if TYPE_CHECKING:
     # Runtime import would cycle (github.py imports this module to build the
     # GitHubLike union); ``get_github_issue_dependencies``'s ``gh: GitHubLike``
     # annotation is a bare string under ``from __future__ import annotations``
     # and is never evaluated, so the TYPE_CHECKING-only import is all it needs.
-    from charlie_work.github import GitHubLike
+    # ``GitHub`` is needed only for ``Issues.__init__``'s ``owner`` annotation
+    # (mirroring ``_base.py``'s own TYPE_CHECKING-only import) and is equally
+    # unevaluated.
+    from charlie_work.github import GitHub, GitHubLike
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +253,38 @@ class Issues(CapabilityCollaborator):
     recurs identically in L04/L05/L06.
     """
 
+    def __init__(self, owner: GitHub) -> None:
+        super().__init__(owner)
+        # Issue #1933 rework: per-number edge baseline for the
+        # ``github_issue_state_partial_fallback`` telemetry event -- the
+        # set of issue numbers already reported as unresolved by a batch
+        # observation. A number leaves the set only when a later batch
+        # positively resolves it; an unrelated clean batch (one that never
+        # named the stale number) leaves the set untouched, so a persistent
+        # stale blocker fires once per GitHub-instance lifetime instead of
+        # once per batch observation. The earlier single-frozenset
+        # signature did reset on any unrelated clean batch, and with
+        # multiple are_issues_open calls per pass (github_ops_blockers
+        # prefetch, backlog_reachability per-issue, blocker_cycles) the
+        # same stale blocker refired every pass.
+        # Lives on the collaborator instance, NOT in ``_list_cache``:
+        # ``_list_cache`` is cleared every pass
+        # (``repo_meta.invalidate_list_cache``), so cache-resident state
+        # could never dedupe the event even within one instance's
+        # lifetime. How far that lifetime reaches depends on the caller:
+        # the single-repo supervisor (``supervise.run_supervised``) keeps
+        # one GitHub/Issues pair for the whole process, but the fleet
+        # supervisor builds a fresh GitHub per repo on every pass
+        # (``fleet_dispatch.fleet_loop``), so there this set dedupes only
+        # within a pass and a persistent stale blocker emits once per pass
+        # per repo. That repeat is why the kind is registered ``info``,
+        # not ``warning`` (see its ``event_levels/`` entry). An instance
+        # attribute never lands in ``vars(Issues)`` --
+        # ``github_delegation._routable_members`` only yields class-level
+        # callables -- so adding it changes neither ``_ROUTES`` nor
+        # ``GitHub``'s surface.
+        self._partial_fallback_reported: set[int] = set()
+
     def issue_list(self, labels=None, state=None) -> list[dict[str, Any]]:
         # Normalize labels for caching and arg building; support legacy str signature.
         if isinstance(labels, str):
@@ -319,9 +356,12 @@ class Issues(CapabilityCollaborator):
 
         Per-issue-number results are cached in the pass-scoped ``_list_cache``
         (keyed ``("issue_open", number)``). Cache misses are first resolved in
-        a single batched GraphQL query (one subprocess for the whole set); only
-        if the batch fails do we fall back to the previous parallel
-        per-``issue_view`` fetch.
+        a single batched GraphQL query (one subprocess for the whole set). The
+        batch tolerates per-node failures (issue #1933): numbers the batch
+        could not resolve come back absent from its result, and the parallel
+        per-``issue_view`` fallback runs over exactly those numbers rather
+        than the whole set. Only a whole-query failure still falls back for
+        every uncached number.
 
         Args:
             issue_numbers: List of issue numbers to check
@@ -342,17 +382,51 @@ class Issues(CapabilityCollaborator):
                 open_issues.add(number)
 
         if uncached:
+            states: dict[int, bool] = {}
+            batch_failed = False
             try:
                 states = self._graphql_issue_states(uncached)
-                for number, is_open in states.items():
-                    self._list_cache[("issue_open", number)] = is_open
-                    if is_open:
-                        open_issues.add(number)
             except (GitHubError, OSError, ValueError, TypeError):
+                batch_failed = True
                 logger.warning(
                     "Batched issue state query failed, falling back to per-issue view",
                     exc_info=True,
                 )
+
+            for number, is_open in states.items():
+                self._list_cache[("issue_open", number)] = is_open
+                if is_open:
+                    open_issues.add(number)
+
+            unresolved = [number for number in uncached if number not in states]
+            if not batch_failed:
+                # Per-number edge tracking: a number this batch positively
+                # resolved leaves the reported set, so a later re-stale of
+                # that number is a fresh edge. Numbers this batch never
+                # named leave the set untouched -- an unrelated clean batch
+                # must NOT reset the baseline (the round-2 review finding:
+                # with multiple are_issues_open calls per pass, clearing on
+                # any clean batch refired the same stale blocker every
+                # pass). Whole-batch failures neither emit nor disturb the
+                # set.
+                self._partial_fallback_reported.difference_update(states)
+            if unresolved:
+                if not batch_failed:
+                    logger.warning(
+                        "Batched issue state query did not resolve %d issue "
+                        "number(s) (%s); falling back to per-issue view for "
+                        "just those",
+                        len(unresolved),
+                        unresolved,
+                    )
+                    if set(unresolved) - self._partial_fallback_reported:
+                        # write-gate-exempt(issue=1933): GitHub client layer has no WriteGate; lock-free telemetry
+                        log_event(
+                            circuit_breaker_state_path(self.runtime, self.repo_root),
+                            "github_issue_state_partial_fallback",
+                            {"unresolved": unresolved, "requested": len(uncached)},
+                        )
+                    self._partial_fallback_reported.update(unresolved)
 
                 # Fallback to the previous parallel per-issue view fetch.
                 def _fetch_state(number: int) -> tuple[int, bool]:
@@ -363,9 +437,9 @@ class Issues(CapabilityCollaborator):
                         is_open = False
                     return number, is_open
 
-                max_workers = min(_MAX_ISSUE_STATE_WORKERS, len(uncached))
+                max_workers = min(_MAX_ISSUE_STATE_WORKERS, len(unresolved))
                 with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                    for number, is_open in pool.map(_fetch_state, uncached):
+                    for number, is_open in pool.map(_fetch_state, unresolved):
                         self._list_cache[("issue_open", number)] = is_open
                         if is_open:
                             open_issues.add(number)

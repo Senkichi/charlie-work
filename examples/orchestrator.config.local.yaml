@@ -29,8 +29,10 @@ dispatch:
   # suite's `-n` (don't let it inherit `-n auto`). See RUNBOOK.md
   # "Local host saturation ceiling (claude-code adapter)".
   default_limit: 3
-  # Issue #1843/#1903: host-load backoff -- before launching a worker, the
-  # dispatch governor measures live pytest process trees on this host.
+  # Issue #1843/#1903/#1943: host-load backoff -- before launching a worker,
+  # the dispatch governor measures live pytest process trees attributable to
+  # orchestrator-managed worktrees (CI-runner suites under
+  # C:\actions-runners\* and other foreign trees do not count).
   # host_load_max_pytest_trees caps concurrent *suites* (dispatch limit
   # clamps to the remaining suite headroom; default: cpu_count // 2);
   # host_load_max_pytest_processes is the fan-out brake for abnormal -n

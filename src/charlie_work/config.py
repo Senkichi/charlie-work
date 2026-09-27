@@ -156,8 +156,12 @@ DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
 # operator hygiene (remove the stale checkout), so it gets the same retry
 # budget as an ordinary redispatch before escalating — just with the
 # correct reason and the blocking path in the message.
+#
+# Issue #1494: the superseded worker survived its reap (or was live with
+# no fingerprint to kill against) — the launch is refused.
+PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND = "prior_worker_still_alive"
 PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"worktree_foreign_writer"}
+    {"worktree_foreign_writer", PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND}
 )
 
 
@@ -403,8 +407,9 @@ class DispatchConfig:
     # fresh-dispatch-only: a rework launch spawns a real local suite too,
     # and the host does not care which lane oversubscribed it.
     #
-    # The probe (host_load.py) reports two readings per pass and the
-    # governor applies two terms (issue #1903 recalibration):
+    # The probe (host_load.py) reports two readings per pass, both scoped to
+    # orchestrator-attributable trees (issue #1943 -- see host_load.py);
+    # the governor applies two terms (issue #1903 recalibration):
     #
     # * ``host_load_max_pytest_trees`` -- the primary governor. Counts
     #   distinct live pytest *suites* (a suite's xdist workers fold into
@@ -431,8 +436,7 @@ class DispatchConfig:
     # width. 0 disables a term individually; 0 on both disables the probe
     # entirely (also the effective behavior where os.cpu_count() returns
     # None). A failed measurement fails OPEN (dispatch proceeds) and is
-    # reported via a rate-limited host_load_unavailable event, never by
-    # silently treating the host as idle.
+    # reported via a rate-limited host_load_unavailable event.
     host_load_max_pytest_processes: int = field(default_factory=lambda: (os.cpu_count() or 0) * 3)
     host_load_max_pytest_trees: int = field(default_factory=lambda: (os.cpu_count() or 0) // 2)
     # Repo-root-relative paths copied into each worktree after creation
@@ -656,12 +660,31 @@ class ReviewConfig:
     # logic; a false positive costs an operator glance plus ``charlie
     # unescalate``, while a false negative repeats the incident (automated
     # rework asserting an operator decision that never happened).
+    #
+    # Markers are DECISION PHRASES, never the bare nouns "human"/"operator"/
+    # "sign-off": those are ordinary domain vocabulary in the repos this
+    # fleet works on ("operator HTTP Basic", ``operator_stop_drained``, "an
+    # operator-kind marker", "not legal sign-off"). With bare nouns, 12 of
+    # the first 16 reclassifications fleet-wide were false positives, and
+    # nobody gave them the "operator glance" -- they parked agent-doable PRs
+    # under agent:human-needed for days. The phrase set below keeps all 4
+    # genuine human calls in that corpus (pinned verbatim in
+    # tests/test_human_decision_marker_corpus.py).
     human_decision_markers: tuple[str, ...] = (
-        "human",
-        "operator",
-        "sign-off",
-        "signoff",
-        "sign off",
+        "human call",
+        "operator call",
+        "human/operator",
+        "human decision",
+        "operator decision",
+        "human check",
+        "human should",
+        "human must",
+        "flag for human",
+        "needs a human",
+        "requires a human",
+        "human sign-off",
+        "operator sign-off",
+        "not worker-resolvable",
         "not automated rework",
         "confirm explicitly",
     )
@@ -2148,6 +2171,27 @@ class SupervisorConfig:
     comfortably above observed worker session durations, and far below the
     multi-hour continuous deferral observed under sustained fleet load.
     <= 0 disables the bound.
+    ``fleet_lane_concurrency``: maximum number of per-repo lanes one
+    ``fleet_loop`` pass runs concurrently (issue #1934). Per-repo lane work is
+    I/O-bound and repo-isolated (own config, GitHub client, supervisor lock,
+    state files), so lanes run on a bounded thread pool: a pass's wall-clock
+    approximates the slowest lane instead of the sum of every lane (~35-42
+    min observed across 6 repos for a configured 5-minute cadence). When the
+    cap meets or exceeds the registered repo count, a repo's lane-to-lane gap
+    is bounded by its own lane duration plus the supervisor's pass cadence --
+    decoupled from sibling lanes' workloads. <= 0 falls back to the built-in
+    default at the call site; 1 restores the pre-#1934 strict-serial order.
+    ``reap_sweep_interval_seconds``: cadence for the fleet supervisor's
+    out-of-band review-claim reap scheduler (issue #1934). The
+    dead-reviewer-claim sweep set (``OrchestratorApp._run_review_reap_sweeps``
+    -- the identical block ``dispatch_reviews`` and ``reap_reviews`` run)
+    executes once per registered repo on this interval from a dedicated
+    thread, independent of whether a fleet pass is due or in flight, so a
+    dead claim is freed on a ~5-minute cadence instead of once per fleet-wide
+    round. The sweeps launch nothing and are ``state_lock``-serialized /
+    merge-on-write safe against a concurrent lane (issue #1874's design), so
+    they run even while a repo's supervisor lock is held. <= 0 disables the
+    scheduler.
     """
 
     poll_interval_seconds: int = 20
@@ -2160,6 +2204,8 @@ class SupervisorConfig:
     zero_pass_alarm: int = 3
     wedge_kill_loop_alarm: int = 3
     dependency_sync_starvation_seconds: int = 14400
+    fleet_lane_concurrency: int = 8
+    reap_sweep_interval_seconds: int = 300
 
 
 @dataclass(frozen=True)
@@ -4090,6 +4136,8 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         "zero_pass_alarm",
         "wedge_kill_loop_alarm",
         "dependency_sync_starvation_seconds",
+        "fleet_lane_concurrency",
+        "reap_sweep_interval_seconds",
     ):
         value = supervisor_data.get(int_key)
         if value is not None and not isinstance(value, int):

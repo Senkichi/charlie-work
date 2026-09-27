@@ -27,7 +27,7 @@ import charlie_work.workflow as _wf
 from charlie_work import layout
 from charlie_work.ci_headroom import ci_headroom_available
 from charlie_work.fleet_paths import fleet_dir
-from charlie_work.fleet_registry import try_acquire_fleet_lock
+from charlie_work.fleet_registry import registered_state_dirs, try_acquire_fleet_lock
 from charlie_work.github import GitHubError, GraphQLBudgetError
 from charlie_work.host_load import measure_host_load
 from charlie_work.instrumentation import log_event
@@ -301,9 +301,25 @@ def _apply_concurrency_governor(
         # failure (fail-open -- dispatch proceeds; it logs a rate-limited
         # host_load_unavailable event itself), so only a real over-threshold
         # reading ever reaches the clamp.
+        # Issue #1943: the reading is scoped to orchestrator-attributable
+        # trees. ``measure_host_load`` builds in the ``.var/charlie-work``
+        # state-dir convention marker; the paths below add this repo's
+        # resolved roots (``runtime.state_dir`` and
+        # ``claude_code.worktrees_dir`` overrides included -- the latter is
+        # only reachable via ``self._layout.worktrees``, never
+        # ``self.paths.worktrees``) and every fleet-registered ``state_dir``,
+        # so a sibling repo's overridden layout stays attributable too. A
+        # suite with no managed path in any member/ancestor command line --
+        # e.g. a CI runner's tree under ``C:\actions-runners\*`` -- no longer
+        # feeds either count.
         host_load_reading = measure_host_load(
             diagnostic_state_path=self.paths.state_file,
             diagnostic_repo=self.repo_root.name,
+            scope_paths=(
+                self.paths.root,
+                self._layout.worktrees,
+                *registered_state_dirs(self.fleet_dir_override),
+            ),
         )
         host_load_limit: int | None = None
         host_load_term: str | None = None

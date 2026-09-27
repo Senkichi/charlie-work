@@ -1,4 +1,9 @@
 4400
+# Issue #1934: +25 lines for SupervisorConfig.fleet_lane_concurrency and
+# SupervisorConfig.reap_sweep_interval_seconds (fields + _SUPERVISOR_INT_KEYS
+# validation entries). Dataclass fields cannot be extracted into a domain
+# module -- the reviewed-exception path applies. Raised to the next
+# MARK_QUANTUM multiple per the ratchet's hand-raise rule.
 # Issue #1477 / PR #1925 rework: the new
 # `deescalation.identical_reason_recurrence_window_minutes` knob added its
 # DeescalationConfig field plus scoped-extraction validation to config.py

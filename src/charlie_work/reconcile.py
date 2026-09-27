@@ -61,6 +61,7 @@ from .merge_finalize import _merged_issue_fields
 from .paths import resolved_layout, runtime_paths
 from .pr_create_retry import create_pr_with_retry
 from .process_utils import kill_process_tree
+from .queue_bot import is_queue_bot_pr  # noqa: F401 (deliberate re-export)
 from .review_decision import review_decision as _resolve_review_decision
 from .state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
@@ -324,6 +325,12 @@ def _normalize_reconcile_pr(pr: dict[str, Any]) -> dict[str, Any]:
         else:
             state = "OPEN"
 
+        # REST ``user`` -> ``author`` normalization: the REST ``pulls`` endpoint
+        # names the author object ``user``; ``gh pr list --json`` names it
+        # ``author``. Queue-bot filtering (Aviator parallel mode) reads
+        # ``author.login`` to skip bot-created draft PRs fleet-wide.
+        raw_user = pr.get("user")
+        author = {"login": raw_user.get("login")} if isinstance(raw_user, dict) else None
         return {
             "number": pr.get("number"),
             "title": pr.get("title"),
@@ -333,6 +340,8 @@ def _normalize_reconcile_pr(pr: dict[str, Any]) -> dict[str, Any]:
             "body": pr.get("body"),
             "state": state,
             "labels": pr.get("labels", []),
+            "author": author,
+            "isDraft": bool(pr.get("draft")),
             "isCrossRepository": is_cross_repository,
             "headRefOid": head.get("sha"),
             # Issue #1398: the REST ``pulls`` endpoint names this ``closed_at``
@@ -530,6 +539,8 @@ def detect_aviator_stale_blocked(
     """
     drift: list[DriftItem] = []
     for pr in _fetch_prs(gh):
+        if is_queue_bot_pr(pr, config):
+            continue
         if str(pr.get("state") or "").upper() != "OPEN":
             continue
         if "blocked" not in label_names(pr):
@@ -766,9 +777,17 @@ def detect_mergequeue_not_approved(
         return []
     drift: list[DriftItem] = []
     for pr in _fetch_prs(gh):
+        if is_queue_bot_pr(pr, config):
+            continue
         if str(pr.get("state") or "").upper() != "OPEN":
             continue
         if mergequeue_label not in label_names(pr):
+            continue
+        # Fleet-owned PRs only: a non-prefix branch never gets a fleet
+        # review-decision.json, so the operator's own ``mergequeue`` label
+        # there IS the approval -- revoking it only ever undid operator
+        # queueing (and closed the Aviator draft batching it).
+        if not str(pr.get("headRefName") or "").startswith(config.dispatch.branch_prefix):
             continue
         pr_number = pr.get("number")
         head_sha = pr.get("headRefOid")
@@ -923,6 +942,8 @@ def detect_mergequeue_wedged(
     # behavior (fail open) rather than blocking the wedge sweep.
     branch_validator = build_branch_issue_validator(gh)
     for pr in _fetch_prs(gh):
+        if is_queue_bot_pr(pr, config):
+            continue
         if str(pr.get("state") or "").upper() != "OPEN":
             continue
         names = label_names(pr)
@@ -1256,6 +1277,8 @@ def detect_drift(
         _pr_num = _pr.get("number")
         if _pr_num is None:
             continue
+        if is_queue_bot_pr(_pr, config):
+            continue
         _issue_num = linked_issue_number(
             _pr,
             is_cross_repository=_pr.get("isCrossRepository"),
@@ -1281,6 +1304,9 @@ def detect_drift(
         if pr_number is None:
             continue
         pr_number = int(pr_number)
+        # Aviator parallel-mode draft PRs: see queue_bot.is_queue_bot_pr.
+        if is_queue_bot_pr(pr, config):
+            continue
         gh_state = str(pr.get("state") or "").upper()
         issue_number = linked_issue_number(
             pr,

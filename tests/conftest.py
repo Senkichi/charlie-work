@@ -53,6 +53,33 @@ def autospec() -> Callable[..., Any]:
     return autospec_patch
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Issue #1665: refuse to run when ``charlie_work`` resolves outside this checkout.
+
+    A pytest run without a per-project venv can silently import
+    ``charlie_work`` from another checkout (a stray editable ``.pth`` in the
+    system interpreter's user-site, ancestor ``.venv`` discovery, a bare
+    ``python`` call) while collection and rootdir still point here -- the
+    suite reports green against the wrong tree. The existing venv guards
+    (``preflight._check_venv_identity``, ``venv_anchor``) are wired only into
+    the orchestrator path and the first is stubbed healthy by
+    ``_default_healthy_preflight`` below, so this hook is the point that
+    actually sees a builder's own ``uv run pytest``.
+
+    Deliberately checks only ``charlie_work.__file__``, never
+    ``sys.executable``: the sanctioned shared-venv worker pattern runs under
+    a different checkout's interpreter with ``PYTHONPATH`` shadowing the
+    package into this tree, so the executable legitimately mismatches while
+    the package location does not. ``CHARLIE_WORK_TEST_SOURCE_ANCHOR_OPT_OUT``
+    is the explicit opt-out for a run that intentionally resolves the package
+    elsewhere.
+    """
+    from _source_anchor import enforce_source_anchor
+
+    enforce_source_anchor(Path(__file__).resolve().parents[1])
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _kill_on_close_job() -> None:
     """Issue #1851: on Windows, put this pytest process in a Job Object with

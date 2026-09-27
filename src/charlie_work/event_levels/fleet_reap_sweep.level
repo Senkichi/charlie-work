@@ -1,0 +1,8 @@
+info
+# Issue #1934: the fleet supervisor's out-of-band dead-review-claim reap
+# scheduler runs the shared sweep set once per selected repo on its own
+# interval (default 300 s), independent of -- and concurrent with -- the
+# per-repo lane pool, so a dead claim is freed on a ~5-minute cadence
+# instead of once per fleet-wide round. Emitted once per repo per round
+# into the fleet-level (daemon) events.db; a per-repo sweep failure emits
+# the same kind with an explicit level="warning" override.

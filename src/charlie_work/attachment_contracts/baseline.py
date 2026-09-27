@@ -5,7 +5,10 @@ directory (issue #1839 -- the single ``.attachment-budgets.json`` document
 was a shared append point; see ``baseline_dir.py`` for the on-disk layout).
 This module owns the layout-independent DOCUMENT contract: the dict shape
 (version/generated_by/generated_at/floor/entries[/kind_stats]), generation,
-comparison, ratcheting, bump validation, and the tamper guards. ``dumps``/
+comparison, ratcheting, bump validation, and the tamper guards. An entry may
+carry ``"pinned": true`` (issue #1620): an operator-authored sub-saturation
+contract on a de-godded point -- enforced below the fence, never dropped by
+the ratchet (see ``BaselineEntry`` and ``compare()``). ``dumps``/
 ``loads``/``dump``/``load`` remain the legacy single-file codec -- used for
 pre-#1839 checkouts via ``baseline_dir``'s layout dispatch, and for any
 caller that needs a document serialized as one JSON text.
@@ -68,7 +71,7 @@ def _bump_from_dict(raw: dict[str, object]) -> Bump:
 
 
 def _entry_to_dict(entry: BaselineEntry) -> dict[str, object]:
-    return {
+    data: dict[str, object] = {
         "kind": entry.kind,
         "identity": entry.identity,
         "file": entry.file,
@@ -76,12 +79,21 @@ def _entry_to_dict(entry: BaselineEntry) -> dict[str, object]:
         "boundary": entry.boundary,
         "bumps": [_bump_to_dict(b) for b in entry.bumps],
     }
+    # Issue #1620: emitted only when True -- every pre-#1620 entry file lacks
+    # the key, and a routine --ratchet must not churn all of their bytes just
+    # to write ``"pinned": false`` into each one.
+    if entry.pinned:
+        data["pinned"] = True
+    return data
 
 
 def _entry_from_dict(raw: dict[str, object]) -> BaselineEntry:
     bumps_raw = raw.get("bumps", [])
     if not isinstance(bumps_raw, list):
         raise TamperError(f"entries[].bumps must be a list, got {type(bumps_raw)!r}")
+    pinned = raw.get("pinned", False)
+    if not isinstance(pinned, bool):
+        raise TamperError(f"entries[].pinned must be a bool, got {type(pinned)!r}")
     try:
         return BaselineEntry(
             kind=str(raw["kind"]),  # type: ignore[arg-type]
@@ -90,6 +102,7 @@ def _entry_from_dict(raw: dict[str, object]) -> BaselineEntry:
             member_count=int(raw["member_count"]),  # type: ignore[arg-type]
             boundary=float(raw["boundary"]),  # type: ignore[arg-type]
             bumps=tuple(_bump_from_dict(b) for b in bumps_raw),
+            pinned=pinned,
         )
     except (KeyError, ValueError, TypeError) as exc:
         # Finding #12: same rationale as _bump_from_dict -- a missing key or a
@@ -480,10 +493,21 @@ def compare(
       entered completely unchecked). It IS still added to the ratcheted
       document so the baseline stays a complete snapshot of the tree's
       current state -- the enforcement is the Finding, not the omission.
+    - A ``pinned`` entry (issue #1620 -- an operator-authored sub-saturation
+      contract on a deliberately de-godded point) is enforced whether or not
+      its point is saturated: growth past ``min(effective_ceiling,
+      boundary)`` blocks exactly like over-ceiling saturation, a strict
+      shrink ratchets the pin down like any other row, and the row is never
+      dropped by omission on de-saturation. Capping the ceiling at the fence
+      means a pin can only tighten a point's budget -- a hand-authored pin
+      with a member_count above the boundary cannot act as a blanket
+      exemption. `--ratchet` therefore never deletes a pinned row, and never
+      creates one either: the operator authors it explicitly.
     The input document is never mutated; a new document dict is returned.
     """
     baseline_entries = {_entry_key(e): e for e in entries_of(baseline_document)}
     current_by_key = {_verdict_key(v): v for v in current if v.saturated}
+    all_verdicts = {_verdict_key(v): v for v in current}
 
     findings: list[Finding] = []
     new_entries: list[BaselineEntry] = []
@@ -523,7 +547,13 @@ def compare(
             continue
 
         ceiling = effective_ceiling(baseline_entry)
+        if baseline_entry.pinned:
+            # A pin can only TIGHTEN the contract (issue #1620): cap the
+            # ceiling at the fence so a pin row whose member_count sits above
+            # the boundary cannot silently exempt its point from saturation.
+            ceiling = min(ceiling, verdict.boundary)
         if point.member_count > ceiling:
+            qualifier = "pinned ceiling" if baseline_entry.pinned else "baselined ceiling"
             findings.append(
                 Finding(
                     severity="block",
@@ -531,7 +561,7 @@ def compare(
                     identity=point.identity,
                     message=(
                         f"{point.identity} ({point.kind}) has {point.member_count} "
-                        f"members, exceeding baselined ceiling {ceiling}. Add a bump "
+                        f"members, exceeding {qualifier} {ceiling}. Add a bump "
                         "or move new members to a redirect destination."
                     ),
                     redirect=None,
@@ -547,6 +577,7 @@ def compare(
                     file=point.file,
                     member_count=point.member_count,
                     boundary=verdict.boundary,
+                    pinned=baseline_entry.pinned,
                 )
             )
         else:
@@ -555,7 +586,57 @@ def compare(
     # Points baselined before but no longer saturated at all are simply absent
     # from `new_entries` (the loop above only ever visits currently-saturated
     # points) — that is the "ratchet down to not tracked" case, handled by
-    # omission rather than an explicit branch.
+    # omission rather than an explicit branch. Pinned rows are the exception
+    # (issue #1620): their point is deliberately BELOW the fence, so the
+    # saturation loop never visits them — evaluate them separately and keep
+    # the row even when nothing about it changes.
+    for key, entry in baseline_entries.items():
+        if not entry.pinned or key in current_by_key:
+            continue
+        verdict = all_verdicts.get(key)
+        if verdict is None:
+            # The point left the eligible population entirely (class deleted,
+            # renamed, ledger/trivial, or zero members): the pin can neither
+            # block nor ratchet, so the row is carried verbatim -- dropping
+            # it would silently end the contract, and a re-eligible point is
+            # checked against it again on the next pass.
+            new_entries.append(entry)
+            continue
+        point = verdict.point
+        ceiling = min(effective_ceiling(entry), verdict.boundary)
+        if point.member_count > ceiling:
+            findings.append(
+                Finding(
+                    severity="block",
+                    file=point.file,
+                    identity=point.identity,
+                    message=(
+                        f"{point.identity} ({point.kind}) has {point.member_count} "
+                        f"members, exceeding pinned ceiling {ceiling} below the "
+                        "saturation fence. The row is an explicit sub-saturation "
+                        "contract on a de-godded point (issue #1620) -- add a "
+                        "bump or move new members to a redirect destination."
+                    ),
+                    redirect=None,
+                )
+            )
+            new_entries.append(entry)
+        elif point.member_count < entry.member_count:
+            # The pin ratchets down with the class like any other row: a
+            # shrink tightens the contract (stale bumps are dropped the same
+            # way -- a raise on a now-lower ceiling no longer applies).
+            new_entries.append(
+                BaselineEntry(
+                    kind=point.kind,
+                    identity=point.identity,
+                    file=point.file,
+                    member_count=point.member_count,
+                    boundary=verdict.boundary,
+                    pinned=True,
+                )
+            )
+        else:
+            new_entries.append(entry)
     sorted_entries = sorted(new_entries, key=_entry_sort_key)
     # Finding #11: preserve every top-level key already in the document
     # (e.g. an operator-set "mode": "enforce") instead of rebuilding from a

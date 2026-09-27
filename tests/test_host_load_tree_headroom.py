@@ -63,11 +63,28 @@ def _patch_procs(monkeypatch: pytest.MonkeyPatch, *procs: quiesce.ProcessInfo) -
 
 def _xdist_snapshot(*widths: int) -> list[quiesce.ProcessInfo]:
     """Fabricate one pytest tree per width: a root plus ``width`` xdist
-    workers (the fleet's ~6-9-process suite shape from the #1903 report)."""
+    workers (the fleet's ~6-9-process suite shape from the #1903 report).
+
+    Issue #1943: ``measure_host_load`` scopes to orchestrator-attributable
+    trees, and a ``uv run`` root's own command line carries no managed path
+    -- so each tree hangs off a launcher ancestor whose cmdline names a
+    managed state-dir path (the worker-harness ``--prompt-file`` shape).
+    The launcher's cmdline deliberately names no pytest invocation, so it
+    is an ancestor, not a member, and does not add to
+    ``pytest_process_count``.
+    """
     procs: list[quiesce.ProcessInfo] = []
     for i, width in enumerate(widths):
         root = 100 + i * 100
-        procs.append(_proc(root, 1, "uv run --extra dev pytest -n 6 -q --tb=short"))
+        launcher = 50 + i
+        procs.append(
+            _proc(
+                launcher,
+                1,
+                f"devin --prompt-file /repo/.var/charlie-work/dispatches/s{i}/prompt.md --print",
+            )
+        )
+        procs.append(_proc(root, launcher, "uv run --extra dev pytest -n 6 -q --tb=short"))
         procs += [_proc(root + 1 + j, root, "python -u -c xdist") for j in range(width)]
     return procs
 
@@ -272,7 +289,9 @@ def test_process_brake_dominates_tree_headroom(
     """One suite at pathological ``-n`` width is invisible to the tree cap
     (a single tree leaves ample tree headroom) -- the process brake is what
     catches it, and it still drops to 0."""
-    procs = [_proc(100, 1, "pytest -n 64")]
+    procs = [
+        _proc(100, 1, r"C:\repo\.var\charlie-work\worktrees\wt\.venv\Scripts\pytest.exe -n 64")
+    ]
     procs += [_proc(110 + i, 100, "python -u -c xdist") for i in range(20)]
     _patch_procs(monkeypatch, *procs)  # 1 tree, 21 processes
     app = _build_app(tmp_path, trees_max=8, processes_max=16)

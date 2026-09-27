@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 from _fleet_dispatch_fixtures import (
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
+    _per_repo_runtime_paths,
 )
 from charlie_work import layout
 from charlie_work.config import (
@@ -64,9 +65,8 @@ def test_fleet_loop_github_error_isolated(
     # Mock config and paths
     mock_config = OrchestratorConfig()
     mock_load_layered_config.return_value = mock_config
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     # Mock OrchestratorApp instances - first one raises GitHubError
     mock_app1 = MagicMock()
@@ -139,9 +139,8 @@ def test_fleet_loop_unclassified_exception_isolated(
     # Mock config and paths
     mock_config = OrchestratorConfig()
     mock_load_layered_config.return_value = mock_config
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     # Mock OrchestratorApp instances - first one raises an unclassified RuntimeError
     mock_app1 = MagicMock()
@@ -270,9 +269,8 @@ def test_fleet_loop_config_load_error_isolated(
         return OrchestratorConfig()
 
     mock_load_layered_config.side_effect = _load_layered_config_side_effect
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     mock_app2 = MagicMock()
     mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
@@ -405,9 +403,8 @@ def test_fleet_loop_real_unknown_config_key_reproduces_incident(
         }
     }
 
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     mock_app2 = MagicMock()
     mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})

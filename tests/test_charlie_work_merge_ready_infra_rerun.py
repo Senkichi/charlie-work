@@ -24,7 +24,7 @@ import json
 from pathlib import Path
 
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
-from _fakes_github import FakeGitHubWithRerunCapture
+from _fakes_github_rerun import FakeGitHubWithRerunCapture
 from _review_fixtures import _required_checks_config
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
@@ -404,3 +404,103 @@ def test_merge_ready_infra_missing_required_check_does_not_rerun(tmp_path: Path)
     assert result.data["checks"]["missing"] == ("Lint & Format",)
     assert fake_gh.rerun_calls == []
     assert _infra_rerun_events(paths) == []
+
+
+def _already_running_error() -> str:
+    fixture = Path(__file__).parent / "fixtures" / "gh_run_rerun_already_running.json"
+    return json.loads(fixture.read_text(encoding="utf-8"))["error"]
+
+
+def test_merge_ready_infra_rerun_refused_already_running_defers_then_follows_up(
+    tmp_path: Path,
+) -> None:
+    """Issue #1936 AC: on the carried-forward lane an "already running"
+    refusal defers the follow-up instead of bookkeeping a failed merge
+    attempt -- no ``consecutive_failed_merge_attempts`` increment, no
+    alarm -- and the follow-up fires once the containing run is terminal."""
+    fake_gh = FakeGitHubWithRerunCapture(
+        checks=list(_CANCELLED_CHECKS),
+        rerun_ok=False,
+        rerun_error=_already_running_error(),
+    )
+    app, config, paths = _merge_ready_app(tmp_path, fake_gh)
+
+    # Pass 1: refused -> deferred.
+    result = app.merge_ready(456)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["merged"] is False
+    assert result.data.get("already_running") is True
+    assert result.data.get("infra_rerun_run_ids") == [12345]
+    assert result.data.get("infra_rerun_deferred_run_ids") == [12345]
+    assert fake_gh.rerun_calls == [["run", "rerun", "12345"]]
+    assert fake_gh.workflow_runs_calls == []
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["infra_rerun_deferred"] == {"sha-abc123": [12345]}
+    assert "infra_rerun_attempts" not in state["prs"]["456"]
+    # Waiting on CI is not a failed merge attempt.
+    assert state["prs"]["456"].get("consecutive_failed_merge_attempts", 0) == 0
+    assert len(_events(paths, "infra_rerun_failed")) == 1
+    assert not _events(paths, "merge_failed_attempt_alarm")
+    assert state.get("issues", {}).get("123", {}).get("status") != "escalated"
+
+    # Pass 2: run still in progress -> quiet deferral, no doomed re-call.
+    fake_gh.workflow_runs = [{"id": 12345, "status": "in_progress", "conclusion": None}]
+    result = app.merge_ready(456)
+
+    assert result.ok is True
+    assert result.data.get("already_running") is True
+    assert len(fake_gh.rerun_calls) == 1
+    assert fake_gh.workflow_runs_calls == ["sha-abc123"]
+    assert len(_events(paths, "infra_rerun_failed")) == 1
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"].get("consecutive_failed_merge_attempts", 0) == 0
+
+    # Pass 3: terminal -> exactly one follow-up rerun, attempt consumed.
+    fake_gh.workflow_runs = [{"id": 12345, "status": "completed", "conclusion": "cancelled"}]
+    fake_gh.rerun_ok = True
+    result = app.merge_ready(456)
+
+    assert result.data.get("infra_rerun_run_ids") == [12345]
+    assert fake_gh.rerun_calls == [["run", "rerun", "12345"]] * 2
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["infra_rerun_attempts"] == {
+        "sha-abc123": {"Tests passed": {"12345": 1}}
+    }
+    assert state["prs"]["456"]["infra_rerun_deferred"] == {}
+    assert len(_events(paths, "infra_rerun_triggered")) == 1
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_added
+
+
+def test_merge_ready_infra_rerun_deferred_follow_up_still_escalates_at_cap(
+    tmp_path: Path,
+) -> None:
+    """Issue #1936: a deferred pass does not reset the attempt budget --
+    the follow-up consumes attempts normally and cap exhaustion still
+    escalates to the operator queue."""
+    fake_gh = FakeGitHubWithRerunCapture(
+        checks=list(_CANCELLED_CHECKS),
+        rerun_ok=False,
+        rerun_error=_already_running_error(),
+    )
+    app, config, paths = _merge_ready_app(tmp_path, fake_gh)
+
+    # Pass 1: refused -> deferred (no attempt consumed).
+    app.merge_ready(456)
+    # Pass 2: terminal -> follow-up attempt 1.
+    fake_gh.workflow_runs = [{"id": 12345, "status": "completed", "conclusion": "cancelled"}]
+    fake_gh.rerun_ok = True
+    app.merge_ready(456)
+    # Pass 3: still cancelled -> capped attempt 2.
+    app.merge_ready(456)
+    assert fake_gh.rerun_calls == [["run", "rerun", "12345"]] * 3
+
+    # Pass 4: cap exhausted -> escalate.
+    result = app.merge_ready(456)
+    assert result.data.get("infra_escalated") is True
+    assert len(fake_gh.rerun_calls) == 3
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "infra_rerun_cap_exceeded"
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added

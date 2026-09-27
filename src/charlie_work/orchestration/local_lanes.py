@@ -35,6 +35,7 @@ import json
 from pathlib import Path
 from typing import Any, Sequence
 
+import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
 from charlie_work.adapters import SessionRequest
 from charlie_work.claude_code import resolve_review_effort
@@ -262,11 +263,12 @@ def _local_review_packets(self) -> dict[str, Any]:
 
     # --- packet build/refresh for lane records ---
     state = _wf.load_state_locked(self.paths.state_file)
-    # Liveness by sidecar, not by issue status: a freshly parked issue keeps
-    # its dead worker's ``status="dispatched"`` (the salvage lane never
-    # rewrites it), so keying liveness off the status string alone would
-    # defer packet builds forever. ``dispatch_pending`` is live by
-    # definition -- the worker launch is mid-flight and has no sidecar yet.
+    # Liveness by sidecar, not by issue status: a parked issue's status is
+    # whatever its lane last wrote (``dispatched`` before issue #1923's park
+    # flip, ``open_passive`` after), so keying liveness off the status
+    # string alone would defer packet builds forever. ``dispatch_pending``
+    # is live by definition -- the worker launch is mid-flight and has no
+    # sidecar yet.
     live_sidecar_issues = {
         w.issue_number for w in iter_workers(self._layout.sessions_dir) if w.is_alive()
     }
@@ -1881,13 +1883,35 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
             state["issues"][str(issue_number)] = entry
         self.write_gate.save_state(state)
 
-    dispatch_results = _wf.dispatch_sessions(
-        self.repo_root,
-        self._layout.session_manifest,
-        self._layout.session_results,
-        self._adapter_settings(),
-        requests,
+    # Issue #1494: the same superseded-worker reap the remote
+    # ``_dispatch_rework_impl`` performs at its launch trigger, via the
+    # shared helper — a prior worker still running on the branch's
+    # worktree must be reaped before the replacement launches. A pid that
+    # survives blocks the launch and is recorded as a failed dispatch
+    # below so the claim releases back to ``rework_requested``.
+    launch_requests, superseded_failures = (
+        superseded_worker_reap._reap_superseded_workers_for_launch(
+            requests,
+            state.get("issues") or {},
+            self._layout.sessions_dir,
+            repo_root=self.repo_root,
+            worktrees_dir=self._layout.worktrees,
+            adapter_label=lambda _request: self.config.worker.harness,
+            write_gate=self.write_gate,
+        )
     )
+
+    dispatch_results = list(superseded_failures)
+    if launch_requests:
+        dispatch_results.extend(
+            _wf.dispatch_sessions(
+                self.repo_root,
+                self._layout.session_manifest,
+                self._layout.session_results,
+                self._adapter_settings(),
+                launch_requests,
+            )
+        )
     successful = {r.issue_number for r in dispatch_results if r.ok}
     failed_map = {
         r.issue_number: (r.error or "dispatch failed") for r in dispatch_results if not r.ok
