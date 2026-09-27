@@ -61,6 +61,7 @@ from .merge_finalize import _merged_issue_fields
 from .paths import resolved_layout, runtime_paths
 from .pr_create_retry import create_pr_with_retry
 from .process_utils import kill_process_tree
+from .queue_bot import is_queue_bot_pr  # noqa: F401 (deliberate re-export)
 from .review_decision import review_decision as _resolve_review_decision
 from .state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
@@ -353,34 +354,6 @@ def _normalize_reconcile_pr(pr: dict[str, Any]) -> dict[str, Any]:
         }
 
     return pr
-
-
-def is_queue_bot_pr(pr: dict[str, Any], config: OrchestratorConfig) -> bool:
-    """Return True if ``pr`` was created by the configured merge-queue bot.
-
-    Aviator parallel mode creates draft PRs on ``mq-bot-*`` branches to test
-    queued PR combinations (``mq-tmp-*`` is a separate, PR-less internal
-    branch Aviator uses for fast-forward checks -- it never gets a PR at
-    all, so it can't reach this filter regardless). These PRs must be
-    invisible to the fleet: they
-    are not fleet-owned, have no linked issue, and their lifecycle is entirely
-    Aviator's. The ``branch_prefix`` filter already excludes them from most
-    paths (dispatch, merge-train, broadcast sync), but the reconcile PR loop
-    and the mergequeue detectors enumerate ALL PRs and would otherwise emit
-    spurious ``merged_outside_orchestrator`` / ``closed_unmerged_pr_*`` drift
-    items and pollute ``state["prs"]`` with entries the fleet did not create.
-
-    This is the single predicate for that exclusion. It checks the PR's
-    ``author.login`` against ``auto_merge.queue_bot_login`` (e.g.
-    ``aviator-app[bot]``). When the config key is unset, no PR is excluded.
-    """
-    queue_bot_login = config.auto_merge.queue_bot_login
-    if not queue_bot_login:
-        return False
-    author = pr.get("author")
-    if isinstance(author, dict):
-        return author.get("login") == queue_bot_login
-    return False
 
 
 def _fetch_prs(gh: GitHubLike) -> list[dict[str, Any]]:
@@ -1325,12 +1298,7 @@ def detect_drift(
         if pr_number is None:
             continue
         pr_number = int(pr_number)
-        # Aviator parallel-mode exclusion: draft PRs created by the queue
-        # bot (aviator-app[bot]) on mq-bot-* branches are Aviator's own CI
-        # validation artifacts. They have no linked issue, no state entry,
-        # and their lifecycle is entirely Aviator's. Without this skip,
-        # detect_drift emits spurious merged_outside_orchestrator /
-        # closed_unmerged_pr_* items and pollutes state["prs"].
+        # Aviator parallel-mode draft PRs: see queue_bot.is_queue_bot_pr.
         if is_queue_bot_pr(pr, config):
             continue
         gh_state = str(pr.get("state") or "").upper()
