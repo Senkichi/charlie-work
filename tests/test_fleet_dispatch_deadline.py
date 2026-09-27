@@ -13,37 +13,17 @@ import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from _fleet_dispatch_fixtures import (
+    _StepClock,
     _make_fleet_json,
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
+    _per_repo_runtime_paths,
 )
 from charlie_work import layout
 from charlie_work.config import OrchestratorConfig
 from charlie_work.fleet_dispatch import fleet_loop
 from charlie_work.instrumentation import query_events
 from charlie_work.workflow import CommandResult
-
-
-class _StepClock:
-    """A deterministic fake monotonic clock for deadline tests.
-
-    Returns ``steps`` in order, then repeats ``after`` forever once
-    exhausted. Deliberately NOT tied to the exact number of ``pass_clock()``
-    calls a given code path makes internally (e.g. a per-repo lane's own
-    elapsed-time logging) -- only the calls a test cares about need an
-    explicit, distinct step; everything past that reads a constant, so an
-    unrelated extra/missing call elsewhere cannot flip the outcome.
-    """
-
-    def __init__(self, steps: list[float], after: float) -> None:
-        self._steps = list(steps)
-        self._after = after
-        self._n = 0
-
-    def __call__(self) -> float:
-        value = self._steps[self._n] if self._n < len(self._steps) else self._after
-        self._n += 1
-        return value
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")
@@ -89,9 +69,8 @@ def test_fleet_loop_deadline_defers_later_repos(
         (tmp_path / name).mkdir()
 
     mock_load_layered_config.return_value = OrchestratorConfig()
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     mock_app = MagicMock()
     mock_app.dispatch.return_value = CommandResult(True, "repo1 dispatch complete", {})
@@ -174,9 +153,8 @@ def test_fleet_loop_deadline_rotates_last_seen(
         (tmp_path / name).mkdir()
 
     mock_load_layered_config.return_value = OrchestratorConfig()
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     mock_app = MagicMock()
     mock_app.dispatch.return_value = CommandResult(True, "repo1 dispatch complete", {})

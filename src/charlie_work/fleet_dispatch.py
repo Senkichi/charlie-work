@@ -6,8 +6,10 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -38,7 +40,19 @@ from .fleet_health_baseline import (  # noqa: F401  (deliberate re-export)
     reconcile_fleet_health_baselines,
 )
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
-from .fleet_registry import _load_registry, count_fleet_runners
+from .fleet_registry import _load_registry, _select_repos, count_fleet_runners
+
+# Re-exported so the issue #1934 extraction keeps the
+# ``fleet_dispatch.<name>`` facade intact for existing callers/tests; the
+# implementations live in the fleet_lanes domain module.
+from .fleet_lanes import (  # noqa: F401  (deliberate re-export)
+    _DEFAULT_FLEET_LANE_CONCURRENCY,
+    _fleet_reap_sweep_loop,
+    _resolve_fleet_lane_concurrency,
+    _run_fleet_reap_sweep,
+    _run_fleet_repo_lane,
+    _start_fleet_reap_scheduler,
+)
 from .fleet_stop import (
     FleetStopState,
     apply_fleet_drain_config,
@@ -301,46 +315,6 @@ def run_allocation_pass_with_ci_fleet_guard(
         full_pass_interval_seconds=full_pass_interval_seconds,
     )
     return result, dirty_check
-
-
-def _select_repos(
-    registry: dict[str, Any],
-    repos: tuple[str, ...] | None,
-) -> list[tuple[str, dict[str, Any]]]:
-    """Select and order repos for a fleet pass.
-
-    If repos is provided, use exactly that subset in the given order.
-    Otherwise, return all repos sorted by oldest last_seen first.
-
-    Args:
-        registry: The fleet registry dict with a "repos" map.
-        repos: Optional tuple of repo keys to select explicitly.
-
-    Returns:
-        A list of (repo_key, entry) tuples in the order to process.
-    """
-    repos_map = registry.get("repos", {})
-    if repos:
-        # Explicit subset: use exactly the given keys in the given order
-        # Skip keys that don't exist in the registry
-        selected = [(key, repos_map[key]) for key in repos if key in repos_map]
-        return selected
-    else:
-        # All repos: sort by oldest last_seen first
-        all_repos = list(repos_map.items())
-
-        # Sort by last_seen ascending (oldest first)
-        # Repos without last_seen go last (treated as newest)
-        def last_seen_key(item: tuple[str, dict[str, Any]]) -> tuple[bool, str]:
-            key, entry = item
-            last_seen = entry.get("last_seen", "")
-            # Repos with last_seen sort before those without
-            # (False < True, so False comes first)
-            has_last_seen = last_seen != ""
-            return (not has_last_seen, last_seen)
-
-        all_repos.sort(key=last_seen_key)
-        return all_repos
 
 
 @dataclass(frozen=True)
@@ -1988,206 +1962,284 @@ def fleet_loop(
                 pass_clock() - autoscale_lane_start,
             )
 
-    for repo_key, entry in selected:
-        if _deadline_exceeded():
-            # Issue #1832: stop starting new repo lanes once the pass is over
-            # its cooperative budget. The remaining repos are deferred (not
-            # failed) -- they sort first next pass via the last_seen rotation
-            # below instead of never getting a turn behind a slow repo.
-            deferred_repo_keys.append(repo_key)
-            continue
+    def _record_repo_lane_error(
+        repo_key: str,
+        repo_root: Path,
+        entry: dict[str, Any],
+        exc: Exception,
+    ) -> None:
+        """Render a lane exception into the same per-repo error shape the
+        pre-#1934 serial loop produced (issues #738, #6-G).
 
-        repo_lane_start = pass_clock()
-        # Default to "" rather than None: a registry entry missing repo_root
-        # entirely would make Path(None) raise, where the is_dir() check below
-        # already has the right answer for a bad path.
-        repo_root = Path(entry.get("repo_root") or "")
-        if not repo_root.is_dir():
-            # Issue #1372: a registry entry whose repo_root no longer exists is
-            # STALE, not a live failing lane. Emit ONE warning-level
-            # fleet_registry_stale_entry event into the DAEMON's own events.db
-            # (fleet_state_path), never into the dead entry's recorded
-            # state_dir — _record_lane_failure_event resolves the event state
-            # path from the registry's recorded state_dir, and log_event
-            # auto-mkdirs (#746), which resurrects a zombie directory under
-            # %TEMP% on every pass. Skip the lane without making the pass fail
-            # (ok=True, pass_skipped=True) so one corpse cannot degrade
-            # fleet-wide tooling. The entry is collected for prune-after-grace.
-            stale_message = f"repo_root missing, stale entry skipped: {repo_root}"
-            per_repo_results[repo_key] = CommandResult(
-                True, stale_message, {"stale": True, "pass_skipped": True}
-            )
-            stale_keys.append(repo_key)
-            try:
-                log_event(
-                    fleet_state_path,
-                    "fleet_registry_stale_entry",
-                    {
-                        "repo_key": repo_key,
-                        "repo_root": str(repo_root),
-                        "reason": "repo_root_missing",
-                    },
-                    repo=repo_key,
-                )
-            except Exception:
-                logger.debug("Failed to record fleet_registry_stale_entry for %s", repo_key)
-            logger.info(
-                "fleet pass lane elapsed: lane=%s elapsed_seconds=%.1f",
-                repo_key,
-                pass_clock() - repo_lane_start,
-            )
-            continue
+        Per-repo isolation: catch any provider/logic failure at the lane
+        boundary and continue. Keep the rest of the fleet pass alive instead
+        of crashing on one unclassified exception. The exception type is part
+        of the message and the full traceback goes to the log — an
+        unclassified failure must stay diagnosable.
 
-        touched_repo_keys.append(repo_key)
+        Issue #738: this is the only per-repo construction site that
+        represents a genuine lane crash (app.loop() never ran to
+        completion). Mark it distinctly from the non-fatal ok=False
+        conditions app.loop() returns for (PR errors, the unauthorized-
+        merge tripwire, etc.) so the supervisor headline can split
+        "errored" from "completed with conditions" instead of painting
+        both red under one "failed" count.
+        """
+        error_message = f"{type(exc).__name__}: {exc}"
+        per_repo_results[repo_key] = CommandResult(
+            False, f"fleet pass error: {error_message}", {"errored": True}
+        )
         try:
-            # Load per-repo config through the global fleet layer so a fleet-wide
-            # default (e.g. fleet.global_max_concurrent_sessions, watchdog knobs)
-            # set once in <fleet_dir>/config.yaml applies here too; the per-repo
-            # orchestrator.config.yaml still wins on any overlapping key.
-            explicit_cfg = entry.get("config_path")
-            config = load_layered_config(
-                repo_root,
-                Path(explicit_cfg) if explicit_cfg else None,
-                fleet_dir_override=fleet_dir_override,
-            )
-            # Cache the raw layered config for the api-worker fleet report
-            # (captured before the notify-silencing replace below).
-            loaded_configs[repo_key] = config
-            # Fleet mode is the single notification authority: the aggregate
-            # digest below emits once for the whole pass. Silence per-repo
-            # dispatch()/loop() emission so one health transition doesn't fire
-            # both a per-repo and a fleet-level notification.
-            config = replace(config, notify=replace(config.notify, enabled=False))
-            if drain:
-                config = apply_fleet_drain_config(config)
-            paths = runtime_paths(repo_root, config.runtime.state_dir)
+            raise exc
+        except Exception:
+            logger.exception("Error processing repo %s", repo_key)
+        # #6-G: the two lines above are an in-process dict and a line in a
+        # dated flat-text log — neither reaches events.db, state.json, or
+        # the fleet digest, since _extract_attention_events() below only
+        # runs for a lane that returned a result. A repo whose lane fails on
+        # every pass (e.g. a config-load ConfigError, cw#... 2026-07-29)
+        # was previously invisible to everything except that log line.
+        # Reuse the existing "error" AttentionEntry branch (health=ERROR,
+        # already desktop-toast-eligible via _DESKTOP_SEVERITIES) so this
+        # works on exactly the path where app.loop() never ran, and
+        # durably record it so `charlie doctor` and
+        # query_events(level="error") can see it even after the digest's
+        # cross-pass dedup stops re-emitting the same standing failure.
+        attention_events.append({"repo_key": repo_key, "type": "error", "error": error_message})
+        _record_lane_failure_event(repo_root, repo_key, entry, error_message)
 
-            # Non-blocking supervisor lock: fleet passes must be mutually exclusive
-            # with a supervised bash-rats loop on the same repo to avoid double-
-            # dispatching through the governor's read-then-launch window.
-            lock = try_acquire_supervisor_lock(layout.supervisor_lock_path(paths.root))
-            if lock is None:
+    # Issue #1934: two-phase lane execution. Phase 1 (this loop) does each
+    # repo's deterministic prep on the calling thread -- deadline check,
+    # stale-entry handling, config load, lock acquisition, GitHub client /
+    # OrchestratorApp construction -- then submits the lane body
+    # (_run_fleet_repo_lane) to a bounded pool and keeps every shared
+    # aggregate (per_repo_results, attention_events, loaded_configs,
+    # observed/touched/deferred lists) single-threaded in selection order.
+    # Futures are resolved strictly in selection order -- either while
+    # throttling a full pool mid-submission or in the post-loop drain -- so
+    # result ordering and instrumentation are identical to the serial loop.
+    # The supervisor lock a lane acquires in phase 1 stays held until its
+    # lane body returns, exactly as before.
+    lane_concurrency = max(1, min(len(selected), _resolve_fleet_lane_concurrency(global_config)))
+    pending_lanes: list[tuple[str, dict[str, Any], Path, float, Any]] = []
+    collected_lane_count = 0
+
+    def _collect_next_pending_lane() -> None:
+        """Resolve the oldest uncollected lane future, in selection order.
+
+        Runs on the calling thread both when the submission loop throttles
+        on a full pool and in the post-loop drain, so per-repo results,
+        attention events, and the lane-elapsed log line keep serial ordering
+        no matter when a lane actually finishes.
+        """
+        nonlocal collected_lane_count, orphan_sweep_calls
+        repo_key, entry, repo_root, repo_lane_start, future = pending_lanes[collected_lane_count]
+        collected_lane_count += 1
+        try:
+            result = future.result()
+        except Exception as exc:
+            _record_repo_lane_error(repo_key, repo_root, entry, exc)
+        else:
+            per_repo_results[repo_key] = result
+            attention_events.extend(_extract_attention_events(repo_key, result))
+            observed_repo_keys.add(repo_key)
+
+            # Count orphan sweep calls (B6a interaction)
+            # Each loop() call internally triggers orphan sweep via
+            # _sweep_orphan_processes_for_dead_sessions
+            # We count this as a metric for the follow-up optimization
+            if not work_only:
+                orphan_sweep_calls += 1
+        logger.info(
+            "fleet pass lane elapsed: lane=%s elapsed_seconds=%.1f",
+            repo_key,
+            pass_clock() - repo_lane_start,
+        )
+
+    with ThreadPoolExecutor(
+        max_workers=lane_concurrency, thread_name_prefix="fleet-lane"
+    ) as lane_pool:
+        for repo_key, entry in selected:
+            if _deadline_exceeded():
+                # Issue #1832: stop starting new repo lanes once the pass is
+                # over its cooperative budget. The remaining repos are
+                # deferred (not failed) -- they sort first next pass via the
+                # last_seen rotation below instead of never getting a turn
+                # behind a slow repo.
+                deferred_repo_keys.append(repo_key)
+                continue
+
+            # Issue #1832 under #1934: never let more than lane_concurrency
+            # lanes stay outstanding. Without this throttle the submission
+            # loop outruns the pool -- prep is fast, so every selected repo
+            # is submitted before the check above can trip, and lanes queued
+            # beyond the pool's width then run to completion past
+            # max_pass_runtime_seconds on the executor's unconditional
+            # shutdown join. Resolving the oldest outstanding lane first
+            # reproduces the serial loop's bound: a repo whose turn arrives
+            # after the deadline is deferred before its prep ever runs
+            # (re-check below), while lanes already in flight finish
+            # cooperatively.
+            waited_for_slot = False
+            while len(pending_lanes) - collected_lane_count >= lane_concurrency:
+                _collect_next_pending_lane()
+                waited_for_slot = True
+            # The wait for a pool slot can consume the rest of the budget, so
+            # re-check before prep -- but only when a wait actually happened:
+            # the top-of-loop check is otherwise still fresh, and an
+            # unconditional re-read would break callers (tests) that budget
+            # one pass_clock read per repo.
+            if waited_for_slot and _deadline_exceeded():
+                deferred_repo_keys.append(repo_key)
+                continue
+
+            repo_lane_start = pass_clock()
+            # Default to "" rather than None: a registry entry missing repo_root
+            # entirely would make Path(None) raise, where the is_dir() check below
+            # already has the right answer for a bad path.
+            repo_root = Path(entry.get("repo_root") or "")
+            if not repo_root.is_dir():
+                # Issue #1372: a registry entry whose repo_root no longer exists is
+                # STALE, not a live failing lane. Emit ONE warning-level
+                # fleet_registry_stale_entry event into the DAEMON's own events.db
+                # (fleet_state_path), never into the dead entry's recorded
+                # state_dir — _record_lane_failure_event resolves the event state
+                # path from the registry's recorded state_dir, and log_event
+                # auto-mkdirs (#746), which resurrects a zombie directory under
+                # %TEMP% on every pass. Skip the lane without making the pass fail
+                # (ok=True, pass_skipped=True) so one corpse cannot degrade
+                # fleet-wide tooling. The entry is collected for prune-after-grace.
+                stale_message = f"repo_root missing, stale entry skipped: {repo_root}"
                 per_repo_results[repo_key] = CommandResult(
-                    True,
-                    "supervisor lock held, skipped",
-                    {"pass_skipped": True, "reason": "supervisor_lock_held"},
+                    True, stale_message, {"stale": True, "pass_skipped": True}
                 )
-                attention_events.append(
-                    {
-                        "repo_key": repo_key,
-                        "type": "skipped",
-                        "reason": "supervisor_lock_held",
-                    }
+                stale_keys.append(repo_key)
+                try:
+                    log_event(
+                        fleet_state_path,
+                        "fleet_registry_stale_entry",
+                        {
+                            "repo_key": repo_key,
+                            "repo_root": str(repo_root),
+                            "reason": "repo_root_missing",
+                        },
+                        repo=repo_key,
+                    )
+                except Exception:
+                    logger.debug("Failed to record fleet_registry_stale_entry for %s", repo_key)
+                logger.info(
+                    "fleet pass lane elapsed: lane=%s elapsed_seconds=%.1f",
+                    repo_key,
+                    pass_clock() - repo_lane_start,
                 )
                 continue
 
+            touched_repo_keys.append(repo_key)
+            lane_submitted = False
             try:
-                gh = github_client_for(repo_root, config, github=GitHub, dry_run=dry_run)
-                app = OrchestratorApp(
+                # Load per-repo config through the global fleet layer so a fleet-wide
+                # default (e.g. fleet.global_max_concurrent_sessions, watchdog knobs)
+                # set once in <fleet_dir>/config.yaml applies here too; the per-repo
+                # orchestrator.config.yaml still wins on any overlapping key.
+                explicit_cfg = entry.get("config_path")
+                config = load_layered_config(
                     repo_root,
-                    paths,
-                    config,
-                    gh,
-                    dry_run=dry_run,
+                    Path(explicit_cfg) if explicit_cfg else None,
                     fleet_dir_override=fleet_dir_override,
                 )
+                # Cache the raw layered config for the api-worker fleet report
+                # (captured before the notify-silencing replace below).
+                loaded_configs[repo_key] = config
+                # Fleet mode is the single notification authority: the aggregate
+                # digest below emits once for the whole pass. Silence per-repo
+                # dispatch()/loop() emission so one health transition doesn't fire
+                # both a per-repo and a fleet-level notification.
+                config = replace(config, notify=replace(config.notify, enabled=False))
+                if drain:
+                    config = apply_fleet_drain_config(config)
+                paths = runtime_paths(repo_root, config.runtime.state_dir)
 
-                # Issue #1339: ensure every LabelConfig-derived label exists
-                # on the repo before the lane runs. Idempotent and
-                # best-effort: ``ensure_labels`` records failures as events
-                # and never raises, so a missing-label drift self-heals on
-                # the supervisor's first pass without blocking the lane. The
-                # supervisor passes ``ensure_labels=True`` on its first pass
-                # only (see run_fleet_supervise), so this is once per startup
-                # per repo, not once per pass.
-                if ensure_labels:
-                    try:
-                        app.ensure_labels()
-                    except Exception as exc:  # noqa: BLE001 — never block a lane
-                        logger.warning("fleet label ensure failed for %s: %s", repo_key, exc)
+                # Non-blocking supervisor lock: fleet passes must be mutually exclusive
+                # with a supervised bash-rats loop on the same repo to avoid double-
+                # dispatching through the governor's read-then-launch window.
+                lock = try_acquire_supervisor_lock(layout.supervisor_lock_path(paths.root))
+                if lock is None:
+                    per_repo_results[repo_key] = CommandResult(
+                        True,
+                        "supervisor lock held, skipped",
+                        {"pass_skipped": True, "reason": "supervisor_lock_held"},
+                    )
+                    attention_events.append(
+                        {
+                            "repo_key": repo_key,
+                            "type": "skipped",
+                            "reason": "supervisor_lock_held",
+                        }
+                    )
+                    continue
 
-                # Call the appropriate per-repo method
-                if work_only:
-                    # Dispatch-only path (worker dispatch + optional review dispatch)
-                    result = app.dispatch(0 if drain else limit)
-                    if config.review_dispatch.enabled:
-                        review_dispatch_result = app.dispatch_reviews(0 if drain else limit)
-                        ok = result.ok and review_dispatch_result.ok
-                        message = (
-                            "work-only dispatch: "
-                            f"workers={result.data.get('selected_count', 0)}, "
-                            f"reviews={review_dispatch_result.data.get('selected_count', 0)}"
-                        )
-                        combined_data = dict(result.data)
-                        combined_data["dispatch_reviews"] = review_dispatch_result.data
-                        result = CommandResult(ok, message, combined_data)
-                else:
-                    # Full loop (intake -> dispatch -> review -> merge). A
-                    # drain pass forces limit=0: dispatch_rework/dispatch
-                    # slice candidates[:0] (0 is not None, so it is never
-                    # replaced by default_limit) while the reap, review, and
-                    # merge lanes below them run normally.
-                    result = app.loop(0 if drain else limit, merge=merge)
+                try:
+                    gh = github_client_for(repo_root, config, github=GitHub, dry_run=dry_run)
+                    app = OrchestratorApp(
+                        repo_root,
+                        paths,
+                        config,
+                        gh,
+                        dry_run=dry_run,
+                        fleet_dir_override=fleet_dir_override,
+                    )
+                    future = lane_pool.submit(
+                        _run_fleet_repo_lane,
+                        repo_key,
+                        app,
+                        config,
+                        lock,
+                        work_only=work_only,
+                        drain=drain,
+                        limit=limit,
+                        merge=merge,
+                        ensure_labels=ensure_labels,
+                    )
+                except Exception:
+                    lock.release()
+                    raise
+                pending_lanes.append((repo_key, entry, repo_root, repo_lane_start, future))
+                lane_submitted = True
 
-                per_repo_results[repo_key] = result
-                attention_events.extend(_extract_attention_events(repo_key, result))
-                observed_repo_keys.add(repo_key)
-
-                # Count orphan sweep calls (B6a interaction)
-                # Each loop() call internally triggers orphan sweep via
-                # _sweep_orphan_processes_for_dead_sessions
-                # We count this as a metric for the follow-up optimization
-                if not work_only:
-                    orphan_sweep_calls += 1
+            except Exception as exc:
+                _record_repo_lane_error(repo_key, repo_root, entry, exc)
             finally:
-                lock.release()
+                # Issue #1832: logged on every path that actually attempted this
+                # repo's lane on this thread -- the non-fatal construction
+                # failure branch and the supervisor-lock-held skip (its
+                # `continue` still runs this `finally`). A submitted lane logs
+                # its own elapsed line at collection time below, since it is
+                # still running here. Not logged for a stale entry or a
+                # deadline-deferred repo -- those never started a lane and
+                # have their own (or no) elapsed line.
+                if not lane_submitted:
+                    logger.info(
+                        "fleet pass lane elapsed: lane=%s elapsed_seconds=%.1f",
+                        repo_key,
+                        pass_clock() - repo_lane_start,
+                    )
 
-        except Exception as exc:
-            # Per-repo isolation: catch any provider/logic failure at the
-            # iteration boundary and continue. Keep the rest of the fleet
-            # pass alive instead of crashing on one unclassified exception.
-            # The exception type is part of the message and the full traceback
-            # goes to the log — an unclassified failure must stay diagnosable.
-            error_message = f"{type(exc).__name__}: {exc}"
-            # Issue #738: this is the only per-repo construction site that
-            # represents a genuine lane crash (app.loop() never ran to
-            # completion). Mark it distinctly from the non-fatal ok=False
-            # conditions app.loop() returns for (PR errors, the unauthorized-
-            # merge tripwire, etc.) so the supervisor headline can split
-            # "errored" from "completed with conditions" instead of painting
-            # both red under one "failed" count.
-            per_repo_results[repo_key] = CommandResult(
-                False, f"fleet pass error: {error_message}", {"errored": True}
-            )
-            logger.exception("Error processing repo %s", repo_key)
-            # #6-G: the two lines above are an in-process dict and a line in a
-            # dated flat-text log — neither reaches events.db, state.json, or
-            # the fleet digest, since _extract_attention_events() above only
-            # runs after a successful app.loop(). A repo whose lane fails on
-            # every pass (e.g. a config-load ConfigError, cw#... 2026-07-29)
-            # was previously invisible to everything except that log line.
-            # Reuse the existing "error" AttentionEntry branch (health=ERROR,
-            # already desktop-toast-eligible via _DESKTOP_SEVERITIES) so this
-            # works on exactly the path where app.loop() never ran, and
-            # durably record it so `charlie doctor` and
-            # query_events(level="error") can see it even after the digest's
-            # cross-pass dedup stops re-emitting the same standing failure.
-            attention_events.append(
-                {"repo_key": repo_key, "type": "error", "error": error_message}
-            )
-            _record_lane_failure_event(repo_root, repo_key, entry, error_message)
-        finally:
-            # Issue #1832: logged on every path that actually attempted this
-            # repo's lane -- success, the non-fatal ok=False branch, the
-            # supervisor-lock-held skip (its `continue` still runs this
-            # `finally`), and the exception branch above. Not logged for a
-            # stale entry or a deadline-deferred repo -- those never started
-            # a lane and have their own (or no) elapsed line.
-            logger.info(
-                "fleet pass lane elapsed: lane=%s elapsed_seconds=%.1f",
-                repo_key,
-                pass_clock() - repo_lane_start,
-            )
+        # Drain the lanes still outstanding, in selection order (not
+        # completion order) so result/attention-event ordering is identical
+        # to the serial loop. ``future.result()`` blocks until each lane
+        # finishes; the ``with`` exit then joins the pool with nothing left
+        # to wait on.
+        while collected_lane_count < len(pending_lanes):
+            _collect_next_pending_lane()
+
+    # Results were recorded from two interleaved sources -- skips/prep errors
+    # during submission and lane completions during collection -- so restore
+    # strict selection order (the serial loop's insertion order) before the
+    # per-repo instrumentation and result consumers below.
+    _selected_order = {key: i for i, (key, _entry) in enumerate(selected)}
+    per_repo_results = dict(
+        sorted(per_repo_results.items(), key=lambda kv: _selected_order[kv[0]])
+    )
 
     # Issue #1372: prune stale registry entries past their grace period. The
     # grace_days knob is read from the global config's runtime section (the
@@ -3011,7 +3063,26 @@ def run_fleet_supervise(
     # the daemon was already running).
     startup_head = read_head_sha(orchestrator_root())
 
+    # Issue #1934: the dead-review-claim sweep set used to run only inside
+    # each repo's lane (dispatch_reviews) and via the standalone
+    # ``reap-reviews`` command, so a dead claim waited a full fleet-wide
+    # round (~55-67 min observed) to be freed. The supervisor now runs the
+    # same sweep set once per selected repo on its own cadence from a
+    # dedicated daemon thread, independent of -- and concurrent with -- the
+    # lane pool and this pass scheduler. The sweeps never launch reviewers
+    # and are state_lock-serialized / merge-on-write safe against a live
+    # lane (issue #1874), so they neither need nor take the supervisor lock.
+    # ``reap_sweep_interval_seconds`` <= 0 disables the scheduler.
+    reap_scheduler: tuple[threading.Thread, threading.Event] | None = None
+
     try:
+        if cfg.reap_sweep_interval_seconds > 0:
+            reap_scheduler = _start_fleet_reap_scheduler(
+                interval_seconds=cfg.reap_sweep_interval_seconds,
+                fleet_dir_override=fleet_dir_override,
+                repos=repos,
+                dry_run=dry_run,
+            )
         while True:
             now = clock()
             # Refresh the heartbeat at the top of every iteration so the
@@ -3436,6 +3507,14 @@ def run_fleet_supervise(
             },
         )
     finally:
+        if reap_scheduler is not None:
+            # Stop the out-of-band reap scheduler before releasing the
+            # supervisor lock (issue #1934). ``set`` wakes the loop's
+            # ``Event.wait`` sleep immediately; the bounded join keeps a
+            # slow in-flight sweep from stalling exit indefinitely.
+            reap_thread, reap_stop_event = reap_scheduler
+            reap_stop_event.set()
+            reap_thread.join(timeout=10)
         lock.release()
         # Record supervisor_exited for every in-control exit (issue #627). A
         # TerminateProcess kill never reaches here — that is the gap the next

@@ -1,0 +1,8 @@
+error
+# Issue #1494: a recorded prior worker for the issue remained alive after
+# the pre-launch reap attempt — either the guarded process-tree kill
+# failed, the pid was live with no process-start fingerprint to kill
+# against, or it was still alive on the post-kill recheck. The replacement
+# rework launch was refused and recorded as a ``prior_worker_still_alive``
+# blocked-environment failure, so error is correct: dispatch did not
+# happen and a human may need to terminate the process manually.

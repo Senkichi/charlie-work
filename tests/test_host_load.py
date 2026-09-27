@@ -304,8 +304,13 @@ def test_pytest_tree_load_tolerates_blank_command_lines() -> None:
 
 
 def test_measure_host_load_returns_reading(tmp_path: Path) -> None:
+    # Issue #1943: measurement is scoped to orchestrator-attributable trees,
+    # so the fixture root names a managed worktree's venv interpreter (the
+    # .var/charlie-work state-dir marker) rather than a bare "pytest".
     reading = host_load.measure_host_load(
-        lister=lambda: _lister(_proc(100, 1, "pytest -q")),
+        lister=lambda: _lister(
+            _proc(100, 1, r"C:\repo\.var\charlie-work\worktrees\wt\.venv\Scripts\pytest.exe -q")
+        ),
         self_pid=999,
         diagnostic_state_path=tmp_path / "state.json",
         diagnostic_repo="repo",
@@ -403,7 +408,9 @@ def test_measure_host_load_uses_module_lister_by_default(
     monkeypatch.setattr(
         host_load,
         "list_host_processes",
-        lambda: _lister(_proc(100, 1, "pytest -q")),
+        lambda: _lister(
+            _proc(100, 1, r"C:\repo\.var\charlie-work\worktrees\wt\.venv\Scripts\pytest.exe -q")
+        ),
     )
     reading = host_load.measure_host_load(self_pid=999)
     assert reading == host_load.HostLoad(pytest_tree_count=1, pytest_process_count=1)
@@ -501,11 +508,26 @@ def _patch_procs(monkeypatch: pytest.MonkeyPatch, *procs: quiesce.ProcessInfo) -
 
 
 def _saturated_snapshot() -> list[quiesce.ProcessInfo]:
-    """The incident shape from #1843: ~18 pytest processes across several
-    trees (two CI suites at -n 8 fan-out, plus worktree suites)."""
-    procs = [_proc(100, 1, "uv run --extra dev pytest -n auto -q --tb=short")]
+    """The incident shape from #1843: ~18 pytest processes across two
+    managed worktree suites at ``-n 8`` fan-out.
+
+    Issue #1943: ``measure_host_load`` scopes to orchestrator-attributable
+    trees, so the roots name a managed worktree's venv interpreter rather
+    than a bare ``pytest``/``uv run`` -- a pathless cmdline no longer
+    counts (the pathless shapes' attribution through a launcher ancestor is
+    covered in tests/test_host_load_scope.py).
+    """
+    procs = [
+        _proc(
+            100,
+            1,
+            r"C:\repo\.var\charlie-work\worktrees\wt-a\.venv\Scripts\pytest.exe -n auto -q --tb=short",
+        )
+    ]
     procs += [_proc(110 + i, 100, "python -u -c xdist") for i in range(8)]
-    procs.append(_proc(200, 1, "pytest -n auto"))
+    procs.append(
+        _proc(200, 1, r"C:\repo\.var\charlie-work\worktrees\wt-b\.venv\Scripts\pytest.exe -n auto")
+    )
     procs += [_proc(210 + i, 200, "python -u -c xdist") for i in range(8)]
     return procs
 
@@ -545,11 +567,11 @@ def test_host_load_applies_to_fresh_dispatch_lane_too(
 def test_host_load_does_not_clamp_under_threshold(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A single CI suite running alone is normal fleet activity -- the
-    clamp exists for oversubscription, not for any nonzero load."""
+    """A single managed suite running alone is normal fleet activity --
+    the clamp exists for oversubscription, not for any nonzero load."""
     _patch_procs(
         monkeypatch,
-        _proc(100, 1, "pytest -n 2"),
+        _proc(100, 1, r"C:\repo\.var\charlie-work\worktrees\wt\.venv\Scripts\pytest.exe -n 2"),
         _proc(101, 100, "python -u -c w1"),
         _proc(102, 100, "python -u -c w2"),
     )
@@ -572,8 +594,8 @@ def test_host_load_threshold_is_strictly_greater(
     permits a launch."""
     _patch_procs(
         monkeypatch,
-        _proc(100, 1, "pytest -q"),
-        _proc(200, 1, "pytest -q"),
+        _proc(100, 1, r"C:\repo\.var\charlie-work\worktrees\wt-a\.venv\Scripts\pytest.exe -q"),
+        _proc(200, 1, r"C:\repo\.var\charlie-work\worktrees\wt-b\.venv\Scripts\pytest.exe -q"),
     )
     app = _build_app(tmp_path, host_load_max=2)
 

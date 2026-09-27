@@ -85,6 +85,32 @@ def _read_packet_head_oid(self, pr_number: int) -> str | None:
     return str(value) if value is not None else None
 
 
+def _read_packet_body(self, pr_number: int) -> str | None:
+    """Return the ``body`` stored in the existing review packet's ``pr.json``
+    for ``pr_number``, or ``None`` if no packet exists, it cannot be read,
+    or it carries no body field.
+
+    Mirrors ``_read_packet_head_oid``: keeps ``reviewed_body_sha256``
+    (issue #1939) derived from the PR description the reviewer actually
+    saw rather than a live re-fetch. A non-string body value (e.g. a
+    packet predating the slim-field set) reads as ``None`` -- the caller
+    falls back to the live body, matching the packet-first/live-fallback
+    source rule used for ``reviewed_head_sha`` and ``reviewed_patch_id``.
+    """
+    pr_json_path = self.paths.prs / f"pr-{pr_number}" / "pr.json"
+    if not pr_json_path.exists():
+        return None
+    try:
+        with pr_json_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("body")
+    return value if isinstance(value, str) else None
+
+
 def _read_packet_turn_cap_multiplier(self, pr_number: int) -> int:
     """Return the structure-aware turn-cap multiplier stamped into the
     review packet for ``pr_number`` (issue #1439), or 1 if no packet

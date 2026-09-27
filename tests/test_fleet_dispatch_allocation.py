@@ -16,6 +16,7 @@ from _fleet_dispatch_fixtures import (
     _make_repo,
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
+    _per_repo_runtime_paths,
 )
 from charlie_work import layout
 from charlie_work.doctor_allocation import _check_runner_allocation
@@ -659,9 +660,8 @@ def test_autoscale_prologue_up_forwards_affinity_knobs(
         runner_allocation=RunnerAllocationConfig(reserved_threads=4, threads_per_slot=6),
     )
     mock_load_layered_config.return_value = config
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
     mock_count_fleet_runners.return_value = (1, 0, [])
     mock_is_in_cooldown.return_value = False
     mock_is_pool_idle.return_value = False
