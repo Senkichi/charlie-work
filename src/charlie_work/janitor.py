@@ -560,6 +560,59 @@ def run_janitor(
     )
 
 
+def _unwind_skipped_rerun_attempts(
+    infra_rerun_attempts: dict[str, Any],
+    head_key: str,
+    skipped_run_ids: set[int],
+) -> dict[str, Any]:
+    """Return ``infra_rerun_attempts`` with each ``skipped_run_ids``
+    pre-increment undone, without mutating the caller's map.
+
+    ``classify_infra_failures`` increments the per-head counter for every
+    eligible run id before the driver decides what to do with it. An id
+    this pass deferred without dispatching -- the containing run still
+    reads in progress on probe -- must not keep that increment: the
+    bounded attempt is spent only when ``gh run rerun`` is actually
+    called, so persisting the map unmodified would march a skipped run
+    toward cap exhaustion (and early escalation) on attempts it never
+    spent. Entries emptied by the unwind are dropped so the persisted map
+    matches what the classifier would have produced had the run never
+    been eligible this pass. Map shape mirrors the classifier's:
+    ``{head_sha: {check_name: {run_id_str: count}}}``.
+    """
+    if not skipped_run_ids or not head_key:
+        return infra_rerun_attempts
+    head_attempts = infra_rerun_attempts.get(head_key)
+    if not isinstance(head_attempts, dict):
+        return infra_rerun_attempts
+    skipped = {str(run_id) for run_id in skipped_run_ids}
+    unwound_head: dict[str, Any] = {}
+    for name, name_attempts in head_attempts.items():
+        if not isinstance(name_attempts, dict):
+            unwound_head[name] = name_attempts
+            continue
+        counts = dict(name_attempts)
+        for key in skipped:
+            if key not in counts:
+                continue
+            try:
+                remaining = int(counts[key]) - 1
+            except (TypeError, ValueError):
+                continue
+            if remaining > 0:
+                counts[key] = remaining
+            else:
+                del counts[key]
+        if counts:
+            unwound_head[name] = counts
+    unwound = dict(infra_rerun_attempts)
+    if unwound_head:
+        unwound[head_key] = unwound_head
+    else:
+        unwound.pop(head_key, None)
+    return unwound
+
+
 def _check_draft(pr: dict[str, Any], failures: list[str]) -> bool:
     """Detect a draft PR. Returns True iff the draft failure was appended."""
     if "isDraft" not in pr:

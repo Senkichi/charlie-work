@@ -654,6 +654,35 @@ def classify_infra_failures(
     )
 
 
+def workflow_run_terminal_by_id(
+    runs: list[dict[str, Any]] | None,
+) -> dict[int, bool] | None:
+    """Map ``workflow_runs_for_head`` entries to ``{run_id: is_terminal}``.
+
+    GitHub marks a workflow run terminal with ``status == "completed"``;
+    every other status (``queued``/``requested``/``waiting``/``pending``/
+    ``in_progress``) means the run is still in progress and a ``gh run
+    rerun`` against it is refused with "already running". ``None`` in --
+    the ``workflow_runs_for_head`` call itself failed -- is propagated as
+    ``None`` so callers can fail open and let ``gh run rerun`` arbitrate.
+
+    Issue #1936: the infra-rerun driver uses this to gate a deferred
+    follow-up rerun on the containing run's terminal state.
+    """
+    if runs is None:
+        return None
+    out: dict[int, bool] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        try:
+            run_id = int(run.get("id"))
+        except (TypeError, ValueError):
+            continue
+        out[run_id] = str(run.get("status") or "").lower() == "completed"
+    return out
+
+
 def compute_ratchetable_points(
     repo_root: Path,
     diff: str,
