@@ -262,20 +262,27 @@ class Issues(CapabilityCollaborator):
         # positively resolves it; an unrelated clean batch (one that never
         # named the stale number) leaves the set untouched, so a persistent
         # stale blocker fires once per GitHub-instance lifetime instead of
-        # once per pass. The earlier single-frozenset signature did reset on
-        # any unrelated clean batch, and with multiple are_issues_open
-        # calls per pass (github_ops_blockers prefetch, backlog_reachability
-        # per-issue, blocker_cycles) the same stale blocker refired every
-        # pass -- the every-pass warning flood (one row per pass into
-        # ``check_warning_events``) the edge-trigger exists to close.
-        # Lives on the collaborator instance, NOT in ``_list_cache``: one
-        # GitHub/Issues pair lives for a whole supervisor process while
+        # once per batch observation. The earlier single-frozenset
+        # signature did reset on any unrelated clean batch, and with
+        # multiple are_issues_open calls per pass (github_ops_blockers
+        # prefetch, backlog_reachability per-issue, blocker_cycles) the
+        # same stale blocker refired every pass.
+        # Lives on the collaborator instance, NOT in ``_list_cache``:
         # ``_list_cache`` is cleared every pass
         # (``repo_meta.invalidate_list_cache``), so cache-resident state
-        # could never dedupe the event across passes. An instance attribute
-        # never lands in ``vars(Issues)`` -- ``github_delegation._routable_members``
-        # only yields class-level callables -- so adding it changes neither
-        # ``_ROUTES`` nor ``GitHub``'s surface.
+        # could never dedupe the event even within one instance's
+        # lifetime. How far that lifetime reaches depends on the caller:
+        # the single-repo supervisor (``supervise.run_supervised``) keeps
+        # one GitHub/Issues pair for the whole process, but the fleet
+        # supervisor builds a fresh GitHub per repo on every pass
+        # (``fleet_dispatch.fleet_loop``), so there this set dedupes only
+        # within a pass and a persistent stale blocker emits once per pass
+        # per repo. That repeat is why the kind is registered ``info``,
+        # not ``warning`` (see its ``event_levels/`` entry). An instance
+        # attribute never lands in ``vars(Issues)`` --
+        # ``github_delegation._routable_members`` only yields class-level
+        # callables -- so adding it changes neither ``_ROUTES`` nor
+        # ``GitHub``'s surface.
         self._partial_fallback_reported: set[int] = set()
 
     def issue_list(self, labels=None, state=None) -> list[dict[str, Any]]:
@@ -397,7 +404,7 @@ class Issues(CapabilityCollaborator):
                 # resolved leaves the reported set, so a later re-stale of
                 # that number is a fresh edge. Numbers this batch never
                 # named leave the set untouched -- an unrelated clean batch
-                # must NOT reset the baseline (the round-1 review finding:
+                # must NOT reset the baseline (the round-2 review finding:
                 # with multiple are_issues_open calls per pass, clearing on
                 # any clean batch refired the same stale blocker every
                 # pass). Whole-batch failures neither emit nor disturb the

@@ -27,6 +27,11 @@ The fix has three seams, each covered below:
   per GitHub-instance lifetime: a number leaves the tracked set only when a
   later batch positively resolves it, so an unrelated clean batch cannot
   reset the baseline and whole-batch failures neither emit nor disturb it.
+  Instance lifetime is caller-dependent -- the single-repo supervisor keeps
+  one GitHub for the whole process, while ``fleet_loop`` builds a fresh
+  GitHub per repo per pass -- so the kind is registered ``info``, not
+  ``warning`` (the last test below covers the fleet lifecycle end-to-end
+  through the real ``log_event``/events.db path).
 
 No live network anywhere: the HTTP transport's ``HTTPSConnection`` is faked
 (the same stand-in shape as ``tests/test_http_transport.py``) and the ``gh``
@@ -274,16 +279,22 @@ def test_are_issues_open_emits_telemetry_for_partial_batch_fallback(
     per batch observation. The emitter tracks numbers already reported; a
     reported number leaves the tracked set only when a later batch
     positively resolves it -- an unrelated clean batch must NOT reset the
-    baseline (the multi-call-per-pass flood the round-1 review caught). A
-    persistent stale blocker would otherwise write a warning row every
-    orchestrator pass (the pass-scoped ``_list_cache`` is cleared but the
-    tracked set is not), flooding ``check_warning_events``' flat per-event
-    listing -- the every-pass warning flood shape #1271/#1768 already
-    burned once. A newly-stale number joining an already-reported set is a
-    new edge and still fires. Short-lived processes such as
-    ``fleet status --json`` still emit once per invocation: their GitHub
-    instance does not outlive the run, so there is nothing to dedupe
-    against.
+    baseline (the multi-call-per-pass flood the round-2 review caught). A
+    newly-stale number joining an already-reported set is a new edge and
+    still fires.
+
+    Lifetime caveat (round-3 review): instance lifetime is
+    caller-dependent. This test models the single-repo supervisor
+    (``supervise.run_supervised``), which keeps one GitHub/Issues pair
+    across passes -- there the set does suppress a persistent stale
+    blocker's repeat. The fleet supervisor builds a fresh GitHub per repo
+    per pass, so there the same blocker emits once per pass per repo;
+    that expected repeat is why the kind is registered ``info``, not
+    ``warning`` -- covered end-to-end by
+    ``test_fleet_lifecycle_persistent_blocker_never_emits_warning``.
+    Short-lived processes such as ``fleet status --json`` still emit once
+    per invocation: their GitHub instance does not outlive the run, so
+    there is nothing to dedupe against.
     """
     from charlie_work.github_capabilities import issues as issues_module
 
@@ -311,9 +322,12 @@ def test_are_issues_open_emits_telemetry_for_partial_batch_fallback(
         return {"number": int(args[2]), "state": "CLOSED"}
 
     def new_pass() -> None:
-        # Simulate an orchestrator pass boundary: the pass-scoped list cache
-        # is cleared (repo_meta.invalidate_list_cache) while the same
-        # GitHub/Issues pair -- and its edge-trigger signature -- survives.
+        # Simulate a pass boundary in the single-repo supervisor
+        # (run_supervised): the pass-scoped list cache is cleared
+        # (repo_meta.invalidate_list_cache) while the same GitHub/Issues
+        # pair -- and its edge-trigger signature -- survives. fleet_loop
+        # instead rebuilds GitHub per repo per pass; that lifecycle is
+        # covered by the fresh-instance test at the bottom of this file.
         gh._list_cache.clear()
         gh._list_cache[("_repo_owner_name",)] = ("o", "r")
 
@@ -377,9 +391,12 @@ def _telemetry_harness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         return {"number": number, "state": knobs["view_states"].get(number, "CLOSED")}
 
     def new_pass() -> None:
-        # Orchestrator pass boundary: the pass-scoped list cache is
-        # cleared (repo_meta.invalidate_list_cache) while the same
-        # GitHub/Issues pair -- and its reported-numbers set -- survives.
+        # Single-repo supervisor (run_supervised) pass boundary: the
+        # pass-scoped list cache is cleared
+        # (repo_meta.invalidate_list_cache) while the same GitHub/Issues
+        # pair -- and its reported-numbers set -- survives. fleet_loop's
+        # rebuild-per-pass lifecycle is covered by the fresh-instance
+        # test at the bottom of this file.
         gh._list_cache.clear()
         gh._list_cache[("_repo_owner_name",)] = ("o", "r")
 
@@ -397,7 +414,7 @@ def _partial_events(events: list[tuple[str, dict]]) -> list[dict]:
 def test_unrelated_clean_batch_cannot_clear_reported_numbers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The round-1 blocker shape: multiple are_issues_open calls per pass.
+    """The round-2 blocker shape: multiple are_issues_open calls per pass.
     A second call over OTHER uncached numbers that all resolve must not
     reset the baseline -- the retired single-frozenset signature cleared
     here and refired the same stale blocker every pass."""
@@ -519,3 +536,62 @@ def test_are_issues_open_end_to_end_over_http_transport(
 
     assert gh.are_issues_open([1, 361]) == {1, 361}
     assert issue_view_calls == [361]
+
+
+def test_fleet_lifecycle_persistent_blocker_never_emits_warning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The fleet supervisor lifecycle (round-3 review): ``fleet_loop``
+    builds a NEW ``GitHub`` per repo on every pass
+    (``fleet_dispatch.fleet_loop``), so the instance-scoped
+    ``_partial_fallback_reported`` baseline resets each pass and a
+    persistent stale blocker re-emits
+    ``github_issue_state_partial_fallback`` every pass. The earlier tests
+    model the other lifecycle (``run_supervised`` reusing one GitHub) via
+    ``_list_cache.clear()``; this one constructs a fresh instance per
+    pass exactly as fleet_loop does.
+
+    Because the per-pass repeat is expected, the flood is closed by the
+    kind's ``info`` registration, not by dedupe: at ``warning`` the same
+    blocker would write one row per pass into ``check_warning_events``
+    (the #1271/#1768 flood shape). The real ``log_event`` is left
+    unpatched so the persisted ``level`` column itself is asserted --
+    zero warning rows across all passes, while the info rows still land
+    once per pass.
+    """
+    from charlie_work.github_capabilities.circuit_breaker_transport import (
+        circuit_breaker_state_path,
+    )
+    from charlie_work.instrumentation import query_events
+
+    def fake_states(self, issue_numbers):
+        # 361 is persistently unresolvable; every other number resolves.
+        return {n: True for n in issue_numbers if n != 361}
+
+    def fake_run(self, args, *, json_output=False, allow_failure=False, long_call=False):
+        assert args[:2] == ["issue", "view"]
+        return {"number": int(args[2]), "state": "CLOSED"}
+
+    monkeypatch.setattr(GitHub, "_graphql_issue_states", fake_states)
+    monkeypatch.setattr(GitHub, "run", fake_run)
+
+    # Same state path the emit site resolves:
+    # circuit_breaker_state_path(self.runtime, self.repo_root) with
+    # runtime=None for GitHub(tmp_path).
+    state_path = circuit_breaker_state_path(None, tmp_path)
+    passes = 4
+    for _ in range(passes):
+        # fleet_loop's lifecycle: a fresh GitHub per pass -- deliberately
+        # NOT _list_cache.clear() on one long-lived instance.
+        gh = GitHub(tmp_path)
+        assert gh.are_issues_open([1, 361]) == {1}
+
+    emitted = query_events(state_path, kind="github_issue_state_partial_fallback")
+    # The telemetry still lands every pass (the degradation is not
+    # hidden) ...
+    assert len(emitted) == passes
+    assert all(e["level"] == "info" for e in emitted)
+    # ... but never at warning level, so check_warning_events sees nothing.
+    assert not query_events(
+        state_path, kind="github_issue_state_partial_fallback", level="warning"
+    )

@@ -1,18 +1,17 @@
-warning
+info
 # Issue #1933: the batched GraphQL issue-state query (are_issues_open)
 # partially failed -- a per-node `Could not resolve` error left some issue
 # numbers unresolved, and the parallel per-issue `issue_view` fallback ran
-# for exactly those numbers instead of the whole batch. Warning, not error:
-# the call still completes correctly, but a high rate means stale issue
-# references are degrading `fleet status --json`'s fast path. The payload
-# names the unresolved numbers (the telemetry the incident lacked).
-# Edge-triggered (rework review): `are_issues_open` emits this once per
-# newly-unresolved issue number per GitHub-instance lifetime. The emitter
-# tracks numbers already reported; a number leaves the tracked set only
-# when a later batch positively resolves it, so a persistent stale blocker
-# produces one row rather than one per loop pass -- the every-pass warning
-# flood shape #1271/#1768 already burned once for check_warning_events --
-# while a number that resolves and later goes stale again fires a fresh
-# warning. Short-lived processes such as `fleet status --json` still emit
-# once per invocation: their GitHub instance does not outlive the run, so
-# there is nothing to dedupe against.
+# for exactly those numbers instead of the whole batch. The payload names
+# the unresolved numbers (the telemetry the incident lacked).
+# Info, not warning (rework review): the edge-trigger dedupe that makes
+# this fire once per newly-unresolved number lives on the Issues instance,
+# and instance lifetime depends on the caller. The single-repo supervisor
+# (supervise.run_supervised) keeps one GitHub for the whole process, so
+# there a persistent stale blocker emits one row per process. But the
+# fleet supervisor (fleet_loop) builds a fresh GitHub per repo on every
+# pass, so there the same blocker emits once per pass per repo -- an
+# every-pass warning row into check_warning_events is the flood shape
+# #1271/#1768 already burned once for check_warning_events. At info the
+# per-pass rows still record the degradation each pass without alarming
+# on an expected repeat.
