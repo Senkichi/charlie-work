@@ -23,7 +23,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state
 from charlie_work.workflow import OrchestratorApp
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
-from _fakes_github import FakeGitHubWithRerunCapture
+from _fakes_github_rerun import FakeGitHubWithRerunCapture
 
 
 def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None:

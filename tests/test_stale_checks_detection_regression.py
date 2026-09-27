@@ -21,9 +21,18 @@ production code:
   ``config.review.stale_checks_grace_minutes`` governs ONLY the
   post-retrigger wait (inside ``_attempt_stale_checks_retrigger``) and is
   never threaded into detection; ``workflow_runs_for_head`` (the one gh API
-  call that answers "did Actions ever create a run for this head") has
+  call that answers "did Actions ever create a run for this head") had
   exactly one call site in ``src/``, inside ``_detect_ci_run_never_created``
-  itself.
+  itself -- until #1936 registered a second consumer
+  (``_drive_infra_rerun_or_escalate``, misc_checks.py, asking the different
+  question "is this run terminal"). The fence is now a pair: the src-wide
+  call-site SET is pinned by
+  ``test_workflow_runs_for_head_call_sites_are_the_registered_ones``, and
+  the stale-checks-internal uniqueness guarantee stays on the original
+  leaf name -- the collect-only gate (#1538) fails a test rename as
+  ``removed`` + ``missing_sibling`` and waiving one needs an
+  operator-applied ``collect-gate-exempt`` label, so the fence is split
+  rather than renamed.
 
   This fence test was verified by mutation during implementation (per the
   issue's own instruction): a scratch second call to
@@ -239,21 +248,85 @@ def test_stale_checks_grace_minutes_never_referenced_inside_the_detector() -> No
 
 
 def test_exactly_one_workflow_runs_for_head_call_site_and_it_is_inside_the_detector() -> None:
-    """The one gh API call that can answer "did Actions ever create a run
-    for this head" (``workflow_runs_for_head``) must have exactly one call
-    site in ``src/``, and it must live inside
-    ``_detect_ci_run_never_created``. A second, independently-gated call
-    site anywhere else (even under a different name for the same query
-    shape) would be exactly the second-detector-predicate binding comment
-    item 1 forbids and this fence exists to catch. Call-site COUNT, not a
-    text-pattern match for "grace" nearby -- a differently-phrased second
-    window still shows up here as a second ``ast.Call`` node.
+    """Within the stale-checks guard modules -- the modules hosting the
+    detector and the retrigger, located via ``_guard_member_modules()`` --
+    ``workflow_runs_for_head`` still has exactly one call site, inside
+    ``_detect_ci_run_never_created``.
+
+    Before #1936 this fence asserted a single call site across all of
+    ``src/``: ``workflow_runs_for_head`` was the one gh API call answering
+    "did Actions ever create a run for this head", and a second,
+    independently-gated call site anywhere else would be exactly the
+    second-detector-predicate binding comment item 1 forbids. Issue #1936
+    registered a second consumer OUTSIDE the stale-checks family
+    (``_drive_infra_rerun_or_escalate`` in misc_checks.py asks "is this
+    run terminal" -- a different question), so the src-wide assertion
+    moved to the sibling set test below. This leaf keeps the narrower
+    guarantee: inside the stale-checks machinery itself no second call
+    site has appeared -- a differently-phrased second window inside
+    ``_attempt_stale_checks_retrigger`` still shows up here.
+
+    The leaf name is deliberately unchanged: the collect-only gate
+    (#1538) reads a rename as ``removed`` + ``missing_sibling`` and fails
+    the required check; waiving it needs an operator-applied
+    ``collect-gate-exempt`` label, so the fence is split instead of
+    renamed.
 
     Verified by mutation during implementation: temporarily adding
     ``self.gh.workflow_runs_for_head(head_sha)`` inside
-    ``_attempt_stale_checks_retrigger`` made this test fail (2 call sites,
-    second one inside the wrong function); removed after confirming the
-    failure.
+    ``_attempt_stale_checks_retrigger`` made this test fail (2 call sites
+    in the guard modules, the second inside the wrong function); removed
+    after confirming the failure.
+    """
+    call_sites: list[tuple[str, str | None]] = []
+    for module in _guard_member_modules():
+        module_file = getattr(module, "__file__", None)
+        assert module_file is not None, f"could not locate source file for {module!r}"
+        tree = ast.parse(inspect.getsource(module), filename=module_file)
+        parents = _build_parent_map(tree)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "workflow_runs_for_head"
+            ):
+                enclosing = _enclosing_function_name(node, parents)
+                call_sites.append((Path(module_file).name, enclosing))
+
+    assert call_sites == [("reap_dispatch.py", "_detect_ci_run_never_created")], (
+        f"expected exactly one workflow_runs_for_head call site across the "
+        f"stale-checks guard modules, inside _detect_ci_run_never_created; "
+        f"found {call_sites!r}"
+    )
+
+
+def test_workflow_runs_for_head_call_sites_are_the_registered_ones() -> None:
+    """``workflow_runs_for_head`` (the one gh API call answering "did
+    Actions ever create a run for this head" / "is this run terminal")
+    has a deliberately small call-site set -- every site named here.
+
+    ``_detect_ci_run_never_created`` (reap_dispatch.py) is the original
+    consumer: the stale-checks detector. A second, independently-gated
+    "did CI ever create a run" predicate anywhere else would be exactly
+    the second-detector-predicate binding comment item 1 forbids and
+    this fence exists to catch.
+
+    Issue #1936 adds ``_drive_infra_rerun_or_escalate`` (misc_checks.py):
+    a deferred infra-rerun follow-up probes the CONTAINING run's
+    terminal status before re-calling ``gh run rerun`` -- a different
+    question (per-run status, not run existence), deliberately registered
+    rather than smuggled in. Call-site SET, not a text-pattern match for
+    "grace" nearby -- a differently-phrased second window still shows up
+    here as another ``ast.Call`` node. The stale-checks-internal half of
+    the original fence (exactly one call site inside the detector) lives
+    on the ``test_exactly_one_workflow_runs_for_head_call_site_...`` leaf
+    above -- kept under its original name because the collect-only gate
+    (#1538) enforces leaf-name stability.
+
+    Verified by mutation during implementation: temporarily adding
+    ``self.gh.workflow_runs_for_head(head_sha)`` inside
+    ``_attempt_stale_checks_retrigger`` made this test fail (3 call sites,
+    the third unregistered); removed after confirming the failure.
     """
     call_sites: list[tuple[str, str | None]] = []
     for py_file in sorted(_SRC_ROOT.rglob("*.py")):
@@ -268,7 +341,7 @@ def test_exactly_one_workflow_runs_for_head_call_site_and_it_is_inside_the_detec
                 enclosing = _enclosing_function_name(node, parents)
                 call_sites.append((py_file.name, enclosing))
 
-    assert call_sites == [("reap_dispatch.py", "_detect_ci_run_never_created")], (
-        f"expected exactly one workflow_runs_for_head call site, inside "
-        f"_detect_ci_run_never_created; found {call_sites!r}"
-    )
+    assert call_sites == [
+        ("misc_checks.py", "_drive_infra_rerun_or_escalate"),
+        ("reap_dispatch.py", "_detect_ci_run_never_created"),
+    ], f"unexpected workflow_runs_for_head call site(s); found {call_sites!r}"
