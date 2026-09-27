@@ -1,0 +1,263 @@
+"""Per-repo fleet lane execution and the out-of-band reap scheduler.
+
+Extracted from ``fleet_dispatch`` (issue #1934, under the file-size
+ratchet lineage of #1442): the lane body submitted to the pass's bounded
+thread pool, the fleet-wide dead-review-claim reap sweep, and the
+scheduler thread that fires it independently of pass cadence. The names
+are re-exported through ``fleet_dispatch`` so existing callers and test
+patch seams keep resolving on the ``fleet_dispatch.<name>`` facade.
+"""
+
+from __future__ import annotations
+
+import datetime
+import logging
+import threading
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+from . import layout
+from .config import OrchestratorConfig
+from .fleet_paths import fleet_dir
+from .fleet_registry import _load_registry, _select_repos
+from .github import GitHub
+from .global_config import load_layered_config
+from .instrumentation import log_event
+from .local_issues import github_client_for
+from .paths import runtime_paths
+from .workflow import CommandResult, OrchestratorApp
+
+logger = logging.getLogger(__name__)
+
+# Issue #1934: per-repo lane work inside one fleet pass is I/O-bound (gh
+# calls, state file I/O, worker/reviewer launches that return immediately)
+# and repo-isolated (each lane builds its own config, GitHub client,
+# OrchestratorApp, and supervisor lock against disjoint state dirs). The
+# pre-#1934 serial ``for`` loop made one pass cost the SUM of every repo's
+# lane (~35-42 min across 6 repos against a configured 5-minute cadence),
+# starving every lane-embedded sweep that assumes a per-pass cadence. Lanes
+# now run on a bounded pool: the pass is bounded by the slowest lane, and --
+# when the cap meets the registered repo count -- a repo's lane-to-lane gap
+# depends only on its own lane duration plus the supervisor's pass cadence.
+_DEFAULT_FLEET_LANE_CONCURRENCY = 8
+
+
+def _resolve_fleet_lane_concurrency(global_config: Any) -> int:
+    """Effective per-pass lane cap: ``supervisor.fleet_lane_concurrency`` or
+    the built-in default when absent/misconfigured (including a None
+    ``global_config`` on direct CLI call sites)."""
+    supervisor_cfg = getattr(global_config, "supervisor", None)
+    value = getattr(supervisor_cfg, "fleet_lane_concurrency", None)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return _DEFAULT_FLEET_LANE_CONCURRENCY
+    return value
+
+
+def _run_fleet_repo_lane(
+    repo_key: str,
+    app: OrchestratorApp,
+    config: OrchestratorConfig,
+    lock: Any,
+    *,
+    work_only: bool,
+    drain: bool,
+    limit: int | None,
+    merge: bool | None,
+    ensure_labels: bool,
+) -> CommandResult:
+    """One repo's lane body, executed on a pool thread (issue #1934).
+
+    Everything this touches is per-repo: ``app`` was constructed on the
+    submitting thread for this repo alone and no lane shares an
+    OrchestratorApp/GitHub client/config instance. The supervisor ``lock``
+    is held from submission until this lane returns (released here in
+    ``finally``), preserving the pre-#1934 "one lane owns the repo for the
+    pass" invariant. A raised exception propagates to the collector future,
+    which renders it into the same per-repo error result the serial loop
+    produced.
+    """
+    try:
+        # Issue #1339: ensure every LabelConfig-derived label exists on the
+        # repo before the lane runs. Idempotent and best-effort:
+        # ``ensure_labels`` records failures as events and never raises, so
+        # a missing-label drift self-heals on the supervisor's first pass
+        # without blocking the lane. The supervisor passes
+        # ``ensure_labels=True`` on its first pass only (see
+        # run_fleet_supervise), so this is once per startup per repo, not
+        # once per pass.
+        if ensure_labels:
+            try:
+                app.ensure_labels()
+            except Exception as exc:  # noqa: BLE001 — never block a lane
+                logger.warning("fleet label ensure failed for %s: %s", repo_key, exc)
+
+        if work_only:
+            # Dispatch-only path (worker dispatch + optional review dispatch)
+            result = app.dispatch(0 if drain else limit)
+            if config.review_dispatch.enabled:
+                review_dispatch_result = app.dispatch_reviews(0 if drain else limit)
+                ok = result.ok and review_dispatch_result.ok
+                message = (
+                    "work-only dispatch: "
+                    f"workers={result.data.get('selected_count', 0)}, "
+                    f"reviews={review_dispatch_result.data.get('selected_count', 0)}"
+                )
+                combined_data = dict(result.data)
+                combined_data["dispatch_reviews"] = review_dispatch_result.data
+                result = CommandResult(ok, message, combined_data)
+            return result
+        # Full loop (intake -> dispatch -> review -> merge). A
+        # drain pass forces limit=0: dispatch_rework/dispatch
+        # slice candidates[:0] (0 is not None, so it is never
+        # replaced by default_limit) while the reap, review, and
+        # merge lanes below them run normally.
+        return app.loop(0 if drain else limit, merge=merge)
+    finally:
+        lock.release()
+
+
+def _run_fleet_reap_sweep(
+    *,
+    fleet_dir_override: str | None = None,
+    repos: tuple[str, ...] | None = None,
+    dry_run: bool = False,
+    now: datetime.datetime | None = None,
+) -> dict[str, Any]:
+    """Run the dead-review-claim reap sweep set once per selected repo (issue #1934).
+
+    Each repo's sweep is ``OrchestratorApp._run_review_reap_sweeps`` -- the
+    identical block ``dispatch_reviews`` runs at the top of every lane pass
+    and the standalone ``reap_reviews`` command runs out-of-band (issue
+    #1874). No supervisor lock is taken: the sweeps never launch a reviewer,
+    so the double-dispatch window the lock exists to close cannot open, and
+    every write inside them is ``state_lock``-serialized / merge-on-write
+    safe against a concurrent lane pass (issue #594, #1874). That makes the
+    reap scheduler immune to the exact failure this issue exists to fix --
+    a fleet lane currently holding the lock does not postpone this repo's
+    reap, and a reap in flight never causes a lane's lock probe to skip.
+
+    Per-repo isolation mirrors the lane loop's: a stale entry is skipped, and
+    a failure in one repo's sweep is logged/recorded and does not abort the
+    round. Every repo's outcome lands in the fleet-level events.db as one
+    ``fleet_reap_sweep`` event (warning level on failure) so the cadence is
+    observable from one query. ``dry_run`` propagates into the app, where
+    ``_run_review_reap_sweeps`` returns the empty summary read-only.
+    """
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
+    registry = _load_registry(fleet_json_path)
+    selected = _select_repos(registry, repos)
+    fleet_state_path = layout.state_file_path(fleet_dir(override=fleet_dir_override))
+    resolved_now = now if now is not None else datetime.datetime.now(datetime.UTC)
+    results: dict[str, Any] = {}
+    for repo_key, entry in selected:
+        repo_root = Path(entry.get("repo_root") or "")
+        if not repo_root.is_dir():
+            # Stale-entry bookkeeping lives in the lane path (issue #1372);
+            # the sweep just has nothing to do here.
+            continue
+        try:
+            explicit_cfg = entry.get("config_path")
+            config = load_layered_config(
+                repo_root,
+                Path(explicit_cfg) if explicit_cfg else None,
+                fleet_dir_override=fleet_dir_override,
+            )
+            # Fleet mode owns notification emission; keep the sweep's per-repo
+            # side effects quiet the same way the lane does.
+            config = replace(config, notify=replace(config.notify, enabled=False))
+            paths = runtime_paths(repo_root, config.runtime.state_dir)
+            gh = github_client_for(repo_root, config, github=GitHub, dry_run=dry_run)
+            app = OrchestratorApp(
+                repo_root,
+                paths,
+                config,
+                gh,
+                dry_run=dry_run,
+                fleet_dir_override=fleet_dir_override,
+            )
+            sweep = app._run_review_reap_sweeps(resolved_now)
+            verdict_result = sweep.get("verdict_result") or {}
+            payload = {
+                "repo_key": repo_key,
+                "stalled_reaped": len(sweep.get("stalled") or []),
+                "verdicts_recorded": len(verdict_result.get("recorded") or []),
+                "verdicts_missed": len(verdict_result.get("missed") or []),
+                "reconciled_verdicts": len(sweep.get("reconciled_verdicts") or []),
+                "reaped_checkouts": len(sweep.get("reaped_checkouts") or []),
+                "orphaned_checkouts": len(sweep.get("orphaned_checkouts") or []),
+                "dry_run": dry_run,
+            }
+            try:
+                # write-gate-exempt(issue=1934): no write_gate param; sibling raw calls remain
+                log_event(fleet_state_path, "fleet_reap_sweep", payload, repo=repo_key)
+            except Exception:
+                logger.debug("Failed to record fleet_reap_sweep for %s", repo_key)
+            results[repo_key] = payload
+        except Exception as exc:  # noqa: BLE001 — one repo must not starve the round
+            error_message = f"{type(exc).__name__}: {exc}"
+            logger.warning("fleet reap sweep failed for %s: %s", repo_key, error_message)
+            try:
+                # write-gate-exempt(issue=1934): no write_gate param; sibling raw calls remain
+                log_event(
+                    fleet_state_path,
+                    "fleet_reap_sweep",
+                    {"repo_key": repo_key, "error": error_message},
+                    repo=repo_key,
+                    level="warning",
+                )
+            except Exception:
+                logger.debug("Failed to record fleet_reap_sweep error for %s", repo_key)
+            results[repo_key] = {"repo_key": repo_key, "error": error_message}
+    return results
+
+
+def _fleet_reap_sweep_loop(
+    stop_event: threading.Event,
+    interval_seconds: float,
+    *,
+    fleet_dir_override: str | None,
+    repos: tuple[str, ...] | None,
+    dry_run: bool,
+) -> None:
+    """Out-of-band reap scheduler loop (issue #1934).
+
+    Fires ``_run_fleet_reap_sweep`` every ``interval_seconds`` until
+    ``stop_event`` is set. ``Event.wait`` doubles as the sleep so shutdown is
+    immediate rather than waiting out a pending interval. A failing round is
+    logged and the loop continues -- a transient registry/config error must
+    not permanently disarm the only reaper that runs while lanes are slow.
+    """
+    while not stop_event.wait(interval_seconds):
+        try:
+            _run_fleet_reap_sweep(
+                fleet_dir_override=fleet_dir_override,
+                repos=repos,
+                dry_run=dry_run,
+            )
+        except Exception:  # noqa: BLE001 — the scheduler must survive a bad round
+            logger.exception("fleet reap sweep round failed")
+
+
+def _start_fleet_reap_scheduler(
+    *,
+    interval_seconds: int,
+    fleet_dir_override: str | None,
+    repos: tuple[str, ...] | None,
+    dry_run: bool,
+) -> tuple[threading.Thread, threading.Event]:
+    """Start the daemon reap-sweep thread; return ``(thread, stop_event)``."""
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_fleet_reap_sweep_loop,
+        args=(stop_event, interval_seconds),
+        kwargs={
+            "fleet_dir_override": fleet_dir_override,
+            "repos": repos,
+            "dry_run": dry_run,
+        },
+        name="fleet-reap-sweeps",
+        daemon=True,
+    )
+    thread.start()
+    return thread, stop_event

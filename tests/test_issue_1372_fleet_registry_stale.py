@@ -412,12 +412,14 @@ def test_run_fleet_status_stale_does_not_flip_exit_code(
     from charlie_work.cli import run_fleet_status
 
     # Mock the valid repo's status path so it doesn't hit GitHub.
+    # The seam lives on fleet_status since the #1941 rework extracted the
+    # fan-out; cli.run_fleet_status is a re-export.
     with (
-        patch("charlie_work.cli.load_layered_config") as mock_cfg,
-        patch("charlie_work.cli.runtime_paths") as mock_paths,
-        patch("charlie_work.cli.GitHub") as mock_gh,
-        patch("charlie_work.cli.OrchestratorApp") as mock_app,
-        patch("charlie_work.cli.compute_api_worker_fleet_report") as mock_report,
+        patch("charlie_work.fleet_status.load_layered_config") as mock_cfg,
+        patch("charlie_work.fleet_status.runtime_paths") as mock_paths,
+        patch("charlie_work.fleet_status.GitHub") as mock_gh,
+        patch("charlie_work.fleet_status.OrchestratorApp") as mock_app,
+        patch("charlie_work.fleet_status.compute_api_worker_fleet_report") as mock_report,
     ):
         from charlie_work.config import OrchestratorConfig
 
