@@ -9,11 +9,21 @@ flag-like argv guards live in the ``test_janitor_no_op_rework_*`` siblings.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from _janitor_fixtures import _config, _green_checks, _green_pr
 
 from charlie_work.janitor import _calculate_patch_id, run_janitor
+
+
+def _body_sha256(body: str | None) -> str:
+    """The ``reviewed_body_sha256`` wire contract (issue #1939): SHA-256 of the
+    PR body with CRLF/CR line endings normalized to LF, ``None`` treated as
+    the empty string. Computed here rather than imported so the tests pin the
+    contract, not the implementation that happens to produce it."""
+    text = (body or "").replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def test_no_op_rework_offset_shift_still_blocks(tmp_path: Path) -> None:
@@ -293,3 +303,234 @@ def test_no_op_rework_skips_when_no_current_sha() -> None:
 
     assert verdict.ok is True
     assert not any("PR head unchanged" in f for f in verdict.failures)
+
+
+def test_no_op_rework_body_change_satisfies_patch_id_gate(tmp_path: Path) -> None:
+    """Issue #1939: an unchanged patch-id plus a changed PR body is real
+    rework, not a no-op -- the requested fix lived in the PR description
+    (swole #198 / PR #348), which produces no code diff by construction.
+
+    MUTATION CHECK: MUST FAIL against the pre-fix implementation, which
+    only ever compared patch-ids and had no body-change signal."""
+    diff = """\
+diff --git a/test.txt b/test.txt
+index 1234567..abcdef0 100644
+--- a/test.txt
++++ b/test.txt
+@@ -1,2 +1,2 @@
+ line 1
+-line 2
++line 2 modified
+"""
+    reviewed_patch_id = _calculate_patch_id(diff)
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+        "reviewed_patch_id": reviewed_patch_id,
+        "reviewed_body_sha256": _body_sha256(
+            "Closes #123.\n\nTests: body as it was at verdict time."
+        ),
+    }
+    pr = _green_pr(
+        headRefOid="def456",  # head moved by a base-update merge
+        body="Closes #123.\n\nTests: corrected description after rework.",
+    )
+
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=tmp_path,
+        pr_diff=diff,
+        review_decision=pr_state,
+    )
+
+    assert verdict.ok is True, (
+        f"Expected the changed-body escape to satisfy the gate, got {verdict.failures}"
+    )
+    assert not verdict.is_no_op_rework
+    assert not any("unchanged since request_changes verdict" in f for f in verdict.failures)
+
+
+def test_no_op_rework_body_change_satisfies_head_sha_fallback() -> None:
+    """Issue #1939: a verdict recorded without a patch-id (pre-#222 legacy
+    shape, or a diff fetch that failed) still recognizes a body-only rework
+    -- the escape precedes the head-SHA fallback comparison too."""
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",  # head identical to current -- no patch-id
+        "reviewed_body_sha256": _body_sha256("Closes #123.\n\nOld description."),
+    }
+    pr = _green_pr(
+        headRefOid="abc123",
+        body="Closes #123.\n\nTests: added unit tests -- corrected description.",
+    )
+
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=Path.cwd(),
+        review_decision=pr_state,
+    )
+
+    assert verdict.ok is True, (
+        f"Expected the changed-body escape to satisfy the head-SHA fallback, "
+        f"got {verdict.failures}"
+    )
+    assert not any("PR head unchanged" in f for f in verdict.failures)
+
+
+def test_no_op_rework_unchanged_body_still_blocks(tmp_path: Path) -> None:
+    """Issue #1939 regression side: an unchanged body means the unchanged
+    patch-id verdict stands -- the escape must not weaken the genuine
+    no-op protection (no code change AND no body change is still a no-op)."""
+    diff = """\
+diff --git a/test.txt b/test.txt
+index 1234567..abcdef0 100644
+--- a/test.txt
++++ b/test.txt
+@@ -1,2 +1,2 @@
+ line 1
+-line 2
++line 2 modified
+"""
+    body = "Closes #123.\n\nTests: added unit tests for the search path."
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+        "reviewed_patch_id": _calculate_patch_id(diff),
+        "reviewed_body_sha256": _body_sha256(body),
+    }
+    pr = _green_pr(headRefOid="def456", body=body)
+
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=tmp_path,
+        pr_diff=diff,
+        review_decision=pr_state,
+    )
+
+    assert verdict.ok is False
+    assert any("PR diff unchanged since request_changes verdict" in f for f in verdict.failures)
+
+
+def test_no_op_rework_missing_body_baseline_still_blocks(tmp_path: Path) -> None:
+    """Fail closed on a legacy verdict: a request_changes recorded before
+    issue #1939 carries no ``reviewed_body_sha256`` baseline, so the gate
+    cannot tell a body-only rework from a genuine no-op -- it keeps
+    blocking exactly as before (the worker's next verdict picks up a
+    baseline and unlocks the escape from then on)."""
+    diff = """\
+diff --git a/test.txt b/test.txt
+index 1234567..abcdef0 100644
+--- a/test.txt
++++ b/test.txt
+@@ -1,2 +1,2 @@
+ line 1
+-line 2
++line 2 modified
+"""
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+        "reviewed_patch_id": _calculate_patch_id(diff),
+        # No reviewed_body_sha256 -- verdict predates the field.
+    }
+    pr = _green_pr(headRefOid="def456", body="Closes #123.\n\nEdited description.")
+
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=tmp_path,
+        pr_diff=diff,
+        review_decision=pr_state,
+    )
+
+    assert verdict.ok is False
+    assert any("PR diff unchanged since request_changes verdict" in f for f in verdict.failures)
+
+
+def test_no_op_rework_line_ending_flip_is_not_a_body_change(tmp_path: Path) -> None:
+    """A pure CRLF/LF serialization flip must not open the escape: the hash
+    normalizes line endings on both sides, so a transport artifact (e.g.
+    ``gh pr edit --body-file`` vs. the API's echo) cannot satisfy the gate."""
+    diff = """\
+diff --git a/test.txt b/test.txt
+index 1234567..abcdef0 100644
+--- a/test.txt
++++ b/test.txt
+@@ -1,2 +1,2 @@
+ line 1
+-line 2
++line 2 modified
+"""
+    reviewed_body = "Closes #123.\r\n\r\nTests: added unit tests for the search path."
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+        "reviewed_patch_id": _calculate_patch_id(diff),
+        "reviewed_body_sha256": _body_sha256(reviewed_body),
+    }
+    # Same content, LF-only line endings.
+    pr = _green_pr(
+        headRefOid="def456",
+        body="Closes #123.\n\nTests: added unit tests for the search path.",
+    )
+
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=tmp_path,
+        pr_diff=diff,
+        review_decision=pr_state,
+    )
+
+    assert verdict.ok is False
+    assert any("PR diff unchanged since request_changes verdict" in f for f in verdict.failures)
+
+
+def test_no_op_rework_body_key_absent_fails_closed(tmp_path: Path) -> None:
+    """A PR payload without a ``body`` key gives the gate nothing to compare
+    against the baseline -- treat it as unknown and keep blocking, never as
+    an implicit change."""
+    diff = """\
+diff --git a/test.txt b/test.txt
+index 1234567..abcdef0 100644
+--- a/test.txt
++++ b/test.txt
+@@ -1,2 +1,2 @@
+ line 1
+-line 2
++line 2 modified
+"""
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+        "reviewed_patch_id": _calculate_patch_id(diff),
+        "reviewed_body_sha256": _body_sha256("some body"),
+    }
+    pr = _green_pr(headRefOid="def456")
+    pr.pop("body", None)
+
+    verdict = run_janitor(
+        pr,
+        _green_checks(),
+        _config(),
+        pr_state=pr_state,
+        repo_root=tmp_path,
+        pr_diff=diff,
+        review_decision=pr_state,
+    )
+
+    assert verdict.ok is False
+    assert any("PR diff unchanged since request_changes verdict" in f for f in verdict.failures)
