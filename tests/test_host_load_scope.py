@@ -38,7 +38,12 @@ import pytest
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from charlie_work import fleet_registry, host_load, quiesce
-from charlie_work.config import DevinConfig, DispatchConfig, OrchestratorConfig
+from charlie_work.config import (
+    ClaudeCodeConfig,
+    DevinConfig,
+    DispatchConfig,
+    OrchestratorConfig,
+)
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
@@ -89,6 +94,7 @@ def _build_app(
     host_load_max: int = 0,
     trees_max: int = 0,
     fleet_dir_override: str | None = None,
+    worktrees_dir: str | None = None,
     **dispatch_kwargs: Any,
 ) -> OrchestratorApp:
     """Build an app with explicit host-load knobs (both default 0 so each
@@ -101,6 +107,7 @@ def _build_app(
             **dispatch_kwargs,
         ),
         devin=DevinConfig(),
+        claude_code=ClaudeCodeConfig(worktrees_dir=worktrees_dir),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     return OrchestratorApp(
@@ -568,5 +575,48 @@ def test_governor_attributes_pathless_root_via_ancestor(
     result = app._apply_concurrency_governor(5)
 
     assert result.host_load_pytest_trees == 1
+    assert result.dispatch_limit == 0
+    assert result.clamped_by == "host_load"
+
+
+def test_governor_attributes_via_worktrees_dir_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``claude_code.worktrees_dir`` override path of the governor's
+    scope tuple. A suite whose only managed-path reference lives under the
+    overridden worktrees root -- carrying neither the ``.var/charlie-work``
+    marker nor any path under the resolved state root -- is attributable
+    only through ``self._layout.worktrees``, the attribute reap_dispatch's
+    ``scope_paths`` wires in. ``RuntimePaths.worktrees`` is deliberately
+    override-blind (``paths.py``: "this member deliberately does NOT honour
+    ``claude_code.worktrees_dir``"), so a swap to ``self.paths.worktrees``
+    would silently read this tree as host noise and never clamp -- the
+    regression this test pins."""
+    # The override must live where no other managed-path marker reaches:
+    # neither under the built-in ``.var/charlie-work`` convention marker
+    # nor under this repo's resolved state root. Anchoring at the
+    # filesystem root (``C:\`` / ``/``) guarantees that -- anything under
+    # tmp_path inherits the marker here because the worktree itself sits
+    # inside ``<repo>/.var/charlie-work/worktrees/``. The path never needs
+    # to exist: scope matching is regex over command-line text, so nothing
+    # stats it.
+    override_worktrees = Path(tmp_path.anchor) / "wt-outside-state"
+    assert _STATE_MARKER not in str(override_worktrees).replace("\\", "/")
+    _patch_procs(
+        monkeypatch,
+        _proc(
+            100,
+            1,
+            f"{override_worktrees}/wt-a/.venv/Scripts/pytest.exe -n 2",
+        ),
+        _proc(101, 100, "python -u -c w"),
+    )
+    app = _build_app(tmp_path, trees_max=1, worktrees_dir=str(override_worktrees))
+
+    result = app._apply_concurrency_governor(5)
+
+    # The override-dir suite counts (trees=1 at cap 1 -> headroom 0).
+    assert result.host_load_pytest_trees == 1
+    assert result.host_load_pytest_processes == 2
     assert result.dispatch_limit == 0
     assert result.clamped_by == "host_load"
