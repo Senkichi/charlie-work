@@ -400,6 +400,15 @@ two clamps:
   the total count *strictly exceeds* the threshold — its job is catching a
   single suite run at pathological width, which a tree count cannot see.
 
+Both counts are scoped to **orchestrator-attributable** trees (issue #1943):
+a suite only counts when some process in it — or some ancestor in the
+snapshot — names a managed path in its command line (the
+`.var/charlie-work` state-dir convention, the repo's resolved
+state/worktrees roots, and every fleet-registered `state_dir`). Suites that
+leave no such trace — CI-runner jobs under `C:\actions-runners\*`, ad-hoc
+developer runs — feed neither count, so they can no longer brake dispatch
+for a repo they do not belong to.
+
 Set either knob to `0` to disable that term, or both to `0` to skip the probe
 entirely. A deferred launch writes a `dispatch_backpressure` event
 (`clamped_by: "host_load"`, with the measured process/tree counts, both caps,

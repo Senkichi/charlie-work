@@ -929,6 +929,10 @@ class ConcurrencyGovernorResult:
     # two knobs: ``host_load_max_pytest_trees`` (the governor -- clamps by
     # suite headroom ``cap - live_trees``) and ``host_load_max_pytest_processes``
     # (the fan-out brake -- strict ``>`` trip to 0 on abnormal ``-n`` width).
+    # Issue #1943: both reported counts are scoped to
+    # orchestrator-attributable trees (any member/ancestor command line
+    # referencing a managed state/worktree path) -- CI-runner and other
+    # foreign suites feed neither count.
     host_load_max_pytest_processes: int = 0
     host_load_max_pytest_trees: int = 0
     host_load_pytest_processes: int | None = None
