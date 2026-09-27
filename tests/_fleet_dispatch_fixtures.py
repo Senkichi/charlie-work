@@ -160,6 +160,22 @@ def _patch_ci_fleet_dirty_for_hermetic_tests(monkeypatch: Any) -> None:
     )
 
 
+def _per_repo_runtime_paths(repo_root: Any, _state_dir: Any = None, **_kwargs: Any) -> MagicMock:
+    """RuntimePaths-shaped mock whose ``root`` is unique per repo (issue #1934).
+
+    ``fleet_loop`` lanes now run concurrently, and each lane holds its repo's
+    supervisor byte-range lock for the lane's whole duration. The older tests
+    gave every repo the same mocked ``paths.root`` -- one lock file shared by
+    every lane -- which was harmless under the serial loop but makes a second
+    live lane's nonblocking acquire fail (or flake) under the pool. Deriving
+    ``root`` from the ``repo_root`` argument keeps the real lock path live in
+    these tests while matching production's disjoint-per-repo layout.
+    """
+    paths = MagicMock()
+    paths.root = Path(repo_root) / ".var" / "charlie-work"
+    return paths
+
+
 def _drained_fleet_result() -> CommandResult:
     return CommandResult(
         True,

@@ -91,6 +91,46 @@ def _load_registry(fleet_json_path: Path) -> dict[str, Any]:
     return data
 
 
+def _select_repos(
+    registry: dict[str, Any],
+    repos: tuple[str, ...] | None,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Select and order repos for a fleet pass.
+
+    If repos is provided, use exactly that subset in the given order.
+    Otherwise, return all repos sorted by oldest last_seen first.
+
+    Args:
+        registry: The fleet registry dict with a "repos" map.
+        repos: Optional tuple of repo keys to select explicitly.
+
+    Returns:
+        A list of (repo_key, entry) tuples in the order to process.
+    """
+    repos_map = registry.get("repos", {})
+    if repos:
+        # Explicit subset: use exactly the given keys in the given order
+        # Skip keys that don't exist in the registry
+        selected = [(key, repos_map[key]) for key in repos if key in repos_map]
+        return selected
+    else:
+        # All repos: sort by oldest last_seen first
+        all_repos = list(repos_map.items())
+
+        # Sort by last_seen ascending (oldest first)
+        # Repos without last_seen go last (treated as newest)
+        def last_seen_key(item: tuple[str, dict[str, Any]]) -> tuple[bool, str]:
+            key, entry = item
+            last_seen = entry.get("last_seen", "")
+            # Repos with last_seen sort before those without
+            # (False < True, so False comes first)
+            has_last_seen = last_seen != ""
+            return (not has_last_seen, last_seen)
+
+        all_repos.sort(key=last_seen_key)
+        return all_repos
+
+
 def _resolved_canonical_root(path: Path) -> Path | None:
     """Return the shared main worktree root for *path*, or ``None`` if not a git repo.
 
