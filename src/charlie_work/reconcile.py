@@ -358,8 +358,11 @@ def _normalize_reconcile_pr(pr: dict[str, Any]) -> dict[str, Any]:
 def is_queue_bot_pr(pr: dict[str, Any], config: OrchestratorConfig) -> bool:
     """Return True if ``pr`` was created by the configured merge-queue bot.
 
-    Aviator parallel mode creates draft PRs on ``mq-tmp-*`` branches to test
-    queued PR combinations. These PRs must be invisible to the fleet: they
+    Aviator parallel mode creates draft PRs on ``mq-bot-*`` branches to test
+    queued PR combinations (``mq-tmp-*`` is a separate, PR-less internal
+    branch Aviator uses for fast-forward checks -- it never gets a PR at
+    all, so it can't reach this filter regardless). These PRs must be
+    invisible to the fleet: they
     are not fleet-owned, have no linked issue, and their lifecycle is entirely
     Aviator's. The ``branch_prefix`` filter already excludes them from most
     paths (dispatch, merge-train, broadcast sync), but the reconcile PR loop
@@ -1323,7 +1326,7 @@ def detect_drift(
             continue
         pr_number = int(pr_number)
         # Aviator parallel-mode exclusion: draft PRs created by the queue
-        # bot (aviator-app[bot]) on mq-tmp-* branches are Aviator's own CI
+        # bot (aviator-app[bot]) on mq-bot-* branches are Aviator's own CI
         # validation artifacts. They have no linked issue, no state entry,
         # and their lifecycle is entirely Aviator's. Without this skip,
         # detect_drift emits spurious merged_outside_orchestrator /

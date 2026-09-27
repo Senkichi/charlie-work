@@ -4,7 +4,7 @@ Problem 1: ``_should_update_pr_branch`` must skip PRs carrying the
 configured ``mergequeue`` label -- the queue handles rebasing itself.
 
 Problem 2: Aviator's draft PRs (authored by ``queue_bot_login`` on
-``mq-tmp-*`` branches) must be invisible to the fleet's reconcile loop
+``mq-bot-*`` branches) must be invisible to the fleet's reconcile loop
 and mergequeue detectors.
 """
 
@@ -55,9 +55,9 @@ def _aviator_draft_pr(
     number: int,
     state: str = "OPEN",
     *,
-    branch: str = "mq-tmp-abc123",
+    branch: str = "mq-bot-abc123",
 ) -> dict[str, Any]:
-    """A PR created by Aviator parallel mode on a temp branch."""
+    """A PR created by Aviator parallel mode on a combo draft branch."""
     return {
         "number": number,
         "title": f"Aviator queue validation ({branch})",
@@ -296,17 +296,18 @@ class TestAviatorDraftPrsInvisibleToMergequeueDetectors:
 
 
 class TestBranchPrefixExcludesAviatorBranches:
-    """The fleet's branch_prefix filter naturally excludes mq-tmp-* branches.
+    """The fleet's branch_prefix filter naturally excludes Aviator branches.
 
     This test codifies the structural guarantee: even without the
-    is_queue_bot_pr filter, Aviator temp branches are excluded from
-    fleet operations because they don't match 'agent/issue'.
+    is_queue_bot_pr filter, any Aviator-created branch (draft-PR-bearing
+    ``mq-bot-*`` or internal PR-less ``mq-tmp-*``) is excluded from
+    fleet operations because neither matches 'agent/issue'.
     """
 
     def test_linked_issue_number_returns_none_for_mq_branch(self) -> None:
         from charlie_work.issue_linking import linked_issue_number
 
-        pr = _aviator_draft_pr(9001, branch="mq-tmp-abc123")
+        pr = _aviator_draft_pr(9001, branch="mq-bot-abc123")
         result = linked_issue_number(
             pr,
             is_cross_repository=False,
