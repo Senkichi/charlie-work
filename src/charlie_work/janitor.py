@@ -36,6 +36,7 @@ from charlie_work.checks import (
     summarize_checks,
 )
 from charlie_work.issue_linking import linked_issue_number
+from charlie_work.no_op_rework_body import _body_rework_escape_warning
 from charlie_work.safe_ref import require_valid_ref_name, require_valid_sha
 from charlie_work.subprocess_runner import run_captured
 
@@ -361,13 +362,22 @@ def run_janitor(
     check that depends on it is skipped rather than failed.
 
     ``review_decision`` is the recorded review-decision mapping for this PR
-    (``prs/pr-N/review-decision.json`` content), used only by the issue #1116
-    stale-CI skip: when the verdict is a non-escalated request_changes whose
-    findings all cite required checks that are green now
-    (``is_stale_ci_verdict``), the no-op rework check is skipped so the gate
-    can pass and the packet/fresh-review machinery can run. ``None`` (or any
-    non-stale decision) preserves the existing behavior — the predicate fails
-    closed on red, pending, missing, or unavailable checks.
+    (``prs/pr-N/review-decision.json`` content). It feeds two narrow
+    exceptions to the no-op rework check:
+
+    * the issue #1116 stale-CI skip: when the verdict is a non-escalated
+      request_changes whose findings all cite required checks that are
+      green now (``is_stale_ci_verdict``), the no-op rework check is
+      skipped so the gate can pass and the packet/fresh-review machinery
+      can run. ``None`` (or any non-stale decision) preserves the
+      existing behavior — the predicate fails closed on red, pending,
+      missing, or unavailable checks;
+    * the issue #1939 body-change escape inside ``_check_no_op_rework``:
+      an unchanged patch-id/head is satisfied (not a no-op) when the PR
+      body's hash differs from the verdict's ``reviewed_body_sha256``
+      baseline — a body-only rework produces no code delta by
+      construction. A missing baseline or a ``pr`` without a ``body``
+      key fails closed.
 
     ``issue_labels`` (issue #1598) is the set of live labels on the PR's
     bound issue, when the caller already has them. When provided and any
@@ -887,6 +897,15 @@ def _check_no_op_rework(
     # leaves this check acting on stale state.json (the #1340 divergence class).
     decision = (review_decision or {}).get("decision")
     if decision != "request_changes":
+        return False
+
+    # Issue #1939: a body-only rework produces no code delta, so a changed
+    # PR body satisfies the gate; the comparison lives in
+    # no_op_rework_body._body_rework_escape_warning (extracted per the
+    # file-size ratchet). No baseline or no ``body`` key fails closed.
+    body_escape_warning = _body_rework_escape_warning(pr, pr_state, review_decision)
+    if body_escape_warning is not None:
+        warnings.append(body_escape_warning)
         return False
 
     # Primary check: compare patch-ids when both are available
