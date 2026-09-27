@@ -24,6 +24,27 @@ worker processes (``python -u -c ...``, no ``pytest`` token of their own) get
 counted. Nested pytest invocations inside an outer tree count once -- the
 outer tree is the suite.
 
+Scope (issue #1943)
+-------------------
+Both counts are scoped to *orchestrator-attributable* trees. A merged tree
+counts only when some member's -- or some member-ancestor's -- command line
+references an orchestrator state path: the ``.var/charlie-work`` convention
+marker (``layout.DEFAULT_STATE_DIR``; every default-layout repo on the host
+keeps its worktrees, dispatch prompt files, and session records under it),
+plus any caller-supplied ``scope_paths`` (the measuring repo's resolved
+worktrees/state roots and every fleet-registered ``state_dir``, which keep
+``runtime.state_dir``/``claude_code.worktrees_dir`` overrides attributable).
+
+This is the #1943 fix: previously the count was host-wide, so three swole
+self-hosted CI runners mid-suite (~50 xdist processes under
+``C:\\actions-runners\\*\\_work``) tripped the 48-process brake and
+hard-clamped *every* repo's dispatch to 0 for 13+ hours while host CPU sat
+under 40%. CI fan-out is bounded by its own allocation ceiling (ci_fleet),
+not by this governor -- so the brake's scope now matches the workload it
+exists to bound: orchestrator-dispatched test suites. Attribution failures
+degrade toward *not* counting -- the same fail-open direction the probe
+itself uses.
+
 The governor consumes both numbers (issue #1903): the tree count feeds the
 primary clamp (``dispatch.host_load_max_pytest_trees``, applied as
 remaining-suite headroom, since one launch ≈ one new suite), while the
@@ -67,12 +88,22 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from charlie_work import quiesce
+from charlie_work import layout, quiesce
 from charlie_work.instrumentation import log_event, query_events
 
 logger = logging.getLogger(__name__)
 
 UNAVAILABLE_EVENT_KIND = "host_load_unavailable"
+
+# The orchestrator-attribution marker (issue #1943): the state-dir convention
+# every managed repo shares -- ``<repo>/.var/charlie-work``. Matched at
+# state-dir granularity rather than ``.../worktrees`` so the ancestor walk in
+# ``_tree_references_scope`` also attributes launches whose only
+# path-carrying ancestor names a state-dir sibling (a devin worker's
+# ``--prompt-file <state_dir>/dispatches/...``, a session record path).
+# Derived from layout.DEFAULT_STATE_DIR -- never re-spelled (enforced by
+# tests/test_no_path_literals.py rule 2).
+_ORCHESTRATOR_SCOPE_MARKER = layout.DEFAULT_STATE_DIR
 
 # Same cadence class as ci_headroom's diagnostic dedup: the governor runs once
 # per dispatch pass (default pass interval 5 min), so a stuck probe produces a
@@ -97,14 +128,17 @@ _PYTEST_INVOCATION_RE = re.compile(
 
 @dataclass(frozen=True)
 class HostLoad:
-    """One host-wide measurement of live pytest process-tree load.
+    """One measurement of live pytest process-tree load.
 
     ``pytest_tree_count`` is the number of distinct live pytest trees (i.e.
     how many separate test suites are running) -- the count the dispatch
     governor's suite-headroom clamp compares against;
     ``pytest_process_count`` is the total number of processes inside those
     trees (controllers plus xdist workers plus any descendants), which feeds
-    the governor's fan-out brake.
+    the governor's fan-out brake. When the measurement was scoped
+    (``pytest_tree_load``'s ``scope_paths`` -- the production behavior via
+    ``measure_host_load``, issue #1943), both counts cover only
+    orchestrator-attributable trees.
     """
 
     pytest_tree_count: int
@@ -115,6 +149,7 @@ def pytest_tree_load(
     processes: Iterable[quiesce.ProcessInfo],
     *,
     self_pid: int | None = None,
+    scope_paths: Iterable[str | Path] | None = None,
 ) -> HostLoad:
     """Reduce a process snapshot to the live pytest-tree load on the host.
 
@@ -123,12 +158,21 @@ def pytest_tree_load(
     process) is excluded so a measurement taken from inside a pytest suite --
     including this project's own test suite calling the function -- never
     counts itself as the load it is guarding against.
+
+    ``scope_paths`` (issue #1943): when not ``None``, only
+    *orchestrator-attributable* trees count -- a merged tree qualifies when
+    any member's or member-ancestor's command line references one of the
+    given path markers (see ``_tree_references_scope``). ``None`` measures
+    every pytest tree on the host (the pre-#1943 behavior, kept for
+    diagnostics and tests); ``measure_host_load`` always scopes.
     """
     resolved_self_pid = self_pid if self_pid is not None else os.getpid()
+    proc_by_pid: dict[int, quiesce.ProcessInfo] = {}
     ppid_by_pid: dict[int, int] = {}
     children_by_ppid: dict[int, list[int]] = {}
     root_pids: set[int] = set()
     for proc in processes:
+        proc_by_pid[proc.pid] = proc
         ppid_by_pid[proc.pid] = proc.ppid
         children_by_ppid.setdefault(proc.ppid, []).append(proc.pid)
         if _PYTEST_INVOCATION_RE.search(proc.command_line or ""):
@@ -153,8 +197,79 @@ def pytest_tree_load(
             else:
                 disjoint.append(tree)
         trees = [*disjoint, merged]
-    seen = set().union(*trees)
+
+    if scope_paths is not None:
+        scope_re = _scope_matcher(scope_paths)
+        trees = [
+            tree
+            for tree in trees
+            if scope_re is not None and _tree_references_scope(tree, proc_by_pid, scope_re)
+        ]
+
+    seen = set().union(*trees) if trees else set()
     return HostLoad(pytest_tree_count=len(trees), pytest_process_count=len(seen))
+
+
+def _normalize_scope_text(text: str) -> str:
+    """Fold a command line or path marker to the scope-comparison form.
+
+    ``os.path.normcase`` lowercases on Windows only (matching that platform's
+    case-insensitive filesystem) and is identity elsewhere; the separator
+    fold lets one needle match ``\\``, ``\\\\`` (escaped/JSON-embedded), and
+    ``/`` spellings of the same path in a command line.
+    """
+    return re.sub(r"[/\\]+", "/", os.path.normcase(text))
+
+
+def _scope_matcher(scope_paths: Iterable[str | Path]) -> re.Pattern[str] | None:
+    """Compile the boundary-anchored path-marker matcher for ``scope_paths``.
+
+    A needle matches only at path-token boundaries on both sides:
+    ``.var/charlie-work`` must not match ``.var/charlie-work-legacy``
+    (trailing) or ``repo.var/charlie-work`` (leading), and an absolute needle
+    must not match its own tail inside a longer path. Returns ``None`` when
+    no usable needle survives normalization -- an empty scope attributes
+    nothing, which is what ``scope_paths=()`` must mean.
+    """
+    needles = [
+        needle
+        for raw in scope_paths
+        if (needle := _normalize_scope_text(str(raw)).strip().rstrip("/"))
+    ]
+    if not needles:
+        return None
+    body = "|".join(re.escape(needle) for needle in needles)
+    return re.compile(r"(?:^|[\s/\"'=;(])(?:" + body + r")(?=[/\s\"';)]|$)")
+
+
+def _tree_references_scope(
+    tree_pids: set[int],
+    proc_by_pid: dict[int, quiesce.ProcessInfo],
+    scope_re: re.Pattern[str],
+) -> bool:
+    """``True`` when the tree is attributable to an orchestrator-managed path.
+
+    Checks every member's own command line plus its ancestor chain (bounded
+    by the snapshot: already-visited pids are skipped, so a ppid cycle cannot
+    spin). The ancestor half is what attributes the common pathless-root
+    shapes -- ``uv run pytest``, ``python -m pytest`` on a PATH interpreter,
+    ``bash -c "cd <wt> && pytest"`` -- whose own command line carries no
+    managed path but whose launcher (the ``uv`` wrapper's venv child, a
+    ``cd``-into-worktree shell, a worker harness's ``--prompt-file`` or
+    session-dir argument) names one.
+    """
+    seen = set(tree_pids)
+    stack = list(tree_pids)
+    while stack:
+        proc = proc_by_pid.get(stack.pop())
+        if proc is None:
+            continue
+        if scope_re.search(_normalize_scope_text(proc.command_line or "")):
+            return True
+        if proc.ppid and proc.ppid not in seen:
+            seen.add(proc.ppid)
+            stack.append(proc.ppid)
+    return False
 
 
 def _self_tree(
@@ -255,17 +370,27 @@ def measure_host_load(
     *,
     lister: quiesce.ProcessLister | None = None,
     self_pid: int | None = None,
+    scope_paths: Iterable[str | Path] | None = None,
     diagnostic_state_path: Path | None = None,
     diagnostic_repo: str | None = None,
     now: datetime | None = None,
     min_interval_minutes: int = DEFAULT_UNAVAILABLE_INTERVAL_MINUTES,
 ) -> HostLoad | None:
-    """Measure host pytest-tree load, or ``None`` when it cannot be trusted.
+    """Measure orchestrator-attributable pytest load, or ``None`` on failure.
 
     ``lister`` defaults to `list_host_processes` (resolved through this
     module's globals at call time, so tests and the conftest autouse stub can
     substitute a fake with zero subprocess use). ``self_pid`` defaults to
     ``os.getpid()``; see `pytest_tree_load` for the self-exclusion rule.
+
+    The measurement is always scoped (issue #1943): the built-in
+    ``.var/charlie-work`` state-dir convention marker
+    (``layout.DEFAULT_STATE_DIR``) covers every default-layout repo on the
+    host, and ``scope_paths`` layers on additional markers -- the caller
+    passes the repo's resolved worktrees/state roots plus the
+    fleet-registered ``state_dir`` values so ``runtime.state_dir`` /
+    ``claude_code.worktrees_dir`` overrides stay attributable. CI-runner
+    suites and any other unattributable tree feed neither count.
 
     ``diagnostic_state_path``/``diagnostic_repo`` route the rate-limited
     ``host_load_unavailable`` event written on every fail-open path -- the
@@ -286,7 +411,8 @@ def measure_host_load(
             min_interval_minutes=min_interval_minutes,
         )
         return None
-    return pytest_tree_load(processes, self_pid=self_pid)
+    scope = [_ORCHESTRATOR_SCOPE_MARKER, *(scope_paths or ())]
+    return pytest_tree_load(processes, self_pid=self_pid, scope_paths=scope)
 
 
 def _log_unavailable(

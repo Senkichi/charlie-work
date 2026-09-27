@@ -431,6 +431,28 @@ def count_fleet_live_sessions(
     return total_live_count, skipped_repos
 
 
+def registered_state_dirs(fleet_dir_override: str | None) -> tuple[Path, ...]:
+    """Return every registered repo's resolved ``state_dir`` (best-effort).
+
+    Read-only consumer of the same fleet.json registry
+    ``count_fleet_live_sessions`` walks, for callers that need the set of
+    orchestrator-managed state roots on this host (e.g. ``host_load``'s
+    orchestrator-attribution scope, issue #1943). Entries with a missing or
+    blank ``state_dir`` are skipped; a missing or corrupt registry yields an
+    empty tuple. The result is additive scope data, not load-bearing state --
+    a stale or vanished repo path simply matches nothing.
+    """
+    data = _load_registry(layout.fleet_registry_path(override=fleet_dir_override))
+    out: list[Path] = []
+    for entry in data.get("repos", {}).values():
+        if not isinstance(entry, dict):
+            continue
+        raw = entry.get("state_dir")
+        if raw:
+            out.append(Path(str(raw)))
+    return tuple(out)
+
+
 FleetLock = ByteRangeFileLock
 
 

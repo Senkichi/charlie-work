@@ -407,8 +407,9 @@ class DispatchConfig:
     # fresh-dispatch-only: a rework launch spawns a real local suite too,
     # and the host does not care which lane oversubscribed it.
     #
-    # The probe (host_load.py) reports two readings per pass and the
-    # governor applies two terms (issue #1903 recalibration):
+    # The probe (host_load.py) reports two readings per pass, both scoped to
+    # orchestrator-attributable trees (issue #1943 -- see host_load.py);
+    # the governor applies two terms (issue #1903 recalibration):
     #
     # * ``host_load_max_pytest_trees`` -- the primary governor. Counts
     #   distinct live pytest *suites* (a suite's xdist workers fold into
@@ -435,8 +436,7 @@ class DispatchConfig:
     # width. 0 disables a term individually; 0 on both disables the probe
     # entirely (also the effective behavior where os.cpu_count() returns
     # None). A failed measurement fails OPEN (dispatch proceeds) and is
-    # reported via a rate-limited host_load_unavailable event, never by
-    # silently treating the host as idle.
+    # reported via a rate-limited host_load_unavailable event.
     host_load_max_pytest_processes: int = field(default_factory=lambda: (os.cpu_count() or 0) * 3)
     host_load_max_pytest_trees: int = field(default_factory=lambda: (os.cpu_count() or 0) // 2)
     # Repo-root-relative paths copied into each worktree after creation
