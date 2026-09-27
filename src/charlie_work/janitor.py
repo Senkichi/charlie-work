@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import builtins
 import fnmatch
+import hashlib
 import logging
 import re
 from collections.abc import Iterator, Mapping, Sequence
@@ -252,6 +253,24 @@ def _calculate_patch_id(diff: str) -> str:
     return ""
 
 
+def _body_content_sha256(body: object) -> str:
+    """Content hash of a PR body for no-op-rework comparison (issue #1939).
+
+    ``record_review`` stamps the result into the verdict as
+    ``reviewed_body_sha256``; ``_check_no_op_rework`` rehashes the live
+    ``pr["body"]`` and compares. Line endings are normalized before
+    hashing so a transport-level CRLF/LF flip (e.g. ``gh pr edit
+    --body-file`` vs. the value the API echoes back) never counts as a
+    content change -- the escape hatch must open only on a real body
+    edit, never on a serialization artifact. ``None`` (a PR with no
+    body, or a JSON ``null``) hashes as the empty string so verdict-time
+    and live reads agree.
+    """
+    text = body if isinstance(body, str) else ""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class DiffContentSignature:
     """Normalized content signature of a unified diff (issue #414, tier 2).
@@ -361,13 +380,22 @@ def run_janitor(
     check that depends on it is skipped rather than failed.
 
     ``review_decision`` is the recorded review-decision mapping for this PR
-    (``prs/pr-N/review-decision.json`` content), used only by the issue #1116
-    stale-CI skip: when the verdict is a non-escalated request_changes whose
-    findings all cite required checks that are green now
-    (``is_stale_ci_verdict``), the no-op rework check is skipped so the gate
-    can pass and the packet/fresh-review machinery can run. ``None`` (or any
-    non-stale decision) preserves the existing behavior — the predicate fails
-    closed on red, pending, missing, or unavailable checks.
+    (``prs/pr-N/review-decision.json`` content). It feeds two narrow
+    exceptions to the no-op rework check:
+
+    * the issue #1116 stale-CI skip: when the verdict is a non-escalated
+      request_changes whose findings all cite required checks that are
+      green now (``is_stale_ci_verdict``), the no-op rework check is
+      skipped so the gate can pass and the packet/fresh-review machinery
+      can run. ``None`` (or any non-stale decision) preserves the
+      existing behavior — the predicate fails closed on red, pending,
+      missing, or unavailable checks;
+    * the issue #1939 body-change escape inside ``_check_no_op_rework``:
+      an unchanged patch-id/head is satisfied (not a no-op) when the PR
+      body's hash differs from the verdict's ``reviewed_body_sha256``
+      baseline — a body-only rework produces no code delta by
+      construction. A missing baseline or a ``pr`` without a ``body``
+      key fails closed.
 
     ``issue_labels`` (issue #1598) is the set of live labels on the PR's
     bound issue, when the caller already has them. When provided and any
@@ -834,6 +862,35 @@ def _check_no_op_rework(
     # leaves this check acting on stale state.json (the #1340 divergence class).
     decision = (review_decision or {}).get("decision")
     if decision != "request_changes":
+        return False
+
+    # Issue #1939: a request_changes finding whose required fix lives in the
+    # PR body/description produces no code delta by construction -- the
+    # rework's only artifact is a ``gh pr edit`` body update (applied on the
+    # worker's behalf through the rework-outcome ``pr_body`` channel, since
+    # workers hold no gh credential). Without this signal such a rework is
+    # indistinguishable from a genuine no-op and the PR pins in a permanent
+    # janitor_gate block (swole #198 / PR #348). A live body whose hash
+    # differs from the verdict's ``reviewed_body_sha256`` baseline -- stamped
+    # from the body the reviewer actually read -- is therefore satisfied as
+    # real rework, skipping every diff/head comparison below (patch-id,
+    # head-SHA, merge-only): all are blind to body edits. A verdict that
+    # predates the field, or a PR payload without a ``body`` key, yields no
+    # comparison and fails closed -- the gate behaves exactly as before.
+    reviewed_body_sha256 = (review_decision or {}).get("reviewed_body_sha256")
+    if not isinstance(reviewed_body_sha256, str) or not reviewed_body_sha256:
+        reviewed_body_sha256 = pr_state.get("reviewed_body_sha256")
+    if (
+        isinstance(reviewed_body_sha256, str)
+        and reviewed_body_sha256
+        and "body" in pr
+        and _body_content_sha256(pr.get("body")) != reviewed_body_sha256
+    ):
+        warnings.append(
+            "No-op rework check satisfied: PR body changed since the "
+            "request_changes verdict — a body-only rework produces no code "
+            "delta but is not a no-op (issue #1939)"
+        )
         return False
 
     # Primary check: compare patch-ids when both are available

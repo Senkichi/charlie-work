@@ -76,6 +76,7 @@ from .cross_pr_revert import (  # noqa: F401  (deliberate re-export)
     detect_cross_pr_revert,
 )
 from .janitor import (
+    _body_content_sha256,  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/state_record_review.py)
     _calculate_patch_id,  # noqa: F401  (deliberate re-export; patched on the workflow module in tests)
     _diff_content_signature,  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/state_record_review.py)
     check_operator_containment,
