@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from charlie_work.github import GitHubRunResult
+from charlie_work.github import GitHubRunResult, label_names
 import charlie_work.workflow as _wf
 
 
@@ -166,7 +166,18 @@ def _should_update_pr_branch(
 
     If no ``base_current`` signal is supplied, fall back to the legacy
     mergeStateStatus heuristic for backward compatibility.
+
+    Aviator MergeQueue guard: a PR carrying the configured ``mergequeue``
+    label is owned by Aviator's queue, which handles its own rebasing. In
+    parallel mode Aviator creates temp branches and validates against
+    current main itself; syncing here would race Aviator's rebase and
+    restart CI for nothing. This is the single enforcement point --
+    every branch-update path (``_update_open_agent_prs`` broadcast/
+    front_of_train, ``merge_ready``'s inline sync) flows through here.
     """
+    mergequeue_label = self.config.auto_merge.mergequeue_label
+    if mergequeue_label and mergequeue_label in label_names(pr):
+        return False
     if isinstance(base_current, _wf._BaseCurrentUnset):
         status = str(pr.get("mergeStateStatus") or "").upper()
         return status not in {"CLEAN", "UNSTABLE", "HAS_HOOKS"}
