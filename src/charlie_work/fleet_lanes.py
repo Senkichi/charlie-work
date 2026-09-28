@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ from . import layout
 from .config import OrchestratorConfig
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, _select_repos
-from .github import GitHub
+from .github import GitHub, set_pass_deadline_exceeded
 from .global_config import load_layered_config
 from .instrumentation import log_event
 from .local_issues import github_client_for
@@ -65,6 +66,7 @@ def _run_fleet_repo_lane(
     limit: int | None,
     merge: bool | None,
     ensure_labels: bool,
+    deadline_exceeded: Callable[[], bool] | None = None,
 ) -> CommandResult:
     """One repo's lane body, executed on a pool thread (issue #1934).
 
@@ -76,8 +78,28 @@ def _run_fleet_repo_lane(
     pass" invariant. A raised exception propagates to the collector future,
     which renders it into the same per-repo error result the serial loop
     produced.
+
+    ``deadline_exceeded`` (issue #1948) is ``fleet_loop``'s cooperative
+    in-pass deadline predicate. Before #1948 it was only consulted between
+    lanes, so a single lane could overrun the pass budget by tens of
+    minutes of sequential gh timeouts and retry backoffs. The lane arms it
+    on its own ``GitHub`` client (``run()`` then refuses new calls/aborts
+    retry chains the moment the budget is spent), checks it at the lane's
+    own yield points, and threads it into ``app.loop()`` for the
+    sub-phase-boundary checks there. A lane cut short returns a
+    ``CommandResult`` carrying ``data["deadline_deferred"] = True`` instead
+    of finishing every queued phase.
     """
     try:
+        # Arm the deadline hook on this lane's own client (issue #1948).
+        # isinstance, not getattr duck-typing: the suite patches
+        # ``charlie_work.fleet_dispatch.GitHub`` with a MagicMock, so
+        # ``app.gh`` on a mocked app must be skipped here; a real app built
+        # on LocalFileGitHub (local_issues backend) has no run() loop to
+        # bound and is skipped the same way.
+        if deadline_exceeded is not None and isinstance(app.gh, GitHub):
+            set_pass_deadline_exceeded(app.gh, deadline_exceeded)
+
         # Issue #1339: ensure every LabelConfig-derived label exists on the
         # repo before the lane runs. Idempotent and best-effort:
         # ``ensure_labels`` records failures as events and never raises, so
@@ -92,10 +114,33 @@ def _run_fleet_repo_lane(
             except Exception as exc:  # noqa: BLE001 — never block a lane
                 logger.warning("fleet label ensure failed for %s: %s", repo_key, exc)
 
+        # Issue #1948: label-ensure can consume the remainder of the pass
+        # budget after fleet_loop's post-slot-wait re-check ran. Bail before
+        # the lane's first real phase rather than starting work on a dead
+        # budget -- the unfinished work defers to the next pass.
+        if deadline_exceeded is not None and deadline_exceeded():
+            return CommandResult(
+                True,
+                "in-pass deadline reached before lane work; deferred to next pass",
+                {"deadline_deferred": True},
+            )
+
         if work_only:
             # Dispatch-only path (worker dispatch + optional review dispatch)
             result = app.dispatch(0 if drain else limit)
             if config.review_dispatch.enabled:
+                # Issue #1948: yield-point check between the work lane's two
+                # sequential GitHub phases -- skip review dispatch once the
+                # pass budget is spent instead of accumulating timeouts.
+                if deadline_exceeded is not None and deadline_exceeded():
+                    combined_data = dict(result.data)
+                    combined_data["deadline_deferred"] = True
+                    combined_data["dispatch_reviews"] = {"deadline_deferred": True}
+                    return CommandResult(
+                        result.ok,
+                        f"{result.message}; review dispatch deferred: in-pass deadline",
+                        combined_data,
+                    )
                 review_dispatch_result = app.dispatch_reviews(0 if drain else limit)
                 ok = result.ok and review_dispatch_result.ok
                 message = (
@@ -112,7 +157,9 @@ def _run_fleet_repo_lane(
         # slice candidates[:0] (0 is not None, so it is never
         # replaced by default_limit) while the reap, review, and
         # merge lanes below them run normally.
-        return app.loop(0 if drain else limit, merge=merge)
+        # ``deadline_exceeded`` (issue #1948) lets _loop_body's
+        # sub-phase-boundary checks stop the pass mid-lane.
+        return app.loop(0 if drain else limit, merge=merge, deadline_exceeded=deadline_exceeded)
     finally:
         lock.release()
 

@@ -26,7 +26,6 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from _fleet_dispatch_fixtures import (
-    _StepClock,
     _drained_fleet_result,
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
@@ -73,7 +72,8 @@ def _gated_app(
     gate can never trip, so these tests spend the timeout once and fail."""
     app = MagicMock()
 
-    def _loop(limit: int | None, merge: bool | None = None) -> CommandResult:
+    def _loop(limit: int | None, merge: bool | None = None, **_kwargs: Any) -> CommandResult:
+        # **_kwargs absorbs the lane's deadline_exceeded predicate (#1948).
         with guard:
             live["n"] += 1
             peak["n"] = max(peak["n"], live["n"])
@@ -223,25 +223,35 @@ def test_fleet_loop_deadline_defers_lanes_waiting_on_a_full_pool(
     mock_runtime_paths.side_effect = _per_repo_runtime_paths
     mock_gh_class.return_value = MagicMock()
 
-    apps = []
-    for name in ("repo1", "repo2"):
-        app = MagicMock()
-        app.dispatch.return_value = CommandResult(True, f"{name} dispatch complete", {})
-        apps.append(app)
-    mock_app_class.side_effect = apps
+    # Issue #1948: the deadline predicate is now also invoked from lane
+    # threads, so a call-order step clock would be consumed in a
+    # nondeterministic interleaving between the submitting thread and the
+    # lanes. The budget instead flips on a named happens-before edge:
+    # repo2's dispatch marks it spent, and repo1's dispatch blocks until
+    # that mark -- so repo1's collection (the throttle's slot-wait) cannot
+    # complete before the flag is set, and repo3's post-wait re-check
+    # observes it deterministically. Before repo1's collect returns, every
+    # in-lane check (repo1/repo2's own yield checks) already ran False.
+    budget_spent = threading.Event()
+    clock = lambda: 10000.0 if budget_spent.is_set() else 0.0  # noqa: E731
 
-    # pass_clock reads (work_only skips the prologue deadline checks):
-    #   1. pass_started_at                         -> 0
-    #   2. repo1 deadline check                    -> 0   (under the 100s budget)
-    #   3. repo1 repo_lane_start                   -> 0
-    #   4. repo2 deadline check                    -> 0
-    #   5. repo2 repo_lane_start                   -> 0
-    #   6. repo3 deadline check                    -> 50  (still under -- proceed)
-    #   7. throttle collects repo1's lane; its elapsed log reads -> 60
-    #   8. repo3's post-wait re-check              -> 10000 (blown -> defer)
-    #   9. repo4 deadline check                    -> 10000 (defer)
-    #   10+. drain elapsed / deferred-event reads  -> 10000
-    clock = _StepClock(steps=[0.0, 0.0, 0.0, 0.0, 0.0, 50.0, 60.0], after=10000.0)
+    app1 = MagicMock()
+
+    def _dispatch_after_spend(*args: object, **kwargs: object) -> CommandResult:
+        # Blocks until repo2's lane marks the budget spent -- a real call
+        # site for the ordering edge, not a sleep.
+        budget_spent.wait(timeout=_LANE_GATE_TIMEOUT)
+        return CommandResult(True, "repo1 dispatch complete", {})
+
+    app1.dispatch.side_effect = _dispatch_after_spend
+    app2 = MagicMock()
+
+    def _dispatch_then_spend(*args: object, **kwargs: object) -> CommandResult:
+        budget_spent.set()
+        return CommandResult(True, "repo2 dispatch complete", {})
+
+    app2.dispatch.side_effect = _dispatch_then_spend
+    mock_app_class.side_effect = [app1, app2]
 
     result = fleet_loop(
         fleet_dir_override=str(tmp_path / "fleet"),
@@ -257,7 +267,7 @@ def test_fleet_loop_deadline_defers_lanes_waiting_on_a_full_pool(
     assert set(result.data["repos"]) == {"owner/repo1", "owner/repo2"}
     assert result.data["deferred"] == ["owner/repo3", "owner/repo4"]
     assert mock_app_class.call_count == 2
-    for app in apps:
+    for app in (app1, app2):
         app.dispatch.assert_called_once_with(3)
 
     from charlie_work.fleet_paths import fleet_dir
@@ -307,7 +317,8 @@ def test_fleet_loop_results_follow_selection_order_not_completion_order(
     def _app_for(name: str) -> MagicMock:
         app = MagicMock()
 
-        def _loop(limit: int | None, merge: bool | None = None) -> CommandResult:
+        def _loop(limit: int | None, merge: bool | None = None, **_kwargs: Any) -> CommandResult:
+            # **_kwargs absorbs the lane's deadline_exceeded predicate (#1948).
             if name == "repo1":
                 # Deliberately the last lane to finish.
                 other_lane_done.wait(timeout=_LANE_GATE_TIMEOUT)

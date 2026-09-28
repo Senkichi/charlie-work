@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -668,7 +669,12 @@ def tripwire_status(self) -> _wf.CommandResult:
 
 
 def _loop_impl(
-    self, limit: int | None, *, merge: bool | None, now: datetime | None = None
+    self,
+    limit: int | None,
+    *,
+    merge: bool | None,
+    now: datetime | None = None,
+    deadline_exceeded: Callable[[], bool] | None = None,
 ) -> _wf.CommandResult:
     # Issue #1363: preflight gate. Runs BEFORE `loop_started` is recorded
     # -- a fatal host-precondition failure (disk_floor, venv_identity)
@@ -746,7 +752,9 @@ def _loop_impl(
         # -- the lint guard in ``test_no_unlocked_load_state_in_production_code``
         # flags any bare ``load_state`` outside a ``state_lock`` context.
         sink_before = _wf.sink_census(_wf.load_state_locked(self.paths.state_file))
-        result = self._loop_body(limit, merge=merge, now=now)
+        # Issue #1948: forward the fleet pass deadline predicate into the
+        # pass body so its sub-phase yield checks can cut the lane short.
+        result = self._loop_body(limit, merge=merge, now=now, deadline_exceeded=deadline_exceeded)
         elapsed = time.monotonic() - loop_start
         sink_after = _wf.sink_census(_wf.load_state_locked(self.paths.state_file))
         sink_arrivals = len(sink_after - sink_before)

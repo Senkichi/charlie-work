@@ -1,0 +1,8 @@
+1000
+# Issue #1948: _loop_body grew past the 800-line cap (800 -> 903) because the
+# in-pass deadline checks are interleaved between its sequential sub-phases
+# (intake / reap / reconcile / dispatch / review / per-PR scan / worktree
+# reclamation) -- the yield points the issue asks to bound. The checks are
+# call-site guards on the pass body itself; extracting them would mean
+# extracting the pass. New baseline entry per the ratchet's reviewed-edit
+# rule, raised to the next MARK_QUANTUM multiple.

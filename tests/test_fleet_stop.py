@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -587,7 +587,7 @@ def test_fleet_loop_drain_suppresses_all_new_dispatch(
 
     # limit 0 reaches the per-repo loop — dispatch_rework/dispatch slice
     # candidates[:0], so nothing launches no matter how many are ready.
-    mock_app.loop.assert_called_once_with(0, merge=True)
+    mock_app.loop.assert_called_once_with(0, merge=True, deadline_exceeded=ANY)
     # The config handed to OrchestratorApp is the pass-local copy with
     # review dispatch disabled — dispatch_reviews() early-returns after its
     # reaper sweeps, so no reviewer is launched either.
@@ -642,6 +642,6 @@ def test_fleet_loop_no_drain_keeps_limit_and_review_dispatch(
         work_only=False,
     )
 
-    mock_app.loop.assert_called_once_with(3, merge=True)
+    mock_app.loop.assert_called_once_with(3, merge=True, deadline_exceeded=ANY)
     config_seen = mock_app_class.call_args.args[2]
     assert config_seen.review_dispatch.enabled is True

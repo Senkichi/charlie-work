@@ -1,1 +1,9 @@
-1000
+1200
+# Issue #1948: the cooperative in-pass deadline check had to land inside
+# run()'s retry loop -- before each attempt and before each backoff sleep --
+# because the whole point is bounding a lane's overrun to ONE gh call
+# sequence rather than the sum of its retries. That machinery (sentinel,
+# refusal helper, per-attempt/per-backoff checks, arming hook) cannot move
+# to a domain module without moving run() itself. +66 lines over the prior
+# live count (987 -> 1053); raised to the next MARK_QUANTUM multiple per
+# the ratchet's hand-raise rule.

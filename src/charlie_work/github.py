@@ -114,6 +114,11 @@ _TIMEOUT_RETURNCODE = 124
 # to tell "gh hung" from "gh was never spawned" apart.
 _CIRCUIT_OPEN_RETURNCODE = 125
 
+# Sentinel returncode for "the cooperative in-pass deadline refused this
+# call" (issue #1948) -- like _CIRCUIT_OPEN_RETURNCODE, no gh subprocess ever
+# ran, but the refusal is budget exhaustion, not a transport failure.
+_PASS_DEADLINE_RETURNCODE = 126
+
 # Fractional jitter applied to each retry backoff (e.g. 0.25 => +/- 25%).
 _JITTER_FRACTION = 0.25
 
@@ -298,6 +303,13 @@ class GitHub:
         # `_circuit_breaker_state` above -- `run_gh_command` needs it before
         # the `_COLLABORATORS` loop below installs any delegate.
         object.__setattr__(self, "_http_transport_state", build_http_transport_state())
+        # Cooperative in-pass deadline hook (issue #1948): a `() -> bool`
+        # predicate armed per-lane by set_pass_deadline_exceeded() and read
+        # by run()'s retry loop. None (the default for every non-fleet
+        # caller) disables the check entirely. Same object.__setattr__
+        # pattern as the state above -- the dataclass is frozen but this is
+        # per-instance runtime state, not a constructor field.
+        object.__setattr__(self, "_pass_deadline_exceeded", None)
         # Capability collaborators (Track 2, issue #1585, design doc
         # Section 3.3): each is constructed with a back-reference to this
         # instance and reached through the delegates _install_delegates()
@@ -350,7 +362,32 @@ class GitHub:
         )
         last_result: subprocess.CompletedProcess[str] | None = None
 
+        # Issue #1948: cooperative in-pass deadline, armed per fleet lane via
+        # set_pass_deadline_exceeded(). Checked before each attempt (so a
+        # lane already over budget never spawns gh) and before each backoff
+        # sleep (so a deadline reached mid-sequence aborts the remaining
+        # retries instead of accumulating timeout+backoff cycles until the
+        # lane boundary notices). Deliberately NOT fed to the circuit
+        # breaker via _circuit_breaker_note_result: a deadline refusal is
+        # budget exhaustion, not evidence about transport health.
+        pass_deadline = self._pass_deadline_exceeded
+        deadline_error = f"in-pass deadline exceeded; gh call refused: {' '.join(command)}"
+
+        def _deadline_refusal() -> Any:
+            if not allow_failure:
+                raise GitHubError(deadline_error)
+            return GitHubRunResult(
+                ok=False,
+                returncode=_PASS_DEADLINE_RETURNCODE,
+                stdout="",
+                stderr=deadline_error,
+                value=None,
+                error=deadline_error,
+            )
+
         for attempt in range(max_retries + 1):
+            if pass_deadline is not None and pass_deadline():
+                return _deadline_refusal()
             try:
                 # Issue #1834: `run_gh_command` chooses HTTP or the `gh`
                 # subprocess per call (config-default HTTP for
@@ -418,6 +455,10 @@ class GitHub:
                         value=None,
                         error=timeout_error,
                     )
+                # Issue #1948: don't burn a backoff sleep once the pass
+                # budget is spent -- refuse instead.
+                if pass_deadline is not None and pass_deadline():
+                    return _deadline_refusal()
                 delay = base_delay * (2**attempt)
                 jitter = random.uniform(-_JITTER_FRACTION * delay, _JITTER_FRACTION * delay)
                 sleep_seconds = max(0.0, delay + jitter)
@@ -499,6 +540,10 @@ class GitHub:
             if attempt >= max_retries or not _should_retry(args, error, is_mutating):
                 break
 
+            # Issue #1948: don't burn a backoff sleep once the pass budget
+            # is spent -- refuse instead.
+            if pass_deadline is not None and pass_deadline():
+                return _deadline_refusal()
             delay = base_delay * (2**attempt)
             jitter = random.uniform(-_JITTER_FRACTION * delay, _JITTER_FRACTION * delay)
             sleep_seconds = max(0.0, delay + jitter)
@@ -572,6 +617,27 @@ class GitHub:
 # empty), so this is a no-op: it installs nothing and `GitHub`'s lexical
 # member surface is unchanged.
 _install_delegates(GitHub)
+
+
+def set_pass_deadline_exceeded(gh: GitHub, check: Callable[[], bool] | None) -> None:
+    """Arm (or clear, with None) the cooperative in-pass deadline hook on *gh*.
+
+    Issue #1948: ``fleet_loop``'s per-pass budget was previously only
+    consulted between repo lanes, so one lane could overrun the deadline by
+    tens of minutes of sequential gh timeouts and retry backoffs. Arming
+    this hook on the lane's own client lets ``run()`` refuse a call -- or
+    abort a retry chain -- the moment the budget is spent.
+
+    A module-level function rather than a ``GitHub`` member: the class's
+    lexical surface is frozen at ``__post_init__``/``run`` by the
+    githublike-protocol tests (L06/L09) -- capability access goes through
+    delegates, and this hook is per-lane runtime state, not a capability.
+    Written through ``object.__setattr__`` because ``GitHub`` is a frozen
+    dataclass; fleet lanes build a fresh client per repo per pass, so an
+    armed hook cannot leak into a later pass. Non-fleet callers never arm
+    it, keeping the check a no-op for single-repo passes.
+    """
+    object.__setattr__(gh, "_pass_deadline_exceeded", check)
 
 
 @runtime_checkable

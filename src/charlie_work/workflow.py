@@ -8493,6 +8493,7 @@ class OrchestratorApp:
         *,
         merge: bool | None = None,
         now: datetime | None = None,
+        deadline_exceeded: Callable[[], bool] | None = None,
     ) -> CommandResult:
         # ``now`` (issue #822, extended #828) is this pass's injectable clock.
         # ``_loop_body`` forwards it, unresolved, to every cadence-gated lane
@@ -8506,7 +8507,11 @@ class OrchestratorApp:
         # is byte-identical when this argument is omitted (as all current
         # production callers do); tests can freeze one ``now`` and assert
         # exact equality instead of a wall-clock-tolerance proximity check.
-        return self._loop_impl(limit, merge=merge, now=now)
+        # ``deadline_exceeded`` (issue #1948) is an optional cooperative
+        # in-pass deadline predicate threaded from ``fleet_loop``'s pass
+        # budget into ``_loop_body``'s sub-phase-boundary yield checks;
+        # ``None`` (every non-fleet caller) disables them entirely.
+        return self._loop_impl(limit, merge=merge, now=now, deadline_exceeded=deadline_exceeded)
 
 
 # Track 2 Phase B delegation install (#1631, umbrella #1582). Every submodule of

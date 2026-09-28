@@ -26,6 +26,7 @@ detector, unpatched) is the decoy sibling of the ``_wf.``-rebound
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -44,7 +45,12 @@ from charlie_work.review_decision import review_decision
 
 
 def _loop_body(
-    self, limit: int | None, *, merge: bool | None, now: datetime | None = None
+    self,
+    limit: int | None,
+    *,
+    merge: bool | None,
+    now: datetime | None = None,
+    deadline_exceeded: Callable[[], bool] | None = None,
 ) -> _wf.CommandResult:
     # Every pass must observe a fresh GitHub snapshot. The list cache
     # dedupes calls within one pass, but a long-running supervisor
@@ -64,6 +70,48 @@ def _loop_body(
     # double.
     if isinstance(self.gh, GitHub):
         self.gh.reset_circuit_breaker()
+
+    # Issue #1948: cooperative in-pass deadline. ``deadline_exceeded`` is
+    # fleet_loop's pass-budget predicate, threaded through loop()/
+    # _loop_impl by _run_fleet_repo_lane (which also arms it on this
+    # app's GitHub client so gh.run() aborts retry chains mid-call).
+    # Before #1948 the budget was only consulted between repo lanes, so a
+    # single lane could overrun the deadline by ~51min of sequential gh
+    # timeouts/retries. The rule here: every GitHub-touching sub-phase gets
+    # a boundary check (skipped phases produce a ``deadline_deferred``
+    # placeholder result), the per-PR review/merge scan breaks at the top
+    # of each iteration, and purely local work (orphan-process sweeps,
+    # stall scans, digest emission, the marker write below) stays
+    # unconditional -- a deadline must never strand bookkeeping the pass
+    # already committed to. Once observed True the result is latched so
+    # later checks are free and the pass ends marked
+    # ``data["deadline_deferred"]``. None (every non-fleet caller) disables
+    # every check.
+    deadline_hit = deadline_exceeded is not None and deadline_exceeded()
+
+    def _deadline_now() -> bool:
+        nonlocal deadline_hit
+        if not deadline_hit and deadline_exceeded is not None:
+            deadline_hit = bool(deadline_exceeded())
+        return deadline_hit
+
+    def _phase_skipped(name: str) -> _wf.CommandResult:
+        return _wf.CommandResult(
+            True,
+            f"{name} skipped: in-pass deadline reached",
+            {"deadline_deferred": True},
+        )
+
+    if deadline_hit:
+        # The lane was submitted just as the budget ran out (the pool-slot
+        # wait or label-ensure can consume the remainder after fleet_loop's
+        # re-check) -- return a complete-but-empty pass instead of starting
+        # the first sub-phase on a dead budget.
+        return _wf.CommandResult(
+            True,
+            "loop pass deferred: in-pass deadline already reached",
+            {"deadline_deferred": True},
+        )
     sessions_dir = self._layout.sessions_dir
     # Issue #646: the worker census now logs from inside dispatch() itself
     # (the one chokepoint every dispatch path funnels through, including
@@ -88,7 +136,7 @@ def _loop_body(
         write_gate=self.write_gate,
         now=now,
     )
-    intake = self.intake()
+    intake = _phase_skipped("intake") if _deadline_now() else self.intake()
     # Share a single wave budget between fresh and rework dispatch
     # Rework-first, then fresh fills the remainder
     # Resolve the effective budget once
@@ -106,15 +154,19 @@ def _loop_body(
     # (line ~4100) already ran this pass and is the sole writer of the
     # inconclusive-probe deferral counter for a not-alive worker -- tell
     # this lane not to persist it again on top of that write.
-    reaped = _wf._classify_dead_sessions_and_update_throttle_state(
-        sessions_dir,
-        self.paths.state_file,
-        self.gh,
-        self.config,
-        write_gate=self.write_gate,
-        persist_inconclusive_probe_counter=False,
-        now=now,
-        fleet_dir_override=self.fleet_dir_override,
+    reaped = (
+        []
+        if _deadline_now()
+        else _wf._classify_dead_sessions_and_update_throttle_state(
+            sessions_dir,
+            self.paths.state_file,
+            self.gh,
+            self.config,
+            write_gate=self.write_gate,
+            persist_inconclusive_probe_counter=False,
+            now=now,
+            fleet_dir_override=self.fleet_dir_override,
+        )
     )
 
     # Flat-interval Haiku probe for early quota/rate-limit recovery (see
@@ -122,7 +174,8 @@ def _loop_body(
     # `now` (issue #828) is this pass's single injected clock, forwarded
     # so the probe's own cadence-scheduling samples stay consistent with
     # the rest of this pass instead of independently racing wall clock.
-    self._maybe_probe_quota_recovery(now=now)
+    if not _deadline_now():
+        self._maybe_probe_quota_recovery(now=now)
 
     # Periodic in-loop reconcile (merge-lane-recovery §6-B): repairs
     # GitHub label / state.json divergence on a fixed cadence instead of
@@ -130,13 +183,15 @@ def _loop_body(
     # the dispatch calls below so labels it repairs (e.g. a stale
     # `needs-rework` on an issue state already marked `escalated`) are
     # visible to this same pass's dispatch decisions, not just the next.
-    self._maybe_reconcile_drift(now=now)
+    if not _deadline_now():
+        self._maybe_reconcile_drift(now=now)
 
     # Issues #863/#815: reclaim superseded, not-yet-started main CI runs
     # every pass -- no runner needed, so unlike the workflow-based
     # reaper this cannot lose the race for the capacity it exists to
     # free. See _maybe_reclaim_superseded_main_ci's docstring.
-    self._maybe_reclaim_superseded_main_ci()
+    if not _deadline_now():
+        self._maybe_reclaim_superseded_main_ci()
 
     # Issue #783: periodic re-evaluation of `mechanical` escalations --
     # the only automated re-entry from `agent:human-needed` for pure
@@ -145,7 +200,8 @@ def _loop_body(
     # since become mergeable and janitor-clean. `judgment` escalations
     # and any pre-existing escalation with no recorded reason_class are
     # untouched by construction (see _maybe_deescalate_mechanical).
-    self._maybe_deescalate_mechanical()
+    if not _deadline_now():
+        self._maybe_deescalate_mechanical()
 
     # Sweep for orphan processes in dead session worktrees (issue #139)
     # This catches detached/daemonized processes that survived session kills
@@ -157,15 +213,16 @@ def _loop_body(
     # This fallback detects dead workers even when session sidecar files are orphaned.
     # Pass the review callback so a head-advanced request_changes finding can be
     # routed to the review-pending path instead of being re-emitted as drift.
-    _wf._detect_and_handle_orphaned_workers(
-        sessions_dir,
-        self.paths.state_file,
-        self.config,
-        self.gh,
-        write_gate=self.write_gate,
-        review_callback=self.review,
-        fleet_dir_override=self.fleet_dir_override,
-    )
+    if not _deadline_now():
+        _wf._detect_and_handle_orphaned_workers(
+            sessions_dir,
+            self.paths.state_file,
+            self.config,
+            self.gh,
+            write_gate=self.write_gate,
+            review_callback=self.review,
+            fleet_dir_override=self.fleet_dir_override,
+        )
 
     # Detect stalled sessions for notification (read-only, stateful via _build_attention_digest)
     stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
@@ -222,10 +279,18 @@ def _loop_body(
         if digest:
             _wf.emit_digest(self._layout.notify, digest)
 
-    dispatch_rework = self.dispatch_rework(effective_limit, stalled_entries=loop_stalled_entries)
+    dispatch_rework = (
+        _phase_skipped("dispatch_rework")
+        if _deadline_now()
+        else self.dispatch_rework(effective_limit, stalled_entries=loop_stalled_entries)
+    )
     rework_count = dispatch_rework.data.get("selected_count", 0)
     fresh_limit = max(0, effective_limit - rework_count)
-    dispatch = self.dispatch(fresh_limit, stalled_entries=loop_stalled_entries)
+    dispatch = (
+        _phase_skipped("dispatch")
+        if _deadline_now()
+        else self.dispatch(fresh_limit, stalled_entries=loop_stalled_entries)
+    )
 
     # Issue #370: launch reviewers for queued PRs. This runs after worker
     # dispatch so a completed worker's review packet can be picked up by the
@@ -234,7 +299,9 @@ def _loop_body(
     # `now` (issue #822/#828) is this pass's injectable clock, threaded
     # through so dispatch_reviews's is_claim_stale checks share the same
     # instant as the rest of this pass instead of resampling.
-    dispatch_reviews = self.dispatch_reviews(now=now)
+    dispatch_reviews = (
+        _phase_skipped("dispatch_reviews") if _deadline_now() else self.dispatch_reviews(now=now)
+    )
 
     # Issue #1844: the local (no-remote) review/merge lane. On a
     # ``LocalFileGitHub`` backend every remote stage in this pass is a no-op
@@ -246,7 +313,9 @@ def _loop_body(
     # operator gate. It is itself a no-op on a remote backend.
     # ``limit`` is the pre-governor dispatch budget: an explicit 0 (drain)
     # suspends the rework launch -- see the ``_local_lane`` docstring (#1716).
-    local_lane_result = self._local_lane(now=now, limit=limit)
+    local_lane_result = (
+        _phase_skipped("local_lane") if _deadline_now() else self._local_lane(now=now, limit=limit)
+    )
 
     reviews: list[dict[str, Any]] = []
     merges: list[dict[str, Any]] = []
@@ -277,7 +346,12 @@ def _loop_body(
     merged_prs_for_tripwire: list[dict[str, Any]] | None = dispatch.data.get("merged_prs")
     if not merged_prs_for_tripwire:
         merged_prs_for_tripwire = None
-    for unauthorized in self._detect_unauthorized_merges(merged_prs_for_tripwire):
+    # Issue #1948: past the budget the tripwire's own merged_pr_list fetch
+    # (and any per-candidate lookups) must not start -- the check stands
+    # down for this pass and re-arms on the next one.
+    for unauthorized in (
+        () if _deadline_now() else self._detect_unauthorized_merges(merged_prs_for_tripwire)
+    ):
         reviewed_sha = unauthorized.get("reviewed_head_sha")
         live_sha = unauthorized.get("live_head_sha")
         if (
@@ -304,7 +378,10 @@ def _loop_body(
     open_tracked_prs = 0
     skipped_reviews = 0
     parked_prs: list[int] = []
-    prs = self.gh.pr_list()
+    # Issue #1948: the last fetch-gated boundary before the per-PR scan --
+    # once the budget is spent the scan runs on an empty list rather than
+    # starting a new review/merge round on the tail end of a dead budget.
+    prs = [] if _deadline_now() else self.gh.pr_list()
     # Snapshot for foreign-PR markers only: markers change at most once
     # per PR, so a single point-in-time read at loop start is sufficient.
     state_snapshot = _wf.load_state_locked(self.paths.state_file)
@@ -333,6 +410,11 @@ def _loop_body(
     # markers whose PR is no longer issue-less (the falling edge).
     linked_prs: dict[int, int] = {}
     for pr in prs:
+        # Issue #1948: stop the review/merge scan at the first PR after the
+        # budget is spent -- the remaining PRs defer to the next pass
+        # untouched rather than each accumulating its own gh call sequence.
+        if _deadline_now():
+            break
         issue_number = _wf.linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
@@ -782,6 +864,24 @@ def _loop_body(
         ):
             if key in data[lane]:
                 data[key] = data[lane][key]
+    # Issue #1948: mark a pass the in-pass deadline cut short. Fleet collects
+    # this key into ``deadline_partial_repo_keys`` -- distinct from a
+    # never-started deferred repo and from a hard failure -- and the
+    # per-pass event makes the cut attributable in events.db.
+    if deadline_hit:
+        data["deadline_deferred"] = True
+        message += " (partial: in-pass deadline reached)"
+        # write-gate-exempt(issue=1948): sibling raw log_event calls in _loop_body
+        log_event(
+            self.paths.state_file,
+            "loop_pass_deadline_deferred",
+            {
+                "reviews_completed": len(reviews),
+                "merges_completed": len(merges),
+                "open_tracked_prs": open_tracked_prs,
+            },
+            repo=self.repo_root.name,
+        )
     # Cadence-gated merged-PR worktree reclamation (issue #636). Runs at
     # the END of the pass so the per-candidate `gh pr view` fan-out never
     # contends with the dispatch/review/merge lanes for state_lock or
@@ -790,7 +890,10 @@ def _loop_body(
     # interval regardless of poll frequency or backlog size. `now`
     # (issue #828) is this pass's single injected clock -- see
     # `_loop_body`'s other cadence-gated calls above.
-    reclamation = self._maybe_reclaim_worktrees(now=now)
+    # Issue #1948: skipped outright once the budget is spent -- its
+    # per-candidate `gh pr view` fan-out is exactly the call sequence the
+    # deadline exists to bound.
+    reclamation = None if deadline_hit else self._maybe_reclaim_worktrees(now=now)
     if reclamation is not None:
         data["worktrees_reclaimed"] = reclamation
     return _wf.CommandResult(

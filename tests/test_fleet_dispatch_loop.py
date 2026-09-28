@@ -8,7 +8,7 @@ fixtures live in ``tests/_fleet_dispatch_fixtures.py``.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 from _fleet_dispatch_fixtures import (
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
@@ -123,8 +123,11 @@ def test_fleet_loop_calls_loop_per_repo(
     assert mock_app2.loop.call_count == 1
 
     # Verify loop() was called with correct args
-    mock_app1.loop.assert_called_once_with(3, merge=True)
-    mock_app2.loop.assert_called_once_with(3, merge=True)
+    # Issue #1948: the in-pass deadline predicate is now threaded into the
+    # lane's loop() call -- asserted loosely here (ANY); the predicate's
+    # own behavior is covered by test_fleet_lane_deadline.py.
+    mock_app1.loop.assert_called_once_with(3, merge=True, deadline_exceeded=ANY)
+    mock_app2.loop.assert_called_once_with(3, merge=True, deadline_exceeded=ANY)
 
     # Verify result includes both repos
     assert "repos" in result.data
@@ -190,7 +193,7 @@ def test_fleet_loop_ensure_labels_calls_ensure_per_repo(
     mock_app1.ensure_labels.assert_called_once()
     mock_app2.ensure_labels.assert_called_once()
     # The lane still ran after the ensure.
-    mock_app1.loop.assert_called_once_with(3, merge=True)
+    mock_app1.loop.assert_called_once_with(3, merge=True, deadline_exceeded=ANY)
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")
@@ -240,7 +243,7 @@ def test_fleet_loop_ensure_labels_failure_does_not_block_lane(
     )
 
     # The lane still ran despite the ensure raising.
-    mock_app.loop.assert_called_once_with(3, merge=True)
+    mock_app.loop.assert_called_once_with(3, merge=True, deadline_exceeded=ANY)
     assert "owner/repo1" in result.data["repos"]
 
 
