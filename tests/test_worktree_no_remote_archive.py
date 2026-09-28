@@ -165,6 +165,40 @@ def test_no_remote_archive_name_collision_gets_suffix(wt_scratch: Path) -> None:
     }
 
 
+def test_no_remote_archive_failure_falls_through_to_refusal(wt_scratch: Path) -> None:
+    """Fail-closed: when the archive ref itself cannot be created, the reset
+    must still refuse — a failed archive never permits discarding the tip.
+
+    A branch literally named ``archive`` pins ``refs/heads/archive`` as a
+    loose ref, so every ``archive/<branch>-<date>`` create fails with a ref
+    D/F conflict — a deterministic archive failure with no mocks. The
+    fall-through to capture-or-refuse is the core safety property of the
+    #1944 fix.
+    """
+    repo_root = wt_scratch / "repo"
+    _init_repo(repo_root)  # no origin remote
+    branch = "agent/issue-206-archive-failure"
+
+    info1 = create_worktree(repo_root, branch, base_ref="HEAD", issue_number=206)
+    old_tip = _commit_in(info1.path)
+    assert remove_worktree(repo_root, info1.path)
+    assert not info1.path.exists()
+
+    # refs/heads/archive now exists as a ref, so refs/heads/archive/<x> is
+    # un-creatable (D/F conflict) — _archive_unreachable_branch_tip must
+    # return None and the reset must refuse rather than reset anyway.
+    _git(repo_root, "branch", "archive")
+
+    with pytest.raises(WorktreeUnsafeError, match="local commit"):
+        create_worktree(repo_root, branch, base_ref="HEAD", issue_number=206)
+
+    # The refusal preserved everything: the diverged tip is intact on the
+    # agent branch, no archive ref was minted, and no new worktree exists.
+    assert _git(repo_root, "rev-parse", branch).stdout.strip() == old_tip
+    assert _archive_refs(repo_root, branch) == {}
+    assert not info1.path.exists()
+
+
 def test_no_remote_archive_kill_switch_off_still_refuses(wt_scratch: Path) -> None:
     """The config kill switch restores refuse-and-escalate when set false."""
     repo_root = wt_scratch / "repo"
