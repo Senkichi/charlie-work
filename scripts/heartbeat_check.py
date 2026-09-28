@@ -67,6 +67,24 @@ check_infra_blocked_events = _event_alarms.check_infra_blocked_events
 check_draft_pr_blocked_events = _event_alarms.check_draft_pr_blocked_events
 check_ci_headroom_unavailable = _event_alarms.check_ci_headroom_unavailable
 
+# Issue #1476: the config + worktree-path resolution helpers
+# (``load_orchestrator_config``, ``_slugify_branch``,
+# ``_resolved_worktrees_dir``, ``_worktree_path_for_branch``) live in the
+# sibling module scripts/heartbeat_worktree.py -- extraction for file-size
+# ratchet headroom, same importlib-loader pattern as heartbeat_event_alarms
+# above. Re-exported here so existing call sites and tests
+# (``hb._worktree_path_for_branch``, ``hb._slugify_branch``) keep resolving.
+_worktree_path = Path(__file__).resolve().parent / "heartbeat_worktree.py"
+_worktree_spec: Any = importlib.util.spec_from_file_location("_heartbeat_worktree", _worktree_path)
+_worktree_helpers = importlib.util.module_from_spec(_worktree_spec)
+sys.modules[_worktree_spec.name] = _worktree_helpers
+_worktree_spec.loader.exec_module(_worktree_helpers)
+
+load_orchestrator_config = _worktree_helpers.load_orchestrator_config
+_slugify_branch = _worktree_helpers._slugify_branch
+_resolved_worktrees_dir = _worktree_helpers._resolved_worktrees_dir
+_worktree_path_for_branch = _worktree_helpers._worktree_path_for_branch
+
 # --------------------------------------------------------------------------
 # CONSTANTS
 # --------------------------------------------------------------------------
@@ -645,9 +663,11 @@ def save_state(state: dict[str, Any]) -> None:
 # Worker worktree mtime signal (issue #1379)
 # --------------------------------------------------------------------------
 #
-# These helpers are stdlib-only reimplementations of layout/worktree helpers
-# this script cannot import (see scripts/README.md's "stdlib-only" invariant).
-# They mirror:
+# The worktree-path helpers themselves moved to the sibling module
+# scripts/heartbeat_worktree.py for file-size-ratchet headroom and are
+# re-exported above. They are stdlib-only reimplementations of
+# layout/worktree helpers this script cannot import (see
+# scripts/README.md's "stdlib-only" invariant). They mirror:
 #   - charlie_work.layout.worktrees_dir(state_root) -> state_root / "worktrees"
 #   - charlie_work.worktree._slugify(branch)
 #   - charlie_work.worktree.worktree_path_for_branch(root, branch, worktrees_dir)
@@ -655,61 +675,6 @@ def save_state(state: dict[str, Any]) -> None:
 # worktree-mtime tests will catch it (they build the worktree dir the same
 # way the orchestrator does, via the same slugify, so a slug mismatch
 # surfaces as a missing dir).
-
-
-def _slugify_branch(branch: str) -> str:
-    """Mirror ``charlie_work.worktree._slugify`` (stdlib-only reimplementation).
-
-    The production function lives in ``charlie_work.worktree``; this script
-    cannot import it (stdlib-only invariant, scripts/README.md). The two must
-    agree so the worktree path derived here matches the one the orchestrator
-    created. ``tests/test_heartbeat_check_in_progress_stale.py`` exercises
-    the same derivation against real branch names, so a drift surfaces as a
-    missing-dir test failure rather than a silent false ANOMALY.
-    """
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", branch).strip("-")
-    slug = re.sub(r"-+", "-", slug)
-    return slug[:80].rstrip("-") or "worktree"
-
-
-def _resolved_worktrees_dir(repo: RepoInfo) -> Path:
-    """Resolve the worktrees root for ``repo``, honouring ``claude_code.worktrees_dir``.
-
-    Mirrors ``charlie_work.paths.resolved_layout``'s worktrees resolution
-    (issue #1379 review): ``claude_code.worktrees_dir`` is a sentinel-style
-    override -- ``None``/empty means "derive from ``runtime.state_dir``"
-    (``<state_dir>/worktrees``), a non-empty value is an explicit path
-    (absolute returned as-is, relative joined to ``repo_root``). This script
-    cannot import ``charlie_work.config``/``paths`` (stdlib-only invariant,
-    scripts/README), so the resolution is reimplemented locally against the
-    config dict ``load_orchestrator_config`` already returns -- the same
-    reimplement-locally treatment ``fleet_dir`` and the stale-open-issue-mention
-    primitives use. A broken/unreadable config degrades to the default
-    (fail-toward-flagging: a missing worktree dir reads as ANOMALY, not OK).
-    """
-    default = repo.state_dir / "worktrees"
-    config, _error = load_orchestrator_config(repo.config_path)
-    raw = config.get("claude_code", {}).get("worktrees_dir")
-    if not raw or not isinstance(raw, str):
-        return default
-    candidate = Path(raw)
-    return candidate if candidate.is_absolute() else repo.repo_root / candidate
-
-
-def _worktree_path_for_branch(
-    repo: RepoInfo, branch: str, worktrees_dir: Path | None = None
-) -> Path:
-    """Return the worktree dir for ``branch`` under ``repo``'s worktrees root.
-
-    Mirrors ``charlie_work.worktree.worktree_path_for_branch``. The worktrees
-    root defaults to ``_resolved_worktrees_dir(repo)`` (which honours
-    ``claude_code.worktrees_dir``); pass ``worktrees_dir`` to override it
-    once (e.g. a caller that resolves it once for many branches). ``repo.state_dir``
-    is the state root (the directory holding ``state.json``, as registered in
-    fleet.json).
-    """
-    root = worktrees_dir if worktrees_dir is not None else _resolved_worktrees_dir(repo)
-    return root / _slugify_branch(branch)
 
 
 def _load_state_issues(repo: RepoInfo) -> dict[str, Any]:
@@ -808,37 +773,6 @@ def _newest_worktree_mtime(
                 if mt >= threshold:
                     return newest
     return newest
-
-
-def load_orchestrator_config(config_path: Path) -> tuple[dict[str, Any], str | None]:
-    """Load an orchestrator.config.yaml.
-
-    Returns (config, error). error is None when the config is legitimately
-    absent -- including an unset config_path, which load_repos() represents
-    as Path("") (== Path("."), the "no config registered for this repo"
-    sentinel -- deliberately not treated as cwd-relative) -- or when the file
-    parses cleanly to a mapping. error is a message when config_path is set
-    and points at something that exists but fails to read, isn't valid UTF-8,
-    fails to parse as YAML, or parses to something other than a mapping.
-    That "present but broken" case (issue #703) must not be treated the same
-    as "absent" -- callers that need it surfaced use check_orchestrator_config
-    below rather than reading the error here.
-    """
-    if config_path == Path(""):
-        return {}, None
-    try:
-        if not config_path.exists():
-            return {}, None
-        raw = config_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        return {}, f"{config_path}: {exc}"
-    try:
-        data = yaml.safe_load(raw) or {}
-    except yaml.YAMLError as exc:
-        return {}, f"{config_path}: invalid YAML: {exc}"
-    if not isinstance(data, dict):
-        return {}, f"{config_path}: expected a mapping at top level, got {type(data).__name__}"
-    return data, None
 
 
 def get_mergequeue_label(config_path: Path) -> str | None:
