@@ -14,18 +14,20 @@ daemon's world, not its own checkout's. The consumer half (the heartbeat
 script's verdict) lives in ``scripts/heartbeat_check.py`` on top of
 ``notify_digest_check.py``.
 
-Imported only by ``fleet_dispatch`` -- this module pulls in
+Imported by ``fleet_dispatch`` and ``cli`` -- this module pulls in
 ``instrumentation`` (and transitively ``ci_fleet``), so it is deliberately
 NOT a leaf like ``notify_digest_check``.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from pathlib import Path
 from typing import Any
 
+from . import layout
 from .instrumentation import log_event
 from .notify import digest_file_status
 from .notify_digest_check import NOTIFY_DIGEST_STALE_HOURS
@@ -69,6 +71,36 @@ def _resolve_for_event(file_path: str) -> str | None:
             return str(Path(file_path).absolute())
         except (OSError, RuntimeError, ValueError):
             return file_path
+
+
+def resolve_fleet_notify(notify_config: Any, state_root: Path) -> Any:
+    """Resolve the ``file_path=""`` sentinel for a fleet-level notify config.
+
+    ``NotifyConfig.file_path`` documents the empty string as "derive from
+    ``runtime.state_dir``" -- a substitution ``paths.resolved_layout``
+    performs per repo against that repo's own state root. The fleet
+    supervisor never runs that pass (it has no single repo root), so the
+    raw sentinel reached ``_file_sink`` and every fleet-level emit failed
+    "file_path is empty" while ``report_notify_resolution`` flagged the
+    state as misconfigured on every supervisor start (issue #1899). The
+    fleet analog of the per-repo anchor is the supervisor's own
+    bookkeeping root -- ``supervisor_runtime_paths(runtime.state_dir).root``
+    -- which callers compute once and pass in here so the report, the
+    staleness probe, and every emit all agree on one path.
+
+    ``None`` stays ``None`` (absent notify section); non-dataclass
+    stand-ins (test doubles) pass through untouched because
+    ``dataclasses.replace`` cannot rebuild them; an explicit
+    ``file_path`` -- relative or absolute -- is the operator's own choice
+    and is preserved verbatim. The frozen source config is never mutated.
+    """
+    if notify_config is None or not dataclasses.is_dataclass(notify_config):
+        return notify_config
+    if getattr(notify_config, "file_path", ""):
+        return notify_config
+    return dataclasses.replace(
+        notify_config, file_path=str(layout.notify_digest_default(state_root))
+    )
 
 
 def check_notify_digest_freshness(

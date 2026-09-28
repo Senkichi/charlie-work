@@ -36,6 +36,7 @@ from charlie_work.checks import (
     summarize_checks,
 )
 from charlie_work.issue_linking import linked_issue_number
+from charlie_work.no_op_rework_body import _body_rework_escape_warning
 from charlie_work.safe_ref import require_valid_ref_name, require_valid_sha
 from charlie_work.subprocess_runner import run_captured
 
@@ -361,13 +362,22 @@ def run_janitor(
     check that depends on it is skipped rather than failed.
 
     ``review_decision`` is the recorded review-decision mapping for this PR
-    (``prs/pr-N/review-decision.json`` content), used only by the issue #1116
-    stale-CI skip: when the verdict is a non-escalated request_changes whose
-    findings all cite required checks that are green now
-    (``is_stale_ci_verdict``), the no-op rework check is skipped so the gate
-    can pass and the packet/fresh-review machinery can run. ``None`` (or any
-    non-stale decision) preserves the existing behavior — the predicate fails
-    closed on red, pending, missing, or unavailable checks.
+    (``prs/pr-N/review-decision.json`` content). It feeds two narrow
+    exceptions to the no-op rework check:
+
+    * the issue #1116 stale-CI skip: when the verdict is a non-escalated
+      request_changes whose findings all cite required checks that are
+      green now (``is_stale_ci_verdict``), the no-op rework check is
+      skipped so the gate can pass and the packet/fresh-review machinery
+      can run. ``None`` (or any non-stale decision) preserves the
+      existing behavior — the predicate fails closed on red, pending,
+      missing, or unavailable checks;
+    * the issue #1939 body-change escape inside ``_check_no_op_rework``:
+      an unchanged patch-id/head is satisfied (not a no-op) when the PR
+      body's hash differs from the verdict's ``reviewed_body_sha256``
+      baseline — a body-only rework produces no code delta by
+      construction. A missing baseline or a ``pr`` without a ``body``
+      key fails closed.
 
     ``issue_labels`` (issue #1598) is the set of live labels on the PR's
     bound issue, when the caller already has them. When provided and any
@@ -558,6 +568,59 @@ def run_janitor(
         missing_required_checks=missing_required_checks,
         is_missing_checks_only_block=is_missing_checks_only_block,
     )
+
+
+def _unwind_skipped_rerun_attempts(
+    infra_rerun_attempts: dict[str, Any],
+    head_key: str,
+    skipped_run_ids: set[int],
+) -> dict[str, Any]:
+    """Return ``infra_rerun_attempts`` with each ``skipped_run_ids``
+    pre-increment undone, without mutating the caller's map.
+
+    ``classify_infra_failures`` increments the per-head counter for every
+    eligible run id before the driver decides what to do with it. An id
+    this pass deferred without dispatching -- the containing run still
+    reads in progress on probe -- must not keep that increment: the
+    bounded attempt is spent only when ``gh run rerun`` is actually
+    called, so persisting the map unmodified would march a skipped run
+    toward cap exhaustion (and early escalation) on attempts it never
+    spent. Entries emptied by the unwind are dropped so the persisted map
+    matches what the classifier would have produced had the run never
+    been eligible this pass. Map shape mirrors the classifier's:
+    ``{head_sha: {check_name: {run_id_str: count}}}``.
+    """
+    if not skipped_run_ids or not head_key:
+        return infra_rerun_attempts
+    head_attempts = infra_rerun_attempts.get(head_key)
+    if not isinstance(head_attempts, dict):
+        return infra_rerun_attempts
+    skipped = {str(run_id) for run_id in skipped_run_ids}
+    unwound_head: dict[str, Any] = {}
+    for name, name_attempts in head_attempts.items():
+        if not isinstance(name_attempts, dict):
+            unwound_head[name] = name_attempts
+            continue
+        counts = dict(name_attempts)
+        for key in skipped:
+            if key not in counts:
+                continue
+            try:
+                remaining = int(counts[key]) - 1
+            except (TypeError, ValueError):
+                continue
+            if remaining > 0:
+                counts[key] = remaining
+            else:
+                del counts[key]
+        if counts:
+            unwound_head[name] = counts
+    unwound = dict(infra_rerun_attempts)
+    if unwound_head:
+        unwound[head_key] = unwound_head
+    else:
+        unwound.pop(head_key, None)
+    return unwound
 
 
 def _check_draft(pr: dict[str, Any], failures: list[str]) -> bool:
@@ -834,6 +897,15 @@ def _check_no_op_rework(
     # leaves this check acting on stale state.json (the #1340 divergence class).
     decision = (review_decision or {}).get("decision")
     if decision != "request_changes":
+        return False
+
+    # Issue #1939: a body-only rework produces no code delta, so a changed
+    # PR body satisfies the gate; the comparison lives in
+    # no_op_rework_body._body_rework_escape_warning (extracted per the
+    # file-size ratchet). No baseline or no ``body`` key fails closed.
+    body_escape_warning = _body_rework_escape_warning(pr, pr_state, review_decision)
+    if body_escape_warning is not None:
+        warnings.append(body_escape_warning)
         return False
 
     # Primary check: compare patch-ids when both are available

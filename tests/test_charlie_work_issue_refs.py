@@ -49,6 +49,77 @@ def test_issue_numbers_mentioned_by_pr_ignores_blockquoted_lines() -> None:
     assert issue_numbers_mentioned_by_pr(pr) == set()
 
 
+def test_issue_numbers_mentioned_by_pr_desync_fence_with_inner_backticks() -> None:
+    """Issue #1819: a fenced block whose own content contains a triple-
+    backtick run desynced the old nearest-pair regex — it closed the
+    "block" at the first inline ``` and scanned the remaining fenced
+    content as prose, harvesting mentions out of code samples. The fence
+    model is now the same line-based ``_fenced_block_ranges`` that
+    ``parse_blockers`` uses."""
+    pr = {
+        "title": "",
+        "body": (
+            "See the fenced-block helper below.\n\n"
+            "```python\n"
+            'example = "```see issue #42```"  # sample text in a docstring\n'
+            "# NOTE: this comment about issue #555 is CODE, not prose\n"
+            "```\n"
+        ),
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr) == set()
+
+
+def test_issue_numbers_mentioned_by_pr_mention_after_fenced_block_still_counts() -> None:
+    """The shared fence model must not over-suppress: a genuine mention on
+    prose lines outside the fenced block still counts."""
+    pr = {
+        "title": "",
+        "body": "```\nissue #42 lives in a code sample\n```\nReal mention: issue #7.",
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr) == {7}
+
+
+def test_issue_numbers_mentioned_by_pr_ignores_tilde_fenced_block() -> None:
+    """``~~~`` fences are equivalent to triple-backtick fences in CommonMark
+    and are excluded by the shared fence model (the naive regex only knew
+    about ```)."""
+    pr = {"title": "", "body": "~~~\nsee issue #42\n~~~\n"}
+
+    assert issue_numbers_mentioned_by_pr(pr) == set()
+
+
+def test_issue_numbers_mentioned_by_pr_ignores_inline_code_span() -> None:
+    """Issue #1819 + PR #1904 review: the naive regex incidentally stripped
+    inline ```...``` runs (3+ backticks); the replacement keeps that
+    suppression via a clause-scoped guard restricted to runs of 3+.
+    Single-backtick code spans are NOT suppressed — suppressing them was out
+    of scope for #1819 and drops genuine mentions, so `` `issue #42` ``
+    counts as a mention."""
+    pr = {
+        "title": "",
+        "body": "match `issue #42` or ```issue #43``` in code, not issue #9",
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr) == {9, 42}
+
+
+def test_issue_numbers_mentioned_by_pr_dot_in_code_span_keeps_later_mention() -> None:
+    """PR #1904 review regression: a ``.`` inside an earlier single-backtick
+    code span is a clause boundary, so the span's closing backtick lands in
+    the next clause and pairs with a later span's opening backtick —
+    enveloping and suppressing a genuine prose mention between them. A
+    single-backtick guard fails in the unsafe direction for a dispatch
+    gate; single-backtick spans must not suppress."""
+    pr = {
+        "title": "",
+        "body": "`worktree.py` covers it (issue #5) and `foo` too.",
+    }
+
+    assert issue_numbers_mentioned_by_pr(pr) == {5}
+
+
 def test_issue_numbers_mentioned_by_pr_suppresses_visibility_qualified_mentions() -> None:
     """Issue #1803: ``private issue #N`` / ``internal issue #N`` name another
     repo's tracker (the jobcannon docs rewrite that produced the #377/#391

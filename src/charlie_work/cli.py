@@ -40,7 +40,6 @@ from .experiment_report_command import (
 from .config import ConfigError, OrchestratorConfig, find_config_path
 from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import (
-    compute_api_worker_fleet_report,
     fleet_loop,
     run_allocation_pass_with_ci_fleet_guard,
     run_fleet_supervise,
@@ -53,6 +52,10 @@ from .supervise_loop import (
 )
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
+from .fleet_status import (  # noqa: F401  (deliberate re-export)
+    FLEET_STATUS_REPO_TIMEOUT_SECONDS,
+    run_fleet_status,
+)
 from .fleet_stop import register_fleet_stop_subparser, run_fleet_stop
 from .global_config import load_layered_config
 from .github import (
@@ -66,12 +69,18 @@ from .dirty_tree import check_working_tree_clean
 from .logging_setup import configure_logging
 from .instrumentation import query_events
 from .notify import AttentionDigest, AttentionEntry, emit_digest
+from .notify_freshness import resolve_fleet_notify
 from .paths import RepoNotFoundError, RuntimePaths, find_repo_root, resolved_layout, runtime_paths
 from .quiesce import check_quiescence
 from .state import StateLockBusy, load_state_locked, utc_now
 from .subprocess_runner import run_captured
 from .state_migration import apply_state_dir_migration, gather_migration_inputs
-from .supervise import orchestrator_root, self_deploy, supervisor_runtime_paths
+from .supervise import (
+    DEFAULT_SYNC_STARVATION_SECONDS,
+    orchestrator_root,
+    self_deploy,
+    supervisor_runtime_paths,
+)
 from ci_fleet.charlie_work_adapter import (
     CLI_ALLOCATION_SOURCE,
     UNATTENDED_ALLOCATION_SOURCE,
@@ -1297,6 +1306,14 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # The supervisor's own bookkeeping root is resolved via the dedicated
     # helper, which binds the phantom-state-dir opt-out (issue #1754).
     state_root = supervisor_runtime_paths(state_dir).root
+    # Issue #1899: resolve the notify.file_path "" sentinel against the same
+    # bookkeeping root the supervisor uses, so the self-deploy digests below
+    # land at the path the supervisor's notify_resolution event publishes
+    # rather than failing "file_path is empty" under the documented default.
+    notify_config = resolve_fleet_notify(
+        getattr(global_config, "notify", None) if global_config else None,
+        state_root,
+    )
     deploy = self_deploy(
         orchestrator_root(),
         state_root=state_root,
@@ -1307,10 +1324,14 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
             if global_config is not None
             else False
         ),
+        starvation_seconds=(
+            global_config.supervisor.dependency_sync_starvation_seconds
+            if global_config is not None
+            else DEFAULT_SYNC_STARVATION_SECONDS
+        ),
     )
     if not deploy.ok:
         print(f"self-deploy skipped: {deploy.error}", flush=True)
-        notify_config = getattr(global_config, "notify", None) if global_config else None
         if (
             deploy.alertable
             and notify_config is not None
@@ -1337,7 +1358,6 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         print(f"self-deploy: {deploy.message}", flush=True)
     elif deploy.venv_repaired:
         print(f"self-deploy: {deploy.message}", flush=True)
-        notify_config = getattr(global_config, "notify", None) if global_config else None
         if notify_config is not None and getattr(notify_config, "enabled", False):
             attention_digest = AttentionDigest(
                 generated_at=utc_now(),
@@ -1354,6 +1374,15 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
                 ),
             )
             emit_digest(notify_config, attention_digest)
+    elif deploy.starved:
+        # Issue #1855: a pending dependency sync starved past its bound —
+        # this pass launches nothing new so live workers can drain to zero
+        # and the sync can land (same posture as `fleet stop --drain`).
+        print(
+            f"self-deploy: {deploy.message} -- starvation bound reached; "
+            "dispatch suppressed this pass",
+            flush=True,
+        )
 
     return fleet_loop(
         fleet_dir_override=args.fleet_dir,
@@ -1363,6 +1392,7 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         merge=args.merge,
         dry_run=args.dry_run,
         work_only=False,
+        drain=deploy.starved,
     )
 
 
@@ -1385,63 +1415,6 @@ def run_fleet_supervise_command(args: argparse.Namespace) -> CommandResult:
         dry_run=args.dry_run,
         poll_interval_override=args.poll_interval,
         max_runtime_override=args.max_runtime,
-    )
-
-
-def run_fleet_status(args: argparse.Namespace) -> CommandResult:
-    """Run fleet status aggregation across all registered repos.
-
-    This is a read-only command that:
-    - Loads the fleet registry from fleet.json
-    - For each registered repo, calls OrchestratorApp.status() with dry_run=True
-    - Aggregates results keyed by repo_key (nameWithOwner)
-    - Isolates per-repo errors (missing/broken repos) without aborting the whole aggregation
-
-    Note: This command does not include per-worker health fields yet. That will be added
-    in a follow-up issue (#167) once the worker health abstraction lands.
-    """
-    fleet_json_path = layout.fleet_registry_path()
-    registry = _load_registry(fleet_json_path)
-    per_repo: dict[str, Any] = {}
-    errors: list[dict[str, str]] = []
-    # Issue #1372: stale entries (repo_root no longer exists) are reported in a
-    # separate "stale" list that does NOT flip ok/exit-code, so one corpse
-    # cannot degrade fleet-wide tooling (e.g. the heartbeat's blocked-issue
-    # enrichment that treats any nonzero exit as degraded).
-    stale: list[dict[str, str]] = []
-
-    for repo_key, entry in sorted(registry.get("repos", {}).items()):
-        try:
-            repo_root = Path(entry.get("repo_root") or "")
-            if not repo_root.exists():
-                # Issue #1372: a stale entry is not a live failing lane —
-                # report it separately so it does not affect the exit code.
-                stale.append({"repo_key": repo_key, "repo_root": str(repo_root)})
-                continue
-
-            config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
-            paths = runtime_paths(repo_root, config.runtime.state_dir)
-            gh = github_client_for(repo_root, config, github=GitHub, dry_run=True)
-            app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
-            result = app.status(use_cache=not getattr(args, "no_cache", False))
-            per_repo[repo_key] = result.data
-        except (RepoNotFoundError, ConfigError, GitHubError, OSError) as exc:
-            errors.append({"repo_key": repo_key, "error": str(exc)})
-
-    # api-worker fleet report line (issue #483): read-only, never raises.
-    api_worker_report = compute_api_worker_fleet_report(fleet_dir_override=args.fleet_dir)
-
-    return CommandResult(
-        ok=not errors,
-        message=f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s), {len(stale)} stale(s)",
-        data={
-            "repos": per_repo,
-            "errors": errors,
-            "stale": stale,
-            "api_worker_report": api_worker_report.to_dict()
-            if api_worker_report is not None
-            else None,
-        },
     )
 
 

@@ -65,6 +65,7 @@ the list-then-cancel race window. This mirrors
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 from .git_retry import RetryOutcome, run_git_with_retry
@@ -174,6 +175,79 @@ def _is_strict_ancestor(repo_root: Path, ancestor_sha: str, descendant_sha: str)
     return result.ok
 
 
+def _ssh_remote_url_to_https(url: str) -> str | None:
+    """Return the ``https://`` equivalent of an SSH git remote URL, else None.
+
+    Handles both URL forms git accepts for SSH remotes:
+
+    - scp-like ``[user@]host:path`` -- what ``git@github.com:o/r.git`` is;
+    - explicit ``ssh://[user@]host[:port]/path``.
+
+    The userinfo and (for ``ssh://``) the port are dropped: neither has an
+    HTTPS counterpart, and credentials for the HTTPS fetch come from the
+    host's credential-helper chain (``gh auth git-credential`` where ``gh
+    auth setup-git`` ran, or the platform manager), never from the URL
+    itself.
+
+    Returns None for anything not SSH-shaped -- ``https://`` URLs (already on
+    the credential-helper path), ``git://``, ``file://``, local paths -- and
+    for SSH URLs whose host is not a dotted name (single-label hostnames and
+    ssh-config aliases): rewriting those to ``https://<host>/`` is more
+    likely to break a working non-DNS setup than to fix one, so they keep the
+    original SSH fetch behavior.
+    """
+    if url.lower().startswith("ssh://"):
+        authority, sep, path = url[len("ssh://") :].partition("/")
+        if not sep or not path:
+            return None
+        host = authority.rsplit("@", 1)[-1].split(":", 1)[0]
+    else:
+        # scp-like: git treats '<something>:<path>' with no '://' scheme
+        # marker and the ':' before any '/' as [user@]host:path.
+        first_colon = url.find(":")
+        first_slash = url.find("/")
+        if "://" in url or first_colon <= 0 or (0 <= first_slash < first_colon):
+            return None
+        host = url[:first_colon].rsplit("@", 1)[-1]
+        path = url[first_colon + 1 :]
+        if ":" in path:
+            return None
+    if not host or "." not in host or not path:
+        return None
+    return f"https://{host}/{path}"
+
+
+def _origin_https_rewrite_args(repo_root: Path) -> list[str]:
+    """Return ``git -c url.<https>.insteadOf=<url>`` argv for one fetch, or [].
+
+    ``origin`` on a managed repo may be an SSH URL (``git@host:...``). Every
+    other orchestrator<->GitHub operation authenticates through the ``gh``
+    token over HTTPS; this fetch was the one place that instead depended on
+    an ssh-agent the supervisor context does not reliably have, and
+    ``Permission denied (publickey)`` from it produced recurring
+    ``main_ci_reclaim_failed`` noise (issue #1885). Rewriting the URL per
+    invocation -- rather than fetching a literal URL or another remote name
+    -- keeps remote semantics intact: the configured refspec still updates
+    ``refs/remotes/origin/<branch>`` exactly as ``git fetch origin`` would.
+
+    Returns [] when ``origin`` is absent/unreadable or its URL is not
+    SSH-shaped: the fetch then behaves exactly as before, including surfacing
+    whatever error it always would have.
+    """
+    result = run_captured(
+        ["git", "remote", "get-url", "origin"],
+        cwd=repo_root,
+        timeout_seconds=_GIT_TIMEOUT_SECONDS,
+    )
+    if not result.ok:
+        return []
+    url = result.stdout.strip()
+    https_url = _ssh_remote_url_to_https(url)
+    if https_url is None:
+        return []
+    return ["-c", f"url.{https_url}.insteadOf={url}"]
+
+
 def reclaim_superseded_main_ci_runs(
     gh: GitHubLike,
     repo_root: Path,
@@ -197,6 +271,14 @@ def reclaim_superseded_main_ci_runs(
     codepath happens to fetch it. Wrapped in ``run_git_with_retry`` (issue
     #1773): a fetch is read-only/idempotent, so a transient TLS/connection
     blip -- previously a whole-pass failure -- is retried in place instead.
+
+    Issue #1885: the fetch still names the ``origin`` remote (so its
+    configured refspec keeps updating ``refs/remotes/origin/<branch>``), but
+    an SSH-shaped ``origin`` URL is rewritten to ``https://`` for this one
+    invocation -- see ``_origin_https_rewrite_args``. ``GIT_TERMINAL_PROMPT``
+    is pinned to ``0`` so a credential-less HTTPS fetch can never block a
+    fleet pass on a username/password prompt; it fails fast instead (mirrors
+    ``worktree.py``'s remote-capture convention).
     """
     fetch_attempts = 1
 
@@ -204,10 +286,18 @@ def reclaim_superseded_main_ci_runs(
         nonlocal fetch_attempts
         fetch_attempts = outcome.attempts
 
+    fetch_command = [
+        "git",
+        *_origin_https_rewrite_args(repo_root),
+        "fetch",
+        "origin",
+        default_branch,
+    ]
     fetch_result = run_git_with_retry(
-        ["git", "fetch", "origin", default_branch],
+        fetch_command,
         cwd=repo_root,
         timeout_seconds=_FETCH_TIMEOUT_SECONDS,
+        run_command=partial(run_captured, extra_env={"GIT_TERMINAL_PROMPT": "0"}),
         on_retry=_capture_fetch_retry,
     )
     if not fetch_result.ok:
@@ -221,7 +311,7 @@ def reclaim_superseded_main_ci_runs(
             # being able to see (finding 1's positive control needs real
             # stderr in events.db to validate against, not "exited 128").
             error=command_failure_message(
-                ["git", "fetch", "origin", default_branch],
+                fetch_command,
                 fetch_result,
                 "fetch failed",
             ),

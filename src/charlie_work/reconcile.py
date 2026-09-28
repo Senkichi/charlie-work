@@ -61,6 +61,7 @@ from .merge_finalize import _merged_issue_fields
 from .paths import resolved_layout, runtime_paths
 from .pr_create_retry import create_pr_with_retry
 from .process_utils import kill_process_tree
+from .queue_bot import is_queue_bot_pr  # noqa: F401 (deliberate re-export)
 from .review_decision import review_decision as _resolve_review_decision
 from .state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
@@ -117,7 +118,9 @@ class DriftItem:
     # "dead_session_no_open_pr"); ``failure_kind`` is the classifier's
     # optional refinement (may be None when classification was inconclusive).
     # Both are threaded into the ``reconcile`` event payload by apply_fixes.
-    # Unused by every other kind.
+    # ``failure_kind`` is also the payload a ``dead_worker_failure_kind``
+    # item (#1917) stamps onto the issue entry. ``reason`` stays unused by
+    # every other kind.
     reason: str | None = None
     failure_kind: str | None = None
     # Issue #1402: structured "why" for ``mergequeue_revoked`` drift items, so
@@ -322,6 +325,12 @@ def _normalize_reconcile_pr(pr: dict[str, Any]) -> dict[str, Any]:
         else:
             state = "OPEN"
 
+        # REST ``user`` -> ``author`` normalization: the REST ``pulls`` endpoint
+        # names the author object ``user``; ``gh pr list --json`` names it
+        # ``author``. Queue-bot filtering (Aviator parallel mode) reads
+        # ``author.login`` to skip bot-created draft PRs fleet-wide.
+        raw_user = pr.get("user")
+        author = {"login": raw_user.get("login")} if isinstance(raw_user, dict) else None
         return {
             "number": pr.get("number"),
             "title": pr.get("title"),
@@ -331,6 +340,8 @@ def _normalize_reconcile_pr(pr: dict[str, Any]) -> dict[str, Any]:
             "body": pr.get("body"),
             "state": state,
             "labels": pr.get("labels", []),
+            "author": author,
+            "isDraft": bool(pr.get("draft")),
             "isCrossRepository": is_cross_repository,
             "headRefOid": head.get("sha"),
             # Issue #1398: the REST ``pulls`` endpoint names this ``closed_at``
@@ -528,6 +539,8 @@ def detect_aviator_stale_blocked(
     """
     drift: list[DriftItem] = []
     for pr in _fetch_prs(gh):
+        if is_queue_bot_pr(pr, config):
+            continue
         if str(pr.get("state") or "").upper() != "OPEN":
             continue
         if "blocked" not in label_names(pr):
@@ -764,9 +777,17 @@ def detect_mergequeue_not_approved(
         return []
     drift: list[DriftItem] = []
     for pr in _fetch_prs(gh):
+        if is_queue_bot_pr(pr, config):
+            continue
         if str(pr.get("state") or "").upper() != "OPEN":
             continue
         if mergequeue_label not in label_names(pr):
+            continue
+        # Fleet-owned PRs only: a non-prefix branch never gets a fleet
+        # review-decision.json, so the operator's own ``mergequeue`` label
+        # there IS the approval -- revoking it only ever undid operator
+        # queueing (and closed the Aviator draft batching it).
+        if not str(pr.get("headRefName") or "").startswith(config.dispatch.branch_prefix):
             continue
         pr_number = pr.get("number")
         head_sha = pr.get("headRefOid")
@@ -921,6 +942,8 @@ def detect_mergequeue_wedged(
     # behavior (fail open) rather than blocking the wedge sweep.
     branch_validator = build_branch_issue_validator(gh)
     for pr in _fetch_prs(gh):
+        if is_queue_bot_pr(pr, config):
+            continue
         if str(pr.get("state") or "").upper() != "OPEN":
             continue
         names = label_names(pr)
@@ -1254,6 +1277,8 @@ def detect_drift(
         _pr_num = _pr.get("number")
         if _pr_num is None:
             continue
+        if is_queue_bot_pr(_pr, config):
+            continue
         _issue_num = linked_issue_number(
             _pr,
             is_cross_repository=_pr.get("isCrossRepository"),
@@ -1279,6 +1304,9 @@ def detect_drift(
         if pr_number is None:
             continue
         pr_number = int(pr_number)
+        # Aviator parallel-mode draft PRs: see queue_bot.is_queue_bot_pr.
+        if is_queue_bot_pr(pr, config):
+            continue
         gh_state = str(pr.get("state") or "").upper()
         issue_number = linked_issue_number(
             pr,
@@ -1808,6 +1836,29 @@ def detect_drift(
                             )
                         else:
                             failure_kind, throttled_until = None, None
+
+                    if failure_kind:
+                        # Issue #1917: persist the classification on the
+                        # issue entry so workflow.py's state.json-keyed
+                        # orphan sweep — which runs after the sidecar is
+                        # reaped just below — can exempt provider-throttle
+                        # deaths (is_provider_throttle_failure) from its
+                        # dead_dispatched_reap_minutes escalation and the
+                        # orphan-redispatch cap, matching the #1684
+                        # exemption the rework lanes already apply.
+                        drift.append(
+                            DriftItem(
+                                kind="dead_worker_failure_kind",
+                                issue_number=w.issue_number,
+                                pr_number=None,
+                                detail=(
+                                    f"issue #{w.issue_number} dead worker classified "
+                                    f"failure_kind={failure_kind}"
+                                ),
+                                fix_actions=(f"stamp dead_worker_failure_kind={failure_kind}",),
+                                failure_kind=failure_kind,
+                            )
+                        )
 
                     if failure_kind and throttled_until:
                         # Update state with throttle window
@@ -3191,6 +3242,21 @@ def apply_fixes(
                         adapter_kind=item.throttle_adapter_kind,
                     )
                     break
+
+        elif item.kind == "dead_worker_failure_kind":
+            # Issue #1917: persist the dead worker's classification on the
+            # issue entry so the state.json-keyed orphan sweep can exempt
+            # provider-throttle deaths from its timed reap and
+            # orphan-redispatch cap. Never invents an issue entry — an
+            # untracked session has no orphan-sweep bookkeeping to exempt.
+            if item.issue_number is not None and item.failure_kind is not None:
+                issue_key = str(item.issue_number)
+                existing_issue = new_issues.get(issue_key)
+                if isinstance(existing_issue, dict):
+                    new_issues[issue_key] = {
+                        **existing_issue,
+                        "dead_worker_failure_kind": item.failure_kind,
+                    }
 
         elif item.kind == "session_failed_escalated":
             # Issue #261: worker was killed by a push-gate hook — escalate

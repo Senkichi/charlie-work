@@ -16,6 +16,7 @@ from _fleet_dispatch_fixtures import (
     _make_repo,
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
+    _per_repo_runtime_paths,
 )
 from charlie_work import layout
 from charlie_work.config import (
@@ -93,9 +94,8 @@ def test_fleet_loop_lane_failure_reaches_real_emit_digest(
         return OrchestratorConfig()
 
     mock_load_layered_config.side_effect = _load_layered_config_side_effect
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     mock_app2 = MagicMock()
     mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
@@ -168,9 +168,8 @@ def test_fleet_loop_dry_run_propagates(
     # Mock config and paths
     mock_config = OrchestratorConfig()
     mock_load_layered_config.return_value = mock_config
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     # Mock OrchestratorApp
     mock_app = MagicMock()
@@ -241,9 +240,8 @@ def test_fleet_loop_digest_aggregation(
     # Mock config and paths
     mock_config = OrchestratorConfig()
     mock_load_layered_config.return_value = mock_config
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     # Mock OrchestratorApp instances with attention events
     mock_app1 = MagicMock()
@@ -334,9 +332,8 @@ def test_fleet_loop_actually_reaches_the_allocation_pass(
         }
     }
     mock_load_layered_config.return_value = OrchestratorConfig()
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
     mock_app = MagicMock()
     mock_app.loop.return_value = CommandResult(True, "ok", {})
     mock_app_class.return_value = mock_app
@@ -421,9 +418,8 @@ def test_fleet_loop_converged_pass_does_not_emit_digest(
         }
     }
     mock_load_layered_config.return_value = OrchestratorConfig()
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
     mock_app = MagicMock()
     mock_app.loop.return_value = CommandResult(True, "ok", {})
     mock_app_class.return_value = mock_app
@@ -520,9 +516,8 @@ def test_fleet_loop_empty_events_still_builds_digest_when_notify_on(
         }
     }
     mock_load_layered_config.return_value = OrchestratorConfig()
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
     mock_app = MagicMock()
     mock_app.loop.return_value = CommandResult(True, "ok", {})
     mock_app_class.return_value = mock_app
@@ -619,9 +614,8 @@ def test_fleet_loop_gc_health_baseline_for_unregistered_repo(
         }
     }
     mock_load_layered_config.return_value = OrchestratorConfig()
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
     mock_app = MagicMock()
     mock_app.loop.return_value = CommandResult(True, "ok", {})
     mock_app_class.return_value = mock_app
@@ -706,9 +700,8 @@ def test_fleet_loop_records_fleet_lane_completed_event(
     (tmp_path / "repo2").mkdir()
 
     mock_load_layered_config.return_value = OrchestratorConfig()
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     mock_app1 = MagicMock()
     mock_app2 = MagicMock()

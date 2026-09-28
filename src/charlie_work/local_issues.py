@@ -28,13 +28,14 @@ The surface splits in two:
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
-from .config import OrchestratorConfig
+from .config import DispatchConfig, OrchestratorConfig
 from .github import GitHubError, GitHubLike, GitHubRunResult
 from .github_capabilities.pull_requests import MergedPRSearchResult
 from .outbound_body_guard import (
@@ -53,11 +54,54 @@ from .local_issue_files import (
     scan_issues,
     write_text_atomic,
 )
+from .local_lane import branch_head_sha, is_ancestor, worker_branch_heads
 from .safe_path import require_contained
 
 logger = logging.getLogger(__name__)
 
 _NO_REMOTE = "local-file issue source: this repo has no GitHub remote"
+
+# How ``local_work_park._post_branch_comment`` records the worker branch on
+# the issue itself: "Work for this issue is committed on branch `<name>`."
+_PARK_COMMENT_BRANCH_RE = re.compile(r"committed on branch `([^`]+)`")
+
+
+def _closed_issue_work_unlanded(repo_root: Path, branch_prefix: str, issue: LocalIssue) -> bool:
+    """True when a closed issue's worker branch is not contained in local HEAD.
+
+    On this backend nothing sits between "worker finished" and "issue
+    closed": a human flips ``state: closed`` by hand, and can do it before
+    (or without ever) merging the branch the work lives on. When such a
+    branch exists and its tip is not an ancestor of ``HEAD``, the closed
+    frontmatter is not proof the deliverable landed, so the issue still
+    blocks its dependents (issue #1820).
+
+    Candidate branch names come from the two channels the pipeline already
+    writes: the park comment naming the branch on the issue
+    (``local_work_park._post_branch_comment``) and the live
+    ``refs/heads/{branch_prefix}-{n}[-*]`` namespace (which also covers an
+    issue closed while a dispatched worker's branch was still in flight).
+    A candidate whose ref no longer resolves is skipped rather than counted
+    as unlanded: merged-then-deleted is the default lane's own end state
+    (``auto_merge.delete_branch``), so demanding the ref would wedge every
+    dependent behind a normal merge.
+
+    Fails open on a non-git ``repo_root``: with no repository there is no
+    branch evidence to weigh, and ``state: closed`` keeps its historical
+    verdict.
+    """
+    if not (repo_root / ".git").exists():
+        return False
+    heads = worker_branch_heads(repo_root, branch_prefix, issue.number)
+    for comment in issue.comments:
+        for match in _PARK_COMMENT_BRANCH_RE.finditer(comment):
+            name = match.group(1).strip().removeprefix("refs/heads/")
+            if name and name not in heads:
+                tip = branch_head_sha(repo_root, name)
+                if tip is not None:
+                    heads[name] = tip
+    return any(not is_ancestor(repo_root, tip, "HEAD") for tip in heads.values())
+
 
 # ``check_graphql_rate_limit`` reports (sufficient, remaining, reset_at). There
 # is no quota to exhaust; any positive ``remaining`` reads as "plenty".
@@ -84,6 +128,12 @@ class LocalFileGitHub:
     # ``RuntimeConfig`` provides. ``None`` falls back to the default state
     # dir; only test/direct constructions omit it.
     state_dir: str | None = None
+    # ``dispatch.branch_prefix``, carried through ``github_client_for`` for
+    # the same reason: ``are_issues_open`` needs the convention namespace
+    # (``{prefix}-<n>-*``) to find a closed issue's worker branch. The default
+    # mirrors ``DispatchConfig.branch_prefix``'s own default rather than
+    # duplicating the literal; only direct constructions see it.
+    branch_prefix: str = DispatchConfig.branch_prefix
     # Holds exactly one kind of entry: ``("issue_dependencies", n) -> []``,
     # the warm-cache contract ``Issues.issue_dependencies`` documents. The
     # per-issue ``get_github_issue_dependencies`` reads this key before it
@@ -102,6 +152,10 @@ class LocalFileGitHub:
     # the set's lifetime is "one pass": one warning per broken file per pass,
     # not one per read.
     _reported: set[tuple[Path, str]] = field(default_factory=set, compare=False, repr=False)
+    # Closed issue numbers already reported as still-blocking on unmerged
+    # branch work -- one warning per issue per instance, matching
+    # ``_reported``'s per-pass dedupe rationale.
+    _unmerged_blocker_warned: set[int] = field(default_factory=set, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         # Boundary check, once: ``issues_dir`` is config-derived, and every
@@ -201,8 +255,35 @@ class LocalFileGitHub:
         return closed
 
     def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+        """The subset of ``issue_numbers`` that still count as open.
+
+        ``state: open`` frontmatter, plus -- issue #1820 -- a ``closed``
+        issue whose worker branch tip is not reachable from local HEAD. This
+        backend's whole dependency gate resolves blocker state through this
+        one method, so it is the single place that can enforce "closed must
+        mean merged": there is no remote or PR boundary where a premature
+        close would otherwise be caught. A closed issue with no resolvable
+        worker branch (never dispatched, or merged and the ref cleaned up)
+        keeps the plain frontmatter verdict.
+        """
         by_number = self._scan().by_number()
-        return {n for n in issue_numbers if n in by_number and by_number[n].is_open}
+        open_numbers = {n for n in issue_numbers if n in by_number and by_number[n].is_open}
+        for n in issue_numbers:
+            issue = by_number.get(n)
+            if (
+                issue is not None
+                and not issue.is_open
+                and _closed_issue_work_unlanded(self.repo_root, self.branch_prefix, issue)
+            ):
+                if n not in self._unmerged_blocker_warned:
+                    self._unmerged_blocker_warned.add(n)
+                    logger.warning(
+                        "local issue #%d is closed but its worker branch is not "
+                        "merged into HEAD; still counts as an open blocker",
+                        n,
+                    )
+                open_numbers.add(n)
+        return open_numbers
 
     def issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]:
         # GitHub-native "blocked by" edges have no file equivalent. Blockers
@@ -432,4 +513,5 @@ def github_client_for(
         issues_dir=repo_root / local.issues_dir,
         dry_run=dry_run,
         state_dir=config.runtime.state_dir,
+        branch_prefix=config.dispatch.branch_prefix,
     )

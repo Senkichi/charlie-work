@@ -92,6 +92,23 @@ PROVIDER_THROTTLE_FAILURE_KINDS: frozenset[str] = frozenset(
 )
 
 
+def is_provider_throttle_failure(failure_kind: str | None) -> bool:
+    """True when ``failure_kind`` is a provider-throttle classification.
+
+    Single point of enforcement for the issue #1684 exemption family: a
+    death classified in ``PROVIDER_THROTTLE_FAILURE_KINDS`` is a global
+    provider condition, not a worker-quality signal, so it must not
+    consume any redispatch cap or timed escalation. Every lane that
+    credits a worker death — the rework-restore lane, the pre-review
+    rework route, the dead-session no-open-PR relabel lane (all #1684),
+    and the dead-dispatched timed reap plus its orphan-redispatch
+    bookkeeping (#1917) — calls this same predicate so a new lane cannot
+    silently reintroduce the raw membership test and miss a kind.
+    ``None`` (unclassifiable death) is never a throttle kind.
+    """
+    return failure_kind in PROVIDER_THROTTLE_FAILURE_KINDS
+
+
 def match_throttle_tail(tail: str, markers: Sequence[str]) -> tuple[bool, int | None]:
     """Match ``tail`` against ``markers`` (case-insensitive substrings).
 
@@ -184,6 +201,7 @@ def parse_reset_clock_time(tail: str, now: datetime) -> datetime | None:
 
 __all__ = [
     "PROVIDER_THROTTLE_FAILURE_KINDS",
+    "is_provider_throttle_failure",
     "match_quota_tail",
     "match_throttle_tail",
     "parse_reset_clock_time",

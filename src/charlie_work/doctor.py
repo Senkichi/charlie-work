@@ -22,6 +22,7 @@ from .doctor_allocation import _check_runner_allocation
 from .doctor_config_drift import _check_aviator_required_checks, _check_triage_label_map
 from .doctor_cross_repo import _check_cross_repo_escalations
 from .doctor_local_backend import _check_local_issue_backend
+from .doctor_sync_starvation import _check_sync_starvation
 from .fleet_paths import fleet_dir, fleet_dir_virtualization
 from .fleet_registry import _load_registry
 from . import layout
@@ -1478,6 +1479,12 @@ def run_doctor(
     # was positively matched under. Warning-severity, silent when the
     # window is empty.
     _check_cross_repo_escalations(add, paths)
+
+    # -- recent self_deploy_sync_starved events (issue #1855) ----------------
+    # Read-only: queries the orchestrator's own self-deploy events.db. A
+    # starved deferred sync means the fleet drained on purpose; warning
+    # severity, silent when the window is empty.
+    _check_sync_starvation(add, _self_deploy_state_path(orchestrator_root()))
 
     hard_failures = [check for check in checks if not check.ok and check.severity == "error"]
     return (not hard_failures, checks)

@@ -32,8 +32,10 @@ from charlie_work.instrumentation import query_events
 from charlie_work.notify_freshness import (
     check_notify_digest_freshness,
     report_notify_resolution,
+    resolve_fleet_notify,
 )
-from charlie_work.notify import AttentionDigest, AttentionEntry
+from charlie_work.notify import AttentionDigest, AttentionEntry, NotifyResult
+from charlie_work.supervise import supervisor_runtime_paths
 
 
 @pytest.fixture(autouse=True)
@@ -158,6 +160,40 @@ def test_stale_check_noop_when_file_path_unset(tmp_path: Path, monkeypatch: Any)
     log_event.assert_not_called()
 
 
+# ---------------------------------------------------------------------------
+# resolve_fleet_notify: the fleet-level ""-sentinel resolution (issue #1899)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_fleet_notify_resolves_empty_sentinel(tmp_path: Path) -> None:
+    """The documented file_path="" default resolves to
+    ``<state_root>/notify/digest.jsonl`` -- the same substitution
+    ``paths.resolved_layout`` performs per repo -- and the frozen source
+    config is untouched."""
+    cfg = NotifyConfig(enabled=True, sink="file")
+    resolved = resolve_fleet_notify(cfg, tmp_path)
+    assert resolved is not cfg
+    assert resolved.file_path == str(layout.notify_digest_default(tmp_path))
+    assert cfg.file_path == ""
+
+
+def test_resolve_fleet_notify_preserves_explicit_file_path(tmp_path: Path) -> None:
+    """An operator-set file_path (relative or absolute) is the operator's own
+    choice -- the sentinel contract only covers the empty string."""
+    cfg = NotifyConfig(enabled=True, sink="file", file_path="custom/digest.jsonl")
+    assert resolve_fleet_notify(cfg, tmp_path) is cfg
+
+
+def test_resolve_fleet_notify_passthrough_for_none_and_non_dataclass(
+    tmp_path: Path,
+) -> None:
+    """No notify section -> None; a non-dataclass stand-in (test double) is
+    returned as-is since dataclasses.replace cannot rebuild it."""
+    assert resolve_fleet_notify(None, tmp_path) is None
+    stand_in = SimpleNamespace(enabled=True, sink="file", file_path="")
+    assert resolve_fleet_notify(stand_in, tmp_path) is stand_in
+
+
 def test_stale_check_swallows_probe_errors(tmp_path: Path, monkeypatch: Any) -> None:
     """The check itself must never take down the pass it rides on."""
     monkeypatch.setattr(
@@ -238,6 +274,93 @@ def test_fleet_loop_skips_stale_check_when_notify_disabled(
         work_only=True,
     )
     check.assert_not_called()
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_resolves_notify_sentinel_for_stale_check(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """Issue #1899: the documented file_path="" default must reach the
+    staleness probe ALREADY resolved to the supervisor-anchored digest path
+    -- the raw sentinel no-ops the probe forever (digest_file_status returns
+    None on empty file_path)."""
+    mock_load_registry.return_value = {"repos": {}}
+    check = MagicMock(name="check_notify_digest_freshness")
+    monkeypatch.setattr("charlie_work.fleet_dispatch.check_notify_digest_freshness", check)
+    fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=SimpleNamespace(notify=NotifyConfig(enabled=True, sink="file")),
+        repos=None,
+        limit=1,
+        merge=None,
+        dry_run=True,
+        work_only=True,
+    )
+    check.assert_called_once()
+    probed = check.call_args[0][0]
+    assert probed.file_path == str(
+        layout.notify_digest_default(supervisor_runtime_paths(layout.DEFAULT_STATE_DIR).root)
+    )
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_consolidated_emit_uses_resolved_notify(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """Issue #1899: the once-per-pass consolidated digest emit gets the
+    sentinel-resolved config, so the file sink lands entries instead of
+    failing "file_path is empty" under the documented default."""
+    mock_load_registry.return_value = {"repos": {}}
+    emit = MagicMock(name="emit_digest", return_value=NotifyResult(ok=True))
+    monkeypatch.setattr("charlie_work.fleet_dispatch.emit_digest", emit)
+    transition = AttentionEntry(
+        issue_number=1,
+        adapter_kind="owner/repo",
+        health="ERROR",
+        previous_health=None,
+        last_log_line="boom",
+        pid=None,
+    )
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch._build_fleet_attention_digest",
+        lambda *a, **k: AttentionDigest(
+            generated_at="2026-09-25T00:00:00Z", repo="fleet", transitions=(transition,)
+        ),
+    )
+    fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=SimpleNamespace(notify=NotifyConfig(enabled=True, sink="file")),
+        repos=None,
+        limit=1,
+        merge=None,
+        dry_run=True,
+        work_only=True,
+    )
+    emit.assert_called_once()
+    emitted_config = emit.call_args[0][0]
+    assert emitted_config.file_path == str(
+        layout.notify_digest_default(supervisor_runtime_paths(layout.DEFAULT_STATE_DIR).root)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -421,3 +544,39 @@ def test_run_fleet_supervise_reports_notify_resolution_at_startup(
     args = reporter.call_args[0]
     assert args[0] is cfg.notify
     assert args[2] == layout.state_file_path(fleet_dir(override=str(tmp_path / "fleet")))
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_publishes_resolved_digest_path(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #1899 regression: with the documented ``file_path=""`` default
+    the ``notify_resolution`` event must publish the supervisor-anchored
+    digest path with ``file_path_empty=False`` -- before the fix the raw
+    sentinel reached the report and the heartbeat fired a spurious
+    'file_path is unset' anomaly on every supervisor start."""
+    cfg = OrchestratorConfig(notify=NotifyConfig(enabled=True, sink="file"))
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+    fleet_dir_override = str(tmp_path / "fleet")
+
+    run_fleet_supervise(
+        max_passes=1,
+        fleet_dir_override=fleet_dir_override,
+        clock=lambda: 0.0,
+        sleep=lambda _s: None,
+    )
+
+    expected = layout.notify_digest_default(supervisor_runtime_paths(cfg.runtime.state_dir).root)
+    events = _resolution_events(layout.state_file_path(fleet_dir(override=fleet_dir_override)))
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["file_path_empty"] is False
+    assert payload["file_path"] == str(expected)
+    assert payload["resolved_file_path"] == str(expected.resolve())
+    assert events[0]["level"] == "info"

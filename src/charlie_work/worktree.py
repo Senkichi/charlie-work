@@ -40,9 +40,10 @@ from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS
 from .issue_linking import linked_issue_number
 from .janitor import _calculate_patch_id
 from . import layout
+from .orphan_sweep import sweep_orphan_processes
 from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
-from .process_utils import is_pid_alive, kill_orphan_pid, kill_process_tree, sweep_orphan_processes
+from .process_utils import is_pid_alive, kill_orphan_pid, kill_process_tree
 from .safe_path import contains
 from .safe_ref import require_valid_ref_name, require_valid_rev, require_valid_sha
 from .subprocess_runner import RunResult, run_captured

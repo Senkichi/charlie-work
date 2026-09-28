@@ -194,6 +194,7 @@ from .cross_repo_gate_candidates import (
     _split_whitespace_candidate,
 )
 from .cross_repo_gate_shorthand import _is_dotdot_shorthand, _resolve_list_shorthand
+from .repo_toplevel import _repo_is_toplevel
 from .safe_path import contains
 from .subprocess_runner import run_captured
 
@@ -733,10 +734,12 @@ def _repo_tracked_files(repo_root: Path) -> list[str]:
     ``.venv`` copy of *something*, so 2+ matches was the norm, not the
     exception).
 
-    Falls back to :func:`_all_repo_files` (a pruned ``os.walk``) when ``git
-    ls-files`` fails. The fallback is strictly noisier, never wrong: see
-    its own docstring.
+    Falls back to :func:`_all_repo_files` (a pruned ``os.walk``; strictly
+    noisier, never wrong — see its docstring) when ``git ls-files`` fails
+    or ``repo_root`` is not a git toplevel (:func:`_repo_is_toplevel`).
     """
+    if not _repo_is_toplevel(repo_root):
+        return _all_repo_files(repo_root)
     result = run_captured(
         ["git", "ls-files"],
         cwd=repo_root,
@@ -937,13 +940,15 @@ def _is_gitignored(candidate: str, repo_root: Path) -> bool:
     ignored by ``repo_root``'s gitignore rules.
 
     Works on non-existent paths — ``check-ignore`` matches by pathname
-    pattern only, with no filesystem existence check. Any failure
-    (``repo_root`` is not a git repository, the candidate resolves outside
-    the repository, the git binary is missing, a timeout) falls back to
-    ``False`` — "not ignored" — so a broken git invocation degrades to the
-    *narrower* neutral set, not a wider one: a candidate that should
-    escalate keeps escalating rather than being silently suppressed.
+    pattern only, with no filesystem existence check. Any failure —
+    ``repo_root`` not a git repository or not its own toplevel (a nested
+    dir consults the enclosing repo's rules; :func:`_repo_is_toplevel`),
+    candidate outside the repository, missing git binary, a timeout —
+    falls back to ``False``, "not ignored": the *narrower* neutral set,
+    never wider — a candidate that should escalate keeps escalating.
     """
+    if not _repo_is_toplevel(repo_root):
+        return False
     result = run_captured(
         ["git", "check-ignore", "-q", "--", candidate],
         cwd=repo_root,

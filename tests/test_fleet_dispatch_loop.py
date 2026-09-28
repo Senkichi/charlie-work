@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 from _fleet_dispatch_fixtures import (
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
+    _per_repo_runtime_paths,
 )
 from charlie_work import layout
 from charlie_work.config import OrchestratorConfig
@@ -92,9 +93,8 @@ def test_fleet_loop_calls_loop_per_repo(
     # Mock config and paths
     mock_config = OrchestratorConfig()
     mock_load_layered_config.return_value = mock_config
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     # Mock OrchestratorApp instances
     mock_app1 = MagicMock()
@@ -166,9 +166,8 @@ def test_fleet_loop_ensure_labels_calls_ensure_per_repo(
     (tmp_path / "repo2").mkdir()
 
     mock_load_layered_config.return_value = OrchestratorConfig()
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     mock_app1 = MagicMock()
     mock_app2 = MagicMock()
@@ -220,9 +219,8 @@ def test_fleet_loop_ensure_labels_failure_does_not_block_lane(
     (tmp_path / "repo1").mkdir()
 
     mock_load_layered_config.return_value = OrchestratorConfig()
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     mock_app = MagicMock()
     mock_app.loop.return_value = CommandResult(True, "repo1 loop complete", {})
@@ -283,9 +281,8 @@ def test_fleet_loop_missing_repo_root_records_stale_event_to_daemon(
     mock_load_registry.return_value = registry
 
     mock_load_layered_config.return_value = OrchestratorConfig()
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     mock_app2 = MagicMock()
     mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
@@ -610,9 +607,8 @@ def test_fleet_loop_work_only_calls_dispatch(
     # Mock config and paths
     mock_config = OrchestratorConfig()
     mock_load_layered_config.return_value = mock_config
-    mock_paths = MagicMock()
-    mock_paths.root = tmp_path / ".var" / "charlie-work"
-    mock_runtime_paths.return_value = mock_paths
+    # Issue #1934: distinct lock-file root per repo for concurrent lanes.
+    mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
     # Mock OrchestratorApp
     mock_app = MagicMock()

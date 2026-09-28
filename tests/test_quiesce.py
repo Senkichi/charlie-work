@@ -25,6 +25,7 @@ from charlie_work.quiesce import (
     list_processes,
     self_process_chain,
 )
+from charlie_work.subprocess_runner import no_console_window_kwargs
 
 # A single pattern standing in for the config-supplied fleet-process regexes
 # a real caller would pass (never hardcoded inside quiesce.py itself).
@@ -592,3 +593,78 @@ def test_check_quiescence_can_report_quiescent_against_the_real_lister() -> None
 
     assert report.ok is True, f"expected quiescent, got: {report.summary}"
     assert report.matched == ()
+
+
+# ---------------------------------------------------------------------------
+# list_processes() -- stdout encoding contract (issue #1930). The real bug was
+# a codepage mismatch on the wire, not malformed JSON: powershell.exe writes
+# redirected stdout in the host's OEM codepage (cp437 on this host), under
+# which a CommandLine character like U+2665 is emitted as the raw byte 0x03.
+# Any ASCII-compatible decode -- the `text=True` ANSI-codepage default, or
+# even UTF-8 alone -- turns that byte back into U+0003 inside a JSON string,
+# and `json.loads` fails with "Invalid control character". The fix pins both
+# sides of the pipe: `[Console]::OutputEncoding` to no-BOM UTF-8 inside the
+# -Command payload, and `encoding="utf-8", errors="replace"` on the Python
+# side. Either half alone leaves the defect live.
+# ---------------------------------------------------------------------------
+
+
+def test_list_processes_pins_utf8_on_both_sides_of_the_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The subprocess spawn must carry the full UTF-8 contract.
+
+    Asserts the kwargs and the -Command payload rather than decoded output:
+    the decode happens inside ``subprocess.run``, which tests substitute, so
+    the spawn arguments are the only observable surface of the fix short of
+    the real-host test below.
+    """
+    _win32_listing_env(monkeypatch)
+    captured: dict[str, object] = {}
+    payload = json.dumps(
+        [{"ProcessId": 1, "ParentProcessId": 0, "Name": "a.exe", "CommandLine": "a.exe"}]
+    )
+
+    def _capturing_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["args"] = args
+        captured.update(kwargs)
+        return _fake_completed(payload)
+
+    monkeypatch.setattr(subprocess, "run", _capturing_run)
+
+    processes, error = list_processes()
+
+    assert error is None
+    assert [p.pid for p in processes] == [1]
+    assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "replace"
+    command = " ".join(str(a) for a in captured["args"])  # type: ignore[union-attr]
+    assert "[Console]::OutputEncoding" in command
+    assert "UTF8" in command
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="list_processes is win32-only")
+def test_list_processes_survives_cp437_low_glyph_in_command_line() -> None:
+    """End-to-end #1930 regression against the real PowerShell snapshot.
+
+    Spawns a real process whose command line contains U+2665 -- a character
+    the host's OEM codepage (cp437) encodes as the raw byte 0x03. Before the
+    fix that byte decoded to U+0003 inside a JSON string and the *entire*
+    snapshot failed to parse; now it must list cleanly and preserve the
+    glyph. This is the level the fake-``subprocess.run`` tests structurally
+    cannot reach, matching this file's real-lister precedent.
+    """
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)", "\u2665"],
+        **no_console_window_kwargs(),
+    )
+    try:
+        processes, error = list_processes()
+    finally:
+        child.kill()
+        child.wait()
+
+    assert error is None, f"process listing failed: {error}"
+    own = [p for p in processes if p.pid == child.pid]
+    assert own, "spawned child did not appear in the process snapshot"
+    assert "\u2665" in own[0].command_line
