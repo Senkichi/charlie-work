@@ -48,9 +48,8 @@ from .safe_ref import require_valid_ref_name, require_valid_rev, require_valid_s
 from .subprocess_runner import RunResult, run_captured
 from . import state as _state
 from .worktree_archive import (
-    _archive_unreachable_branch_tip,
+    _archive_unreachable_tip_if_applicable,
     _is_confirmed_missing_ref,
-    _resolve_reset_target_tip,
 )
 from .worktree_pr_lookup import WorktreeCleanGH, _pr_number_for_head_branch
 from .rescue_capture_exclusions import (  # noqa: F401  (deliberate re-export)
@@ -3200,43 +3199,6 @@ def create_worktree(
         except Exception:  # noqa: BLE001 — instrumentation is best-effort
             pass
 
-    def _emit_local_commits_archived_event(
-        archived_branch: str, archive_ref: str, tip_sha: str
-    ) -> None:
-        """Best-effort: record a ``worktree_local_commits_archived`` event.
-
-        Same contract as ``_emit_rescue_event``: no state file (no config) or
-        an instrumentation I/O error is silently skipped — the archive branch
-        itself is the durable artifact, not the event. Deduped on
-        ``archive_ref`` because one dispatch can run the refuse-to-reset probe
-        twice (once for the worktree, once for the branch) against the same
-        tip — the archive already exists the second time, and a duplicate
-        event would double-count one archival.
-        """
-        if state_file is None or archive_ref in _archive_events_emitted:
-            return
-        _archive_events_emitted.add(archive_ref)
-        try:
-            from .instrumentation import log_event
-
-            # standalone closure, not an OrchestratorApp method -- no
-            # write_gate receiver exists to convert to; event is
-            # best-effort (the archive branch is the durable artifact),
-            # same out-of-wave pattern as the #1423 site baselined above.
-            # write-gate-exempt(issue=1944): no write_gate receiver; best-effort event
-            log_event(
-                state_file,
-                "worktree_local_commits_archived",
-                {
-                    "issue_number": issue_number,
-                    "branch": archived_branch,
-                    "archive_ref": archive_ref,
-                    "tip_sha": tip_sha,
-                },
-            )
-        except Exception:  # noqa: BLE001 — instrumentation is best-effort
-            pass
-
     def _capture_or_raise(
         check_path: Path, unsafe_reason: str, capture_injected: tuple[str, ...]
     ) -> None:
@@ -3374,18 +3336,18 @@ def create_worktree(
             (config is None or config.dispatch.archive_unreachable_local_commits)
             and _worktree_unsafe_kind_from_reason(reason) == WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
             and not _has_origin_remote(repo_root)
-        ):
-            tip_sha = _resolve_reset_target_tip(repo_root, branch, check_path)
-            archive_ref = (
-                _archive_unreachable_branch_tip(repo_root, branch, tip_sha)
-                if tip_sha is not None
-                else None
+            and _archive_unreachable_tip_if_applicable(
+                repo_root,
+                branch,
+                check_path,
+                state_file,
+                _archive_events_emitted,
+                issue_number,
             )
-            if archive_ref is not None:
-                _emit_local_commits_archived_event(branch, archive_ref, tip_sha)
-                return
-            # Archival failed — fall through to capture-or-refuse so the
-            # reset still refuses loudly rather than discarding the tip.
+        ):
+            return
+        # Archival declined or failed — fall through to capture-or-refuse so
+        # the reset still refuses loudly rather than discarding the tip.
         # Issue #849: before refusing, attempt to capture the work durably
         # onto a rescue ref. If capture succeeds, the reset is permitted
         # (the work is preserved on a ref, so resetting destroys nothing).

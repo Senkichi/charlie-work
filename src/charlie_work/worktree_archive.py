@@ -130,3 +130,86 @@ def _archive_unreachable_branch_tip(repo_root: Path, branch: str, tip_sha: str) 
         )
         return name if create.ok else None
     return None
+
+
+def _emit_local_commits_archived_event(
+    state_file: Path | None,
+    emitted: set[str],
+    issue_number: int | None,
+    archived_branch: str,
+    archive_ref: str,
+    tip_sha: str,
+) -> None:
+    """Best-effort: record a ``worktree_local_commits_archived`` event.
+
+    Same contract as ``worktree.create_worktree``'s ``_emit_rescue_event``:
+    no state file (no config) or an instrumentation I/O error is silently
+    skipped — the archive branch itself is the durable artifact, not the
+    event. Deduped on ``archive_ref`` via ``emitted`` because one dispatch
+    can run the refuse-to-reset probe twice (once for the worktree, once
+    for the branch) against the same tip — the archive already exists the
+    second time, and a duplicate event would double-count one archival.
+    """
+    if state_file is None or archive_ref in emitted:
+        return
+    emitted.add(archive_ref)
+    try:
+        from .instrumentation import log_event
+
+        # standalone helper, not an OrchestratorApp method -- no
+        # write_gate receiver exists to convert to; event is
+        # best-effort (the archive branch is the durable artifact),
+        # same out-of-wave pattern as the #1423 site baselined above.
+        # write-gate-exempt(issue=1944): no write_gate receiver; best-effort event
+        log_event(
+            state_file,
+            "worktree_local_commits_archived",
+            {
+                "issue_number": issue_number,
+                "branch": archived_branch,
+                "archive_ref": archive_ref,
+                "tip_sha": tip_sha,
+            },
+        )
+    except Exception:  # noqa: BLE001 — instrumentation is best-effort
+        pass
+
+
+def _archive_unreachable_tip_if_applicable(
+    repo_root: Path,
+    branch: str,
+    check_path: Path | None,
+    state_file: Path | None,
+    emitted: set[str],
+    issue_number: int | None,
+) -> bool:
+    """Archive a diverged no-remote branch tip; True = the reset may proceed.
+
+    On a repo with no origin remote the "local commits not on remote branch"
+    verdict can never resolve — there is nowhere to push — so every requeue
+    of a diverged agent branch escalates to human-needed forever (mdls #144).
+    Archiving the unreachable tip to a local ``archive/<branch>-<utc-date>``
+    branch permits the reset instead.
+
+    The caller gates on the ``dispatch.archive_unreachable_local_commits``
+    kill switch, the ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`` reason kind, and
+    ``_has_origin_remote`` BEFORE calling — those checks stay in
+    ``worktree.py`` because the config type, the kind classifier, and the
+    remote probe all live there, and importing them back would close the
+    import cycle this module exists to break.
+
+    A ``False`` return is a fall-through to capture-or-refuse: archival
+    declines on an unresolvable tip or a failed/unverifiable archive ref —
+    and in both cases the caller still refuses, so a declined archive never
+    downgrades the safety property.
+    """
+    tip_sha = _resolve_reset_target_tip(repo_root, branch, check_path)
+    if tip_sha is None:
+        return False
+    archive_ref = _archive_unreachable_branch_tip(repo_root, branch, tip_sha)
+    if archive_ref is None:
+        return False
+    _emit_local_commits_archived_event(
+        state_file, emitted, issue_number, branch, archive_ref, tip_sha
+    )
+    return True
