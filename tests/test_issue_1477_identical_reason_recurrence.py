@@ -362,6 +362,103 @@ def test_dry_run_does_not_promote(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Race / partial-failure paths
+# ---------------------------------------------------------------------------
+
+
+def test_promotion_raced_skip_when_entry_changes_before_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The promotion block snapshots the issue entry, then re-reads it under
+    the state lock (compare-and-swap). If the entry changed between the two
+    reads -- a human unescalate, a different re-escalation, a parallel lane --
+    the sweep must NOT act on the stale snapshot: it returns the
+    ``promotion_raced`` skip, records no ``deescalation_recurrence_promoted``
+    event, and performs no label edge."""
+    import charlie_work.workflow as wf
+
+    app = _app(tmp_path)
+    _seed_escalated_issue(
+        app,
+        issue_extra={
+            "unescalate_cleared_reason": _REASON,
+            "unescalate_cleared_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        },
+    )
+
+    # Mutate the entry inside the window between the snapshot read and the
+    # locked re-read. ``_parse_iso_timestamp`` runs after the snapshot and
+    # before the CAS lock is taken, so it is the injection point.
+    real_parse = wf._parse_iso_timestamp
+    raced = False
+
+    def racing_parse(value):
+        nonlocal raced
+        if not raced:
+            raced = True
+            with state_lock(app.paths.state_file):
+                state = load_state(app.paths.state_file)
+                # A different re-escalation landed concurrently.
+                state["issues"]["123"]["escalation_reason"] = "session_failed_escalated"
+                save_state(app.paths.state_file, state)
+        return real_parse(value)
+
+    monkeypatch.setattr(wf, "_parse_iso_timestamp", racing_parse)
+
+    outcome = app._deescalate_mechanical_issue(123)
+
+    assert raced is True
+    assert outcome == {"skipped": "promotion_raced", "issue_number": 123}
+    state = load_state(app.paths.state_file)
+    issue = state["issues"]["123"]
+    # The racing write stands; the promotion did not touch the entry.
+    assert issue["escalation_reason"] == "session_failed_escalated"
+    assert issue["reason_class"] == "mechanical"
+    assert _events(state, "deescalation_recurrence_promoted") == []
+    assert app.gh.labels_added == []
+    assert app.gh.labels_removed == []
+
+
+def test_promotion_label_error_fallback_on_failed_escalated_edge(tmp_path: Path) -> None:
+    """If the post-promotion ``escalated`` label edge fails, the promotion
+    itself still stands (``reason_class="judgment"`` was already committed)
+    and the failure is recorded as ``label_error`` on the issue entry -- the
+    same fallback the clear path uses for its ``unescalated_pr_open`` edge --
+    so the failed write stays diagnosable for the label-repair self-heal."""
+    app = _app(tmp_path)
+    _seed_escalated_issue(
+        app,
+        issue_extra={
+            "unescalate_cleared_reason": _REASON,
+            "unescalate_cleared_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        },
+    )
+    # Every label add fails -> the "escalated" edge reports PARTIAL_FAILURE.
+    app.gh.add_issue_label = lambda number, label: False
+
+    outcome = app._deescalate_mechanical_issue(123)
+
+    assert outcome == {
+        "promoted_to_judgment": True,
+        "issue_number": 123,
+        "escalation_reason": _REASON,
+    }
+    state = load_state(app.paths.state_file)
+    issue = state["issues"]["123"]
+    assert issue["reason_class"] == "judgment"
+    assert issue["label_error"] == {
+        "edge": "escalated",
+        "outcome": "partial_failure",
+        "add_failures": [[123, app.config.labels.human_needed]],
+        "remove_failures": [],
+    }
+    # The promotion event was still recorded; only the label edge failed.
+    promoted = _events(state, "deescalation_recurrence_promoted")
+    assert len(promoted) == 1
+    assert promoted[0]["payload"]["issue_number"] == 123
+
+
+# ---------------------------------------------------------------------------
 # Config parsing
 # ---------------------------------------------------------------------------
 

@@ -21,6 +21,7 @@ from charlie_work.state import (
     PASSIVE_OPEN_STATUS,
     SINK_STATUSES,
 )
+from charlie_work.unescalate_reset_fields import stamp_unescalate_cleared_markers
 from charlie_work.worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
@@ -569,22 +570,14 @@ def unescalate(
             updated.pop(field_name, None)
         # Issue #1477 (Option A): this reset also zeroes
         # ``auto_deescalation_count`` (via the tuple above), which is correct
-        # only when the re-arm actually changed the underlying cause. Record
+        # only when the re-arm actually changed the underlying cause. Stamp
         # WHICH escalation_reason was cleared and when, so the de-escalation
         # sweep can recognize the identical reason re-firing shortly after
         # the re-arm as "the human just cleared the label" and promote that
         # recurrence to ``reason_class="judgment"`` instead of restarting
         # the auto-clear budget (the #1306/PR #1409 infinite no_op_rework
-        # loop). The markers are deliberately NOT in the reset tuple: they
-        # describe this re-arm, not the episode it ended. A reset that
-        # cleared no reason pops any stale marker left by an earlier
-        # unescalate rather than letting it mis-fire on a later episode.
-        cleared_reason = entry.get("escalation_reason")
-        updated.pop("unescalate_cleared_reason", None)
-        updated.pop("unescalate_cleared_at", None)
-        if isinstance(cleared_reason, str) and cleared_reason:
-            updated["unescalate_cleared_reason"] = cleared_reason
-            updated["unescalate_cleared_at"] = _wf.utc_now()
+        # loop).
+        stamp_unescalate_cleared_markers(updated, entry, now=_wf.utc_now())
         return updated
 
     if pr_number is not None and pr_stuck:

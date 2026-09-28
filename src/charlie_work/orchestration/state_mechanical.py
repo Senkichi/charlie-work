@@ -11,12 +11,15 @@ from collections import Counter
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from charlie_work.labels import TransitionOutcome
 from charlie_work.state import (
     PASSIVE_OPEN_STATUS,
     SINK_STATUSES,
     arm_deescalation_pass,
     is_deescalation_due,
+)
+from charlie_work.unescalate_reset_fields import (
+    UNESCALATE_CLEARED_AT_KEY,
+    UNESCALATE_CLEARED_REASON_KEY,
 )
 from charlie_work.worktree import WORKTREE_UNSAFE_KINDS
 import charlie_work.workflow as _wf
@@ -135,8 +138,8 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
     # clear, so it needs no GitHub calls, and it must preempt a sweep that
     # would otherwise burn a fresh ``auto_deescalation_count`` slot on an
     # already-doomed clear.
-    cleared_reason = issue_entry.get("unescalate_cleared_reason")
-    cleared_at = _wf._parse_iso_timestamp(issue_entry.get("unescalate_cleared_at"))
+    cleared_reason = issue_entry.get(UNESCALATE_CLEARED_REASON_KEY)
+    cleared_at = _wf._parse_iso_timestamp(issue_entry.get(UNESCALATE_CLEARED_AT_KEY))
     recurrence_window_minutes = self.config.deescalation.identical_reason_recurrence_window_minutes
     if (
         recurrence_window_minutes > 0
@@ -153,7 +156,7 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
                 fresh_entry.get("status") not in SINK_STATUSES
                 or fresh_entry.get("reason_class") != "mechanical"
                 or fresh_entry.get("escalation_reason") != cleared_reason
-                or fresh_entry.get("unescalate_cleared_reason") != cleared_reason
+                or fresh_entry.get(UNESCALATE_CLEARED_REASON_KEY) != cleared_reason
             ):
                 # Changed concurrently since the snapshot (human
                 # unescalate, a different re-escalation, etc.) -- do not
@@ -172,7 +175,7 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
                 {
                     "issue_number": issue_number,
                     "escalation_reason": cleared_reason,
-                    "unescalate_cleared_at": issue_entry.get("unescalate_cleared_at"),
+                    UNESCALATE_CLEARED_AT_KEY: issue_entry.get(UNESCALATE_CLEARED_AT_KEY),
                     "window_minutes": recurrence_window_minutes,
                 },
             )
@@ -185,21 +188,9 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
         # label_error fallback so a failed write stays diagnosable and is
         # backstopped by the _repair_escalated_labels self-heal sweep.
         result = self.write_gate.transition(self.gh, self.config.labels, issue_number, "escalated")
-        if result.outcome != TransitionOutcome.APPLIED:
-            with _wf.state_lock(self.paths.state_file):
-                fresh_state = _wf.load_state(self.paths.state_file)
-                entry = fresh_state["issues"].get(issue_key, {})
-                fresh_state["issues"][issue_key] = {
-                    **(entry if isinstance(entry, dict) else {}),
-                    "number": issue_number,
-                    "label_error": {
-                        "edge": "escalated",
-                        "outcome": result.outcome.value,
-                        "add_failures": result.add_failures,
-                        "remove_failures": result.remove_failures,
-                    },
-                }
-                self.write_gate.save_state(fresh_state)
+        _wf._record_issue_label_error(
+            self.paths.state_file, self.write_gate, issue_number, "escalated", result
+        )
         return {
             "promoted_to_judgment": True,
             "issue_number": issue_number,
@@ -430,21 +421,9 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
     result = self.write_gate.transition(
         self.gh, self.config.labels, issue_number, "unescalated_pr_open"
     )
-    if result.outcome != TransitionOutcome.APPLIED:
-        with _wf.state_lock(self.paths.state_file):
-            fresh_state = _wf.load_state(self.paths.state_file)
-            entry = fresh_state["issues"].get(issue_key, {})
-            fresh_state["issues"][issue_key] = {
-                **(entry if isinstance(entry, dict) else {}),
-                "number": issue_number,
-                "label_error": {
-                    "edge": "unescalated_pr_open",
-                    "outcome": result.outcome.value,
-                    "add_failures": result.add_failures,
-                    "remove_failures": result.remove_failures,
-                },
-            }
-            self.write_gate.save_state(fresh_state)
+    _wf._record_issue_label_error(
+        self.paths.state_file, self.write_gate, issue_number, "unescalated_pr_open", result
+    )
 
     return {
         "cleared": True,

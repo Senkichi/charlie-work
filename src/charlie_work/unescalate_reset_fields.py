@@ -15,6 +15,9 @@ keeps the private class-attribute aliases so call sites are unchanged.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 # PR-record bookkeeping that must not survive an operator re-arm: attempt
 # counters and caches that would otherwise instantly re-escalate the PR
 # (counters at cap) or feed the pipeline frozen pre-escalation data
@@ -143,8 +146,8 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     # ``deescalation.identical_reason_recurrence_window_minutes`` is
     # promoted to ``reason_class="judgment"`` by the de-escalation sweep),
     # not leftover bookkeeping from the episode it ended. Listing them
-    # here would only re-pop what ``unescalate()`` re-stamps immediately
-    # after; it manages the pair itself.
+    # here would only re-pop what ``stamp_unescalate_cleared_markers``
+    # re-stamps immediately after; unescalate() manages the pair itself.
     "label_error",
     "worker_pid",
     "worker_process_start_time",
@@ -162,6 +165,49 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     # readers treat a missing key as an empty window.
     "blocked_environment_at",
 )
+
+# Issue #1477 (Option A -- identical-cause recurrence is sticky): the marker
+# pair ``unescalate()`` stamps on the issue entry recording WHICH
+# ``escalation_reason`` a manual re-arm cleared and when. The de-escalation
+# sweep's recurrence check (``_deescalate_mechanical_issue``) reads exactly
+# this pair; writer and reader share these names rather than each
+# hard-coding the literals.
+UNESCALATE_CLEARED_REASON_KEY = "unescalate_cleared_reason"
+UNESCALATE_CLEARED_AT_KEY = "unescalate_cleared_at"
+
+
+def stamp_unescalate_cleared_markers(
+    updated: dict[str, Any], entry: Mapping[str, Any], *, now: str
+) -> dict[str, Any]:
+    """Pop any stale #1477 marker pair from ``updated`` and re-stamp it.
+
+    ``unescalate()``'s reset also zeroes ``auto_deescalation_count`` (via
+    ``UNESCALATE_ISSUE_RESET_FIELDS``), which is correct only when the re-arm
+    actually changed the underlying cause. Recording WHICH escalation_reason
+    was cleared and when lets the de-escalation sweep recognize the identical
+    reason re-firing within
+    ``deescalation.identical_reason_recurrence_window_minutes`` as "the human
+    just cleared the label" and promote that recurrence to
+    ``reason_class="judgment"`` instead of restarting the auto-clear budget
+    (the #1306/PR #1409 infinite no_op_rework loop).
+
+    ``entry`` is the PRE-reset issue entry (its ``escalation_reason`` is what
+    this re-arm cleared); ``updated`` is the post-reset entry the caller is
+    building, where ``escalation_reason`` has already been popped by the
+    reset tuple. The markers are deliberately NOT in the reset tuple: they
+    describe this re-arm, not the episode it ended. A reset that cleared no
+    reason pops any stale marker left by an earlier unescalate rather than
+    letting it mis-fire on a later episode.
+    """
+    updated.pop(UNESCALATE_CLEARED_REASON_KEY, None)
+    updated.pop(UNESCALATE_CLEARED_AT_KEY, None)
+    cleared_reason = entry.get("escalation_reason")
+    if isinstance(cleared_reason, str) and cleared_reason:
+        updated[UNESCALATE_CLEARED_REASON_KEY] = cleared_reason
+        updated[UNESCALATE_CLEARED_AT_KEY] = now
+    return updated
+
+
 # Issue #1093: the de-escalation sweep's once-per-episode rework-budget
 # reset must zero the per-mechanism PR counter that ACTUALLY gates the
 # cleared ``escalation_reason``, not a counter belonging to a different

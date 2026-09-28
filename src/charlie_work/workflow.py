@@ -235,6 +235,7 @@ from .workflow_delegation import _install_delegates, discover_delegate_modules
 from .escalation import (  # noqa: F401  (deliberate re-export)
     _escalation_flags,
     _deescalation_skip,
+    _record_issue_label_error,
     _escalate_issue,
     _escalated_label_needs_repair,
     _collect_escalated_label_subjects,
