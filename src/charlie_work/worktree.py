@@ -3400,7 +3400,16 @@ def create_worktree(
         # destructive reset. If the recorded PID (or sessions.db real activity)
         # says the worker is still alive, abort the redispatch and let the
         # orchestrator restore the in-progress label.
-        _probe_recovery_liveness(recovery, worktree_path, config, issue_number)
+        # Issue #1476 rework: the probe must run against the checkout the
+        # prior worker actually ran in — for a branch registered in a foreign
+        # worktree, sessions.db rows and file mtimes live under the foreign
+        # path, and a probe pointed at the managed slug path reports a
+        # permanently-absent worker while the real one is still moving.
+        probe_path = worktree_path
+        registered_wt = find_branch_worktree(list_worktrees(repo_root), branch)
+        if registered_wt is not None:
+            probe_path = Path(registered_wt["worktree"])
+        _probe_recovery_liveness(recovery, probe_path, config, issue_number)
 
         # Issue #110: Check if the branch exists on origin before attempting fetch
         # If the branch doesn't exist on origin (killed before first push), fall through

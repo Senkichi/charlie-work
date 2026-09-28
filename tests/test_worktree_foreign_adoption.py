@@ -17,26 +17,38 @@ from __future__ import annotations
 
 import os
 import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from _sessions_db_fixtures import make_sessions_db
 from _worktree_fixtures import _clone_repo, _git, _init_repo
 
 from charlie_work import claude_code, devin_shell
 from charlie_work import worktree as worktree_mod
 from charlie_work.claude_code import launch_claude_worker
-from charlie_work.config import OrchestratorConfig
+from charlie_work.config import (
+    DevinConfig,
+    OrchestratorConfig,
+    PostMortemConfig,
+    WorkerRoleConfig,
+)
 from charlie_work.devin_shell import launch_devin_session
 from charlie_work.subprocess_runner import RunResult
 from charlie_work.worktree import (
+    OPERATOR_MARKER_KIND,
+    OPERATOR_MARKER_SESSION_ID,
     RESCUE_REF_PREFIX,
+    LiveWorkerRedispatchError,
     ReworkBranchConflictError,
     WorktreeForeignWriterError,
     WorktreeInfo,
     _create_junction_or_symlink,
     _merge_update_rework_branch,
+    _slugify,
     create_worktree,
+    find_branch_worktree,
     is_junction,
     read_worktree_marker,
     worktree_path_for_branch,
@@ -254,6 +266,55 @@ def test_rework_recovery_refuses_foreign_worktree_without_marker(tmp_path: Path)
     assert (foreign_wt / "partial.txt").read_text(encoding="utf-8") == "foreign edits\n"
 
 
+@pytest.mark.parametrize(
+    "marker_kwargs",
+    [
+        pytest.param(
+            {
+                "pid": 0,
+                "session_id": OPERATOR_MARKER_SESSION_ID,
+                "kind": OPERATOR_MARKER_KIND,
+            },
+            id="operator-kind-marker",
+        ),
+        pytest.param(
+            {"pid": 4242, "session_id": "operator-9f8e7d"},
+            id="operator-session-id",
+        ),
+        pytest.param(
+            {"pid": 0, "session_id": "worker-session"},
+            id="nonpositive-pid",
+        ),
+    ],
+)
+def test_rework_recovery_refuses_non_worker_marker(tmp_path: Path, marker_kwargs: dict) -> None:
+    """Only a worker-kind marker proves prior orchestrator ownership. An
+    operator claim marker, an ``operator-*`` session id, and a nonpositive pid
+    each leave the checkout foreign — recovery must refuse rather than treat
+    someone else's dirt as a dead worker's partial work."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch = "agent/issue-1476-marker-kind"
+    foreign_wt = tmp_path / "operator-worktree"
+    _git(repo_root, "worktree", "add", str(foreign_wt), "-b", branch)
+    (foreign_wt / "partial.txt").write_text("foreign edits\n", encoding="utf-8")
+    write_worktree_marker(foreign_wt, **marker_kwargs)
+
+    with pytest.raises(WorktreeForeignWriterError) as exc_info:
+        create_worktree(
+            repo_root,
+            branch,
+            rework=True,
+            recovery={"branch_name": branch},
+            worktrees_dir=tmp_path / "managed",
+        )
+
+    assert exc_info.value.worktree_path == foreign_wt
+    assert "ownership" in str(exc_info.value)
+    assert (foreign_wt / "partial.txt").read_text(encoding="utf-8") == "foreign edits\n"
+
+
 def test_rework_recovery_adopts_marked_foreign_worktree(tmp_path: Path) -> None:
     """A writer marker is the durable proof a prior orchestrator session owned
     the checkout, so recovery may continue the dead worker's dirt there — the
@@ -347,6 +408,141 @@ def test_recovery_dispatch_refuses_unmarked_foreign(tmp_path: Path) -> None:
 
     assert exc_info.value.worktree_path == foreign_wt
     assert "ownership" in str(exc_info.value)
+
+    _git(repo_root, "worktree", "remove", str(foreign_wt), "--force")
+
+
+def test_recovery_liveness_probe_targets_foreign_checkout_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recovery liveness probe must inspect the checkout the prior worker
+    actually ran in. ``real_activity_for_worker`` keys both its sessions.db
+    lookup and its file-mtime check on the worktree path it is given; a branch
+    checked out in a foreign worktree records that activity under the foreign
+    path, so probing the managed slug path reports a permanently-absent worker
+    while the real one is still moving — re-opening the #282
+    dispatch-over-a-live-worker hole on the recovery route this issue added.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch = "agent/issue-1476-probe-path"
+    foreign_wt = tmp_path / "operator-worktree"
+    _git(repo_root, "worktree", "add", str(foreign_wt), "-b", branch)
+    (foreign_wt / "partial.txt").write_text("worker output\n", encoding="utf-8")
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    # Dead worker's leftover marker — proof of prior orchestrator occupancy.
+    write_worktree_marker(foreign_wt, 99999999, "dead-session")
+
+    # Fresh sessions.db activity keyed at the FOREIGN path, where the prior
+    # worker ran — invisible to a probe pointed at the managed slug path.
+    db_path = tmp_path / "sessions.db"
+    now = datetime.now(UTC).isoformat()
+    make_sessions_db(
+        db_path,
+        session_id="session-1",
+        working_directory=str(foreign_wt),
+        created_at=now,
+        rows=[{"role": "tool", "content": "tool result", "created_at": now}],
+    )
+
+    probed_paths: list[str] = []
+    real_probe = worktree_mod.real_activity_for_worker
+
+    def recording_probe(pm_config, worktree_path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        probed_paths.append(worktree_path)
+        return real_probe(pm_config, worktree_path, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_mod, "real_activity_for_worker", recording_probe)
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
+        post_mortem=PostMortemConfig(db_path=str(db_path)),
+    )
+
+    with pytest.raises(LiveWorkerRedispatchError) as exc_info:
+        create_worktree(
+            repo_root,
+            branch,
+            rework=False,
+            recovery={
+                "branch_name": branch,
+                "status": "dispatched",
+                "worker_pid": 999999,
+                "worker_process_start_time": 0.0,
+                "started_at": now,
+            },
+            worktrees_dir=tmp_path / "managed",
+            sessions_dir=sessions_dir,
+            config=config,
+        )
+
+    # The probe was pointed at the foreign checkout — the path the prior
+    # worker actually ran in — and its fresh activity aborted the redispatch.
+    assert probed_paths == [str(foreign_wt)]
+    assert exc_info.value.probe_result.endswith("_activity")
+
+    _git(repo_root, "worktree", "remove", str(foreign_wt), "--force")
+
+
+def test_find_branch_worktree_normalizes_refs_heads_prefix() -> None:
+    """``git worktree list --porcelain`` emits ``refs/heads/<name>`` values —
+    the matcher must normalize that prefix. Detached entries (no branch line)
+    never match."""
+    worktrees = [
+        {"worktree": "/repo", "branch": "refs/heads/main"},
+        {
+            "worktree": "/repo/.var/worktrees/agent-issue-5-x",
+            "branch": "refs/heads/agent/issue-5-x",
+        },
+        {"worktree": "/repo/.var/worktrees/detached"},
+    ]
+    assert find_branch_worktree(worktrees, "main")["worktree"] == "/repo"
+    assert find_branch_worktree(worktrees, "agent/issue-5-x")["worktree"] == (
+        "/repo/.var/worktrees/agent-issue-5-x"
+    )
+    assert find_branch_worktree(worktrees, "missing/branch") is None
+
+
+def test_find_branch_worktree_rejects_suffix_collision() -> None:
+    """``team/agent/issue-5-x`` must NOT alias ``agent/issue-5-x``: the matcher
+    also gates adoption now, so a suffix match would dispatch a worker into a
+    checkout holding a different branch's work."""
+    worktrees = [
+        {"worktree": "/repo", "branch": "refs/heads/main"},
+        {
+            "worktree": "/repo/.claude/worktrees/team-agent-issue-5-x",
+            "branch": "refs/heads/team/agent/issue-5-x",
+        },
+    ]
+    assert find_branch_worktree(worktrees, "agent/issue-5-x") is None
+    assert find_branch_worktree(worktrees, "team/agent/issue-5-x")["worktree"] == (
+        "/repo/.claude/worktrees/team-agent-issue-5-x"
+    )
+
+
+def test_rework_does_not_adopt_branch_suffix_collision(tmp_path: Path) -> None:
+    """End to end: a foreign checkout of ``team/agent/...`` is left untouched
+    when the rework branch is ``agent/...`` — the create goes to the managed
+    destination instead of borrowing the wrong checkout."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    branch = "agent/issue-1476-suffix"
+    foreign_wt = tmp_path / "operator-worktree"
+    _git(repo_root, "worktree", "add", str(foreign_wt), "-b", f"team/{branch}")
+    _git(repo_root, "branch", branch)
+
+    managed_dir = tmp_path / "managed"
+    info = create_worktree(repo_root, branch, rework=True, worktrees_dir=managed_dir)
+
+    assert info.path == managed_dir / _slugify(branch)
+    assert info.foreign_adopted is False
+    assert foreign_wt.is_dir()
+    assert _git(foreign_wt, "branch", "--show-current").stdout.strip() == (f"team/{branch}")
 
     _git(repo_root, "worktree", "remove", str(foreign_wt), "--force")
 
