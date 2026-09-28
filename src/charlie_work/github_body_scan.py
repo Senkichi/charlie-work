@@ -293,6 +293,7 @@ _NONE_SENTINEL_RE = re.compile(r"(?:none|n/a)\b", flags=re.IGNORECASE)
 # #12 and #13" contributes both refs.
 _BLOCKER_ITEM_REF_RUN_RE = re.compile(_ISSUE_REF_RUN, flags=re.IGNORECASE)
 
+
 def _inside_inline_fence_span(text: str, start: int, end: int) -> bool:
     """True if the [start, end) range falls inside an inline run of 3+ backticks.
 
