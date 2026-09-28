@@ -54,11 +54,20 @@ review:
   # instead of routing to automated rework. These are the case-insensitive
   # substring markers; tune to taste.
   # human_decision_markers:
-  #   - human
-  #   - operator
-  #   - sign-off
-  #   - signoff
-  #   - sign off
+  #   - human call
+  #   - operator call
+  #   - human/operator
+  #   - human decision
+  #   - operator decision
+  #   - human check
+  #   - human should
+  #   - human must
+  #   - flag for human
+  #   - needs a human
+  #   - requires a human
+  #   - human sign-off
+  #   - operator sign-off
+  #   - not worker-resolvable
   #   - not automated rework
   #   - confirm explicitly
   require_tests_or_rationale: true

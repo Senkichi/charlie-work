@@ -9,3 +9,13 @@ merge_rules:
       - "Collect-only gate"
   merge_strategy:
     name: "squash"
+  # Parallel mode: Aviator validates each queued PR on its own draft PR
+  # (main + PRs ahead of it) and never pushes to the original PR branch,
+  # so a merge no longer restarts CI on every other queued PR.
+  merge_mode:
+    type: "parallel"
+    parallel_mode:
+      max_parallel_builds: 2
+      batch_size: 2
+      skip_draft_when_up_to_date: true
+      stuck_pr_timeout_mins: 60

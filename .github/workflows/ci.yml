@@ -323,7 +323,23 @@ jobs:
         # Shells out to `gh` via github.py: gh is preinstalled on hosted
         # runner images and reads GH_TOKEN from the environment -- no gh
         # auth state is assumed from the host.
-        if: github.event_name == 'pull_request'
+        #
+        # Aviator MergeQueue parallel mode skip: aviator-app[bot] opens a
+        # combined draft PR (an `mq-bot-*` head branch) whose body/commits
+        # union every queued PR's own commits. linked_issue_number() cannot
+        # bind that combo branch to a single issue (no `agent/issue-*`
+        # prefix match, no single-issue closing keyword in Aviator's own
+        # title/body), so intended_issue_number resolves to None and every
+        # queued PR's own legitimate closing keyword gets flagged as
+        # unexpected -- a guaranteed false-positive failure, not a real
+        # risk: each constituent PR already passed this exact gate on its
+        # own branch before Aviator queued it. Skip by PR author rather
+        # than branch-name pattern -- author is stable regardless of
+        # Aviator's internal branch-naming, and matches the same
+        # queue_bot_login-authored-PR exclusion reconcile.py/
+        # helpers_merge_gate.py already use fleet-wide (issue-linked PR
+        # #1934 salvage work).
+        if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'aviator-app[bot]'
         env:
           GH_TOKEN: ${{ github.token }}
         run: uv run charlie closing-keyword-check --pr ${{ github.event.pull_request.number }}
