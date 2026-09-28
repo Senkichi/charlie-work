@@ -52,6 +52,13 @@ from .github_capabilities.circuit_breaker import (  # noqa: F401  (deliberate re
     GhCircuitBreakerConfig,
 )
 
+# Facade import, same pattern as ``.capacity_starvation_escalation`` above:
+# the ``deescalation`` section's scoped-extraction validation lives in its
+# own module so new parse rules do not land in this over-cap monolith
+# (file-size ratchet, issue #1442); ``build_config_from_data`` delegates to
+# it below.
+from .deescalation_config import parse_deescalation_overrides
+
 from . import layout
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
 from .issue_comments import DEFAULT_INCLUDED_ASSOCIATIONS as DEFAULT_COMMENT_ASSOCIATIONS
@@ -834,6 +841,19 @@ class DeescalationConfig:
     # a distinct one-time event (deescalation_cap_exhausted) makes the
     # terminal state diagnosable rather than a silently renamed one-way door.
     max_auto_deescalations: int = 2
+    # Issue #1477 (Option A): ``auto_deescalation_count`` is reset only by a
+    # manual ``charlie unescalate``, which also stamps
+    # ``unescalate_cleared_reason``/``unescalate_cleared_at`` on the issue
+    # entry. When the IDENTICAL escalation reason re-fires within this many
+    # minutes of that reset, the sweep promotes the recurrence to
+    # ``reason_class="judgment"`` (never auto-cleared) instead of letting the
+    # reset budget re-arm a failure the human did not actually fix. 0
+    # disables the promotion entirely (kill switch). 24h covers at least one
+    # full dispatch -> worker -> janitor -> re-escalate cycle even on a
+    # degraded-cadence fleet (the observed #1306 loop re-escalated ~36 min
+    # after the 2026-08-27T00:23:54Z manual unescalate; the two 08-25
+    # escalations were ~10.5h apart).
+    identical_reason_recurrence_window_minutes: int = 1440
     # Issue #1314 item 2 (retained by #1768's rewrite): dedicated cadence
     # knob for the operator-queue-impact check. The check currently rides
     # the loop pass cadence (every pass); this knob lets operators slow it
@@ -2914,40 +2934,11 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     # ``enabled``/``interval_minutes`` overrides are silently ignored, same
     # as before this PR.
     deescalation_data = _section(data, "deescalation")
-    oqr_interval = deescalation_data.get("operator_queue_review_interval_minutes")
-    if oqr_interval is not None and (
-        isinstance(oqr_interval, bool) or not isinstance(oqr_interval, int)
-    ):
-        raise ConfigError(
-            "config section 'deescalation' key 'operator_queue_review_interval_minutes' "
-            f"must be an int, got {type(oqr_interval).__name__}"
-        )
-    if oqr_interval is not None and oqr_interval < 0:
-        raise ConfigError(
-            "config section 'deescalation' key 'operator_queue_review_interval_minutes' "
-            f"must be >= 0, got {oqr_interval}"
-        )
-    oq_threshold = deescalation_data.get("operator_queue_depth_threshold")
-    if oq_threshold is not None and (
-        isinstance(oq_threshold, bool) or not isinstance(oq_threshold, int)
-    ):
-        raise ConfigError(
-            "config section 'deescalation' key 'operator_queue_depth_threshold' "
-            "(blocked-ready-issue count, not root-issue count -- see issue #1768) "
-            f"must be an int, got {type(oq_threshold).__name__}"
-        )
-    if oq_threshold is not None and oq_threshold < 0:
-        raise ConfigError(
-            "config section 'deescalation' key 'operator_queue_depth_threshold' "
-            "(blocked-ready-issue count, not root-issue count -- see issue #1768) "
-            f"must be >= 0, got {oq_threshold}"
-        )
-    deescalation_overrides: dict[str, Any] = {}
-    if oqr_interval is not None:
-        deescalation_overrides["operator_queue_review_interval_minutes"] = oqr_interval
-    if oq_threshold is not None:
-        deescalation_overrides["operator_queue_depth_threshold"] = oq_threshold
-    deescalation = DeescalationConfig(**deescalation_overrides)
+    # Issue #1477 added the third knob (``identical_reason_recurrence_window_minutes``)
+    # to the same scoped-extraction pattern: each key is parsed explicitly and
+    # unknown keys are still silently ignored. The validation lives in
+    # ``deescalation_config.py``; error messages are byte-identical.
+    deescalation = DeescalationConfig(**parse_deescalation_overrides(deescalation_data))
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):

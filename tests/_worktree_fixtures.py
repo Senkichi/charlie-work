@@ -37,6 +37,13 @@ here where both test modules can reach it.
 overruns git's internal worktree-path buffer and ``git worktree add``
 exits 128. Tests that create real linked worktrees use this fixture
 instead of ``tmp_path`` for their repo roots.
+
+``_clone_with_pushed_branch`` and ``_push_sibling_commit`` joined under the
+#1476 rework: the file-size ratchet (issue #1442) required splitting
+``tests/test_worktree_foreign_adoption.py`` into two thematic modules (gate /
+rework adoption vs recovery / teardown / probe), and both sides need the same
+bare-remote-plus-pushed-branch builders, so they live here rather than being
+duplicated.
 """
 
 from __future__ import annotations
@@ -183,6 +190,35 @@ def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
     _git(clone, "commit", "-m", "initial commit")
     _git(clone, "push", "-u", "origin", "main")
     return remote, clone
+
+
+def _clone_with_pushed_branch(tmp_path: Path, branch: str) -> tuple[Path, Path]:
+    """Bare origin + clone + ``branch`` pushed to origin; return (remote, repo)."""
+    remote = tmp_path / "remote.git"
+    _init_repo(remote, bare=True)
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote, repo_root)
+    _git(repo_root, "branch", branch)
+    _git(repo_root, "push", "origin", branch)
+    return remote, repo_root
+
+
+def _push_sibling_commit(remote: Path, tmp_path: Path, branch: str, filename: str) -> str:
+    """Advance ``origin/<branch>`` by one commit from a second clone; return the
+    pushed SHA."""
+    other = tmp_path / "other-clone"
+    if not other.exists():
+        _clone_repo(remote, other)
+        _git(other, "checkout", "-b", branch, f"origin/{branch}")
+    else:
+        _git(other, "fetch", "origin", branch)
+        _git(other, "reset", "--hard", f"origin/{branch}")
+    (other / filename).write_text(f"{filename}\n", encoding="utf-8")
+    _git(other, "add", filename)
+    _git(other, "commit", "-m", f"remote advance {filename}")
+    pushed_sha = _git(other, "rev-parse", "HEAD").stdout.strip()
+    _git(other, "push", "origin", branch)
+    return pushed_sha
 
 
 def _setup_completed_worktree(

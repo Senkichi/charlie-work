@@ -755,6 +755,39 @@ class TestLocalMergeGate:
         labels = {lb["name"] for lb in app.gh.issue_view(7)["labels"]}
         assert app.config.labels.needs_rework in labels
 
+    def test_merge_preserves_foreign_worker_worktree(self, repo: Path) -> None:
+        """Issue #1476: the merge gate's post-merge teardown only owns
+        worktrees under the managed dir. When the branch is checked out in a
+        FOREIGN worktree (``ensure_branch_worktree`` returns the registered
+        path wherever it lives), the merge still lands but the checkout is
+        left on disk — it belongs to whoever created it."""
+        _init_repo(repo)
+        issues_dir = repo / "docs" / "issues"
+        head = _make_branch(repo, "agent/issue-7-x", "a.py", "a = 1\n")
+        # Check the branch out at a path outside the managed worktrees dir.
+        foreign_wt = repo.parent / f"{repo.name}-foreign-wt"
+        _git(repo, "worktree", "add", str(foreign_wt), "agent/issue-7-x")
+        app = _app(repo, issues_dir)
+        _parked_issue(app, issues_dir, 7, "agent/issue-7-x")
+        app._local_review_packets()
+        app.record_local_review(
+            7, "approved", reviewed_head=head, verdict_provenance="fresh_llm_review"
+        )
+
+        results = app._local_merge_approved()
+
+        assert results[0]["outcome"] in ("merged", "already_merged")
+        assert is_ancestor(repo, head, branch_head_sha(repo, "main"))
+        # The foreign checkout survives the merge — never removed, and its
+        # branch ref can't be deleted while checked out anyway. Resolve both
+        # sides: git may canonicalize the registered path (e.g. an 8.3
+        # short-name component) relative to what mkdtemp produced.
+        assert foreign_wt.is_dir()
+        found = worktree_for_branch(repo, "agent/issue-7-x")
+        assert found is not None and found.resolve() == foreign_wt.resolve()
+
+        _git(repo, "worktree", "remove", str(foreign_wt), "--force")
+
     def test_no_merge_without_approval(self, repo: Path) -> None:
         """reviewing records must never reach the merge gate."""
         _init_repo(repo)

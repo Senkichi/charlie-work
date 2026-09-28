@@ -1,0 +1,9 @@
+info
+# Issue #1476: a rework dispatch adopted a foreign checkout of the PR branch
+# (a worktree the orchestrator did not create) instead of looping on
+# worktree_foreign_writer forever. Info, not warning: adoption is the intended
+# recovery — the checkout was verified clean, not the repo's main checkout,
+# and free of any live foreign writer — but the event stays grep-able because
+# a borrowed checkout has different teardown/ownership semantics (it is never
+# removed) and an operator investigating a foreign worktree's mutations should
+# be able to see which dispatch borrowed it.
