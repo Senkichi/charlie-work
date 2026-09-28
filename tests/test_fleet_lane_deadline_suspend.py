@@ -7,11 +7,14 @@ module covers the places a refusal must NOT behave like an ordinary abort:
   post-pass epilogue, so observability calls (queue-impact's cold
   ``gh.issue_list``, the secret-refusal digest) cannot raise a
   ``BaseException`` refusal past their ``except Exception`` containment.
-* ``merge_ready`` -- the post-``merge_pr`` finalize trio (label transition,
-  close_issue, delete_branch) runs under ``pass_deadline_suspended``:
-  refusing there cannot undo a landed merge, it can only strand durable
-  bookkeeping. The ``add_pr_label`` mergequeue handoff is NOT suspended --
-  it is the reversible step itself, so a refusal there propagates cleanly.
+* ``merge_ready`` -- the whole post-``merge_pr`` region (label transition,
+  close_issue, delete_branch, plus the ``_update_open_agent_prs`` /
+  ``cancel_superseded_runs`` deferral tail) runs under
+  ``pass_deadline_suspended``: refusing there cannot undo a landed merge --
+  it can only strand durable bookkeeping or silently drop the merge's
+  events/``merges[]`` entry. The ``add_pr_label`` mergequeue handoff is NOT
+  suspended -- it is the reversible step itself, so a refusal there
+  propagates cleanly.
 * ``dispatch`` / ``dispatch_rework`` -- a refusal between the durable
   ``dispatch_pending`` claim write and ``dispatch_sessions`` must strand
   nothing: no in-progress label is applied without a worker, and the claim
@@ -37,6 +40,7 @@ from _deadline_fixtures import (
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
+    RunnersConfig,
     WorkerRoleConfig,
 )
 from charlie_work.instrumentation import query_events
@@ -151,6 +155,94 @@ def test_merge_ready_delete_branch_runs_despite_deadline_spent_at_close(
 
     assert result.ok is True
     _assert_merge_finalized(app, paths, fake_gh)
+
+
+def test_merge_ready_post_merge_tail_runs_despite_deadline_spent(
+    tmp_path: Path,
+) -> None:
+    """Deadline trips on merge_pr: the deferral tail still runs to completion.
+
+    Under ``update_branch_strategy="front_of_train"`` (the default) the
+    post-``merge_pr`` tail -- ``_update_open_agent_prs`` and
+    ``cancel_superseded_runs`` -- sits past the irreversible step. A refusal
+    there propagates out of merge_ready before the ``merge_ready`` /
+    ``merge_succeeded`` events and the ``merges[]`` result are produced, and
+    the idempotency short-circuit makes that loss permanent. The tail shares
+    the finalize trio's ``pass_deadline_suspended`` window: the calls run,
+    the records land, and the armed predicate still reports spent for the
+    merge-counter guard and the pass's deferred marker.
+    """
+    app, paths, fake_gh = _merge_ready_app(
+        tmp_path,
+        update_branch_strategy="front_of_train",
+        runners=RunnersConfig(
+            enabled=True,
+            cancel_superseded_main_runs=True,
+            workflow_name="CI",
+        ),
+    )
+    # A second approved agent PR riding the merge train: merging 456
+    # advances the base tip, leaving 789 stale -- so the tail's
+    # front_of_train update does real work (pr_update_branch), not a no-op.
+    fake_gh.issues.append(
+        {
+            "number": 789,
+            "title": "Another fix",
+            "url": "https://example.test/issues/789",
+            "labels": [{"name": "automated-ready"}],
+            "state": "OPEN",
+        }
+    )
+    fake_gh.prs = [
+        *fake_gh.prs,
+        {
+            "number": 789,
+            "title": "Fix #789: other",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-789-another-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #789\n\nTests: covered.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    assert app.record_review(
+        789, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+    ).ok
+    # Spent the instant merge_pr lands: every pre-merge check runs on a live
+    # budget; the tail's first gh call (the train sweep's pr_list) is where
+    # the deadline is observed.
+    set_pass_deadline_exceeded(fake_gh, lambda: bool(fake_gh.merged))
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    _assert_merge_finalized(app, paths, fake_gh)
+    # The tail ran to completion past the spent deadline -- no refusal
+    # anywhere in the post-merge sequence.
+    assert fake_gh.deadline_refusals == []
+    assert fake_gh.pr_update_branch_calls == [789]
+    assert result.data["update_open_prs_results"][0]["pr_number"] == 789
+    assert result.data["update_open_prs_results"][0]["updated"] is True
+    assert result.data["cancel_superseded_runs_results"]["total_queued"] == 0
+    assert pass_deadline_spent(fake_gh) is True, "suspend must re-arm the hook on exit"
+    # merge_succeeded is recorded exactly once -- and stays once across the
+    # idempotent re-entry _assert_merge_finalized already performed (the
+    # permanent-loss regression this fix closes).
+    assert len(query_events(paths.state_file, kind="merge_succeeded")) == 1
+    assert len(query_events(paths.state_file, kind="merge_ready")) == 1
+    # The deferred tail is not misread as a merge failure: no counter bump,
+    # no alarm, no escalation.
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 0
+    assert state["issues"]["123"]["status"] == "closed"
+    assert "escalation_reason" not in state["issues"]["123"]
+    assert state["prs"]["456"].get("status") == "merged"
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert alarm_events == []
 
 
 def test_merge_ready_mergequeue_handoff_refusal_propagates_cleanly(

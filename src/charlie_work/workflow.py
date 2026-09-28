@@ -7917,13 +7917,18 @@ class OrchestratorApp:
                 # Label + branch cleanup are best-effort; the merged fact is already
                 # durable. A branch-deletion failure (head branch checked out in a
                 # worktree) or label failure must never un-record the merge.
-                # Issue #1948: deadline refusals are suspended for exactly this
-                # finalize trio -- merge_pr is irreversible, so a refusal here
-                # cannot undo anything; it would only strand cleanup for the
-                # reconcile merged_outside_orchestrator path to redo later.
-                # The suspend re-arms the hook on exit, so the deferral tail
-                # below (open-PR update, superseded-run cancel) still honors a
-                # spent budget.
+                # Issue #1948: the WHOLE post-merge_pr sequence is past the
+                # irreversible step, so deadline refusals are suspended for the
+                # finalize trio AND the deferral tail below it. A refusal in the
+                # tail cannot undo the merge -- it would propagate out of
+                # merge_ready before the merge_ready/merge_succeeded events and
+                # the merges[] result are produced, and the idempotency
+                # short-circuit above makes that loss permanent (the next pass
+                # returns "already merged" without re-emitting them). The tail
+                # is itself reconcile-visible bookkeeping -- the head-of-train's
+                # own merge_ready resyncs a stale base, and the maintenance lane
+                # reclaims superseded runs every pass -- so finishing it here is
+                # strictly better than stranding it.
                 with pass_deadline_suspended(self.gh):
                     if issue_number is not None:
                         result = transition(self.gh, self.config.labels, issue_number, "merged")
@@ -7941,19 +7946,22 @@ class OrchestratorApp:
                     if self.config.auto_merge.delete_branch:
                         head_ref = str(pr.get("headRefName") or "")
                         branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
-                # Update remaining open agent PRs after successful merge (if configured)
-                if self.config.auto_merge.update_branch_strategy in {
-                    "broadcast",
-                    "front_of_train",
-                }:
-                    update_results = self._update_open_agent_prs(pr_number)
-                # Cancel superseded queued runs on default branch after successful merge (if configured)
-                if self.config.runners.enabled and self.config.runners.cancel_superseded_main_runs:
-                    cancel_results = cancel_superseded_runs(
-                        self.gh,
-                        self.config.runners.default_branch,
-                        self.config.runners.workflow_name,
-                    )
+                    # Update remaining open agent PRs after successful merge (if configured)
+                    if self.config.auto_merge.update_branch_strategy in {
+                        "broadcast",
+                        "front_of_train",
+                    }:
+                        update_results = self._update_open_agent_prs(pr_number)
+                    # Cancel superseded queued runs on default branch after successful merge (if configured)
+                    if (
+                        self.config.runners.enabled
+                        and self.config.runners.cancel_superseded_main_runs
+                    ):
+                        cancel_results = cancel_superseded_runs(
+                            self.gh,
+                            self.config.runners.default_branch,
+                            self.config.runners.workflow_name,
+                        )
         # Issue #1598: human-merge hand-off. When the bound issue carries a
         # configured human_merge_labels label and the PR is merge-ready
         # (approved, checks green, no conflicts), the fleet does NOT merge or

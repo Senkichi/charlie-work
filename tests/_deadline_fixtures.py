@@ -33,6 +33,7 @@ from charlie_work.config import (
     MainCiReclaimConfig,
     OrchestratorConfig,
     ReconcilePassConfig,
+    RunnersConfig,
     WorkerRoleConfig,
     WorktreeReclamationConfig,
 )
@@ -141,25 +142,33 @@ def _build_app(
 
 
 def _merge_ready_app(
-    tmp_path: Path, **auto_merge_kwargs: Any
+    tmp_path: Path,
+    *,
+    runners: RunnersConfig | None = None,
+    **auto_merge_kwargs: Any,
 ) -> tuple[OrchestratorApp, Any, _DeadlineAwareGitHub]:
     """An app whose approved PR 456 (linked to issue 123) is merge-eligible.
 
     ``update_branch_strategy="off"`` keeps the post-merge deferral tail
-    (``_update_open_agent_prs``) out of these tests so the armed predicate
-    isolates exactly the finalize trio -- transition / close_issue /
+    (``_update_open_agent_prs``) out of the finalize-trio tests so the
+    armed predicate isolates exactly transition / close_issue /
     delete_branch -- the trio is what the review matrix names. (The config
     cross-check requires ``require_current_base=False`` alongside "off".)
+    Pass ``update_branch_strategy="front_of_train"`` (the production
+    default) to keep the tail in play, and ``runners=RunnersConfig(...)``
+    to arm ``cancel_superseded_runs``.
     """
+    auto_merge: dict[str, Any] = {
+        "required_checks": ("Tests passed", "Lint & Format", "Pre-commit"),
+        "require_approved_review": True,
+        "failed_attempt_alarm": 1,
+        "update_branch_strategy": "off",
+        "require_current_base": False,
+    }
+    auto_merge.update(auto_merge_kwargs)
     config = OrchestratorConfig(
-        auto_merge=AutoMergeConfig(
-            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
-            require_approved_review=True,
-            failed_attempt_alarm=1,
-            update_branch_strategy="off",
-            require_current_base=False,
-            **auto_merge_kwargs,
-        )
+        auto_merge=AutoMergeConfig(**auto_merge),
+        runners=runners if runners is not None else RunnersConfig(),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)

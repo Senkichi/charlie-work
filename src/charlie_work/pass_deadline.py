@@ -20,7 +20,8 @@ a lane mid-flight:
   ``reap_loop._loop_body`` drives its sub-phase yield points with.
 * :func:`pass_deadline_suspended` -- disarm a lane's hook around a
   mutating sequence that is already past its irreversible step (a
-  refusal there could only strand half-finished cleanup).
+  refusal there could only strand half-finished cleanup -- or skip the
+  pass's merge bookkeeping entirely).
 * :func:`run_deadline_guarded_maintenance` -- the per-pass maintenance
   lane, extracted from ``_loop_body`` for the module-size ratchet.
 
@@ -40,10 +41,13 @@ caller) disables every check.
 
 The exception to "guard every gh call" is a sequence already past its
 irreversible step: once ``merge_pr`` has merged, refusing the trailing
-label/close/branch cleanup does not un-merge anything -- it only strands
-reconcile-visible bookkeeping. ``pass_deadline_suspended`` is the scoped
-valve for exactly that case; callers keep it tight because the suspend
-window is also a refusal-free zone for anything called inside it.
+label/close/branch cleanup -- or the open-PR update / superseded-run
+cancel tail -- does not un-merge anything -- it only strands
+reconcile-visible bookkeeping (and, past the tail, silently drops the
+merge's own events and ``merges[]`` entry). ``pass_deadline_suspended``
+is the scoped valve for exactly that case; callers keep it tight because
+the suspend window is also a refusal-free zone for anything called
+inside it.
 
 This module imports nothing from ``charlie_work`` at module level:
 ``github.py`` imports it, so an import back would be circular.
@@ -169,14 +173,20 @@ def pass_deadline_suspended(gh: Any) -> Iterator[None]:
     """Disarm *gh*'s deadline hook for the scope, then re-arm it.
 
     For a mutating sequence already past its irreversible step --
-    ``merge_ready``'s post-``merge_pr`` finalize (issue-label transition,
-    issue close, head-branch delete). Refusing mid-sequence cannot undo
-    the merge, so the refusal's only effect would be stranding
-    half-finished cleanup for reconcile to find later; running the calls
-    is both correct and faster than the reconcile fallback. The hook is
-    re-armed on exit so the deferral tail after the block still sees a
-    spent budget, and ``pass_deadline_spent(gh)`` keeps reporting True
-    for the merge-counter guard.
+    ``merge_ready``'s whole post-``merge_pr`` region: the finalize trio
+    (issue-label transition, issue close, head-branch delete) AND the
+    deferral tail (``_update_open_agent_prs``,
+    ``cancel_superseded_runs``). Refusing mid-sequence cannot undo the
+    merge, so the refusal's only effect would be stranding half-finished
+    cleanup for reconcile to find later -- or, in the tail's case,
+    propagating out of ``merge_ready`` before the ``merge_ready`` /
+    ``merge_succeeded`` events and the ``merges[]`` result are produced
+    (a permanent loss: the durable merged status makes the next pass
+    short-circuit without re-emitting them). Running the calls is both
+    correct and faster than the reconcile fallback. The hook is re-armed
+    on exit so the code after the block still sees a spent budget, and
+    ``pass_deadline_spent(gh)`` keeps reporting True for the
+    merge-counter guard.
 
     A no-op on an unarmed client (``GitHubLike`` doubles, non-fleet
     passes): nothing was armed, nothing to re-arm.
