@@ -7,6 +7,10 @@ domain lives here as its own module. ``github.py`` re-exports the public
 surface (``issue_numbers_mentioned_by_pr``, ``parse_blockers``,
 ``detect_prose_only_dependencies``) so existing
 ``from charlie_work.github import ...`` callers and tests are unchanged.
+The prose-dependency pattern tables and shared quoted-prose judgement
+helpers were themselves split out to ``github_prose_dependencies`` (issue
+#1949 rework, same cap) — this module imports them back; the dependency is
+one-directional so ``parse_blockers`` stays downstream-free.
 
 Every scanner in this module shares ONE fenced-code-block model:
 ``_fenced_block_ranges`` — a line-based CommonMark-ish scan where a closing
@@ -24,6 +28,25 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from typing import Any
+
+# The prose-dependency pattern tables and the shared quoted-prose judgement
+# helpers live in ``github_prose_dependencies`` (extracted during the issue
+# #1949 rework to keep this module under the 800-line cap). The import is
+# one-directional — nothing there imports this module — so ``parse_blockers``
+# remains downstream-free.
+from .github_prose_dependencies import (  # noqa: F401  (facade: private domain imports)
+    _ISSUE_REF_RUN,
+    _NEGATED_ORDERING_RE,
+    _ORDERING_ISSUE_REF_PATTERNS,
+    _ORDERING_ISSUE_REF_RE,
+    _PROSE_DEPENDENCY_PATTERNS,
+    _clause_bounds,
+    _inside_code_span,
+    _inside_quoted_prose,
+    _inside_quoted_span,
+    _is_blockquote_line,
+    _is_noun_merge_match,
+)
 
 # GitHub repository-visibility designators that qualify an ``issue #N``
 # mention as belonging to a different repo's tracker (issue #1803). The
@@ -229,12 +252,8 @@ _BLOCKER_PATTERNS = [
     re.compile(r"blocked-by:\s*#\d+(?:\s*,\s*#\d+)*", flags=re.IGNORECASE),
 ]
 
-_CLAUSE_BOUNDARY_CHARS = ".!?\n"
 _ISSUE_REF = re.compile(r"#\d+")
 
-# Markdown backtick code span: an opening run of backticks, content, and a
-# closing run of the SAME length. Capturing group 2 is the span content.
-_CODE_SPAN_RE = re.compile(r"(`+)(.+?)(\1)", flags=re.DOTALL)
 # Inline run of 3+ backticks (`` ```...``` ``) — the shape the pre-#1819
 # nearest-pair `` ```.*?``` `` regex incidentally stripped along with real
 # fenced blocks. ``issue_numbers_mentioned_by_pr`` keeps suppressing these
@@ -243,8 +262,6 @@ _CODE_SPAN_RE = re.compile(r"(`+)(.+?)(\1)", flags=re.DOTALL)
 # boundary, so the span's closing backtick lands inside the next clause and
 # pairs with a later span's opener, enveloping a genuine prose mention.
 _INLINE_FENCE_SPAN_RE = re.compile(r"(`{3,})(.+?)(\1)", flags=re.DOTALL)
-# Balanced straight-double-quote span. Group 1 is the quoted content.
-_DOUBLE_QUOTE_SPAN_RE = re.compile(r'"([^"]*)"')
 # Opening fence of a fenced code block: a line beginning with a run of 3+
 # backticks or tildes (optionally followed by an info string). CommonMark
 # allows up to 3 leading spaces; we tolerate any leading whitespace.
@@ -271,116 +288,10 @@ _NONE_SENTINEL_RE = re.compile(r"(?:none|n/a)\b", flags=re.IGNORECASE)
 # ("#12, #13", "#12 and #13", "#12, #13, and #14"). A ref followed by
 # non-separator prose ends the run ("#14 after #9 lands" -> "#14"), so
 # trailing annotation text in an item is ignored rather than misparsed.
-# The pattern text is shared with the prose-ordering patterns below via
-# ``_ISSUE_REF_RUN`` so "wait for #12 and #13" contributes both refs.
-_ISSUE_REF_RUN = r"#\d+(?:[ \t]*(?:,[ \t]*(?:and[ \t]+)?|and[ \t]+)#\d+)*"
+# The pattern text is shared with the prose-ordering patterns via the
+# ``_ISSUE_REF_RUN`` import from ``github_prose_dependencies`` so "wait for
+# #12 and #13" contributes both refs.
 _BLOCKER_ITEM_REF_RUN_RE = re.compile(_ISSUE_REF_RUN, flags=re.IGNORECASE)
-
-# Issue #225 dependency-prose patterns (the detector's original surface).
-# Each match is judged per-occurrence against the quoted-prose guards in
-# ``detect_prose_only_dependencies`` — a phrase inside a code span, double
-# quotes, or a blockquote line describes the detector rather than declaring
-# a dependency (issue #1949).
-_PROSE_DEPENDENCY_PATTERNS = [
-    # "do not dispatch before" and variants
-    re.compile(r"do\s+not\s+dispatch\s+before", flags=re.IGNORECASE),
-    # Task references (P\d+-T\d+) only in dependency context — bare task
-    # marker mentions like "implements P2-T4" are deliberately NOT matched.
-    re.compile(r"depends\s+on\s+[^.\n]*P\d+-T\d+", flags=re.IGNORECASE),
-    # "wait for ... P\d+-T\d+ ... <completion verb>" — "Wait for P1-T5 to
-    # complete first."
-    re.compile(
-        r"wait\s+for\s+[^.\n]*P\d+-T\d+[^.\n]*(?:land|merge|complete|done|ship)",
-        flags=re.IGNORECASE,
-    ),
-    # "before/until/after ... P\d+-T\d+ ... <completion verb>"
-    re.compile(
-        r"(?:before|until|after)\s+[^.\n]*P\d+-T\d+[^.\n]*(?:land|merge|complete|done|ship)",
-        flags=re.IGNORECASE,
-    ),
-    # "wait for" before a PR or merge event (non-task dependency prose)
-    re.compile(
-        r"wait\s+for\s+(?:this|that|these|those)?\s*(?:PR|merge|land)",
-        flags=re.IGNORECASE,
-    ),
-]
-
-# Issue #1949: ordering prose next to a same-repo issue ref. ``parse_blockers``
-# only reads "Blocked by"/"Depends on" declarations, so ordering written as
-# "after #12 lands" or "wait for #12 to merge" used to slip through
-# undetected. Capturing group 1 is the run of issue refs the phrase orders
-# on. ``_ORDERING_REF_RUN`` anchors the run's first ref with a lookbehind so
-# an ``owner/repo#N`` cross-repo reference is never captured (the spec scopes
-# the detector to same-repo references; a cross-repo edge cannot be declared
-# as a ``## Blocked by`` item anyway — it already reads as unreadable there).
-# The gap between the phrase and the ref may contain neither another ref nor
-# clause punctuation (`,`/`;`), and is length-bounded: "requires a race or
-# permissions failure, ... issue #357" is incidental mention, not ordering.
-_ORDERING_REF_RUN = r"(?<![\w/])" + _ISSUE_REF_RUN
-# Same-repo ref extractor for the ordering patterns — a ``owner/repo#N``
-# token inside a match (e.g. in the post-ref text before the verb) is not a
-# same-repo reference and does not count toward the blocker-set check.
-_ORDERING_ISSUE_REF_RE = re.compile(r"(?<![\w/])#\d+")
-# A completion verb in a forward-looking form: bare present/noun
-# ("lands", "the merge", "merge") or auxiliary + participle ("is merged",
-# "are BOTH merged", "has landed", "to merge"). Bare past tense ("merged",
-# "landed") is excluded — "after PR #920 merged" narrates history, it does
-# not order this issue behind #920.
-_COMPLETION_VERB = (
-    r"\b(?:lands?|merges?|completes?|done|ships?)\b"
-    r"|(?:is|are|be|been|being|has|have|gets?|getting|to)\s+"
-    r"(?:fully\s+|both\s+|all\s+)?"
-    r"\b(?:lands?|landed|landing|merges?|merged|merging"
-    r"|completes?|completed|completing|ships?|shipped|shipping|done)\b"
-)
-# A negation immediately before the ordering phrase inverts it: "this issue
-# does not wait for #207" is an explicit non-dependency and must not park.
-_NEGATED_ORDERING_RE = re.compile(r"(?:not|n't|never|no)\s+(?:longer\s+)?$", flags=re.IGNORECASE)
-# Each entry: (pattern, negation_sensitive). Only the modal-verb shapes
-# ("wait for", "depends on", "requires") read as inverted under a leading
-# negation — "do not merge before #12 lands" is still ordering prose.
-_ORDERING_ISSUE_REF_PATTERNS = [
-    # "wait for #12", "wait for the merge of #12" — the issue number is the
-    # ordering target; no completion verb required.
-    (
-        re.compile(
-            rf"\bwait\s+for\b[^.\n#,;]{{0,40}}?({_ORDERING_REF_RUN})",
-            flags=re.IGNORECASE,
-        ),
-        True,
-    ),
-    # "depends on #12", "requires #12". "Depends on #N" is also a structured
-    # blocker phrase; the blocker-set check in the caller keeps a properly
-    # declared edge from being flagged.
-    (
-        re.compile(
-            rf"\b(?:depends\s+on|requires)\b[^.\n#,;]{{0,40}}?({_ORDERING_REF_RUN})",
-            flags=re.IGNORECASE,
-        ),
-        True,
-    ),
-    # "before/until/after ... #12 ... <completion verb>" — the issue-ref
-    # counterpart of the P\d+-T\d+ ordering pattern above. The verb must sit
-    # in the same sub-clause as the ref (no `,`/`;`/`:` between) and in a
-    # forward-looking form, so retrospective narration does not park.
-    (
-        re.compile(
-            rf"\b(?:before|until|after)\b[^.\n#,;]{{0,50}}?({_ORDERING_REF_RUN})"
-            rf"[^.\n,;:]{{0,80}}?(?:{_COMPLETION_VERB})",
-            flags=re.IGNORECASE,
-        ),
-        False,
-    ),
-]
-
-
-def _inside_code_span(text: str, start: int, end: int) -> bool:
-    """True if the [start, end) range falls inside a Markdown backtick code span."""
-    for m in _CODE_SPAN_RE.finditer(text):
-        if m.start(2) <= start and end <= m.end(2):
-            return True
-    return False
-
 
 def _inside_inline_fence_span(text: str, start: int, end: int) -> bool:
     """True if the [start, end) range falls inside an inline run of 3+ backticks.
@@ -393,38 +304,6 @@ def _inside_inline_fence_span(text: str, start: int, end: int) -> bool:
         if m.start(2) <= start and end <= m.end(2):
             return True
     return False
-
-
-def _inside_quoted_span(text: str, start: int, end: int) -> bool:
-    """True if the [start, end) range falls inside a straight-double-quote span."""
-    for m in _DOUBLE_QUOTE_SPAN_RE.finditer(text):
-        if m.start(1) <= start and end <= m.end(1):
-            return True
-    return False
-
-
-def _inside_quoted_prose(text: str, start: int, end: int) -> bool:
-    """True if the ``[start, end)`` range reads as quoted/example prose.
-
-    The same guards ``parse_blockers`` applies to a candidate blocker
-    declaration (issues #1454/#1847), minus the fenced-block check — callers
-    run on ``_strip_fenced_blocks`` output, which already removed fenced
-    blocks:
-
-    - blockquote line: the match's line starts with ``>`` after whitespace;
-    - inline code span: the match falls inside a Markdown backtick code
-      span, scoped to the containing clause so a stray backtick elsewhere in
-      the body cannot pair across clauses and swallow a genuine match;
-    - quoted span: same, for a balanced straight-double-quote span.
-    """
-    line_start = text.rfind("\n", 0, start) + 1
-    if _is_blockquote_line(text[line_start:start]):
-        return True
-    clause_start, clause_end = _clause_bounds(text, start, end)
-    clause = text[clause_start:clause_end]
-    return _inside_code_span(
-        clause, start - clause_start, end - clause_start
-    ) or _inside_quoted_span(clause, start - clause_start, end - clause_start)
 
 
 def _fenced_block_ranges(text: str) -> list[tuple[int, int]]:
@@ -509,27 +388,6 @@ def _strip_fenced_blocks(text: str) -> str:
         prev = len(text) if newline == -1 else newline + 1
     out.append(text[prev:])
     return "".join(out)
-
-
-def _clause_bounds(text: str, match_start: int, match_end: int) -> tuple[int, int]:
-    """Return the (start, end) offsets of the sentence/line containing a match.
-
-    Bounded by the closest preceding AND following sentence terminator
-    (".", "!", "?") or line break, so each bullet/sentence is judged
-    independently. The boundary characters themselves are excluded from the
-    returned range.
-    """
-    start_boundary = max(text.rfind(ch, 0, match_start) for ch in _CLAUSE_BOUNDARY_CHARS)
-    start = start_boundary + 1 if start_boundary != -1 else 0
-    end_candidates = [text.find(ch, match_end) for ch in _CLAUSE_BOUNDARY_CHARS]
-    end_candidates = [p for p in end_candidates if p != -1]
-    end = min(end_candidates) if end_candidates else len(text)
-    return start, end
-
-
-def _is_blockquote_line(line: str) -> bool:
-    """True if the line's first non-space character is ``>`` (a Markdown blockquote)."""
-    return line.lstrip(" \t").startswith(">")
 
 
 def _is_thematic_break(line: str) -> bool:
@@ -816,6 +674,11 @@ def detect_prose_only_dependencies(text: str) -> bool:
                 clause_start, _ = _clause_bounds(text, match.start(), match.end(1))
                 if _NEGATED_ORDERING_RE.search(text[clause_start : match.start()]):
                     continue
+            # Noun-"merge" guard (issue #1949 rollout step 3): "after #990's
+            # merge" / "after the #1500 merge" narrate a merge event, they do
+            # not order this issue behind it.
+            if _is_noun_merge_match(text, match):
+                continue
             refs = {
                 int(ref.group(0)[1:]) for ref in _ORDERING_ISSUE_REF_RE.finditer(match.group(0))
             }
