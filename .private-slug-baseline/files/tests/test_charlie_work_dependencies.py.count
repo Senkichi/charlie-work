@@ -1,0 +1,4 @@
+1
+# test_detect_prose_only_dependencies_ordering_tightening cites
+# job-cannon#991 in a comment as the provenance of the noun-form
+# "merge" false-positive case (issue #1949 rollout step 3).
