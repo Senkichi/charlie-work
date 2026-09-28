@@ -22,10 +22,11 @@ from . import layout
 from .config import OrchestratorConfig
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, _select_repos
-from .github import GitHub, set_pass_deadline_exceeded
+from .github import GitHub
 from .global_config import load_layered_config
 from .instrumentation import log_event
 from .local_issues import github_client_for
+from .pass_deadline import PassDeadlineExceeded, set_pass_deadline_exceeded
 from .paths import runtime_paths
 from .workflow import CommandResult, OrchestratorApp
 
@@ -160,6 +161,18 @@ def _run_fleet_repo_lane(
         # ``deadline_exceeded`` (issue #1948) lets _loop_body's
         # sub-phase-boundary checks stop the pass mid-lane.
         return app.loop(0 if drain else limit, merge=merge, deadline_exceeded=deadline_exceeded)
+    except PassDeadlineExceeded:
+        # Issue #1948: a refusal escaped the lane body -- the pass budget
+        # was spent mid-flight on a path the pass's own deadline markers
+        # didn't cover (a work_only dispatch has no _loop_impl wrapper).
+        # Report the lane as a deadline partial -- a distinct shape from
+        # both a hard lane failure and an observed repo, so fleet_loop's
+        # collector sorts it into deadline_partial_repo_keys.
+        return CommandResult(
+            True,
+            "in-pass deadline reached mid-lane; deferred to next pass",
+            {"deadline_deferred": True},
+        )
     finally:
         lock.release()
 

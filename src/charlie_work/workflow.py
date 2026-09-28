@@ -89,6 +89,7 @@ from .janitor import (
 from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
 from .labels import TransitionOutcome, transition
 from .local_work_park import park_or_reclaim_local_orphan
+from .pass_deadline import pass_deadline_spent
 from .paths import RuntimePaths, resolved_layout
 from .prompt_sections import section_variant_names
 from .prompts import (
@@ -8173,9 +8174,19 @@ class OrchestratorApp:
             new_stale_base_deferrals = 0
             merge_attempt_alarm = False
             merge_attempt_warning: str | None = None
-            if (
-                approved and not can_merge and not _is_pending_only(summary)
-            ) or mergequeue_handoff_failed:
+            # Issue #1948 belt: an in-pass deadline refusal propagates out of
+            # merge_ready as PassDeadlineExceeded and never reaches this
+            # block, but the counter invariant is stated here too -- a
+            # deadline-spent pass's verdict is partial information, so it
+            # must neither increment the failure streak nor zero it (same
+            # indeterminate-pass rule as pending-only above). Guards against
+            # any future path that lets a spent budget reach this block as
+            # a result rather than an exception.
+            deadline_spent = pass_deadline_spent(self.gh)
+            if not deadline_spent and (
+                (approved and not can_merge and not _is_pending_only(summary))
+                or mergequeue_handoff_failed
+            ):
                 new_attempts = int(existing.get("consecutive_failed_merge_attempts", 0)) + 1
                 threshold = self.config.auto_merge.failed_attempt_alarm
                 # Issue #777(b): this counter previously had no ceiling and
@@ -8300,7 +8311,7 @@ class OrchestratorApp:
                             "message": merge_attempt_warning,
                         },
                     )
-            elif can_merge:
+            elif can_merge and not deadline_spent:
                 # Genuine success: checks are ready (or an explicit merge/
                 # mergequeue-handoff already reset the persisted value above,
                 # which this re-read of `existing` picked up) and this is not
@@ -8310,6 +8321,7 @@ class OrchestratorApp:
                 # A confirmed-mergeable pass is real positive information, so
                 # it is safe -- and correct -- to zero the streak here, unlike
                 # the pending-only case above which conveys no information.
+                # A deadline-spent pass conveys none either (issue #1948).
                 new_attempts = 0
             if (
                 approved

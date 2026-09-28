@@ -9,8 +9,11 @@ threads the same ``deadline_exceeded`` predicate three ways:
 
 1. ``_run_fleet_repo_lane`` arms it on the lane's own ``GitHub`` client --
    ``GitHub.run()`` refuses a new call (or aborts a retry chain) the moment
-   the budget is spent, returning a ``_PASS_DEADLINE_RETURNCODE`` refusal
-   instead of accumulating timeout+backoff cycles.
+   the budget is spent, raising ``PassDeadlineExceeded`` (a
+   ``BaseException`` -- the ``asyncio.CancelledError`` precedent, so no
+   ``except Exception`` / ``except GitHubError`` site can swallow it and
+   re-enter the ordinary-failure vocabulary) instead of accumulating
+   timeout+backoff cycles.
 2. The lane checks it at its own yield points (before the first real
    phase, between the work-only dispatch and review-dispatch calls).
 3. ``loop()`` -> ``_loop_impl`` -> ``_loop_body`` carries it into the
@@ -53,8 +56,12 @@ from charlie_work.config import (
 from charlie_work.fleet_dispatch import fleet_loop
 from charlie_work.fleet_lanes import _run_fleet_repo_lane
 from charlie_work.fleet_paths import fleet_dir
-from charlie_work.github import GitHub, GitHubError, set_pass_deadline_exceeded
+from charlie_work.github import GitHub
 from charlie_work.instrumentation import query_events
+from charlie_work.pass_deadline import (
+    PassDeadlineExceeded,
+    set_pass_deadline_exceeded,
+)
 from charlie_work.paths import runtime_paths
 from charlie_work.state import empty_state, save_state
 from charlie_work.workflow import CommandResult, OrchestratorApp
@@ -68,22 +75,45 @@ from charlie_work.workflow import CommandResult, OrchestratorApp
 def test_gh_run_refuses_call_when_pass_deadline_exceeded(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An armed, tripped deadline refuses a gh call without spawning it."""
+    """An armed, tripped deadline refuses a gh call without spawning it.
+
+    The refusal RAISES ``PassDeadlineExceeded`` under BOTH allow_failure
+    modes: a refusal is control flow, not a transport failure, and every
+    existing allow_failure consumer misreads a refusal-shaped result as a
+    real gh failure (the review finding this contract answers).
+    """
     gh = GitHub(tmp_path)
     set_pass_deadline_exceeded(gh, lambda: True)
 
     spawn = MagicMock()
     monkeypatch.setattr(github_module, "run_gh_command", spawn)
 
-    refusal = gh.run(["api", "rate_limit"], allow_failure=True)
-    assert refusal.ok is False
-    assert refusal.returncode == github_module._PASS_DEADLINE_RETURNCODE
-    assert "in-pass deadline" in refusal.error
+    with pytest.raises(PassDeadlineExceeded, match="in-pass deadline"):
+        gh.run(["api", "rate_limit"], allow_failure=True)
     spawn.assert_not_called()
 
-    with pytest.raises(GitHubError, match="in-pass deadline"):
+    with pytest.raises(PassDeadlineExceeded, match="in-pass deadline"):
         gh.run(["api", "rate_limit"], allow_failure=False)
     spawn.assert_not_called()
+
+
+def test_pass_deadline_exceeded_is_cancellation_not_an_exception() -> None:
+    """``PassDeadlineExceeded`` must be uncatchable by ``except Exception``.
+
+    ``asyncio.CancelledError`` precedent: a refusal is cooperative
+    cancellation. The lane's call graph contains broad ``except Exception``
+    handlers whose fallbacks are dangerous on a spent budget (stale-data
+    rework routing, fail-open branch validation, merge_ready's comment
+    handler falling through to the failed-attempt counter). BaseException
+    makes the whole class of swallow bugs unreachable, and keeps the
+    refusal out of every ``except GitHubError`` failure-value translator.
+    """
+    assert issubclass(PassDeadlineExceeded, BaseException)
+    assert not issubclass(PassDeadlineExceeded, Exception)
+
+    from charlie_work.github import GitHubError
+
+    assert not issubclass(PassDeadlineExceeded, GitHubError)
 
 
 def test_gh_run_unarmed_deadline_is_inert(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -120,12 +150,49 @@ def test_gh_run_aborts_retry_chain_at_deadline(
     monkeypatch.setattr(github_module, "run_gh_command", spawn)
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: sleeps.append(seconds))
 
-    refusal = gh.run(["api", "rate_limit"], allow_failure=True)
-    assert refusal.ok is False
-    assert refusal.returncode == github_module._PASS_DEADLINE_RETURNCODE
+    with pytest.raises(PassDeadlineExceeded, match="in-pass deadline"):
+        gh.run(["api", "rate_limit"], allow_failure=True)
     assert spawn.call_count == 1, (
         "a retryable timeout followed by a tripped deadline must not spawn "
         "another gh -- the refusal replaces the whole remaining retry chain"
+    )
+    assert sleeps == [], "the deadline refusal must precede the backoff sleep"
+
+
+def test_gh_run_checks_deadline_before_transient_retry_backoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The NON-timeout retry branch re-checks the deadline before backoff.
+
+    ``test_gh_run_aborts_retry_chain_at_deadline`` covers the
+    ``TimeoutExpired`` branch; this covers the sibling branch -- a
+    transient non-timeout gh failure ("connection reset") that
+    ``_should_retry`` classifies retryable for a read call. The predicate
+    is False for the pre-attempt check and True for the pre-sleep check.
+    """
+    gh = GitHub(tmp_path)
+    checks = {"n": 0}
+
+    def _deadline() -> bool:
+        checks["n"] += 1
+        return checks["n"] > 1
+
+    set_pass_deadline_exceeded(gh, _deadline)
+
+    spawn = MagicMock(
+        return_value=subprocess.CompletedProcess(
+            ["gh", "api", "rate_limit"], 1, "", "connection reset by peer"
+        )
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(github_module, "run_gh_command", spawn)
+    monkeypatch.setattr(github_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    with pytest.raises(PassDeadlineExceeded, match="in-pass deadline"):
+        gh.run(["api", "rate_limit"], allow_failure=True)
+    assert spawn.call_count == 1, (
+        "a retryable transient failure followed by a tripped deadline must "
+        "not spawn another gh -- the refusal replaces the retry chain"
     )
     assert sleeps == [], "the deadline refusal must precede the backoff sleep"
 
@@ -164,8 +231,8 @@ def test_fleet_repo_lane_arms_deadline_on_real_github(tmp_path: Path) -> None:
     assert real_gh._pass_deadline_exceeded is predicate
     # And the armed client actually refuses once the predicate trips.
     set_pass_deadline_exceeded(real_gh, lambda: True)
-    refusal = real_gh.run(["api", "rate_limit"], allow_failure=True)
-    assert refusal.returncode == github_module._PASS_DEADLINE_RETURNCODE
+    with pytest.raises(PassDeadlineExceeded, match="in-pass deadline"):
+        real_gh.run(["api", "rate_limit"], allow_failure=True)
 
 
 def test_fleet_repo_lane_stops_between_dispatch_and_review_dispatch() -> None:
