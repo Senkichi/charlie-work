@@ -11,18 +11,24 @@ monkeypatch targets keep working unchanged.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .config import LabelConfig
-from .labels import _edges
+from .labels import TransitionOutcome, TransitionResult, _edges
 from .state import (
     ESCALATION_REASON_CLASSES,
     PASSIVE_OPEN_STATUS,
     SINK_STATUSES,
     escalation_reason_class,
+    load_state,
+    state_lock,
     utc_now,
 )
+
+if TYPE_CHECKING:
+    from .write_gate import WriteGate
 
 # Issue #1266: the two labels.py edges every escalation call site otherwise
 # hardcodes ("escalated" and "redispatch_escalated") get a mechanical
@@ -168,6 +174,42 @@ def _deescalation_skip(reason: str, issue_number: int) -> dict[str, Any]:
     the unattributed bucket this helper exists to eliminate.
     """
     return {"skipped": reason, "issue_number": issue_number}
+
+
+def _record_issue_label_error(
+    state_file: Path,
+    write_gate: WriteGate,
+    issue_number: int,
+    edge: str,
+    result: TransitionResult,
+) -> None:
+    """Persist a failed/partial label transition as ``label_error`` on the issue.
+
+    Shared by the de-escalation sweep's two best-effort label moves (the
+    ``unescalated_pr_open`` edge after a clear and the ``escalated`` edge
+    after an identical-reason recurrence promotion, issue #1477): a
+    transition whose outcome is not ``APPLIED`` is recorded on the issue
+    entry so the failed write stays diagnosable, and the
+    ``_repair_escalated_labels`` self-heal sweep backstops it on a later
+    pass. No-op when the transition applied cleanly or had nothing to do.
+    """
+    if result.outcome == TransitionOutcome.APPLIED:
+        return
+    issue_key = str(issue_number)
+    with state_lock(state_file):
+        state = load_state(state_file)
+        entry = state["issues"].get(issue_key, {})
+        state["issues"][issue_key] = {
+            **(entry if isinstance(entry, dict) else {}),
+            "number": issue_number,
+            "label_error": {
+                "edge": edge,
+                "outcome": result.outcome.value,
+                "add_failures": result.add_failures,
+                "remove_failures": result.remove_failures,
+            },
+        }
+        write_gate.save_state(state)
 
 
 def _escalate_issue(
