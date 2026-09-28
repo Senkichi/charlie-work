@@ -7,6 +7,10 @@ domain lives here as its own module. ``github.py`` re-exports the public
 surface (``issue_numbers_mentioned_by_pr``, ``parse_blockers``,
 ``detect_prose_only_dependencies``) so existing
 ``from charlie_work.github import ...`` callers and tests are unchanged.
+The prose-dependency pattern tables and shared quoted-prose judgement
+helpers were themselves split out to ``github_prose_dependencies`` (issue
+#1949 rework, same cap) — this module imports them back; the dependency is
+one-directional so ``parse_blockers`` stays downstream-free.
 
 Every scanner in this module shares ONE fenced-code-block model:
 ``_fenced_block_ranges`` — a line-based CommonMark-ish scan where a closing
@@ -24,6 +28,25 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from typing import Any
+
+# The prose-dependency pattern tables and the shared quoted-prose judgement
+# helpers live in ``github_prose_dependencies`` (extracted during the issue
+# #1949 rework to keep this module under the 800-line cap). The import is
+# one-directional — nothing there imports this module — so ``parse_blockers``
+# remains downstream-free.
+from .github_prose_dependencies import (  # noqa: F401  (facade: private domain imports)
+    _ISSUE_REF_RUN,
+    _NEGATED_ORDERING_RE,
+    _ORDERING_ISSUE_REF_PATTERNS,
+    _ORDERING_ISSUE_REF_RE,
+    _PROSE_DEPENDENCY_PATTERNS,
+    _clause_bounds,
+    _inside_code_span,
+    _inside_quoted_prose,
+    _inside_quoted_span,
+    _is_blockquote_line,
+    _is_noun_merge_match,
+)
 
 # GitHub repository-visibility designators that qualify an ``issue #N``
 # mention as belonging to a different repo's tracker (issue #1803). The
@@ -229,12 +252,8 @@ _BLOCKER_PATTERNS = [
     re.compile(r"blocked-by:\s*#\d+(?:\s*,\s*#\d+)*", flags=re.IGNORECASE),
 ]
 
-_CLAUSE_BOUNDARY_CHARS = ".!?\n"
 _ISSUE_REF = re.compile(r"#\d+")
 
-# Markdown backtick code span: an opening run of backticks, content, and a
-# closing run of the SAME length. Capturing group 2 is the span content.
-_CODE_SPAN_RE = re.compile(r"(`+)(.+?)(\1)", flags=re.DOTALL)
 # Inline run of 3+ backticks (`` ```...``` ``) — the shape the pre-#1819
 # nearest-pair `` ```.*?``` `` regex incidentally stripped along with real
 # fenced blocks. ``issue_numbers_mentioned_by_pr`` keeps suppressing these
@@ -243,8 +262,6 @@ _CODE_SPAN_RE = re.compile(r"(`+)(.+?)(\1)", flags=re.DOTALL)
 # boundary, so the span's closing backtick lands inside the next clause and
 # pairs with a later span's opener, enveloping a genuine prose mention.
 _INLINE_FENCE_SPAN_RE = re.compile(r"(`{3,})(.+?)(\1)", flags=re.DOTALL)
-# Balanced straight-double-quote span. Group 1 is the quoted content.
-_DOUBLE_QUOTE_SPAN_RE = re.compile(r'"([^"]*)"')
 # Opening fence of a fenced code block: a line beginning with a run of 3+
 # backticks or tildes (optionally followed by an info string). CommonMark
 # allows up to 3 leading spaces; we tolerate any leading whitespace.
@@ -271,18 +288,10 @@ _NONE_SENTINEL_RE = re.compile(r"(?:none|n/a)\b", flags=re.IGNORECASE)
 # ("#12, #13", "#12 and #13", "#12, #13, and #14"). A ref followed by
 # non-separator prose ends the run ("#14 after #9 lands" -> "#14"), so
 # trailing annotation text in an item is ignored rather than misparsed.
-_BLOCKER_ITEM_REF_RUN_RE = re.compile(
-    r"#\d+(?:[ \t]*(?:,[ \t]*(?:and[ \t]+)?|and[ \t]+)#\d+)*",
-    flags=re.IGNORECASE,
-)
-
-
-def _inside_code_span(text: str, start: int, end: int) -> bool:
-    """True if the [start, end) range falls inside a Markdown backtick code span."""
-    for m in _CODE_SPAN_RE.finditer(text):
-        if m.start(2) <= start and end <= m.end(2):
-            return True
-    return False
+# The pattern text is shared with the prose-ordering patterns via the
+# ``_ISSUE_REF_RUN`` import from ``github_prose_dependencies`` so "wait for
+# #12 and #13" contributes both refs.
+_BLOCKER_ITEM_REF_RUN_RE = re.compile(_ISSUE_REF_RUN, flags=re.IGNORECASE)
 
 
 def _inside_inline_fence_span(text: str, start: int, end: int) -> bool:
@@ -294,14 +303,6 @@ def _inside_inline_fence_span(text: str, start: int, end: int) -> bool:
     """
     for m in _INLINE_FENCE_SPAN_RE.finditer(text):
         if m.start(2) <= start and end <= m.end(2):
-            return True
-    return False
-
-
-def _inside_quoted_span(text: str, start: int, end: int) -> bool:
-    """True if the [start, end) range falls inside a straight-double-quote span."""
-    for m in _DOUBLE_QUOTE_SPAN_RE.finditer(text):
-        if m.start(1) <= start and end <= m.end(1):
             return True
     return False
 
@@ -388,27 +389,6 @@ def _strip_fenced_blocks(text: str) -> str:
         prev = len(text) if newline == -1 else newline + 1
     out.append(text[prev:])
     return "".join(out)
-
-
-def _clause_bounds(text: str, match_start: int, match_end: int) -> tuple[int, int]:
-    """Return the (start, end) offsets of the sentence/line containing a match.
-
-    Bounded by the closest preceding AND following sentence terminator
-    (".", "!", "?") or line break, so each bullet/sentence is judged
-    independently. The boundary characters themselves are excluded from the
-    returned range.
-    """
-    start_boundary = max(text.rfind(ch, 0, match_start) for ch in _CLAUSE_BOUNDARY_CHARS)
-    start = start_boundary + 1 if start_boundary != -1 else 0
-    end_candidates = [text.find(ch, match_end) for ch in _CLAUSE_BOUNDARY_CHARS]
-    end_candidates = [p for p in end_candidates if p != -1]
-    end = min(end_candidates) if end_candidates else len(text)
-    return start, end
-
-
-def _is_blockquote_line(line: str) -> bool:
-    """True if the line's first non-space character is ``>`` (a Markdown blockquote)."""
-    return line.lstrip(" \t").startswith(">")
 
 
 def _is_thematic_break(line: str) -> bool:
@@ -619,7 +599,7 @@ def detect_prose_only_dependencies(text: str) -> bool:
     structured blocker declarations. This catches cases like "Do not dispatch
     before P2-T2/P2-T3 have landed" that lack corresponding "Blocked by #N" markers.
 
-    Patterns detected:
+    Patterns detected (``_PROSE_DEPENDENCY_PATTERNS``, issue #225):
     - "do not dispatch before" (case-insensitive)
     - "depends on <...> P\\d+-T\\d+" — task reference in dependency context
     - "wait for <...> P\\d+-T\\d+ <...> (complete|done|land|merge|ship)" — task
@@ -631,16 +611,30 @@ def detect_prose_only_dependencies(text: str) -> bool:
     marker mentions like "implements P2-T4" or title suffixes "(P2-T4)" are
     NOT matched, to avoid flagging every plan-generated issue for human review.
 
+    Ordering prose next to a same-repo issue ref (``_ORDERING_ISSUE_REF_PATTERNS``,
+    issue #1949): "wait for #12", "depends on"/"requires #12", and
+    "before/until/after #12 <completion verb>". ``parse_blockers`` does not
+    read these shapes, so an issue whose only ordering was written this way
+    used to dispatch out of order. A match flags only when a referenced
+    number is NOT among the blockers ``parse_blockers`` extracts from the
+    same body — a body that declares the edge properly (a ``## Blocked by``
+    section or an inline declaration) and also mentions it in prose is not
+    prose-only and must not be parked.
+
+    Every match — old and new patterns alike — is judged against the
+    quoted-prose guards ``parse_blockers`` applies (issue #1949): a phrase
+    inside a fenced code block (removed up front via ``_strip_fenced_blocks``
+    — the ``_fenced_block_ranges`` model ``parse_blockers`` uses, issue
+    #1819), a Markdown blockquote line, an inline backtick code span, or a
+    double-quote span is quoted/example text describing the detector, not
+    the author's own dependency declaration. An issue describing this
+    detector by quoting its trigger phrase must not park itself.
+
     Additionally (issue #1847), a "Blocked by"/"Depends on" heading section
     that holds an item the parser cannot read — neither a same-repo issue
     reference nor a none-sentinel (a URL, an ``owner/repo`` reference, free
     prose) — returns True so the issue is parked for a human instead of
     silently freed.
-
-    Dependency-shaped prose inside a fenced code block is quoted/example
-    code, not the issue author's own declaration: the body is stripped via
-    ``_strip_fenced_blocks`` (the ``_fenced_block_ranges`` model
-    ``parse_blockers`` uses — issue #1819) before any pattern runs.
 
     Args:
         text: The issue body text to check
@@ -655,34 +649,42 @@ def detect_prose_only_dependencies(text: str) -> bool:
     # dependency-shaped prose must not park the issue.
     text = _strip_fenced_blocks(text)
 
-    # Pattern 1: "do not dispatch before" and variants
-    if re.search(r"do\s+not\s+dispatch\s+before", text, flags=re.IGNORECASE):
-        return True
+    # Issue #1949: the numbers the author already declared structurally.
+    # parse_blockers applies its own quoting guards; on the stripped body it
+    # reads exactly the genuine self-declarations.
+    declared_blockers = set(parse_blockers(text))
 
-    # Pattern 2: task references (P\d+-T\d+) only in dependency context.
-    # "depends on ... P\d+-T\d+" — classic self-declaration
-    if re.search(r"depends\s+on\s+[^.\n]*P\d+-T\d+", text, flags=re.IGNORECASE):
-        return True
-    # "wait for ... P\d+-T\d+ ... <completion verb>" — e.g. "Wait for P1-T5 to complete first."
-    if re.search(
-        r"wait\s+for\s+[^.\n]*P\d+-T\d+[^.\n]*(?:land|merge|complete|done|ship)",
-        text,
-        flags=re.IGNORECASE,
-    ):
-        return True
-    # "before/until/after ... P\d+-T\d+ ... <completion verb>"
-    if re.search(
-        r"(?:before|until|after)\s+[^.\n]*P\d+-T\d+[^.\n]*(?:land|merge|complete|done|ship)",
-        text,
-        flags=re.IGNORECASE,
-    ):
-        return True
+    for pattern in _PROSE_DEPENDENCY_PATTERNS:
+        for match in pattern.finditer(text):
+            if _inside_quoted_prose(text, match.start(), match.end()):
+                continue
+            return True
 
-    # Pattern 3: "wait for" before a PR or merge event (non-task dependency prose)
-    if re.search(
-        r"wait\s+for\s+(?:this|that|these|those)?\s*(?:PR|merge|land)", text, flags=re.IGNORECASE
-    ):
-        return True
+    # A prose ordering edge whose ref is not a declared blocker is a
+    # dependency ``parse_blockers`` cannot see — flag it so the issue is
+    # parked for a human instead of dispatching out of order. The quoting
+    # guard is judged on phrase-plus-refs (``start`` to ``end(1)``): a match
+    # that begins inside a quoted span is quoted prose even when a second
+    # ref outside the span extends the match (the stale-comment shape —
+    # `the comment says "until #575 lands" — #575 has landed`).
+    for pattern, negation_sensitive in _ORDERING_ISSUE_REF_PATTERNS:
+        for match in pattern.finditer(text):
+            if _inside_quoted_prose(text, match.start(), match.end(1)):
+                continue
+            if negation_sensitive:
+                clause_start, _ = _clause_bounds(text, match.start(), match.end(1))
+                if _NEGATED_ORDERING_RE.search(text[clause_start : match.start()]):
+                    continue
+            # Noun-"merge" guard (issue #1949 rollout step 3): "after #990's
+            # merge" / "after the #1500 merge" narrate a merge event, they do
+            # not order this issue behind it.
+            if _is_noun_merge_match(text, match):
+                continue
+            refs = {
+                int(ref.group(0)[1:]) for ref in _ORDERING_ISSUE_REF_RE.finditer(match.group(0))
+            }
+            if refs - declared_blockers:
+                return True
 
     # Issue #1847: an unreadable item inside a "Blocked by"/"Depends on"
     # heading section is a dependency declaration we cannot read.

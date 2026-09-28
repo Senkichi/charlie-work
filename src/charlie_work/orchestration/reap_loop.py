@@ -32,7 +32,7 @@ from typing import Any
 
 import charlie_work.workflow as _wf
 from charlie_work.dead_worker_reap import _detect_stalled_sessions
-from charlie_work.escalation import _escalation_flags
+from charlie_work.escalation import _stale_template_warning_suppressed
 from charlie_work.github import (
     GitHub,
     GitHubError,
@@ -615,50 +615,24 @@ def _loop_body(
                         )
                         self._record_merge_or_error(merge_result, errors, merges)
                 else:
-                    # Issue #1338: an escalated PR's packet regeneration is
-                    # unreachable -- review() early-returns "escalated;
-                    # review skipped" before its regen path -- so the
-                    # staleness WARNING below would re-emit an identical
-                    # review_packet_template_stale event every pass without
-                    # ever converging. (The cross-family regen-budget charge
-                    # this comment used to also call out here -- attempts_before /
-                    # _charge_cross_family_regen_not_reached -- was deleted along
-                    # with the auto-gate cross-family subsystem in role-config
-                    # phase 2, track A; there is no second side effect left to
-                    # skip.) Escalation means "awaiting a human", and the recovery
-                    # procedure (unescalate + why-charlie-hate) already
-                    # regenerates the packet with the current template, so skip
-                    # ONLY that meaningless side effect while escalated.
-                    #
-                    # self.review(pr_number) is still called: its own
-                    # _escalation_flags entry gate no-ops packet regen and
-                    # label transitions, but it is the ONLY per-pass path
-                    # that refreshes janitor_ok/janitor_failures/
-                    # ci_run_never_created and runs the #776
-                    # merge-conflict/no-op-rework remediation for
-                    # judgment-class escalations (PRs #1397/#1443). Skipping
-                    # it entirely would reintroduce the exact frozen-
-                    # diagnostics staleness class the sibling-repo fix
-                    # addressed, just via a different trigger. A
-                    # non-escalated stale-template PR still regenerates
-                    # exactly as today (#592 preserved).
-                    issue_state_for_esc = (
+                    issue_state = (
                         state.get("issues", {}).get(str(issue_number), {})
                         if issue_number is not None
                         else None
                     )
-                    pr_escalated_now, issue_escalated_now = _escalation_flags(
-                        pr_state, issue_state_for_esc
+                    # Issues #1338/#1894: suppress the WARNING while the
+                    # record is escalated, sink-parked, or janitor-blocked on
+                    # unreported required checks -- the per-arm rationale
+                    # (and why review() must still run every pass) lives on
+                    # _stale_template_warning_suppressed in escalation.py.
+                    stale_warning_suppressed = _stale_template_warning_suppressed(
+                        pr_state, issue_state
                     )
-                    escalated_now = pr_escalated_now or issue_escalated_now
                     # Emit a distinct event when regeneration fires
                     # because the template changed while the head stayed
                     # put, so a fleet-wide template edit is visible as a
-                    # burst rather than unexplained review churn. Suppressed
-                    # while escalated (#1338): the regen is unreachable, so
-                    # the WARNING would fire identically every pass without
-                    # converging.
-                    if head_current and not template_current and not escalated_now:
+                    # burst rather than unexplained review churn.
+                    if head_current and not template_current and not stale_warning_suppressed:
                         log_event(
                             self.paths.state_file,
                             "review_packet_template_stale",
