@@ -660,12 +660,31 @@ class ReviewConfig:
     # logic; a false positive costs an operator glance plus ``charlie
     # unescalate``, while a false negative repeats the incident (automated
     # rework asserting an operator decision that never happened).
+    #
+    # Markers are DECISION PHRASES, never the bare nouns "human"/"operator"/
+    # "sign-off": those are ordinary domain vocabulary in the repos this
+    # fleet works on ("operator HTTP Basic", ``operator_stop_drained``, "an
+    # operator-kind marker", "not legal sign-off"). With bare nouns, 12 of
+    # the first 16 reclassifications fleet-wide were false positives, and
+    # nobody gave them the "operator glance" -- they parked agent-doable PRs
+    # under agent:human-needed for days. The phrase set below keeps all 4
+    # genuine human calls in that corpus (pinned verbatim in
+    # tests/test_human_decision_marker_corpus.py).
     human_decision_markers: tuple[str, ...] = (
-        "human",
-        "operator",
-        "sign-off",
-        "signoff",
-        "sign off",
+        "human call",
+        "operator call",
+        "human/operator",
+        "human decision",
+        "operator decision",
+        "human check",
+        "human should",
+        "human must",
+        "flag for human",
+        "needs a human",
+        "requires a human",
+        "human sign-off",
+        "operator sign-off",
+        "not worker-resolvable",
         "not automated rework",
         "confirm explicitly",
     )
