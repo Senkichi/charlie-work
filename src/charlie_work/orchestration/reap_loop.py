@@ -10,12 +10,11 @@ binds through the descriptor protocol exactly as a lexical method did).
 Names reached through ``_wf.`` (module-object seam, design Section 3.1 rule 2,
 #1627): ``charlie_work.workflow`` module-level definitions ``CommandResult``
 (class), ``_build_attention_digest``, ``_clear_foreign_issue_ref_marker``,
-``_detect_and_handle_orphaned_workers``, ``_should_reprobe_foreign_marker``,
+``_should_reprobe_foreign_marker``,
 ``_touch_foreign_issue_ref_marker`` (free functions); and Tier-D names patched
 on ``charlie_work.workflow`` by the suite:
-``_classify_dead_sessions_and_update_throttle_state``,
 ``_detect_and_handle_stalled_sessions``,
-``_sweep_orphan_processes_for_dead_sessions``, ``emit_digest``,
+``emit_digest``,
 ``linked_issue_number``, ``load_state_locked``, ``utc_now``. All other free
 names are imported directly from their defining module (a three-form,
 six-alias patch census confirms no test patches any of them on
@@ -41,7 +40,11 @@ from charlie_work.github import (
 )
 from charlie_work.instrumentation import log_event
 from charlie_work.notify import AttentionDigest, AttentionEntry
-from charlie_work.pass_deadline import PassDeadline, PassDeadlineExceeded
+from charlie_work.pass_deadline import (
+    PassDeadline,
+    PassDeadlineExceeded,
+    run_deadline_guarded_maintenance,
+)
 from charlie_work.review_decision import review_decision
 
 
@@ -76,32 +79,13 @@ def _loop_body(
     # fleet_loop's pass-budget predicate, threaded through loop()/
     # _loop_impl by _run_fleet_repo_lane (which also arms it on this
     # app's GitHub client so gh.run() aborts retry chains mid-call by
-    # raising PassDeadlineExceeded). Before #1948 the budget was only
-    # consulted between repo lanes, so a single lane could overrun the
-    # deadline by ~51min of sequential gh timeouts/retries. The rule here:
-    # every GitHub-touching sub-phase goes through ``deadline.phase`` /
-    # ``deadline.call`` (boundary check + deferred placeholder/fallback,
-    # plus a catch for a refusal raised mid-phase), the per-PR
-    # review/merge scan breaks at the top of each iteration, and purely
-    # local work (orphan-process sweeps, stall scans, digest emission, the
-    # marker write below) stays unconditional -- a deadline must never
-    # strand bookkeeping the pass already committed to. Once observed True
-    # the result is latched so later checks are free; the pass-end marker
-    # re-queries the predicate rather than trusting the latch, so a
-    # deadline that trips inside the FINAL guarded step still marks the
-    # pass ``data["deadline_deferred"]``. None (every non-fleet caller)
-    # disables every check.
+    # raising PassDeadlineExceeded). The full wiring policy -- what is
+    # guarded, what stays unconditional, and the deferred-marking rule --
+    # lives in charlie_work.pass_deadline's module docstring.
     deadline = PassDeadline(deadline_exceeded, _wf.CommandResult)
-    if deadline.now():
-        # The lane was submitted just as the budget ran out (the pool-slot
-        # wait or label-ensure can consume the remainder after fleet_loop's
-        # re-check) -- return a complete-but-empty pass instead of starting
-        # the first sub-phase on a dead budget.
-        return _wf.CommandResult(
-            True,
-            "loop pass deferred: in-pass deadline already reached",
-            {"deadline_deferred": True},
-        )
+    early = deadline.preflight("loop pass deferred: in-pass deadline already reached")
+    if early is not None:
+        return early
     sessions_dir = self._layout.sessions_dir
     # Issue #646: the worker census now logs from inside dispatch() itself
     # (the one chokepoint every dispatch path funnels through, including
@@ -136,80 +120,12 @@ def _loop_body(
     gov = self._apply_concurrency_governor(effective_limit)
     effective_limit = gov.dispatch_limit
 
-    # Classify dead sessions and update throttle state (production loop path)
-    # This detects provider throttling from worker deaths and sets cooldown
-    # Also reconciles labels for dead sessions with no open PR (issue #118)
-    sessions_dir = self._layout.sessions_dir
-    # Issue #343 Finding 2: the stall lane at the top of this method
-    # (line ~4100) already ran this pass and is the sole writer of the
-    # inconclusive-probe deferral counter for a not-alive worker -- tell
-    # this lane not to persist it again on top of that write.
-    reaped = deadline.call(
-        lambda: _wf._classify_dead_sessions_and_update_throttle_state(
-            sessions_dir,
-            self.paths.state_file,
-            self.gh,
-            self.config,
-            write_gate=self.write_gate,
-            persist_inconclusive_probe_counter=False,
-            now=now,
-            fleet_dir_override=self.fleet_dir_override,
-        ),
-        [],
-    )
-
-    # Flat-interval Haiku probe for early quota/rate-limit recovery (see
-    # docstring): only does real work when a throttle indicator is active.
-    # `now` (issue #828) is this pass's single injected clock, forwarded
-    # so the probe's own cadence-scheduling samples stay consistent with
-    # the rest of this pass instead of independently racing wall clock.
-    deadline.call(lambda: self._maybe_probe_quota_recovery(now=now), None)
-
-    # Periodic in-loop reconcile (merge-lane-recovery §6-B): repairs
-    # GitHub label / state.json divergence on a fixed cadence instead of
-    # only when an operator runs `charlie mop-up --fix`. Placed before
-    # the dispatch calls below so labels it repairs (e.g. a stale
-    # `needs-rework` on an issue state already marked `escalated`) are
-    # visible to this same pass's dispatch decisions, not just the next.
-    deadline.call(lambda: self._maybe_reconcile_drift(now=now), None)
-
-    # Issues #863/#815: reclaim superseded, not-yet-started main CI runs
-    # every pass -- no runner needed, so unlike the workflow-based
-    # reaper this cannot lose the race for the capacity it exists to
-    # free. See _maybe_reclaim_superseded_main_ci's docstring.
-    deadline.call(lambda: self._maybe_reclaim_superseded_main_ci(), None)
-
-    # Issue #783: periodic re-evaluation of `mechanical` escalations --
-    # the only automated re-entry from `agent:human-needed` for pure
-    # process failures (a dead rework worker, a redispatch cap, a
-    # stalled janitor-gate rework, ...) whose underlying PR artifact has
-    # since become mergeable and janitor-clean. `judgment` escalations
-    # and any pre-existing escalation with no recorded reason_class are
-    # untouched by construction (see _maybe_deescalate_mechanical).
-    deadline.call(lambda: self._maybe_deescalate_mechanical(), None)
-
-    # Sweep for orphan processes in dead session worktrees (issue #139)
-    # This catches detached/daemonized processes that survived session kills
-    _wf._sweep_orphan_processes_for_dead_sessions(
-        sessions_dir, self.paths.state_file, self.config, write_gate=self.write_gate
-    )
-
-    # Detect and handle orphaned workers using state.json PID records (issue #207)
-    # This fallback detects dead workers even when session sidecar files are orphaned.
-    # Pass the review callback so a head-advanced request_changes finding can be
-    # routed to the review-pending path instead of being re-emitted as drift.
-    deadline.call(
-        lambda: _wf._detect_and_handle_orphaned_workers(
-            sessions_dir,
-            self.paths.state_file,
-            self.config,
-            self.gh,
-            write_gate=self.write_gate,
-            review_callback=self.review,
-            fleet_dir_override=self.fleet_dir_override,
-        ),
-        None,
-    )
+    # Issue #1948: the deadline-guarded maintenance lane (dead-session
+    # classification, quota probe, drift reconcile, superseded-CI reclaim,
+    # mechanical de-escalation, orphan process/worker sweeps) -- extracted
+    # to pass_deadline.run_deadline_guarded_maintenance to hold this file
+    # under its size mark; the per-step comments moved with it.
+    reaped = run_deadline_guarded_maintenance(deadline, self, now=now)
 
     # Detect stalled sessions for notification (read-only, stateful via _build_attention_digest)
     stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
@@ -851,25 +767,18 @@ def _loop_body(
     if reclamation is not None:
         data["worktrees_reclaimed"] = reclamation
     # Issue #1948: mark a pass the in-pass deadline cut short. Fleet collects
-    # this key into ``deadline_partial_repo_keys`` -- distinct from a
-    # never-started deferred repo and from a hard failure -- and the
-    # per-pass event makes the cut attributable in events.db. This is a
-    # FRESH predicate evaluation, not the earlier latch read: a deadline
-    # tripped inside the final guarded step (the last PR's review/merge
-    # work, or reclamation above) must still mark this pass partial --
-    # otherwise fleet_loop would count an uninspected repo as observed.
-    if deadline.now():
-        data["deadline_deferred"] = True
+    # the key into ``deadline_partial_repo_keys`` -- distinct from a
+    # never-started deferred repo and from a hard failure -- and the event
+    # makes the cut attributable in events.db. See PassDeadline.finalize_pass
+    # for why this is a fresh predicate evaluation, not the latch read.
+    deferred_payload = deadline.finalize_pass(data)
+    if deferred_payload is not None:
         message += " (partial: in-pass deadline reached)"
         # write-gate-exempt(issue=1948): sibling raw log_event calls in _loop_body
         log_event(
             self.paths.state_file,
             "loop_pass_deadline_deferred",
-            {
-                "reviews_completed": len(reviews),
-                "merges_completed": len(merges),
-                "open_tracked_prs": open_tracked_prs,
-            },
+            deferred_payload,
             repo=self.repo_root.name,
         )
     return _wf.CommandResult(

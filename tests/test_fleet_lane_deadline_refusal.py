@@ -23,26 +23,20 @@ result without ever letting it masquerade as a GitHub failure:
 from __future__ import annotations
 
 import datetime
-import sys
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from _fakes_github import FakeGitHub, FakeGitHubWithMissingRequired
+from _deadline_fixtures import _build_app
+from _fakes_github import FakeGitHubWithMissingRequired
 from _fleet_dispatch_fixtures import (
     _StepClock,
     _per_repo_runtime_paths,
 )
 from charlie_work.config import (
     AutoMergeConfig,
-    DeescalationConfig,
-    DevinConfig,
-    MainCiReclaimConfig,
     OrchestratorConfig,
-    ReconcilePassConfig,
-    WorkerRoleConfig,
-    WorktreeReclamationConfig,
 )
 from charlie_work.fleet_dispatch import fleet_loop
 from charlie_work.fleet_lanes import _run_fleet_repo_lane
@@ -58,29 +52,6 @@ from charlie_work.workflow import CommandResult, OrchestratorApp
 
 def _lane_lock() -> MagicMock:
     return MagicMock(name="lane_lock")
-
-
-def _build_app(root: Path) -> tuple[OrchestratorApp, Any, FakeGitHub]:
-    """Minimal real-app harness in the shape of test_write_gate_dry_run_loop's."""
-    config = OrchestratorConfig(
-        devin=DevinConfig(dispatch_command=(sys.executable, "-c", "import sys; print('ok')")),
-        deescalation=DeescalationConfig(enabled=False),
-        worktree_reclamation=WorktreeReclamationConfig(enabled=False),
-        main_ci_reclaim=MainCiReclaimConfig(enabled=False),
-        reconcile_pass=ReconcilePassConfig(enabled=False),
-        worker=WorkerRoleConfig(harness="command"),
-    )
-    paths = runtime_paths(root, config.runtime.state_dir)
-    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
-    save_state(paths.state_file, empty_state())
-
-    fake_gh = FakeGitHub()
-    fake_gh.issues = []
-    fake_gh.prs = []
-
-    app = OrchestratorApp(root, paths, config, fake_gh)
-    (root / ".var" / "charlie-work" / "dispatches" / "sessions").mkdir(parents=True, exist_ok=True)
-    return app, paths, fake_gh
 
 
 # ---------------------------------------------------------------------------

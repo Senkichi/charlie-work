@@ -299,12 +299,8 @@ class GitHub:
         # `_circuit_breaker_state` above -- `run_gh_command` needs it before
         # the `_COLLABORATORS` loop below installs any delegate.
         object.__setattr__(self, "_http_transport_state", build_http_transport_state())
-        # Cooperative in-pass deadline hook (issue #1948): a `() -> bool`
-        # predicate armed per-lane by pass_deadline.set_pass_deadline_exceeded()
-        # and read by run()'s retry loop. None (the default for every non-fleet
-        # caller) disables the check entirely. Same object.__setattr__
-        # pattern as the state above -- the dataclass is frozen but this is
-        # per-instance runtime state, not a constructor field.
+        # Cooperative in-pass deadline hook (issue #1948), armed per-lane via
+        # pass_deadline.set_pass_deadline_exceeded(); None disables it.
         object.__setattr__(self, "_pass_deadline_exceeded", None)
         # Capability collaborators (Track 2, issue #1585, design doc
         # Section 3.3): each is constructed with a back-reference to this
@@ -358,18 +354,10 @@ class GitHub:
         )
         last_result: subprocess.CompletedProcess[str] | None = None
 
-        # Issue #1948: cooperative in-pass deadline, armed per fleet lane via
-        # pass_deadline.set_pass_deadline_exceeded(). Checked before each
-        # attempt (so a lane already over budget never spawns gh) and before
-        # each backoff sleep (so a deadline reached mid-sequence aborts the
-        # remaining retries instead of accumulating timeout+backoff cycles
-        # until the lane boundary notices). A refusal RAISES
-        # PassDeadlineExceeded even under allow_failure=True -- a refusal is
-        # control flow, not an external-process failure, and every existing
-        # allow_failure consumer misread the refusal result as a real gh
-        # failure (see pass_deadline.py). Deliberately NOT fed to the
-        # circuit breaker via _circuit_breaker_note_result: budget
-        # exhaustion is not evidence about transport health.
+        # Issue #1948: cooperative in-pass deadline -- checked before each
+        # attempt and each backoff sleep; a spent budget raises
+        # PassDeadlineExceeded (even under allow_failure=True, and never
+        # feeds the circuit breaker). See pass_deadline.py.
         for attempt in range(max_retries + 1):
             raise_if_pass_deadline_spent(self._pass_deadline_exceeded, command)
             try:
@@ -439,8 +427,7 @@ class GitHub:
                         value=None,
                         error=timeout_error,
                     )
-                # Issue #1948: don't burn a backoff sleep once the pass
-                # budget is spent -- refuse instead.
+                # Issue #1948: a spent budget refuses instead of sleeping.
                 raise_if_pass_deadline_spent(self._pass_deadline_exceeded, command)
                 delay = base_delay * (2**attempt)
                 jitter = random.uniform(-_JITTER_FRACTION * delay, _JITTER_FRACTION * delay)
@@ -523,8 +510,7 @@ class GitHub:
             if attempt >= max_retries or not _should_retry(args, error, is_mutating):
                 break
 
-            # Issue #1948: don't burn a backoff sleep once the pass budget
-            # is spent -- refuse instead.
+            # Issue #1948: a spent budget refuses instead of sleeping.
             raise_if_pass_deadline_spent(self._pass_deadline_exceeded, command)
             delay = base_delay * (2**attempt)
             jitter = random.uniform(-_JITTER_FRACTION * delay, _JITTER_FRACTION * delay)

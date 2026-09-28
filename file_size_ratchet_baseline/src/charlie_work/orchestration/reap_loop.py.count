@@ -1,8 +1,0 @@
-1000
-# Issue #1948: _loop_body grew past the 800-line cap (800 -> 905) AFTER the
-# latch/_phase_skipped machinery was extracted to pass_deadline.py
-# (PassDeadline). The residual growth is the per-PR refusal catch, the
-# guarded-phase call sites, and the end-of-pass re-evaluation comments --
-# yield-point wiring that must live in the pass body itself.
-# New baseline entry per the ratchet's reviewed-edit rule, raised to the
-# next MARK_QUANTUM multiple.

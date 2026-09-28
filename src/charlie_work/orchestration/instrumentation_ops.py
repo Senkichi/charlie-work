@@ -52,7 +52,10 @@ from charlie_work.instrumentation import (
     record_loop_pass,
 )
 from charlie_work.module_map import build_module_map
-from charlie_work.pass_deadline import PassDeadlineExceeded
+from charlie_work.pass_deadline import (
+    PassDeadlineExceeded,
+    set_pass_deadline_exceeded,
+)
 from charlie_work.preflight import PreflightPaths, emit_preflight_refusal
 from charlie_work.queue_sync_coverage import _QueueSyncCoverageResult
 from charlie_work.state import (
@@ -755,6 +758,11 @@ def _loop_impl(
         sink_before = _wf.sink_census(_wf.load_state_locked(self.paths.state_file))
         # Issue #1948: forward the fleet pass deadline predicate into the
         # pass body so its sub-phase yield checks can cut the lane short.
+        # The finally disarms the gh-side hook the moment the body exits:
+        # the post-pass epilogue below is best-effort instrumentation
+        # (queue-impact's gh.issue_list, the secret-refusal digest) that
+        # must still run on a spent budget, and its ``except Exception``
+        # containment cannot catch a BaseException refusal.
         try:
             result = self._loop_body(
                 limit, merge=merge, now=now, deadline_exceeded=deadline_exceeded
@@ -762,13 +770,14 @@ def _loop_impl(
         except PassDeadlineExceeded:
             # A refusal escaped a gh call _loop_body does not wrap. The
             # pass is partial -- report it deferred (the marker is what
-            # keeps fleet_loop from counting this repo as observed) and
-            # let the post-pass instrumentation below record it normally.
+            # keeps fleet_loop from counting this repo as observed).
             result = _wf.CommandResult(
                 True,
                 "loop pass deferred: in-pass deadline reached",
                 {"deadline_deferred": True},
             )
+        finally:
+            set_pass_deadline_exceeded(self.gh, None)
         elapsed = time.monotonic() - loop_start
         sink_after = _wf.sink_census(_wf.load_state_locked(self.paths.state_file))
         sink_arrivals = len(sink_after - sink_before)

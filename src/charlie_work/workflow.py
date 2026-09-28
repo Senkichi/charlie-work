@@ -89,7 +89,7 @@ from .janitor import (
 from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
 from .labels import TransitionOutcome, transition
 from .local_work_park import park_or_reclaim_local_orphan
-from .pass_deadline import pass_deadline_spent
+from .pass_deadline import pass_deadline_spent, pass_deadline_suspended
 from .paths import RuntimePaths, resolved_layout
 from .prompt_sections import section_variant_names
 from .prompts import (
@@ -7917,22 +7917,30 @@ class OrchestratorApp:
                 # Label + branch cleanup are best-effort; the merged fact is already
                 # durable. A branch-deletion failure (head branch checked out in a
                 # worktree) or label failure must never un-record the merge.
-                if issue_number is not None:
-                    result = transition(self.gh, self.config.labels, issue_number, "merged")
-                    if result.outcome != TransitionOutcome.APPLIED:
-                        label_error = {
-                            "edge": "merged",
-                            "outcome": result.outcome.value,
-                            "add_failures": result.add_failures,
-                            "remove_failures": result.remove_failures,
-                        }
-                    # Close the linked issue explicitly — idempotent if already closed
-                    # via GitHub's keyword automation. This ensures the dependency gate
-                    # sees the closure immediately, avoiding the agent:done+OPEN state.
-                    self.gh.close_issue(issue_number)
-                if self.config.auto_merge.delete_branch:
-                    head_ref = str(pr.get("headRefName") or "")
-                    branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
+                # Issue #1948: deadline refusals are suspended for exactly this
+                # finalize trio -- merge_pr is irreversible, so a refusal here
+                # cannot undo anything; it would only strand cleanup for the
+                # reconcile merged_outside_orchestrator path to redo later.
+                # The suspend re-arms the hook on exit, so the deferral tail
+                # below (open-PR update, superseded-run cancel) still honors a
+                # spent budget.
+                with pass_deadline_suspended(self.gh):
+                    if issue_number is not None:
+                        result = transition(self.gh, self.config.labels, issue_number, "merged")
+                        if result.outcome != TransitionOutcome.APPLIED:
+                            label_error = {
+                                "edge": "merged",
+                                "outcome": result.outcome.value,
+                                "add_failures": result.add_failures,
+                                "remove_failures": result.remove_failures,
+                            }
+                        # Close the linked issue explicitly — idempotent if already closed
+                        # via GitHub's keyword automation. This ensures the dependency gate
+                        # sees the closure immediately, avoiding the agent:done+OPEN state.
+                        self.gh.close_issue(issue_number)
+                    if self.config.auto_merge.delete_branch:
+                        head_ref = str(pr.get("headRefName") or "")
+                        branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
                 # Update remaining open agent PRs after successful merge (if configured)
                 if self.config.auto_merge.update_branch_strategy in {
                     "broadcast",
