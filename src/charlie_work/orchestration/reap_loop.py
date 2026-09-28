@@ -31,7 +31,7 @@ from typing import Any
 
 import charlie_work.workflow as _wf
 from charlie_work.dead_worker_reap import _detect_stalled_sessions
-from charlie_work.escalation import _escalation_flags
+from charlie_work.escalation import _stale_template_warning_suppressed
 from charlie_work.github import (
     GitHub,
     GitHubError,
@@ -41,7 +41,6 @@ from charlie_work.github import (
 from charlie_work.instrumentation import log_event
 from charlie_work.notify import AttentionDigest, AttentionEntry
 from charlie_work.review_decision import review_decision
-from charlie_work.state import SINK_STATUSES
 
 
 def _loop_body(
@@ -543,123 +542,24 @@ def _loop_body(
                         )
                         self._record_merge_or_error(merge_result, errors, merges)
                 else:
-                    # Issue #1338: an escalated PR's packet regeneration is
-                    # unreachable -- review() early-returns "escalated;
-                    # review skipped" before its regen path -- so the
-                    # staleness WARNING below would re-emit an identical
-                    # review_packet_template_stale event every pass without
-                    # ever converging. (The cross-family regen-budget charge
-                    # this comment used to also call out here -- attempts_before /
-                    # _charge_cross_family_regen_not_reached -- was deleted along
-                    # with the auto-gate cross-family subsystem in role-config
-                    # phase 2, track A; there is no second side effect left to
-                    # skip.) Escalation means "awaiting a human", and the recovery
-                    # procedure (unescalate + why-charlie-hate) already
-                    # regenerates the packet with the current template, so skip
-                    # ONLY that meaningless side effect while escalated.
-                    #
-                    # self.review(pr_number) is still called: its own
-                    # _escalation_flags entry gate no-ops packet regen and
-                    # label transitions, but it is the ONLY per-pass path
-                    # that refreshes janitor_ok/janitor_failures/
-                    # ci_run_never_created and runs the #776
-                    # merge-conflict/no-op-rework remediation for
-                    # judgment-class escalations (PRs #1397/#1443). Skipping
-                    # it entirely would reintroduce the exact frozen-
-                    # diagnostics staleness class the sibling-repo fix
-                    # addressed, just via a different trigger. A
-                    # non-escalated stale-template PR still regenerates
-                    # exactly as today (#592 preserved).
-                    issue_state_for_esc = (
+                    issue_state = (
                         state.get("issues", {}).get(str(issue_number), {})
                         if issue_number is not None
                         else None
                     )
-                    pr_escalated_now, issue_escalated_now = _escalation_flags(
-                        pr_state, issue_state_for_esc
-                    )
-                    escalated_now = pr_escalated_now or issue_escalated_now
-                    # Issue #1894: the #1338 suppression names only
-                    # "escalated", but the WARNING's non-convergence is also
-                    # reachable through statuses that predicate deliberately
-                    # does not cover (state.py documents why
-                    # _escalation_flags stays narrow -- a real policy
-                    # boundary, not an oversight to "fix" here). Two more
-                    # arms, each for a different reason:
-                    #
-                    # * janitor_blocked + is_missing_checks_only_block: the
-                    #   flag marks the TRANSIENT "required checks not yet
-                    #   reported" population -- the sole janitor failure is
-                    #   "Required check(s) missing" (janitor.py) -- which is
-                    #   durable only alongside ci_run_never_created_head
-                    #   (adapters.py); it is not "permanently missing" by
-                    #   itself. While the flag reads true on THIS pass,
-                    #   packet regen is unreachable THIS pass -- review()'s
-                    #   deterministic janitor gate short-circuits before its
-                    #   regen path, so packet_template_sha cannot catch up to
-                    #   current_template_sha and the WARNING would fire
-                    #   without any path to convergence for as long as the
-                    #   flag holds (the swole PR #298 shape, where CI never
-                    #   started for the head).
-                    # * SINK_STATUSES' other member, "blocked" (a recorded
-                    #   judgment verdict parked on agent:human-needed), on
-                    #   either the PR record or the linked issue's record.
-                    #   Per the owner's #1894 amendment / #1897 proposal the
-                    #   suppression covers "blocked" too -- deliberately,
-                    #   even though regen is NOT categorically unreachable
-                    #   here: review()'s entry gate excludes only escalated,
-                    #   so a blocked record still flows through review()'s
-                    #   main path each pass, which converges it (janitor
-                    #   green -> packet regenerated with the current
-                    #   template and status "reviewing"; janitor red ->
-                    #   status rewritten to "janitor_blocked", where the
-                    #   arm above then applies if the sole failure is
-                    #   missing checks). For a janitor-green blocked PR the
-                    #   WARNING would have fired exactly once before
-                    #   converging -- this arm trades away that one-shot,
-                    #   non-actionable signal (the event carries no
-                    #   automated remediation) for silence while a
-                    #   human-owned record stands. review() does not touch
-                    #   the ISSUE record's status, so an issue-level
-                    #   "blocked" keeps suppressing across passes.
-                    # SINK_STATUSES already subsumes "escalated"; naming
-                    # escalated_now alongside it keeps the #1338 lineage
-                    # legible at the gate.
-                    #
-                    # self.review() is still called for these statuses too.
-                    # Unlike the escalated early-return branch, the
-                    # janitor-diagnostics refresh for janitor_blocked /
-                    # blocked records lives inside review()'s MAIN janitor
-                    # path (janitor_ok / janitor_failures /
-                    # is_missing_checks_only_block -- the very fields this
-                    # predicate reads -- plus the ci_run_never_created
-                    # detection and the stale-checks-retrigger self-heal
-                    # lane). Skipping the call would freeze the predicate's
-                    # own inputs so the suppression could never lift once
-                    # the checks report -- a permanent wedge, and the same
-                    # frozen-diagnostics failure mode PRs #1397/#1443
-                    # established for the escalated case.
-                    non_convergent_now = (
-                        escalated_now
-                        or pr_state.get("status") in SINK_STATUSES
-                        or (
-                            isinstance(issue_state_for_esc, dict)
-                            and issue_state_for_esc.get("status") in SINK_STATUSES
-                        )
-                        or (
-                            pr_state.get("status") == "janitor_blocked"
-                            and bool(pr_state.get("is_missing_checks_only_block"))
-                        )
+                    # Issues #1338/#1894: suppress the WARNING while the
+                    # record is escalated, sink-parked, or janitor-blocked on
+                    # unreported required checks -- the per-arm rationale
+                    # (and why review() must still run every pass) lives on
+                    # _stale_template_warning_suppressed in escalation.py.
+                    stale_warning_suppressed = _stale_template_warning_suppressed(
+                        pr_state, issue_state
                     )
                     # Emit a distinct event when regeneration fires
                     # because the template changed while the head stayed
                     # put, so a fleet-wide template edit is visible as a
-                    # burst rather than unexplained review churn. Suppressed
-                    # while the WARNING cannot converge or the record is
-                    # human-owned (#1338 escalated, #1894 blocked /
-                    # janitor_blocked-missing-checks): otherwise it would
-                    # re-fire identically without producing new information.
-                    if head_current and not template_current and not non_convergent_now:
+                    # burst rather than unexplained review churn.
+                    if head_current and not template_current and not stale_warning_suppressed:
                         log_event(
                             self.paths.state_file,
                             "review_packet_template_stale",
