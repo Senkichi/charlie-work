@@ -3323,15 +3323,11 @@ def create_worktree(
                     probe_result="live_writer_at_unsafe_evaluation",
                     inconclusive_probe_deferred_count=0,
                 )
-        # Issue #1944: on a repo with no origin remote the "local commits not
-        # on remote branch" verdict can never resolve — there is nowhere to
-        # push, so every requeue of a diverged agent branch escalates to
-        # human-needed forever (mdls #144). Archive the unreachable tip to a
-        # local archive/<branch>-<utc-date> branch and permit the reset, which
-        # recreates the branch from the default branch below. Repos WITH a
-        # remote keep the refusal: unpushed work there can still be salvaged
-        # by a real push. The live-writer recheck above runs first — a live
-        # worker's branch is deferred, never archived under it.
+        # Issue #1944: on a repo with no origin remote the diverged tip can
+        # never become "pushed" — archive it locally and permit the reset
+        # (see _archive_unreachable_tip_if_applicable). Runs after the
+        # live-writer recheck: a live worker's branch is deferred, never
+        # archived under it.
         if (
             (config is None or config.dispatch.archive_unreachable_local_commits)
             and _worktree_unsafe_kind_from_reason(reason) == WORKTREE_UNSAFE_KIND_LOCAL_COMMITS

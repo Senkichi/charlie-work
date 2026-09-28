@@ -77,6 +77,16 @@ def _wt_scratch() -> Iterator[Path]:
     stays shallow on Windows; on POSIX ``tempfile.gettempdir()`` is
     already short, and ``min()`` by path length picks the shallowest
     either way.
+
+    The yielded path is canonicalized with ``Path.resolve()``: on
+    GitHub-hosted Windows runners ``%TEMP%`` is an 8.3 short path
+    (``C:\\Users\\RUNNER~1\\...``) while ``git worktree
+    list --porcelain`` reports the canonical long spelling, so
+    ``Path(wt["worktree"]) == worktree_path`` lookups inside
+    ``create_worktree`` miss the registered worktree — it survives
+    removal, and the fresh-dispatch ``git branch -D`` then fails on
+    a branch still checked out in it. Resolving here keeps the
+    spelling the tests pass in identical to the one git reports.
     """
     roots = []
     local_appdata = os.environ.get("LOCALAPPDATA")
@@ -85,7 +95,7 @@ def _wt_scratch() -> Iterator[Path]:
     roots.append(Path(tempfile.gettempdir()))
     root = min(roots, key=lambda p: len(str(p))) / "charlie-wt-scratch"
     root.mkdir(parents=True, exist_ok=True)
-    scratch = Path(tempfile.mkdtemp(prefix="wt-", dir=root))
+    scratch = Path(tempfile.mkdtemp(prefix="wt-", dir=root)).resolve()
     try:
         yield scratch
     finally:
