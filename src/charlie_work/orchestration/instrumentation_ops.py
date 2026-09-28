@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,10 @@ from charlie_work.instrumentation import (
     record_loop_pass,
 )
 from charlie_work.module_map import build_module_map
+from charlie_work.pass_deadline import (
+    PassDeadlineExceeded,
+    set_pass_deadline_exceeded,
+)
 from charlie_work.preflight import PreflightPaths, emit_preflight_refusal
 from charlie_work.queue_sync_coverage import _QueueSyncCoverageResult
 from charlie_work.state import (
@@ -668,7 +673,12 @@ def tripwire_status(self) -> _wf.CommandResult:
 
 
 def _loop_impl(
-    self, limit: int | None, *, merge: bool | None, now: datetime | None = None
+    self,
+    limit: int | None,
+    *,
+    merge: bool | None,
+    now: datetime | None = None,
+    deadline_exceeded: Callable[[], bool] | None = None,
 ) -> _wf.CommandResult:
     # Issue #1363: preflight gate. Runs BEFORE `loop_started` is recorded
     # -- a fatal host-precondition failure (disk_floor, venv_identity)
@@ -746,7 +756,28 @@ def _loop_impl(
         # -- the lint guard in ``test_no_unlocked_load_state_in_production_code``
         # flags any bare ``load_state`` outside a ``state_lock`` context.
         sink_before = _wf.sink_census(_wf.load_state_locked(self.paths.state_file))
-        result = self._loop_body(limit, merge=merge, now=now)
+        # Issue #1948: forward the fleet pass deadline predicate into the
+        # pass body so its sub-phase yield checks can cut the lane short.
+        # The finally disarms the gh-side hook the moment the body exits:
+        # the post-pass epilogue below is best-effort instrumentation
+        # (queue-impact's gh.issue_list, the secret-refusal digest) that
+        # must still run on a spent budget, and its ``except Exception``
+        # containment cannot catch a BaseException refusal.
+        try:
+            result = self._loop_body(
+                limit, merge=merge, now=now, deadline_exceeded=deadline_exceeded
+            )
+        except PassDeadlineExceeded:
+            # A refusal escaped a gh call _loop_body does not wrap. The
+            # pass is partial -- report it deferred (the marker is what
+            # keeps fleet_loop from counting this repo as observed).
+            result = _wf.CommandResult(
+                True,
+                "loop pass deferred: in-pass deadline reached",
+                {"deadline_deferred": True},
+            )
+        finally:
+            set_pass_deadline_exceeded(self.gh, None)
         elapsed = time.monotonic() - loop_start
         sink_after = _wf.sink_census(_wf.load_state_locked(self.paths.state_file))
         sink_arrivals = len(sink_after - sink_before)

@@ -581,7 +581,7 @@ def test_loop_records_sink_metric_in_completed_event_and_pass_row(
     # Stub _loop_body to escalate a second issue during the pass and return a
     # clean CommandResult without touching GitHub. This isolates the sink
     # census diff (the issue #1083 measurement) from the rest of the pass.
-    def stub_body(limit: int | None, *, merge: bool | None, now=None) -> CommandResult:
+    def stub_body(limit: int | None, *, merge: bool | None, now=None, **_kwargs) -> CommandResult:
         mid = load_state(paths.state_file)
         mid["issues"]["200"] = {
             "number": 200,
@@ -657,7 +657,7 @@ def test_loop_fatal_preflight_refusal_skips_loop_body(
 
     body_invoked = False
 
-    def stub_body(limit: int | None, *, merge: bool | None, now=None) -> CommandResult:
+    def stub_body(limit: int | None, *, merge: bool | None, now=None, **_kwargs) -> CommandResult:
         nonlocal body_invoked
         body_invoked = True
         return CommandResult(ok=True, message="stub", data={})
@@ -706,7 +706,7 @@ def test_loop_healthy_preflight_proceeds_with_no_extra_events(
         "charlie_work.workflow.run_preflight", lambda *args, **kwargs: all_ok_result
     )
 
-    def stub_body(limit: int | None, *, merge: bool | None, now=None) -> CommandResult:
+    def stub_body(limit: int | None, *, merge: bool | None, now=None, **_kwargs) -> CommandResult:
         return CommandResult(
             ok=True, message="stub", data={"errors": [], "merges": [], "reviews": []}
         )
