@@ -45,7 +45,7 @@ from .post_mortem import real_activity_for_worker
 from .process_utils import is_pid_alive, kill_orphan_pid, kill_process_tree
 from .safe_path import contains
 from .safe_ref import require_valid_ref_name, require_valid_rev, require_valid_sha
-from .subprocess_runner import RunResult, run_captured
+from .subprocess_runner import RunResult, command_failure_message, run_captured
 from . import state as _state
 from .worktree_archive import (
     _archive_unreachable_tip_if_applicable,
@@ -3982,7 +3982,11 @@ def create_worktree(
                 if not branch_delete_result.ok:
                     raise RuntimeError(
                         f"git branch -D failed for branch {branch!r} for fresh dispatch: "
-                        f"{branch_delete_result.error or branch_delete_result.stderr}"
+                        + command_failure_message(
+                            ["git", "branch", "-D", branch],
+                            branch_delete_result,
+                            "unknown git branch -D failure",
+                        )
                     )
 
             if resolved_base_ref.startswith("origin/"):

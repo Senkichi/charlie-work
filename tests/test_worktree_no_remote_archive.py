@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -107,7 +108,32 @@ def test_no_remote_diverged_worktree_present_is_archived_and_pruned(
     info1 = create_worktree(repo_root, branch, base_ref="HEAD", issue_number=200)
     old_tip = _commit_in(info1.path)
 
-    info2 = create_worktree(repo_root, branch, base_ref="HEAD", issue_number=200)
+    try:
+        info2 = create_worktree(repo_root, branch, base_ref="HEAD", issue_number=200)
+    except RuntimeError as exc:
+        # Diagnose environment-sensitive failures: the exact state git
+        # reports for the worktree/branch decides whether a stale
+        # registration, a missed reclaim, or a ref-level error is at fault.
+        admin = repo_root / ".git" / "worktrees"
+        admin_entries = sorted(p.name for p in admin.iterdir()) if admin.is_dir() else ["<absent>"]
+        listed = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        ).stdout
+        branches = subprocess.run(
+            ["git", "branch", "--list", "-a"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        ).stdout
+        pytest.fail(
+            f"requeue dispatch raised {exc!r}\n"
+            f"git worktree list --porcelain:\n{listed}\n"
+            f"git branch --list -a:\n{branches}\n"
+            f".git/worktrees entries: {admin_entries}"
+        )
 
     assert info2.reclaimed == "pruned"
     archives = _archive_refs(repo_root, branch)
