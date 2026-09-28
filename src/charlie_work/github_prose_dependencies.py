@@ -144,16 +144,22 @@ _ORDERING_ISSUE_REF_PATTERNS = [
 ]
 
 # A bare "merge"/"merges" completion token can be the *event noun* rather
-# than a verb: "after #990's merge" (possessive) or "after the #1500 merge"
-# (determiner-preceded ref) both park on a noun, which contradicts the
-# forward-looking-verb claim — the issue narrates a merge event, it does not
-# order itself behind it. Verb uses ("after #336 and #329 merge", "after PR
-# #1043 merges") carry neither marker and still flag. Determiners are a
-# closed grammatical class, so a literal alternation is correct here.
+# than a verb — but only when the token directly follows the ref run or
+# the possessive clitic: "after #990's merge" (possessive) or "after the
+# #1500 merge" (determiner-preceded ref) both park on a noun, which
+# contradicts the forward-looking-verb claim — the issue narrates a merge
+# event, it does not order itself behind it. An intervening word means
+# "merge" is the verb of a determiner-marked subject ("the #12 PR
+# merges"), and under a determiner only the singular "merge" is a noun —
+# "the #12 merges" is verb agreement, not a named event. Verb uses
+# ("after #336 and #329 merge", "after PR #1043 merges") carry neither
+# marker and still flag. Determiners are a closed grammatical class, so a
+# literal alternation is correct here.
 _MERGE_NOUN_DETERMINER_RE = re.compile(
     r"\b(?:the|a|an|this|that|these|those|its|their|our)\s+$", flags=re.IGNORECASE
 )
 _POSSESSIVE_CLITIC_RE = re.compile(r"^[ \t]*['’]s[ \t]+merge\b", flags=re.IGNORECASE)
+_SINGULAR_MERGE_AFTER_REF_RE = re.compile(r"^[ \t]*merge\b", flags=re.IGNORECASE)
 _BARE_MERGE_TOKEN_RE = re.compile(r"\bmerges?$", flags=re.IGNORECASE)
 _COMPLETION_VERB_RE = re.compile(_COMPLETION_VERB, flags=re.IGNORECASE)
 
@@ -163,15 +169,21 @@ def _is_noun_merge_match(text: str, match: re.Match[str]) -> bool:
     reads as the event noun, not the completion verb (issue #1949 rollout
     step 3).
 
-    Two noun markers are recognised: a possessive clitic that makes the ref
-    own the merge (``after #990's merge`` — ``#12's dependents merge`` is a
-    *verb* merge and still flags) and a determiner directly before the ref
-    (``after the #1500 merge`` — ``match.start()`` is the ordering phrase, so
-    the checked span is the gap between phrase and ref). Auxiliary forms
-    ("is merged", "has merged") are never nouns and the match does not end
-    in a bare token for them, so they return False before either marker is
-    consulted. Only callable on ``_ORDERING_ISSUE_REF_PATTERNS`` matches —
-    group 1 is the ref run in every entry.
+    Two noun markers are recognised, both requiring the bare token to
+    directly follow the ref run or the clitic: a possessive clitic that
+    makes the ref own the merge (``after #990's merge`` — ``#12's
+    dependents merge`` is a *verb* merge and still flags) and a determiner
+    directly before the ref with the singular ``merge`` directly after it
+    (``after the #1500 merge`` — ``match.start()`` is the ordering phrase,
+    so the determiner check covers the gap between phrase and ref). Any
+    other word between the ref and the token means ``merge`` is the verb
+    of a determiner-marked subject (``the #12 PR merges``), and ``merges``
+    under a determiner is verb agreement, not a noun (``the #12 merges``)
+    — both still flag. Auxiliary forms ("is merged", "has merged") are
+    never nouns and the match does not end in a bare token for them, so
+    they return False before either marker is consulted. Only callable on
+    ``_ORDERING_ISSUE_REF_PATTERNS`` matches — group 1 is the ref run in
+    every entry.
 
     The noun token lazily claims the match's verb slot, so a genuine
     completion verb later in the same sub-clause is recovered before
@@ -181,9 +193,13 @@ def _is_noun_merge_match(text: str, match: re.Match[str]) -> bool:
     """
     if _BARE_MERGE_TOKEN_RE.search(match.group(0)) is None:
         return False
+    after_ref = text[match.end(1) :]
     if not (
-        _POSSESSIVE_CLITIC_RE.match(text[match.end(1) :])
-        or _MERGE_NOUN_DETERMINER_RE.search(text[match.start() : match.start(1)])
+        _POSSESSIVE_CLITIC_RE.match(after_ref)
+        or (
+            _SINGULAR_MERGE_AFTER_REF_RE.match(after_ref)
+            and _MERGE_NOUN_DETERMINER_RE.search(text[match.start() : match.start(1)])
+        )
     ):
         return False
     tail = text[match.end() : match.end(1) + 80]

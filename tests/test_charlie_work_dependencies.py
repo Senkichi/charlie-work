@@ -331,6 +331,17 @@ def test_detect_prose_only_dependencies_ordering_tightening() -> None:
     assert detect_prose_only_dependencies("Hold until #12's dependents merge.") is True
     # A genuine verb later in the sub-clause is not swallowed by the noun.
     assert detect_prose_only_dependencies("Hold until the #12 merge completes.") is True
+    # A determiner before the ref does not make "merge" a noun: an
+    # intervening subject ("the #12 PR merges" — "the" marks the PR) or
+    # verb agreement under a determiner ("the #12 merges") is still
+    # ordering prose. The noun token must directly follow the ref run or
+    # the possessive clitic (round-3 rework repro cases).
+    assert detect_prose_only_dependencies("Start after the #12 PR merges.") is True
+    assert detect_prose_only_dependencies("Do not start until the #12 fix merges.") is True
+    assert detect_prose_only_dependencies("Hold until the #12 work merges.") is True
+    assert detect_prose_only_dependencies("Land after the #12 change merges.") is True
+    assert detect_prose_only_dependencies("Hold until the #12 PR merges and CI is green.") is True
+    assert detect_prose_only_dependencies("Ship after the #12 merges.") is True
 
 
 def test_detect_prose_only_dependencies_ordering_negation_boundary() -> None:
