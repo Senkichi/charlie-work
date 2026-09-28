@@ -1,0 +1,8 @@
+warning
+# Issue #1948: a repo lane's pass was cut short mid-lane by the fleet
+# in-pass deadline (max_pass_runtime_seconds); remaining sub-phases defer
+# to the next pass. Warning, not error: the pass still ends cleanly and
+# returns a CommandResult carrying data["deadline_deferred"] -- nothing
+# crashed, work was rescheduled. Sibling of fleet_pass_deadline_deferred
+# (which covers never-started lanes); this one covers a lane that ran
+# partially.

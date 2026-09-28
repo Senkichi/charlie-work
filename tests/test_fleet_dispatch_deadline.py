@@ -10,6 +10,7 @@ file) would have been the wrong call.
 from __future__ import annotations
 
 import datetime
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from _fleet_dispatch_fixtures import (
@@ -20,7 +21,7 @@ from _fleet_dispatch_fixtures import (
     _per_repo_runtime_paths,
 )
 from charlie_work import layout
-from charlie_work.config import OrchestratorConfig
+from charlie_work.config import OrchestratorConfig, SupervisorConfig
 from charlie_work.fleet_dispatch import fleet_loop
 from charlie_work.instrumentation import query_events
 from charlie_work.workflow import CommandResult
@@ -42,11 +43,19 @@ def test_fleet_loop_deadline_defers_later_repos(
     """Issue #1832: a pass over its in-pass deadline defers later repos cleanly.
 
     Three repos are selected explicitly (bypassing registry ordering). The
-    fake clock lets repo1's own deadline check pass, then reports the
-    deadline exceeded for every call after -- repo2 and repo3's lanes must
-    never start (no app.dispatch() call, no per_repo_results entry for
-    either), and both must show up in ``data["deferred"]`` instead of being
-    counted as failed.
+    clock stays under the deadline until repo1's lane is observed dispatching,
+    then reports it blown -- repo2 and repo3's lanes must never start (no
+    app.dispatch() call, no per_repo_results entry for either), and both must
+    show up in ``data["deferred"]`` instead of being counted as failed.
+
+    Issue #1948 changed the clock's shape: the deadline predicate is now
+    also invoked from lane THREADS (``_run_fleet_repo_lane``'s own yield
+    checks and ``gh.run``'s retry loop), so a call-order step clock would be
+    consumed in a nondeterministic interleaving. The flag flips inside
+    repo1's ``dispatch`` -- a named happens-before edge -- and
+    ``fleet_lane_concurrency=1`` makes the pool wait collect repo1's lane
+    before repo2's re-check, so the outcome is identical whether repo2's
+    top-of-loop check or its post-wait re-check observes the trip first.
     """
     registry = {
         "repos": {
@@ -72,19 +81,24 @@ def test_fleet_loop_deadline_defers_later_repos(
     # Issue #1934: distinct lock-file root per repo for concurrent lanes.
     mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
+    # Deadline budget spent the moment repo1's lane dispatches: repo1's own
+    # in-lane check already passed, repo2/repo3 defer.
+    budget_spent = threading.Event()
+    clock = lambda: 10000.0 if budget_spent.is_set() else 0.0  # noqa: E731
+
     mock_app = MagicMock()
-    mock_app.dispatch.return_value = CommandResult(True, "repo1 dispatch complete", {})
+
+    def _dispatch_then_spend(*args: object, **kwargs: object) -> CommandResult:
+        budget_spent.set()
+        return CommandResult(True, "repo1 dispatch complete", {})
+
+    mock_app.dispatch.side_effect = _dispatch_then_spend
     mock_app_class.return_value = mock_app
     mock_gh_class.return_value = MagicMock()
 
-    # steps[0]=pass_started_at, steps[1]=repo1's deadline check (1s elapsed,
-    # under the 100s deadline -> repo1 proceeds); every call after reads
-    # `after` (10000s elapsed -> over the deadline for repo2/repo3).
-    clock = _StepClock(steps=[0.0, 1.0], after=10000.0)
-
     result = fleet_loop(
         fleet_dir_override=str(tmp_path / "fleet"),
-        global_config=None,
+        global_config=OrchestratorConfig(supervisor=SupervisorConfig(fleet_lane_concurrency=1)),
         repos=("owner/repo1", "owner/repo2", "owner/repo3"),
         work_only=True,
         deadline_seconds=100,
@@ -156,17 +170,27 @@ def test_fleet_loop_deadline_rotates_last_seen(
     # Issue #1934: distinct lock-file root per repo for concurrent lanes.
     mock_runtime_paths.side_effect = _per_repo_runtime_paths
 
+    # Same event-gated clock as the sibling test above (issue #1948): lane
+    # threads consume pass_clock reads now, so the budget flips inside
+    # repo1's dispatch -- an observed edge -- not on a call ordinal.
+    budget_spent = threading.Event()
+    clock = lambda: 10000.0 if budget_spent.is_set() else 0.0  # noqa: E731
+
     mock_app = MagicMock()
-    mock_app.dispatch.return_value = CommandResult(True, "repo1 dispatch complete", {})
+
+    def _dispatch_then_spend(*args: object, **kwargs: object) -> CommandResult:
+        budget_spent.set()
+        return CommandResult(True, "repo1 dispatch complete", {})
+
+    mock_app.dispatch.side_effect = _dispatch_then_spend
     mock_app_class.return_value = mock_app
     mock_gh_class.return_value = MagicMock()
 
-    clock = _StepClock(steps=[0.0, 1.0], after=10000.0)
     pass_now = datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC)
 
     fleet_loop(
         fleet_dir_override=str(fleet_dir_path),
-        global_config=None,
+        global_config=OrchestratorConfig(supervisor=SupervisorConfig(fleet_lane_concurrency=1)),
         repos=None,
         work_only=True,
         deadline_seconds=100,
