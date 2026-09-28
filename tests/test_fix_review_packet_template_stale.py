@@ -578,18 +578,30 @@ def test_review_queue_includes_pending_packet_when_template_matches(tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------
-# Issue #1894: the #1338 stale-template suppression names only "escalated",
-# but the identical non-convergent shape is reachable through the other
-# durably-stuck statuses -- a "blocked" record on the PR or its linked
-# issue (SINK_STATUSES' other member), and a "janitor_blocked" PR whose
-# sole janitor failure is a permanently-missing required check
-# (is_missing_checks_only_block; review()'s deterministic janitor gate
-# short-circuits before packet regen, so packet_template_sha can never
-# catch up). review() is still called for these statuses: the
-# janitor-diagnostics refresh, ci_run_never_created detection, and the
-# stale-checks-retrigger self-heal lane all live inside review()'s main
-# janitor-gate path, so skipping the call would freeze the predicate's own
-# inputs -- the same #1397/#1443 frozen-diagnostics failure mode.
+# Issue #1894: the #1338 stale-template suppression names only "escalated".
+# This PR extends it to two more shapes, for different reasons:
+#
+# * janitor_blocked + is_missing_checks_only_block: the flag marks the
+#   TRANSIENT "required checks not yet reported" population (janitor.py --
+#   "Required check(s) missing" is the sole failure), durable only alongside
+#   ci_run_never_created_head (adapters.py). While the flag reads true on a
+#   pass, review()'s deterministic janitor gate short-circuits before packet
+#   regen, so the WARNING cannot converge while it holds.
+# * a "blocked" record on the PR or its linked issue (SINK_STATUSES' other
+#   member). Covered per the owner's #1894 amendment / #1897 proposal even
+#   though regen is NOT categorically unreachable: review()'s entry gate
+#   excludes only "escalated", so a blocked record still flows through
+#   review()'s main path -- janitor green regenerates the packet and flips
+#   status to "reviewing" in the same pass; janitor red rewrites status to
+#   "janitor_blocked". The suppression is deliberate one-shot silencing of
+#   a WARNING that carries no automated remediation while a human-owned
+#   record stands.
+#
+# review() is still called for these statuses: the janitor-diagnostics
+# refresh, ci_run_never_created detection, and the stale-checks-retrigger
+# self-heal lane all live inside review()'s main janitor-gate path, so
+# skipping the call would freeze the predicate's own inputs -- the same
+# #1397/#1443 frozen-diagnostics failure mode.
 # ---------------------------------------------------------------------------
 
 
@@ -613,10 +625,12 @@ def _seed_pr_janitor_blocked_missing_checks(
         save_state(app.paths.state_file, state)
 
 
-def _seed_blocked(app: OrchestratorApp, pr_number: int, issue_number: int) -> None:
-    """Mark a PR and its linked issue as "blocked" in state.json -- the
-    shape record_review's blocked path persists (the other SINK_STATUSES
-    member, a judgment verdict parked on agent:human-needed)."""
+def _seed_pr_blocked(app: OrchestratorApp, pr_number: int, issue_number: int) -> None:
+    """Mark only the PR record as "blocked" in state.json -- the shape
+    record_review's blocked path persists (the other SINK_STATUSES member, a
+    judgment verdict parked on agent:human-needed). No issue record is
+    seeded, so a suppression here can only come from the PR-record sink
+    arm -- co-seeding the issue would mask which clause fired."""
     from charlie_work.state import load_state, save_state, state_lock
 
     with state_lock(app.paths.state_file):
@@ -626,15 +640,12 @@ def _seed_blocked(app: OrchestratorApp, pr_number: int, issue_number: int) -> No
             "issue_number": issue_number,
             "status": "blocked",
         }
-        state["issues"][str(issue_number)] = {
-            "number": issue_number,
-            "status": "blocked",
-        }
         save_state(app.paths.state_file, state)
 
 
 def _seed_issue_blocked(app: OrchestratorApp, issue_number: int) -> None:
-    """Mark only the linked issue as "blocked" (PR status left untouched)."""
+    """Mark only the linked issue as "blocked" (PR record left absent or
+    seeded separately) -- isolates the issue-record sink arm."""
     from charlie_work.state import load_state, save_state, state_lock
 
     with state_lock(app.paths.state_file):
@@ -649,13 +660,17 @@ def _seed_issue_blocked(app: OrchestratorApp, issue_number: int) -> None:
 def test_loop_skips_template_stale_warning_for_janitor_blocked_missing_checks(
     tmp_path: Path,
 ) -> None:
-    """A janitor_blocked PR whose sole janitor failure is a permanently-
-    missing required check (is_missing_checks_only_block=True) can never
-    reach packet regen -- review() short-circuits in the deterministic
-    janitor gate -- so the stale-template WARNING must not re-fire every
-    pass (issue #1894; the swole PR #298 shape). review() is still called
-    each pass -- the janitor-diagnostics refresh and the
-    ci_run_never_created / stale-checks-retrigger lanes live inside it."""
+    """A janitor_blocked PR whose sole janitor failure is required checks
+    not yet reported (is_missing_checks_only_block=True) cannot reach
+    packet regen while the flag holds -- review() short-circuits in the
+    deterministic janitor gate -- so the stale-template WARNING must not
+    re-fire every pass (issue #1894; the swole PR #298 shape). The flag
+    marks the TRANSIENT population (janitor.py): it is durable only
+    alongside ci_run_never_created_head, and review()'s per-pass refresh
+    lifts the suppression as soon as the checks report (proven by the
+    heal test below). review() is still called each pass -- the
+    janitor-diagnostics refresh and the ci_run_never_created /
+    stale-checks-retrigger lanes live inside it."""
     pr = _pr456("sha-same")
     app, fake_gh = _make_loop_app_with_required_checks(
         tmp_path, prs=[pr], required_checks=("Tests passed",)
@@ -694,18 +709,25 @@ def test_loop_skips_template_stale_warning_for_janitor_blocked_missing_checks(
     assert not any(e.get("pr_number") == 456 for e in events)
 
 
-def test_loop_skips_template_stale_warning_for_blocked_pr(tmp_path: Path) -> None:
-    """status="blocked" is the other SINK_STATUSES member -- a terminal
-    judgment verdict parked on agent:human-needed (issue #1894's second
-    half). The same non-convergent suppression applies: nothing on the loop
-    side can move a blocked record, so a stale-template WARNING would fire
-    identically every pass until a human acts."""
+def test_loop_skips_template_stale_warning_for_blocked_pr_record(
+    tmp_path: Path,
+) -> None:
+    """Isolates the PR-record sink arm: status="blocked" on the PR record
+    ALONE (no issue record seeded, so neither the issue-sink nor the
+    escalated clause can fire, and the record is not janitor_blocked) must
+    suppress the WARNING. Single pass -- review() still runs and is
+    expected to move the PR record off "blocked" itself (this fixture's
+    body is janitor-red, so the janitor gate rewrites the status to
+    janitor_blocked), which is exactly why the blocked arm is one-shot
+    silencing rather than a claim that regen is unreachable."""
+    from charlie_work.state import load_state
+
     pr = _pr456("sha-same")
     app, _ = _make_loop_app(tmp_path, prs=[pr])
     current_sha = app._review_template_sha()
 
     _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
-    _seed_blocked(app, pr_number=456, issue_number=123)
+    _seed_pr_blocked(app, pr_number=456, issue_number=123)
     assert "stale-digest" != current_sha
 
     review_calls: list[int] = []
@@ -718,18 +740,125 @@ def test_loop_skips_template_stale_warning_for_blocked_pr(tmp_path: Path) -> Non
     app.review = tracking_review  # type: ignore[method-assign]
 
     app.loop(limit=0)
+
+    assert review_calls.count(456) == 1
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert not any(e.get("pr_number") == 456 for e in events)
+    # review()'s janitor gate moved the record off "blocked" within the
+    # same pass (janitor red -> janitor_blocked): the suppressed state is
+    # not parked-forever, and the predicate must be re-evaluated against
+    # whatever status the record carries next pass.
+    assert load_state(app.paths.state_file)["prs"]["456"]["status"] != "blocked"
+
+
+def test_loop_skips_template_stale_warning_for_blocked_issue_no_pr_record(
+    tmp_path: Path,
+) -> None:
+    """Isolates the issue-record sink arm: status="blocked" on the linked
+    ISSUE alone, with NO PR record at all (so neither the PR-sink nor the
+    janitor_blocked+flag clause can fire), suppresses the WARNING on the
+    pass where the issue record reads blocked."""
+    pr = _pr456("sha-same")
+    app, _ = _make_loop_app(tmp_path, prs=[pr])
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    _seed_issue_blocked(app, issue_number=123)
+
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+
     app.loop(limit=0)
 
-    assert review_calls.count(456) == 2
+    assert review_calls.count(456) == 1
     events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
     assert not any(e.get("pr_number") == 456 for e in events)
 
 
-def test_loop_skips_template_stale_warning_for_blocked_issue(tmp_path: Path) -> None:
-    """The swole evidence shape: the linked ISSUE carries status="blocked"
-    while the PR record is janitor_blocked on missing checks. Either
-    record's sink status suffices for suppression -- a human owns the
-    record either way."""
+def test_loop_skips_template_stale_warning_for_blocked_issue_nonsink_pr(
+    tmp_path: Path,
+) -> None:
+    """Same isolation as the no-PR-record case but with a live PR record
+    in a non-sink, non-janitor_blocked status ("reviewing", no
+    is_missing_checks_only_block): the issue record's "blocked" is the
+    only clause that can suppress."""
+    from charlie_work.state import load_state, save_state, state_lock
+
+    pr = _pr456("sha-same")
+    app, _ = _make_loop_app(tmp_path, prs=[pr])
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    _seed_issue_blocked(app, issue_number=123)
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "reviewing",
+        }
+        save_state(app.paths.state_file, state)
+
+    app.loop(limit=0)
+
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert not any(e.get("pr_number") == 456 for e in events)
+
+
+def test_loop_blocked_pr_green_janitor_converges_without_warning(
+    tmp_path: Path,
+) -> None:
+    """Pins the blocked arm's actual semantics for a janitor-GREEN PR
+    (body carries a tests/verification mention, so the gate passes):
+    review() is NOT gated by the suppression -- it regenerates the packet
+    with the current template in the same pass and stamps janitor_ok=True
+    (the status->"reviewing" flip lives in the same write, gated on
+    review_dispatch.enabled which defaults off here -- issue #868). The
+    WARNING is silenced for that one pass and the packet still converges:
+    deliberate one-shot silencing, not a regen-unreachable claim. The
+    pre-existing blocked tests use _pr456's bare 'Closes #123' body,
+    which is janitor-red, so only a green fixture proves this."""
+    from charlie_work.state import load_state
+
+    pr = _pr456("sha-same")
+    # Janitor-green body: linked issue via "Closes #" plus a tests
+    # mention satisfies _check_body's require_tests_or_rationale gate.
+    pr["body"] = "Closes #123\n\nTests: regression coverage added."
+    app, _ = _make_loop_app(tmp_path, prs=[pr])
+    current_sha = app._review_template_sha()
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    _seed_pr_blocked(app, pr_number=456, issue_number=123)
+
+    app.loop(limit=0)
+    app.loop(limit=0)
+
+    # The WARNING never fired -- the one shot it would have produced on
+    # pass 1 was suppressed.
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert not any(e.get("pr_number") == 456 for e in events)
+    # ...and the packet still converged: review() regenerated it with the
+    # current template digest and re-stamped the janitor verdict green.
+    pr_json = json.loads((_pr_dir(tmp_path, 456) / "pr.json").read_text(encoding="utf-8"))
+    assert pr_json["prompt_template_sha"] == current_sha
+    pr_state = load_state(app.paths.state_file)["prs"]["456"]
+    assert pr_state["janitor_ok"] is True
+    assert pr_state["janitor_failures"] == []
+
+
+def test_loop_skips_template_stale_warning_for_swole_blocked_shape(
+    tmp_path: Path,
+) -> None:
+    """The production evidence shape (swole #196/PR #298): the linked
+    ISSUE carries status="blocked" while the PR record is janitor_blocked
+    on unreported required checks. Deliberately NOT an isolation test --
+    both the issue-sink and the janitor_blocked+flag clauses can fire here
+    (the per-clause isolation lives in the tests above); this pins the
+    combined shape the issue was filed on, across two passes."""
     pr = _pr456("sha-same")
     app, fake_gh = _make_loop_app_with_required_checks(
         tmp_path, prs=[pr], required_checks=("Tests passed",)

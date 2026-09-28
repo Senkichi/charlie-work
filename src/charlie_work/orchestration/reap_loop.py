@@ -580,22 +580,48 @@ def _loop_body(
                     )
                     escalated_now = pr_escalated_now or issue_escalated_now
                     # Issue #1894: the #1338 suppression names only
-                    # "escalated", but the identical non-convergent shape is
-                    # reachable through the other durably-stuck statuses that
-                    # predicate deliberately does not cover (state.py
-                    # documents why _escalation_flags stays narrow -- a real
-                    # policy boundary, not an oversight to "fix" here). A
-                    # "blocked" record (SINK_STATUSES' other member -- a
-                    # judgment verdict parked on agent:human-needed until a
-                    # human moves it, e.g. record_review's "blocked" path)
-                    # is terminal the same way, and a janitor_blocked PR
-                    # whose sole janitor failure is a permanently-missing
-                    # required check (is_missing_checks_only_block) can never
-                    # reach packet regen either: review() short-circuits in
-                    # the deterministic janitor gate before its regen path,
-                    # so packet_template_sha can never catch up to
-                    # current_template_sha and the WARNING below would
-                    # re-emit an identical event every pass, forever.
+                    # "escalated", but the WARNING's non-convergence is also
+                    # reachable through statuses that predicate deliberately
+                    # does not cover (state.py documents why
+                    # _escalation_flags stays narrow -- a real policy
+                    # boundary, not an oversight to "fix" here). Two more
+                    # arms, each for a different reason:
+                    #
+                    # * janitor_blocked + is_missing_checks_only_block: the
+                    #   flag marks the TRANSIENT "required checks not yet
+                    #   reported" population -- the sole janitor failure is
+                    #   "Required check(s) missing" (janitor.py) -- which is
+                    #   durable only alongside ci_run_never_created_head
+                    #   (adapters.py); it is not "permanently missing" by
+                    #   itself. While the flag reads true on THIS pass,
+                    #   packet regen is unreachable THIS pass -- review()'s
+                    #   deterministic janitor gate short-circuits before its
+                    #   regen path, so packet_template_sha cannot catch up to
+                    #   current_template_sha and the WARNING would fire
+                    #   without any path to convergence for as long as the
+                    #   flag holds (the swole PR #298 shape, where CI never
+                    #   started for the head).
+                    # * SINK_STATUSES' other member, "blocked" (a recorded
+                    #   judgment verdict parked on agent:human-needed), on
+                    #   either the PR record or the linked issue's record.
+                    #   Per the owner's #1894 amendment / #1897 proposal the
+                    #   suppression covers "blocked" too -- deliberately,
+                    #   even though regen is NOT categorically unreachable
+                    #   here: review()'s entry gate excludes only escalated,
+                    #   so a blocked record still flows through review()'s
+                    #   main path each pass, which converges it (janitor
+                    #   green -> packet regenerated with the current
+                    #   template and status "reviewing"; janitor red ->
+                    #   status rewritten to "janitor_blocked", where the
+                    #   arm above then applies if the sole failure is
+                    #   missing checks). For a janitor-green blocked PR the
+                    #   WARNING would have fired exactly once before
+                    #   converging -- this arm trades away that one-shot,
+                    #   non-actionable signal (the event carries no
+                    #   automated remediation) for silence while a
+                    #   human-owned record stands. review() does not touch
+                    #   the ISSUE record's status, so an issue-level
+                    #   "blocked" keeps suppressing across passes.
                     # SINK_STATUSES already subsumes "escalated"; naming
                     # escalated_now alongside it keeps the #1338 lineage
                     # legible at the gate.
@@ -609,8 +635,8 @@ def _loop_body(
                     # predicate reads -- plus the ci_run_never_created
                     # detection and the stale-checks-retrigger self-heal
                     # lane). Skipping the call would freeze the predicate's
-                    # own inputs so the suppression could never lift once the
-                    # check appears -- a permanent wedge, and the same
+                    # own inputs so the suppression could never lift once
+                    # the checks report -- a permanent wedge, and the same
                     # frozen-diagnostics failure mode PRs #1397/#1443
                     # established for the escalated case.
                     non_convergent_now = (
@@ -629,9 +655,10 @@ def _loop_body(
                     # because the template changed while the head stayed
                     # put, so a fleet-wide template edit is visible as a
                     # burst rather than unexplained review churn. Suppressed
-                    # while the regen is unreachable (#1338 escalated, #1894
-                    # blocked / janitor_blocked-missing-checks): the WARNING
-                    # would fire identically every pass without converging.
+                    # while the WARNING cannot converge or the record is
+                    # human-owned (#1338 escalated, #1894 blocked /
+                    # janitor_blocked-missing-checks): otherwise it would
+                    # re-fire identically without producing new information.
                     if head_current and not template_current and not non_convergent_now:
                         log_event(
                             self.paths.state_file,
