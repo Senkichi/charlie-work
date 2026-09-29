@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +29,7 @@ from charlie_work.doctor import run_doctor
 from charlie_work.github import GitHubError
 from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.paths import runtime_paths
+from charlie_work.state import empty_state, save_state
 from _doctor_fixtures import FakeDoctorGitHub, _config, _write_workflow
 
 
@@ -539,3 +541,117 @@ def test_doctor_local_merge_queue_detached_head_fails(tmp_path: Path) -> None:
     assert by_name["local merge queue branch"].ok is False
     assert by_name["local merge queue verify commands"].ok is True  # empty is satisfiable
     assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #1968: the "local lane kill switch" doctor check.
+# ---------------------------------------------------------------------------
+
+
+def _write_review_ready_issue(issues_dir: Path, number: int) -> Path:
+    issues_dir.mkdir(parents=True, exist_ok=True)
+    path = issues_dir / f"{number:03d}_issue.md"
+    path.write_text(
+        f'---\ntitle: "issue {number}"\nstate: open\nlabels: ["agent:review-ready"]\n---\nBody.\n',
+        encoding="utf-8",
+    )
+    return path
+
+
+def _seed_issue_age(paths, number: int, *, hours: float) -> None:
+    state = empty_state()
+    state["issues"][str(number)] = {
+        "updated_at": (datetime.now(UTC) - timedelta(hours=hours))
+        .isoformat()
+        .replace("+00:00", "Z")
+    }
+    save_state(paths.state_file, state)
+
+
+def test_doctor_warns_when_local_lane_kill_switch_strands_parked_issue(
+    tmp_path: Path,
+) -> None:
+    """``_local_config`` carries ``auto_merge.enabled: false`` (the honest
+    no-remote setting); a review-ready issue parked past
+    ``local_lane.kill_switch_stall_hours`` must surface a warning-severity
+    finding that names the config key to flip -- the exact silent-stranding
+    gap issue #1968 exists to close."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".var/\n", encoding="utf-8")
+    issues_dir = tmp_path / "docs" / "issues"
+    _write_review_ready_issue(issues_dir, 5)
+    config = _local_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    _seed_issue_age(paths, 5, hours=48)
+    gh = _local_gh(tmp_path, issues_dir)
+
+    ok, checks = run_doctor(
+        tmp_path,
+        paths,
+        config,
+        tmp_path / "orchestrator.config.yaml",
+        gh,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+    by_name = _by_name(checks)
+    check = by_name["local lane kill switch"]
+    assert check.ok is False
+    assert check.severity == "warning"
+    assert "auto_merge.enabled" in check.detail
+    assert "5" in check.detail
+    assert ok is True  # warning-severity: the config is honored as written
+
+
+def test_doctor_local_lane_kill_switch_ok_when_lane_armed(tmp_path: Path) -> None:
+    """Positive control: the same stale review-ready issue with both
+    switches on reports armed, not stranded."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".var/\n", encoding="utf-8")
+    issues_dir = tmp_path / "docs" / "issues"
+    _write_review_ready_issue(issues_dir, 5)
+    config = _local_config(auto_merge=AutoMergeConfig(enabled=True))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    _seed_issue_age(paths, 5, hours=48)
+    gh = _local_gh(tmp_path, issues_dir)
+
+    ok, checks = run_doctor(
+        tmp_path,
+        paths,
+        config,
+        tmp_path / "orchestrator.config.yaml",
+        gh,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+    by_name = _by_name(checks)
+    assert by_name["local lane kill switch"].ok is True
+    assert "armed" in by_name["local lane kill switch"].detail
+    assert ok is True
+
+
+def test_doctor_local_lane_kill_switch_quiet_under_threshold(tmp_path: Path) -> None:
+    """A review-ready issue younger than the stall threshold is not yet a
+    finding -- the switch is honored and nothing is stranded."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".var/\n", encoding="utf-8")
+    issues_dir = tmp_path / "docs" / "issues"
+    _write_review_ready_issue(issues_dir, 5)
+    config = _local_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    _seed_issue_age(paths, 5, hours=1)
+    gh = _local_gh(tmp_path, issues_dir)
+
+    ok, checks = run_doctor(
+        tmp_path,
+        paths,
+        config,
+        tmp_path / "orchestrator.config.yaml",
+        gh,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+    by_name = _by_name(checks)
+    assert by_name["local lane kill switch"].ok is True
+    assert "nothing" in by_name["local lane kill switch"].detail
+    assert ok is True

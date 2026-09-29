@@ -8,19 +8,30 @@ unwrapped onto ``OrchestratorApp``. ``linked_issue_number`` and
 ``_authorized_override_matches`` are reached through ``_wf.``:
 ``linked_issue_number`` is patched on ``charlie_work.workflow`` by the suite
 (Tier D, via the ``workflow_mod`` alias), and ``_authorized_override_matches``
-is a ``charlie_work.workflow`` module-level def. All other free names are
-imported directly (no test patches them on ``charlie_work.workflow``).
+is a ``charlie_work.workflow`` module-level def. ``_wf.`` is also the seam for
+the shared state primitives ``state_lock``/``load_state`` used by
+``_drain_local_blocker_patch_equiv`` (issue #1967), matching
+``github_ops_unlinked_prs``. All other free names are imported directly (no
+test patches them on ``charlie_work.workflow``).
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
+
+import charlie_work.workflow as _wf
 from charlie_work.github import (
     GitHubError,
     build_branch_issue_validator,
     get_github_issue_dependencies,
     parse_blockers,
 )
+from charlie_work.instrumentation import query_events
+from charlie_work.local_issues import drain_patch_equiv_satisfied
+from charlie_work.state import StateLockBusy
+
+logger = logging.getLogger(__name__)
 
 
 def _make_branch_issue_validator(self) -> Callable[[int], bool] | None:
@@ -123,3 +134,58 @@ def _prefetch_blocker_data(self, issues: list[dict[str, Any]]) -> None:
 
     if all_blockers:
         self.gh.are_issues_open(sorted(all_blockers))
+
+
+def _drain_local_blocker_patch_equiv(self) -> None:
+    """Emit ``local_blocker_satisfied_by_patch_equivalence`` once per satisfied issue.
+
+    Issue #1967. ``LocalFileGitHub.are_issues_open`` has no event channel,
+    so when its patch-equivalence fallback is what lets a closed issue stop
+    blocking, the client collects the issue on ``_patch_equiv_satisfied``
+    instead; this drains that map in one locked read-modify-write -- the
+    same batch-after-the-work shape ``_record_unlinked_pr_skips`` uses --
+    and records one event per issue. Dedupe against ``events.db``
+    (``query_events`` on kind+issue_number) rather than the client-side
+    ``_patch_equiv_noted`` set alone, because the fleet loop rebuilds the
+    client every pass: without the durable check a surviving branch ref
+    would refire the signal on every pass. No-op on the remote backend
+    (``drain_patch_equiv_satisfied`` returns ``{}``).
+
+    Failure here is by-value: an informational notice must never outrank
+    the pass's real work, so lock contention or a write error is logged
+    and swallowed (identical best-effort shape to
+    ``_record_unlinked_pr_skips``).
+    """
+    pending = drain_patch_equiv_satisfied(self.gh)
+    if not pending:
+        return
+    try:
+        with _wf.state_lock(self.paths.state_file):
+            state = _wf.load_state(self.paths.state_file)
+            emitted = False
+            for issue_number, (branches, base) in sorted(pending.items()):
+                if query_events(
+                    self.paths.state_file,
+                    kind="local_blocker_satisfied_by_patch_equivalence",
+                    issue_number=issue_number,
+                ):
+                    continue
+                state = self._record_event(
+                    state,
+                    "local_blocker_satisfied_by_patch_equivalence",
+                    {
+                        "issue_number": issue_number,
+                        "branch": branches[0],
+                        "branches": list(branches),
+                        "base": base,
+                    },
+                )
+                emitted = True
+            if emitted:
+                self.write_gate.save_state(state)
+    except (OSError, ValueError, StateLockBusy) as exc:
+        logger.warning(
+            "could not record local_blocker_satisfied_by_patch_equivalence for %d issue(s): %s",
+            len(pending),
+            exc,
+        )

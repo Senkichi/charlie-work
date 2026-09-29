@@ -152,6 +152,7 @@ def _local_lane(self, *, now: Any = None, limit: int | None = None) -> _wf.Comma
             {"local": True, "dry_run": True},
         )
     resolved_now = now
+    self._local_kill_switch_stall_alarm(now=resolved_now)
     packets = self._local_review_packets()
     dispatched: dict[str, Any] = {"launched": [], "claimed": []}
     if self.config.review_dispatch.enabled:

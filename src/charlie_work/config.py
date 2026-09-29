@@ -1212,12 +1212,12 @@ class AutoMergeConfig:
 @dataclass(frozen=True)
 class PreflightConfig:
     """Thresholds and fatal/non-fatal classification for ``preflight.py``'s
-    four host-precondition checks (issue #1363). Defaults match the issue's
-    explicit design: disk_floor and venv_identity are fatal (refuse the
-    pass); clock_sanity and config_freshness are non-fatal tripwires (emit
-    an event, pass proceeds). Never hardcode these values at a call site --
-    read them from here so an operator can retune per host without a code
-    change.
+    five host-precondition checks (issue #1363; fifth check #1950). Defaults
+    match the issues' explicit design: disk_floor, venv_identity, and
+    git_identity are fatal (refuse the pass); clock_sanity and
+    config_freshness are non-fatal tripwires (emit an event, pass proceeds).
+    Never hardcode these values at a call site -- read them from here so an
+    operator can retune per host without a code change.
     """
 
     #: Minimum free disk space, in GB, on each volume hosting state_dir/repo
@@ -1232,6 +1232,13 @@ class PreflightConfig:
     clock_sanity_fatal: bool = False
     venv_identity_fatal: bool = True
     config_freshness_fatal: bool = False
+    #: Fatal by default (issue #1950): a repo-local ``user.email``/
+    #: ``user.name`` override that differs from the global identity makes
+    #: every commit in every worktree of the managed checkout carry the
+    #: bogus identity -- exactly the misattribution this check exists to
+    #: stop, so the pass refuses rather than dispatching through it. Set
+    #: false on a host that deliberately pins a per-repo commit identity.
+    git_identity_fatal: bool = True
 
 
 @dataclass(frozen=True)
@@ -2095,6 +2102,24 @@ class LocalIssuesConfig:
 
 
 @dataclass(frozen=True)
+class LocalLaneConfig:
+    """Knobs for the local (no-remote) review/merge lane (``local_lanes.py``).
+
+    ``kill_switch_stall_hours``: on a ``local_issues`` repo an explicit
+    ``review_dispatch.enabled: false`` or ``auto_merge.enabled: false`` is a
+    deliberate kill switch and stays honored -- but it dead-ends every
+    finished ticket at ``agent:review-ready`` with no signal (issue #1968).
+    While a disabled switch coexists with a review-ready issue older than
+    this many hours, the lane emits a ``local_lane_kill_switch_stalled``
+    warning event each pass (surfaced by ``charlie doctor``'s matching check
+    and the heartbeat's ``local_lane_kill_switch_stalled`` anomaly). ``0``
+    mutes the alarm only -- the kill switches themselves are unaffected.
+    """
+
+    kill_switch_stall_hours: float = 12.0
+
+
+@dataclass(frozen=True)
 class RunnersConfig:
     """GitHub Actions runner management.
 
@@ -2339,6 +2364,7 @@ class OrchestratorConfig:
     fleet: FleetConfig = field(default_factory=FleetConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     local_issues: LocalIssuesConfig = field(default_factory=LocalIssuesConfig)
+    local_lane: LocalLaneConfig = field(default_factory=LocalLaneConfig)
     runners: RunnersConfig = field(default_factory=RunnersConfig)
     main_ci_reclaim: MainCiReclaimConfig = field(default_factory=MainCiReclaimConfig)
     runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
@@ -3354,6 +3380,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "clock_sanity_fatal",
             "venv_identity_fatal",
             "config_freshness_fatal",
+            "git_identity_fatal",
         ):
             bool_value = preflight_data.get(bool_key)
             if bool_value is not None and not isinstance(bool_value, bool):
@@ -3981,6 +4008,20 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     # ``review_dispatch.enabled`` (either value) wins: only the default moves.
     if local_issues.enabled and "enabled" not in review_dispatch_data:
         review_dispatch = replace(review_dispatch, enabled=True)
+    local_lane_data = _section(data, "local_lane")
+    stall_hours = local_lane_data.get("kill_switch_stall_hours")
+    if stall_hours is not None:
+        if isinstance(stall_hours, bool) or not isinstance(stall_hours, (int, float)):
+            raise ConfigError(
+                "config section 'local_lane' key 'kill_switch_stall_hours' must be a "
+                f"number, got {type(stall_hours).__name__}"
+            )
+        if stall_hours < 0:
+            raise ConfigError(
+                "config section 'local_lane' key 'kill_switch_stall_hours' must be "
+                f">= 0, got {stall_hours}"
+            )
+    local_lane = _build_section(LocalLaneConfig, "local_lane", local_lane_data)
     runners_data = _section(data, "runners")
     # Validate runners config fields
     for bool_key in ("enabled", "cancel_superseded_main_runs"):
@@ -4225,6 +4266,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         fleet=fleet,
         notify=notify,
         local_issues=local_issues,
+        local_lane=local_lane,
         runners=runners,
         main_ci_reclaim=main_ci_reclaim,
         runner_scaling=runner_scaling,
