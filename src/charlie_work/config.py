@@ -1395,7 +1395,7 @@ class RuntimeConfig:
 # empty worker/reviewer model pin) so they cannot silently drift apart --
 # CLAUDE.md's "no hardcoded lists" rule applied to a scalar default instead
 # of a list.
-_DEFAULT_CLAUDE_MODEL: str = "claude-sonnet-5"
+_DEFAULT_CLAUDE_MODEL: str = "claude-sonnet-5-5"
 
 
 @dataclass(frozen=True)
@@ -1756,7 +1756,7 @@ class RescueConfig:
 
     enabled: bool = False
     worker_adapter: str = "claude-code"
-    worker_model: str = "claude-opus-4-1"
+    worker_model: str = "claude-opus-5-5"
     reviewer_adapter: str = "devin"
     reviewer_model: str = "codex"
     # Standard Devin CLI invocation shape -- override only if the rescue
@@ -1771,7 +1771,7 @@ class RescueConfig:
     )
     reviewer_timeout_seconds: int = 300
     worker: WorkerRoleConfig = field(
-        default_factory=lambda: WorkerRoleConfig(harness="claude-code", model="claude-opus-4-1")
+        default_factory=lambda: WorkerRoleConfig(harness="claude-code", model="claude-opus-5-5")
     )
     reviewer: WorkerRoleConfig = field(
         default_factory=lambda: WorkerRoleConfig(harness="devin", model="codex")
@@ -3617,7 +3617,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     # rescue_data entirely so _build_section's cls(**data) below does NOT
     # pass worker=/reviewer= at all -- letting RescueConfig's own
     # field-level default_factory apply (harness="claude-code",
-    # model="claude-opus-4-1" for worker; harness="devin", model="codex"
+    # model="claude-opus-5-5" for worker; harness="devin", model="codex"
     # for reviewer). Unconditionally constructing a bare WorkerRoleConfig()
     # here regardless of presence used to silently override those
     # RescueConfig-specific defaults with WorkerRoleConfig's OWN bare
