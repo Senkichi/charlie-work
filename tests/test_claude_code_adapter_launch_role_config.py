@@ -212,10 +212,10 @@ def test_launch_claude_worker_worker_never_uses_review_effort(
     assert record.command[idx + 1] == "low"
 
 
-def test_launch_claude_worker_worker_defaults_to_accept_edits_permission_mode(
+def test_launch_claude_worker_worker_defaults_to_bypass_permissions_mode(
     tmp_path: Path,
 ) -> None:
-    """Non-review (worker) launches keep the pre-existing acceptEdits default."""
+    """Issue #2010: a headless worker must never default to a prompting mode."""
     repo_root = tmp_path / "repo"
     _init_real_repo(repo_root)
     sessions_dir = tmp_path / "sessions"
@@ -230,4 +230,4 @@ def test_launch_claude_worker_worker_defaults_to_accept_edits_permission_mode(
 
     assert "--permission-mode" in record.command
     mode_index = record.command.index("--permission-mode")
-    assert record.command[mode_index + 1] == "acceptEdits"
+    assert record.command[mode_index + 1] == "bypassPermissions"
