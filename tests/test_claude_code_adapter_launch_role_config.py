@@ -212,7 +212,7 @@ def test_launch_claude_worker_worker_never_uses_review_effort(
     assert record.command[idx + 1] == "low"
 
 
-def test_launch_claude_worker_worker_defaults_to_bypass_permissions_mode(
+def test_launch_claude_worker_worker_defaults_to_accept_edits_permission_mode(
     tmp_path: Path,
 ) -> None:
     """Issue #2010: a headless worker must never default to a prompting mode."""
