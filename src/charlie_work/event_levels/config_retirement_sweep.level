@@ -1,0 +1,5 @@
+info
+# Issue #1976: per-pass presence summary from the config-retirement sweep —
+# which config layers were checked and where each registered deprecated key
+# is still set. Routine once-per-pass bookkeeping, same cadence class as
+# ``fleet_reap_sweep``; not a fault signal.

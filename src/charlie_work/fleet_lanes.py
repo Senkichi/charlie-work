@@ -28,6 +28,7 @@ from .instrumentation import log_event
 from .local_issues import github_client_for
 from .pass_deadline import PassDeadlineExceeded, set_pass_deadline_exceeded
 from .paths import runtime_paths
+from .supervise import orchestrator_root
 from .workflow import CommandResult, OrchestratorApp
 
 logger = logging.getLogger(__name__)
@@ -321,3 +322,38 @@ def _start_fleet_reap_scheduler(
     )
     thread.start()
     return thread, stop_event
+
+
+def _run_fleet_config_retirement_sweep(
+    fleet_dir_override: str | None,
+    global_config: Any,
+    dry_run: bool,
+    now: datetime.datetime | None,
+) -> list[dict[str, Any]]:
+    """Run the deprecated-config-key retirement sweep once per fleet pass
+    (issue #1976).
+
+    Checks every key in ``config_deprecations.DEPRECATED_CONFIG_KEYS``
+    against every config layer of every registered repo and marks the key's
+    ``removal_issue`` Ready once it has been absent everywhere for the
+    ``runtime.config_retirement_quiet_days`` quiet window. Removal issues
+    live on the orchestrator's own repo, so the client is built against
+    ``orchestrator_root()`` rather than a fleet member's root; a ``None`` or
+    non-config ``global_config`` falls back to dataclass defaults (direct
+    CLI call sites pass no GlobalConfig).
+
+    Returns digest attention entries; the sweep itself never raises.
+    """
+    from .config_retirement_sweep import run_config_retirement_sweep
+
+    config = (
+        global_config if isinstance(global_config, OrchestratorConfig) else OrchestratorConfig()
+    )
+    gh = github_client_for(orchestrator_root(), config, github=GitHub, dry_run=dry_run)
+    return run_config_retirement_sweep(
+        fleet_dir_override=fleet_dir_override,
+        config=config,
+        gh=gh,
+        dry_run=dry_run,
+        now=now,
+    )["attention"]

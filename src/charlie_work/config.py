@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import os
 import re
 from collections.abc import Mapping
@@ -59,9 +60,17 @@ from .github_capabilities.circuit_breaker import (  # noqa: F401  (deliberate re
 # it below.
 from .deescalation_config import parse_deescalation_overrides
 
+# Issue #1976: the deprecated-key registry lives in its own leaf module so
+# ``load_config`` can emit ``config_key_deprecated_read`` at the point a
+# layer file was actually read (per-layer source attribution, not the merged
+# view) without this over-cap monolith growing a second registry.
+from .config_deprecations import emit_deprecated_key_reads, repo_state_path
+
 from . import layout
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
 from .issue_comments import DEFAULT_INCLUDED_ASSOCIATIONS as DEFAULT_COMMENT_ASSOCIATIONS
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 
@@ -1407,6 +1416,14 @@ class RuntimeConfig:
     # snapshot before the previous one expires. Set to 0 to disable caching
     # (always compute live).
     status_snapshot_ttl_seconds: int = 900
+    # Issue #1976: quiet window (days) the fleet config-retirement sweep
+    # requires before marking a deprecated key's removal issue Ready. The
+    # sweep records the first pass on which the key was absent from every
+    # config layer of every registered repo and acts only once that
+    # observation is this many days old -- a single clean sample is not
+    # enough, because a repo that still sets the key but has not run a pass
+    # lately is still a user. Reappearance resets the window.
+    config_retirement_quiet_days: float = 7
 
 
 # Shared default for every Claude Code model field this refactor touches
@@ -3213,6 +3230,22 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 "config section 'runtime' key 'gh_timeout_seconds' must be > 0, "
                 f"got {gh_timeout_seconds}"
             )
+    # Issue #1976: quiet window for the config-retirement sweep. 0 is legal —
+    # it retires a key on the first pass where it is absent everywhere, which
+    # is the opt-out an operator would pick deliberately; negative is never
+    # meaningful, so it fails closed.
+    quiet_days = runtime_data.get("config_retirement_quiet_days")
+    if quiet_days is not None:
+        if isinstance(quiet_days, bool) or not isinstance(quiet_days, (int, float)):
+            raise ConfigError(
+                "config section 'runtime' key 'config_retirement_quiet_days' must be a "
+                f"number, got {type(quiet_days).__name__}"
+            )
+        if quiet_days < 0:
+            raise ConfigError(
+                "config section 'runtime' key 'config_retirement_quiet_days' must be "
+                f">= 0, got {quiet_days}"
+            )
     gh_long_call_timeout_seconds = runtime_data.get("gh_long_call_timeout_seconds")
     if gh_long_call_timeout_seconds is not None:
         if isinstance(gh_long_call_timeout_seconds, bool) or not isinstance(
@@ -4291,7 +4324,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         yaml.safe_load(source_path.read_text(encoding="utf-8")) if source_path is not None else {}
     )
     data = raw if isinstance(raw, dict) else {}
-    return replace(
+    config = replace(
         build_config_from_data(data),
         # ``path`` as given, not ``resolve()``d: this is the string the caller
         # passed and the one the layered-config log lines print, so the two are
@@ -4299,3 +4332,18 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         # tolerated.
         sources=(str(source_path),) if source_path is not None else (),
     )
+    # Issue #1976: a registered deprecated key in the file just read is worth
+    # an event, attributed to this file. Emitted after the build so the
+    # event's state path can honour the loaded ``runtime.state_dir``; a file
+    # that fails validation never gets this far, and the retirement sweep
+    # re-reads the raw file anyway.
+    if source_path is not None:
+        try:
+            emit_deprecated_key_reads(
+                data,
+                source_path=source_path,
+                state_path=repo_state_path(source_path.parent, config.runtime.state_dir),
+            )
+        except Exception:  # noqa: BLE001 — deprecation telemetry must never break config load
+            logger.debug("config_key_deprecated_read emit failed for %s", source_path)
+    return config

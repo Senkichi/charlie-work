@@ -594,6 +594,39 @@ path, isolate per-repo failures (a broken/moved repo never aborts the sweep),
 and emit a consolidated attention digest at the end of the pass
 (`data.digest`: needs-attention event count + orphan-sweep calls).
 
+### Deprecated-config-key retirement
+
+Deprecated config keys live in one registry —
+`config_deprecations.DEPRECATED_CONFIG_KEYS` — which is the only place a key
+is declared deprecated. Reading a registered key from any config layer emits a
+`config_key_deprecated_read` event (section, key, source path, replacement),
+so live usage stays visible in `events.db` even before retirement is due.
+
+Once per fleet pass, the retirement sweep
+(`config_retirement_sweep.run_config_retirement_sweep`) re-reads every config
+layer of every registered repo — the user-global `<fleet_dir>/config.yaml` plus
+each repo's `orchestrator.config.yaml`, whether the file is tracked or an
+untracked local override — and checks whether each registered key still appears
+anywhere. Presence is derived from the files themselves, never from the event
+log, so a repo that has not run a pass recently still counts as a user. Each
+pass also writes a `config_retirement_sweep` event recording the layers
+checked and where each registered key is still set.
+
+The sweep keeps a fleet sidecar (`config_retirement_state.json` in the fleet
+dir) recording the first pass on which a key was absent everywhere.
+Reappearance resets that timestamp. Once the key has stayed absent for
+`runtime.config_retirement_quiet_days` (default `7`; `0` retires on the first
+clean pass), the sweep marks the registry entry's `removal_issue` Ready via the
+normal label edge, posts one comment listing the repos and layers checked plus
+the quiet-window start, and emits `config_key_retirement_armed`. Arming is
+idempotent — a closed or already-Ready issue is left alone.
+
+If the key reappears after arming, the sweep emits
+`config_key_retirement_regressed` and comments again naming where it came back,
+but keeps the Ready label — a worker may already be running the removal.
+`--dry-run` passes report `would_arm` in the summary without touching the issue
+or the sidecar.
+
 ### Stopping and restarting the scheduled fleet
 
 The production deployment runs the supervisor hidden — the
