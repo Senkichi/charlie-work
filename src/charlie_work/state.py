@@ -253,6 +253,12 @@ ESCALATION_REASON_CLASS_BY_EVENT_KIND: Mapping[str, str] = MappingProxyType(
         # existence check), not a human judgment call -- the worker cannot
         # fix it, and a human re-triages the target repo.
         "dispatch_cross_repo_escalated": "mechanical",
+        # Issue #1972: a local-lane merge-gate rework loop (base-sync
+        # conflict or full-suite failure) exhausting its persisted
+        # per-kind attempt cap is a pure process limit -- the event is
+        # only ever emitted alongside a reason_class="mechanical"
+        # escalation, so the backfill mapping is unambiguous.
+        "local_merge_rework_escalated": "mechanical",
     }
 )
 DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS: frozenset[str] = frozenset(
