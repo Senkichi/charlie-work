@@ -86,6 +86,38 @@ _LIVE_DISPATCH_STATUSES = frozenset({"dispatched", "dispatch_pending", "manifest
 # applies the same stale-claim timeout the remote stalled-review sweep uses.
 _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES = 5
 
+# Issue #1972: the local merge gate's per-failure-kind rework budgets. The
+# remote lane caps conflict rework through
+# ``_route_janitor_gate_failure_to_rework`` (``conflict_rework_attempts``);
+# the local lane's merge gate bypasses that wrapper, so it keeps its own
+# counters on the local PR record -- deliberately separate field names so the
+# packet re-mint's remote-counter reset block (``_local_build_packet``) does
+# not alias them, and so remote state on a shared record is never clobbered.
+#
+# ``reason`` (the ``_local_route_merge_rework`` argument) maps to
+# ``(counter field, ReviewConfig budget field, below-cap rework event kind)``.
+# The cap read is per-kind: conflicts use ``max_conflict_rework_attempts`` and
+# suite failures reuse ``max_rework_cycles`` (the lane's generic rework cap,
+# per the issue).
+_LOCAL_MERGE_REWORK_CAPS: dict[str, tuple[str, str, str]] = {
+    "merge_conflict": (
+        "local_merge_conflict_rework_attempts",
+        "max_conflict_rework_attempts",
+        "merge_conflict_rework_requested",
+    ),
+    "suite_failed": (
+        "local_suite_failed_rework_attempts",
+        "max_rework_cycles",
+        "local_suite_failed",
+    ),
+}
+
+# The distinct escalation reason (state) + event kind for a capped local
+# merge-gate rework loop. Keeping the reason lane-scoped -- rather than
+# reusing the remote ``*_cap_exceeded`` names -- lets per-lane dedup guards
+# and operators tell a local gate spiral from a remote janitor one.
+_LOCAL_MERGE_REWORK_CAP_REASON = "local_merge_rework_cap_exceeded"
+
 
 def _local_lane(self, *, now: Any = None, limit: int | None = None) -> _wf.CommandResult:
     """One pass of the local review/merge/rework lane.
@@ -1463,11 +1495,11 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
 
     1. Merge the current base branch into the branch worktree
        (``_merge_update_rework_branch`` -- the same sync-merge the remote
-       rework lane performs; a real conflict routes to rework, never to an
-       operator).
+       rework lane performs; a real conflict routes to rework, escalating
+       only once the per-kind rework cap is exhausted, issue #1972).
     2. Run the full test suite inside the updated branch worktree
        (``resolve_test_commands``'s full-suite argv; failure routes to
-       rework).
+       rework under the same cap).
     3. Advance the base branch -- fast-forward when possible, ``--no-ff``
        otherwise (``merge_branch_into_base``).
     4. Remove the worker worktree with ``git worktree remove``, mark the
@@ -1545,7 +1577,7 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
         if conflict is not None:
             entry["outcome"] = "conflict"
             entry["conflicted_paths"] = list(conflict.conflicted_files)
-            self._local_route_merge_rework(
+            entry["routed_to"] = self._local_route_merge_rework(
                 pr_number,
                 issue_number,
                 record,
@@ -1606,7 +1638,7 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
         if not suite.ok:
             entry["outcome"] = "suite_failed"
             entry["returncode"] = suite.returncode
-            self._local_route_merge_rework(
+            entry["routed_to"] = self._local_route_merge_rework(
                 pr_number,
                 issue_number,
                 record,
@@ -1647,7 +1679,7 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
         if outcome.status == "conflict":
             entry["outcome"] = "conflict"
             entry["conflicted_paths"] = list(outcome.conflicted_paths)
-            self._local_route_merge_rework(
+            entry["routed_to"] = self._local_route_merge_rework(
                 pr_number,
                 issue_number,
                 record,
@@ -1706,6 +1738,14 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
                 "merged_at": _wf.utc_now(),
                 "merged_sha": merged_sha,
                 "merge_method": "ff" if outcome.fast_forward else "no-ff",
+                # Issue #1972: the merge-gate rework episode is resolved --
+                # both per-kind attempt counters restart from zero. They
+                # deliberately survive packet re-mints and rework routing;
+                # this write plus the unescalate/de-escalation reset maps
+                # are the only resets.
+                "local_merge_conflict_rework_attempts": 0,
+                "local_suite_failed_rework_attempts": 0,
+                "local_merge_rework_reason": None,
             }
             issue_entry = state["issues"].get(str(issue_number), {})
             state["issues"][str(issue_number)] = _wf._merged_issue_fields(
@@ -1750,21 +1790,59 @@ def _local_route_merge_rework(
     *,
     reason: str,
     note: str,
-) -> None:
-    """Route a merge-gate failure (conflict or suite failure) to rework."""
+) -> str:
+    """Route a merge-gate failure (conflict or suite failure) to rework.
+
+    Issue #1972: this path is capped. Each failure kind carries its own
+    persisted counter on the local PR record (``_LOCAL_MERGE_REWORK_CAPS``);
+    the counters survive packet re-mints and are cleared only by the
+    successful-merge write, ``charlie unescalate``, or the de-escalation
+    reset map. An attempt below the kind's cap routes to rework exactly as
+    before; the cap-th attempt escalates with the distinct
+    ``local_merge_rework_cap_exceeded`` reason via the same
+    ``_escalate_issue`` mechanics as ``_local_merge_error_escalate``.
+
+    Only ``record``s whose status is ``approved`` reach this helper (the
+    merge gate's entry filter), so each call is one genuinely completed
+    rework cycle -- there is no pending-rework double-count hazard to
+    debounce the way ``_route_janitor_gate_failure_to_rework`` must for its
+    every-pass redetection.
+
+    A non-positive cap disables escalation (the remote lane's
+    ``max_attempts > 0`` disable convention); the record routes to rework
+    and the counter still increments so the spiral stays diagnosable.
+
+    Returns ``"rework"`` or ``"escalated"`` for the caller's result entry.
+    """
+    counter_key, budget_attr, event_kind = _LOCAL_MERGE_REWORK_CAPS[reason]
+    cap = int(getattr(self.config.review, budget_attr))
+    snapshot = _wf.load_state_locked(self.paths.state_file)
+    attempts = (
+        int(((snapshot.get("prs") or {}).get(str(pr_number)) or {}).get(counter_key) or 0) + 1
+    )
+    if cap > 0 and attempts >= cap:
+        self._local_merge_rework_escalate(
+            pr_number,
+            issue_number,
+            reason=reason,
+            counter_key=counter_key,
+            attempts=attempts,
+            cap=cap,
+            note=note,
+        )
+        return "escalated"
     pr = local_pr_dict(record)
     label_error = self._route_to_rework(
         pr,
         issue_number,
         decision,
         note,
-        (
-            "merge_conflict_rework_requested"
-            if reason == "merge_conflict"
-            else "local_suite_failed"
-        ),
-        extra_payload={"local": True, "reason": reason},
-        extra_state={"local_merge_rework_reason": reason},
+        event_kind,
+        extra_payload={"local": True, "reason": reason, "attempts": attempts},
+        extra_state={
+            counter_key: attempts,
+            "local_merge_rework_reason": reason,
+        },
     )
     if label_error:
         with _wf.state_lock(self.paths.state_file):
@@ -1776,6 +1854,60 @@ def _local_route_merge_rework(
                 "label_error": label_error,
             }
             self.write_gate.save_state(state)
+    return "rework"
+
+
+def _local_merge_rework_escalate(
+    self,
+    pr_number: int,
+    issue_number: int,
+    *,
+    reason: str,
+    counter_key: str,
+    attempts: int,
+    cap: int,
+    note: str,
+) -> None:
+    """Escalate a local merge-gate rework loop that reached its cap (issue #1972).
+
+    Same ``_escalate_issue`` + mechanical label-edge mechanics as
+    ``_local_merge_error_escalate``, with the persisted counter carried into
+    ``pr_extra`` so the record keeps the exact attempt count that tripped it.
+    """
+    with _wf.state_lock(self.paths.state_file):
+        state = _wf.load_state(self.paths.state_file)
+        state = _wf._escalate_issue(
+            state,
+            issue_number,
+            reason=_LOCAL_MERGE_REWORK_CAP_REASON,
+            reason_class="mechanical",
+            pr_number=pr_number,
+            pr_extra={
+                counter_key: attempts,
+                "local_merge_rework_reason": reason,
+            },
+        )
+        state = self._record_event(
+            state,
+            "local_merge_rework_escalated",
+            {
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+                "reason": reason,
+                "escalation_reason": _LOCAL_MERGE_REWORK_CAP_REASON,
+                "attempts": attempts,
+                "cap": cap,
+                "detail": _wf._truncate_for_event(note),
+            },
+            level="error",
+        )
+        self.write_gate.save_state(state)
+    self.write_gate.transition(
+        self.gh,
+        self.config.labels,
+        issue_number,
+        _wf._escalation_edge("escalated", "mechanical"),
+    )
 
 
 def _local_merge_error_escalate(
