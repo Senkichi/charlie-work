@@ -1,0 +1,6 @@
+warning
+# Issue #1944: on a repo with no remote, a diverged agent branch's
+# unreachable tip was archived to archive/<branch>-<utc-date> and the
+# branch was reset instead of escalating. Warning because committed work
+# was set aside — the archive succeeded, but the divergence that triggered
+# it is worth attention (same posture as worktree_rescue_captured).

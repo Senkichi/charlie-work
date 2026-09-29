@@ -45,8 +45,12 @@ from .post_mortem import real_activity_for_worker
 from .process_utils import is_pid_alive, kill_orphan_pid, kill_process_tree
 from .safe_path import contains
 from .safe_ref import require_valid_ref_name, require_valid_rev, require_valid_sha
-from .subprocess_runner import RunResult, run_captured
+from .subprocess_runner import RunResult, command_failure_message, run_captured
 from . import state as _state
+from .worktree_archive import (
+    _archive_unreachable_tip_if_applicable,
+    _is_confirmed_missing_ref,
+)
 from .worktree_pr_lookup import WorktreeCleanGH, _pr_number_for_head_branch
 from .rescue_capture_exclusions import (  # noqa: F401  (deliberate re-export)
     _build_rescue_capture_exclusions,
@@ -2119,36 +2123,6 @@ def _capture_worktree_work_to_rescue_ref(
     return RescueCapture(ref_name=ref_name, commit_sha=commit_sha)
 
 
-def _is_confirmed_missing_ref(result: RunResult) -> bool:
-    """True only when ``git rev-parse --verify -q <ref>`` ran to completion and
-    definitively reported that ``<ref>`` does not resolve to a single
-    revision (unborn ``HEAD`` in an empty repo, or a branch/tag/sha that does
-    not exist) -- the one non-``ok`` outcome where "nothing to lose" is a
-    sound conclusion.
-
-    This is an allow-list on git's exit code, not a deny-list on failure
-    reasons: with ``-q``/``--quiet``, git reserves exit code 1 exclusively
-    for "the given ref does not resolve" and suppresses the fatal message
-    entirely (confirmed against git 2.45 for an empty repo's unborn ``HEAD``
-    and for a missing branch name -- both produce ``returncode=1`` with empty
-    stdout/stderr). Any other non-zero outcome -- ``returncode=128`` (not a
-    git repository, corrupted refs, permissions error), a git binary missing
-    from PATH entirely (``RunResult.error`` set, ``returncode is None``), or
-    the probe timing out -- fails this check and is therefore treated as a
-    probe failure by the caller, not as a confirmed-absent ref.
-
-    Exit code, not a stderr string match, is the discriminator on purpose:
-    git's fatal messages are locale-translatable, so matching on message text
-    would silently stop working (fail closed forever, not loudly) on a host
-    with a non-English git locale. The exit-code contract for ``--verify -q``
-    is part of git's documented plumbing behavior and does not vary with
-    locale. This is the safe default either way: we only ever fail OPEN
-    (report "nothing to lose") on a positive match, never on the absence of
-    one.
-    """
-    return not result.timed_out and result.returncode == 1
-
-
 def _worktree_refuse_to_reset_reason(
     repo_root: Path,
     branch: str,
@@ -3177,6 +3151,7 @@ def create_worktree(
     attempt_snapshot: AttemptSnapshot | None = None
     rework_conflict: ReworkMergeConflict | None = None
     rescue_capture: RescueCapture | None = None
+    _archive_events_emitted: set[str] = set()
     # Recovery's ls-remote probe result (True = exists on origin, False =
     # provably absent, None = no origin or probe not run). Only ``False``
     # suppresses the rework fetch below — a killed-before-push branch has
@@ -3348,6 +3323,27 @@ def create_worktree(
                     probe_result="live_writer_at_unsafe_evaluation",
                     inconclusive_probe_deferred_count=0,
                 )
+        # Issue #1944: on a repo with no origin remote the diverged tip can
+        # never become "pushed" — archive it locally and permit the reset
+        # (see _archive_unreachable_tip_if_applicable). Runs after the
+        # live-writer recheck: a live worker's branch is deferred, never
+        # archived under it.
+        if (
+            (config is None or config.dispatch.archive_unreachable_local_commits)
+            and _worktree_unsafe_kind_from_reason(reason) == WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+            and not _has_origin_remote(repo_root)
+            and _archive_unreachable_tip_if_applicable(
+                repo_root,
+                branch,
+                check_path,
+                state_file,
+                _archive_events_emitted,
+                issue_number,
+            )
+        ):
+            return
+        # Archival declined or failed — fall through to capture-or-refuse so
+        # the reset still refuses loudly rather than discarding the tip.
         # Issue #849: before refusing, attempt to capture the work durably
         # onto a rescue ref. If capture succeeds, the reset is permitted
         # (the work is preserved on a ref, so resetting destroys nothing).
@@ -3982,7 +3978,11 @@ def create_worktree(
                 if not branch_delete_result.ok:
                     raise RuntimeError(
                         f"git branch -D failed for branch {branch!r} for fresh dispatch: "
-                        f"{branch_delete_result.error or branch_delete_result.stderr}"
+                        + command_failure_message(
+                            ["git", "branch", "-D", branch],
+                            branch_delete_result,
+                            "unknown git branch -D failure",
+                        )
                     )
 
             if resolved_base_ref.startswith("origin/"):

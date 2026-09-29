@@ -1,1 +1,9 @@
-2000
+2200
+# Issue #1944: +12 lines for dispatch.archive_unreachable_local_commits bool
+# validation coverage (rejects a "false" string, accepts a real bool) in
+# build_config_from_data. Every dispatch.* validation test lives in
+# test_config.py by convention -- the rejects_non_bool family for
+# require_worker_github_token, ci_capacity_headroom_ratio, and friends is the
+# pattern a reviewer greps for here; moving two tests to a satellite module
+# would orphan them from it. Deliberate reviewed mark raise to the next
+# MARK_QUANTUM multiple above the live count (2007 -> 2200).
