@@ -192,7 +192,29 @@ def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
     return _extract_verdict_from_stream_json(log_text)
 
 
-def _parse_review_verdict_from_events(events_path: Path) -> dict[str, Any] | None:
+def _session_mtime_cutoff(started_at: str | None) -> datetime | None:
+    """Oldest mtime a file may have and still belong to the session.
+
+    ``started_at`` minus ``_REVIEW_FALLBACK_MTIME_SLACK_S``. ``None`` when
+    ``started_at`` is missing or unparseable: then there is no safe gate, and
+    callers must treat every file as stale.
+    """
+    if not started_at:
+        return None
+    try:
+        cutoff = datetime.fromisoformat(started_at.replace("Z", "+00:00")) - timedelta(
+            seconds=_REVIEW_FALLBACK_MTIME_SLACK_S
+        )
+    except ValueError:
+        return None
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=UTC)
+    return cutoff
+
+
+def _parse_review_verdict_from_events(
+    events_path: Path, *, started_at: str | None
+) -> dict[str, Any] | None:
     """Extract a fenced JSON verdict block from a reviewer's events.jsonl.
 
     Fallback for when ``_parse_review_verdict_from_log`` fails: the log may be
@@ -201,9 +223,26 @@ def _parse_review_verdict_from_events(events_path: Path) -> dict[str, Any] | Non
     lines. Decodes real stream-json events (``assistant``/``result``) as well
     as the legacy ``assistant_message`` shape.
 
-    Returns the parsed dict on success, or ``None`` if no valid block is found.
+    The file is mtime-gated to the reviewer session's ``started_at``, like
+    ``_parse_review_verdict_from_files``. ``issue-N-review.events.jsonl`` is
+    written only by the claude-code reviewer, and it is keyed by PR, not by
+    session. A devin-shell reviewer never writes one. So when a devin review
+    of the next round ends without a verdict, this path used to parse the
+    *previous* claude-code round's events file and record that old verdict
+    against the new head. The prompt quotes those findings, so they looked
+    plausible (PRs #2012 and #2017, and job-cannon #2208, on 2026-09-29).
+    A missing or unparseable ``started_at`` means there is no safe gate, so the
+    fallback is skipped.
+
+    Returns the parsed dict on success, or ``None`` if no valid block is found
+    in a file written during this session.
     """
+    cutoff = _session_mtime_cutoff(started_at)
+    if cutoff is None:
+        return None
     try:
+        if datetime.fromtimestamp(events_path.stat().st_mtime, tz=UTC) < cutoff:
+            return None
         raw_text = events_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
@@ -248,16 +287,9 @@ def _parse_review_verdict_from_files(
 
     Returns ``(verdict, source_path)`` or ``None``.
     """
-    if not started_at:
+    cutoff = _session_mtime_cutoff(started_at)
+    if cutoff is None:
         return None
-    try:
-        cutoff = datetime.fromisoformat(started_at.replace("Z", "+00:00")) - timedelta(
-            seconds=_REVIEW_FALLBACK_MTIME_SLACK_S
-        )
-    except ValueError:
-        return None
-    if cutoff.tzinfo is None:
-        cutoff = cutoff.replace(tzinfo=UTC)
 
     try:
         log_text = log_path.read_text(encoding="utf-8", errors="replace")

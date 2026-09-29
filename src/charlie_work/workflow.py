@@ -286,6 +286,7 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     _parse_review_verdict_from_log,
     _parse_review_verdict_from_events,
     _parse_review_verdict_from_files,
+    _session_mtime_cutoff,
     _reviewer_session_metrics,
     _log_tail_throttled,
     _extract_terminating_cause,
