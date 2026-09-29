@@ -124,6 +124,8 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     # exempt a later, genuinely different death from the orphan-sweep
     # timed reap and redispatch cap.
     "dead_worker_failure_kind",
+    # Issue #1993: companion of the stamp above (bounded re-arm counter).
+    "throttle_reap_rearm_count",
     "escalation_reason",
     # Issue #1461: clear the append-only escalation history so a re-arm
     # gives every lane a genuinely fresh dedup slate.

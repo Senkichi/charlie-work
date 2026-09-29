@@ -1366,13 +1366,20 @@ def _reap_restore_rework_requested(
         # advance-to-pr-open lane, on the ORIGINAL implementer dispatch)
         # cannot escalate a death-loop before this many redispatches
         # actually happened. See ``_paired_death_count``'s docstring.
+        # Issue #1993: not crediting a throttle death (above) is not enough
+        # -- deaths already in the window would still trip either cap on
+        # it (2026-09-29: #1971 escalated worker_death_loop at count 3 on a
+        # ``rate_limited`` death). A throttle death is never the one that
+        # escalates; the next non-throttle death re-evaluates both caps.
         death_loop = (
             not immediate_escalation
+            and not provider_throttled
             and _paired_death_count(redispatch_at=redispatch_at, worker_death_at=worker_death_at)
             > config.watchdog.max_auto_redispatch
         )
         no_op_loop = (
             not immediate_escalation
+            and not provider_throttled
             and not death_loop
             and no_op_count > config.watchdog.max_auto_redispatch
         )

@@ -1,0 +1,5 @@
+info
+# Issue #1974: the local merge gate spawned its detached suite runner
+# (``python -m charlie_work.local_suite_runner``) and returned without
+# blocking the pass. Routine per-launch instrumentation; the ``reason``
+# payload distinguishes a fresh launch from a resync/orphaned relaunch.

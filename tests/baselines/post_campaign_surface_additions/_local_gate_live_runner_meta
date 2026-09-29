@@ -1,0 +1,6 @@
+issue #1974 (round-2 rework): single liveness predicate for the gate
+runner's ``suite-runner.json`` pid file, shared by ``_local_gate_adopt``
+and ``_local_gate_any_in_flight`` -- a pid file holds the merge gate only
+while the fingerprint-checked process it names is alive. Installed from
+``orchestration/local_merge_gate.py``. Net-new OrchestratorApp member
+added after the Track 2 Phase B surface baseline was pinned.
