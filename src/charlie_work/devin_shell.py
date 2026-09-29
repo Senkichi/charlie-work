@@ -26,19 +26,21 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from charlie_work.process_utils import is_pid_alive, parse_proc_stat_starttime, popen_worker
 from .config import OrchestratorConfig
+from .devin_failure_classification import (  # noqa: F401 (deliberate re-export; #1442 extraction keeps devin_shell under its mark)
+    _classify_session_failure,
+    get_rate_limit_defer_until,
+)
 from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, run_captured
-from .throttle_signatures import match_quota_tail, match_throttle_tail
 from .worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
@@ -57,24 +59,6 @@ from .worktree import (
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 logger = logging.getLogger(__name__)
-
-# Provider throttle signatures — matched against session log tails to classify
-# failure kinds. The defaults are sourced from RuntimeConfig so there is a single
-# default list; callers can override via config for new provider phrasings.
-# Matching itself (substring + "resets in N minutes" extraction) is unified in
-# throttle_signatures.match_throttle_tail — used here and by
-# get_rate_limit_defer_until below (PR #262 review findings F1/F5).
-_DEFAULT_THROTTLE_ERROR_MARKERS = OrchestratorConfig().runtime.throttle_error_markers
-# Quota-exhaustion prose fallback markers — defaults sourced from
-# RuntimeConfig so there is a single default list; the structured
-# "cognition.ai/errorKind": "resource_exhausted" trailer and the
-# period-agnostic prose match live in throttle_signatures.match_quota_tail
-# (issue #1684), shared with the claude_code sibling adapter.
-_DEFAULT_QUOTA_ERROR_MARKERS = OrchestratorConfig().runtime.quota_error_markers
-
-# Default cooldown durations when we can't parse a specific reset time
-_DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
-_DEFAULT_QUOTA_COOLDOWN_HOURS = 24
 
 # ``--permission-mode dangerous`` is required for headless workers: without it
 # the Devin CLI defaults to ``auto`` (read-only tools), stalls on any
@@ -122,6 +106,74 @@ _REVIEW_COMMAND_TEMPLATE: tuple[str, ...] = (
     "--respect-workspace-trust",
     "false",
 )
+
+
+# Issue #2011: headless ``devin --print`` in ``auto`` mode auto-REJECTS any exec
+# its classifier does not approve and ENDS the session with no verdict. Models
+# shell out despite the pre-rendered packet, so review launches pre-approve a
+# READ-ONLY exec allow-list via ``<cwd>/.devin/config.local.json`` (project
+# local override; never clobbers a tracked ``.devin/config.json``). Rules are
+# whole-word prefix matches; compound commands are checked per segment, so
+# chaining (``git log && rm x``) cannot escape the list. Allow rules only: a
+# deny rule also ends the session silently.
+#
+# Anything NOT listed still goes to Devin's own classifier, which judges the
+# FULL command line: it already auto-approved ``git status``/``git diff``/
+# ``git log``/``git rev-parse`` in the #2011 sessions, and it can refuse a
+# flag-level escape (``git diff --output=<path>``) that a whole-word prefix
+# rule cannot express. So the list holds only (a) what the classifier
+# actually prompted on -- the read-only ``gh ... view`` family, which ended 4
+# of the 5 missed #2011 sessions -- and (b) commands with no exec/write flag.
+#
+# Deliberately EXCLUDED (keep it that way; the reviewer reads attacker-
+# influenced diffs, so every entry must be safe against prompt injection):
+# - bare ``Exec(git)``/``Exec(gh)`` and any git/gh subcommand with a write or
+#   exec flag: ``git diff|log|show`` (``--output=<path>`` writes anywhere),
+#   ``git grep`` (``-O<cmd>`` runs a pager command), ``gh api`` (arbitrary
+#   REST incl. writes).
+# - ``rg`` (``--pre <cmd>`` runs a program), ``sort`` (``-o``,
+#   ``--compress-program``), ``uniq`` (writes its 2nd arg), ``find``
+#   (``-delete``/``-exec``), ``sed``/``awk`` (in-place writes, system()).
+# - any interpreter or runner (python, uv, node, bash, sh, pwsh): arbitrary
+#   code -- the #2011 mdls session was ended by ``uv run ... python -c``, and
+#   that refusal is correct.
+# ``--permission-mode dangerous`` stays impossible (see the sanitizer below).
+_REVIEW_EXEC_ALLOWLIST: tuple[str, ...] = (
+    "Exec(gh issue view)",
+    "Exec(gh pr view)",
+    "Exec(gh pr diff)",
+    "Exec(gh pr checks)",
+    "Exec(grep)",
+    "Exec(cat)",
+    "Exec(head)",
+    "Exec(tail)",
+    "Exec(wc)",
+    "Exec(ls)",
+    "Exec(pwd)",
+)
+
+
+def _write_review_permissions(checkout_path: Path) -> None:
+    """Write the review exec allow-list into the review checkout (issue #2011).
+
+    Never raises: a missing allow-list degrades to the pre-fix behavior, and
+    adapters return errors as values. The file is untracked inside a review
+    checkout that ``remove_review_checkout`` force-removes wholesale, and
+    nothing computes dirtiness for review checkouts, so no separate cleanup
+    is needed.
+    """
+    try:
+        _write_json(
+            checkout_path / ".devin" / "config.local.json",
+            {"permissions": {"allow": list(_REVIEW_EXEC_ALLOWLIST)}},
+        )
+    except OSError as exc:
+        logger.warning(
+            "could not write review exec allow-list in %s: %s (reviewer may hit "
+            "an exec rejection)",
+            checkout_path,
+            exc,
+        )
 
 
 def _sanitize_review_command_template(command_template: tuple[str, ...]) -> tuple[str, ...]:
@@ -252,150 +304,6 @@ def _read_sidecar_inconclusive_count(sessions_dir: Path, issue_number: int) -> i
         return int(raw)
     except (TypeError, ValueError):
         return 0
-
-
-def _classify_session_failure(
-    log_path: Path,
-    throttle_error_markers: Sequence[str] | None = None,
-    *,
-    quota_error_markers: Sequence[str] | None = None,
-    resume_margin_seconds: int = 0,
-    now: datetime | None = None,
-) -> tuple[str | None, str | None]:
-    """Classify a session failure by matching the log tail against provider throttle signatures.
-
-    Returns a tuple of (failure_kind, throttled_until_iso):
-    - failure_kind: "rate_limited" | "quota_exhausted" | None
-    - throttled_until_iso: ISO timestamp when the cooldown ends, or None if not applicable
-
-    This is called after a session exits to detect provider throttling and set a cool-down window.
-
-    ``quota_error_markers`` is the prose-fallback list for quota exhaustion
-    (``RuntimeConfig.quota_error_markers``); the structured
-    ``cognition.ai/errorKind`` trailer is always checked first, regardless
-    of the marker list (issue #1684). Defaults to the config module's
-    default list when not provided.
-
-    ``resume_margin_seconds`` is an extra safety margin past the provider's
-    reported reset (or fixed quota cooldown) time. Provider reset estimates are
-    floors, not guarantees, and dispatching at T+0 races the actual reset
-    (issue #499).
-
-    ``now`` is the injectable clock (mirrors ``get_rate_limit_defer_until``
-    below and ``post_mortem.classify_and_record``): defaults to
-    ``datetime.now(UTC)`` when not supplied, so production behavior is
-    byte-identical. Tests that need an exact (not wall-clock-tolerance)
-    assertion on the returned ``throttled_until_iso`` should pass a frozen
-    value instead of racing real time (issue #822).
-    """
-    if not log_path.exists():
-        return None, None
-
-    try:
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None, None
-
-    resolved_now = now if now is not None else datetime.now(UTC)
-
-    # Check the last 2KB of the log (where error messages appear)
-    tail = log_text[-2048:] if len(log_text) > 2048 else log_text
-
-    # Check for quota exhaustion first (more severe). Single point of
-    # enforcement (throttle_signatures.match_quota_tail) shared with the
-    # claude_code sibling adapter — the structured "cognition.ai/errorKind":
-    # "resource_exhausted" trailer is matched before the config-driven prose
-    # markers so provider wording drift ("daily" -> "weekly", issue #1684)
-    # cannot defeat the classification.
-    quota_markers = (
-        quota_error_markers if quota_error_markers is not None else _DEFAULT_QUOTA_ERROR_MARKERS
-    )
-    if match_quota_tail(tail, quota_markers):
-        # Quota exhaustion uses a fixed 24-hour cooldown regardless of reset time
-        cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
-        throttled_until = resolved_now + cooldown
-        return "quota_exhausted", throttled_until.replace(microsecond=0).isoformat().replace(
-            "+00:00", "Z"
-        )
-
-    # Check for rate limiting / provider throttling using configurable substrings.
-    # Single point of enforcement (throttle_signatures.match_throttle_tail) shared
-    # with get_rate_limit_defer_until below — see that function's docstring.
-    markers = (
-        throttle_error_markers
-        if throttle_error_markers is not None
-        else _DEFAULT_THROTTLE_ERROR_MARKERS
-    )
-    matched, reset_minutes = match_throttle_tail(tail, markers)
-    if matched:
-        cooldown = timedelta(
-            minutes=reset_minutes
-            if reset_minutes is not None
-            else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES,
-            seconds=resume_margin_seconds,
-        )
-        throttled_until = resolved_now + cooldown
-        return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
-            "+00:00", "Z"
-        )
-
-    return None, None
-
-
-def get_rate_limit_defer_until(
-    log_path: Path,
-    slack_minutes: int,
-    now: datetime | None = None,
-    throttle_error_markers: Sequence[str] | None = None,
-    resume_margin_seconds: int = 0,
-) -> str | None:
-    """Return a defer-until ISO timestamp for a log tail containing a rate-limit signature.
-
-    Reads the same 2KB tail as ``_classify_session_failure`` and matches
-    against the same config-driven markers via ``throttle_signatures.
-    match_throttle_tail`` (issue #247; unified with ``_classify_session_
-    failure`` per PR #262 review findings F1/F5 — previously each function
-    carried its own copy of this matching logic). If the tail matches and a
-    ``"resets in N minutes"`` value is found, the defer deadline is
-    ``now + N minutes + slack + resume_margin_seconds``. Otherwise the fallback
-    ``_DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES`` is used.
-
-    ``throttle_error_markers`` defaults to ``RuntimeConfig``'s default list
-    when not provided (backward compatible with pre-#260 callers).
-
-    ``resume_margin_seconds`` is an extra safety margin past the provider's
-    reported reset time. Provider reset estimates are floors, not guarantees,
-    and dispatching at T+0 races the actual reset (issue #499).
-
-    Returns None when the log is missing, unreadable, or does not contain a
-    rate-limit signature. Quota exhaustion is intentionally not deferred here.
-    """
-    if now is None:
-        now = datetime.now(UTC)
-
-    if not log_path.exists():
-        return None
-
-    try:
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-
-    tail = log_text[-2048:] if len(log_text) > 2048 else log_text
-
-    markers = (
-        throttle_error_markers
-        if throttle_error_markers is not None
-        else _DEFAULT_THROTTLE_ERROR_MARKERS
-    )
-    matched, reset_minutes = match_throttle_tail(tail, markers)
-    if not matched:
-        return None
-
-    minutes = reset_minutes if reset_minutes is not None else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES
-
-    defer_until = now + timedelta(minutes=minutes + slack_minutes, seconds=resume_margin_seconds)
-    return defer_until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -685,6 +593,9 @@ def launch_devin_session(
     # worker_env_dict itself, which already carries the real values).
     xdist_cap, xdist_cap_source = resolve_pytest_cap(sanitized_env, worker_env)
     uv_no_sync, uv_no_sync_source = resolve_uv_no_sync(worktree.path, sanitized_env, worker_env)
+
+    if review:
+        _write_review_permissions(worktree.path)
 
     pid: int | None = None
     error: str | None = None

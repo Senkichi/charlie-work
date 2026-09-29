@@ -495,8 +495,12 @@ def test_dead_dispatched_worker_provider_throttled_reclaimed_and_retried(
 
     issue_number = 249
     log_text = (
+        # Issue #1997: the cooldown anchors at the log's emission time — the
+        # fixture ages the mtime ~30 minutes — so the reset must exceed that
+        # for ``throttled_until`` to still be live at classification (this
+        # test exercises the still-open-window half of the exemption).
         "Error: Reached overall message rate limit. Please try again later. "
-        "Your limit will reset in 10 minutes.\n"
+        "Your limit will reset in 45 minutes.\n"
     )
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -605,6 +609,125 @@ def test_dead_dispatched_worker_provider_throttled_reclaimed_and_retried(
     assert not is_throttled(state)
 
 
+def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1997 + #1917: an emission-anchored cooldown can be armed
+    already expired — the provider's reset elapsed while the worker sat
+    stalled. The timed dead-dispatched reap must still NOT escalate that
+    entry: a rate-limited death is a global provider condition, never
+    worker quality, so the exemption extends one ``dead_dispatched_reap_
+    minutes`` grace past the window's end for normal handling to reclaim
+    the issue — and ``not is_throttled`` means it can redispatch at once.
+    """
+    from unittest.mock import patch
+
+    from _worker_fixtures import _make_stalled_devin_session, _stale_devin_probe
+    from charlie_work import dead_worker_reap
+    from charlie_work.state import is_throttled
+
+    issue_number = 249
+    # The fixture ages the log mtime ~30 minutes; a 10-minute reset means
+    # the emission-anchored window ended ~20 minutes before classification.
+    log_text = (
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n"
+    )
+    config = OrchestratorConfig(
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
+        watchdog=WatchdogConfig(
+            enabled=True,
+            stall_minutes=20,
+            dead_dispatched_reap_minutes=60,
+            rate_limit_defer_enabled=True,
+            rate_limit_defer_slack_minutes=2,
+        ),
+    )
+
+    frozen_now = datetime.now(UTC)
+    past_defer = (frozen_now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    sessions_dir, state_file, _ = _make_stalled_devin_session(
+        tmp_path, issue_number, log_text, rate_limit_defer_until=past_defer
+    )
+
+    old_drift_at = (frozen_now - timedelta(minutes=120)).isoformat().replace("+00:00", "Z")
+    state = load_state(state_file)
+    state["issues"][str(issue_number)] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1710000000.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+        "orphan_drift_at": old_drift_at,
+    }
+    save_state(state_file, state)
+
+    killed = []
+    monkeypatch.setattr(
+        "charlie_work.write_gate.kill_process_tree",
+        lambda pid, start_time=None: killed.append(pid) or [pid],
+    )
+    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
+
+    from charlie_work import workflow
+
+    result = workflow._detect_and_handle_stalled_sessions(
+        sessions_dir, state_file, config, write_gate=_wg(state_file), now=frozen_now
+    )
+    assert result == [{"issue": issue_number, "pid": 99999}]
+    assert killed == [99999]
+
+    state = load_state(state_file)
+    entry = state["issues"][str(issue_number)]
+    assert entry["dead_worker_failure_kind"] == "rate_limited"
+    # The armed window is already expired: anchored ~20 minutes in the
+    # past, it clamps to the classification clock — a zero-length window.
+    assert state.get("throttled_until") is not None
+    throttled_until = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
+    assert throttled_until == frozen_now.replace(microsecond=0)
+    assert not is_throttled(state)
+
+    # --- Lane 2: the orphan sweep's provider-throttle exemption still
+    # applies (the window ended within dead_dispatched_reap_minutes), so
+    # no escalation and the labels are reclaimed for redispatch. ---
+    fake_gh = FakeGitHub()
+    fake_gh.issues.append(
+        {
+            "number": issue_number,
+            "title": "test issue 249",
+            "state": "OPEN",
+            "labels": [config.labels.in_progress],
+            "body": "",
+        }
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, state_file, config, fake_gh, write_gate=_wg(state_file)
+        )
+
+    state = load_state(state_file)
+    entry = state["issues"][str(issue_number)]
+
+    assert entry.get("status") == "dispatched"
+    assert entry.get("escalation_reason") is None
+    assert (issue_number, config.labels.operator_queue) not in fake_gh.labels_added
+    assert (issue_number, config.labels.human_needed) not in fake_gh.labels_added
+    assert [
+        e for e in state.get("events", []) if e.get("kind") == "dead_dispatched_worker_reaped"
+    ] == []
+    assert entry.get("orphan_redispatch_at") == []
+
+    # Reclaimed to the dispatchable pool — and with no live throttle the
+    # issue is eligible for dispatch on the very next pass.
+    assert (issue_number, config.labels.in_progress) in fake_gh.labels_removed
+    assert (issue_number, config.labels.ready) in fake_gh.labels_added
+
+
 def test_dead_dispatched_worker_non_throttle_kind_still_reaped(tmp_path: Path) -> None:
     """Issue #1917 control: a stamped non-throttle classification (e.g.
     ``"stalled"``) must NOT disable the timed reap -- the exemption is
@@ -703,14 +826,16 @@ def test_dead_dispatched_worker_provider_throttled_reaped_once_window_inactive(
     tmp_path: Path, throttled_until: str | None
 ) -> None:
     """Issue #1917: the provider-throttle exemption from the
-    ``dead_dispatched_reap_minutes`` timed backstop is bounded by the
-    throttle window it rides out — it must NOT hold forever. A stamped
-    ``dead_worker_failure_kind`` on an entry whose sub-branches can only
-    emit drift once and then short-circuit on the fingerprint (the
-    clean-exit-no-op PR state below) would otherwise reintroduce exactly
-    the wedge #654 fixed. Once ``throttled_until`` is expired — or was
-    never armed, or is unparseable — the backstop resumes and the issue
-    must escalate after the reap minutes elapse.
+    ``dead_dispatched_reap_minutes`` timed backstop is bounded — it must
+    NOT hold forever. A stamped ``dead_worker_failure_kind`` on an entry
+    whose sub-branches can only emit drift once and then short-circuit on
+    the fingerprint (the clean-exit-no-op PR state below) would otherwise
+    reintroduce exactly the wedge #654 fixed. Once ``throttled_until`` has
+    been over longer than the backstop's own grace — issue #1997's
+    emission-anchored windows can be born already expired, and a fresh
+    stamp still gets ``dead_dispatched_reap_minutes`` for normal handling
+    to reclaim it — or was never armed, or is unparseable, the backstop
+    resumes and the issue must escalate after the reap minutes elapse.
     """
     from unittest.mock import patch
 

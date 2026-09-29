@@ -96,6 +96,10 @@ _Avoid_: Salvage
 Publishing a PR from commits a worker left stranded, for example because it was superseded or exited without pushing.
 _Avoid_: Rescue, park
 
+**Stranded**:
+The fate of a worker that left commits only in its own worktree, never pushed. Stranded work is salvaged, or parked on a repo with no remote.
+_Avoid_: Pushed (pushed means the commits are on the remote)
+
 **Park**:
 Keeping a worker's commits on their branch in a repo with no remote, so the issue can end in Review ready. This is the no-remote counterpart of salvage.
 _Avoid_: Salvage
@@ -163,6 +167,10 @@ _Avoid_: Fleet, daemon
 
 **Worker health**:
 How the supervisor classifies a live worker: healthy, slow, stalled, runaway, dead, or orphaned.
+
+**Worker fate**:
+The single classification of a launched worker, read back from its sidecar and what it left behind. While the worker lives, its fate is its worker health. Once it exits, its fate is one of completed, pushed without a PR, stranded, blocked, throttled, or crashed. A worker that recorded its result counts as finished even if it is still running, or exited with an error while shutting down. Only evidence from the current dispatch counts toward its fate. Every decision about what happens to the worker's issue next starts from its fate.
+_Avoid_: Outcome (the worker's own report is only one input), status
 
 **Tripwire**:
 A configured limit on a worker (stall, wall-clock time, no-progress loop, cost) that triggers an intervention when crossed.

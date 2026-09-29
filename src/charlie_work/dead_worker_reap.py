@@ -773,6 +773,7 @@ def _detect_and_handle_stalled_sessions(
                             w.issue_number,
                             fallback_kind="stalled",
                             config=config,
+                            now=now,
                         )
                     )
                 elif w.adapter_kind == "claude-code":
@@ -782,6 +783,7 @@ def _detect_and_handle_stalled_sessions(
                             w.issue_number,
                             fallback_kind="stalled",
                             config=config,
+                            now=now,
                         )
                     )
                 elif w.adapter_kind == "api":
@@ -796,6 +798,7 @@ def _detect_and_handle_stalled_sessions(
                             fallback_kind="stalled",
                             config=config,
                             adapter_kind="api",
+                            now=now,
                         )
                     )
 
@@ -1353,7 +1356,7 @@ def _reap_restore_rework_requested(
         # stranded work") instead of redispatch_cap_exceeded (triage:
         # "worker is spinning").
         if not immediate_escalation and not provider_throttled:
-            worker_death_at = _credit_worker_death(entry)
+            worker_death_at = _credit_worker_death(entry, kind=failure_kind)
         else:
             worker_death_at = _windowed_worker_death_at(
                 entry, window_minutes=config.watchdog.redispatch_window_minutes
