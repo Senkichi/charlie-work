@@ -39,7 +39,6 @@ def _label_descriptions(self) -> dict[str, str]:
         labels.pr_open: "A worker PR exists for this issue.",
         labels.reviewing: "The orchestrator is adversarially reviewing the worker PR.",
         labels.needs_rework: "The worker PR needs another implementation cycle.",
-        labels.blocked: "Automation is blocked and needs intervention.",
         labels.done: "Automation completed and the issue was merged or resolved.",
         labels.human_needed: "A human product or security decision is needed.",
         labels.operator_queue: "A mechanical failure exhausted its automated retries; needs operator triage.",
