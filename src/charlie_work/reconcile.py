@@ -3249,8 +3249,10 @@ def apply_fixes(
                     new_state = set_throttled_until(
                         new_state,
                         throttled_until,
+                        source="reconcile_apply_fixes",
                         reason=item.throttle_reason,
                         adapter_kind=item.throttle_adapter_kind,
+                        state_path=state_path,
                     )
                     break
 

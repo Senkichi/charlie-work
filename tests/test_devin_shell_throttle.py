@@ -221,8 +221,8 @@ def test_set_throttled_until_overwrites_no_accumulation() -> None:
     second = (datetime.now(UTC) + timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
 
     original = {}
-    state = set_throttled_until(original, first)
-    state = set_throttled_until(state, second)
+    state = set_throttled_until(original, first, source="test")
+    state = set_throttled_until(state, second, source="test")
 
     assert state["throttled_until"] == second
     assert original.get("throttled_until") is None

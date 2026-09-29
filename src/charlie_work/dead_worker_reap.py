@@ -703,8 +703,10 @@ def _detect_and_handle_stalled_sessions(
                             state = set_throttled_until(
                                 state,
                                 defer_until,
+                                source="stalled_sessions_rate_limit_defer",
                                 reason="rate_limited",
                                 adapter_kind=w.adapter_kind,
+                                write_gate=write_gate,
                             )
                             state = write_gate.append_event(
                                 state,
@@ -809,8 +811,10 @@ def _detect_and_handle_stalled_sessions(
                     state = set_throttled_until(
                         state,
                         throttled_until,
+                        source="stalled_sessions_reap",
                         reason=resolved_failure_kind,
                         adapter_kind=w.adapter_kind,
+                        write_gate=write_gate,
                     )
                     write_gate.save_state(state)
 
@@ -1886,8 +1890,10 @@ def _classify_dead_sessions_and_update_throttle_state(
                         state = set_throttled_until(
                             state,
                             throttled_until,
+                            source="dead_sessions_launch_failure",
                             reason=failure_kind,
                             adapter_kind=w.adapter_kind,
+                            write_gate=write_gate,
                         )
                     # Issue #1917: persist the classification on the issue
                     # entry — same stamp the dead-session branch writes —
@@ -2165,8 +2171,10 @@ def _classify_dead_sessions_and_update_throttle_state(
                         state = set_throttled_until(
                             state,
                             throttled_until,
+                            source="dead_sessions_reap",
                             reason=failure_kind,
                             adapter_kind=w.adapter_kind,
+                            write_gate=write_gate,
                         )
                     # Issue #1917: persist the classification on the issue
                     # entry so the state.json-keyed orphan sweep — which

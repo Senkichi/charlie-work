@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 # Issue #1769 review follow-up / file-size ratchet (#1442): dispatch-cadence
 # bookkeeping moved to its own module; re-exported so import paths hold.
@@ -24,6 +24,11 @@ from .dispatch_cadence import (  # noqa: F401 (deliberate re-export)
     mark_dispatch_baseline_backfill_attempted,
     record_non_empty_dispatch,
 )
+
+if TYPE_CHECKING:
+    # write_gate.py imports this module, so the gate can only be named in
+    # annotations -- a runtime import here would be circular.
+    from .write_gate import WriteGate
 
 STATE_VERSION = 1
 
@@ -950,10 +955,25 @@ def set_throttled_until(
     data: dict[str, Any],
     throttled_until: str,
     *,
+    source: str,
     reason: str | None = None,
     adapter_kind: str | None = None,
+    write_gate: WriteGate | None = None,
+    state_path: Path | None = None,
+    repo: str | None = None,
 ) -> dict[str, Any]:
     """Set the provider throttle cooldown window.
+
+    ``source`` is a required keyword naming the caller (issue #2006).
+    Whenever the value changes -- extended or shortened -- this function
+    appends a ``throttle_window_set`` event carrying
+    ``{previous, throttled_until, reason, adapter_kind, source}`` so a moved
+    window is never invisible to the audit trail; a no-op write emits
+    nothing. Emission goes through ``write_gate`` when given (so gated lanes
+    get the gate's dry-run suppression and its bound ``state_path``/``repo``
+    dual-write), else through ``append_event`` with the optional
+    ``state_path``/``repo`` dual-write bindings; with neither, the event
+    lands only in the in-memory ``events`` ring.
 
     ``reason`` (a ``_classify_session_failure`` failure_kind -- e.g.
     "quota_exhausted", "provider_auth", "rate_limited") and ``adapter_kind``
@@ -968,12 +988,25 @@ def set_throttled_until(
 
     Returns a new state dict with throttled_until set; does not mutate ``data``.
     """
-    return {
+    previous = data.get("throttled_until")
+    new_data = {
         **data,
         "throttled_until": throttled_until,
         "throttle_reason": reason,
         "throttle_adapter_kind": adapter_kind,
     }
+    if previous == throttled_until:
+        return new_data
+    payload = {
+        "previous": previous,
+        "throttled_until": throttled_until,
+        "reason": reason,
+        "adapter_kind": adapter_kind,
+        "source": source,
+    }
+    if write_gate is not None:
+        return write_gate.append_event(new_data, "throttle_window_set", payload)
+    return append_event(new_data, "throttle_window_set", payload, state_path=state_path, repo=repo)
 
 
 def record_dead_worker_failure_kind(
