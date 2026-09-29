@@ -6,7 +6,9 @@ the ``workflow_delegation`` installer re-attaches each ``def`` onto the class.
 
 ``_maybe_reclaim_superseded_main_ci`` and ``_maybe_reconcile_drift`` moved
 onward to ``orchestration/state_pr_capability_lanes.py`` (issue #1810):
-they are the per-pass lanes gated on ``publishes_pull_requests``, and this
+they are the per-pass lanes whose remote surface is backend-capability
+dependent (reclaim keeps its ``publishes_pull_requests`` gate; reconcile's
+gate was lifted under #1969 once the pass became local-safe), and this
 module was over its file-size ratchet mark.
 """
 
