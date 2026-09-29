@@ -86,6 +86,13 @@ _LIVE_DISPATCH_STATUSES = frozenset({"dispatched", "dispatch_pending", "manifest
 # applies the same stale-claim timeout the remote stalled-review sweep uses.
 _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES = 5
 
+# Issue #1972: the merge gate's per-failure-kind rework budgets and the
+# below-cap routing / cap-th-escalation delegates live in
+# ``orchestration/local_merge_rework.py`` -- this module is at its
+# file-size-ratchet mark, so the block follows the same
+# net-new-member-in-its-own-submodule pattern as
+# ``local_lane_stall_alarm.py`` (#1968).
+
 
 def _local_lane(self, *, now: Any = None, limit: int | None = None) -> _wf.CommandResult:
     """One pass of the local review/merge/rework lane.
@@ -1464,11 +1471,11 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
 
     1. Merge the current base branch into the branch worktree
        (``_merge_update_rework_branch`` -- the same sync-merge the remote
-       rework lane performs; a real conflict routes to rework, never to an
-       operator).
+       rework lane performs; a real conflict routes to rework, escalating
+       only once the per-kind rework cap is exhausted, issue #1972).
     2. Run the full test suite inside the updated branch worktree
        (``resolve_test_commands``'s full-suite argv; failure routes to
-       rework).
+       rework under the same cap).
     3. Advance the base branch -- fast-forward when possible, ``--no-ff``
        otherwise (``merge_branch_into_base``).
     4. Remove the worker worktree with ``git worktree remove``, mark the
@@ -1546,7 +1553,7 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
         if conflict is not None:
             entry["outcome"] = "conflict"
             entry["conflicted_paths"] = list(conflict.conflicted_files)
-            self._local_route_merge_rework(
+            entry["routed_to"] = self._local_route_merge_rework(
                 pr_number,
                 issue_number,
                 record,
@@ -1607,7 +1614,7 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
         if not suite.ok:
             entry["outcome"] = "suite_failed"
             entry["returncode"] = suite.returncode
-            self._local_route_merge_rework(
+            entry["routed_to"] = self._local_route_merge_rework(
                 pr_number,
                 issue_number,
                 record,
@@ -1648,7 +1655,7 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
         if outcome.status == "conflict":
             entry["outcome"] = "conflict"
             entry["conflicted_paths"] = list(outcome.conflicted_paths)
-            self._local_route_merge_rework(
+            entry["routed_to"] = self._local_route_merge_rework(
                 pr_number,
                 issue_number,
                 record,
@@ -1707,6 +1714,14 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
                 "merged_at": _wf.utc_now(),
                 "merged_sha": merged_sha,
                 "merge_method": "ff" if outcome.fast_forward else "no-ff",
+                # Issue #1972: the merge-gate rework episode is resolved --
+                # both per-kind attempt counters restart from zero. They
+                # deliberately survive packet re-mints and rework routing;
+                # this write plus the unescalate/de-escalation reset maps
+                # are the only resets.
+                "local_merge_conflict_rework_attempts": 0,
+                "local_suite_failed_rework_attempts": 0,
+                "local_merge_rework_reason": None,
             }
             issue_entry = state["issues"].get(str(issue_number), {})
             state["issues"][str(issue_number)] = _wf._merged_issue_fields(
@@ -1740,43 +1755,6 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
             entry["close_error"] = True
         results.append(entry)
     return results
-
-
-def _local_route_merge_rework(
-    self,
-    pr_number: int,
-    issue_number: int,
-    record: dict[str, Any],
-    decision: dict[str, Any],
-    *,
-    reason: str,
-    note: str,
-) -> None:
-    """Route a merge-gate failure (conflict or suite failure) to rework."""
-    pr = local_pr_dict(record)
-    label_error = self._route_to_rework(
-        pr,
-        issue_number,
-        decision,
-        note,
-        (
-            "merge_conflict_rework_requested"
-            if reason == "merge_conflict"
-            else "local_suite_failed"
-        ),
-        extra_payload={"local": True, "reason": reason},
-        extra_state={"local_merge_rework_reason": reason},
-    )
-    if label_error:
-        with _wf.state_lock(self.paths.state_file):
-            state = _wf.load_state(self.paths.state_file)
-            issue_entry = state["issues"].get(str(issue_number), {})
-            state["issues"][str(issue_number)] = {
-                **issue_entry,
-                "number": issue_number,
-                "label_error": label_error,
-            }
-            self.write_gate.save_state(state)
 
 
 def _local_merge_error_escalate(
