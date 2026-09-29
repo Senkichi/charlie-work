@@ -176,6 +176,64 @@ def _write_review_permissions(checkout_path: Path) -> None:
         )
 
 
+# Issue #2024: the allow-list alone does not stop a reviewer from *trying* a
+# refused command -- Gemini re-ran ``uv run pytest`` on PR #2014 three reviews
+# in a row, and each refusal ended the session with no verdict. So the review
+# prompt states the same list, rendered from ``_REVIEW_EXEC_ALLOWLIST`` (never a
+# second hand-kept list), plus what will be refused and why that is fine.
+# Issue #2032: the section must present that list as the ONLY runnable set.
+# Devin's own read-only auto-approval outside the list is unpredictable
+# (`git log` passed nine times, and `git log -n 5 --stat` was refused), and
+# advertising git reads as "normally allowed" cost 3 of the first 5 reviews.
+REVIEW_EXEC_SECTION_HEADING = "## Shell commands in this review session"
+
+
+def _review_exec_prompt_section() -> str:
+    commands = ", ".join(f"`{entry[len('Exec(') : -1]}`" for entry in _REVIEW_EXEC_ALLOWLIST)
+    return (
+        f"{REVIEW_EXEC_SECTION_HEADING}\n\n"
+        "This session is headless and read-only. Commands that need approval are "
+        "REFUSED, and a refusal can end the session before you emit a verdict -- "
+        "the review is then lost.\n\n"
+        f"- The ONLY shell commands you may run: {commands}. Run nothing else -- not "
+        "other `git` subcommands (not even read-only ones such as `git worktree` or "
+        "`git log --stat`), not `sed`, `awk`, `jq`, and not a pipe into any "
+        "unlisted program. Unlisted commands are refused unpredictably.\n"
+        "- Read files (including this packet's `pr.json`, `diff.patch` and "
+        "`interdiff.patch`) with your file-reading and search tools, not the shell. "
+        "The packet already contains the PR's diff and metadata.\n"
+        "- Do NOT run tests, linters, interpreters, or package managers (`pytest`, "
+        "`uv`, `python`, `ruff`, `npm`, ...). CI has already run them: results are "
+        "in the CI status section and `checks.json` of this packet. Judge test "
+        "adequacy by reading the tests.\n"
+    )
+
+
+def _write_devin_review_prompt(prompt_path: Path) -> Path:
+    """Return a sibling prompt with the exec section appended (issue #2024).
+
+    The shared ``review-prompt.md`` packet file is left untouched -- other
+    harnesses read it, and this section is devin-specific. Never raises: on
+    any OSError the original prompt is returned, which is the pre-#2024
+    behavior (the allow-list still applies).
+    """
+    derived = prompt_path.with_name(f"{prompt_path.stem}.devin{prompt_path.suffix}")
+    try:
+        text = prompt_path.read_text(encoding="utf-8")
+        tmp = derived.with_suffix(derived.suffix + ".tmp")
+        tmp.write_text(f"{text.rstrip()}\n\n{_review_exec_prompt_section()}", encoding="utf-8")
+        tmp.replace(derived)
+    except OSError as exc:
+        logger.warning(
+            "could not write devin review prompt %s: %s (using %s without the exec section)",
+            derived,
+            exc,
+            prompt_path,
+        )
+        return prompt_path
+    return derived
+
+
 def _sanitize_review_command_template(command_template: tuple[str, ...]) -> tuple[str, ...]:
     """Hard-pin the read-only reviewer posture onto ``command_template``.
 
@@ -559,12 +617,13 @@ def launch_devin_session(
             return _fail(f"failed to append rework conflict notice to prompt file: {exc}")
 
     # --- command rendering (prompt_path is caller-supplied, lives outside wt) -
+    launch_prompt_path = _write_devin_review_prompt(prompt_path) if review else prompt_path
     try:
         command = _render_command(
             command_template,
             issue_number=issue_number,
             branch=branch,
-            prompt_path=prompt_path,
+            prompt_path=launch_prompt_path,
             worker_model=worker_model,
         )
     except (KeyError, IndexError, ValueError) as exc:

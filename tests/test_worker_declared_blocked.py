@@ -255,3 +255,78 @@ def test_no_outcome_file_keeps_redispatch_behavior(tmp_path: Path) -> None:
     # The redispatch counter is seeded (first observation), not escalated.
     redispatch_at = entry.get("orphan_redispatch_at", [])
     assert len(redispatch_at) == 1
+
+
+def test_permission_denial_blocked_outcome_is_not_operator_escalated(tmp_path: Path) -> None:
+    """Issue #2010: a ``blocked`` outcome that is the headless permission-denial
+    signature must not escalate to the operator as a blocked task."""
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    issue_number = 2010
+    branch = "agent/issue-2010-test"
+    state = load_state(paths.state_file)
+    state["issues"][str(issue_number)] = {
+        "status": "dispatched",
+        "dispatched_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "branch_name": branch,
+    }
+    save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    worktrees_dir = resolved_layout(config, tmp_path).worktrees
+    worktree_path = worktree_path_for_branch(tmp_path, branch, worktrees_dir)
+    _write_blocked_outcome(
+        worktree_path,
+        reason_kind="other",
+        detail="Bash was denied. If you approve command execution, I can finish these steps.",
+    )
+
+    class FakeGitHubNoPR(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubNoPR(repo_root=tmp_path)
+    fake_gh.issues = [
+        {
+            "number": issue_number,
+            "title": "test issue",
+            "url": f"https://example.test/issues/{issue_number}",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    with (
+        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
+        patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
+    ):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            write_gate=_wg(paths.state_file),
+        )
+
+    st = load_state(paths.state_file)
+    entry = st["issues"][str(issue_number)]
+
+    st = load_state(paths.state_file)
+    entry = st["issues"][str(issue_number)]
+    assert entry.get("escalation_reason") != "worker_declared_blocked"
+    assert entry["status"] != "escalated"
+    assert not [e for e in st.get("events", []) if e.get("kind") == "worker_declared_blocked"]

@@ -106,6 +106,43 @@ _PROVIDER_AUTH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Headless permission-denial signature (issue #2010): a ``claude -p`` session
+# that cannot answer a permission prompt ends by asking the operator to
+# approve command execution. That is a config defect, not a blocked task, so
+# it gets its own failure kind (``permission_denied``) instead of escalating.
+PERMISSION_DENIED_FAILURE_KIND = "permission_denied"
+_HEADLESS_PERMISSION_DENIAL_PATTERN = re.compile(
+    r"approve\s+(?:the\s+)?(?:command|bash|tool)\s+execution|"
+    r"requires?\s+(?:your\s+)?approval|"
+    r"(?:command|tool)\s+(?:was|were)\s+(?:denied|not\s+allowed)|"
+    r"permission\s+to\s+run\s+(?:this|these|the)\s+(?:command|bash)",
+    re.IGNORECASE,
+)
+
+
+def is_headless_permission_denial(text: str) -> bool:
+    """True when ``text`` (a log tail or outcome detail) shows the headless
+    permission-denial signature."""
+    return bool(_HEADLESS_PERMISSION_DENIAL_PATTERN.search(text))
+
+
+def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str = "") -> bool:
+    """Whether a dead claude-code worker's outcome ``detail`` or log tail shows
+    the headless permission-denial signature (issue #2010). Never raises."""
+    if is_headless_permission_denial(detail):
+        return True
+    try:
+        payload = json.loads(
+            _sidecar_path(sessions_dir, issue_number, "claude-code").read_text(encoding="utf-8")
+        )
+        log_text = Path(str(payload.get("log_path") or "")).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except (OSError, ValueError, AttributeError):
+        return False
+    return is_headless_permission_denial(log_text[-2048:])
+
+
 # Provider account suspension / insufficient-balance responses (issue #1342).
 # Matched against the log tail of api-kind sessions only — a suspended provider
 # account (e.g. Moonshot "Error: suspended due to insufficient balance, please
@@ -179,12 +216,24 @@ _DEFAULT_QUOTA_COOLDOWN_HOURS = 24
 
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
-# Default command templates. Workers get write access (acceptEdits) since
-# they are expected to commit/push changes. Reviewers get a read-only plan
+# Default command templates. A headless (``-p``) worker cannot answer a
+# permission prompt, so any mode that prompts for Bash (acceptEdits/default/
+# plan) leaves it able to edit but never test/commit/push (issue #2010).
+# Workers therefore default to ``bypassPermissions`` -- the same trust level
+# as the Devin shell worker they replaced -- and never to a prompting mode.
+# Reviewers get a read-only plan
 # mode by default — a reviewer's judgment stays in its verdict, never in a
 # commit to the PR's real branch (see create_review_checkout's isolation
 # guarantee, which this pairs with: no branch checkout AND no write mode).
-_WORKER_COMMAND_TEMPLATE: tuple[str, ...] = ("claude", "-p", "--permission-mode", "acceptEdits")
+_WORKER_COMMAND_TEMPLATE: tuple[str, ...] = (
+    "claude",
+    "-p",
+    "--permission-mode",
+    "bypassPermissions",
+)
+# Permission modes under which a headless worker cannot run un-allow-listed
+# Bash (issue #2010). Single source for the doctor check.
+PROMPTING_PERMISSION_MODES: frozenset[str] = frozenset({"acceptEdits", "default", "plan"})
 _REVIEW_COMMAND_TEMPLATE: tuple[str, ...] = ("claude", "-p", "--permission-mode", "plan")
 
 
@@ -699,6 +748,10 @@ def _classify_session_failure(
         return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
         )
+
+    # Issue #2010: last, so throttle/auth signatures still win.
+    if is_headless_permission_denial(tail):
+        return PERMISSION_DENIED_FAILURE_KIND, None
 
     return None, None
 
@@ -1853,6 +1906,10 @@ __all__ = [
     "read_worker_records",
     "probe_claude",
     "is_worker_alive",
+    "PERMISSION_DENIED_FAILURE_KIND",
+    "PROMPTING_PERMISSION_MODES",
+    "is_headless_permission_denial",
+    "worker_permission_denied",
     "update_worker_record_with_failure_classification",
     "_sidecar_path",
     "ClaudeProgress",

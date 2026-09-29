@@ -87,10 +87,11 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
             # Fallback: parse the structured events.jsonl. The plaintext log
             # may be truncated or the verdict block split across tee buffer
             # boundaries, but the stream-json events contain the assistant's
-            # message text in discrete JSONL lines.
+            # message text in discrete JSONL lines. mtime-gated to this
+            # session: the file is per-PR, so it may be an earlier round's.
             events_path = _events_path(reviews_dir, pr_number, review=True)
             verdict_source = "events"
-            verdict = _parse_review_verdict_from_events(events_path)
+            verdict = _parse_review_verdict_from_events(events_path, started_at=w.started_at)
         if verdict is None:
             # Last resort (issue #566): the reviewer may have written its
             # verdict to a Markdown file it referenced in final output
