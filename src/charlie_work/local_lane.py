@@ -118,6 +118,35 @@ def is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:
     ).ok
 
 
+def is_patch_equivalent(repo_root: Path, tip: str, base: str = "HEAD") -> bool:
+    """``git cherry <base> <tip>`` -- True when every patch on ``tip`` is already on ``base``.
+
+    Each output line is ``+ <sha>`` (the commit's patch-id has no
+    counterpart upstream of ``base``) or ``- <sha>`` (an equivalent patch
+    is already there), so ``tip`` counts as landed iff the command succeeds
+    and no line starts with ``+``. Empty output -- ``tip`` has no commits
+    beyond ``base`` at all -- also counts as landed.
+
+    This is the rebase/cherry-pick landing shape that ``is_ancestor`` cannot
+    see (issue #1967): landing rewrote the work into new commit objects, so
+    the original tip is never an ancestor of ``base`` even though every one
+    of its patches is. A failed ``git cherry`` returns False so callers keep
+    their conservative verdict.
+
+    Limitation: patch-id equivalence is per-commit. A squash-merge collapses
+    the branch's commits into one new commit whose patch-id matches none of
+    the originals, so work landed by squash still reports ``+``/unlanded.
+    """
+    result = run_captured(
+        ["git", "cherry", base, tip],
+        cwd=repo_root,
+        timeout_seconds=GIT_OP_TIMEOUT_SECONDS,
+    )
+    if not result.ok:
+        return False
+    return not any(line.startswith("+") for line in result.stdout.splitlines())
+
+
 def worker_branch_heads(repo_root: Path, branch_prefix: str, issue_number: int) -> dict[str, str]:
     """Live ``{branch_prefix}-<issue_number>[-*]`` local branches -> tip SHAs.
 
