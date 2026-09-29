@@ -6,6 +6,11 @@ Track 2 Phase B leaf L01 batch 4 (issue #1647, parent #1632, umbrella
 ``app.<name>(...)`` -- moved verbatim from ``OrchestratorApp`` in
 ``charlie_work.workflow``; the ``workflow_delegation`` installer re-attaches
 each ``def`` onto the class.
+
+``unescalate``'s no-remote park delegates (``_local_finished_branch`` and
+``_local_park_reentry_target``, issue #1970) live in the sibling module
+``state_unescalate_local_park.py`` -- extracted when this file crossed its
+file-size ratchet mark, same pattern as ``state_review_reap.py`` (#1874).
 """
 
 from __future__ import annotations
@@ -16,6 +21,8 @@ import json
 
 from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
+from charlie_work.local_lane import LOCAL_PENDING_STATUS, is_local_pr_record
+from charlie_work.local_work_park import _post_branch_comment
 from charlie_work.review_decision import record_decision
 from charlie_work.state import (
     PASSIVE_OPEN_STATUS,
@@ -28,6 +35,14 @@ from charlie_work.worktree import (
     WORKTREE_UNSAFE_KINDS,
 )
 import charlie_work.workflow as _wf
+
+
+# ``unescalate`` record targets that trigger the full counter/cache reset in
+# ``_apply_pr_reset``: the remote passive-open re-entry plus the two local
+# lane re-entry statuses a parked record can take. Terminal targets
+# ("merged"/"closed") never take it -- those only normalize the record to
+# the observed GitHub state.
+_PR_REENTRY_TARGETS = frozenset({PASSIVE_OPEN_STATUS, LOCAL_PENDING_STATUS, "approved"})
 
 
 def claim(self, issue_number: int, release: bool = False) -> _wf.CommandResult:
@@ -264,6 +279,7 @@ def unescalate(
     issue_number: int | None = None,
     *,
     dry_run: bool = False,
+    requeue: bool = False,
 ) -> _wf.CommandResult:
     """Operator re-arm for a PR/issue parked in the human/operator sink.
 
@@ -291,7 +307,15 @@ def unescalate(
       but nothing re-queues it, an invisible park replacing a visible one.
     - Issue with no live PR: drop the issue back to the never-dispatched
       baseline and strip workflow labels (``unescalated_requeued``) so
-      dispatch treats it as fresh.
+      dispatch treats it as fresh -- with one exception (issue #1970): on
+      a backend that cannot publish pull requests the worker's branch IS
+      the deliverable, so when the issue's branch still carries a diff
+      against the local base the issue is parked for the local path
+      instead -- ``open_passive`` status + the ``local_work_ready`` edge
+      (``agent:review-ready``), the same park ``park_unpublishable_work``
+      performs at a dead worker, so ``_local_review_packets`` adopts the
+      branch on the next pass. ``--requeue`` forces the drop for an
+      operator who wants a fresh worker even when finished work exists.
     - Issue carrying a merged-PR mention flag: the flag path
       (``dispatch_merged_pr_mention_flagged``) deliberately leaves
       ``status`` untouched, so a mention-flagged issue parks in the
@@ -457,6 +481,57 @@ def unescalate(
     # writer (e.g. a reconcile pass) touched in the meantime.
     transitions: dict[str, list[Any]] = {}
     label_edge: str | None = None
+    parked_branch: str | None = None
+
+    issue_status_action: str = "leave"
+    if issue_number is not None:
+        if live_pr_state == "OPEN" and pr_number is not None:
+            issue_status_action = "passive"
+            label_edge = "unescalated_pr_open"
+        elif live_pr_state in ("MERGED", "CLOSED"):
+            # Terminal PR on GitHub. If the issue is still escalated and
+            # no other open PR references it, drop the issue to baseline
+            # in the same call — reconcile deliberately never rewrites an
+            # open escalated issue's status (D-2), so leaving it would
+            # require a second identical ``unescalate --issue N`` call to
+            # take the no-live-PR path (issue #1391). When another open PR
+            # exists, or the issue is not stuck, leave the issue to
+            # finalization/reconcile as before.
+            if (issue_stuck or mention_flagged) and not _wf._has_other_open_pr(
+                state, issue_number, pr_number
+            ):
+                issue_status_action = "drop"
+                label_edge = "unescalated_requeued"
+            else:
+                label_edge = None
+        elif issue_stuck or mention_flagged:
+            # No live PR at all — back to the never-dispatched baseline
+            # (a status literal no dispatch selector reads would just
+            # recreate the orphan gap reconcile now repairs). For a
+            # mention-flagged issue "drop" is a no-op on ``status`` (the
+            # flag path never writes one); what matters is the
+            # ``unescalated_requeued`` edge stripping agent:human-needed
+            # and the mention_rearmed_at stamp below.
+            issue_status_action = "drop"
+            label_edge = "unescalated_requeued"
+            # Issue #1970: on a backend that cannot publish pull requests
+            # the worker's branch IS the deliverable, so "no live PR" is
+            # the normal end state of a *finished* worker rather than
+            # proof there is nothing to keep. Dropping here discards that
+            # work (or loops it through #1944's diverged-branch
+            # re-escalation). When the issue's branch still diffs against
+            # the local base, park it for the local path instead:
+            # ``local_work_ready`` is the same ``agent:review-ready``
+            # transition ``park_unpublishable_work`` applies at a dead
+            # worker, and ``open_passive`` is the converged placeholder
+            # ``_local_review_packets`` adopts from on the next pass.
+            # ``--requeue`` forces the drop for an operator who wants a
+            # fresh worker even when finished work exists.
+            if not requeue:
+                parked_branch = self._local_finished_branch(issue_number, issue_state, pr_state)
+                if parked_branch is not None:
+                    issue_status_action = "passive"
+                    label_edge = "local_work_ready"
 
     pr_status_target: str | None = None
     if pr_number is not None and pr_stuck:
@@ -466,6 +541,24 @@ def unescalate(
             pr_status_target = "closed"
         else:
             pr_status_target = PASSIVE_OPEN_STATUS
+
+    local_lane_record = is_local_pr_record(pr_state)
+    local_still_valid: tuple[dict[str, Any], str] | None = None
+    local_record_head: str | None = None
+    if parked_branch is not None and local_lane_record:
+        # Issue #1970 rework: a parked local record must re-enter the lane
+        # (approved/local_pending) rather than be left adopted-in-name-only
+        # -- see _local_park_reentry_target for the strand analysis.
+        (
+            pr_status_target,
+            local_still_valid,
+            local_record_head,
+        ) = self._local_park_reentry_target(
+            pr_number,
+            pr_state,
+            pr_stuck=pr_stuck,
+            pr_status_target=pr_status_target,
+        )
 
     # Issue #1765: resetting the PR to the passive-open state is meant to
     # make review_queue() reachable again, but review_queue() skips any PR
@@ -500,8 +593,10 @@ def unescalate(
     # fresh review completes -- the conflict-cap re-arm this command exists
     # to restore (issue #776 follow-up) would be dead on arrival.
     still_valid_verdict = (
-        self._still_valid_recorded_verdict(pr_number, live_pr.get("headRefOid"))
-        if pr_status_target == PASSIVE_OPEN_STATUS
+        local_still_valid
+        if pr_status_target == LOCAL_PENDING_STATUS
+        else self._still_valid_recorded_verdict(pr_number, live_pr.get("headRefOid"))
+        if pr_status_target == PASSIVE_OPEN_STATUS and not local_lane_record
         else None
     )
     if still_valid_verdict is not None and still_valid_verdict[0].get("decision") == "approved":
@@ -510,13 +605,20 @@ def unescalate(
     def _apply_pr_reset(entry: dict[str, Any]) -> dict[str, Any]:
         updated = dict(entry)
         updated["status"] = pr_status_target
-        if pr_status_target == PASSIVE_OPEN_STATUS:
+        if pr_status_target in _PR_REENTRY_TARGETS:
             updated["review_dispatch_attempt_count"] = 0
             updated["request_changes_count"] = 0
             for field_name in self._UNESCALATE_PR_RESET_FIELDS:
                 if field_name in ("review_dispatch_attempt_count", "request_changes_count"):
                     continue
                 updated.pop(field_name, None)
+            if parked_branch is not None and is_local_pr_record(updated):
+                # The lane reviews ``record.branch`` -- repoint the record
+                # at the branch the park actually verified, so a stale
+                # pointer cannot aim the rebuilt packet (or the merge
+                # gate) at the wrong ref.
+                updated["branch"] = parked_branch
+                updated["headRefName"] = parked_branch
         elif pr_status_target == "merged":
             # Issue #747: stamp ``merged_at`` only on a genuine non-merged
             # -> merged transition (the same pattern as the other five
@@ -527,38 +629,6 @@ def unescalate(
             if entry.get("status") != "merged":
                 updated["merged_at"] = _wf.utc_now()
         return updated
-
-    issue_status_action: str = "leave"
-    if issue_number is not None:
-        if live_pr_state == "OPEN" and pr_number is not None:
-            issue_status_action = "passive"
-            label_edge = "unescalated_pr_open"
-        elif live_pr_state in ("MERGED", "CLOSED"):
-            # Terminal PR on GitHub. If the issue is still escalated and
-            # no other open PR references it, drop the issue to baseline
-            # in the same call — reconcile deliberately never rewrites an
-            # open escalated issue's status (D-2), so leaving it would
-            # require a second identical ``unescalate --issue N`` call to
-            # take the no-live-PR path (issue #1391). When another open PR
-            # exists, or the issue is not stuck, leave the issue to
-            # finalization/reconcile as before.
-            if (issue_stuck or mention_flagged) and not _wf._has_other_open_pr(
-                state, issue_number, pr_number
-            ):
-                issue_status_action = "drop"
-                label_edge = "unescalated_requeued"
-            else:
-                label_edge = None
-        elif issue_stuck or mention_flagged:
-            # No live PR at all — back to the never-dispatched baseline
-            # (a status literal no dispatch selector reads would just
-            # recreate the orphan gap reconcile now repairs). For a
-            # mention-flagged issue "drop" is a no-op on ``status`` (the
-            # flag path never writes one); what matters is the
-            # ``unescalated_requeued`` edge stripping agent:human-needed
-            # and the mention_rearmed_at stamp below.
-            issue_status_action = "drop"
-            label_edge = "unescalated_requeued"
 
     def _apply_issue_reset(entry: dict[str, Any]) -> dict[str, Any]:
         updated = dict(entry)
@@ -580,7 +650,7 @@ def unescalate(
         stamp_unescalate_cleared_markers(updated, entry, now=_wf.utc_now())
         return updated
 
-    if pr_number is not None and pr_stuck:
+    if pr_number is not None and pr_status_target is not None:
         snapshot_new_pr = _apply_pr_reset(pr_state)
         if snapshot_new_pr.get("status") != pr_state.get("status"):
             transitions["pr.status"] = [pr_state.get("status"), snapshot_new_pr["status"]]
@@ -621,6 +691,7 @@ def unescalate(
                 "issue": issue_number,
                 "transitions": transitions,
                 "label_edge": label_edge,
+                "parked_branch": parked_branch,
                 "mention_rearmed": mention_flagged,
                 "blocked_environment_at_reset": prior_blocked_environment_count > 0,
                 "blocked_environment_at_prior_count": prior_blocked_environment_count,
@@ -634,7 +705,7 @@ def unescalate(
     cleared_escalation_reason: str | None = None
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
-        if pr_number is not None and pr_stuck:
+        if pr_number is not None and pr_status_target is not None:
             fresh_pr = state["prs"].get(str(pr_number), {})
             state["prs"][str(pr_number)] = {
                 **_apply_pr_reset(fresh_pr if isinstance(fresh_pr, dict) else {}),
@@ -692,7 +763,11 @@ def unescalate(
                         "reviewed_at": None,
                         "verdict_provenance": None,
                     },
-                    live_pr.get("headRefOid"),
+                    # The remote lane pins the stub to the live PR head; a
+                    # local record has no PR object, so it pins to the
+                    # resolved branch head (the same head the packet pass
+                    # rebuilds against).
+                    local_record_head if local_lane_record else live_pr.get("headRefOid"),
                     archive_round=False,
                 )
                 verdict_voided = True
@@ -732,6 +807,7 @@ def unescalate(
                 "issue_number": issue_number,
                 "transitions": transitions,
                 "label_edge": label_edge,
+                "parked_branch": parked_branch,
                 "mention_rearmed": mention_rearmed,
                 "blocked_environment_at_reset": prior_blocked_environment_count > 0,
                 "blocked_environment_at_prior_count": prior_blocked_environment_count,
@@ -764,6 +840,13 @@ def unescalate(
                     "label_error": label_error,
                 }
                 _wf.save_state(self.paths.state_file, state)
+        elif parked_branch is not None:
+            # The same convenience comment ``park_unpublishable_work`` posts
+            # on its ``local_work_ready`` park: name the branch holding the
+            # work on the issue. Best-effort, never fatal.
+            _post_branch_comment(
+                self.gh, self.config, self.repo_root, parked_branch, int(issue_number)
+            )
 
     summary = ", ".join(f"{k}: {old!r} -> {new!r}" for k, (old, new) in transitions.items())
     message = f"unescalated pr={pr_number} issue={issue_number}"
@@ -771,6 +854,8 @@ def unescalate(
         message += f" ({summary})"
     if mention_rearmed:
         message += " (mention flag re-armed)"
+    if parked_branch is not None:
+        message += f" (parked branch {parked_branch} for the local path)"
     if label_error:
         message += f" (label update failed: {label_error['outcome']})"
     return _wf.CommandResult(
@@ -781,6 +866,7 @@ def unescalate(
             "issue": issue_number,
             "transitions": transitions,
             "label_edge": label_edge,
+            "parked_branch": parked_branch,
             "label_error": label_error,
             "mention_rearmed": mention_rearmed,
             "verdict_voided": verdict_voided,

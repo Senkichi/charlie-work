@@ -49,6 +49,7 @@ from .fleet_lanes import (  # noqa: F401  (deliberate re-export)
     _DEFAULT_FLEET_LANE_CONCURRENCY,
     _fleet_reap_sweep_loop,
     _resolve_fleet_lane_concurrency,
+    _run_fleet_config_retirement_sweep,
     _run_fleet_reap_sweep,
     _run_fleet_repo_lane,
     _start_fleet_reap_scheduler,
@@ -1915,6 +1916,12 @@ def fleet_loop(
     notify_config = _fleet_notify_config(global_config)
     if notify_config is not None and getattr(notify_config, "enabled", False):
         check_notify_digest_freshness(notify_config, fleet_state_path)
+
+    # Issue #1976: deprecated-config-key retirement sweep — once per pass,
+    # before lanes start so a deadline-cut pass still gets it.
+    attention_events.extend(
+        _run_fleet_config_retirement_sweep(fleet_dir_override, global_config, dry_run, now)
+    )
 
     # Issue #1372: stale registry entries (repo_root no longer exists) are
     # collected during the pass for prune-after-grace processing. They are

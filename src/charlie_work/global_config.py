@@ -11,13 +11,38 @@ from .config import (
     ConfigError,
     OrchestratorConfig,
     build_config_from_data,
-    find_config_path,
+    default_config_path,
     known_config_sections,
     load_config,
 )
 from . import layout
+from .config_deprecations import emit_deprecated_key_reads, repo_state_path
+from .fleet_paths import fleet_dir
 
 logger = logging.getLogger(__name__)
+
+
+def config_layer_paths(
+    repo_root: Path,
+    explicit: Path | None = None,
+    *,
+    fleet_dir_override: str | None = None,
+) -> tuple[tuple[str, Path], ...]:
+    """The config-layer files ``load_layered_config`` reads, in merge order.
+
+    Each entry is ``(layer, path)`` where *layer* is ``"user-global"`` (the
+    fleet dir's ``config.yaml``) or ``"repo"`` (the resolved per-repo file).
+    Paths come back whether or not the file exists -- the fleet retirement
+    sweep (issue #1976) needs the *slots*, not just the files that happen to
+    be present, so an absent layer is still "checked". ``load_layered_config``
+    itself resolves its layer paths through this function, so the sweep and
+    the loader share one source set by construction rather than by parallel
+    resolution that could drift.
+    """
+    return (
+        ("user-global", layout.global_config_path(override=fleet_dir_override)),
+        ("repo", default_config_path(repo_root)) if explicit is None else ("repo", explicit),
+    )
 
 
 def describe_config_file(path: Path) -> str:
@@ -103,11 +128,17 @@ def load_layered_config(
     Returns:
         The merged OrchestratorConfig.
     """
-    # Load per-repo config path
-    repo_config_path = find_config_path(repo_root, explicit)
-
-    # Load global config if present
-    global_config_path = layout.global_config_path(override=fleet_dir_override)
+    # Both layer paths come from config_layer_paths (issue #1976): the fleet
+    # retirement sweep enumerates exactly these slots, so the loader and the
+    # sweep share one source set by construction. The repo slot is the
+    # *candidate* -- explicit wins unconditionally, otherwise the default
+    # filename whether or not it exists; existence is gated at ``repo_source``
+    # below and ``load_config`` treats a nonexistent path as no config.
+    layer_map = dict(
+        config_layer_paths(repo_root, explicit, fleet_dir_override=fleet_dir_override)
+    )
+    global_config_path = layer_map["user-global"]
+    repo_config_path = layer_map["repo"]
     global_exists = global_config_path.exists()
     if require_global and not global_exists:
         # The silent-{} branch below is the whole of issue #623: every
@@ -129,6 +160,20 @@ def load_layered_config(
         yaml.safe_load(global_config_path.read_text(encoding="utf-8")) if global_exists else {}
     )
     global_data = global_raw if isinstance(global_raw, dict) else {}
+    # Issue #1976: a registered deprecated key in the global layer is worth a
+    # fleet-level event the moment it is read. Emitted here rather than after
+    # the merge because the merged path is also reached via the
+    # discarded-global-layer rescue below, where this layer was still read
+    # even though it did not contribute.
+    if global_exists:
+        try:
+            emit_deprecated_key_reads(
+                global_data,
+                source_path=global_config_path,
+                state_path=layout.state_file_path(fleet_dir(override=fleet_dir_override)),
+            )
+        except Exception:  # noqa: BLE001 — deprecation telemetry must never break config load
+            logger.debug("config_key_deprecated_read emit failed for %s", global_config_path)
 
     # Provenance, not values. An absent global layer is legitimate (a plain
     # single-repo checkout has none), so this cannot be a warning here -- but
@@ -265,7 +310,21 @@ def load_layered_config(
         # build_config_from_data leaves ``sources`` at its dataclass default
         # (it only ever sees a dict); attach the real layer provenance here,
         # the same way load_config attaches a single path's provenance.
-        return replace(build_config_from_data(merged_data), sources=layer_sources)
+        merged = replace(build_config_from_data(merged_data), sources=layer_sources)
+        # Issue #1976: emit the repo layer's deprecated reads here -- the two
+        # delegation branches (``not merged_data``, discarded global layer)
+        # get theirs from ``load_config`` instead, so this is the one place
+        # the merged path's repo-layer read is recorded.
+        if repo_source is not None:
+            try:
+                emit_deprecated_key_reads(
+                    repo_data,
+                    source_path=repo_source,
+                    state_path=repo_state_path(repo_root, merged.runtime.state_dir),
+                )
+            except Exception:  # noqa: BLE001 — deprecation telemetry must never break config load
+                logger.debug("config_key_deprecated_read emit failed for %s", repo_source)
+        return merged
     except ConfigError:
         # A present-but-invalid global layer (e.g. an unknown key) makes
         # the merged load raise, and callers (fleet_dispatch) catch

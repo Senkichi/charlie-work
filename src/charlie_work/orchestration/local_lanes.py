@@ -46,6 +46,7 @@ from charlie_work.github import GitHubError
 from charlie_work.janitor import check_operator_containment, check_test_adequacy
 from charlie_work.labels import TransitionOutcome
 from charlie_work.local_lane import (
+    LOCAL_PENDING_STATUS,
     branch_diff,
     branch_head_sha,
     is_local_pr_record,
@@ -66,9 +67,9 @@ from charlie_work.worktree import list_worktrees
 # Local review-record statuses. These deliberately reuse the remote lane's
 # vocabulary wherever the remote state machine already understands it
 # ("reviewing", "rework_requested", "approved", "blocked", "escalated",
-# "merged", "closed"); "local_pending" is the one new value -- the adopted
-# record between creation and its first packet commit.
-LOCAL_PENDING_STATUS = "local_pending"
+# "merged", "closed"); LOCAL_PENDING_STATUS -- the one new value, imported
+# from charlie_work.local_lane -- is the adopted record between creation
+# and its first packet commit.
 
 # Issue statuses meaning a worker process may still be writing to the branch:
 # never rebuild a review packet (or merge) underneath one.
